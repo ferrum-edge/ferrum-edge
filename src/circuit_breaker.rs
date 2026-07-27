@@ -563,13 +563,15 @@ impl CircuitBreaker {
 
 /// Build the cache key for a circuit breaker.
 ///
-/// When an upstream target is provided, the breaker is scoped to that specific
-/// target (`proxy_id::host:port`) so each target tracks failures independently.
-/// Without a target, the key is just the proxy ID (direct backend proxies).
-fn circuit_breaker_key(proxy_id: &str, target_key: Option<&str>) -> String {
+/// Keys are namespace-qualified (`namespace|proxy_id`) so the same proxy id in
+/// two tenants cannot share or leak breaker state. When an upstream target is
+/// provided, the breaker is scoped to that specific target
+/// (`namespace|proxy_id::host:port`) so each target tracks failures independently.
+/// Without a target, the key is `namespace|proxy_id` (direct backend proxies).
+fn circuit_breaker_key(namespace: &str, proxy_id: &str, target_key: Option<&str>) -> String {
     match target_key {
-        Some(tk) => format!("{proxy_id}::{tk}"),
-        None => proxy_id.to_string(),
+        Some(tk) => format!("{namespace}|{proxy_id}::{tk}"),
+        None => crate::config::db_backend::namespaced_runtime_key(namespace, proxy_id),
     }
 }
 
@@ -578,9 +580,9 @@ pub fn target_key(host: &str, port: u16) -> String {
     format!("{host}:{port}")
 }
 
-/// Cache of circuit breakers, keyed per proxy unless dispatch supplies an
-/// effective target (`proxy_id::host:port`) for upstream targets or direct
-/// backend overrides.
+/// Cache of circuit breakers, keyed per namespace-qualified proxy unless dispatch
+/// supplies an effective target (`namespace|proxy_id::host:port`) for upstream
+/// targets or direct backend overrides.
 ///
 /// Admission uses an atomic entry counter coordinated with DashMap `entry`
 /// semantics so concurrent same-key creation, changed-config replacement, and
@@ -637,13 +639,14 @@ impl CircuitBreakerCache {
     /// change).
     pub fn get_or_create(
         &self,
+        namespace: &str,
         proxy_id: &str,
         target_key: Option<&str>,
         config: &CircuitBreakerConfig,
     ) -> Arc<CircuitBreaker> {
         use dashmap::mapref::entry::Entry;
 
-        let key = circuit_breaker_key(proxy_id, target_key);
+        let key = circuit_breaker_key(namespace, proxy_id, target_key);
         // Hot path: matching-config hits use a shard read lock only.
         if let Some(existing) = self.breakers.get(&key)
             && existing.config() == config
@@ -706,8 +709,13 @@ impl CircuitBreakerCache {
     /// cache (#1649 R8). Returns `None` when no breaker is cached for the key (it
     /// was evicted or replaced by a reload), which the deferred stale check treats
     /// as "the admitted cycle is gone → stale".
-    pub fn peek(&self, proxy_id: &str, target_key: Option<&str>) -> Option<Arc<CircuitBreaker>> {
-        let key = circuit_breaker_key(proxy_id, target_key);
+    pub fn peek(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        target_key: Option<&str>,
+    ) -> Option<Arc<CircuitBreaker>> {
+        let key = circuit_breaker_key(namespace, proxy_id, target_key);
         self.breakers.get(&key).map(|entry| entry.value().clone())
     }
 
@@ -722,11 +730,12 @@ impl CircuitBreakerCache {
     /// counter is decremented only for requests that actually hold a probe slot.
     pub fn can_execute(
         &self,
+        namespace: &str,
         proxy_id: &str,
         target_key: Option<&str>,
         config: &CircuitBreakerConfig,
     ) -> Result<(Arc<CircuitBreaker>, bool), CircuitOpenError> {
-        let cb = self.get_or_create(proxy_id, target_key, config);
+        let cb = self.get_or_create(namespace, proxy_id, target_key, config);
         let is_half_open_probe = cb.can_execute()?;
         Ok((cb, is_half_open_probe))
     }
@@ -747,11 +756,12 @@ impl CircuitBreakerCache {
     /// outcome is recorded at response-body completion. (#1649 R6 finding 3)
     pub fn can_execute_with_admission_epoch(
         &self,
+        namespace: &str,
         proxy_id: &str,
         target_key: Option<&str>,
         config: &CircuitBreakerConfig,
     ) -> Result<(Arc<CircuitBreaker>, bool, u64), CircuitOpenError> {
-        let cb = self.get_or_create(proxy_id, target_key, config);
+        let cb = self.get_or_create(namespace, proxy_id, target_key, config);
         let admission_open_epoch = cb.open_epoch();
         let is_half_open_probe = cb.can_execute()?;
         Ok((cb, is_half_open_probe, admission_open_epoch))
@@ -774,13 +784,16 @@ impl CircuitBreakerCache {
     }
 
     /// Remove circuit breakers for proxies that no longer exist in config.
-    /// Removes both direct-backend keys (`proxy_id`) and per-target keys
-    /// (`proxy_id::host:port`) for each removed proxy.
-    pub fn prune(&self, removed_proxy_ids: &[String]) {
+    /// Removes both direct-backend keys (`namespace|proxy_id`) and per-target
+    /// keys (`namespace|proxy_id::host:port`) for each removed proxy identity.
+    pub fn prune(&self, removed_proxies: &[crate::config::db_backend::NamespacedResourceId]) {
         self.breakers.retain(|key, _| {
-            let keep = !removed_proxy_ids.iter().any(|id| {
-                // Match exact proxy_id key or proxy_id:: prefix for target-scoped keys
-                key == id || key.starts_with(&format!("{id}::"))
+            let keep = !removed_proxies.iter().any(|resource| {
+                crate::config::db_backend::runtime_key_matches_resource(
+                    key,
+                    &resource.namespace,
+                    &resource.id,
+                )
             });
             if !keep {
                 self.release_entry_slot();

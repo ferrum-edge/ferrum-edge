@@ -46,7 +46,7 @@ async fn spawn_dtls_server() -> (Arc<ferrum_edge::dtls::DtlsServer>, SocketAddr)
         .expect("build server config");
     let frontend = ferrum_edge::dtls::FrontendDtlsConfig {
         dimpl_config: Arc::new(server_config),
-        certificate: server_cert,
+        certificate: server_cert.into(),
         client_cert_verifier: None,
     };
     let server = Arc::new(
@@ -699,7 +699,7 @@ async fn test_udp_logging_optional_fail_open_omits_unknown_key_instance() {
 
     let omitted = PluginCache::new(&bad_gateway).expect("cache omits failed optional plugin");
     assert!(
-        omitted.get_plugins("p1").is_empty(),
+        omitted.get_plugins("ferrum", "p1").is_empty(),
         "unknown-key udp_logging must be omitted, not silently defaulted to plaintext"
     );
 
@@ -712,13 +712,13 @@ async fn test_udp_logging_optional_fail_open_omits_unknown_key_instance() {
         ..GatewayConfig::default()
     };
     let cache = PluginCache::new(&valid_gateway).expect("valid dtls config constructs");
-    assert_eq!(cache.get_plugins("p1").len(), 1);
+    assert_eq!(cache.get_plugins("ferrum", "p1").len(), 1);
 
     cache
         .rebuild(&bad_gateway)
         .expect("OptionalFailOpen reload omits bad udp rather than rejecting the generation");
     assert!(
-        cache.get_plugins("p1").is_empty(),
+        cache.get_plugins("ferrum", "p1").is_empty(),
         "reload with unknown keys must drop the previously published udp instance"
     );
 }
@@ -862,6 +862,32 @@ async fn test_udp_logging_dtls_accepts_valid_ecdsa_material_and_caches() {
         }),
     )
     .expect("validate_config must accept the same material without spawning issues");
+}
+
+#[tokio::test]
+async fn test_udp_logging_dtls_accepts_leaf_first_certificate_bundle() {
+    ensure_crypto_provider();
+    let (leaf, key) = mint_ecdsa_p256_pair();
+    let (additional, _additional_key) = mint_ecdsa_p256_pair();
+    let bundle = write_temp_pem(&format!(
+        "{}{}",
+        std::fs::read_to_string(leaf.path()).expect("read leaf"),
+        std::fs::read_to_string(additional.path()).expect("read additional certificate")
+    ));
+
+    let plugin = UdpLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 9514,
+            "dtls": true,
+            "dtls_cert_path": bundle.path().to_str().unwrap(),
+            "dtls_key_path": key.path().to_str().unwrap(),
+            "dtls_no_verify": true
+        }),
+        test_client(),
+    )
+    .expect("UDP logging must materialize the shared leaf-first DTLS loader");
+    assert_eq!(plugin.name(), "udp_logging");
 }
 
 #[tokio::test]
@@ -1371,7 +1397,7 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
         .expect("build server config");
     let frontend = ferrum_edge::dtls::FrontendDtlsConfig {
         dimpl_config: Arc::new(server_config),
-        certificate: server_cert,
+        certificate: server_cert.into(),
         client_cert_verifier: None,
     };
     let server = Arc::new(
@@ -1395,7 +1421,7 @@ async fn test_dtls_connection_send_rejects_oversized_plaintext() {
     let client_cert = dimpl::certificate::generate_self_signed_certificate().expect("client cert");
     let params = ferrum_edge::dtls::BackendDtlsParams {
         config: Arc::new(dimpl::Config::default()),
-        certificate: client_cert,
+        certificate: client_cert.into(),
         server_name: None,
         server_cert_verifier: None,
         connect_timeout_ms: 10_000,

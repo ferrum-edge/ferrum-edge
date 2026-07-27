@@ -78,6 +78,8 @@ const SPOOL_OWNER_DIGEST_DOMAIN: &[u8] = b"ferrum-edge/api_chargeback_sink/spool
 const SPOOL_OWNER_DIGEST_LEN: usize = 32;
 /// Hex characters of the ownership digest embedded in every managed filename.
 const SPOOL_OWNER_TAG_LEN: usize = 32;
+/// Owner-tag length written by the original version-1 spool format.
+const SPOOL_LEGACY_OWNER_TAG_LEN: usize = 16;
 const SPOOL_INFLIGHT_SUFFIX: &str = ".inflight";
 const SPOOL_CLAIM_MARKER: &str = ".claim-";
 const SPOOL_WRITE_MARKER: &str = ".write-";
@@ -4214,7 +4216,16 @@ fn build_clickhouse_http_client(
         return Ok(ClickHouseHttpClient::Shared(Box::new(shared.clone())));
     }
 
+    // Ignore ambient `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
+    // process state (matches the shared PluginHttpClient builders). reqwest
+    // enables system-proxy discovery by default. With a proxy selected, the
+    // connector dials and screens the *proxy* while the proxy resolves and
+    // connects to the configured ClickHouse host, so the ultimate destination
+    // address never passes the `DnsCacheResolver` egress screen installed
+    // below. Inherited proxy environment must not be able to override the
+    // gateway's documented outbound address boundary.
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(Duration::from_millis(cfg.timeout_ms))
         .timeout(Duration::from_millis(cfg.timeout_ms))
         // Do not follow redirects: a 3xx from an allowed ClickHouse host could
@@ -4386,13 +4397,18 @@ impl SpoolOwner {
     fn matches_meta(&self, meta: &SpoolNamespaceMeta) -> bool {
         meta.version == SPOOL_FORMAT_VERSION
             && meta.owner_digest == self.digest.as_ref()
-            && meta.owner_tag == self.tag.as_ref()
+            && self.matches_tag(&meta.owner_tag)
             && meta.plugin_config_id == self.plugin_config_id.as_ref()
             && meta.ferrum_namespace == self.ferrum_namespace.as_ref()
             && meta.destination_endpoint == self.destination_endpoint.as_ref()
             && meta.database == self.database.as_ref()
             && meta.table == self.table.as_ref()
             && meta.node_id == self.node_id.as_ref()
+    }
+
+    fn matches_tag(&self, tag: &str) -> bool {
+        tag == self.tag.as_ref()
+            || (tag.len() == SPOOL_LEGACY_OWNER_TAG_LEN && self.tag.starts_with(tag))
     }
 }
 
@@ -5607,7 +5623,7 @@ impl SpoolManager {
             // Untagged retained artifacts (legacy temps, dead-letter metadata for
             // pre-tag files) belong to this namespace and stay evictable.
             None => true,
-            Some(tag) => tag == self.owner.tag.as_ref(),
+            Some(tag) => self.owner.matches_tag(tag),
         }
     }
 
@@ -5799,10 +5815,9 @@ impl SpoolManager {
         self.validate_namespace_meta()?;
         let mut candidates = Vec::new();
         self.collect(&mut candidates, SpoolFileClass::Replayable)?;
-        let mine = self.owner.tag.as_ref();
         let mut files = Vec::new();
         for path in candidates {
-            if spool_file_owner_tag(&path).is_some_and(|tag| tag == mine) {
+            if spool_file_owner_tag(&path).is_some_and(|tag| self.owner.matches_tag(tag)) {
                 files.push(path);
             }
         }
@@ -5823,10 +5838,9 @@ impl SpoolManager {
         if self.collect(&mut candidates, class).is_err() {
             return 0;
         }
-        let mine = self.owner.tag.as_ref();
         let mut foreign = 0u64;
         for path in &candidates {
-            if !spool_file_owner_tag(path).is_some_and(|tag| tag == mine) {
+            if !spool_file_owner_tag(path).is_some_and(|tag| self.owner.matches_tag(tag)) {
                 foreign = foreign.saturating_add(1);
             }
         }
@@ -5854,7 +5868,7 @@ impl SpoolManager {
             ));
         }
         match spool_file_owner_tag(path) {
-            Some(tag) if tag == self.owner.tag.as_ref() => {}
+            Some(tag) if self.owner.matches_tag(tag) => {}
             _ => {
                 return Err(format!(
                     "{PLUGIN_NAME}: refusing to claim spool file '{}' owned by another identity",
@@ -6197,7 +6211,9 @@ fn spool_owner_tag_of_name(name: &str) -> Option<&str> {
         .strip_suffix(".ndjson.zst")
         .or_else(|| rest.strip_suffix(".ndjson"))?;
     let (_, tag) = stem.rsplit_once('.')?;
-    if tag.len() == SPOOL_OWNER_TAG_LEN && tag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if matches!(tag.len(), SPOOL_LEGACY_OWNER_TAG_LEN | SPOOL_OWNER_TAG_LEN)
+        && tag.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         Some(tag)
     } else {
         None

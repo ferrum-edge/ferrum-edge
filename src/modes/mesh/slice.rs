@@ -201,6 +201,22 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "is_false")]
     pub labels_ambiguous: bool,
     pub version: String,
+    /// Authoritative, CP-replica-shared config revision this slice was built
+    /// from (issue #2473).
+    ///
+    /// `version` is the CP's local `GatewayConfig.loaded_at` rendering and is
+    /// observability-only: it is a wall clock, so it is not comparable across
+    /// CP replicas, clock skew, or restarts. `revision` is the ordering field —
+    /// see [`crate::modes::mesh::revision`] for the comparison contract the DP
+    /// freshness gate enforces before any `ArcSwap` replacement.
+    ///
+    /// `None` when the CP's config authority has no shared monotonic sequence
+    /// (K8s CRD controller, file source). Deliberately EXCLUDED from
+    /// [`MeshSlice::content_eq`]: like `version`, it is ordering metadata, not
+    /// content, and CP-side dedupe must keep suppressing frames whose resources
+    /// did not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workloads: Vec<Workload>,
     /// Workloads eligible to bind trusted Ambient UDP `source.pod_uid`
@@ -727,6 +743,11 @@ impl MeshSlice {
 
     pub fn from_gateway_config(config: &GatewayConfig, request: MeshSliceRequest) -> Self {
         let version = config.loaded_at.to_rfc3339();
+        // Ordering metadata rides the snapshot, not the projection: every
+        // per-workload slice built from one `GatewayConfig` carries the same
+        // authoritative revision, so a DP comparing two CPs' slices compares
+        // their config generations rather than their wall clocks.
+        let revision = config.mesh_revision.clone();
         let Some(mesh) = config.mesh.as_ref() else {
             return Self {
                 node_id: request.node_id,
@@ -735,6 +756,7 @@ impl MeshSlice {
                 waypoint_name: request.waypoint_name,
                 labels: request.labels,
                 version,
+                revision,
                 ..Self::default()
             };
         };
@@ -1263,6 +1285,7 @@ impl MeshSlice {
             labels: effective_labels,
             labels_ambiguous,
             version,
+            revision,
             workloads,
             ambient_udp_source_workloads,
             node_waypoint_assertors,
@@ -3276,6 +3299,7 @@ mod tests {
             labels: BTreeMap::from([("app".into(), "web".into())]),
             labels_ambiguous: false,
             version: "v1".into(),
+            revision: None,
             workloads: vec![make_workload("ns", "web", HashMap::new())],
             ambient_udp_source_workloads: Vec::new(),
             node_waypoint_assertors: Vec::new(),

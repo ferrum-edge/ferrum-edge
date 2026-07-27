@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use dimpl::{Config, Dtls, DtlsCertificate, Output};
+use dimpl::{Config, Dtls, DtlsCertificateChain, DtlsPrivateKey, Output};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, trace, warn};
@@ -113,7 +113,7 @@ async fn fail_pending_app_sends(driver_app_rx: &mut mpsc::Receiver<PendingAppSen
 /// Frontend DTLS server configuration (client → gateway).
 pub struct FrontendDtlsConfig {
     pub dimpl_config: Arc<Config>,
-    pub certificate: DtlsCertificate,
+    pub certificate: DtlsCertificateChain,
     pub client_cert_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
 }
 
@@ -232,7 +232,7 @@ pub fn build_backend_dtls_config(
 #[derive(Clone)]
 pub struct BackendDtlsParams {
     pub config: Arc<Config>,
-    pub certificate: DtlsCertificate,
+    pub certificate: DtlsCertificateChain,
     pub server_name: Option<rustls::pki_types::ServerName<'static>>,
     pub server_cert_verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
     /// End-to-end deadline for the DTLS handshake, in milliseconds.
@@ -690,7 +690,7 @@ impl DtlsConnection {
                                     return;
                                 }
                             }
-                            Output::Connected | Output::PeerCert(_) => {
+                            Output::Connected | Output::PeerCert(_) | Output::PeerCertChain(_) => {
                                 // Already handled during handshake
                             }
                             _ => {
@@ -809,7 +809,7 @@ impl Drop for DtlsConnection {
 /// were spawned with until they end.
 struct DtlsServerActiveConfig {
     dimpl_config: Arc<Config>,
-    certificate: DtlsCertificate,
+    certificate: DtlsCertificateChain,
     client_cert_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
 }
 
@@ -917,10 +917,8 @@ pub struct DtlsServerConn {
     /// DER-encoded client leaf certificate from the DTLS handshake.
     /// Populated when the client presents a certificate during mutual DTLS authentication.
     pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
-    /// Always `None` for the current dimpl-backed DTLS path: dimpl 0.6.1
-    /// exposes only the peer leaf through `Output::PeerCert`, not the
-    /// intermediate chain. The field remains for stream-plugin context parity
-    /// with TCP/TLS frontends.
+    /// DER-encoded client intermediate chain in presented order, excluding
+    /// the leaf stored in `tls_client_cert_der`.
     pub tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
     /// SNI hostname extracted from the initial DTLS ClientHello, if supplied.
     pub sni_hostname: Option<String>,
@@ -1318,9 +1316,8 @@ impl DtlsServer {
             let mut out_buf = vec![0u8; dtls_buf_config().output_buf_size];
             let mut next_timeout: Option<Instant> = None;
             let mut connected = false;
-            // dimpl 0.6.1 emits only the peer leaf via Output::PeerCert, not
-            // the rest of the client certificate chain.
             let mut peer_cert_der: Option<Arc<Vec<u8>>> = None;
+            let mut peer_cert_chain_der: Option<Arc<Vec<Vec<u8>>>> = None;
             // Whether a client certificate was actually presented AND verified
             // against the configured client CA during the handshake. dimpl's
             // `require_client_certificate(true)` only makes the server SEND a
@@ -1484,7 +1481,7 @@ impl DtlsServer {
                                 app_rx: tokio::sync::Mutex::new(rx),
                                 shutdown_tx: shutdown_tx.clone(),
                                 tls_client_cert_der: peer_cert_der.clone(),
-                                tls_client_cert_chain_der: None,
+                                tls_client_cert_chain_der: peer_cert_chain_der.clone(),
                                 sni_hostname: sni_hostname.clone(),
                             };
                             if accept_tx.send((conn, peer_addr)).await.is_err() {
@@ -1492,8 +1489,13 @@ impl DtlsServer {
                             }
                         }
                         Output::PeerCert(der) => {
+                            // Preserve leaf-only fingerprint semantics for
+                            // existing plugin consumers.
+                            peer_cert_der = Some(Arc::new(der.to_vec()));
+                        }
+                        Output::PeerCertChain(chain) => {
                             if let Some(verifier) = client_cert_verifier.as_deref() {
-                                if let Err(e) = validate_client_cert(der, verifier) {
+                                if let Err(e) = validate_client_cert(&chain, verifier) {
                                     warn!(client = %peer_addr, "Client cert validation failed: {}", e);
                                     return;
                                 }
@@ -1501,9 +1503,8 @@ impl DtlsServer {
                                 // against the configured client CA.
                                 verified_peer_cert = true;
                             }
-                            // Store the leaf certificate DER for plugin access
-                            // after Connected.
-                            peer_cert_der = Some(Arc::new(der.to_vec()));
+                            peer_cert_chain_der =
+                                (chain.len() > 1).then(|| Arc::new(chain[1..].to_vec()));
                         }
                         Output::ApplicationData(data)
                             if app_out_tx.send(data.to_vec()).await.is_err() =>
@@ -1575,14 +1576,110 @@ impl DtlsServer {
 // Certificate Loading
 // ============================================================================
 
-/// Load a DTLS certificate from PEM files and convert to DER for dimpl.
+/// Encoding discriminant for reconstructing a borrowed rustls private-key view
+/// from Ferrum-owned DER bytes without [`PrivateKeyDer::clone_key`].
+#[derive(Clone, Copy)]
+enum DtlsKeyDerEncoding {
+    Pkcs1,
+    Sec1,
+    Pkcs8,
+}
+
+type DtlsKeyDropHook = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Ferrum-owned DTLS private-key DER that is cleared before its allocation is
+/// released.
 ///
-/// Supports ECDSA P-256 and P-384 private keys. Ed25519 is NOT supported
-/// by dimpl for DTLS signatures (unlike the previous webrtc-dtls library).
+/// `rustls_pki_types::PrivateKeyDer` implements [`zeroize::Zeroize`] but not
+/// `Drop`/`ZeroizeOnDrop`. Adopting the PEM-parsed owner into this guard copies
+/// the secret into Ferrum-managed storage and immediately zeroizes the rustls
+/// owner, then reconstructs only borrowed rustls views for ring parsing and
+/// leaf/key matching.
+struct ZeroizingDtlsKeyDer {
+    bytes: Vec<u8>,
+    encoding: DtlsKeyDerEncoding,
+    drop_hook: Option<DtlsKeyDropHook>,
+}
+
+impl ZeroizingDtlsKeyDer {
+    fn adopt(
+        mut key: rustls::pki_types::PrivateKeyDer<'static>,
+        drop_hook: Option<DtlsKeyDropHook>,
+    ) -> anyhow::Result<Self> {
+        use zeroize::Zeroize;
+
+        let encoding = match &key {
+            rustls::pki_types::PrivateKeyDer::Pkcs1(_) => Some(DtlsKeyDerEncoding::Pkcs1),
+            rustls::pki_types::PrivateKeyDer::Sec1(_) => Some(DtlsKeyDerEncoding::Sec1),
+            rustls::pki_types::PrivateKeyDer::Pkcs8(_) => Some(DtlsKeyDerEncoding::Pkcs8),
+            _ => None,
+        };
+        let Some(encoding) = encoding else {
+            key.zeroize();
+            return Err(anyhow::anyhow!("Unsupported DTLS private key DER encoding"));
+        };
+        let bytes = key.secret_der().to_vec();
+        // rustls-pki-types does not clear on Drop; wipe the PEM-parsed owner now
+        // that Ferrum owns the only live DER copy used by the loader.
+        key.zeroize();
+        Ok(Self {
+            bytes,
+            encoding,
+            drop_hook,
+        })
+    }
+
+    fn private_key_der(&self) -> rustls::pki_types::PrivateKeyDer<'_> {
+        match self.encoding {
+            DtlsKeyDerEncoding::Pkcs1 => rustls::pki_types::PrivateKeyDer::Pkcs1(
+                rustls::pki_types::PrivatePkcs1KeyDer::from(self.bytes.as_slice()),
+            ),
+            DtlsKeyDerEncoding::Sec1 => rustls::pki_types::PrivateKeyDer::Sec1(
+                rustls::pki_types::PrivateSec1KeyDer::from(self.bytes.as_slice()),
+            ),
+            DtlsKeyDerEncoding::Pkcs8 => rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(self.bytes.as_slice()),
+            ),
+        }
+    }
+
+    fn secret_der(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for ZeroizingDtlsKeyDer {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+
+        // Preserve length until any observer runs so tests can assert every
+        // live key byte was cleared before the allocation is released.
+        self.bytes.as_mut_slice().zeroize();
+        if let Some(hook) = self.drop_hook.as_ref() {
+            hook(&self.bytes);
+        }
+    }
+}
+
+/// Load a leaf-first DTLS certificate chain from PEM and convert it to DER.
+///
+/// Every certificate record is parsed and retained in configured order. The
+/// first certificate must match an ECDSA P-256 or P-384 private key. Ed25519
+/// is not supported by dimpl for DTLS signatures.
 pub fn load_dtls_certificate(
     cert_path: &str,
     key_path: &str,
-) -> Result<DtlsCertificate, anyhow::Error> {
+) -> Result<DtlsCertificateChain, anyhow::Error> {
+    load_dtls_certificate_with_key_drop_hook(cert_path, key_path, None)
+}
+
+/// Test-only seam that observes Ferrum-managed DTLS key DER after zeroization
+/// and before the backing allocation is released.
+pub(crate) fn load_dtls_certificate_with_key_drop_hook(
+    cert_path: &str,
+    key_path: &str,
+    drop_hook: Option<DtlsKeyDropHook>,
+) -> Result<DtlsCertificateChain, anyhow::Error> {
     let cert_source = CertSource::parse(cert_path, MaterialKind::Cert);
     let key_source = CertSource::parse(key_path, MaterialKind::Key);
     let cert_material = load_material_blocking(&cert_source, MaterialKind::Cert).map_err(|e| {
@@ -1600,49 +1697,57 @@ pub fn load_dtls_certificate(
         )
     })?;
 
-    // dimpl can present exactly one certificate. Reject a declared chain
-    // instead of validating every record and then publishing only the leaf.
-    let cert_chain = crate::tls::parse_pem_certificate_bundle(
+    // Parse every declared certificate and exactly one key through the shared
+    // bounded, fail-closed PEM admission path. The patched dimpl stack presents
+    // the complete leaf-first chain, so a valid multi-certificate identity is
+    // retained rather than rejected or silently truncated.
+    let certificate_chain = crate::tls::parse_pem_certificate_bundle(
         cert_material.bytes.expose_secret(),
         "DTLS certificate",
         &cert_material.display_source_id,
     )?;
-    if cert_chain.len() != 1 {
-        return Err(anyhow::anyhow!(
-            "DTLS certificate source '{}' must contain exactly one CERTIFICATE record because the DTLS stack cannot present a chain",
-            cert_material.display_source_id
-        ));
-    }
-    let cert_der = cert_chain.into_iter().next().ok_or_else(|| {
-        anyhow::anyhow!(
-            "DTLS certificate: no certificate found in {}",
-            cert_material.display_source_id
-        )
-    })?;
-
-    let key_der = crate::tls::parse_pem_private_key(
+    let parsed_key = crate::tls::parse_pem_private_key(
         key_material.bytes.expose_secret(),
         "DTLS private key",
         &key_material.display_source_id,
     )?;
+    // Adopt immediately so every subsequent success/error return clears the
+    // Ferrum-managed DER owner without relying on manual zeroize call sites.
+    let key_der = ZeroizingDtlsKeyDer::adopt(parsed_key, drop_hook)?;
 
-    rustls::sign::CertifiedKey::from_der(
-        vec![cert_der.clone()],
-        key_der.clone_key(),
-        &rustls::crypto::ring::default_provider(),
-    )
-    .map_err(|error| {
-        anyhow::anyhow!(
-            "DTLS certificate {} and private key {} do not form a valid pair: {error}",
-            cert_material.display_source_id,
-            key_material.display_source_id
-        )
-    })?;
+    // Ferrum pins rustls's ring provider. Parse from a borrow — do not
+    // `clone_key()` into `CertifiedKey::from_der`, which would create another
+    // owned DER allocation that ring drops without clearing.
+    let borrowed_key = key_der.private_key_der();
+    let signing_key =
+        rustls::crypto::ring::sign::any_supported_type(&borrowed_key).map_err(|error| {
+            anyhow::anyhow!(
+                "DTLS certificate {} and private key {} do not form a valid pair: {error}",
+                cert_material.display_source_id,
+                key_material.display_source_id
+            )
+        })?;
+    let certified_key = rustls::sign::CertifiedKey::new(certificate_chain.clone(), signing_key);
+    match certified_key.keys_match() {
+        // Preserve rustls `CertifiedKey::from_der` semantics: Unknown is not fatal.
+        Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "DTLS certificate {} and private key {} do not form a valid pair: {error}",
+                cert_material.display_source_id,
+                key_material.display_source_id
+            ));
+        }
+    }
+
+    // Copy into dimpl's zeroizing owner, then drop the Ferrum DER guard so the
+    // rustls-shaped copy lives only long enough for parsing/validation.
+    let private_key = DtlsPrivateKey::from(key_der.secret_der().to_vec());
+    drop(key_der);
 
     // dimpl only supports ECDSA P-256 / P-384. Reject unsupported algorithms at
     // materialization time so admission/config load surfaces the defect instead
     // of panicking inside the DTLS handshake on first use.
-    let private_key = key_der.secret_der().to_vec();
     Config::default()
         .crypto_provider()
         .key_provider
@@ -1654,15 +1759,14 @@ pub fn load_dtls_certificate(
             )
         })?;
 
-    // SAFETY: dimpl::DtlsCertificate stores `private_key` as plain Vec<u8>
-    // without zeroize-on-drop. Unlike the kTLS path (which uses
-    // Zeroizing<Vec<u8>>), we cannot wrap the key here because dimpl owns
-    // the Vec. The key material persists in freed heap until reallocation.
-    // Upstream contribution needed to add Zeroize to dimpl::DtlsCertificate.
-    Ok(DtlsCertificate {
-        certificate: cert_der.to_vec(),
+    DtlsCertificateChain::new(
+        certificate_chain
+            .into_iter()
+            .map(|certificate| certificate.to_vec())
+            .collect(),
         private_key,
-    })
+    )
+    .map_err(|error| anyhow::anyhow!("Invalid DTLS certificate chain: {error}"))
 }
 
 /// Load a rustls root store from a PEM file.
@@ -1699,20 +1803,21 @@ fn load_backend_root_store(
 
 /// Generate an ephemeral self-signed certificate for DTLS clients that don't
 /// need client authentication (the common case for backend connections).
-fn generate_ephemeral_cert() -> Result<DtlsCertificate, anyhow::Error> {
+fn generate_ephemeral_cert() -> Result<DtlsCertificateChain, anyhow::Error> {
     dimpl::certificate::generate_self_signed_certificate()
+        .map(DtlsCertificateChain::from)
         .map_err(|e| anyhow::anyhow!("Failed to generate ephemeral DTLS cert: {}", e))
 }
 
 /// Generate a self-signed DTLS certificate for testing.
 #[allow(dead_code)]
-pub fn generate_self_signed_cert() -> Result<DtlsCertificate, anyhow::Error> {
+pub fn generate_self_signed_cert() -> Result<DtlsCertificateChain, anyhow::Error> {
     generate_ephemeral_cert()
 }
 
 /// Generate an ephemeral self-signed certificate for DTLS clients that don't
 /// need client authentication.
-pub fn generate_ephemeral_cert_public() -> Result<DtlsCertificate, anyhow::Error> {
+pub fn generate_ephemeral_cert_public() -> Result<DtlsCertificateChain, anyhow::Error> {
     generate_ephemeral_cert()
 }
 
@@ -1720,21 +1825,24 @@ pub fn generate_ephemeral_cert_public() -> Result<DtlsCertificate, anyhow::Error
 // Certificate Validation
 // ============================================================================
 
-/// Validate a backend server's DER-encoded leaf certificate.
-///
-/// `dimpl` surfaces only the peer leaf certificate, not the peer's full
-/// certificate chain. Verification therefore runs fail-closed against the leaf,
-/// the configured trust anchors, and the expected server name.
+/// Validate a backend server's leaf-first DER certificate chain.
 fn validate_server_cert(
-    peer_der: &[u8],
+    peer_chain: &[Vec<u8>],
     server_name: &rustls::pki_types::ServerName<'static>,
     verifier: &dyn rustls::client::danger::ServerCertVerifier,
 ) -> Result<(), anyhow::Error> {
-    let cert = rustls::pki_types::CertificateDer::from(peer_der.to_vec());
+    let (leaf, intermediates) = peer_chain
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("DTLS server sent an empty certificate chain"))?;
+    let cert = rustls::pki_types::CertificateDer::from(leaf.as_slice());
+    let intermediates: Vec<_> = intermediates
+        .iter()
+        .map(|certificate| rustls::pki_types::CertificateDer::from(certificate.as_slice()))
+        .collect();
     verifier
         .verify_server_cert(
             &cert,
-            &[],
+            &intermediates,
             server_name,
             &[],
             rustls::pki_types::UnixTime::now(),
@@ -1745,12 +1853,19 @@ fn validate_server_cert(
 
 /// Validate a frontend client certificate when DTLS mTLS is enabled.
 fn validate_client_cert(
-    peer_der: &[u8],
+    peer_chain: &[Vec<u8>],
     verifier: &dyn rustls::server::danger::ClientCertVerifier,
 ) -> Result<(), anyhow::Error> {
-    let cert = rustls::pki_types::CertificateDer::from(peer_der.to_vec());
+    let (leaf, intermediates) = peer_chain
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("DTLS client sent an empty certificate chain"))?;
+    let cert = rustls::pki_types::CertificateDer::from(leaf.as_slice());
+    let intermediates: Vec<_> = intermediates
+        .iter()
+        .map(|certificate| rustls::pki_types::CertificateDer::from(certificate.as_slice()))
+        .collect();
     verifier
-        .verify_client_cert(&cert, &[], rustls::pki_types::UnixTime::now())
+        .verify_client_cert(&cert, &intermediates, rustls::pki_types::UnixTime::now())
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("DTLS client certificate verification failed: {}", e))
 }
@@ -1810,9 +1925,10 @@ async fn drain_handshake_outputs(
             Output::Connected => {
                 connected = true;
             }
-            Output::PeerCert(der) => {
+            Output::PeerCert(_) => {}
+            Output::PeerCertChain(chain) => {
                 if let (Some(server_name), Some(verifier)) = (server_name, server_cert_verifier) {
-                    validate_server_cert(der, server_name, verifier)?;
+                    validate_server_cert(&chain, server_name, verifier)?;
                     *verified_server_cert = true;
                 }
             }
@@ -1858,7 +1974,7 @@ async fn drain_server_outputs(
             Output::Connected => {
                 connected = true;
             }
-            Output::PeerCert(_) | Output::ApplicationData(_) => {}
+            Output::PeerCert(_) | Output::PeerCertChain(_) | Output::ApplicationData(_) => {}
             _ => {
                 // KeyingMaterial or future variants — continue draining
             }
@@ -1880,7 +1996,7 @@ mod tests {
             socket,
             FrontendDtlsConfig {
                 dimpl_config: Arc::new(config),
-                certificate,
+                certificate: certificate.into(),
                 client_cert_verifier: None,
             },
             limits,
@@ -2101,7 +2217,7 @@ mod tests {
             dimpl::certificate::generate_self_signed_certificate().expect("generate client cert");
         let params = BackendDtlsParams {
             config: Arc::new(Config::default()),
-            certificate,
+            certificate: certificate.into(),
             server_name: None,
             server_cert_verifier: None,
             connect_timeout_ms: 500,
@@ -2144,8 +2260,9 @@ mod tests {
         // swap actually replaced it (not just mutated in place).
         let before = Arc::as_ptr(&server.active_config.load_full());
 
-        let new_certificate =
-            dimpl::certificate::generate_self_signed_certificate().expect("generate cert");
+        let new_certificate = DtlsCertificateChain::from(
+            dimpl::certificate::generate_self_signed_certificate().expect("generate cert"),
+        );
         let new_config = Config::builder().build().expect("build DTLS config");
         server.swap_frontend_config(FrontendDtlsConfig {
             dimpl_config: Arc::new(new_config),

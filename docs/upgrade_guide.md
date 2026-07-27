@@ -142,6 +142,114 @@ restart validation. For file mode, edit the YAML/JSON copy and run the staged
 validation step again. Do not bypass the check by adding placeholder HTTP/UDP
 targets; disable or remove a policy that has no TCP listener to protect.
 
+### `kafka_logging` Fails Closed Under a Restrictive Egress Policy
+
+`kafka_logging` is now refused at config admission whenever the backend egress
+policy is able to deny any address — which includes the **default** posture
+(`FERRUM_BACKEND_ALLOW_IPS=both` plus the dangerous-range baseline). librdkafka
+resolves bootstrap hostnames itself and dials brokers advertised by cluster
+metadata, and the pinned `rdkafka 0.39` exposes no connect/resolve callback, so
+Ferrum cannot screen the addresses it actually connects to. The gateway refuses
+the configuration rather than leaving an unenforced egress path.
+
+Symptoms on upgrade: file mode fails startup; database/CP admin writes return
+400; a data plane refuses the update and keeps its last accepted generation
+(`kafka_logging` is `KeepLastKnownGood`).
+
+Before cutover, inventory every enabled `kafka_logging` plugin row and choose
+one of:
+
+- **Recommended.** Move log shipping to a sink that dials through Ferrum's
+  policy-aware path (`http_logging`, `tcp_logging`, `ws_logging`,
+  `loki_logging`) and bridge to Kafka outside the gateway.
+- Remove or disable the `kafka_logging` rows.
+- Accept an unrestricted backend egress policy for the whole gateway
+  (`FERRUM_BACKEND_ALLOW_IPS=both`, no `FERRUM_BACKEND_DENY_CIDRS`,
+  `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false`). This weakens every other
+  outbound path — proxy backends, service discovery, and all other plugin
+  endpoints — and the gateway logs an unrestricted-egress warning at startup.
+
+Separately, `broker_list` is now parsed with librdkafka's exact
+`[proto://]host[:port]` grammar. Two shapes that were previously accepted are
+now rejected even under a fully-open policy: an unsupported or malformed
+protocol prefix, and a protocol prefix that disagrees with `security_protocol`
+(librdkafka would have discarded that entry and stopped parsing the rest of the
+list, silently shrinking the broker set).
+
+### Ambient Proxy Environment Is Ignored by Plugin Clients
+
+Plugin outbound HTTP no longer honours `HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`, or `NO_PROXY` inherited from the process environment. Deployments
+that relied on an ambient proxy to reach a log sink, AI provider, JWKS/OIDC
+endpoint, webhook, or ClickHouse chargeback sink must point the plugin's
+configured endpoint directly at the reachable destination instead.
+
+### Body Validator Enforcement Hardening
+
+`body_validator` now enforces the policy it advertises, which makes several
+previously-accepted configurations fail closed. Because the plugin is
+fail-closed, a rejected configuration keeps the last known-good generation:
+database and control-plane publication rejects the row, a DP keeps its last
+accepted snapshot, and file-mode startup or reload rejects the file. Audit every
+`body_validator` config in the cloned database or staging config before cutover.
+
+Configuration is now rejected when:
+
+- an unknown top-level key is present (previously ignored), or a
+  `protobuf_method_messages` entry contains any key other than `request` /
+  `response`. Typos such as `response_json_scheam` or `respones` used to be
+  silently dropped while the remaining valid rule kept admission succeeding.
+- `json_schema` / `response_json_schema` is not a valid JSON Schema under the
+  configured draft. Schemas are now compiled with the `jsonschema` crate at
+  plugin construction instead of being interpreted by a partial evaluator, so
+  malformed keyword shapes, invalid type names (`"type": "objcet"`), and invalid
+  `pattern` regexes are configuration errors rather than no-ops.
+- an actual schema position uses a non-local `$ref`/`$dynamicRef` (anything not
+  starting with `#`), a non-fragment `$id` / `id`, a `$vocabulary` declaration,
+  or a `$schema` naming a draft other than the configured one. Property and
+  definition names with those spellings, and literal objects under `enum`,
+  `const`, `default`, or `examples`, are not schema keywords unless a supported
+  local URI-fragment JSON Pointer actually targets that object. Pointer targets
+  are audited with percent-decoding and JSON Pointer escaping before compile,
+  including targets under otherwise literal/unknown containers. No external
+  reference is ever fetched: the dependency is built without HTTP or file
+  retrievers.
+- the complete supplied schema value nests deeper than 32 levels or contains
+  more than 20000 JSON nodes. Literal and annotation data counts toward both
+  budgets.
+- `json_schema_draft` (new, default `draft2020-12`, also accepts `draft7`) has
+  any other value. Draft-4 spellings such as a boolean `exclusiveMinimum` are
+  rejected; convert them to the numeric draft-7/2020-12 form.
+
+Runtime behavior also tightens:
+
+- Standard keywords the old evaluator ignored are now enforced. `$ref`/`$defs`,
+  array `type` unions, conditionals, and dependent keywords all take effect, so
+  traffic a schema was always meant to reject now actually gets rejected.
+  Draft 7 treats `definitions` as its ordinary definition container; `$defs`
+  remains an unknown/literal value there unless a local pointer explicitly
+  targets it. Draft 2020-12 follows both `$defs` and the validator library's
+  compatible `definitions` map. `$dynamicRef` has reference semantics under
+  Draft 2020-12 and remains an unknown, inert keyword under Draft 7.
+- XML bodies are parsed by a real XML parser instead of a tag-balancing scan.
+  Documents with multiple roots, text outside the root, invalid element or
+  attribute names, unquoted or duplicated attributes, undeclared entity
+  references, invalid characters, or non-XML Unicode whitespace outside the
+  document are now rejected. The original body is parsed without trimming;
+  legal XML space (`SP`, `TAB`, `CR`, `LF`) around the root remains accepted.
+  `required_xml_elements` matches parsed element names: a bare name matches that
+  local name in any namespace, `{uri}local` requires both, and `{}local`
+  requires no namespace. A configured entry that previously relied on a raw
+  `prefix:local` source match must be rewritten as `local` or `{uri}local`.
+- External XML identifiers (`SYSTEM` / `PUBLIC`) on the DOCTYPE external subset
+  or an entity declaration are always rejected. Internal DTD subsets remain
+  supported under the entity count/nesting policy.
+- Decoded gRPC protobuf messages must satisfy proto2 required-field
+  initialization, recursively through present nested, repeated, map, and
+  extension message values. proto3 descriptors are unaffected. Clients that
+  relied on sending an uninitialized proto2 message must be fixed before
+  upgrade.
+
 ### Response Cache Shared-Storage Hardening
 
 `response_caching` now applies RFC 9111 shared-cache rules that earlier

@@ -1226,3 +1226,205 @@ async fn test_kafka_logging_rejects_security_namespaces_on_plaintext_escape_hatc
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Bootstrap-server grammar parity with the pinned librdkafka, and the
+// fail-closed gate for destinations librdkafka dials without Ferrum ever
+// seeing them (GHSA-mp2j-gjfp-2vm8).
+// ---------------------------------------------------------------------------
+
+use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+use ferrum_edge::plugins::kafka_logging::{
+    KAFKA_DEFAULT_PORT, KafkaBootstrapEntry, parse_kafka_bootstrap_servers,
+    screen_kafka_broker_list_egress,
+};
+
+fn entry(host: &str, port: u16) -> KafkaBootstrapEntry {
+    KafkaBootstrapEntry {
+        host: host.to_string(),
+        port,
+    }
+}
+
+fn parse_ok(broker_list: &str) -> Vec<KafkaBootstrapEntry> {
+    parse_kafka_bootstrap_servers(broker_list, None).expect("broker list must parse")
+}
+
+fn default_production_policy() -> BackendEgressPolicy {
+    BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).expect("valid policy")
+}
+
+#[test]
+fn kafka_bootstrap_grammar_matches_librdkafka_host_port_forms() {
+    assert_eq!(parse_ok("broker:9092"), vec![entry("broker", 9092)]);
+    // No port -> librdkafka's RD_KAFKA_PORT default.
+    assert_eq!(
+        parse_ok("broker"),
+        vec![entry("broker", KAFKA_DEFAULT_PORT)]
+    );
+    assert_eq!(parse_ok("10.0.0.5:9093"), vec![entry("10.0.0.5", 9093)]);
+    // Multiple entries, with the separator whitespace librdkafka skips.
+    assert_eq!(
+        parse_ok("a:1, b:2 ,c"),
+        vec![entry("a", 1), entry("b", 2), entry("c", KAFKA_DEFAULT_PORT)]
+    );
+}
+
+#[test]
+fn kafka_bootstrap_grammar_matches_librdkafka_ipv6_forms() {
+    // Bracketed IPv6 with a port: the byte before the last ':' is ']', so the
+    // port is split off and the host keeps its brackets.
+    assert_eq!(parse_ok("[::1]:9092"), vec![entry("[::1]", 9092)]);
+    // Bracketed IPv6 without a port: last ':' is inside the brackets and is not
+    // preceded by ']', so no port is split.
+    assert_eq!(
+        parse_ok("[fd00:ec2::254]"),
+        vec![entry("[fd00:ec2::254]", KAFKA_DEFAULT_PORT)]
+    );
+    // Bare IPv6 without brackets: more than one ':' and no ']' -> whole string
+    // is the host.
+    assert_eq!(parse_ok("::1"), vec![entry("::1", KAFKA_DEFAULT_PORT)]);
+    assert_eq!(parse_ok("[::1]:9092")[0].unbracketed_host(), "::1");
+    assert_eq!(
+        parse_ok("[fd00:ec2::254]")[0].literal_ip(),
+        Some("fd00:ec2::254".parse().unwrap())
+    );
+}
+
+#[test]
+fn kafka_bootstrap_grammar_accepts_protocol_prefixes_and_strips_url_paths() {
+    // This is the parser differential the advisory describes: a
+    // protocol-prefixed literal that a `host:port`-only reading misses.
+    assert_eq!(
+        parse_ok("PLAINTEXT://169.254.169.254:9092"),
+        vec![entry("169.254.169.254", 9092)]
+    );
+    assert_eq!(
+        parse_ok("sasl_ssl://broker.example.com"),
+        vec![entry("broker.example.com", KAFKA_DEFAULT_PORT)]
+    );
+    // "Ignore anything that looks like the path part of an URL".
+    assert_eq!(
+        parse_ok("ssl://10.0.0.5:9093/ignored/path"),
+        vec![entry("10.0.0.5", 9093)]
+    );
+    // Empty host after the scheme becomes localhost.
+    assert_eq!(
+        parse_ok("plaintext://:9092"),
+        vec![entry("localhost", 9092)]
+    );
+}
+
+#[test]
+fn kafka_bootstrap_grammar_rejects_entries_librdkafka_would_refuse() {
+    for broker_list in ["://host:9092", "https://host:9092", "ftp://host"] {
+        let error = parse_kafka_bootstrap_servers(broker_list, None)
+            .expect_err("librdkafka would refuse this entry and stop parsing the list");
+        assert!(
+            error.contains("protocol"),
+            "unexpected error for {broker_list}: {error}"
+        );
+    }
+    // A protocol prefix that disagrees with security.protocol makes librdkafka
+    // drop the entry (and the rest of the list) — reject instead.
+    let error = parse_kafka_bootstrap_servers("ssl://broker:9093", Some("plaintext"))
+        .expect_err("protocol mismatch must be rejected");
+    assert!(
+        error.contains("does not match security_protocol"),
+        "{error}"
+    );
+    assert!(parse_kafka_bootstrap_servers("ssl://broker:9093", Some("ssl")).is_ok());
+    // Case-insensitive, matching librdkafka's uppercase-then-compare.
+    assert!(parse_kafka_bootstrap_servers("SASL_SSL://broker", Some("sasl_ssl")).is_ok());
+}
+
+#[test]
+fn kafka_protocol_prefixed_denied_literal_is_rejected_under_restrictive_policy() {
+    // The screen must see the metadata address through the protocol prefix.
+    let error = screen_kafka_broker_list_egress(
+        &json!({ "broker_list": "PLAINTEXT://169.254.169.254:9092", "topic": "logs" }),
+        &default_production_policy(),
+    )
+    .expect_err("protocol-prefixed denied literal must be rejected");
+    assert!(
+        error.contains("169.254.169.254") && error.contains("denied by backend egress policy"),
+        "{error}"
+    );
+}
+
+#[test]
+fn kafka_bracketed_ipv6_denied_literal_is_rejected() {
+    let error = screen_kafka_broker_list_egress(
+        &json!({ "broker_list": "ssl://[fd00:ec2::254]:9093", "security_protocol": "ssl" }),
+        &default_production_policy(),
+    )
+    .expect_err("denied IPv6 literal must be rejected");
+    assert!(error.contains("denied by backend egress policy"), "{error}");
+}
+
+#[test]
+fn kafka_logging_fails_closed_under_any_restrictive_egress_policy() {
+    // librdkafka resolves bootstrap hostnames itself and dials brokers learned
+    // from cluster metadata; rdkafka 0.39 exposes no connect/resolve callback,
+    // so those addresses cannot be screened. Rather than leave an unenforced
+    // egress path, the plugin is refused.
+    for policy in [
+        default_production_policy(),
+        BackendEgressPolicy::from_env(BackendAllowIps::Public, "", "", false).expect("policy"),
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "10.0.0.0/8", false)
+            .expect("policy"),
+    ] {
+        let error = screen_kafka_broker_list_egress(
+            &json!({ "broker_list": "broker.example.com:9092", "topic": "logs" }),
+            &policy,
+        )
+        .expect_err("kafka_logging must fail closed under a restrictive policy");
+        assert!(
+            error.contains("cannot be admitted"),
+            "unexpected error: {error}"
+        );
+        // The message must not leak credentials or endpoint userinfo.
+        assert!(
+            !error.contains("password") && !error.contains('@'),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn kafka_logging_is_admitted_only_when_the_policy_denies_nothing() {
+    screen_kafka_broker_list_egress(
+        &json!({ "broker_list": "PLAINTEXT://broker.example.com:9092" }),
+        &BackendEgressPolicy::unrestricted(),
+    )
+    .expect("a fully-open policy has no boundary to bypass");
+}
+
+#[tokio::test]
+async fn kafka_logging_registry_admission_fails_closed_under_default_policy() {
+    let error = ferrum_edge::plugins::validate_plugin_config_with_policy(
+        "kafka_logging",
+        &json!({ "broker_list": "broker.example.com:9092", "topic": "logs" }),
+        &default_production_policy(),
+    )
+    .expect_err("registry admission must apply the same gate");
+    assert!(error.contains("cannot be admitted"), "{error}");
+}
+
+#[tokio::test]
+async fn kafka_logging_warmup_hostnames_use_the_librdkafka_grammar() {
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "PLAINTEXT://broker-one:9092,[fd00::1]:9093,10.0.0.5:9094,broker-two",
+            "topic": "logs"
+        }),
+        &default_http_client(),
+    )
+    .expect("build plugin");
+    let mut hostnames = plugin.warmup_hostnames();
+    hostnames.sort();
+    assert_eq!(
+        hostnames,
+        vec!["broker-one".to_string(), "broker-two".to_string()]
+    );
+}

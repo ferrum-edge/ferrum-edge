@@ -599,7 +599,7 @@ fn dtls_client_certificate(
     td: &TempDir,
     name: &str,
     cli: &GeneratedCert,
-) -> dimpl::DtlsCertificate {
+) -> dimpl::DtlsCertificateChain {
     let cert_path = write_pem(td, &format!("{}.crt", name), &cli.cert_pem);
     let key_path = write_pem(td, &format!("{}.key", name), &cli.key_pem);
     ferrum_edge::dtls::load_dtls_certificate(&cert_path, &key_path)
@@ -608,7 +608,7 @@ fn dtls_client_certificate(
 
 async fn dtls_send(
     proxy_port: u16,
-    client_cert: dimpl::DtlsCertificate,
+    client_cert: dimpl::DtlsCertificateChain,
     payload: &[u8],
 ) -> Result<Vec<u8>, String> {
     let socket = UdpSocket::bind("127.0.0.1:0")

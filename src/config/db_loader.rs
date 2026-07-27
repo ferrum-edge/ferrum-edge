@@ -43,7 +43,7 @@ use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -56,11 +56,11 @@ pub use crate::config::batch_atomicity::{
 };
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
-    IncrementalResult, MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict,
-    NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts, NamespacedResourceId,
-    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
-    TcpConnectionThrottleAttachmentConflict, extract_db_hostname, redact_url,
+    ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
+    DbFailoverTopologyState, FullConfigLoadPurpose, IncrementalResult, MtlsDnsAdmissionUnavailable,
+    MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts,
+    NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
+    SortOrder, TcpConnectionThrottleAttachmentConflict, extract_db_hostname, redact_url,
 };
 
 const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
@@ -592,6 +592,35 @@ pub(crate) fn statement_timeout_sql(
     }
 }
 
+/// Topology label passed to SQL reconnect transition test hooks (issue #3001).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlReconnectTopology {
+    Primary,
+    Failover,
+}
+
+/// Async callback installed by external tests around
+/// [`DatabaseStore::reconnect_for_topology`]'s publication/topology critical
+/// section. Production leaves hooks unset.
+pub type SqlReconnectTransitionHook = Arc<
+    dyn Fn(SqlReconnectTopology) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Optional test seams for proving reconnect transition serialization without
+/// sleeps. Both callbacks are no-ops when unset.
+#[derive(Clone, Default)]
+pub struct SqlReconnectTransitionTestHooks {
+    /// Invoked after a successful connect and immediately before awaiting the
+    /// reconnect transition write lock.
+    pub before_lock: Option<SqlReconnectTransitionHook>,
+    /// Invoked while the reconnect transition write lock is held, after pool
+    /// publication (and after failover gate-before-publish), before deferred
+    /// migrations and primary `mark_primary` finalize the transition.
+    pub while_holding: Option<SqlReconnectTransitionHook>,
+}
+
 /// Database configuration store.
 ///
 /// The inner pool is wrapped in `ArcSwap` so it can be atomically replaced
@@ -607,8 +636,19 @@ pub struct DatabaseStore {
     /// Read replicas belong to the configured primary topology. While the
     /// active write/runtime pool points at a failover URL, admin reads must
     /// stay on that same active pool rather than crossing into a replica of
-    /// the unavailable primary topology.
-    primary_topology_active: Arc<AtomicBool>,
+    /// the unavailable primary topology. Also tracks sticky failover topology
+    /// and the process-local opt-in divergence-risk marker (issue #3001).
+    failover_topology: DbFailoverTopologyState,
+    /// Write-locks serialize SQL reconnect publication + topology transitions
+    /// across concurrent callers (DB polling/failover and DB TLS reload),
+    /// including the deferred-migration await window. Admin mutations take a
+    /// shared read lock via [`DatabaseBackend::acquire_write_topology_permit`]
+    /// so a reconnect cannot redirect an in-flight write. Not taken on ordinary
+    /// read/request hot paths.
+    reconnect_transition: Arc<tokio::sync::RwLock<()>>,
+    /// External-test hooks around [`Self::reconnect_transition`]. Empty in
+    /// production; see [`Self::set_reconnect_transition_hooks_for_test`].
+    reconnect_transition_test_hooks: Arc<std::sync::Mutex<Option<SqlReconnectTransitionTestHooks>>>,
     db_type: String,
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
@@ -1737,7 +1777,9 @@ impl DatabaseStore {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
-            primary_topology_active: Arc::new(AtomicBool::new(true)),
+            failover_topology: DbFailoverTopologyState::new(),
+            reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
+            reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
             db_type: db_type.to_string(),
             failover_urls: Vec::new(),
             pool_config,
@@ -1795,7 +1837,9 @@ impl DatabaseStore {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
-            primary_topology_active: Arc::new(AtomicBool::new(true)),
+            failover_topology: DbFailoverTopologyState::new(),
+            reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
+            reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
             db_type: db_type.to_string(),
             failover_urls: failover_urls.to_vec(),
             pool_config,
@@ -4928,6 +4972,15 @@ impl DatabaseStore {
         Ok(max_sequence.max(0) as u64)
     }
 
+    pub async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
+        let row =
+            sqlx::query("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM config_changes")
+                .fetch_one(&self.pool())
+                .await?;
+        let max_sequence: i64 = row.try_get("max_sequence")?;
+        Ok(max_sequence.max(0) as u64)
+    }
+
     /// Load only resources referenced by durable change records after `after_sequence`.
     pub async fn load_incremental_config(
         &self,
@@ -6500,11 +6553,56 @@ impl DatabaseStore {
     /// Atomically replace the connection pool with a freshly connected one.
     ///
     /// Called by the DB polling loop when DnsCache detects that the database
-    /// FQDN now resolves to a different set of IPs. The old pool is closed
-    /// gracefully in the background — in-flight queries complete normally.
+    /// FQDN now resolves to a different set of IPs, and by DB TLS live reload.
+    /// Callers pass the configured primary URL (`FERRUM_DB_URL` effective form).
+    /// On success this records primary topology — never label an active
+    /// failover URL as primary (failover reconnects use
+    /// [`Self::reconnect_for_topology`] with [`DatabaseTopology::Failover`] or
+    /// [`Self::try_failover_reconnect`]). The old pool is closed gracefully in
+    /// the background — in-flight queries complete normally.
     pub async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error> {
         self.reconnect_for_topology(db_url, DatabaseTopology::Primary)
             .await
+    }
+
+    /// Reconnect labeling the URL as sticky failover topology.
+    ///
+    /// Crate-visible so `_test_support` can drive failover publication without
+    /// going through [`Self::try_failover_reconnect`]'s primary-first probe.
+    pub(crate) async fn reconnect_as_failover(&self, db_url: &str) -> Result<(), anyhow::Error> {
+        self.reconnect_for_topology(db_url, DatabaseTopology::Failover)
+            .await
+    }
+
+    /// Install (or clear) async test hooks around the reconnect transition
+    /// write lock. Production leaves this unset.
+    #[allow(dead_code)] // exercised via external unit tests through the lib target
+    pub fn set_reconnect_transition_hooks_for_test(
+        &self,
+        hooks: Option<SqlReconnectTransitionTestHooks>,
+    ) {
+        let mut guard = self
+            .reconnect_transition_test_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = hooks;
+    }
+
+    async fn invoke_reconnect_transition_hook(
+        &self,
+        select: impl Fn(&SqlReconnectTransitionTestHooks) -> Option<&SqlReconnectTransitionHook>,
+        topology: SqlReconnectTopology,
+    ) {
+        let hook = {
+            let guard = self
+                .reconnect_transition_test_hooks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.as_ref().and_then(&select).cloned()
+        };
+        if let Some(hook) = hook {
+            hook(topology).await;
+        }
     }
 
     async fn reconnect_for_topology(
@@ -6514,6 +6612,11 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
+        // Connect outside the transition write lock so concurrent reconnect
+        // attempts can open sockets in parallel; only publication/topology
+        // (including deferred migrations) is serialized. Request hot paths
+        // never take this lock; Admin mutations take a shared read pin via
+        // `acquire_write_topology_permit` instead.
         let new_pool = connect_any_pool_with_timeout(
             self.build_pool_options(),
             db_url,
@@ -6522,12 +6625,26 @@ impl DatabaseStore {
         )
         .await?;
 
+        let topology_kind = match topology {
+            DatabaseTopology::Primary => SqlReconnectTopology::Primary,
+            DatabaseTopology::Failover => SqlReconnectTopology::Failover,
+        };
+        self.invoke_reconnect_transition_hook(|hooks| hooks.before_lock.as_ref(), topology_kind)
+            .await;
+        // Exclusive write lock: waits for in-flight mutation topology pins
+        // (shared reads) and serializes concurrent reconnect publishers.
+        let _transition_guard = self.reconnect_transition.write().await;
+
         // Disable and close the configured primary-topology replica before
         // exposing a failover pool. Keeping the dormant pool would make it
         // look immediately available on failback and skip the one reconnect
         // that refreshes its connections after the topology transition.
+        // Gate-before-publish: flip the write gate before ArcSwap so
+        // `check_write_allowed()` / `admit_write()` cannot observe a failover
+        // pool while `primary_active` is still true.
         if topology == DatabaseTopology::Failover {
-            self.primary_topology_active.store(false, Ordering::Release);
+            self.failover_topology
+                .mark_failover(&Self::redact_url(db_url));
             self.suppress_read_replica_pool();
         }
 
@@ -6544,6 +6661,12 @@ impl DatabaseStore {
             old_pool.close().await;
         });
 
+        // Test seam: hold the transition across the deferred-migration window
+        // so a later failover/primary cannot interleave and then be overwritten
+        // by a delayed mark_primary / mismatched topology finalization.
+        self.invoke_reconnect_transition_hook(|hooks| hooks.while_holding.as_ref(), topology_kind)
+            .await;
+
         // If this store was bootstrapped via `connect_offline_with_pool_config`
         // (backup-file startup with an unreachable DB), migrations never ran.
         // Now that the pool is reconnected to a live DB, run them before
@@ -6553,8 +6676,11 @@ impl DatabaseStore {
         // doesn't silently skip migrations forever.
         self.maybe_apply_deferred_migrations().await?;
 
+        // Primary failback stays fail-closed for writes until publication and
+        // deferred migrations succeed: mark_primary only after the await.
         if topology == DatabaseTopology::Primary {
-            self.primary_topology_active.store(true, Ordering::Release);
+            self.failover_topology
+                .mark_primary(&Self::redact_url(db_url));
         }
 
         Ok(())
@@ -6612,8 +6738,8 @@ impl DatabaseStore {
                             );
                             store.failover_urls = failover_urls.to_vec();
                             store
-                                .primary_topology_active
-                                .store(false, Ordering::Release);
+                                .failover_topology
+                                .mark_failover(&Self::redact_url(url));
                             return Ok(store);
                         }
                         Err(e) => {
@@ -6655,7 +6781,7 @@ impl DatabaseStore {
         sqlx::any::install_default_drivers();
         self.read_replica_url = Some(replica_url.to_string());
 
-        if !self.primary_topology_active.load(Ordering::Acquire) {
+        if !self.failover_topology.primary_active() {
             info!(
                 "Read replica configured but connection deferred while the database is failed over"
             );
@@ -6687,7 +6813,7 @@ impl DatabaseStore {
     /// scans, and association validation must read from the primary pool so
     /// replica lag cannot hide changes or advance cursors incorrectly.
     fn admin_read_pool(&self) -> AdminReadPool {
-        if self.primary_topology_active.load(Ordering::Acquire)
+        if self.failover_topology.primary_active()
             && self.read_replica_url.is_some()
             && let Some(replica) = self.read_replica_pool.load_full()
         {
@@ -6762,7 +6888,7 @@ impl DatabaseStore {
     pub async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        if !self.primary_topology_active.load(Ordering::Acquire) {
+        if !self.failover_topology.primary_active() {
             debug!("Read replica reconnect deferred while the database is failed over");
             return Ok(());
         }
@@ -6784,7 +6910,7 @@ impl DatabaseStore {
         // Failover may have started while the connection was opening. Do not
         // publish a replica pool that admin reads must suppress; closing it
         // leaves the post-failback scheduler responsible for one fresh retry.
-        if !self.primary_topology_active.load(Ordering::Acquire) {
+        if !self.failover_topology.primary_active() {
             new_pool.close().await;
             debug!(
                 "Discarded read replica reconnect because the database failed over while it was opening"
@@ -6797,7 +6923,7 @@ impl DatabaseStore {
         // Close the remaining race between the check above and publication:
         // if failover flipped the topology and ran its first suppression just
         // before this swap, remove the newly-published pool ourselves.
-        if !self.primary_topology_active.load(Ordering::Acquire) {
+        if !self.failover_topology.primary_active() {
             let raced_pool = self.read_replica_pool.swap(None);
             if let Some(pool) = raced_pool {
                 tokio::spawn(async move {
@@ -6833,8 +6959,14 @@ impl DatabaseStore {
     ///
     /// Called by the polling loop when the current connection is failing.
     /// Returns the URL that succeeded, or an error if all failed.
+    ///
+    /// Primary failback is always attempted when the primary answers (issue
+    /// #3001 opt-in contract B). When `FERRUM_DB_FAILOVER_ALLOW_WRITES` was
+    /// enabled during the failover window, [`DbFailoverTopologyState::mark_primary`]
+    /// emits one bounded divergence-risk marker; Ferrum does not fence failback.
+    /// Polling and reads remain available on whichever topology reconnects.
     pub async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
-        // Try primary first
+        // Try primary first.
         match self
             .reconnect_for_topology(primary_url, DatabaseTopology::Primary)
             .await
@@ -6859,10 +6991,7 @@ impl DatabaseStore {
 
         // Try failover URLs in order
         for (i, url) in self.failover_urls.iter().enumerate() {
-            match self
-                .reconnect_for_topology(url, DatabaseTopology::Failover)
-                .await
-            {
+            match self.reconnect_as_failover(url).await {
                 Ok(()) => {
                     info!(
                         "Reconnected to failover database #{} ({})",
@@ -9004,7 +9133,7 @@ impl DatabaseBackend for DatabaseStore {
     }
 
     fn read_replica_available(&self) -> bool {
-        self.primary_topology_active.load(Ordering::Acquire)
+        self.failover_topology.primary_active()
             && self
                 .read_replica_pool
                 .load_full()
@@ -9015,7 +9144,24 @@ impl DatabaseBackend for DatabaseStore {
         // A configured replica is suppressed (not broken) precisely while the
         // active write/runtime pool points at a failover URL. The scheduler
         // skips reconnects in this state; failback re-enables eligibility.
-        self.read_replica_url.is_some() && !self.primary_topology_active.load(Ordering::Acquire)
+        self.read_replica_url.is_some() && !self.failover_topology.primary_active()
+    }
+
+    fn failover_topology_status(&self) -> crate::config::db_backend::DbFailoverTopologyStatus {
+        self.failover_topology.status()
+    }
+
+    fn set_failover_allow_writes(&mut self, allow: bool) {
+        self.failover_topology.set_allow_writes(allow);
+    }
+
+    async fn acquire_write_topology_permit(
+        &self,
+    ) -> crate::config::db_backend::DbWriteTopologyPermit {
+        // Shared read pin: blocks reconnect write publication for the
+        // mutation's lifetime without serializing concurrent Admin writes.
+        let guard = self.reconnect_transition.clone().read_owned().await;
+        crate::config::db_backend::DbWriteTopologyPermit::pinned(guard)
     }
 
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
@@ -9024,8 +9170,8 @@ impl DatabaseBackend for DatabaseStore {
         let idle = primary.num_idle() as u32;
 
         let replica = self
-            .primary_topology_active
-            .load(Ordering::Acquire)
+            .failover_topology
+            .primary_active()
             .then(|| self.read_replica_pool.load_full())
             .flatten()
             .map(|rp| {
@@ -9097,6 +9243,10 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         DatabaseStore::latest_change_sequence(self, namespace).await
+    }
+
+    async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
+        DatabaseStore::latest_global_change_sequence(self).await
     }
 
     async fn load_incremental_config(

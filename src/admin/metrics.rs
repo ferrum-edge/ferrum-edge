@@ -79,8 +79,14 @@ pub struct AdminMetricsPoolConnections {
 
 /// Circuit breaker entry. Direct-backend proxies omit `target`; upstream
 /// per-target breakers include `target` as `host:port`.
+///
+/// Runtime cache keys are namespace-qualified (`namespace|proxy_id` or
+/// `namespace|proxy_id::host:port`). Authenticated admin output keeps the
+/// original resource id in `proxy_id` and exposes `namespace` separately so
+/// same-id tenants remain distinguishable without opaque composite IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdminMetricsCircuitBreaker {
+    pub namespace: String,
     pub proxy_id: String,
     /// Upstream target `host:port`. Absent for direct-backend (per-proxy) breakers.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,30 +102,43 @@ pub struct AdminMetricsHealthCheck {
     pub unhealthy_targets: Vec<AdminMetricsUnhealthyTarget>,
 }
 
-/// One unhealthy target. Active probes are upstream-scoped (`type=active`, no
-/// `proxy_id`). Passive failure tracking is proxy-scoped (`type=passive` and
-/// requires `proxy_id`).
+/// One unhealthy target. Active probes are upstream-scoped (`type=active`,
+/// `upstream_id` set, no `proxy_id`). Passive failure tracking is proxy-scoped
+/// (`type=passive`, `proxy_id` set, no `upstream_id`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdminMetricsUnhealthyTarget {
+    pub namespace: String,
     /// Present only for passive health entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_id: Option<String>,
+    /// Present only for active health entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_id: Option<String>,
     pub target: String,
     #[serde(rename = "type")]
     pub kind: AdminMetricsHealthKind,
     pub since_epoch_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdminMetricsHealthKind {
     Active,
     Passive,
 }
 
+/// Active connection counts for one upstream, keyed by namespace + upstream id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdminMetricsUpstreamConnections {
+    pub namespace: String,
+    pub upstream_id: String,
+    /// `host:port` → active connection count (only counts > 0).
+    pub targets: BTreeMap<String, i64>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct AdminMetricsLoadBalancers {
-    pub active_connections: BTreeMap<String, BTreeMap<String, i64>>,
+    pub active_connections: Vec<AdminMetricsUpstreamConnections>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -176,14 +195,16 @@ impl AdminMetricsTcpConnectionThrottle {
 }
 
 impl AdminMetricsCircuitBreaker {
-    /// Direct-backend breaker keyed only by `proxy_id` (no upstream target).
+    /// Direct-backend breaker keyed only by `(namespace, proxy_id)` (no upstream target).
     pub fn direct_backend(
+        namespace: impl Into<String>,
         proxy_id: impl Into<String>,
         state: impl Into<String>,
         failure_count: u32,
         success_count: u32,
     ) -> Self {
         Self {
+            namespace: namespace.into(),
             proxy_id: proxy_id.into(),
             target: None,
             state: state.into(),
@@ -192,8 +213,9 @@ impl AdminMetricsCircuitBreaker {
         }
     }
 
-    /// Per-target breaker for an upstream member (`proxy_id::host:port` at runtime).
+    /// Per-target breaker for an upstream member (`namespace|proxy_id::host:port` at runtime).
     pub fn upstream_target(
+        namespace: impl Into<String>,
         proxy_id: impl Into<String>,
         target: impl Into<String>,
         state: impl Into<String>,
@@ -201,6 +223,7 @@ impl AdminMetricsCircuitBreaker {
         success_count: u32,
     ) -> Self {
         Self {
+            namespace: namespace.into(),
             proxy_id: proxy_id.into(),
             target: Some(target.into()),
             state: state.into(),
@@ -209,24 +232,37 @@ impl AdminMetricsCircuitBreaker {
         }
     }
 
+    /// Parse a runtime circuit-breaker cache key into the authenticated admin shape.
+    ///
+    /// Accepts `namespace|proxy_id` or `namespace|proxy_id::host:port`. Malformed
+    /// keys fail closed as `None` (no panic, no opaque composite id leakage).
     pub(crate) fn from_cache_key(
         key: &str,
         state: &str,
         failure_count: u32,
         success_count: u32,
-    ) -> Self {
-        if let Some((proxy_id, target)) = key.split_once("::") {
-            Self::upstream_target(proxy_id, target, state, failure_count, success_count)
-        } else {
-            Self::direct_backend(key, state, failure_count, success_count)
-        }
+    ) -> Option<Self> {
+        let (namespace, id, target) = parse_namespaced_runtime_key(key)?;
+        Some(match target {
+            Some(target) => {
+                Self::upstream_target(namespace, id, target, state, failure_count, success_count)
+            }
+            None => Self::direct_backend(namespace, id, state, failure_count, success_count),
+        })
     }
 }
 
 impl AdminMetricsUnhealthyTarget {
-    pub fn active(target: impl Into<String>, since_epoch_ms: u64) -> Self {
+    pub fn active(
+        namespace: impl Into<String>,
+        upstream_id: impl Into<String>,
+        target: impl Into<String>,
+        since_epoch_ms: u64,
+    ) -> Self {
         Self {
+            namespace: namespace.into(),
             proxy_id: None,
+            upstream_id: Some(upstream_id.into()),
             target: target.into(),
             kind: AdminMetricsHealthKind::Active,
             since_epoch_ms,
@@ -234,16 +270,58 @@ impl AdminMetricsUnhealthyTarget {
     }
 
     pub fn passive(
+        namespace: impl Into<String>,
         proxy_id: impl Into<String>,
         target: impl Into<String>,
         since_epoch_ms: u64,
     ) -> Self {
         Self {
+            namespace: namespace.into(),
             proxy_id: Some(proxy_id.into()),
+            upstream_id: None,
             target: target.into(),
             kind: AdminMetricsHealthKind::Passive,
             since_epoch_ms,
         }
+    }
+
+    /// Parse an active-health runtime key (`namespace|upstream_id::host:port`).
+    pub(crate) fn from_active_cache_key(key: &str, since_epoch_ms: u64) -> Option<Self> {
+        let (namespace, upstream_id, target) = parse_namespaced_runtime_key(key)?;
+        let target = target?;
+        Some(Self::active(namespace, upstream_id, target, since_epoch_ms))
+    }
+
+    /// Parse a passive-health proxy partition key (`namespace|proxy_id`).
+    pub(crate) fn from_passive_cache_key(
+        proxy_key: &str,
+        target: impl Into<String>,
+        since_epoch_ms: u64,
+    ) -> Option<Self> {
+        let (namespace, proxy_id, scoped) = parse_namespaced_runtime_key(proxy_key)?;
+        if scoped.is_some() {
+            return None;
+        }
+        Some(Self::passive(namespace, proxy_id, target, since_epoch_ms))
+    }
+}
+
+/// Parse `namespace|id` or `namespace|id::target` runtime keys.
+///
+/// Returns `None` when the key is missing the `|` delimiter, has an empty
+/// namespace/id, or has an empty target suffix after `::`. Fail-closed: callers
+/// must skip malformed keys rather than inventing identity.
+fn parse_namespaced_runtime_key(key: &str) -> Option<(&str, &str, Option<&str>)> {
+    let (namespace, rest) = key.split_once('|')?;
+    if namespace.is_empty() || rest.is_empty() {
+        return None;
+    }
+    match rest.split_once("::") {
+        Some((id, target)) if !id.is_empty() && !target.is_empty() => {
+            Some((namespace, id, Some(target)))
+        }
+        None => Some((namespace, rest, None)),
+        Some(_) => None,
     }
 }
 
@@ -334,41 +412,77 @@ pub fn build_admin_metrics(
     }
 
     let http_pool_stats = ps.connection_pool.get_stats();
-    let circuit_breakers = ps
+    let mut circuit_breakers: Vec<AdminMetricsCircuitBreaker> = ps
         .circuit_breaker_cache
         .snapshot()
         .into_iter()
-        .map(|(key, state, failures, successes)| {
+        .filter_map(|(key, state, failures, successes)| {
             AdminMetricsCircuitBreaker::from_cache_key(&key, state, failures, successes)
         })
         .collect();
+    circuit_breakers.sort_by(|a, b| {
+        (&a.namespace, &a.proxy_id, &a.target).cmp(&(&b.namespace, &b.proxy_id, &b.target))
+    });
 
     let mut unhealthy_targets: Vec<AdminMetricsUnhealthyTarget> = ps
         .health_checker
         .active_unhealthy_targets
         .iter()
-        .map(|entry| AdminMetricsUnhealthyTarget::active(entry.key().clone(), *entry.value()))
+        .filter_map(|entry| {
+            AdminMetricsUnhealthyTarget::from_active_cache_key(entry.key(), *entry.value())
+        })
         .collect();
     for proxy_entry in ps.health_checker.passive_health.iter() {
-        let proxy_id = proxy_entry.key();
+        let proxy_key = proxy_entry.key();
         for target_entry in proxy_entry.value().unhealthy.iter() {
-            unhealthy_targets.push(AdminMetricsUnhealthyTarget::passive(
-                proxy_id.clone(),
+            if let Some(entry) = AdminMetricsUnhealthyTarget::from_passive_cache_key(
+                proxy_key,
                 target_entry.key().clone(),
                 target_entry.value().ejected_at_ms,
-            ));
+            ) {
+                unhealthy_targets.push(entry);
+            }
         }
     }
+    unhealthy_targets.sort_by(|a, b| {
+        (
+            a.namespace.as_str(),
+            a.kind,
+            a.proxy_id.as_deref(),
+            a.upstream_id.as_deref(),
+            a.target.as_str(),
+        )
+            .cmp(&(
+                b.namespace.as_str(),
+                b.kind,
+                b.proxy_id.as_deref(),
+                b.upstream_id.as_deref(),
+                b.target.as_str(),
+            ))
+    });
 
     let lb_snapshot = ps.load_balancer_cache.active_connections_snapshot();
-    let mut active_connections = BTreeMap::new();
-    for (upstream_id, targets) in &lb_snapshot {
+    let mut active_connections = Vec::new();
+    for (upstream_key, targets) in &lb_snapshot {
+        let Some((namespace, upstream_id, scoped)) = parse_namespaced_runtime_key(upstream_key)
+        else {
+            continue;
+        };
+        if scoped.is_some() {
+            continue;
+        }
         let mut target_map = BTreeMap::new();
         for (target, count) in targets {
             target_map.insert(target.clone(), *count);
         }
-        active_connections.insert(upstream_id.clone(), target_map);
+        active_connections.push(AdminMetricsUpstreamConnections {
+            namespace: namespace.to_string(),
+            upstream_id: upstream_id.to_string(),
+            targets: target_map,
+        });
     }
+    active_connections
+        .sort_by(|a, b| (&a.namespace, &a.upstream_id).cmp(&(&b.namespace, &b.upstream_id)));
 
     let (prefix_entries, regex_entries, prefix_evictions, regex_evictions, max_entries) =
         ps.router_cache.cache_stats();
@@ -495,8 +609,9 @@ pub fn contract_fixtures() -> Vec<AdminMetrics> {
 
     let mut breakers_and_health = proxy_serving_fixture("database");
     breakers_and_health.circuit_breakers = vec![
-        AdminMetricsCircuitBreaker::direct_backend("proxy-payments-v2", "closed", 0, 0),
+        AdminMetricsCircuitBreaker::direct_backend("ferrum", "proxy-payments-v2", "closed", 0, 0),
         AdminMetricsCircuitBreaker::upstream_target(
+            "ferrum",
             "proxy-legacy-billing",
             "10.0.2.1:8080",
             "open",
@@ -504,19 +619,26 @@ pub fn contract_fixtures() -> Vec<AdminMetrics> {
             0,
         ),
         AdminMetricsCircuitBreaker::upstream_target(
+            "ferrum",
             "proxy-legacy-billing",
             "10.0.2.2:8080",
             "closed",
             0,
             0,
         ),
-        AdminMetricsCircuitBreaker::direct_backend("proxy-search", "half_open", 3, 1),
+        AdminMetricsCircuitBreaker::direct_backend("ferrum", "proxy-search", "half_open", 3, 1),
     ];
     breakers_and_health.health_check = AdminMetricsHealthCheck {
         unhealthy_target_count: 2,
         unhealthy_targets: vec![
-            AdminMetricsUnhealthyTarget::active("10.0.3.12:8080", 1_711_720_800_000),
+            AdminMetricsUnhealthyTarget::active(
+                "ferrum",
+                "upstream-payments",
+                "10.0.3.12:8080",
+                1_711_720_800_000,
+            ),
             AdminMetricsUnhealthyTarget::passive(
+                "ferrum",
                 "proxy-legacy-billing",
                 "10.0.5.7:8080",
                 1_711_720_920_000,

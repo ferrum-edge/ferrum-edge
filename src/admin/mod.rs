@@ -427,9 +427,83 @@ impl AdminState {
         self.cached_config.as_ref().map(|c| c.load_full())
     }
 
-    /// Check whether write operations are allowed. Returns an error response
-    /// if the admin API is read-only or the database is currently unavailable.
+    /// Observe-only write-gate evaluation (issue #3001).
+    ///
+    /// Used by `/health` and policy tests. **Mutation handlers must call
+    /// [`Self::admit_write`] instead** so a reconnect cannot redirect an
+    /// already-admitted write onto a newly published failover topology.
+    ///
+    /// Observationally pure: does not mutate failover topology counters or
+    /// risk markers. Opt-in enablement is recorded by the store when
+    /// `set_failover_allow_writes(true)` is applied on failover topology.
     pub fn check_write_allowed(&self) -> Option<Response<Full<Bytes>>> {
+        self.evaluate_write_gate()
+    }
+
+    /// Whether admin mutations are currently blocked (same policy as
+    /// [`Self::check_write_allowed`], for observe-only callers such as `/health`).
+    pub fn admin_writes_currently_blocked(&self) -> bool {
+        self.check_write_allowed().is_some()
+    }
+
+    /// Admit an Admin API mutation under a write-topology pin (issue #3001).
+    ///
+    /// Acquires a backend topology pin **before** evaluating sticky-failover
+    /// policy, and returns that pin so the caller retains it through
+    /// persistence and response construction. Ordering:
+    /// - If a failover reconnect publishes first, this returns the existing
+    ///   `503` fail-closed response (or admits under opt-in and pins failover).
+    /// - If this pin wins first, reconnect publication waits (SQL) or
+    ///   fail-fast defers (Mongo) until the permit drops, so the mutation
+    ///   cannot silently land on a different topology.
+    ///
+    /// Use this for config-database mutations (CRUD, credentials, API specs,
+    /// batch, restore). Managed TLS / ACME handlers mutate independent stores
+    /// and must call [`Self::admit_non_config_db_write`] instead.
+    pub async fn admit_write(
+        &self,
+    ) -> Result<crate::config::db_backend::DbWriteTopologyPermit, Response<Full<Bytes>>> {
+        if let Some(response) = self.evaluate_non_topology_write_gate() {
+            return Err(response);
+        }
+        if let Some(ref db) = self.db {
+            let permit = db.acquire_write_topology_permit().await;
+            let topology = db.failover_topology_status();
+            if !topology.primary_active && !topology.allow_writes {
+                return Err(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": "Admin writes are disabled while connected to a failover database; set FERRUM_DB_FAILOVER_ALLOW_WRITES=true only for synchronously replicated multi-primary topologies"
+                    }),
+                ));
+            }
+            return Ok(permit);
+        }
+        Ok(crate::config::db_backend::DbWriteTopologyPermit::noop())
+    }
+
+    /// Admit a mutation that does **not** touch the sticky config-database
+    /// topology (managed TLS / ACME file stores).
+    ///
+    /// Applies the pre-existing non-topology Admin write gates (explicit
+    /// read-only mode and database-unavailable) only. Does **not** acquire a
+    /// config-DB write-topology pin and does **not** apply
+    /// `FERRUM_DB_FAILOVER_ALLOW_WRITES`, so slow ACME network work cannot
+    /// defer failover/failback and independent TLS stores are not gated by
+    /// sticky DB failover policy.
+    // Returning the response by value keeps this synchronous gate identical to
+    // the async `admit_write` contract and lets every handler return it without
+    // an extra allocation/dereference layer on an already exceptional path.
+    #[allow(clippy::result_large_err)]
+    pub fn admit_non_config_db_write(&self) -> Result<(), Response<Full<Bytes>>> {
+        if let Some(response) = self.evaluate_non_topology_write_gate() {
+            Err(response)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn evaluate_non_topology_write_gate(&self) -> Option<Response<Full<Bytes>>> {
         if self.read_only {
             return Some(json_response(
                 StatusCode::FORBIDDEN,
@@ -443,6 +517,24 @@ impl AdminState {
                 StatusCode::SERVICE_UNAVAILABLE,
                 &json!({"error": "Database is currently unavailable — admin API is temporarily read-only"}),
             ));
+        }
+        None
+    }
+
+    fn evaluate_write_gate(&self) -> Option<Response<Full<Bytes>>> {
+        if let Some(response) = self.evaluate_non_topology_write_gate() {
+            return Some(response);
+        }
+        if let Some(ref db) = self.db {
+            let topology = db.failover_topology_status();
+            if !topology.primary_active && !topology.allow_writes {
+                return Some(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": "Admin writes are disabled while connected to a failover database; set FERRUM_DB_FAILOVER_ALLOW_WRITES=true only for synchronously replicated multi-primary topologies"
+                    }),
+                ));
+            }
         }
         None
     }
@@ -1662,12 +1754,42 @@ pub async fn handle_admin_request(
             }
         }
 
-        // Report whether admin writes are enabled (read_only flag + db_available)
-        let writes_blocked = state.check_write_allowed().is_some();
+        // Report whether config-database admin writes are enabled (read_only
+        // flag + db_available + sticky failover write gate). Policy observation
+        // only; managed TLS/ACME stores use an independent non-topology gate.
+        let writes_blocked = state.admin_writes_currently_blocked();
         health_status["admin_writes_enabled"] = json!(!writes_blocked);
         if writes_blocked && !state.read_only {
             // DB-driven read-only — mark as degraded if not already
             health_status["status"] = json!("degraded");
+        }
+
+        if let Some(db) = &state.db {
+            let topology = db.failover_topology_status();
+            if !topology.primary_active {
+                let mut failover = json!({
+                    "primary_active": topology.primary_active,
+                    "allow_writes": topology.allow_writes,
+                    "opt_in_writes_enabled_during_window":
+                        topology.opt_in_writes_enabled_during_window,
+                });
+                if let Some(since) = topology.failover_since_unix_ms {
+                    failover["failover_since_unix_ms"] = json!(since);
+                }
+                if let Some(redacted) = topology.active_url_redacted {
+                    failover["active_url_redacted"] = json!(redacted);
+                }
+                match health_status.get_mut("database") {
+                    Some(serde_json::Value::Object(map)) => {
+                        map.insert("failover_topology".to_string(), failover);
+                    }
+                    _ => {
+                        health_status["database"] = json!({
+                            "failover_topology": failover
+                        });
+                    }
+                }
+            }
         }
 
         // Acquire pairs with the Release store in each mode's startup path
@@ -2781,6 +2903,26 @@ pub async fn handle_admin_request(
             handle_mesh_config_drift_get(&state, query.as_deref()).await
         }
 
+        // Issue #2473: operator escape hatch for the config-revision freshness
+        // gate. Clears the DP's last-accepted revision so the next slice from
+        // ANY authority is eligible again. This is the documented recovery for
+        // a config-store sequence rewind inside one authority (restore from
+        // backup without bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID`) — the one
+        // case the gate never auto-adopts, because it is indistinguishable
+        // from the rollback the gate exists to prevent.
+        //
+        // JWT-authenticated (falls through the admin auth gate above) and
+        // Operator-role gated: it does not write configuration, but it lowers
+        // a fail-closed guard, so it is audited like any other privileged
+        // mutation. It installs nothing itself — the next slice still has to
+        // pass subscription binding and update validation.
+        (Method::POST, ["mesh", "config-revision", "reset"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            handle_mesh_config_revision_reset(&state, &auth).await
+        }
+
         // F7.2: remote-cluster discovery introspection. Read-only operator
         // view of the DP's multicluster east-west state — clusters it has
         // actually fetched endpoints from (with per-cluster workload/service
@@ -3084,6 +3226,47 @@ async fn handle_mesh_runtime_overlay_get(
     ))
 }
 
+/// `POST /mesh/config-revision/reset` — clear the accepted mesh config
+/// revision (issue #2473).
+///
+/// Returns the cleared revision so the operator can record what the gate was
+/// holding. Never logs or returns slice content.
+///
+/// The revision the gate hands back is already sanitized — the `authority` is
+/// control-plane-supplied, so `MeshRevisionGate::reset` strips control
+/// characters and truncates before the value can reach this audit log line or
+/// the JSON body. Do not swap this for a raw accessor.
+async fn handle_mesh_config_revision_reset(
+    state: &AdminState,
+    auth: &AuditActor,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh runtime state"}),
+        ));
+    };
+
+    let cleared = mesh_runtime.reset_accepted_revision();
+    warn!(
+        actor = %auth.sub,
+        cleared_authority = cleared
+            .as_ref()
+            .map(|revision| revision.authority.as_str())
+            .unwrap_or("<none>"),
+        cleared_sequence = cleared.as_ref().map_or(0, |revision| revision.sequence),
+        "Mesh config-revision freshness gate reset by operator; the next accepted slice \
+         establishes a new ordering baseline"
+    );
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "status": "reset",
+            "cleared_revision": cleared,
+        }),
+    ))
+}
+
 /// MESH-T6-C: per-DP config drift introspection.
 ///
 /// Returns a structured "where is this DP relative to the CP's last push?"
@@ -3144,6 +3327,8 @@ async fn handle_mesh_config_drift_get(
         include_overlay,
         // xDS-mode only; native mode leaves this `None` and the block is omitted.
         convergence: mesh_runtime.xds_convergence(),
+        // Issue #2473: accepted config revision + stale-fallback quarantine.
+        revision: mesh_runtime.revision_diagnostics(),
     });
 
     // `MeshConfigDriftResponse` is fully serde-derived; treat a serialize
@@ -4947,9 +5132,10 @@ async fn handle_update_credentials(
     body: &[u8],
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     if let Err(resp) = validate_path_resource_id(consumer_id) {
         return Ok(*resp);
@@ -5059,9 +5245,10 @@ async fn handle_delete_credentials(
     cred_type: &str,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     if let Err(resp) = validate_path_resource_id(consumer_id) {
         return Ok(*resp);
@@ -5144,9 +5331,10 @@ async fn handle_append_credential(
     body: &[u8],
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     if let Err(resp) = validate_path_resource_id(consumer_id) {
         return Ok(*resp);
@@ -5282,9 +5470,10 @@ async fn handle_delete_credential_by_index(
     index_str: &str,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     if let Err(resp) = validate_path_resource_id(consumer_id) {
         return Ok(*resp);
@@ -5574,9 +5763,10 @@ async fn handle_batch_create(
     body: &[u8],
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     let db = match require_db(state) {
         Ok(db) => db,
@@ -6361,7 +6551,13 @@ async fn validate_restore_candidate_on_blocking_pool(
     backend_allow_ips: crate::config::BackendEgressPolicy,
 ) -> Result<(GatewayConfig, Vec<String>), anyhow::Error> {
     let (candidate, result) = tokio::task::spawn_blocking(move || {
+        // Identity first: restore stamps namespaces from the already-validated
+        // X-Ferrum-Namespace header, but payload resource IDs are hostile
+        // boundary input. Reject malformed IDs before any other domain check so
+        // a wiped-and-rewritten namespace cannot persist `|`-bearing identities
+        // that would later collide after `namespace|id` encoding (issue #3094).
         let result = ValidationPipeline::new(&mut candidate)
+            .validate_resource_ids(ValidationAction::Collect)
             .validate_all_fields_with_ip_policy(
                 cert_expiry_days,
                 &backend_allow_ips,
@@ -6400,9 +6596,10 @@ async fn handle_restore(
     query: Option<&str>,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(resp) = state.check_write_allowed() {
-        return Ok(resp);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     let db = match require_db(state) {
         Ok(db) => db,

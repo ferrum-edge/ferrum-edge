@@ -717,8 +717,9 @@ async fn validate_plugin_config_with_policy_screens_denied_direct_client_endpoin
     });
     assert!(
         validate_plugin_config_with_policy("kafka_logging", &kafka_loopback, &default_policy)
-            .is_ok(),
-        "loopback kafka broker must remain valid by default"
+            .is_err(),
+        "kafka_logging must be refused under policies that can deny any address because \
+         librdkafka cannot enforce metadata-advertised broker dials"
     );
 
     // ws_logging dials its endpoint_url via tungstenite (outside the shared

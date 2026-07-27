@@ -165,15 +165,23 @@ fn file_dp_mesh_node_agent_config_source_status_is_na() {
 
 #[test]
 fn circuit_breaker_target_semantics_direct_vs_upstream() {
-    let direct = AdminMetricsCircuitBreaker::direct_backend("proxy-a", "closed", 0, 0);
-    let per_target =
-        AdminMetricsCircuitBreaker::upstream_target("proxy-b", "10.0.2.1:8080", "open", 5, 0);
+    let direct = AdminMetricsCircuitBreaker::direct_backend("ferrum", "proxy-a", "closed", 0, 0);
+    let per_target = AdminMetricsCircuitBreaker::upstream_target(
+        "ferrum",
+        "proxy-b",
+        "10.0.2.1:8080",
+        "open",
+        5,
+        0,
+    );
 
     let direct_json = serde_json::to_value(&direct).expect("direct serializes");
     let target_json = serde_json::to_value(&per_target).expect("target serializes");
 
     assert!(direct_json.get("target").is_none());
+    assert_eq!(direct_json["namespace"], "ferrum");
     assert_eq!(direct_json["proxy_id"], "proxy-a");
+    assert_eq!(target_json["namespace"], "ferrum");
     assert_eq!(target_json["proxy_id"], "proxy-b");
     assert_eq!(target_json["target"], "10.0.2.1:8080");
     assert_eq!(target_json["state"], "open");
@@ -181,18 +189,22 @@ fn circuit_breaker_target_semantics_direct_vs_upstream() {
 
 #[test]
 fn unhealthy_target_active_omits_proxy_id_passive_requires_it() {
-    let active = AdminMetricsUnhealthyTarget::active("10.0.3.12:8080", 100);
-    let passive = AdminMetricsUnhealthyTarget::passive("proxy-x", "10.0.5.7:8080", 200);
+    let active = AdminMetricsUnhealthyTarget::active("ferrum", "upstream-a", "10.0.3.12:8080", 100);
+    let passive = AdminMetricsUnhealthyTarget::passive("ferrum", "proxy-x", "10.0.5.7:8080", 200);
 
     let active_json = serde_json::to_value(&active).expect("active serializes");
     let passive_json = serde_json::to_value(&passive).expect("passive serializes");
 
     assert_eq!(active_json["type"], "active");
+    assert_eq!(active_json["namespace"], "ferrum");
+    assert_eq!(active_json["upstream_id"], "upstream-a");
     assert!(active_json.get("proxy_id").is_none());
     assert_eq!(active.kind, AdminMetricsHealthKind::Active);
 
     assert_eq!(passive_json["type"], "passive");
+    assert_eq!(passive_json["namespace"], "ferrum");
     assert_eq!(passive_json["proxy_id"], "proxy-x");
+    assert!(passive_json.get("upstream_id").is_none());
     assert_eq!(passive.kind, AdminMetricsHealthKind::Passive);
 }
 
@@ -264,26 +276,30 @@ fn contract_fixtures_cover_modes_breakers_and_health_variants() {
         .expect("breaker/health fixture");
 
     let breakers = rich["circuit_breakers"].as_array().expect("breakers array");
+    assert!(breakers.iter().any(|entry| {
+        entry.get("target").is_none()
+            && entry["namespace"] == "ferrum"
+            && entry["proxy_id"] == "proxy-payments-v2"
+    }));
     assert!(
         breakers
             .iter()
-            .any(|entry| entry.get("target").is_none() && entry["proxy_id"] == "proxy-payments-v2")
-    );
-    assert!(
-        breakers
-            .iter()
-            .any(|entry| entry["target"] == "10.0.2.1:8080")
+            .any(|entry| { entry["namespace"] == "ferrum" && entry["target"] == "10.0.2.1:8080" })
     );
 
     let unhealthy = rich["health_check"]["unhealthy_targets"]
         .as_array()
         .expect("unhealthy targets");
-    assert!(
-        unhealthy
-            .iter()
-            .any(|entry| entry["type"] == "active" && entry.get("proxy_id").is_none())
-    );
     assert!(unhealthy.iter().any(|entry| {
-        entry["type"] == "passive" && entry["proxy_id"] == "proxy-legacy-billing"
+        entry["type"] == "active"
+            && entry["namespace"] == "ferrum"
+            && entry["upstream_id"] == "upstream-payments"
+            && entry.get("proxy_id").is_none()
+    }));
+    assert!(unhealthy.iter().any(|entry| {
+        entry["type"] == "passive"
+            && entry["namespace"] == "ferrum"
+            && entry["proxy_id"] == "proxy-legacy-billing"
+            && entry.get("upstream_id").is_none()
     }));
 }

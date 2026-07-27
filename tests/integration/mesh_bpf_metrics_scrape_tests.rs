@@ -17,7 +17,6 @@ use ferrum_edge::config::env_config::EnvConfig;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::ebpf::bpf_metrics::BpfMetricsState;
-use ferrum_edge::modes::mesh::MESH_BPF_METRICS_PLUGIN_ID;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::mesh::bpf_metrics::{DEFAULT_METRIC_PREFIX, PLUGIN_NAME};
 use ferrum_edge::proxy::client_ip::TrustedProxies;
@@ -31,6 +30,7 @@ use std::sync::atomic::AtomicBool;
 
 const JWT_SECRET: &str = "mesh-bpf-metrics-scrape-test-secret-key-00";
 const JWT_ISSUER: &str = "ferrum-edge-mesh-bpf-metrics-test";
+const TEST_PLUGIN_ID: &str = "mesh-bpf-metrics-scrape-test";
 
 fn jwt_manager() -> JwtManager {
     JwtManager::new(JwtConfig {
@@ -67,7 +67,7 @@ fn bpf_metrics_plugin_config(prefix: Option<&str>) -> PluginConfig {
         None => json!({}),
     };
     PluginConfig {
-        id: MESH_BPF_METRICS_PLUGIN_ID.to_string(),
+        id: TEST_PLUGIN_ID.to_string(),
         plugin_name: PLUGIN_NAME.to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         config,

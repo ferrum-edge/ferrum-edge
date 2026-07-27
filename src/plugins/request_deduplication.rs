@@ -349,8 +349,8 @@ pub fn validate_composition(
     // the pair is actually effective together. Two properties of that merge are
     // load-bearing here:
     //
-    // - Globals are namespace-partitioned: a global instance is merged only
-    //   into proxies in its own namespace.
+    // - Globals are gateway-wide: every global instance is merged into every
+    //   proxy unless a scoped instance of the same plugin name shadows it.
     // - Shadowing is decided by the outer `enabled` flag alone. An instance
     //   whose *inner* switch is off is still constructed and still replaces the
     //   same-named global for that proxy, so the effective set has to be

@@ -155,6 +155,11 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         .expect("restore handler must exist");
     assert!(
         batch_source[restore_validator..restore_handler]
+            .contains(".validate_resource_ids(ValidationAction::Collect)"),
+        "restore must reject malformed resource IDs/namespaces before persistence"
+    );
+    assert!(
+        batch_source[restore_validator..restore_handler]
             .contains("tokio::task::spawn_blocking(move ||"),
         "restore graph construction must run off the Tokio worker"
     );

@@ -1,9 +1,9 @@
 use chrono::Utc;
 use ferrum_edge::_test_support::admin_mtls_dns_admission_drop_should_release;
 use ferrum_edge::config::db_backend::{
-    AtomicClearVerification, DeleteAllResourcesError, DeleteMode, IncrementalResult,
-    NamespaceResourceCounts, NamespacedResourceId, classify_atomic_clear_verification,
-    extract_db_hostname, extract_known_ids, redact_url,
+    AtomicClearVerification, DbFailoverTopologyState, DeleteAllResourcesError, DeleteMode,
+    IncrementalResult, NamespaceResourceCounts, NamespacedResourceId,
+    classify_atomic_clear_verification, extract_db_hostname, extract_known_ids, redact_url,
 };
 use ferrum_edge::config::types::GatewayConfig;
 use std::collections::HashMap;
@@ -688,4 +688,87 @@ fn incremental_result_not_empty_with_added_consumer() {
         poll_timestamp: Utc::now(),
     };
     assert!(!result.is_empty());
+}
+
+#[test]
+fn failover_topology_state_transitions_and_opt_in_risk_marker() {
+    let state = DbFailoverTopologyState::new();
+    assert!(state.primary_active());
+    assert!(!state.status().opt_in_writes_enabled_during_window);
+
+    state.mark_failover("sqlite:///tmp/failover.db");
+    let status = state.status();
+    assert!(!status.primary_active);
+    assert_eq!(
+        status.active_url_redacted.as_deref(),
+        Some("sqlite:///tmp/failover.db")
+    );
+    assert!(status.failover_since_unix_ms.is_some());
+    assert!(!status.opt_in_writes_enabled_during_window);
+    assert!(!status.allow_writes);
+
+    // Failback is always allowed under contract B (no write-admission fence).
+    state.mark_primary("sqlite:///tmp/primary.db");
+    assert!(state.primary_active());
+    assert!(!state.status().opt_in_writes_enabled_during_window);
+
+    state.mark_failover("sqlite:///tmp/failover.db");
+    state.set_allow_writes(true);
+    let status = state.status();
+    assert!(status.allow_writes);
+    assert!(
+        status.opt_in_writes_enabled_during_window,
+        "enabling opt-in on failover must sticky-mark the window"
+    );
+
+    // Switching failover URLs must preserve the sticky opt-in risk marker and
+    // must not spam additional transition warnings (silent URL refresh).
+    state.mark_failover("sqlite:///tmp/failover-2.db");
+    let status = state.status();
+    assert!(!status.primary_active);
+    assert!(status.opt_in_writes_enabled_during_window);
+    assert_eq!(
+        status.active_url_redacted.as_deref(),
+        Some("sqlite:///tmp/failover-2.db")
+    );
+
+    // Failback clears the window and remains allowed even after opt-in.
+    state.mark_primary("postgres://***/***/ferrum");
+    assert!(state.primary_active());
+    assert!(!state.status().opt_in_writes_enabled_during_window);
+    assert!(state.status().failover_since_unix_ms.is_none());
+}
+
+#[test]
+fn failover_topology_mark_primary_emits_clear_window() {
+    let state = DbFailoverTopologyState::new();
+    state.mark_failover("postgres://***/***/ferrum");
+    state.mark_primary("postgres://***/***/ferrum");
+    assert!(state.primary_active());
+    assert!(!state.status().opt_in_writes_enabled_during_window);
+    assert!(state.status().failover_since_unix_ms.is_none());
+}
+
+#[test]
+fn failover_topology_opt_in_at_transition_marks_window() {
+    let state = DbFailoverTopologyState::new();
+    state.set_allow_writes(true);
+    state.mark_failover("sqlite:///tmp/failover.db");
+    assert!(
+        state.status().opt_in_writes_enabled_during_window,
+        "opt-in already enabled at failover transition must mark the window"
+    );
+    // Repeated set_allow_writes(true) must stay sticky without clearing.
+    state.set_allow_writes(true);
+    assert!(state.status().opt_in_writes_enabled_during_window);
+}
+
+#[test]
+fn redact_url_strips_userinfo_for_topology_signals() {
+    let redacted = redact_url("postgres://operator:s3cret@db.example:5432/ferrum");
+    assert!(
+        !redacted.contains("s3cret") && !redacted.contains("operator"),
+        "redacted URL leaked credentials: {redacted}"
+    );
+    assert!(redacted.contains("db.example"));
 }

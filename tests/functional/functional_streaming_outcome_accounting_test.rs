@@ -160,6 +160,13 @@ async fn grpc_streaming_2xx_then_stall_trips_circuit_breaker() {
         .spawn()
         .await
         .expect("spawn gateway");
+    // GrpcClient uses hyper H2 prior knowledge and does not retry connect, so
+    // wait until the proxy listener accepts — `/health` alone can race ahead of
+    // the proxy accept queue on a loaded CI runner.
+    harness
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
 
     let client = GrpcClient::h2c(format!("127.0.0.1:{}", gateway_port(&harness)));
 
@@ -281,6 +288,12 @@ async fn h2_streaming_status_then_stall_trips_circuit_breaker(status: u16) {
         .spawn()
         .await
         .expect("spawn gateway");
+    // Same prior-knowledge H2 client race as the gRPC stall test: wait for the
+    // proxy accept queue before the first client connect.
+    harness
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
 
     let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
     let base = harness.proxy_base_url();

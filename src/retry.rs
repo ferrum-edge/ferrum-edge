@@ -336,6 +336,11 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
                 // variant is excluded from `retry_on_connect_failure` regardless
                 // of the class.
                 GrpcBackendUnavailableKind::BackendRequest => ErrorClass::ConnectionReset,
+                // Pooled sender canceled before dispatch (hyper `is_canceled`)
+                // with a buffered/replayable body. Pre-wire pool/stale-sender
+                // failure — `request_reached_wire` is false so connect-failure
+                // retry can redial.
+                GrpcBackendUnavailableKind::DispatchCanceled => ErrorClass::ConnectionPoolError,
             }
         }
         GrpcProxyError::ResourceExhausted(_) => ErrorClass::RequestError,

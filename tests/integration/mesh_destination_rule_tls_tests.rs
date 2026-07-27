@@ -153,8 +153,13 @@ fn build_matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
 }
 
 fn build_proxy(id: &str, upstream_id: &str) -> Proxy {
+    // `resolve_upstream_tls` looks up upstreams by `(proxy.namespace, upstream_id)`.
+    // Mesh fixtures stamp upstreams with the owning Service namespace (`default`);
+    // the serde default for Proxy.namespace is `ferrum`, so omit the field and
+    // the projection silently misses.
     serde_json::from_value(serde_json::json!({
         "id": id,
+        "namespace": "default",
         "hosts": [format!("{id}.example.com")],
         "backend_host": "",
         "backend_port": 0,
@@ -557,8 +562,10 @@ fn dr_two_subsets_with_different_cas_fragment_backend_pool() {
     ));
 
     // Two proxies — one per subset — sharing the upstream.
+    // Namespace must match the upstream (`default`); see `build_proxy`.
     let proxy_v1: Proxy = serde_json::from_value(serde_json::json!({
         "id": "p-v1",
+        "namespace": "default",
         "hosts": ["v1.example.com"],
         "backend_host": "",
         "backend_port": 0,
@@ -568,6 +575,7 @@ fn dr_two_subsets_with_different_cas_fragment_backend_pool() {
     .expect("p-v1");
     let proxy_v2: Proxy = serde_json::from_value(serde_json::json!({
         "id": "p-v2",
+        "namespace": "default",
         "hosts": ["v2.example.com"],
         "backend_host": "",
         "backend_port": 0,

@@ -3372,6 +3372,44 @@ fn spool_metadata_owner_mismatch_fails_closed_without_mutating_records() {
 }
 
 #[test]
+fn version_one_spool_replays_legacy_owner_tags() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let current_record = spool
+        .write_events(&[sample_event("evt-legacy-owner-tag")])
+        .unwrap();
+    let current_tag = spool.owner_tag_for_tests();
+    let legacy_tag = &current_tag[..16];
+
+    let meta_path = spool.namespace_root_for_tests().join("spool.meta.json");
+    let mut meta: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["version"], json!(1));
+    meta["owner_tag"] = json!(legacy_tag);
+    fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+    let legacy_name = current_record
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .replace(current_tag, legacy_tag);
+    let legacy_record = current_record.with_file_name(legacy_name);
+    fs::rename(&current_record, &legacy_record).unwrap();
+
+    assert_eq!(
+        spool.list_replayable_spool_files_for_tests().unwrap(),
+        vec![legacy_record.clone()],
+        "version-1 records with the original 16-character tag remain replayable"
+    );
+    let claim = spool
+        .claim_replay_file_for_tests(&legacy_record)
+        .unwrap()
+        .expect("a legacy-tagged record remains claimable by its digest owner");
+    assert!(claim.exists());
+    assert!(!legacy_record.exists());
+}
+
+#[test]
 fn oversized_namespace_metadata_fails_closed_without_mutating_records() {
     let temp = tempfile::tempdir().unwrap();
     let settings = spool_settings(temp.path(), 1024 * 1024);

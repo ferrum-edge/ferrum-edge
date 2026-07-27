@@ -283,7 +283,7 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
     // All healthy: every selection lands on the local (same-region) endpoint.
     for i in 0..20 {
         let selection = lb
-            .select_target(upstream_id, &i.to_string(), None)
+            .select_target("default", upstream_id, &i.to_string(), None)
             .expect("target");
         assert_eq!(
             selection.target.host, "10.1.0.1",
@@ -291,9 +291,14 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
         );
     }
 
-    // Eject the local endpoint (active unhealthy, keyed `upstream_id::host:port`).
+    // Eject the local endpoint (active unhealthy, keyed
+    // `namespace|upstream_id::host:port` to match production identity).
     let active_unhealthy: DashMap<String, u64> = DashMap::new();
-    active_unhealthy.insert(format!("{upstream_id}::10.1.0.1:8080"), 1);
+    let local_active_key = format!(
+        "{}::10.1.0.1:8080",
+        ferrum_edge::config::db_backend::namespaced_runtime_key("default", upstream_id)
+    );
+    active_unhealthy.insert(local_active_key, 1);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -304,7 +309,7 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
     // remote endpoint tier.
     for i in 0..20 {
         let selection = lb
-            .select_target(upstream_id, &i.to_string(), Some(&health))
+            .select_target("default", upstream_id, &i.to_string(), Some(&health))
             .expect("failover target");
         assert_eq!(
             selection.target.host, "10.2.0.1",
@@ -340,6 +345,9 @@ mod audience_binding {
     use ferrum_edge::modes::mesh::multicluster::{
         NativeRemoteSource, RemoteClusterPollContext, RemoteDiscoveryConfig,
         RemoteDiscoveryTlsConfig, RemoteServiceSource,
+    };
+    use ferrum_edge::modes::mesh::revision::{
+        DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS, MeshRevisionGate,
     };
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -414,12 +422,14 @@ mod audience_binding {
                 poll_interval: Duration::from_millis(50),
                 request_timeout: Duration::from_secs(5),
                 max_stale_age: None,
+                revision_adopt_secs: DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
                 production_mode: false,
                 jwt_secret: Some(shared_secret()),
                 node_id: NODE_ID.to_string(),
                 namespace: NAMESPACE.to_string(),
                 tls_config: RemoteDiscoveryTlsConfig::default(),
             },
+            revision_gate: Arc::new(MeshRevisionGate::new()),
         }
     }
 

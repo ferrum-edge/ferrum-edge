@@ -16,6 +16,15 @@ use crate::retry::ErrorClass;
 
 use super::windows::{MAX_FINITE_LATENCY_BOUND_MS, RuleWindowSpec, WindowKind, WindowStore};
 
+thread_local! {
+    /// Reusable scratch buffer for the namespace-qualified window identity
+    /// (`namespace|proxy_id`). Borrowed strictly synchronously within one
+    /// `observe` call — no `.await`, no re-entry — so window keying stays
+    /// allocation-free in steady state.
+    static OWNER_KEY_BUF: std::cell::RefCell<String> =
+        std::cell::RefCell::new(String::with_capacity(64));
+}
+
 #[allow(clippy::enum_variant_names)] // All variants are millisecond metrics by intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LatencyMetric {
@@ -434,29 +443,67 @@ impl Rule {
         let ownership_generation = sample
             .proxy_lifecycle_generation()
             .unwrap_or(super::UNARMED_PROXY_LIFECYCLE_GENERATION);
-        match self {
-            Rule::ErrorRate(r) => {
-                observe_error_rate(r, sample, proxy_id, ownership_generation, store, now_ms)
+        // Key window rows by the namespace-qualified lifecycle identity
+        // (`namespace|id`) so the same proxy id in two tenants never shares a
+        // window. Zero allocation beyond the reusable thread-local buffer; the
+        // returned observation owns its counts and never borrows the buffer.
+        OWNER_KEY_BUF.with(|buf| {
+            let mut owner = buf.borrow_mut();
+            crate::config::db_backend::write_namespaced_runtime_key(
+                &mut owner,
+                sample.namespace(),
+                proxy_id,
+            );
+            let owner_key = owner.as_str();
+            match self {
+                Rule::ErrorRate(r) => {
+                    observe_error_rate(r, sample, owner_key, ownership_generation, store, now_ms)
+                }
+                Rule::StatusCodeCount(r) => observe_status_code_count(
+                    r,
+                    sample,
+                    owner_key,
+                    ownership_generation,
+                    store,
+                    now_ms,
+                ),
+                Rule::LatencyPercentile(r) => observe_latency_percentile(
+                    r,
+                    sample,
+                    owner_key,
+                    ownership_generation,
+                    store,
+                    now_ms,
+                ),
+                Rule::ErrorClass(r) => {
+                    observe_error_class(r, sample, owner_key, ownership_generation, store, now_ms)
+                }
+                Rule::StreamDisconnectCause(r) => observe_stream_disconnect(
+                    r,
+                    sample,
+                    owner_key,
+                    ownership_generation,
+                    store,
+                    now_ms,
+                ),
+                Rule::GrpcStatusCount(r) => observe_grpc_status_count(
+                    r,
+                    sample,
+                    owner_key,
+                    ownership_generation,
+                    store,
+                    now_ms,
+                ),
+                Rule::GrpcStatusRate(r) => observe_grpc_status_rate(
+                    r,
+                    sample,
+                    owner_key,
+                    ownership_generation,
+                    store,
+                    now_ms,
+                ),
             }
-            Rule::StatusCodeCount(r) => {
-                observe_status_code_count(r, sample, proxy_id, ownership_generation, store, now_ms)
-            }
-            Rule::LatencyPercentile(r) => {
-                observe_latency_percentile(r, sample, proxy_id, ownership_generation, store, now_ms)
-            }
-            Rule::ErrorClass(r) => {
-                observe_error_class(r, sample, proxy_id, ownership_generation, store, now_ms)
-            }
-            Rule::StreamDisconnectCause(r) => {
-                observe_stream_disconnect(r, sample, proxy_id, ownership_generation, store, now_ms)
-            }
-            Rule::GrpcStatusCount(r) => {
-                observe_grpc_status_count(r, sample, proxy_id, ownership_generation, store, now_ms)
-            }
-            Rule::GrpcStatusRate(r) => {
-                observe_grpc_status_rate(r, sample, proxy_id, ownership_generation, store, now_ms)
-            }
-        }
+        })
     }
 }
 

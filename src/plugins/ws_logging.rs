@@ -11,6 +11,16 @@
 //! automatic reconnection on failure; establishment and write/flush progress
 //! are bounded by documented timeouts.
 //!
+//! **Egress policy**: `ws_logging` dials outside the shared reqwest client, so
+//! it owns the same strict connection-establishment path as `ldap_auth`. Every
+//! connection *and reconnection* bypasses both DNS cache layers, resolves the
+//! complete A+AAAA answer set, rejects the whole answer if any candidate is
+//! denied by the backend egress policy, rechecks each concrete candidate
+//! immediately before its socket is opened, and dials only screened addresses.
+//! The configured hostname is retained for TLS SNI, certificate verification,
+//! and the WebSocket `Host` authority — the screened IP is never substituted
+//! into the TLS identity.
+//!
 //! **TLS**: For `wss://` endpoints, the plugin builds a `rustls::ClientConfig`
 //! that follows the gateway's CA trust chain:
 //! - Custom CA (`FERRUM_TLS_CA_BUNDLE_PATH`) → sole trust anchor (webpki roots excluded)
@@ -26,6 +36,7 @@ use futures_util::SinkExt;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, watch};
@@ -48,6 +59,8 @@ use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
     WsDisconnectContext,
 };
+use crate::config::BackendEgressPolicy;
+use crate::dns::{DnsCache, DnsConfig};
 use crate::observability_delivery::DeliveryWorkerControl;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
@@ -266,10 +279,20 @@ impl<'a> From<&'a WsDisconnectContext> for WsDisconnectLogEntry<'a> {
 }
 
 struct WsConfig {
-    /// Full dial URL retained only for connection establishment.
+    /// Full dial URL retained only for connection establishment. Handed to
+    /// tungstenite as the *request* (Host authority + TLS SNI); the transport
+    /// socket is opened separately against a policy-screened address.
     endpoint_url: String,
     /// Structurally redacted form used in every diagnostic (`scheme://host[:port]/redacted`).
     endpoint_url_for_logs: String,
+    /// Configured hostname (or IP literal) resolved fresh before every dial.
+    endpoint_hostname: String,
+    /// Effective destination port (explicit, or the ws/wss default).
+    endpoint_port: u16,
+    /// Cache-bypassing resolver used for dial-time A+AAAA lookups.
+    dns_cache: DnsCache,
+    /// Active backend egress policy, rechecked immediately before each dial.
+    backend_egress_policy: BackendEgressPolicy,
     connector: Option<tokio_tungstenite::Connector>,
     batch_size: usize,
     flush_interval: Duration,
@@ -596,9 +619,28 @@ impl WsLogging {
         // entries, so it opts into that field family. Every other logging
         // plugin uses the shared compiler under `SchemaCapabilities::BASE`.
         let schema = resolve_schema(config, "ws_logging", SchemaCapabilities::WS_LOGGING)?;
+        // `ws_logging` dials outside the shared reqwest client, so it carries the
+        // gateway policy and a cache-bypassing resolver itself. Cache-less
+        // test/validation clients get a private resolver holding the same policy
+        // rather than silently losing the screen (mirrors `ldap_auth`).
+        let backend_egress_policy = http_client.backend_allow_ips().clone();
+        let dns_cache = http_client.dns_cache().cloned().unwrap_or_else(|| {
+            DnsCache::new(DnsConfig {
+                backend_allow_ips: backend_egress_policy.clone(),
+                ..DnsConfig::default()
+            })
+        });
+        let endpoint_port = parsed_url.port_or_known_default().ok_or_else(|| {
+            "ws_logging: 'endpoint_url' has no port and no default port for its scheme".to_string()
+        })?;
+
         let ws_config = WsConfig {
             endpoint_url,
             endpoint_url_for_logs,
+            endpoint_hostname: endpoint_hostname.clone(),
+            endpoint_port,
+            dns_cache,
+            backend_egress_policy,
             connector,
             batch_size,
             flush_interval: Duration::from_millis(flush_interval_ms),
@@ -1316,12 +1358,85 @@ async fn send_batch(
     conn
 }
 
+/// Why a connection attempt failed before a usable WebSocket existed.
+///
+/// Split so an egress-policy refusal is reported distinctly from an ordinary
+/// transport/handshake failure. Both carry only sanitized text: the endpoint is
+/// referenced through `endpoint_url_for_logs`, never the dial URL.
+enum WsConnectError {
+    Egress(String),
+    Handshake(tokio_tungstenite::tungstenite::Error),
+}
+
+/// Screen one dial candidate against the active backend egress policy.
+///
+/// Kept as a standalone helper so it can be called both over the complete
+/// answer set and again immediately before each socket is opened.
+fn screen_ws_dial_candidate(cfg: &WsConfig, candidate: IpAddr) -> Result<(), String> {
+    match cfg.backend_egress_policy.deny_reason(&candidate) {
+        // The address is deliberately included: it is a resolved destination
+        // address, not credential or endpoint-userinfo material (the endpoint
+        // string itself is only ever logged in its redacted form).
+        Some(reason) => Err(format!(
+            "dial candidate {candidate} denied by backend egress policy: {reason}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Resolve the configured endpoint fresh and open a TCP socket to a screened
+/// address.
+///
+/// Bypasses both DNS cache layers, screens the complete A+AAAA answer set as
+/// one atomic decision (a mixed allowed/denied answer fails closed rather than
+/// letting an allowed decoy make a rebinding answer look safe), then rechecks
+/// each concrete candidate immediately before its socket is opened. Only
+/// screened addresses are dialed; the hostname is never handed to a client that
+/// could re-resolve it.
+async fn connect_screened_stream(cfg: &WsConfig) -> Result<tokio::net::TcpStream, String> {
+    let candidates = cfg
+        .dns_cache
+        .resolve_all_fresh(&cfg.endpoint_hostname)
+        .await
+        .map_err(|error| format!("dial-time DNS resolution failed: {error}"))?;
+
+    for &candidate in &candidates {
+        screen_ws_dial_candidate(cfg, candidate)?;
+    }
+
+    let mut last_connect_error = None;
+    for candidate in candidates {
+        // Deliberately repeated after the whole-set screen so the policy
+        // decision stays adjacent to the dial, and so a plugin instance whose
+        // active policy is stricter than the resolver's still fails closed.
+        screen_ws_dial_candidate(cfg, candidate)?;
+        let socket_addr = SocketAddr::new(candidate, cfg.endpoint_port);
+        match tokio::net::TcpStream::connect(socket_addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_connect_error = Some((socket_addr, error)),
+        }
+    }
+
+    match last_connect_error {
+        Some((socket_addr, error)) => Err(format!(
+            "all screened connection candidates failed; last dial to {socket_addr} failed: {error}"
+        )),
+        None => Err("dial-time DNS resolution returned no connection candidates".to_string()),
+    }
+}
+
 /// Establish a new WebSocket connection to the configured endpoint.
 ///
-/// Uses `connect_async_tls_with_config` with the pre-built TLS connector
-/// so that `wss://` connections respect the gateway's CA trust chain and
-/// `FERRUM_TLS_NO_VERIFY` setting. The entire establishment path (DNS, TCP,
-/// TLS, and WebSocket Upgrade) is bounded by `connect_timeout`.
+/// Resolves and screens the destination through [`connect_screened_stream`],
+/// then runs the TLS + WebSocket handshake over that screened socket with
+/// `client_async_tls_with_config`. The original endpoint URL is still what
+/// tungstenite turns into the client request, so the configured hostname
+/// remains the TLS SNI / certificate-verification identity and the WebSocket
+/// `Host` authority — the screened IP is never substituted into the TLS
+/// identity. The pre-built TLS connector keeps `wss://` on the gateway's CA
+/// trust chain, CRL list, and `FERRUM_TLS_NO_VERIFY` setting. The entire
+/// establishment path (DNS, TCP, TLS, and WebSocket Upgrade) is bounded by
+/// `connect_timeout`.
 ///
 /// `tokio_tungstenite` handles WebSocket control frames (Ping / Pong /
 /// server-initiated Close) inside its `Stream` impl while the read half
@@ -1346,12 +1461,19 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
     ws_cfg.max_message_size = Some(64 << 10);
     ws_cfg.max_frame_size = Some(16 << 10);
 
-    let connect_fut = tokio_tungstenite::connect_async_tls_with_config(
-        &cfg.endpoint_url,
-        Some(ws_cfg),
-        false,
-        cfg.connector.clone(),
-    );
+    let connect_fut = async {
+        let stream = connect_screened_stream(cfg)
+            .await
+            .map_err(WsConnectError::Egress)?;
+        tokio_tungstenite::client_async_tls_with_config(
+            cfg.endpoint_url.as_str(),
+            stream,
+            Some(ws_cfg),
+            cfg.connector.clone(),
+        )
+        .await
+        .map_err(WsConnectError::Handshake)
+    };
 
     match tokio::time::timeout(cfg.connect_timeout, connect_fut).await {
         Ok(Ok((stream, _response))) => {
@@ -1387,7 +1509,15 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
                 drain_done: done_rx,
             })
         }
-        Ok(Err(e)) => {
+        Ok(Err(WsConnectError::Egress(reason))) => {
+            warn!(
+                "WebSocket logging: refusing to connect to {}: {reason} — will retry in {:?}",
+                cfg.endpoint_url_for_logs, cfg.reconnect_delay,
+            );
+            tokio::time::sleep(cfg.reconnect_delay).await;
+            None
+        }
+        Ok(Err(WsConnectError::Handshake(e))) => {
             warn!(
                 "WebSocket logging: failed to connect to {}: {e} — will retry in {:?}",
                 cfg.endpoint_url_for_logs, cfg.reconnect_delay,

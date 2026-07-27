@@ -47,6 +47,9 @@ pub mod http2_pool;
 mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
+#[allow(unused_imports)]
+// Used by external tests; unused in the separately compiled bin target.
+pub(crate) use mesh_tcp_egress::connection_balancer as mesh_tcp_egress_connection_balancer;
 mod mesh_tcp_inbound;
 pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;
@@ -90,9 +93,11 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info, trace, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
+use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{
     AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HttpFlavor,
     PluginConfig, PluginScope, Proxy, ResponseBodyMode, Upstream, UpstreamTarget,
+    validate_namespace, validate_resource_id,
 };
 use crate::config::{EnvConfig, PoolConfig};
 use crate::connection_pool::ConnectionPool;
@@ -104,6 +109,7 @@ use crate::identity::{SharedSvidBundle, SvidBundle, TrustBundleSet as RuntimeTru
 use crate::load_balancer::{
     HashOnStrategy, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
 };
+use crate::modes::mesh::TrustedMeshGeneratedResourceIds;
 use crate::modes::mesh::node_waypoint::{
     NodeWaypointIdentity, NodeWaypointIdentityError, NodeWaypointIdentityResolver, pod_uid_label,
 };
@@ -651,15 +657,19 @@ fn node_waypoint_listener_uid_fallback_allowed(error: &NodeWaypointIdentityError
 /// validation, so the contract here matches normal Proxy upstream-id
 /// validation: refuse the config, log every dangling reference once.
 ///
-/// `GatewayConfig` is already namespace-scoped by its loader/distributor
-/// before this runtime validator runs. A missing id here can therefore mean
-/// "does not exist" or "exists only in another namespace"; admin admission
-/// performs the broader DB lookup and emits the more specific cross-namespace
-/// error before the config reaches this path.
+/// References resolve in the matched proxy's namespace at dispatch time.
+/// Scoped plugins therefore validate against their resource namespace, while
+/// a gateway-wide global must resolve in every namespace containing a proxy.
+/// A same-id upstream in another namespace must never make a dangling
+/// reference pass and then fall back to the proxy's direct backend at runtime.
 pub(crate) fn validate_mesh_route_dispatch_upstream_references(
     config: &GatewayConfig,
 ) -> Result<(), Vec<String>> {
-    let upstream_ids: HashSet<&str> = config.upstreams.iter().map(|u| u.id.as_str()).collect();
+    let upstream_ids: HashSet<(&str, &str)> = config
+        .upstreams
+        .iter()
+        .map(|upstream| (upstream.namespace.as_str(), upstream.id.as_str()))
+        .collect();
     let mut errors = Vec::new();
 
     for plugin in &config.plugin_configs {
@@ -669,16 +679,117 @@ pub(crate) fn validate_mesh_route_dispatch_upstream_references(
         let Ok(dispatch_config) = MeshRouteDispatchConfig::from_value(&plugin.config) else {
             continue;
         };
-        for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
-            if let Some(upstream_id) = rule.destination.upstream_id.as_deref()
-                && !upstream_ids.contains(upstream_id)
-            {
-                let proxy_id = plugin.proxy_id.as_deref().unwrap_or("<none>");
-                errors.push(format!(
-                    "PluginConfig '{}' (mesh_route_dispatch) rule {} for proxy_id '{}' references upstream_id '{}' that is not present in the active GatewayConfig namespace",
-                    plugin.id, rule_idx, proxy_id, upstream_id
-                ));
+        let target_namespaces: HashSet<&str> = if plugin.scope == PluginScope::Global {
+            let namespaces: HashSet<&str> = config
+                .proxies
+                .iter()
+                .filter(|proxy| proxy.dispatch_kind.is_http_family())
+                .filter(|proxy| {
+                    !config.plugin_configs.iter().any(|candidate| {
+                        if !candidate.enabled
+                            || candidate.plugin_name != plugin.plugin_name
+                            || candidate.namespace != proxy.namespace
+                            || candidate.scope == PluginScope::Global
+                            || !proxy
+                                .plugins
+                                .iter()
+                                .any(|association| association.plugin_config_id == candidate.id)
+                        {
+                            return false;
+                        }
+                        match candidate.scope {
+                            PluginScope::Proxy => {
+                                candidate.proxy_id.as_deref() == Some(proxy.id.as_str())
+                            }
+                            PluginScope::ProxyGroup => candidate.proxy_id.is_none(),
+                            PluginScope::Global => false,
+                        }
+                    })
+                })
+                .map(|proxy| proxy.namespace.as_str())
+                .collect();
+            // A global plugin with no currently-attached HTTP proxies must
+            // still fail closed against its own namespace: otherwise a dangling
+            // upstream_id is invisible until the first proxy appears.
+            if namespaces.is_empty() {
+                std::iter::once(plugin.namespace.as_str()).collect()
+            } else {
+                namespaces
             }
+        } else {
+            std::iter::once(plugin.namespace.as_str()).collect()
+        };
+        for (rule_idx, rule) in dispatch_config.rules.iter().enumerate() {
+            if let Some(upstream_id) = rule.destination.upstream_id.as_deref() {
+                for namespace in &target_namespaces {
+                    if !upstream_ids.contains(&(*namespace, upstream_id)) {
+                        let proxy_id = plugin.proxy_id.as_deref().unwrap_or("<none>");
+                        errors.push(format!(
+                            "PluginConfig '{}' (mesh_route_dispatch) rule {} for proxy_id '{}' references upstream_id '{}' that is not present in namespace '{}'",
+                            plugin.id, rule_idx, proxy_id, upstream_id, namespace
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Validate runtime resource identities, allowing only the exact
+/// mesh-generated identities recorded by the trusted materialization pass.
+///
+/// Ordinary file/database/CP/operator configs pass `None` and therefore use
+/// the same strict grammar as [`GatewayConfig::validate_resource_ids`].
+/// Namespaces, consumers, non-reserved IDs, and reserved IDs absent from the
+/// exact kind-qualified allowlist are always validated strictly.
+pub(crate) fn validate_runtime_resource_ids(
+    config: &GatewayConfig,
+    trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    for proxy in &config.proxies {
+        let trusted =
+            trusted_mesh_ids.is_some_and(|ids| ids.allows_proxy(&proxy.namespace, &proxy.id));
+        if !trusted && let Err(msg) = validate_resource_id(&proxy.id) {
+            errors.push(format!("Proxy ID: {}", msg));
+        }
+        if let Err(msg) = validate_namespace(&proxy.namespace) {
+            errors.push(format!("Proxy '{}': {}", proxy.id, msg));
+        }
+    }
+    for consumer in &config.consumers {
+        if let Err(msg) = validate_resource_id(&consumer.id) {
+            errors.push(format!("Consumer ID: {}", msg));
+        }
+        if let Err(msg) = validate_namespace(&consumer.namespace) {
+            errors.push(format!("Consumer '{}': {}", consumer.id, msg));
+        }
+    }
+    for plugin in &config.plugin_configs {
+        let trusted = trusted_mesh_ids
+            .is_some_and(|ids| ids.allows_plugin_config(&plugin.namespace, &plugin.id));
+        if !trusted && let Err(msg) = validate_resource_id(&plugin.id) {
+            errors.push(format!("PluginConfig ID: {}", msg));
+        }
+        if let Err(msg) = validate_namespace(&plugin.namespace) {
+            errors.push(format!("PluginConfig '{}': {}", plugin.id, msg));
+        }
+    }
+    for upstream in &config.upstreams {
+        let trusted = trusted_mesh_ids
+            .is_some_and(|ids| ids.allows_upstream(&upstream.namespace, &upstream.id));
+        if !trusted && let Err(msg) = validate_resource_id(&upstream.id) {
+            errors.push(format!("Upstream ID: {}", msg));
+        }
+        if let Err(msg) = validate_namespace(&upstream.namespace) {
+            errors.push(format!("Upstream '{}': {}", upstream.id, msg));
         }
     }
 
@@ -797,14 +908,12 @@ fn inject_gateway_workload_metrics_if_svid(
                 && plugin.enabled
                 && plugin.scope == PluginScope::Global
                 && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
-                && plugin.namespace == namespace
         })
         .or_else(|| {
             config.plugin_configs.iter().position(|plugin| {
                 plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
                     && plugin.scope == PluginScope::Global
                     && plugin.plugin_name == WORKLOAD_METRICS_PLUGIN_NAME
-                    && plugin.namespace == namespace
             })
         });
 
@@ -813,17 +922,15 @@ fn inject_gateway_workload_metrics_if_svid(
             &mut config.plugin_configs[operator_idx].config,
             &spiffe_id,
         );
-        config
-            .plugin_configs
-            .retain(|plugin| plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID);
+        config.plugin_configs.retain(|plugin| {
+            plugin.namespace != namespace || plugin.id != GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+        });
         return;
     }
 
-    if let Some(existing) = config
-        .plugin_configs
-        .iter_mut()
-        .find(|plugin| plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID)
-    {
+    if let Some(existing) = config.plugin_configs.iter_mut().find(|plugin| {
+        plugin.namespace == namespace && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+    }) {
         existing.plugin_name = WORKLOAD_METRICS_PLUGIN_NAME.to_string();
         existing.namespace = namespace.to_string();
         existing.scope = PluginScope::Global;
@@ -1186,7 +1293,7 @@ fn collect_reqwest_warmup_candidates_for_proxy(
     proxy: &Proxy,
     pool_key: &str,
     forces_reqwest: bool,
-    upstream_map: &HashMap<&str, &crate::config::types::Upstream>,
+    upstream_map: &HashMap<(&str, &str), &crate::config::types::Upstream>,
     http_candidates: &mut HashMap<String, ReqwestWarmupCandidate>,
     https_candidates: &mut HashMap<String, ReqwestWarmupCandidate>,
 ) {
@@ -1197,7 +1304,7 @@ fn collect_reqwest_warmup_candidates_for_proxy(
 
     let mut targets: Vec<(String, u16)> = Vec::new();
     if let Some(ref upstream_id) = proxy.upstream_id
-        && let Some(upstream) = upstream_map.get(upstream_id.as_str())
+        && let Some(upstream) = upstream_map.get(&(proxy.namespace.as_str(), upstream_id.as_str()))
     {
         for target in &upstream.targets {
             // Mesh-transport-tagged targets are NOT plaintext reqwest backends.
@@ -1670,14 +1777,15 @@ fn warn_if_h3_backend_tls_policy_incompatible(
     }
 }
 
-/// IDs of HTTP-family proxies whose effective WebSocket idle timeout resolves to
-/// `0` (disabled) — i.e. an upgraded WebSocket on them would have no idle bound.
+/// Namespace-qualified IDs of HTTP-family proxies whose effective WebSocket idle
+/// timeout resolves to `0` (disabled) — i.e. an upgraded WebSocket on them would
+/// have no idle bound.
 /// The effective timeout is the per-proxy `websocket_idle_timeout_seconds`
 /// override when set, else the global `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS`.
 fn websocket_idle_disabled_proxy_ids(
     config: &GatewayConfig,
     global_ws_idle_timeout_seconds: u64,
-) -> Vec<&str> {
+) -> Vec<String> {
     config
         .proxies
         .iter()
@@ -1687,7 +1795,7 @@ fn websocket_idle_disabled_proxy_ids(
                 DispatchKind::HttpPool | DispatchKind::HttpsPool
             ) && proxy.effective_websocket_idle_timeout_seconds(global_ws_idle_timeout_seconds) == 0
         })
-        .map(|proxy| proxy.id.as_str())
+        .map(|proxy| format!("{}/{}", proxy.namespace, proxy.id))
         .collect()
 }
 
@@ -1698,13 +1806,13 @@ fn websocket_idle_disabled_proxy_ids(
 /// that slot indefinitely. Activity from either direction — including Ping/Pong
 /// — refreshes the timer, so the disabled state is the only exposure.
 fn emit_websocket_idle_disabled_warning(
-    disabled_proxy_ids: &[&str],
+    disabled_proxy_ids: &[String],
     global_ws_idle_timeout_seconds: u64,
 ) {
     let sample = disabled_proxy_ids
         .iter()
         .take(3)
-        .copied()
+        .map(String::as_str)
         .collect::<Vec<_>>()
         .join(", ");
     warn!(
@@ -1735,13 +1843,14 @@ fn warn_if_websocket_idle_disabled(config: &GatewayConfig, global_ws_idle_timeou
 /// in `next` relative to `previous` — i.e. a proxy added with an effective `0`
 /// timeout, or one whose effective timeout changed from a bound value to `0`.
 /// Proxies already disabled in `previous` are excluded so a persistent opt-out
-/// is not reported again. The returned slices borrow from `next`.
-fn websocket_idle_newly_disabled_proxy_ids<'a>(
+/// is not reported again. Identity is `(namespace, id)`, so one tenant cannot
+/// suppress another tenant's transition warning.
+fn websocket_idle_newly_disabled_proxy_ids(
     previous: &GatewayConfig,
-    next: &'a GatewayConfig,
+    next: &GatewayConfig,
     global_ws_idle_timeout_seconds: u64,
-) -> Vec<&'a str> {
-    let previously_disabled: std::collections::HashSet<&str> =
+) -> Vec<String> {
+    let previously_disabled: std::collections::HashSet<String> =
         websocket_idle_disabled_proxy_ids(previous, global_ws_idle_timeout_seconds)
             .into_iter()
             .collect();
@@ -1777,7 +1886,7 @@ fn h3_websocket_quic_idle_mismatch_proxy_ids(
     h3_websocket_reachable: bool,
     global_ws_idle_timeout_seconds: u64,
     http3_idle_timeout_seconds: u64,
-) -> Vec<&str> {
+) -> Vec<String> {
     if !h3_websocket_reachable || http3_idle_timeout_seconds == 0 {
         return Vec::new();
     }
@@ -1791,19 +1900,19 @@ fn h3_websocket_quic_idle_mismatch_proxy_ids(
                 proxy.effective_websocket_idle_timeout_seconds(global_ws_idle_timeout_seconds);
             ws_idle == 0 || ws_idle > http3_idle_timeout_seconds
         })
-        .map(|proxy| proxy.id.as_str())
+        .map(|proxy| format!("{}/{}", proxy.namespace, proxy.id))
         .collect()
 }
 
 fn emit_h3_websocket_quic_idle_mismatch_warning(
-    affected_proxy_ids: &[&str],
+    affected_proxy_ids: &[String],
     global_ws_idle_timeout_seconds: u64,
     http3_idle_timeout_seconds: u64,
 ) {
     let sample = affected_proxy_ids
         .iter()
         .take(3)
-        .copied()
+        .map(String::as_str)
         .collect::<Vec<_>>()
         .join(", ");
     warn!(
@@ -1840,14 +1949,14 @@ fn warn_if_h3_websocket_quic_idle_mismatch(
     );
 }
 
-fn h3_websocket_new_quic_idle_mismatch_proxy_ids<'a>(
+fn h3_websocket_new_quic_idle_mismatch_proxy_ids(
     previous: &GatewayConfig,
-    next: &'a GatewayConfig,
+    next: &GatewayConfig,
     h3_websocket_reachable: bool,
     global_ws_idle_timeout_seconds: u64,
     http3_idle_timeout_seconds: u64,
-) -> Vec<&'a str> {
-    let previous_affected: std::collections::HashSet<&str> =
+) -> Vec<String> {
+    let previous_affected: std::collections::HashSet<String> =
         h3_websocket_quic_idle_mismatch_proxy_ids(
             previous,
             h3_websocket_reachable,
@@ -2510,6 +2619,47 @@ fn http2_pool_sender_error_response(
     }
 }
 
+/// Map a direct-H2 pooled `send_request` hyper error into a
+/// [`retry::BackendResponse`] whose `connection_error` bit is derived from
+/// the classified [`retry::ErrorClass`] via
+/// `connection_error == !request_reached_wire(error_class)`.
+///
+/// Extracted so unit tests can assert the boundary invariant without
+/// driving a live H2 backend.
+pub(crate) fn direct_h2_send_request_error_response(
+    proxy_id: &str,
+    e: hyper::Error,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let error_class = http2_pool::classify_pooled_h2_send_request_error(&e);
+    error!(
+        proxy_id = %proxy_id,
+        error_kind = retry::error_class_log_kind(error_class),
+        error = %e,
+        "HTTP/2 backend request failed"
+    );
+    direct_h2_send_request_error_response_for_class(error_class, resolved_ip)
+}
+
+/// Build a direct-H2 `send_request` failure response from an already-classified
+/// error class. This is the single place the
+/// `connection_error == !request_reached_wire(error_class)` boundary is applied
+/// for that dispatch site, so unit tests can assert the invariant across every
+/// class the classifier can emit without driving a live H2 backend.
+pub(crate) fn direct_h2_send_request_error_response_for_class(
+    error_class: retry::ErrorClass,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    retry::BackendResponse {
+        status_code: 502,
+        body: ResponseBody::Buffered(r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec()),
+        headers: HashMap::new(),
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
 fn backend_tls_sni_requires_direct_h2_response(
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
@@ -2613,26 +2763,17 @@ pub(crate) enum DirectH2UploadGate {
     /// The configured request body limit was exceeded — deterministic 413,
     /// never the backend's early response.
     RequestBodyTooLarge,
-    /// No terminal outcome was reported at all, so the size decision is
-    /// genuinely unknown. Fail closed: an unvetted early backend response must
-    /// not reach the client.
+    /// The complete upload was not observed, so the size decision is unknown.
+    /// Fail closed: an unvetted early backend response must not reach the client.
     FailClosed,
 }
 
 /// Map a terminal request-body outcome onto the direct-H2 response gate.
 ///
-/// `Errored` / `Abandoned` forward the backend response. Both provably imply
-/// the limit was *not* exceeded: overflow stores `exceeded` and reports
-/// `RequestBodyOutcome::Exceeded` from the same `poll_frame`, taking the
-/// completion sender so neither a later poll nor `Drop` can relabel it. Failing
-/// closed on them instead would turn two ordinary flows into 502s — a backend
-/// that answers early (401/403/413) and `RST_STREAM`s the unread upload, which
-/// is what Go's and Envoy's HTTP/2 servers do by default, and a client that
-/// disconnects mid-upload — while buying no additional enforcement.
-///
-/// `None` models a completion sender dropped without reporting. The adapter's
-/// `Drop` impl makes that unreachable in practice, but it must still fail
-/// closed rather than default to forwarding.
+/// Only `Completed` proves that the entire upload was observed within the
+/// configured limit. `Errored` and `Abandoned` leave the size decision unknown:
+/// unread frames may still take the upload over the limit, so they fail closed
+/// along with a missing completion signal.
 pub(crate) fn classify_direct_h2_upload_outcome(
     outcome: Option<body::RequestBodyOutcome>,
 ) -> DirectH2UploadGate {
@@ -2641,9 +2782,10 @@ pub(crate) fn classify_direct_h2_upload_outcome(
     };
     match outcome {
         body::RequestBodyOutcome::Exceeded => DirectH2UploadGate::RequestBodyTooLarge,
-        body::RequestBodyOutcome::Completed
-        | body::RequestBodyOutcome::Errored
-        | body::RequestBodyOutcome::Abandoned => DirectH2UploadGate::Forward,
+        body::RequestBodyOutcome::Completed => DirectH2UploadGate::Forward,
+        body::RequestBodyOutcome::Errored | body::RequestBodyOutcome::Abandoned => {
+            DirectH2UploadGate::FailClosed
+        }
     }
 }
 
@@ -3477,9 +3619,11 @@ fn streaming_response_status_is_passively_unhealthy(
     let (Some(upstream_id), Some(target)) = (proxy.upstream_id.as_deref(), target) else {
         return false;
     };
-    let Some(upstream) =
-        crate::load_balancer::LoadBalancerCache::get_upstream_from(lb_snapshot, upstream_id)
-    else {
+    let Some(upstream) = crate::load_balancer::LoadBalancerCache::get_upstream_from(
+        lb_snapshot,
+        &proxy.namespace,
+        upstream_id,
+    ) else {
         return false;
     };
     backend_dispatch::passive_health_for_target(proxy, &upstream, target)
@@ -4169,7 +4313,7 @@ pub(crate) fn plugin_rebuild_targets_for_incremental_stage(
     current_config: &GatewayConfig,
     candidate_config: &GatewayConfig,
     delta: &crate::config_delta::ConfigDelta,
-) -> HashSet<String> {
+) -> HashSet<crate::config::db_backend::NamespacedResourceId> {
     delta.proxy_ids_needing_plugin_rebuild(current_config, candidate_config)
 }
 
@@ -5200,7 +5344,7 @@ impl ProxyState {
         let proxy_map = config
             .proxies
             .iter()
-            .map(|proxy| (proxy.id.as_str(), proxy))
+            .map(|proxy| ((proxy.namespace.as_str(), proxy.id.as_str()), proxy))
             .collect::<HashMap<_, _>>();
         for plugin in &config.plugin_configs {
             if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
@@ -5217,7 +5361,22 @@ impl ProxyState {
             let base_proxy = plugin
                 .proxy_id
                 .as_deref()
-                .and_then(|proxy_id| proxy_map.get(proxy_id).copied())
+                .and_then(|proxy_id| {
+                    proxy_map
+                        .get(&(plugin.namespace.as_str(), proxy_id))
+                        .copied()
+                })
+                // Representative proxy used only to supply the ambient
+                // backend-TLS context for validating the rule's own material.
+                // Prefer one in the plugin's own namespace; fall back to any
+                // proxy so a global rule declared in a namespace that owns no
+                // proxies is still validated (it runs on every proxy anyway).
+                .or_else(|| {
+                    config
+                        .proxies
+                        .iter()
+                        .find(|proxy| proxy.namespace == plugin.namespace)
+                })
                 .or_else(|| config.proxies.first());
             let Some(base_proxy) = base_proxy else {
                 continue;
@@ -5759,7 +5918,7 @@ impl ProxyState {
         let load_balancer_cache = Arc::new(LoadBalancerCache::new(&config));
         let request_epoch = Arc::new(RequestEpochStore::new(RequestEpoch {
             config: Arc::new(config.clone()),
-            proxy_index_by_id: crate::request_epoch::build_proxy_index_by_id(&config),
+            proxy_index_by_key: crate::request_epoch::build_proxy_index_by_key(&config),
             route_table: RouterCache::build_route_table_snapshot(&config),
             plugin_cache: plugin_cache.load_inner(),
             consumer_index: consumer_index.load_inner(),
@@ -6160,15 +6319,23 @@ impl ProxyState {
         &self,
         config: &GatewayConfig,
     ) -> Vec<BackendCapabilityProbeTarget> {
-        let upstream_map: HashMap<&str, &Upstream> = config
+        // Capability probes must resolve upstreams/proxies by (namespace, id).
+        // A bare-id map last-wins across tenants and can probe or retain the
+        // wrong tenant's targets while retain_keys drops the correct ones.
+        let upstream_map: HashMap<(&str, &str), &Upstream> = config
             .upstreams
             .iter()
-            .map(|upstream| (upstream.id.as_str(), upstream))
+            .map(|upstream| {
+                (
+                    (upstream.namespace.as_str(), upstream.id.as_str()),
+                    upstream,
+                )
+            })
             .collect();
-        let proxy_map: HashMap<&str, &Proxy> = config
+        let proxy_map: HashMap<(&str, &str), &Proxy> = config
             .proxies
             .iter()
-            .map(|proxy| (proxy.id.as_str(), proxy))
+            .map(|proxy| ((proxy.namespace.as_str(), proxy.id.as_str()), proxy))
             .collect();
         let mut seen = std::collections::HashSet::new();
         let mut targets = Vec::new();
@@ -6179,7 +6346,8 @@ impl ProxyState {
             }
 
             if let Some(ref upstream_id) = proxy.upstream_id
-                && let Some(upstream) = upstream_map.get(upstream_id.as_str())
+                && let Some(upstream) =
+                    upstream_map.get(&(proxy.namespace.as_str(), upstream_id.as_str()))
             {
                 for target in &upstream.targets {
                     // SKIP cross-cluster east-west HBONE targets: they dial the
@@ -6238,9 +6406,9 @@ impl ProxyState {
             targets.retain(|target| {
                 // Screen BOTH the probe's backend host literal AND a literal
                 // `dns_override`: the H3/H2/reqwest capability probes dial via
-                // `resolve_backend_addr_cached`, whose IP-literal fast path skips
-                // the `DnsCacheResolver`, so a denied literal in EITHER field would
-                // be dialed at startup/reload (e.g. a QUIC probe to 169.254.169.254)
+                // the native-H3 pool's cached resolver, so a denied literal in
+                // EITHER field would be dialed at startup/reload (e.g. a QUIC
+                // probe to 169.254.169.254)
                 // even when a DB-sourced row only warned at load. Mirrors the
                 // request-path `denied_literal_backend_or_dns_override` guard;
                 // dropping the target leaves it `Unknown`, which routes via reqwest
@@ -6277,7 +6445,7 @@ impl ProxyState {
     /// and dispatch capability keys agree by construction.
     fn collect_mesh_tcp_egress_capability_targets(
         config: &GatewayConfig,
-        upstream_map: &HashMap<&str, &Upstream>,
+        upstream_map: &HashMap<(&str, &str), &Upstream>,
         seen: &mut std::collections::HashSet<String>,
         targets: &mut Vec<BackendCapabilityProbeTarget>,
     ) {
@@ -6291,7 +6459,9 @@ impl ProxyState {
                     &service.name,
                     sp.port,
                 );
-                let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
+                let Some(upstream) =
+                    upstream_map.get(&(service.namespace.as_str(), upstream_id.as_str()))
+                else {
                     continue;
                 };
                 let mut relay_proxy = crate::modes::mesh::mesh_outbound_tcp_relay_proxy(
@@ -6301,7 +6471,11 @@ impl ProxyState {
                     &upstream_id,
                 );
                 relay_proxy.dispatch_port_overrides =
-                    Self::projected_dispatch_overrides_for_upstream(config, &upstream_id);
+                    Self::projected_dispatch_overrides_for_upstream(
+                        config,
+                        &service.namespace,
+                        &upstream_id,
+                    );
                 for target in &upstream.targets {
                     // Only Ambient `mesh.hbone` targets use the HBONE capability
                     // registry. Sidecar `mesh.mtls` raw-TCP targets dispatch over
@@ -6339,7 +6513,9 @@ impl ProxyState {
             &mesh.workloads,
             mesh.multi_cluster.as_ref(),
         ) {
-            let Some(upstream) = upstream_map.get(spec.upstream_id.as_str()) else {
+            let Some(upstream) =
+                upstream_map.get(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
+            else {
                 continue;
             };
             let mut relay_proxy = crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
@@ -6349,8 +6525,11 @@ impl ProxyState {
                 spec.canonical_ip,
                 &spec.upstream_id,
             );
-            relay_proxy.dispatch_port_overrides =
-                Self::projected_dispatch_overrides_for_upstream(config, &spec.upstream_id);
+            relay_proxy.dispatch_port_overrides = Self::projected_dispatch_overrides_for_upstream(
+                config,
+                &spec.service.namespace,
+                &spec.upstream_id,
+            );
             for target in &upstream.targets {
                 // Ambient `mesh.hbone` per-workload targets only; Sidecar
                 // `mesh.mtls` (no probe) and cross-cluster east-west targets
@@ -6388,7 +6567,9 @@ impl ProxyState {
                     &service.name,
                     sp.port,
                 );
-                let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
+                let Some(upstream) =
+                    upstream_map.get(&(service.namespace.as_str(), upstream_id.as_str()))
+                else {
                     continue;
                 };
                 let mut relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
@@ -6398,7 +6579,11 @@ impl ProxyState {
                     &upstream_id,
                 );
                 relay_proxy.dispatch_port_overrides =
-                    Self::projected_dispatch_overrides_for_upstream(config, &upstream_id);
+                    Self::projected_dispatch_overrides_for_upstream(
+                        config,
+                        &service.namespace,
+                        &upstream_id,
+                    );
                 for target in &upstream.targets {
                     // Ambient `mesh.hbone` UDP targets only; Sidecar `mesh.mtls`
                     // (no probe) and cross-cluster east-west targets
@@ -6422,8 +6607,8 @@ impl ProxyState {
     fn collect_mesh_route_dispatch_capability_targets(
         &self,
         config: &GatewayConfig,
-        proxy_map: &HashMap<&str, &Proxy>,
-        upstream_map: &HashMap<&str, &Upstream>,
+        proxy_map: &HashMap<(&str, &str), &Proxy>,
+        upstream_map: &HashMap<(&str, &str), &Upstream>,
         seen: &mut std::collections::HashSet<String>,
         targets: &mut Vec<BackendCapabilityProbeTarget>,
     ) {
@@ -6434,7 +6619,7 @@ impl ProxyState {
             let Some(proxy_id) = plugin.proxy_id.as_deref() else {
                 continue;
             };
-            let Some(base_proxy) = proxy_map.get(proxy_id) else {
+            let Some(base_proxy) = proxy_map.get(&(plugin.namespace.as_str(), proxy_id)) else {
                 continue;
             };
             if !base_proxy.dispatch_kind.is_http_family() {
@@ -6458,7 +6643,9 @@ impl ProxyState {
                 let mut effective_proxy = (*base_proxy).clone();
                 if let Some(upstream_id) = destination.upstream_id {
                     effective_proxy.upstream_id = Some(upstream_id.clone());
-                    let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
+                    let Some(upstream) =
+                        upstream_map.get(&(base_proxy.namespace.as_str(), upstream_id.as_str()))
+                    else {
                         continue;
                     };
                     effective_proxy.resolved_tls = BackendTlsConfig::from_upstream(upstream);
@@ -7266,10 +7453,15 @@ impl ProxyState {
         // probes also `tokio::join!` H2 + H3 internally) — overloading
         // backends and breaking the operator-set cap.
         let warmup_semaphore = Arc::new(Semaphore::new(concurrency));
-        let upstream_map: HashMap<&str, &crate::config::types::Upstream> = config
+        let upstream_map: HashMap<(&str, &str), &crate::config::types::Upstream> = config
             .upstreams
             .iter()
-            .map(|upstream| (upstream.id.as_str(), upstream))
+            .map(|upstream| {
+                (
+                    (upstream.namespace.as_str(), upstream.id.as_str()),
+                    upstream,
+                )
+            })
             .collect();
 
         // Collect ALL reqwest warmup candidates upfront, partitioned by
@@ -7321,8 +7513,9 @@ impl ProxyState {
             // sharing the dedup key — one reqwest-forcing proxy is enough
             // to keep the pool warm.
             let per_proxy_pool = pool_config.for_proxy(proxy);
-            let requires_request_body_buffering =
-                self.plugin_cache.requires_request_body_buffering(&proxy.id);
+            let requires_request_body_buffering = self
+                .plugin_cache
+                .requires_request_body_buffering(&proxy.namespace, &proxy.id);
             let forces_reqwest = proxy_config_forces_reqwest_dispatch(
                 proxy,
                 per_proxy_pool.enable_http2,
@@ -7528,6 +7721,9 @@ impl ProxyState {
     ///
     /// - *Reject* — accumulate into the returned error vector and abort
     ///   the reload:
+    ///   - `validate_resource_ids` — delimiter-bearing or otherwise malformed
+    ///     resource IDs/namespaces would make namespace-qualified runtime cache
+    ///     keys ambiguous.
     ///   - `validate_regex_listen_paths` — uncompilable regex would
     ///     silently skip routes at runtime.
     ///   - `validate_unique_listen_paths` — overlapping listen paths
@@ -7567,6 +7763,14 @@ impl ProxyState {
     /// can log every reason in one pass instead of discovering them
     /// iteratively across reloads.
     fn validate_full_config(&self, config: &GatewayConfig) -> Result<(), Vec<String>> {
+        self.validate_full_config_with_mesh_ids(config, None)
+    }
+
+    fn validate_full_config_with_mesh_ids(
+        &self,
+        config: &GatewayConfig,
+        trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
+    ) -> Result<(), Vec<String>> {
         // Warn-only — TLS field validation (cert paths, expiry, IP policy).
         if let Err(errors) = config.validate_all_fields_with_ip_policy(
             self.env_config.tls_cert_expiry_warning_days,
@@ -7588,6 +7792,9 @@ impl ProxyState {
         // error vector so callers can log every reason at once instead of
         // discovering them iteratively across reloads.
         let mut errors: Vec<String> = Vec::new();
+        if let Err(errs) = validate_runtime_resource_ids(config, trusted_mesh_ids) {
+            errors.extend(errs);
+        }
         if let Err(errs) = config.validate_regex_listen_paths() {
             errors.extend(errs);
         }
@@ -7666,19 +7873,19 @@ impl ProxyState {
             return Self::projected_route_proxy_content_changed(old_config, new_config);
         }
 
-        let old_route_indexed_proxy_ids: std::collections::HashSet<&str> = old_config
+        let old_route_indexed_proxy_ids: std::collections::HashSet<(&str, &str)> = old_config
             .proxies
             .iter()
             .filter(|proxy| is_route_indexed(proxy))
-            .map(|proxy| proxy.id.as_str())
+            .map(|proxy| (proxy.namespace.as_str(), proxy.id.as_str()))
             .collect();
 
         delta
             .modified_proxies
             .iter()
-            .map(|proxy| proxy.id.as_str())
-            .chain(delta.removed_proxy_ids.iter().map(String::as_str))
-            .any(|id| old_route_indexed_proxy_ids.contains(id))
+            .map(|proxy| (proxy.namespace.as_str(), proxy.id.as_str()))
+            .chain(delta.removed_proxy_ids.iter().map(|key| key.as_key()))
+            .any(|id| old_route_indexed_proxy_ids.contains(&id))
             || Self::projected_route_proxy_content_changed(old_config, new_config)
     }
 
@@ -7695,11 +7902,14 @@ impl ProxyState {
         old_config: &GatewayConfig,
         new_config: &GatewayConfig,
     ) -> bool {
-        let old_route_indexed: HashMap<&str, &Proxy> = old_config
+        // Keyed by `(namespace, id)`: a bare-id index would let one tenant's
+        // same-id proxy stand in for another's, masking a real projected
+        // route-content change (or inventing one that never happened).
+        let old_route_indexed: HashMap<(&str, &str), &Proxy> = old_config
             .proxies
             .iter()
             .filter(|proxy| !proxy.dispatch_kind.is_stream())
-            .map(|proxy| (proxy.id.as_str(), proxy))
+            .map(|proxy| ((proxy.namespace.as_str(), proxy.id.as_str()), proxy))
             .collect();
 
         new_config
@@ -7708,7 +7918,7 @@ impl ProxyState {
             .filter(|proxy| !proxy.dispatch_kind.is_stream())
             .any(|new_proxy| {
                 old_route_indexed
-                    .get(new_proxy.id.as_str())
+                    .get(&(new_proxy.namespace.as_str(), new_proxy.id.as_str()))
                     .is_some_and(|old_proxy| !Self::proxy_content_eq(old_proxy, new_proxy))
             })
             || Self::projected_mesh_stream_relay_dispatch_content_changed(old_config, new_config)
@@ -7762,12 +7972,18 @@ impl ProxyState {
 
     fn mesh_stream_relay_dispatch_overrides(
         config: &GatewayConfig,
-    ) -> HashMap<String, Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>> {
+    ) -> HashMap<
+        NamespacedResourceId,
+        Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>,
+    > {
         let Some(mesh) = config.mesh.as_deref() else {
             return HashMap::new();
         };
-        let upstream_ids: std::collections::HashSet<&str> =
-            config.upstreams.iter().map(|u| u.id.as_str()).collect();
+        let upstream_keys: std::collections::HashSet<(&str, &str)> = config
+            .upstreams
+            .iter()
+            .map(|u| (u.namespace.as_str(), u.id.as_str()))
+            .collect();
         let mut projection = HashMap::new();
 
         for service in &mesh.services {
@@ -7780,10 +7996,14 @@ impl ProxyState {
                     &service.name,
                     sp.port,
                 );
-                if upstream_ids.contains(upstream_id.as_str()) {
+                if upstream_keys.contains(&(service.namespace.as_str(), upstream_id.as_str())) {
                     projection.insert(
-                        upstream_id.clone(),
-                        Self::projected_dispatch_overrides_for_upstream(config, &upstream_id),
+                        NamespacedResourceId::new(&service.namespace, &upstream_id),
+                        Self::projected_dispatch_overrides_for_upstream(
+                            config,
+                            &service.namespace,
+                            &upstream_id,
+                        ),
                     );
                 }
             }
@@ -7793,10 +8013,14 @@ impl ProxyState {
                     &service.name,
                     sp.port,
                 );
-                if upstream_ids.contains(upstream_id.as_str()) {
+                if upstream_keys.contains(&(service.namespace.as_str(), upstream_id.as_str())) {
                     projection.insert(
-                        upstream_id.clone(),
-                        Self::projected_dispatch_overrides_for_upstream(config, &upstream_id),
+                        NamespacedResourceId::new(&service.namespace, &upstream_id),
+                        Self::projected_dispatch_overrides_for_upstream(
+                            config,
+                            &service.namespace,
+                            &upstream_id,
+                        ),
                     );
                 }
             }
@@ -7807,10 +8031,15 @@ impl ProxyState {
             &mesh.workloads,
             mesh.multi_cluster.as_ref(),
         ) {
-            if upstream_ids.contains(spec.upstream_id.as_str()) {
+            if upstream_keys.contains(&(spec.service.namespace.as_str(), spec.upstream_id.as_str()))
+            {
                 projection.insert(
-                    spec.upstream_id.clone(),
-                    Self::projected_dispatch_overrides_for_upstream(config, &spec.upstream_id),
+                    NamespacedResourceId::new(&spec.service.namespace, &spec.upstream_id),
+                    Self::projected_dispatch_overrides_for_upstream(
+                        config,
+                        &spec.service.namespace,
+                        &spec.upstream_id,
+                    ),
                 );
             }
         }
@@ -7820,9 +8049,13 @@ impl ProxyState {
 
     fn projected_dispatch_overrides_for_upstream(
         config: &GatewayConfig,
+        namespace: &str,
         upstream_id: &str,
     ) -> Option<HashMap<u16, crate::config::types::ResolvedPortOverride>> {
-        let upstream = config.upstreams.iter().find(|u| u.id == upstream_id)?;
+        let upstream = config
+            .upstreams
+            .iter()
+            .find(|u| u.namespace == namespace && u.id == upstream_id)?;
         if upstream.port_overrides.is_empty() {
             return None;
         }
@@ -7838,12 +8071,18 @@ impl ProxyState {
     }
 
     fn mesh_stream_relay_dispatch_overrides_eq(
-        a: &HashMap<String, Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>>,
-        b: &HashMap<String, Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>>,
+        a: &HashMap<
+            NamespacedResourceId,
+            Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>,
+        >,
+        b: &HashMap<
+            NamespacedResourceId,
+            Option<HashMap<u16, crate::config::types::ResolvedPortOverride>>,
+        >,
     ) -> bool {
         a.len() == b.len()
-            && a.iter().all(|(upstream_id, a_overrides)| {
-                b.get(upstream_id).is_some_and(|b_overrides| {
+            && a.iter().all(|(upstream_key, a_overrides)| {
+                b.get(upstream_key).is_some_and(|b_overrides| {
                     Self::route_dispatch_overrides_eq(a_overrides, b_overrides)
                 })
             })
@@ -8080,7 +8319,27 @@ impl ProxyState {
     }
 
     /// Update the proxy configuration.
-    pub fn update_config(&self, mut new_config: GatewayConfig) -> ConfigApplyOutcome {
+    pub fn update_config(&self, new_config: GatewayConfig) -> ConfigApplyOutcome {
+        self.update_config_with_mesh_ids(new_config, None)
+    }
+
+    /// Mesh-only update path carrying the exact identities emitted by the
+    /// trusted materialization pass. It changes only resource-ID validation;
+    /// every other rejecting validator and the atomic publication path are
+    /// shared with [`Self::update_config`].
+    pub(crate) fn update_mesh_config(
+        &self,
+        new_config: GatewayConfig,
+        trusted_mesh_ids: &TrustedMeshGeneratedResourceIds,
+    ) -> ConfigApplyOutcome {
+        self.update_config_with_mesh_ids(new_config, Some(trusted_mesh_ids))
+    }
+
+    fn update_config_with_mesh_ids(
+        &self,
+        mut new_config: GatewayConfig,
+        trusted_mesh_ids: Option<&TrustedMeshGeneratedResourceIds>,
+    ) -> ConfigApplyOutcome {
         use crate::config_delta::ConfigDelta;
 
         // Normalize hostnames (ASCII-lowercase) and pre-compute each
@@ -8111,7 +8370,8 @@ impl ProxyState {
         // fully BEFORE swap" guard must live inside the swap function so a
         // future caller (e.g. an admin "import config" handler) cannot
         // publish an invalid config to the hot path.
-        if let Err(errors) = self.validate_full_config(&new_config) {
+        if let Err(errors) = self.validate_full_config_with_mesh_ids(&new_config, trusted_mesh_ids)
+        {
             for msg in &errors {
                 error!("Config reload rejected: {}", msg);
             }
@@ -8205,11 +8465,16 @@ impl ProxyState {
                 });
             }
 
-            // Prune adaptive buffer state for removed proxies.
+            // Prune adaptive buffer state for removed proxies. Identity is the
+            // `(namespace, id)` pair so removing one tenant's proxy leaves a
+            // same-id proxy in another namespace untouched.
             {
-                let active_ids: Vec<&str> =
-                    new_config.proxies.iter().map(|p| p.id.as_str()).collect();
-                self.adaptive_buffer.prune_missing(&active_ids);
+                let active_proxies: Vec<(&str, &str)> = new_config
+                    .proxies
+                    .iter()
+                    .map(|p| (p.namespace.as_str(), p.id.as_str()))
+                    .collect();
+                self.adaptive_buffer.prune_missing(&active_proxies);
             }
 
             warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
@@ -8389,12 +8654,16 @@ impl ProxyState {
             let mut active_keys = std::collections::HashSet::new();
             for proxy in &new_config.proxies {
                 if let Some(ref upstream_id) = proxy.upstream_id
-                    && let Some(upstream) =
-                        new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+                    && let Some(upstream) = new_config
+                        .upstreams
+                        .iter()
+                        .find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
                 {
                     for target in &upstream.targets {
-                        active_keys
-                            .insert(format!("{}::{}:{}", proxy.id, target.host, target.port));
+                        active_keys.insert(format!(
+                            "{}|{}::{}:{}",
+                            proxy.namespace, proxy.id, target.host, target.port
+                        ));
                     }
                 }
             }
@@ -8408,10 +8677,16 @@ impl ProxyState {
         }
         for proxy in &new_config.proxies {
             if let Some(ref upstream_id) = proxy.upstream_id
-                && let Some(upstream) = new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+                && let Some(upstream) = new_config
+                    .upstreams
+                    .iter()
+                    .find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
             {
-                self.health_checker
-                    .remove_stale_passive_targets_for_proxy(&proxy.id, &upstream.targets);
+                self.health_checker.remove_stale_passive_targets_for_proxy(
+                    &proxy.namespace,
+                    &proxy.id,
+                    &upstream.targets,
+                );
             }
         }
 
@@ -8452,10 +8727,16 @@ impl ProxyState {
             });
         }
 
-        // Prune adaptive buffer state for removed proxies.
+        // Prune adaptive buffer state for removed proxies. Identity is the
+        // `(namespace, id)` pair so removing one tenant's proxy leaves a
+        // same-id proxy in another namespace untouched.
         {
-            let active_ids: Vec<&str> = new_config.proxies.iter().map(|p| p.id.as_str()).collect();
-            self.adaptive_buffer.prune_missing(&active_ids);
+            let active_proxies: Vec<(&str, &str)> = new_config
+                .proxies
+                .iter()
+                .map(|p| (p.namespace.as_str(), p.id.as_str()))
+                .collect();
+            self.adaptive_buffer.prune_missing(&active_proxies);
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
@@ -8644,6 +8925,9 @@ impl ProxyState {
         // Upsert added/modified resources using HashMap index for O(1) lookups
         // instead of O(n) linear scan per resource. Move values to avoid cloning.
 
+        // Upsert keys are the `(namespace, id)` pair, matching consumers below.
+        // A bare-id index would let one tenant's point update overwrite another
+        // tenant's identically-named resource row.
         if !result.added_or_modified_proxies.is_empty() {
             let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .proxies
@@ -8855,12 +9139,16 @@ impl ProxyState {
             let mut active_keys = std::collections::HashSet::new();
             for proxy in &new_config.proxies {
                 if let Some(ref upstream_id) = proxy.upstream_id
-                    && let Some(upstream) =
-                        new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+                    && let Some(upstream) = new_config
+                        .upstreams
+                        .iter()
+                        .find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
                 {
                     for target in &upstream.targets {
-                        active_keys
-                            .insert(format!("{}::{}:{}", proxy.id, target.host, target.port));
+                        active_keys.insert(format!(
+                            "{}|{}::{}:{}",
+                            proxy.namespace, proxy.id, target.host, target.port
+                        ));
                     }
                 }
             }
@@ -8874,10 +9162,16 @@ impl ProxyState {
         }
         for proxy in &new_config.proxies {
             if let Some(ref upstream_id) = proxy.upstream_id
-                && let Some(upstream) = new_config.upstreams.iter().find(|u| u.id == *upstream_id)
+                && let Some(upstream) = new_config
+                    .upstreams
+                    .iter()
+                    .find(|u| u.id == *upstream_id && u.namespace == proxy.namespace)
             {
-                self.health_checker
-                    .remove_stale_passive_targets_for_proxy(&proxy.id, &upstream.targets);
+                self.health_checker.remove_stale_passive_targets_for_proxy(
+                    &proxy.namespace,
+                    &proxy.id,
+                    &upstream.targets,
+                );
             }
         }
 
@@ -8916,10 +9210,16 @@ impl ProxyState {
             });
         }
 
-        // Prune adaptive buffer state for removed proxies.
+        // Prune adaptive buffer state for removed proxies. Identity is the
+        // `(namespace, id)` pair so removing one tenant's proxy leaves a
+        // same-id proxy in another namespace untouched.
         {
-            let active_ids: Vec<&str> = new_config.proxies.iter().map(|p| p.id.as_str()).collect();
-            self.adaptive_buffer.prune_missing(&active_ids);
+            let active_proxies: Vec<(&str, &str)> = new_config
+                .proxies
+                .iter()
+                .map(|p| (p.namespace.as_str(), p.id.as_str()))
+                .collect();
+            self.adaptive_buffer.prune_missing(&active_proxies);
         }
 
         warn_if_h3_backend_tls_policy_incompatible(&new_config, self.tls_policy.as_deref());
@@ -8945,12 +9245,15 @@ impl ProxyState {
         // idempotent and only restarts listeners whose reload key actually
         // changed.
         let removed_had_stream = if !delta.removed_proxy_ids.is_empty() {
-            let removed_set: std::collections::HashSet<&str> =
-                delta.removed_proxy_ids.iter().map(|s| s.as_str()).collect();
-            old_config
-                .proxies
+            let removed_set: std::collections::HashSet<(&str, &str)> = delta
+                .removed_proxy_ids
                 .iter()
-                .any(|p| removed_set.contains(p.id.as_str()) && p.dispatch_kind.is_stream())
+                .map(|key| key.as_key())
+                .collect();
+            old_config.proxies.iter().any(|p| {
+                removed_set.contains(&(p.namespace.as_str(), p.id.as_str()))
+                    && p.dispatch_kind.is_stream()
+            })
         } else {
             false
         };
@@ -9848,6 +10151,7 @@ async fn handle_websocket_request_authenticated(
                     // future refactor that moves this block.)
                     if let Some(cb_config) = &proxy.circuit_breaker {
                         let cb = state.circuit_breaker_cache.get_or_create(
+                            &proxy.namespace,
                             &proxy.id,
                             current_cb_target_key.as_deref(),
                             cb_config,
@@ -9946,6 +10250,7 @@ async fn handle_websocket_request_authenticated(
                     let mut retry_admitted_by_cb = true;
                     if !retry_path_mismatch && let Some(cb_config) = &proxy.circuit_breaker {
                         match state.circuit_breaker_cache.can_execute(
+                            &proxy.namespace,
                             &proxy.id,
                             retry_cb_target_key.as_deref(),
                             cb_config,
@@ -10003,6 +10308,7 @@ async fn handle_websocket_request_authenticated(
                 // permanently.
                 if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
@@ -10158,6 +10464,7 @@ async fn handle_websocket_request_authenticated(
     // target. Mirrors the H3 WS path (`src/http3/websocket.rs`).
     if let Some(cb_config) = &proxy.circuit_breaker {
         let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
             &proxy.id,
             current_cb_target_key.as_deref(),
             cb_config,
@@ -10273,7 +10580,11 @@ async fn handle_websocket_request_authenticated(
             target,
         );
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(
+                &epoch.load_balancer,
+                &proxy.namespace,
+                upstream_id,
+            );
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -11187,46 +11498,77 @@ pub(crate) async fn connect_websocket_backend(
             80
         }
     });
-    let connect_future = async {
-        // Resolve through the gateway DNS cache when available so the egress
-        // policy is enforced on the resolved address (a hostname that resolves —
-        // or rebinds — to a denied IP such as 169.254.169.254 fails here) and we
-        // dial that exact IP. The TLS connector still derives SNI from
-        // `ws_request` (the hostname), so dialing the IP is transparent.
-        let tcp = match dns_cache {
-            Some(cache) => {
-                let resolved_ip = cache
-                    .resolve(
-                        &dial_host,
-                        proxy.dns_override.as_deref(),
-                        proxy.dns_cache_ttl_seconds,
-                    )
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("WebSocket backend resolution failed for {dial_host}: {e}").into()
-                    })?;
-                tokio::net::TcpStream::connect((resolved_ip, dial_port)).await?
+    let connect_result = if let Some(cache) = dns_cache {
+        let candidates = cache
+            .resolve_candidates(
+                &dial_host,
+                proxy.dns_override.as_deref(),
+                proxy.dns_cache_ttl_seconds,
+            )
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("WebSocket backend resolution failed for {dial_host}: {e}").into()
+            })?;
+        crate::dns::connect_candidates(&candidates, dial_port, connect_timeout, |addr| {
+            let request = ws_request.clone();
+            let connector = connector.clone();
+            let idle_tracker = idle_tracker.clone();
+            async move {
+                let tcp = tokio::net::TcpStream::connect(addr).await?;
+                // Keep the hostname-bearing request intact: tungstenite derives
+                // Host and TLS SNI/certificate verification from it, never from
+                // the concrete address selected for this attempt.
+                set_tcp_keepalive(&tcp);
+                client_async_tls_with_config(
+                    request,
+                    WsActivityIo::new(tcp, idle_tracker),
+                    // WebSocketConfig is Copy; pass by value (clippy::clone_on_copy).
+                    Some(ws_config),
+                    connector,
+                )
+                .await
+                .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
             }
-            None => tokio::net::TcpStream::connect((dial_host.as_str(), dial_port)).await?,
-        };
-        // Without nodelay, 70 KB WS messages hit Nagle + delayed-ACK
-        // (~40 ms/msg); keepalive bounds dead-peer detection on idle
-        // long-lived sessions.
-        set_tcp_keepalive(&tcp);
-        client_async_tls_with_config(
-            ws_request,
-            WsActivityIo::new(tcp, idle_tracker),
-            Some(ws_config),
-            connector,
-        )
+        })
         .await
-        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+        .map(|(handshake, _)| handshake)
+        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+            match error {
+                crate::dns::CandidateConnectError::TimedOut { .. } => format!(
+                    "WebSocket backend connect timeout ({}ms) for proxy {}",
+                    proxy.backend_connect_timeout_ms, proxy.id
+                )
+                .into(),
+                crate::dns::CandidateConnectError::Failed { source, .. } => source,
+            }
+        })
+    } else {
+        tokio::time::timeout(connect_timeout, async {
+            let tcp = tokio::net::TcpStream::connect((dial_host.as_str(), dial_port)).await?;
+            set_tcp_keepalive(&tcp);
+            client_async_tls_with_config(
+                ws_request,
+                WsActivityIo::new(tcp, idle_tracker),
+                Some(ws_config),
+                connector,
+            )
+            .await
+            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
+        })
+        .await
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            format!(
+                "WebSocket backend connect timeout ({}ms) for proxy {}",
+                proxy.backend_connect_timeout_ms, proxy.id
+            )
+            .into()
+        })?
     };
 
-    let (backend_ws_stream, backend_response) =
-        match tokio::time::timeout(connect_timeout, connect_future).await {
-            Ok(result) => result?,
-            Err(_) => {
+    let (backend_ws_stream, backend_response) = match connect_result {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            if error.to_string().contains("connect timeout") {
                 error!(
                     proxy_id = %proxy.id,
                     backend_url = %strip_query_params(backend_url),
@@ -11234,13 +11576,10 @@ pub(crate) async fn connect_websocket_backend(
                     error_kind = "connect_timeout",
                     "WebSocket backend connect timeout"
                 );
-                return Err(format!(
-                    "WebSocket backend connect timeout ({}ms) for proxy {}",
-                    proxy.backend_connect_timeout_ms, proxy.id
-                )
-                .into());
             }
-        };
+            return Err(error);
+        }
+    };
 
     debug!("Connected to backend WebSocket server: {}", backend_url);
     debug!("Backend response status: {}", backend_response.status());
@@ -12575,7 +12914,11 @@ where
                 error = %message,
                 "WebSocket tunnel residual forward failed"
             );
-            adaptive_buffer.record_connection(proxy_id, recovered_backend_bytes_written);
+            adaptive_buffer.record_connection(
+                &session_meta.namespace,
+                proxy_id,
+                recovered_backend_bytes_written,
+            );
             fire_ws_tunnel_disconnect_hooks(
                 &ws_disconnect_plugins,
                 proxy_id,
@@ -12587,7 +12930,7 @@ where
             .await;
             return Ok(());
         }
-        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+        let buf_size = adaptive_buffer.get_buffer_size(&session_meta.namespace, proxy_id);
         // With the WebSocket idle timeout disabled, pass a non-zero relay cap
         // so the shared TCP relay uses its direction-tracking path instead of
         // Tokio's opaque fast path. That preserves per-direction byte counters
@@ -12608,6 +12951,7 @@ where
         )
         .await;
         adaptive_buffer.record_connection(
+            &session_meta.namespace,
             proxy_id,
             copy_result.bytes_client_to_backend.saturating_add(
                 copy_result
@@ -17664,9 +18008,12 @@ fn release_circuit_breaker_probe_on_admission_reject(
         return;
     }
     if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state
-            .circuit_breaker_cache
-            .get_or_create(&proxy.id, target_key, cb_config);
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            &proxy.id,
+            target_key,
+            cb_config,
+        );
         cb.record_neutral(true);
     }
 }
@@ -19380,7 +19727,7 @@ async fn handle_proxy_request_inner(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
     debug!(proxy_id = %proxy.id, method = %method, path = %path, client_ip = %ctx.client_ip, "Request routed to proxy");
 
     // Preserve the path the client actually requested before any plugin can
@@ -19407,9 +19754,13 @@ async fn handle_proxy_request_inner(
         HttpFlavor::Plain => ProxyProtocol::Http,
     };
     let plugin_cache_view = if grpc_web_request {
-        epoch.plugin_cache.grpc_web_request_view(&proxy.id)
+        epoch
+            .plugin_cache
+            .grpc_web_request_view(&proxy.namespace, &proxy.id)
     } else {
-        epoch.plugin_cache.request_view(&proxy.id, request_protocol)
+        epoch
+            .plugin_cache
+            .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
     let initial_response_header_policy_plugins =
         plugin_cache_view.initial_response_header_policy_plugins();
@@ -20524,7 +20875,7 @@ async fn handle_proxy_request_inner(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
 
     // Istio `VirtualService.http[].rewrite.uri`: `mesh_route_dispatch` set
     // `ctx.route_override_path` for the matched route. Rebase the request path
@@ -20969,7 +21320,7 @@ async fn handle_proxy_request_inner(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
 
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet> = None;
@@ -21552,6 +21903,7 @@ async fn handle_proxy_request_inner(
             cb: if cb_is_half_open_probe {
                 proxy.circuit_breaker.as_ref().map(|cfg| {
                     state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         &proxy.id,
                         cb_target_key.as_deref(),
                         cfg,
@@ -21685,6 +22037,16 @@ async fn handle_proxy_request_inner(
         // coupling ownership to the response lifecycle is defense-in-depth,
         // while the raw client still handles the legal residual reset (#2057).
         let mut held_frontend_grpc_upload: Option<grpc_proxy::GrpcBody> = None;
+        // Header map replayed by the gRPC retry loop (#2934). It must be the
+        // REAL collected `HeaderMap` the first attempt dispatched: rebuilding
+        // it from the stringified plugin `ctx.headers` map comma-joins legal
+        // duplicate gRPC metadata (`x-md: a`, `x-md: b`) into one value and
+        // silently drops opaque/non-UTF-8 field values, so attempt 2 would send
+        // a different request than attempt 1. Each dispatch branch below fills
+        // this in before it moves `grpc_headers` into the first attempt, and
+        // only when a retry policy exists so the clone is never paid for
+        // otherwise.
+        let mut grpc_replay_headers = hyper::HeaderMap::new();
         let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
             // Split path: collect body → run plugin hooks → dispatch
             let (grpc_method, grpc_headers, grpc_req_body) = match client_request_body {
@@ -21937,6 +22299,11 @@ async fn handle_proxy_request_inner(
                 upstream_balancer.clone(),
             ));
             grpc_backend_admission_started_at = Instant::now();
+            // Capture the real HeaderMap for retries BEFORE it moves into the
+            // first attempt (#2934).
+            if grpc_has_retry {
+                grpc_replay_headers = grpc_headers.clone();
+            }
             let result = grpc_proxy::proxy_grpc_request_core(
                 grpc_method,
                 grpc_headers,
@@ -22024,6 +22391,7 @@ async fn handle_proxy_request_inner(
                     match proxy.circuit_breaker.as_ref() {
                         Some(cb_config) => {
                             let cb = state.circuit_breaker_cache.get_or_create(
+                                &proxy.namespace,
                                 &proxy.id,
                                 grpc_final_cb_key.as_deref(),
                                 cb_config,
@@ -22189,6 +22557,11 @@ async fn handle_proxy_request_inner(
                             upstream_balancer.clone(),
                         ));
                         grpc_backend_admission_started_at = Instant::now();
+                        // Capture the real HeaderMap for retries BEFORE it
+                        // moves into the first attempt (#2934).
+                        if grpc_has_retry {
+                            grpc_replay_headers = grpc_headers.clone();
+                        }
                         let result = grpc_proxy::proxy_grpc_request_core(
                             grpc_method,
                             grpc_headers,
@@ -22245,22 +22618,12 @@ async fn handle_proxy_request_inner(
             }
         };
 
-        // Only build retry parts when retries are configured
+        // Retry attempts reuse the real collected HeaderMap (cloned above when
+        // retry is enabled) so duplicate metadata lines and opaque/non-UTF-8
+        // values stay byte-identical to attempt 1. Do NOT rebuild from the
+        // stringified plugin `ctx.headers` map.
         let grpc_method = hyper::Method::POST; // gRPC always uses POST
-        let grpc_req_headers: hyper::HeaderMap = if grpc_has_retry {
-            let mut hm = hyper::HeaderMap::new();
-            for (k, v) in owned_proxy_headers_ref.unwrap_or(&ctx.headers) {
-                if let (Ok(name), Ok(val)) = (
-                    hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                    hyper::header::HeaderValue::from_str(v),
-                ) {
-                    hm.insert(name, val);
-                }
-            }
-            hm
-        } else {
-            hyper::HeaderMap::new()
-        };
+        let grpc_req_headers = grpc_replay_headers;
 
         // gRPC retry loop — retries on connection failures
         if grpc_has_retry && let Some(retry_config) = &proxy.retry {
@@ -22366,6 +22729,7 @@ async fn handle_proxy_request_inner(
                 // Record circuit breaker failure for current target
                 if let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         &proxy.id,
                         grpc_current_cb_key.as_deref(),
                         cb_config,
@@ -22544,6 +22908,7 @@ async fn handle_proxy_request_inner(
                     match state
                         .circuit_breaker_cache
                         .can_execute_with_admission_epoch(
+                            &proxy.namespace,
                             &proxy.id,
                             grpc_current_cb_key.as_deref(),
                             cb_config,
@@ -22685,6 +23050,7 @@ async fn handle_proxy_request_inner(
         // breaker rejected (already recorded for the prior target).
         if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
             let cb = state.circuit_breaker_cache.get_or_create(
+                &proxy.namespace,
                 &proxy.id,
                 grpc_final_cb_key.as_deref(),
                 cb_config,
@@ -22847,6 +23213,7 @@ async fn handle_proxy_request_inner(
                     false
                 } else if let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         &proxy.id,
                         grpc_final_cb_key.as_deref(),
                         cb_config,
@@ -23902,8 +24269,11 @@ async fn handle_proxy_request_inner(
                         target,
                     );
                     if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-                        let upstream =
-                            LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
+                        let upstream = LoadBalancerCache::get_upstream_from(
+                            &epoch.load_balancer,
+                            &proxy.namespace,
+                            upstream_id,
+                        );
                         let default_cc = crate::config::types::HashOnCookieConfig::default();
                         let cookie_config = upstream
                             .as_ref()
@@ -24681,6 +25051,7 @@ async fn handle_proxy_request_inner(
             // before potentially switching to a different target for the next retry.
             if let Some(cb_config) = &proxy.circuit_breaker {
                 let cb = state.circuit_breaker_cache.get_or_create(
+                    &proxy.namespace,
                     &proxy.id,
                     current_cb_target_key.as_deref(),
                     cb_config,
@@ -24824,6 +25195,7 @@ async fn handle_proxy_request_inner(
                 match state
                     .circuit_breaker_cache
                     .can_execute_with_admission_epoch(
+                        &proxy.namespace,
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
@@ -25227,7 +25599,12 @@ async fn handle_proxy_request_inner(
         {
             state
                 .circuit_breaker_cache
-                .get_or_create(&proxy.id, final_cb_target_key.as_deref(), cb_config)
+                .get_or_create(
+                    &proxy.namespace,
+                    &proxy.id,
+                    final_cb_target_key.as_deref(),
+                    cb_config,
+                )
                 .record_neutral(true);
         }
     } else {
@@ -25601,7 +25978,11 @@ async fn handle_proxy_request_inner(
             target,
         );
         if let HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(
+                &epoch.load_balancer,
+                &proxy.namespace,
+                upstream_id,
+            );
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -27078,6 +27459,14 @@ pub(crate) async fn proxy_to_backend_retry(
     // `parse_connection_listed_from_str_map` for the spec rationale and
     // smuggling defence.
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let remaining_grpc_timeout_header = request_ctx
+        .grpc_deadline_at()
+        .filter(|_| {
+            !connection_listed_strip
+                .iter()
+                .any(|name| name == "grpc-timeout")
+        })
+        .map(grpc_proxy::remaining_grpc_timeout_header_value);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -27094,10 +27483,14 @@ pub(crate) async fn proxy_to_backend_retry(
                 continue;
             }
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            "grpc-timeout" if remaining_grpc_timeout_header.is_some() => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
         }
+    }
+    if let Some(value) = remaining_grpc_timeout_header {
+        req_builder = req_builder.header("grpc-timeout", value);
     }
 
     // Add proxy-managed forwarding metadata.
@@ -27562,18 +27955,67 @@ fn buffered_backend_response_from_body_read(
             error_class: None,
         },
         Err(e) => {
-            warn!("Failed to read backend response body: {}", e);
+            let (status_code, error_class) =
+                eager_buffer_body_read_status_and_class(retry::classify_reqwest_error(&e));
+            warn!(
+                error_kind = retry::error_class_log_kind(error_class),
+                error = %e,
+                "Failed to read backend response body"
+            );
             retry::BackendResponse {
-                status_code: 502,
-                body: ResponseBody::Buffered(
-                    r#"{"error":"Backend response body read failed"}"#.as_bytes().to_vec(),
-                ),
+                status_code,
+                body: ResponseBody::Buffered(eager_buffer_body_read_error_body(status_code)),
                 headers: HashMap::new(),
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
-                error_class: Some(retry::ErrorClass::ConnectionReset),
+                error_class: Some(error_class),
             }
         }
+    }
+}
+
+/// Status + `ErrorClass` for a reqwest body-read failure on an eager-buffering
+/// path, given the classifier's verdict for the underlying error (#2953).
+///
+/// The per-request `RequestBuilder::timeout()` (`backend_read_timeout_ms`)
+/// covers through body completion in reqwest, so a read **timeout** during
+/// eager buffering lands here. Hardcoding `ConnectionReset`/502 made the same
+/// backend fault surface as 502/`connection_reset` over reqwest and
+/// 504/`read_write_timeout` over direct H2 (`HyperBodyCollectError::ReadTimeout`)
+/// — a transport-dependent split in `TransactionSummary.error_class`, operator
+/// dashboards, and circuit-breaker `failure_status_codes` matching. Map
+/// `ReadWriteTimeout` to 504 for parity with the H2/H3 arms; everything else
+/// keeps the 502.
+///
+/// Response headers have already arrived at every call site, so the fault is
+/// post-wire by construction and callers keep `connection_error: false`. A
+/// pre-wire label is therefore impossible here (`classify_reqwest_error` only
+/// returns connect-class verdicts under `e.is_connect()`); coerce one anyway to
+/// `ConnectionReset` so the documented
+/// `connection_error == !request_reached_wire(error_class)` boundary cannot be
+/// violated by a future classifier change, and so `retry_on_connect_failure`
+/// can never replay a non-idempotent request whose body the backend already
+/// processed.
+pub(crate) fn eager_buffer_body_read_status_and_class(
+    class: retry::ErrorClass,
+) -> (u16, retry::ErrorClass) {
+    if !retry::request_reached_wire(class) {
+        return (502, retry::ErrorClass::ConnectionReset);
+    }
+    if class == retry::ErrorClass::ReadWriteTimeout {
+        return (504, class);
+    }
+    (502, class)
+}
+
+/// Error body paired with [`eager_buffer_body_read_status_and_class`]. The 504
+/// wording matches the direct-H2 read-timeout arm so operators see one string
+/// per fault regardless of transport.
+fn eager_buffer_body_read_error_body(status_code: u16) -> Vec<u8> {
+    if status_code == 504 {
+        r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()
+    } else {
+        r#"{"error":"Backend response body read failed"}"#.as_bytes().to_vec()
     }
 }
 
@@ -27623,7 +28065,7 @@ pub(crate) fn denied_literal_backend_or_dns_override(
 /// **self-resolving** dispatch pools — gRPC (`GrpcConnectionPool`) and native H3
 /// (`Http3ConnectionPool`). Those pools do NOT hand the host to reqwest's URL
 /// parser; they resolve it themselves through `DnsCache::resolve` /
-/// `resolve_backend_addr_cached`, whose literal fast path is `IpAddr::parse`
+/// the cached direct resolver, whose literal fast path is `IpAddr::parse`
 /// (canonical only) and which otherwise performs real DNS and policy-screens the
 /// *resolved* address. So a non-canonical numeric spelling like `2852039166` or
 /// `111` is a DNS NAME on those paths (resolved, then screened), NOT the
@@ -28460,6 +28902,14 @@ async fn proxy_to_backend(
     // (canonical predicate in `proxy::headers`). Also strip every header
     // NAMED in the request's `Connection` field.
     let connection_listed_strip = headers_mod::parse_connection_listed_from_str_map(headers);
+    let remaining_grpc_timeout_header = request_ctx
+        .grpc_deadline_at()
+        .filter(|_| {
+            !connection_listed_strip
+                .iter()
+                .any(|name| name == "grpc-timeout")
+        })
+        .map(grpc_proxy::remaining_grpc_timeout_header_value);
     for (k, v) in headers {
         match k.as_str() {
             "host" => {
@@ -28476,10 +28926,14 @@ async fn proxy_to_backend(
                 continue;
             }
             n if connection_listed_strip.iter().any(|s| s == n) => continue,
+            "grpc-timeout" if remaining_grpc_timeout_header.is_some() => continue,
             _ => {
                 req_builder = req_builder.header(k.as_str(), v.as_str());
             }
         }
+    }
+    if let Some(value) = remaining_grpc_timeout_header {
+        req_builder = req_builder.header("grpc-timeout", value);
     }
 
     // Add proxy-managed forwarding metadata.
@@ -31290,10 +31744,11 @@ async fn proxy_to_backend_mesh_mtls(
         is_grpc_flavored && crate::plugins::grpc_web::request_is_grpc_web_translated(request_ctx);
     let is_native_grpc = is_grpc_flavored && !is_grpc_web_translated;
 
-    // Client end-to-end RPC deadline. Prefer the receipt-anchored monotonic
-    // instant prepared by `grpc_deadline`; parsing the post-plugin header is
-    // only a compatibility fallback for direct internal callers that did not
-    // run the request preflight. Timeout regimes mirror the direct pool:
+    // Client end-to-end RPC deadline. The receipt-anchored monotonic instant
+    // is established by `prepare_request_deadline` (independent of whether the
+    // `grpc_deadline` plugin is installed). Do NOT re-parse the relative
+    // header here — that would re-arm a fresh full budget after gateway
+    // elapsed time and on every retry. Timeout regimes mirror the direct pool:
     //  * NATIVE gRPC (streams) — `streaming_effective_timeout_ms` semantics
     //    for `send_request` (upload + response-header wait): the client
     //    deadline UNCAPPED (it is the end-to-end budget, explicitly covering
@@ -31308,14 +31763,8 @@ async fn proxy_to_backend_mesh_mtls(
     //  * Plain HTTP — the per-phase `backend_read_timeout_ms`, unchanged.
     // Timing out a gRPC-flavored request returns the direct pool's
     // Trailers-Only DEADLINE_EXCEEDED instead of a JSON 504.
-    let receipt_deadline_anchor = tokio::time::Instant::now();
     let client_grpc_deadline_at = if is_grpc_flavored {
-        request_ctx.grpc_deadline_at().or_else(|| {
-            headers
-                .get("grpc-timeout")
-                .and_then(|value| grpc_proxy::parse_grpc_timeout_value(value))
-                .and_then(|ms| receipt_deadline_anchor.checked_add(Duration::from_millis(ms)))
-        })
+        request_ctx.grpc_deadline_at()
     } else {
         None
     };
@@ -31799,6 +32248,10 @@ async fn proxy_to_backend_mesh_mtls(
             "forwarded",
             &fwd,
         );
+    }
+
+    if let Some(deadline) = client_grpc_deadline_at {
+        grpc_proxy::apply_remaining_grpc_timeout_header(&mut parts.headers, deadline);
     }
 
     let backend_req = Request::from_parts(parts, body);
@@ -32443,6 +32896,10 @@ async fn proxy_to_backend_http2(
         );
     }
 
+    if let Some(deadline) = grpc_deadline_at {
+        grpc_proxy::apply_remaining_grpc_timeout_header(&mut parts.headers, deadline);
+    }
+
     let backend_req = Request::from_parts(parts, body);
 
     // Send to backend with read timeout (0 = no timeout)
@@ -32464,8 +32921,15 @@ async fn proxy_to_backend_http2(
     };
     let map_h2_err = {
         let resolved_ip = resolved_ip.clone();
+        // Borrowed, not cloned: the closure is consumed inside this function,
+        // so a per-request String allocation on the direct-H2 dispatch path
+        // would be pure hot-path waste.
+        let proxy_id = proxy.id.as_str();
         let body_size_exceeded = Arc::clone(&body_size_exceeded);
         move |e: hyper::Error| {
+            // A locally-generated 413 is not a wire failure: keep
+            // connection_error=false so retry policy treats it as a terminal
+            // client error rather than a replayable connect failure.
             if body_size_exceeded.load(std::sync::atomic::Ordering::Acquire) {
                 return (
                     retry::BackendResponse {
@@ -32481,18 +32945,11 @@ async fn proxy_to_backend_http2(
                     None,
                 );
             }
-            error!(proxy_id = %proxy.id, error = %e, "HTTP/2 backend request failed");
+            // Real send_request failures are classified (issue #2948) so
+            // connection_error tracks request_reached_wire instead of being
+            // hardcoded true with a post-wire ProtocolError class.
             (
-                retry::BackendResponse {
-                    status_code: 502,
-                    body: ResponseBody::Buffered(
-                        r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: true,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(retry::ErrorClass::ProtocolError),
-                },
+                direct_h2_send_request_error_response(proxy_id, e, resolved_ip),
                 None,
             )
         }
@@ -32647,7 +33104,7 @@ async fn proxy_to_backend_http2(
                 error!(
                     proxy_id = %proxy.id,
                     outcome = ?outcome,
-                    "HTTP/2 request upload reported no terminal size decision; refusing to forward early backend response"
+                    "HTTP/2 request upload did not establish an authoritative size decision; refusing to forward early backend response"
                 );
                 return (
                     retry::BackendResponse {
@@ -32972,7 +33429,7 @@ async fn proxy_to_backend_http3(
         .map(|t| t.host.as_str())
         .unwrap_or(&proxy.backend_host);
     // Enforce the backend egress policy for a literal-IP backend before dialing.
-    // The native H3 pool self-resolves via `resolve_backend_addr_cached` — whose
+    // The native H3 pool self-resolves via the shared DNS cache — whose
     // literal fast path is canonical `IpAddr::parse` (non-canonical spellings go
     // to real DNS and are screened on the resolved address) — never reqwest's URL
     // parser, so use the canonical screen. The URL-canonicalizing one would
@@ -34056,7 +34513,7 @@ async fn proxy_to_backend_http3_retry(
         .unwrap_or(proxy.backend_port);
 
     // Re-screen the (possibly LB-rotated) retry target: the native H3 pool
-    // self-resolves via `resolve_backend_addr_cached` (canonical `IpAddr` fast
+    // self-resolves via the shared DNS cache (canonical `IpAddr` fast
     // path; non-canonical → real DNS + resolved-address screen), so use the
     // canonical screen, mirroring the first-attempt H3 screen — the
     // URL-canonicalizing one would wrongly reject a legitimate all-numeric
@@ -34910,8 +35367,12 @@ mod tests {
         );
         // The single-target HBONE-tagged, identity-pinned upstream the Ambient
         // materializer would emit.
+        // `namespace` mirrors the owning Service: the collector resolves the
+        // upstream by `(service.namespace, upstream_id)`, and the serde default
+        // is `DEFAULT_NAMESPACE` ("ferrum"), not `"default"`.
         let mut upstream: Upstream = serde_json::from_value(json!({
             "id": bywl_id,
+            "namespace": "default",
             "name": "redis.default.svc.cluster.local",
             "targets": [{
                 "host": "10.0.0.7",
@@ -34941,10 +35402,10 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let upstream_map: HashMap<&str, &Upstream> = config
+        let upstream_map: HashMap<(&str, &str), &Upstream> = config
             .upstreams
             .iter()
-            .map(|u| (u.id.as_str(), u))
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
             .collect();
         let mut seen = std::collections::HashSet::new();
         let mut targets = Vec::new();
@@ -35016,8 +35477,10 @@ mod tests {
             cluster_ips: vec!["10.96.0.10".to_string()],
         };
         let udp_id = crate::modes::mesh::mesh_outbound_udp_upstream_id("default", "dns", 53);
+        // Same-namespace as the owning Service; see the TCP by-workload case.
         let upstream: Upstream = serde_json::from_value(json!({
             "id": udp_id,
+            "namespace": "default",
             "name": "dns.default.svc.cluster.local",
             "targets": [{
                 "host": "10.0.0.9",
@@ -35035,10 +35498,10 @@ mod tests {
             ..GatewayConfig::default()
         };
 
-        let upstream_map: HashMap<&str, &Upstream> = config
+        let upstream_map: HashMap<(&str, &str), &Upstream> = config
             .upstreams
             .iter()
-            .map(|u| (u.id.as_str(), u))
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
             .collect();
         let mut seen = std::collections::HashSet::new();
         let mut targets = Vec::new();
@@ -38834,11 +39297,17 @@ mod tests {
         let upstream_id = crate::modes::mesh::mesh_outbound_udp_upstream_id("default", "dns", 53);
         let mut old_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 53)]);
         old_upstream.name = Some("dns.default.svc.cluster.local".to_string());
+        // Mesh materialization stamps the owning Service's namespace onto the
+        // upstream it emits, and the projection/probe collectors resolve it by
+        // `(service.namespace, upstream_id)`. The serde/struct default is
+        // `DEFAULT_NAMESPACE` ("ferrum"), so the fixture must say so explicitly.
+        old_upstream.namespace = "default".to_string();
         old_upstream.created_at = t0;
         old_upstream.updated_at = t0;
         mutate_old_upstream(&mut old_upstream);
         let mut new_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 53)]);
         new_upstream.name = Some("dns.default.svc.cluster.local".to_string());
+        new_upstream.namespace = "default".to_string();
         new_upstream.created_at = t1;
         new_upstream.updated_at = t1;
         mutate_new_upstream(&mut new_upstream);
@@ -38898,11 +39367,17 @@ mod tests {
             crate::modes::mesh::mesh_outbound_tcp_upstream_id("default", "mysql", 3306);
         let mut old_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 3306)]);
         old_upstream.name = Some("mysql.default.svc.cluster.local".to_string());
+        // Mesh materialization stamps the owning Service's namespace onto the
+        // upstream it emits, and the projection/probe collectors resolve it by
+        // `(service.namespace, upstream_id)`. The serde/struct default is
+        // `DEFAULT_NAMESPACE` ("ferrum"), so the fixture must say so explicitly.
+        old_upstream.namespace = "default".to_string();
         old_upstream.created_at = t0;
         old_upstream.updated_at = t0;
         mutate_old_upstream(&mut old_upstream);
         let mut new_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.9", 3306)]);
         new_upstream.name = Some("mysql.default.svc.cluster.local".to_string());
+        new_upstream.namespace = "default".to_string();
         new_upstream.created_at = t1;
         new_upstream.updated_at = t1;
         mutate_new_upstream(&mut new_upstream);
@@ -38973,11 +39448,17 @@ mod tests {
         );
         let mut old_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.7", 6380)]);
         old_upstream.name = Some("redis.default.svc.cluster.local".to_string());
+        // Mesh materialization stamps the owning Service's namespace onto the
+        // upstream it emits, and the projection/probe collectors resolve it by
+        // `(service.namespace, upstream_id)`. The serde/struct default is
+        // `DEFAULT_NAMESPACE` ("ferrum"), so the fixture must say so explicitly.
+        old_upstream.namespace = "default".to_string();
         old_upstream.created_at = t0;
         old_upstream.updated_at = t0;
         mutate_old_upstream(&mut old_upstream);
         let mut new_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.7", 6380)]);
         new_upstream.name = Some("redis.default.svc.cluster.local".to_string());
+        new_upstream.namespace = "default".to_string();
         new_upstream.created_at = t1;
         new_upstream.updated_at = t1;
         mutate_new_upstream(&mut new_upstream);
@@ -39479,6 +39960,74 @@ mod tests {
             Some(60),
             "rebuilding the route table swaps in the synthesized TCP relay policy"
         );
+    }
+
+    #[test]
+    fn delta_routes_changed_qualifies_lossy_mesh_relay_ids_by_namespace() {
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, MeshService, ServicePort};
+
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+        let upstream_id_a = crate::modes::mesh::mesh_outbound_tcp_upstream_id("a", "b-c", 3306);
+        let upstream_id_b = crate::modes::mesh::mesh_outbound_tcp_upstream_id("a-b", "c", 3306);
+        assert_eq!(
+            upstream_id_a, upstream_id_b,
+            "the generated id join is intentionally lossy"
+        );
+
+        let make_upstream =
+            |namespace: &str, timeout_ms: u64, updated_at: chrono::DateTime<chrono::Utc>| {
+                let mut upstream = upstream_with_targets(&upstream_id_a, &[("10.0.0.9", 3306)]);
+                upstream.namespace = namespace.to_string();
+                upstream.created_at = updated_at;
+                upstream.updated_at = updated_at;
+                upstream.port_overrides.insert(
+                    3306,
+                    crate::config::types::UpstreamPortOverride {
+                        connect_timeout_ms: Some(timeout_ms),
+                        ..Default::default()
+                    },
+                );
+                upstream
+            };
+        let service = |namespace: &str, name: &str, cluster_ip: &str| MeshService {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            ports: vec![ServicePort {
+                port: 3306,
+                protocol: AppProtocol::Tcp,
+                name: Some("mysql".to_string()),
+                target_port: None,
+            }],
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            cluster_ips: vec![cluster_ip.to_string()],
+        };
+        let mesh = MeshConfig {
+            services: vec![
+                service("a", "b-c", "10.96.0.20"),
+                service("a-b", "c", "10.96.0.21"),
+            ],
+            ..MeshConfig::default()
+        };
+        let old_config = GatewayConfig {
+            upstreams: vec![make_upstream("a", 30, t0), make_upstream("a-b", 90, t0)],
+            mesh: Some(Box::new(mesh.clone())),
+            ..GatewayConfig::default()
+        };
+        let new_config = GatewayConfig {
+            upstreams: vec![make_upstream("a", 60, t1), make_upstream("a-b", 90, t0)],
+            mesh: Some(Box::new(mesh)),
+            ..GatewayConfig::default()
+        };
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+
+        assert_eq!(delta.modified_upstreams.len(), 1);
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
     }
 
     #[test]
@@ -41320,6 +41869,150 @@ mod tests {
     }
 
     #[test]
+    fn validate_mesh_route_dispatch_upstream_references_are_namespace_qualified() {
+        let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "stable.test", 443);
+        proxy.namespace = "tenant-a".to_string();
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "mrd-p".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "tenant-a".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "shared-id"}
+                }]
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut foreign_upstream = upstream_with_targets("shared-id", &[("foreign.test", 8080)]);
+        foreign_upstream.namespace = "tenant-b".to_string();
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            upstreams: vec![foreign_upstream],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        let errors = validate_mesh_route_dispatch_upstream_references(&config)
+            .expect_err("a foreign same-id upstream must not satisfy the reference");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("tenant-a"), "{errors:?}");
+    }
+
+    #[test]
+    fn validate_global_mesh_route_dispatch_requires_each_proxy_namespace() {
+        let mut tenant_a = warmup_test_proxy("a", BackendScheme::Https, "a.test", 443);
+        tenant_a.namespace = "tenant-a".to_string();
+        let mut tenant_b = warmup_test_proxy("b", BackendScheme::Https, "b.test", 443);
+        tenant_b.namespace = "tenant-b".to_string();
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "global-mrd".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "tenant-a".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "shared-id"}
+                }]
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut tenant_a_upstream = upstream_with_targets("shared-id", &[("tenant-a.test", 8080)]);
+        tenant_a_upstream.namespace = "tenant-a".to_string();
+        let config = GatewayConfig {
+            proxies: vec![tenant_a, tenant_b],
+            upstreams: vec![tenant_a_upstream],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        let errors = validate_mesh_route_dispatch_upstream_references(&config)
+            .expect_err("a gateway-wide global must resolve for every proxy namespace");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("tenant-b"), "{errors:?}");
+    }
+
+    #[test]
+    fn validate_global_mesh_route_dispatch_without_http_proxies_rejects_dangling_reference() {
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "global-mrd".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "tenant-a".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "missing"}
+                }]
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let config = GatewayConfig {
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        let errors = validate_mesh_route_dispatch_upstream_references(&config)
+            .expect_err("a global with no current HTTP attachment must not pass vacuously");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("tenant-a"), "{errors:?}");
+        assert!(errors[0].contains("missing"), "{errors:?}");
+    }
+
+    #[test]
+    fn validate_global_mesh_route_dispatch_without_http_proxies_uses_own_namespace() {
+        let now = chrono::Utc::now();
+        let plugin = PluginConfig {
+            id: "global-mrd".to_string(),
+            plugin_name: "mesh_route_dispatch".to_string(),
+            namespace: "tenant-a".to_string(),
+            config: json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "shared-id"}
+                }]
+            }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut own_upstream = upstream_with_targets("shared-id", &[("tenant-a.test", 8080)]);
+        own_upstream.namespace = "tenant-a".to_string();
+        let config = GatewayConfig {
+            upstreams: vec![own_upstream],
+            plugin_configs: vec![plugin],
+            ..GatewayConfig::default()
+        };
+
+        validate_mesh_route_dispatch_upstream_references(&config)
+            .expect("the unattached global resolves in its declaring namespace");
+    }
+
+    #[test]
     fn validate_mesh_route_dispatch_upstream_references_skips_disabled_plugins() {
         // Disabled plugins don't execute on the hot path, so a typo in a
         // disabled instance shouldn't block config reload. This mirrors
@@ -41359,7 +42052,7 @@ mod tests {
         let http_proxy = warmup_test_proxy("h", BackendScheme::Http, "plain.test", 80);
         let https_proxy = warmup_test_proxy("s", BackendScheme::Https, "secure.test", 443);
 
-        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let upstreams: HashMap<(&str, &str), &Upstream> = HashMap::new();
         let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
 
         collect_reqwest_warmup_candidates_for_proxy(
@@ -41409,7 +42102,7 @@ mod tests {
         let proxy_b = warmup_test_proxy("b", BackendScheme::Https, "shared.test", 443);
         let shared_pool_key = "test-pool-key|shared-tls";
 
-        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let upstreams: HashMap<(&str, &str), &Upstream> = HashMap::new();
         let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
 
         collect_reqwest_warmup_candidates_for_proxy(
@@ -41457,7 +42150,7 @@ mod tests {
         let proxy_a = warmup_test_proxy("a", BackendScheme::Https, "shared.test", 443);
         let proxy_b = warmup_test_proxy("b", BackendScheme::Https, "shared.test", 443);
 
-        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let upstreams: HashMap<(&str, &str), &Upstream> = HashMap::new();
         let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
 
         collect_reqwest_warmup_candidates_for_proxy(
@@ -41508,8 +42201,11 @@ mod tests {
             "up1",
             &[("a.test", 8443), ("b.test", 8443), ("c.test", 8443)],
         );
-        let mut upstreams: HashMap<&str, &Upstream> = HashMap::new();
-        upstreams.insert("up1", &upstream);
+        let mut upstreams: HashMap<(&str, &str), &Upstream> = HashMap::new();
+        upstreams.insert(
+            (upstream.namespace.as_str(), upstream.id.as_str()),
+            &upstream,
+        );
 
         let (mut http_candidates, mut https_candidates) = empty_candidate_maps();
         collect_reqwest_warmup_candidates_for_proxy(
@@ -41538,7 +42234,7 @@ mod tests {
         // proxy's traffic.
         let proxy_skip = warmup_test_proxy("skip", BackendScheme::Https, "shared.test", 443);
         let proxy_force = warmup_test_proxy("force", BackendScheme::Https, "shared.test", 443);
-        let upstreams: HashMap<&str, &Upstream> = HashMap::new();
+        let upstreams: HashMap<(&str, &str), &Upstream> = HashMap::new();
         // Same pool_key so the two proxies actually share a candidate.
         let shared_pool_key = "pool-key-shared";
 
@@ -42729,6 +43425,7 @@ mod tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            mesh_revision: None,
         }
     }
 
@@ -42749,14 +43446,14 @@ mod tests {
         // Global bounded (300): only the explicit `Some(0)` override is disabled.
         assert_eq!(
             websocket_idle_disabled_proxy_ids(&config, 300),
-            vec!["disabled"]
+            vec!["ferrum/disabled"]
         );
 
         // Global disabled (0): the `Some(0)` override AND the inheriting proxy
         // are disabled; the explicit `Some(120)` override stays bounded.
         let mut ids = websocket_idle_disabled_proxy_ids(&config, 0);
         ids.sort();
-        assert_eq!(ids, vec!["disabled", "inherit"]);
+        assert_eq!(ids, vec!["ferrum/disabled", "ferrum/inherit"]);
     }
 
     #[test]
@@ -42773,13 +43470,17 @@ mod tests {
         next_b.websocket_idle_timeout_seconds = Some(0); // newly disabled
         let mut next_c = make_validation_proxy("c", "/c");
         next_c.websocket_idle_timeout_seconds = Some(0); // added, disabled
-        let mut next = make_validation_config(vec![next_a, next_b, next_c]);
+        let mut next_same_id_other_namespace = make_validation_proxy("a", "/tenant-b-a");
+        next_same_id_other_namespace.namespace = "tenant-b".to_string();
+        next_same_id_other_namespace.websocket_idle_timeout_seconds = Some(0);
+        let mut next =
+            make_validation_config(vec![next_a, next_b, next_c, next_same_id_other_namespace]);
         next.normalize_fields();
 
         // "a" was already disabled -> excluded; only the transitions report.
         let mut newly = websocket_idle_newly_disabled_proxy_ids(&previous, &next, 300);
         newly.sort();
-        assert_eq!(newly, vec!["b", "c"]);
+        assert_eq!(newly, vec!["ferrum/b", "ferrum/c", "tenant-b/a"]);
 
         // Steady state (no new transitions) reports nothing, so a persistent
         // opt-out does not re-warn on every unrelated reload.
@@ -42827,7 +43528,10 @@ mod tests {
 
         let mut affected = h3_websocket_quic_idle_mismatch_proxy_ids(&config, true, 300, 30);
         affected.sort();
-        assert_eq!(affected, vec!["disabled", "inherit", "long"]);
+        assert_eq!(
+            affected,
+            vec!["ferrum/disabled", "ferrum/inherit", "ferrum/long"]
+        );
 
         assert!(h3_websocket_quic_idle_mismatch_proxy_ids(&config, false, 300, 30).is_empty());
         assert!(h3_websocket_quic_idle_mismatch_proxy_ids(&config, true, 300, 0).is_empty());
@@ -42848,13 +43552,17 @@ mod tests {
         next_b.websocket_idle_timeout_seconds = Some(45); // newly affected
         let mut next_c = make_validation_proxy("c", "/c");
         next_c.websocket_idle_timeout_seconds = Some(0); // added and affected
-        let mut next = make_validation_config(vec![next_a, next_b, next_c]);
+        let mut next_same_id_other_namespace = make_validation_proxy("a", "/tenant-b-a");
+        next_same_id_other_namespace.namespace = "tenant-b".to_string();
+        next_same_id_other_namespace.websocket_idle_timeout_seconds = Some(120);
+        let mut next =
+            make_validation_config(vec![next_a, next_b, next_c, next_same_id_other_namespace]);
         next.normalize_fields();
 
         let mut newly =
             h3_websocket_new_quic_idle_mismatch_proxy_ids(&previous, &next, true, 300, 30);
         newly.sort();
-        assert_eq!(newly, vec!["b", "c"]);
+        assert_eq!(newly, vec!["ferrum/b", "ferrum/c", "tenant-b/a"]);
 
         assert!(
             h3_websocket_new_quic_idle_mismatch_proxy_ids(&next, &next, true, 300, 30).is_empty()
@@ -43030,6 +43738,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gateway_workload_metrics_managed_identity_is_namespace_qualified() {
+        let svid_slot = Arc::new(ArcSwap::new(Arc::new(Some(test_svid_bundle(
+            test_runtime_trust_bundles("file.local", vec![vec![1]]),
+        )))));
+        let timestamp = gateway_managed_plugin_timestamp();
+        let managed = |namespace: &str, spiffe_id: &str| PluginConfig {
+            id: GATEWAY_WORKLOAD_METRICS_PLUGIN_ID.to_string(),
+            plugin_name: WORKLOAD_METRICS_PLUGIN_NAME.to_string(),
+            namespace: namespace.to_string(),
+            config: json!({ "workload_spiffe_id": spiffe_id }),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let mut config = make_validation_config(vec![]);
+        config.plugin_configs = vec![
+            managed(
+                "tenant-b",
+                "spiffe://tenant-b.example/ns/tenant-b/sa/gateway",
+            ),
+            managed("ferrum", "spiffe://old.example/ns/ferrum/sa/old"),
+        ];
+
+        inject_gateway_workload_metrics_if_svid(&mut config, &svid_slot, "ferrum");
+
+        let ferrum = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.namespace == "ferrum" && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+            })
+            .expect("ferrum managed plugin");
+        assert_eq!(
+            ferrum
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://file.local/ns/default/sa/gateway")
+        );
+        let tenant_b = config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.namespace == "tenant-b" && plugin.id == GATEWAY_WORKLOAD_METRICS_PLUGIN_ID
+            })
+            .expect("tenant-b managed plugin");
+        assert_eq!(
+            tenant_b
+                .config
+                .get("workload_spiffe_id")
+                .and_then(serde_json::Value::as_str),
+            Some("spiffe://tenant-b.example/ns/tenant-b/sa/gateway")
+        );
+    }
+
     #[tokio::test]
     async fn clear_gateway_trust_bundles_restores_startup_svid_trust() {
         let state = make_test_proxy_state(make_validation_config(vec![]));
@@ -43124,6 +43892,22 @@ mod tests {
         assert_eq!(
             svid.trust_bundles.local.x509_authorities,
             vec![vec![7, 8, 9]]
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_full_config_rejects_malformed_runtime_identity() {
+        let state = make_test_proxy_state(make_validation_config(vec![]));
+        let mut bad = make_validation_proxy("p1", "/api");
+        bad.namespace = "tenant|prod".to_string();
+        let bad_config = make_validation_config(vec![bad]);
+
+        let err = state
+            .validate_full_config(&bad_config)
+            .expect_err("delimiter-bearing namespace must be rejected before cache encoding");
+        assert!(
+            err.iter().any(|error| error.contains("namespace")),
+            "error must identify the malformed namespace; got {err:?}"
         );
     }
 

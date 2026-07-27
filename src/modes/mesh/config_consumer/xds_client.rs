@@ -19,7 +19,8 @@ use crate::grpc::dp_client::{
 use crate::modes::mesh::config::{
     AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, ServicePort,
 };
-use crate::modes::mesh::runtime::{MeshRuntimeState, XdsConvergenceSnapshot};
+use crate::modes::mesh::revision::MeshRevisionRejection;
+use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall, XdsConvergenceSnapshot};
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 use crate::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::proto::{self, DiscoveryRequest, Node, Status};
@@ -876,7 +877,7 @@ async fn run_ads_stream_with_auth(
             }
             _ = &mut debounce, if debounce_active => {
                 if let Some(pending) = pending_slice.take() {
-                    apply_pending_xds_slice(consumer, config, pending);
+                    apply_pending_xds_slice(consumer, config, pending)?;
                 }
                 debounce_active = false;
                 pending_since = None;
@@ -885,7 +886,7 @@ async fn run_ads_stream_with_auth(
     }
 
     if let Some(pending) = pending_slice.take() {
-        apply_pending_xds_slice(consumer, config, pending);
+        apply_pending_xds_slice(consumer, config, pending)?;
     }
 
     Ok(())
@@ -915,7 +916,7 @@ fn flush_pending_xds_slice_before_error(
     error: anyhow::Error,
 ) -> Result<(), anyhow::Error> {
     if let Some(pending) = pending_slice.take() {
-        apply_pending_xds_slice(consumer, config, pending);
+        apply_pending_xds_slice(consumer, config, pending)?;
     }
     Err(error)
 }
@@ -1088,15 +1089,17 @@ fn apply_pending_xds_slice(
     consumer: &XdsConfigConsumer,
     config: &XdsClientConfig,
     pending: PendingXdsSlice,
-) {
+) -> Result<(), anyhow::Error> {
     let version = pending.slice.version.clone();
     let version_skew = pending.version_skew;
+    consumer
+        .apply_slice(pending.slice)
+        .map_err(anyhow::Error::new)?;
     if version_skew {
         crate::plugins::mesh::prometheus_helpers::increment_xds_warming_partial_apply(
             &config.namespace,
         );
     }
-    consumer.apply_slice(pending.slice);
     info!(
         node_id = %config.node_id,
         namespace = %config.namespace,
@@ -1106,6 +1109,7 @@ fn apply_pending_xds_slice(
         version_skew = version_skew,
         "Applied debounced xDS ADS update"
     );
+    Ok(())
 }
 
 async fn send_ads_request(
@@ -1142,8 +1146,41 @@ impl XdsConfigConsumer {
         &self.state
     }
 
-    pub fn apply_slice(&self, slice: MeshSlice) {
-        self.state.install_slice(slice);
+    /// Install a rebuilt slice, subject to the shared config-revision freshness
+    /// gate (issue #2473).
+    ///
+    /// A quarantined slice returns its revision rejection so the ADS loop drops
+    /// the stream and rotates to the next configured control plane. The
+    /// previously installed slice keeps serving throughout.
+    ///
+    /// The ADS accumulator is deliberately NOT rewound. By the time the gate
+    /// rules, the response has already been folded into the accumulator and
+    /// ACKed (`handle_ads_response` rolls the accumulator back only for a
+    /// NACK — a structurally invalid response). That is correct rather than
+    /// leaky, because the accumulator is state-of-the-world state scoped to ONE
+    /// control-plane URL: `XdsStreamState::reset_for_new_control_plane` clears
+    /// it wholesale on failover, so a quarantined CP's resources can never mix
+    /// into another CP's slice. Within one CP the retained resources are
+    /// ordinary SotW resume state, and the required-type presence/version
+    /// coherence gates still govern the next build — the freshness gate
+    /// protects the serving generation, not the subscription. Rewinding the
+    /// accumulator here would instead desynchronize it from the versions this
+    /// client has already ACKed.
+    ///
+    /// The gate already recorded the reason-labelled metric and the sanitized
+    /// diagnostic, so this only adds the xDS-side context.
+    pub fn apply_slice(&self, slice: MeshSlice) -> Result<(), MeshRevisionRejection> {
+        match self.state.install_slice(slice) {
+            MeshSliceInstall::Installed => Ok(()),
+            MeshSliceInstall::Quarantined(rejection) => {
+                tracing::warn!(
+                    reason = rejection.reason().as_metric_label(),
+                    "Quarantined an xDS-built mesh slice on config-revision ordering; \
+                     keeping the last-good slice and closing ADS for CP failover"
+                );
+                Err(rejection)
+            }
+        }
     }
 }
 
@@ -1415,6 +1452,11 @@ fn reverse_translate(
         // Required xDS types are coherent before a slice is built, so this is
         // the shared observability version for the installed mesh slice.
         version: composite_required_version(accumulator),
+        // Issue #2473: the authoritative ordering revision rides its own ECDS
+        // carrier so an xDS-built slice materializes the same freshness
+        // metadata a native-built one does and passes through the SAME
+        // `MeshRuntimeState::install_slice` gate.
+        revision: recovered.config_revision,
         // GAP-1a: workloads/endpoints recovered from the Workloads carrier.
         // Empty only when the CP emitted no carrier (older Ferrum-shaped xDS
         // CP) or the slice genuinely has no workloads.
@@ -1576,6 +1618,11 @@ struct RecoveredSliceCarriers {
     declared_ingress_http_ports: usize,
     labels: Option<BTreeMap<String, String>>,
     labels_ambiguous: bool,
+    /// Authoritative config revision (issue #2473) recovered from the
+    /// `ConfigRevision` carrier. `None` when the CP's config authority is
+    /// unordered (or predates the carrier) — the DP freshness gate then treats
+    /// the rebuilt slice exactly like a native slice with no `revision`.
+    config_revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
     workloads: Vec<crate::modes::mesh::config::Workload>,
     ambient_udp_source_workloads: Vec<crate::modes::mesh::config::Workload>,
     node_waypoint_assertors: Vec<crate::identity::spiffe::SpiffeId>,
@@ -1809,6 +1856,7 @@ fn apply_recovered_carrier(
         MeshSliceCarrier::SidecarIngressDeclaredPorts(value) => {
             recovered.declared_ingress_http_ports = value
         }
+        MeshSliceCarrier::ConfigRevision(value) => recovered.config_revision = Some(value),
         MeshSliceCarrier::Workloads(value) => recovered.workloads = value,
         MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => {
             recovered.ambient_udp_source_workloads = value
@@ -2995,7 +3043,8 @@ mod tests {
                 all_types_ready: true,
                 version_skew: true,
             },
-        );
+        )
+        .expect("the skewed slice applies");
         assert_eq!(
             xds_warming_partial_apply_count(&namespace),
             1,
@@ -3015,11 +3064,65 @@ mod tests {
                 all_types_ready: true,
                 version_skew: false,
             },
-        );
+        )
+        .expect("the coherent slice applies");
         assert_eq!(
             xds_warming_partial_apply_count(&namespace),
             1,
             "a coherent apply must not increment the partial-apply counter"
+        );
+    }
+
+    #[test]
+    fn stale_pending_slice_is_stream_terminal_and_not_counted_as_applied() {
+        use crate::modes::mesh::revision::MeshConfigRevision;
+        use crate::plugins::mesh::prometheus_helpers::xds_warming_partial_apply_count;
+
+        let namespace = format!("stale-apply-{}-{}", std::process::id(), line!());
+        let config = XdsClientConfig {
+            namespace: namespace.clone(),
+            ..test_config()
+        };
+        let state = MeshRuntimeState::new();
+        let consumer = XdsConfigConsumer::new(config.clone(), state.clone());
+        consumer
+            .apply_slice(MeshSlice {
+                version: "v100".to_string(),
+                revision: Some(MeshConfigRevision::new("db", 100)),
+                ..MeshSlice::default()
+            })
+            .expect("the fresh baseline applies");
+
+        let before = xds_warming_partial_apply_count(&namespace);
+        let error = apply_pending_xds_slice(
+            &consumer,
+            &config,
+            PendingXdsSlice {
+                slice: MeshSlice {
+                    version: "v99".to_string(),
+                    revision: Some(MeshConfigRevision::new("db", 99)),
+                    ..MeshSlice::default()
+                },
+                type_url: ECDS_TYPE_URL.to_string(),
+                all_types_ready: true,
+                version_skew: true,
+            },
+        )
+        .expect_err("a stale xDS slice closes ADS so the client can fail over");
+
+        assert!(error.to_string().contains("stale_revision"));
+        assert_eq!(
+            xds_warming_partial_apply_count(&namespace),
+            before,
+            "a quarantined slice was never applied"
+        );
+        assert_eq!(
+            state
+                .snapshot()
+                .as_ref()
+                .as_ref()
+                .map(|slice| slice.version.as_str()),
+            Some("v100")
         );
     }
 

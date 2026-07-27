@@ -810,6 +810,7 @@ fn port_level_locality_lb_drives_distribute_at_dispatch() {
     for i in 0..16 {
         let selection = LoadBalancerCache::select_target_for_port_from(
             &snapshot,
+            "default",
             "reviews-u",
             &format!("k-{i}"),
             8080,
@@ -827,6 +828,7 @@ fn port_level_locality_lb_drives_distribute_at_dispatch() {
     // settings from port 8080 must NOT leak across ports.
     let selection = LoadBalancerCache::select_target_for_port_from(
         &snapshot,
+        "default",
         "reviews-u",
         "k-9090",
         9090,

@@ -5,17 +5,19 @@
 //! can preserve unchanged plugin, consumer, and load-balancer state while
 //! publishing a fresh request epoch atomically.
 //!
-//! Changes are detected by comparing `id` + `updated_at` timestamps.
-//! Resources present in the new config but not the old are additions;
-//! resources in the old but not the new are removals; resources in both
-//! with a different `updated_at` are modifications (uses `!=` to catch
-//! both forward progress and backward clock skew). Proxy/plugin association
-//! membership is compared directly because junction-table changes can arrive
-//! without advancing the owning proxy's timestamp.
+//! Changes are detected by comparing the namespace-qualified `(namespace, id)`
+//! identity plus `updated_at` timestamps. Resources present in the new config
+//! but not the old are additions; resources in the old but not the new are
+//! removals; resources in both with a different `updated_at` are modifications
+//! (uses `!=` to catch both forward progress and backward clock skew).
+//! Proxy/plugin association membership is compared directly because
+//! junction-table changes can arrive without advancing the owning proxy's
+//! timestamp.
 
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
+use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream};
 
 /// Summary of routing changes affected by proxy adds, removals, or modifications.
@@ -39,26 +41,28 @@ impl AffectedRoutes {
 /// Identifies which resources changed between two config snapshots.
 ///
 /// Used by request-epoch builders to decide which pre-computed inners can be
-/// reused and which must be rebuilt from the new config.
+/// reused and which must be rebuilt from the new config. Removals carry
+/// [`NamespacedResourceId`] so cache pruning can drop only the matching
+/// tenant's runtime state when the same id exists in another namespace.
 #[derive(Debug)]
 pub struct ConfigDelta {
     // Proxy changes
     pub added_proxies: Vec<Proxy>,
-    pub removed_proxy_ids: Vec<String>,
+    pub removed_proxy_ids: Vec<NamespacedResourceId>,
     pub modified_proxies: Vec<Proxy>,
 
     // Consumer changes
     pub added_consumers: Vec<Consumer>,
-    pub removed_consumer_ids: Vec<String>,
+    pub removed_consumer_ids: Vec<NamespacedResourceId>,
     pub modified_consumers: Vec<Consumer>,
 
     // Plugin config changes
     pub added_plugin_configs: Vec<PluginConfig>,
-    pub removed_plugin_config_ids: Vec<String>,
+    pub removed_plugin_config_ids: Vec<NamespacedResourceId>,
     pub modified_plugin_configs: Vec<PluginConfig>,
     /// Existing proxies whose plugin association membership changed even
     /// though the proxy resource timestamp may not have advanced.
-    pub plugin_association_changed_proxy_ids: Vec<String>,
+    pub plugin_association_changed_proxy_ids: Vec<NamespacedResourceId>,
     /// True when a global plugin was added, removed, modified, or changed away
     /// from global scope. Known proxy plugin lists contain merged global
     /// instances, so they must all be rebuilt when this is true.
@@ -66,14 +70,14 @@ pub struct ConfigDelta {
 
     // Upstream changes
     pub added_upstreams: Vec<Upstream>,
-    pub removed_upstream_ids: Vec<String>,
+    pub removed_upstream_ids: Vec<NamespacedResourceId>,
     pub modified_upstreams: Vec<Upstream>,
 }
 
 impl ConfigDelta {
     /// Compute the delta between an old and new config snapshot.
     ///
-    /// Uses `id` for identity and `updated_at` for change detection.
+    /// Uses `(namespace, id)` for identity and `updated_at` for change detection.
     /// Returns a delta describing exactly which resources were added,
     /// removed, or modified.
     pub fn compute(old: &GatewayConfig, new: &GatewayConfig) -> Self {
@@ -82,30 +86,31 @@ impl ConfigDelta {
         let modified_plugin_configs = diff_modified(&old.plugin_configs, &new.plugin_configs);
         let plugin_association_changed_proxy_ids =
             diff_plugin_association_changes(&old.proxies, &new.proxies);
-        let old_global_plugin_ids: HashSet<&str> = old
+        let old_global_plugin_keys: HashSet<ResourceKey<'_>> = old
             .plugin_configs
             .iter()
             .filter(|pc| pc.scope == PluginScope::Global)
-            .map(|pc| pc.id.as_str())
+            .map(resource_key)
             .collect();
         let global_plugin_configs_changed = added_plugin_configs
             .iter()
             .any(|pc| pc.scope == PluginScope::Global)
             || modified_plugin_configs.iter().any(|pc| {
-                pc.scope == PluginScope::Global || old_global_plugin_ids.contains(pc.id.as_str())
+                pc.scope == PluginScope::Global
+                    || old_global_plugin_keys.contains(&resource_key(pc))
             })
             || removed_plugin_config_ids
                 .iter()
-                .any(|id| old_global_plugin_ids.contains(id.as_str()));
+                .any(|key| old_global_plugin_keys.contains(&key.as_key()));
 
         Self {
             added_proxies: diff_added(&old.proxies, &new.proxies),
             removed_proxy_ids: diff_removed_ids(&old.proxies, &new.proxies),
             modified_proxies: diff_modified(&old.proxies, &new.proxies),
 
-            added_consumers: diff_added_consumers(&old.consumers, &new.consumers),
-            removed_consumer_ids: diff_removed_consumer_ids(&old.consumers, &new.consumers),
-            modified_consumers: diff_modified_consumers(&old.consumers, &new.consumers),
+            added_consumers: diff_added(&old.consumers, &new.consumers),
+            removed_consumer_ids: diff_removed_ids(&old.consumers, &new.consumers),
+            modified_consumers: diff_modified(&old.consumers, &new.consumers),
 
             added_plugin_configs,
             removed_plugin_config_ids,
@@ -137,7 +142,7 @@ impl ConfigDelta {
             && self.modified_upstreams.is_empty()
     }
 
-    /// IDs of all proxies that need their plugin lists rebuilt.
+    /// Namespace-qualified keys of all proxies that need their plugin lists rebuilt.
     ///
     /// A proxy needs plugin rebuild if:
     /// - The proxy itself was added or modified (plugin associations may have changed)
@@ -147,15 +152,15 @@ impl ConfigDelta {
         &self,
         old_config: &GatewayConfig,
         new_config: &GatewayConfig,
-    ) -> HashSet<String> {
+    ) -> HashSet<NamespacedResourceId> {
         let mut ids = HashSet::new();
 
         // Added/modified proxies always need plugin rebuild
         for p in &self.added_proxies {
-            ids.insert(p.id.clone());
+            ids.insert(namespaced_id_of(p));
         }
         for p in &self.modified_proxies {
-            ids.insert(p.id.clone());
+            ids.insert(namespaced_id_of(p));
         }
         ids.extend(self.plugin_association_changed_proxy_ids.iter().cloned());
 
@@ -164,55 +169,68 @@ impl ConfigDelta {
             || !self.removed_plugin_config_ids.is_empty()
             || !self.modified_plugin_configs.is_empty()
         {
-            let changed_pc_ids: HashSet<&str> = self
+            let changed_pc_keys: HashSet<ResourceKey<'_>> = self
                 .added_plugin_configs
                 .iter()
-                .map(|pc| pc.id.as_str())
-                .chain(self.removed_plugin_config_ids.iter().map(|s| s.as_str()))
-                .chain(self.modified_plugin_configs.iter().map(|pc| pc.id.as_str()))
+                .map(resource_key)
+                .chain(self.removed_plugin_config_ids.iter().map(|k| k.as_key()))
+                .chain(self.modified_plugin_configs.iter().map(resource_key))
                 .collect();
 
             // Include both the previous and replacement direct placements.
             // A modified PluginConfig contains only its new proxy_id, while a
-            // cache entry can still be live on the former proxy.
-            let old_changed_proxy_scoped: HashSet<&str> = old_config
+            // cache entry can still be live on the former proxy. Proxy-scoped
+            // plugin_config.proxy_id is an id within the plugin's namespace.
+            let old_changed_proxy_scoped: HashSet<ResourceKey<'_>> = old_config
                 .plugin_configs
                 .iter()
-                .filter(|pc| changed_pc_ids.contains(pc.id.as_str()))
-                .filter_map(|pc| pc.proxy_id.as_deref())
+                .filter(|pc| changed_pc_keys.contains(&resource_key(*pc)))
+                .filter_map(|pc| {
+                    pc.proxy_id
+                        .as_deref()
+                        .map(|proxy_id| (pc.namespace.as_str(), proxy_id))
+                })
                 .collect();
-            let new_changed_proxy_scoped: HashSet<&str> = self
+            let new_changed_proxy_scoped: HashSet<ResourceKey<'_>> = self
                 .added_plugin_configs
                 .iter()
                 .chain(self.modified_plugin_configs.iter())
-                .filter_map(|pc| pc.proxy_id.as_deref())
+                .filter_map(|pc| {
+                    pc.proxy_id
+                        .as_deref()
+                        .map(|proxy_id| (pc.namespace.as_str(), proxy_id))
+                })
                 .collect();
-            let old_proxies_by_id: HashMap<&str, &Proxy> = old_config
+            let old_proxies_by_key: HashMap<ResourceKey<'_>, &Proxy> = old_config
                 .proxies
                 .iter()
-                .map(|proxy| (proxy.id.as_str(), proxy))
+                .map(|proxy| (resource_key(proxy), proxy))
                 .collect();
 
             for proxy in &new_config.proxies {
+                let proxy_key = resource_key(proxy);
                 // Check both association generations. Scope/group moves can
                 // remove the old association without advancing the proxy's
                 // timestamp, but the old cached chain still needs rebuilding.
-                let references_changed_plugin = proxy
-                    .plugins
-                    .iter()
-                    .any(|assoc| changed_pc_ids.contains(assoc.plugin_config_id.as_str()))
-                    || old_proxies_by_id
-                        .get(proxy.id.as_str())
-                        .is_some_and(|old_proxy| {
-                            old_proxy.plugins.iter().any(|assoc| {
-                                changed_pc_ids.contains(assoc.plugin_config_id.as_str())
-                            })
-                        });
+                // Association plugin_config_id values are namespace-local to
+                // the proxy (cross-namespace associations are rejected).
+                let references_changed_plugin =
+                    proxy.plugins.iter().any(|assoc| {
+                        changed_pc_keys
+                            .contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+                    }) || old_proxies_by_key.get(&proxy_key).is_some_and(|old_proxy| {
+                        old_proxy.plugins.iter().any(|assoc| {
+                            changed_pc_keys.contains(&(
+                                old_proxy.namespace.as_str(),
+                                assoc.plugin_config_id.as_str(),
+                            ))
+                        })
+                    });
                 if references_changed_plugin
-                    || old_changed_proxy_scoped.contains(proxy.id.as_str())
-                    || new_changed_proxy_scoped.contains(proxy.id.as_str())
+                    || old_changed_proxy_scoped.contains(&proxy_key)
+                    || new_changed_proxy_scoped.contains(&proxy_key)
                 {
-                    ids.insert(proxy.id.clone());
+                    ids.insert(namespaced_id_of(proxy));
                 }
             }
 
@@ -222,7 +240,7 @@ impl ConfigDelta {
                 // cascade can remove association rows without updating proxy
                 // timestamps, leaving no reliable proxy-level delta.
                 for proxy in &new_config.proxies {
-                    ids.insert(proxy.id.clone());
+                    ids.insert(namespaced_id_of(proxy));
                 }
             }
         }
@@ -252,21 +270,21 @@ impl ConfigDelta {
             record(&mut listen_paths, &mut host_only_hosts, p);
         }
 
-        let old_proxy_map: HashMap<&str, &Proxy> = old_config
+        let old_proxy_map: HashMap<ResourceKey<'_>, &Proxy> = old_config
             .proxies
             .iter()
-            .map(|p| (p.id.as_str(), p))
+            .map(|p| (resource_key(p), p))
             .collect();
 
-        for id in &self.removed_proxy_ids {
-            if let Some(p) = old_proxy_map.get(id.as_str()) {
+        for key in &self.removed_proxy_ids {
+            if let Some(p) = old_proxy_map.get(&key.as_key()) {
                 record(&mut listen_paths, &mut host_only_hosts, p);
             }
         }
 
         for p in &self.modified_proxies {
             record(&mut listen_paths, &mut host_only_hosts, p);
-            if let Some(old_proxy) = old_proxy_map.get(p.id.as_str()) {
+            if let Some(old_proxy) = old_proxy_map.get(&resource_key(p)) {
                 let routing_changed = old_proxy.dispatch_kind.is_stream()
                     != p.dispatch_kind.is_stream()
                     || old_proxy.listen_path != p.listen_path
@@ -285,14 +303,28 @@ impl ConfigDelta {
 }
 
 // --- Generic diffing helpers ---
-// These work on any type with `id: String` and `updated_at: DateTime<Utc>`.
+// These work on any type with namespace + id + updated_at.
 
-trait HasIdAndTimestamp {
+type ResourceKey<'a> = (&'a str, &'a str);
+
+trait HasNamespacedIdAndTimestamp {
+    fn namespace(&self) -> &str;
     fn id(&self) -> &str;
     fn updated_at(&self) -> DateTime<Utc>;
 }
 
-impl HasIdAndTimestamp for Proxy {
+fn resource_key<T: HasNamespacedIdAndTimestamp>(resource: &T) -> ResourceKey<'_> {
+    (resource.namespace(), resource.id())
+}
+
+fn namespaced_id_of<T: HasNamespacedIdAndTimestamp>(resource: &T) -> NamespacedResourceId {
+    NamespacedResourceId::new(resource.namespace(), resource.id())
+}
+
+impl HasNamespacedIdAndTimestamp for Proxy {
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
     fn id(&self) -> &str {
         &self.id
     }
@@ -301,7 +333,10 @@ impl HasIdAndTimestamp for Proxy {
     }
 }
 
-impl HasIdAndTimestamp for Consumer {
+impl HasNamespacedIdAndTimestamp for Consumer {
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
     fn id(&self) -> &str {
         &self.id
     }
@@ -310,7 +345,10 @@ impl HasIdAndTimestamp for Consumer {
     }
 }
 
-impl HasIdAndTimestamp for PluginConfig {
+impl HasNamespacedIdAndTimestamp for PluginConfig {
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
     fn id(&self) -> &str {
         &self.id
     }
@@ -319,7 +357,10 @@ impl HasIdAndTimestamp for PluginConfig {
     }
 }
 
-impl HasIdAndTimestamp for Upstream {
+impl HasNamespacedIdAndTimestamp for Upstream {
+    fn namespace(&self) -> &str {
+        &self.namespace
+    }
     fn id(&self) -> &str {
         &self.id
     }
@@ -329,20 +370,23 @@ impl HasIdAndTimestamp for Upstream {
 }
 
 /// Resources in `new` but not in `old`.
-fn diff_added<T: HasIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
-    let old_ids: HashSet<&str> = old.iter().map(|r| r.id()).collect();
+fn diff_added<T: HasNamespacedIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
+    let old_keys: HashSet<ResourceKey<'_>> = old.iter().map(resource_key).collect();
     new.iter()
-        .filter(|r| !old_ids.contains(r.id()))
+        .filter(|r| !old_keys.contains(&resource_key(*r)))
         .cloned()
         .collect()
 }
 
-/// IDs of resources in `old` but not in `new`.
-fn diff_removed_ids<T: HasIdAndTimestamp>(old: &[T], new: &[T]) -> Vec<String> {
-    let new_ids: HashSet<&str> = new.iter().map(|r| r.id()).collect();
+/// Namespace-qualified keys of resources in `old` but not in `new`.
+fn diff_removed_ids<T: HasNamespacedIdAndTimestamp>(
+    old: &[T],
+    new: &[T],
+) -> Vec<NamespacedResourceId> {
+    let new_keys: HashSet<ResourceKey<'_>> = new.iter().map(resource_key).collect();
     old.iter()
-        .filter(|r| !new_ids.contains(r.id()))
-        .map(|r| r.id().to_string())
+        .filter(|r| !new_keys.contains(&resource_key(*r)))
+        .map(namespaced_id_of)
         .collect()
 }
 
@@ -353,13 +397,15 @@ fn diff_removed_ids<T: HasIdAndTimestamp>(old: &[T], new: &[T]) -> Vec<String> {
 /// locally. Incremental SQL polling still depends on its `updated_at > cursor`
 /// predicate to fetch candidates in the first place, so this is a defensive
 /// diff guard rather than a substitute for monotonic database timestamps.
-fn diff_modified<T: HasIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
-    let old_map: HashMap<&str, DateTime<Utc>> =
-        old.iter().map(|r| (r.id(), r.updated_at())).collect();
+fn diff_modified<T: HasNamespacedIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
+    let old_map: HashMap<ResourceKey<'_>, DateTime<Utc>> = old
+        .iter()
+        .map(|r| (resource_key(r), r.updated_at()))
+        .collect();
     new.iter()
         .filter(|r| {
             old_map
-                .get(r.id())
+                .get(&resource_key(*r))
                 .is_some_and(|&old_ts| r.updated_at() != old_ts)
         })
         .cloned()
@@ -372,17 +418,19 @@ fn diff_modified<T: HasIdAndTimestamp + Clone>(old: &[T], new: &[T]) -> Vec<T> {
 /// SQL stores these links in a junction table, so an association-only update or
 /// cascade need not advance `Proxy.updated_at`. Association order is not part of
 /// placement identity; plugin execution order comes from effective priorities.
-fn diff_plugin_association_changes(old: &[Proxy], new: &[Proxy]) -> Vec<String> {
-    let old_by_id: HashMap<&str, &Proxy> =
-        old.iter().map(|proxy| (proxy.id.as_str(), proxy)).collect();
+fn diff_plugin_association_changes(old: &[Proxy], new: &[Proxy]) -> Vec<NamespacedResourceId> {
+    let old_by_key: HashMap<ResourceKey<'_>, &Proxy> = old
+        .iter()
+        .map(|proxy| (resource_key(proxy), proxy))
+        .collect();
 
     new.iter()
         .filter(|proxy| {
-            old_by_id
-                .get(proxy.id.as_str())
+            old_by_key
+                .get(&resource_key(*proxy))
                 .is_some_and(|old_proxy| !same_plugin_associations(old_proxy, proxy))
         })
-        .map(|proxy| proxy.id.clone())
+        .map(namespaced_id_of)
         .collect()
 }
 
@@ -405,43 +453,6 @@ fn same_plugin_associations(left: &Proxy, right: &Proxy) -> bool {
     left_ids == right_ids
 }
 
-type ConsumerKey<'a> = (&'a str, &'a str);
-
-fn consumer_key(consumer: &Consumer) -> ConsumerKey<'_> {
-    (consumer.namespace.as_str(), consumer.id.as_str())
-}
-
-fn diff_added_consumers(old: &[Consumer], new: &[Consumer]) -> Vec<Consumer> {
-    let old_keys: HashSet<ConsumerKey<'_>> = old.iter().map(consumer_key).collect();
-    new.iter()
-        .filter(|consumer| !old_keys.contains(&consumer_key(consumer)))
-        .cloned()
-        .collect()
-}
-
-fn diff_removed_consumer_ids(old: &[Consumer], new: &[Consumer]) -> Vec<String> {
-    let new_keys: HashSet<ConsumerKey<'_>> = new.iter().map(consumer_key).collect();
-    old.iter()
-        .filter(|consumer| !new_keys.contains(&consumer_key(consumer)))
-        .map(|consumer| consumer.id.clone())
-        .collect()
-}
-
-fn diff_modified_consumers(old: &[Consumer], new: &[Consumer]) -> Vec<Consumer> {
-    let old_map: HashMap<ConsumerKey<'_>, DateTime<Utc>> = old
-        .iter()
-        .map(|consumer| (consumer_key(consumer), consumer.updated_at))
-        .collect();
-    new.iter()
-        .filter(|consumer| {
-            old_map
-                .get(&consumer_key(consumer))
-                .is_some_and(|old_ts| consumer.updated_at != *old_ts)
-        })
-        .cloned()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,11 +464,16 @@ mod tests {
 
     #[derive(Clone)]
     struct TestResource {
+        namespace: String,
         id: String,
         updated_at: DateTime<Utc>,
     }
 
-    impl HasIdAndTimestamp for TestResource {
+    impl HasNamespacedIdAndTimestamp for TestResource {
+        fn namespace(&self) -> &str {
+            &self.namespace
+        }
+
         fn id(&self) -> &str {
             &self.id
         }
@@ -488,6 +504,7 @@ mod tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            mesh_revision: None,
         }
     }
 
@@ -498,9 +515,27 @@ mod tests {
         plugin_ids: &[&str],
         updated_at: DateTime<Utc>,
     ) -> Proxy {
+        proxy_in_namespace(
+            default_namespace().as_str(),
+            id,
+            listen_path,
+            hosts,
+            plugin_ids,
+            updated_at,
+        )
+    }
+
+    fn proxy_in_namespace(
+        namespace: &str,
+        id: &str,
+        listen_path: Option<&str>,
+        hosts: &[&str],
+        plugin_ids: &[&str],
+        updated_at: DateTime<Utc>,
+    ) -> Proxy {
         let mut proxy: Proxy = serde_json::from_value(json!({
             "id": id,
-            "namespace": default_namespace(),
+            "namespace": namespace,
             "hosts": hosts,
             "listen_path": listen_path,
             "backend_scheme": "http",
@@ -565,10 +600,12 @@ mod tests {
     #[test]
     fn diff_modified_treats_backward_timestamp_drift_as_change() {
         let old = vec![TestResource {
+            namespace: default_namespace(),
             id: "r1".to_string(),
             updated_at: ts(20),
         }];
         let new = vec![TestResource {
+            namespace: default_namespace(),
             id: "r1".to_string(),
             updated_at: ts(10),
         }];
@@ -606,7 +643,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["added"]
         );
-        assert_eq!(delta.removed_proxy_ids, vec!["removed"]);
+        assert_eq!(
+            delta.removed_proxy_ids,
+            vec![NamespacedResourceId::new(default_namespace(), "removed")]
+        );
         assert_eq!(
             delta
                 .modified_proxies
@@ -619,26 +659,48 @@ mod tests {
     }
 
     #[test]
-    fn compute_keys_consumers_by_namespace_and_id() {
-        let mut old = config(vec![], vec![]);
+    fn compute_keys_resources_by_namespace_and_id() {
+        let mut old = config(
+            vec![
+                proxy_in_namespace("prod", "p1", Some("/prod"), &[], &[], ts(10)),
+                proxy_in_namespace("staging", "p1", Some("/staging"), &[], &[], ts(10)),
+            ],
+            vec![],
+        );
         old.consumers = vec![
             consumer("prod", "c1", ts(10)),
             consumer("staging", "c1", ts(10)),
         ];
-        let mut new = config(vec![], vec![]);
+        let mut new = config(
+            vec![
+                proxy_in_namespace("prod", "p1", Some("/prod"), &[], &[], ts(10)),
+                proxy_in_namespace("staging", "p1", Some("/staging"), &[], &[], ts(11)),
+            ],
+            vec![],
+        );
         new.consumers = vec![
             consumer("prod", "c1", ts(10)),
             consumer("staging", "c1", ts(11)),
         ];
 
         let modified = ConfigDelta::compute(&old, &new);
+        assert_eq!(modified.modified_proxies.len(), 1);
+        assert_eq!(modified.modified_proxies[0].namespace, "staging");
         assert_eq!(modified.modified_consumers.len(), 1);
         assert_eq!(modified.modified_consumers[0].namespace, "staging");
 
+        new.proxies.retain(|proxy| proxy.namespace == "prod");
         new.consumers
             .retain(|consumer| consumer.namespace == "prod");
         let removed = ConfigDelta::compute(&old, &new);
-        assert_eq!(removed.removed_consumer_ids, vec!["c1"]);
+        assert_eq!(
+            removed.removed_proxy_ids,
+            vec![NamespacedResourceId::new("staging", "p1")]
+        );
+        assert_eq!(
+            removed.removed_consumer_ids,
+            vec![NamespacedResourceId::new("staging", "c1")]
+        );
     }
 
     #[test]
@@ -666,9 +728,9 @@ mod tests {
         let delta = ConfigDelta::compute(&old, &new);
         let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
 
-        assert!(ids.contains("p1"));
-        assert!(ids.contains("p3"));
-        assert!(!ids.contains("p2"));
+        assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
+        assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p3")));
+        assert!(!ids.contains(&NamespacedResourceId::new(default_namespace(), "p2")));
     }
 
     #[test]
@@ -691,8 +753,8 @@ mod tests {
         let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
 
         assert_eq!(ids.len(), 2);
-        assert!(ids.contains("p1"));
-        assert!(ids.contains("p2"));
+        assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
+        assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p2")));
     }
 
     #[test]

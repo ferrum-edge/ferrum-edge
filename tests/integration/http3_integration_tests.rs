@@ -913,8 +913,10 @@ async fn test_http3_streaming_decision_logic() {
 
     // Case 1: No plugins, no retry → streaming
     let has_retry_1 = proxy_stream.retry.is_some();
-    let needs_resp_buf_1 = plugin_cache.requires_response_body_buffering(&proxy_stream.id);
-    let needs_req_buf_1 = plugin_cache.requires_request_body_buffering(&proxy_stream.id);
+    let needs_resp_buf_1 =
+        plugin_cache.requires_response_body_buffering(&proxy_stream.namespace, &proxy_stream.id);
+    let needs_req_buf_1 =
+        plugin_cache.requires_request_body_buffering(&proxy_stream.namespace, &proxy_stream.id);
     assert!(!has_retry_1, "No retry configured");
     assert!(!needs_resp_buf_1, "No response body buffering needed");
     assert!(!needs_req_buf_1, "No request body buffering needed");
@@ -924,16 +926,19 @@ async fn test_http3_streaming_decision_logic() {
     // Case 2: Retry configured → buffered
     let has_retry_2 = proxy_buffered.retry.is_some();
     assert!(has_retry_2, "Retry is configured");
-    let should_stream_2 =
-        !has_retry_2 && !plugin_cache.requires_response_body_buffering(&proxy_buffered.id);
+    let needs_resp_buf_2 = plugin_cache
+        .requires_response_body_buffering(&proxy_buffered.namespace, &proxy_buffered.id);
+    let should_stream_2 = !has_retry_2 && !needs_resp_buf_2;
     assert!(
         !should_stream_2,
         "Should buffer: retry configured requires body replay"
     );
 
     // Case 3: ai_token_metrics plugin → buffered responses
-    let needs_resp_buf_3 =
-        plugin_cache.requires_response_body_buffering(&proxy_with_body_plugin.id);
+    let needs_resp_buf_3 = plugin_cache.requires_response_body_buffering(
+        &proxy_with_body_plugin.namespace,
+        &proxy_with_body_plugin.id,
+    );
     assert!(
         needs_resp_buf_3,
         "ai_token_metrics requires response body buffering"

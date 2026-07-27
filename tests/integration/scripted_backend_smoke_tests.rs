@@ -738,9 +738,23 @@ async fn serve_drops_prebound_admin_https_without_tls_before_reserved_ports() {
     use ferrum_edge::config::{EnvConfig, OperatingMode};
     use ferrum_edge::modes::file::{self, ServeOptions};
 
-    let admin_https_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind prebound admin HTTPS");
+    // Do not use an ephemeral port for this ownership-transfer test. `serve()`
+    // intentionally drops the admin socket several seconds before the stream
+    // manager rebinds it; under the highly parallel protocols-data-plane shard,
+    // an unrelated outbound connection can acquire that just-released
+    // ephemeral source port during the gap and make the assertion fail with
+    // EADDRINUSE even though Ferrum released the FD correctly. Scan a bounded
+    // non-ephemeral test range so the gap still proves release/rebind without
+    // racing the kernel's ephemeral allocator.
+    let mut admin_https_listener = None;
+    for port in 20_000..30_000 {
+        if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            admin_https_listener = Some(listener);
+            break;
+        }
+    }
+    let admin_https_listener =
+        admin_https_listener.expect("bind prebound admin HTTPS outside the ephemeral range");
     let admin_https_port = admin_https_listener.local_addr().unwrap().port();
 
     // Stream proxy on the same port the unused admin HTTPS socket held.

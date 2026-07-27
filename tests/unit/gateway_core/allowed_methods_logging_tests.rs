@@ -1,5 +1,13 @@
 //! Source-contract coverage for matched-proxy `allowed_methods` transaction logging.
 
+/// Namespace-qualified protocol-filtered request view. Keying by
+/// `(namespace, id)` is what stops a same-id proxy in another tenant from
+/// supplying this request's plugin list.
+const PROTOCOL_VIEW: &str = "request_view(&proxy.namespace, &proxy.id, request_protocol)";
+
+/// Namespace-qualified gRPC-Web composed request view.
+const GRPC_WEB_VIEW: &str = "grpc_web_request_view(&proxy.namespace, &proxy.id)";
+
 #[test]
 fn h1_h2_allowed_methods_rejection_logs_before_request_hooks() {
     let source = include_str!("../../../src/proxy/mod.rs");
@@ -34,9 +42,8 @@ fn h1_h2_allowed_methods_rejection_logs_before_request_hooks() {
 
     let logging_slice = &source[plugin_view..grpc_post];
     assert!(
-        logging_slice.contains("grpc_web_request_view(&proxy.id)")
-            && logging_slice.contains("request_view(&proxy.id, request_protocol)"),
-        "405 logging must select the protocol-appropriate plugin-cache view"
+        logging_slice.contains(GRPC_WEB_VIEW) && logging_slice.contains(PROTOCOL_VIEW),
+        "405 logging must select the namespace-qualified, protocol-appropriate plugin-cache view"
     );
     assert!(
         !logging_slice.contains("on_request_received("),
@@ -74,9 +81,8 @@ fn h3_allowed_methods_rejection_logs_before_request_hooks() {
 
     let logging_slice = &region[..grpc_post];
     assert!(
-        logging_slice.contains("grpc_web_request_view(&proxy.id)")
-            && logging_slice.contains("request_view(&proxy.id, request_protocol)"),
-        "H3 405 logging must select the protocol-appropriate plugin-cache view"
+        logging_slice.contains(GRPC_WEB_VIEW) && logging_slice.contains(PROTOCOL_VIEW),
+        "H3 405 logging must select the namespace-qualified, protocol-appropriate cache view"
     );
     assert!(
         !logging_slice.contains("on_request_received("),

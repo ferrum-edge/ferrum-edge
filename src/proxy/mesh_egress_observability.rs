@@ -54,7 +54,7 @@ impl CapturedMeshEgressLifecycle {
     ) -> Option<Self> {
         let plugins: Vec<_> = epoch
             .plugin_cache
-            .get_plugins_for_protocol(&proxy.id, protocol)
+            .plugins_for_protocol(&proxy.namespace, &proxy.id, protocol)
             .iter()
             .filter(|plugin| plugin.name() == WORKLOAD_METRICS_PLUGIN)
             .cloned()
@@ -73,9 +73,10 @@ impl CapturedMeshEgressLifecycle {
             proxy.effective_scheme(),
             Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index))),
         );
+        stream_ctx.proxy_namespace = proxy.namespace.clone();
         stream_ctx.proxy_lifecycle_generation = epoch
             .plugin_cache
-            .proxy_lifecycle_generation(proxy.id.as_str());
+            .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
         // NodeWaypoint TCP and Ambient UDP capture already verified the
         // originating pod's identity before handing the flow here; carry
         // it so workload_metrics attributes CLIENT spans/labels to the

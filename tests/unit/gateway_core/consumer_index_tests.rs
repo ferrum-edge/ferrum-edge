@@ -2,6 +2,7 @@
 
 use chrono::Utc;
 use ferrum_edge::ConsumerIndex;
+use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::Consumer;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -322,7 +323,7 @@ fn test_apply_delta_remove_consumer() {
     let c2 = make_consumer("c2", "bob", Some("key-b"), None);
     let index = ConsumerIndex::new(&[c1, c2]);
 
-    index.apply_delta(&[], &["c1".to_string()], &[]);
+    index.apply_delta(&[], &[NamespacedResourceId::new("ferrum", "c1")], &[]);
 
     assert_eq!(index.consumer_count(), 1);
     assert!(index.find_by_api_key("key-a").is_none());
@@ -361,7 +362,11 @@ fn test_apply_delta_simultaneous_add_remove_modify() {
     let c4 = make_consumer("c4", "dave", Some("key-d"), None);
     let c2_modified = make_consumer("c2", "bob", Some("key-b-new"), None);
 
-    index.apply_delta(&[c4], &["c1".to_string()], &[c2_modified]);
+    index.apply_delta(
+        &[c4],
+        &[NamespacedResourceId::new("ferrum", "c1")],
+        &[c2_modified],
+    );
 
     assert_eq!(index.consumer_count(), 3); // c2, c3, c4
     assert!(index.find_by_api_key("key-a").is_none()); // removed
@@ -432,7 +437,7 @@ fn test_apply_delta_remove_consumer_with_array_credentials() {
     let c1 = make_consumer_with_array_keys("c1", "alice", &["key-a1", "key-a2"]);
     let index = ConsumerIndex::new(&[c1]);
 
-    index.apply_delta(&[], &["c1".to_string()], &[]);
+    index.apply_delta(&[], &[NamespacedResourceId::new("ferrum", "c1")], &[]);
 
     assert!(index.find_by_api_key("key-a1").is_none());
     assert!(index.find_by_api_key("key-a2").is_none());
@@ -975,7 +980,7 @@ fn test_apply_delta_remove_collision_winner_restores_shadowed_consumer() {
     assert_eq!(index.find_by_identity("shared-custom").unwrap().id, "c2");
     assert_eq!(index.find_by_mtls_identity("CN=shared").unwrap().id, "c2");
 
-    index.apply_delta(&[], &["c2".to_string()], &[]);
+    index.apply_delta(&[], &[NamespacedResourceId::new("ferrum", "c2")], &[]);
 
     assert_eq!(index.consumer_count(), 1);
     assert_eq!(index.find_by_api_key("shared-key").unwrap().id, "c1");
@@ -1111,7 +1116,11 @@ fn test_apply_delta_remove_nonexistent_consumer() {
     let c1 = make_consumer("c1", "alice", Some("key-a"), None);
     let index = ConsumerIndex::new(&[c1]);
 
-    index.apply_delta(&[], &["nonexistent-id".to_string()], &[]);
+    index.apply_delta(
+        &[],
+        &[NamespacedResourceId::new("ferrum", "nonexistent-id")],
+        &[],
+    );
 
     assert_eq!(index.consumer_count(), 1);
     assert!(index.find_by_api_key("key-a").is_some());
@@ -1196,7 +1205,14 @@ fn test_apply_delta_remove_all_consumers() {
     let c2 = make_consumer("c2", "bob", Some("key-b"), None);
     let index = ConsumerIndex::new(&[c1, c2]);
 
-    index.apply_delta(&[], &["c1".to_string(), "c2".to_string()], &[]);
+    index.apply_delta(
+        &[],
+        &[
+            NamespacedResourceId::new("ferrum", "c1"),
+            NamespacedResourceId::new("ferrum", "c2"),
+        ],
+        &[],
+    );
 
     assert_eq!(index.consumer_count(), 0);
     assert!(index.find_by_api_key("key-a").is_none());
@@ -1214,7 +1230,7 @@ fn test_apply_delta_remove_consumer_with_mtls_cleans_mtls_index() {
     assert!(index.find_by_mtls_identity("CN=cert-a").is_some());
     assert!(index.find_by_mtls_identity("CN=cert-b").is_some());
 
-    index.apply_delta(&[], &["c1".to_string()], &[]);
+    index.apply_delta(&[], &[NamespacedResourceId::new("ferrum", "c1")], &[]);
 
     assert!(index.find_by_mtls_identity("CN=cert-a").is_none());
     assert!(index.find_by_mtls_identity("CN=cert-b").is_none());
@@ -1247,7 +1263,7 @@ fn test_apply_delta_remove_jwt_consumer_updates_count() {
     let (_, _, _, jwt_before, _, _, _) = index.auth_type_counts();
     assert_eq!(jwt_before, 2);
 
-    index.apply_delta(&[], &["c1".to_string()], &[]);
+    index.apply_delta(&[], &[NamespacedResourceId::new("ferrum", "c1")], &[]);
 
     let (_, _, _, jwt_after, _, _, _) = index.auth_type_counts();
     assert_eq!(jwt_after, 1);
@@ -1301,7 +1317,7 @@ fn test_lookups_return_none_after_delta_remove() {
     assert!(index.find_by_identity("c1").is_some());
     assert!(index.find_by_identity("custom-a").is_some());
 
-    index.apply_delta(&[], &["c1".to_string()], &[]);
+    index.apply_delta(&[], &[NamespacedResourceId::new("ferrum", "c1")], &[]);
 
     // All lookups must return None after removal
     assert!(index.find_by_api_key("key-a").is_none());
@@ -1436,7 +1452,11 @@ fn test_sequential_deltas_accumulate() {
 
     // Third delta: modify c1, remove c2
     let c1_modified = make_consumer("c1", "alice", Some("key-a-new"), None);
-    index.apply_delta(&[], &["c2".to_string()], &[c1_modified]);
+    index.apply_delta(
+        &[],
+        &[NamespacedResourceId::new("ferrum", "c2")],
+        &[c1_modified],
+    );
     assert_eq!(index.consumer_count(), 1);
     assert!(index.find_by_api_key("key-a").is_none());
     assert!(index.find_by_api_key("key-a-new").is_some());

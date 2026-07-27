@@ -31,6 +31,11 @@
 //! - [`ScriptedH2Backend::accepted_connections`] — raw TCP accepts
 //! - [`ScriptedH2Backend::handshakes_completed`] — connections that finished
 //!   the H2 settings exchange
+//! - [`ScriptedH2Backend::acceptors_waiting`] — scripts blocked in
+//!   `ExpectHeaders` / `AcceptRpc`
+//! - [`ScriptedH2Backend::awaiting_test_signal`] /
+//!   [`ScriptedH2Backend::release_test_signal`] — explicit test↔fixture barrier
+//! - [`ScriptedH2Backend::goaways_sent`] — GOAWAY frames issued by the script
 //! - [`ScriptedH2Backend::received_streams`] — parsed request headers per
 //!   stream, ordered by arrival
 //! - [`ScriptedH2Backend::step_errors`] — non-empty if any script step
@@ -51,7 +56,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 
 /// Headers of a received H2 request stream, captured for assertions.
@@ -174,6 +179,13 @@ pub enum H2Step {
     /// the client window before the Sleep so no additional capacity is
     /// granted.
     Sleep(Duration),
+    /// Block until the test calls [`ScriptedH2Backend::release_test_signal`].
+    ///
+    /// Use this to separate a successful RPC response from a later connection
+    /// fault (e.g. GOAWAY) without a wall-clock sleep: the client must be
+    /// allowed to fully observe response headers/trailers before the script
+    /// poisons the pooled sender.
+    AwaitTestSignal,
     /// Withhold WINDOW_UPDATE frames by configuring a tiny initial
     /// connection/stream window, then sleep for `duration`. Anything the
     /// peer writes past the initial window stalls. The step returns once
@@ -359,7 +371,21 @@ impl ScriptedH2BackendBuilder {
     /// background task.
     pub fn spawn(self) -> io::Result<ScriptedH2Backend> {
         let port = self.listener.local_addr()?.port();
-        let state = Arc::new(H2State::default());
+        let (test_signal_tx, test_signal_rx) = watch::channel(false);
+        let state = Arc::new(H2State {
+            accepted: AtomicU32::new(0),
+            handshakes: AtomicU32::new(0),
+            acceptors_waiting: AtomicU32::new(0),
+            awaiting_test_signal: AtomicU32::new(0),
+            goaways_sent: AtomicU32::new(0),
+            stream_count: AtomicU32::new(0),
+            stream_resets: AtomicU32::new(0),
+            matcher_mismatches: AtomicU32::new(0),
+            streams: Mutex::new(Vec::new()),
+            step_errors: Mutex::new(Vec::new()),
+            connection_aborts: StdMutex::new(Vec::new()),
+            test_signal: test_signal_rx,
+        });
         let state_task = state.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let listener = self.listener;
@@ -423,6 +449,7 @@ impl ScriptedH2BackendBuilder {
             state,
             handle: Some(handle),
             shutdown: Some(shutdown_tx),
+            test_signal_tx,
         })
     }
 }
@@ -433,6 +460,7 @@ pub struct ScriptedH2Backend {
     state: Arc<H2State>,
     handle: Option<JoinHandle<()>>,
     shutdown: Option<oneshot::Sender<()>>,
+    test_signal_tx: watch::Sender<bool>,
 }
 
 impl ScriptedH2Backend {
@@ -459,6 +487,29 @@ impl ScriptedH2Backend {
     /// H2 handshakes that completed successfully.
     pub fn handshakes_completed(&self) -> u32 {
         self.state.handshakes.load(Ordering::SeqCst)
+    }
+
+    /// Number of connection scripts currently blocked in `ExpectHeaders`
+    /// waiting for an inbound stream. Non-zero means the fixture has armed
+    /// at least that many acceptors after handshake.
+    pub fn acceptors_waiting(&self) -> u32 {
+        self.state.acceptors_waiting.load(Ordering::SeqCst)
+    }
+
+    /// Number of scripts currently blocked in [`H2Step::AwaitTestSignal`].
+    pub fn awaiting_test_signal(&self) -> u32 {
+        self.state.awaiting_test_signal.load(Ordering::SeqCst)
+    }
+
+    /// Number of GOAWAY frames the fixture has issued (`SendGoaway` /
+    /// `SendGoawayAndClose`).
+    pub fn goaways_sent(&self) -> u32 {
+        self.state.goaways_sent.load(Ordering::SeqCst)
+    }
+
+    /// Release every script blocked on [`H2Step::AwaitTestSignal`].
+    pub fn release_test_signal(&self) {
+        let _ = self.test_signal_tx.send(true);
     }
 
     /// Request headers (and any drained body) for every stream the script
@@ -537,16 +588,24 @@ impl Drop for ScriptedH2Backend {
     }
 }
 
-#[derive(Default)]
 struct H2State {
     accepted: AtomicU32,
     handshakes: AtomicU32,
+    /// Scripts currently blocked in `ExpectHeaders` / `AcceptRpc` waiting for
+    /// the next inbound stream. Tests that must not race a cold pooled sender
+    /// against an unarmed acceptor poll this before sending traffic.
+    acceptors_waiting: AtomicU32,
+    /// Scripts currently blocked in [`H2Step::AwaitTestSignal`].
+    awaiting_test_signal: AtomicU32,
+    /// GOAWAY frames issued by scripted steps.
+    goaways_sent: AtomicU32,
     stream_count: AtomicU32,
     stream_resets: AtomicU32,
     matcher_mismatches: AtomicU32,
     streams: Mutex<Vec<ReceivedStream>>,
     step_errors: Mutex<Vec<String>>,
     connection_aborts: StdMutex<Vec<AbortHandle>>,
+    test_signal: watch::Receiver<bool>,
 }
 
 impl H2State {
@@ -726,7 +785,13 @@ async fn run_script(
                     current_body_sender = None;
                     let _previous = current_stream.take();
 
+                    // Publish "acceptor armed" before parking on the channel so
+                    // tests can wait for a real AcceptRpc/ExpectHeaders barrier
+                    // instead of guessing after handshake or sleeping past a
+                    // teardown race on a dying pooled sender.
+                    state.acceptors_waiting.fetch_add(1, Ordering::SeqCst);
                     let pair = stream_rx.recv().await;
+                    state.acceptors_waiting.fetch_sub(1, Ordering::SeqCst);
                     match pair {
                         Some((req, send)) => {
                             let received = parse_request_head(&req);
@@ -891,9 +956,11 @@ async fn run_script(
                 }
                 H2Step::SendGoaway { error_code } => {
                     let _ = ctrl_tx.send(DriverCtrl::Goaway(Reason::from(error_code)));
+                    state.goaways_sent.fetch_add(1, Ordering::SeqCst);
                 }
                 H2Step::SendGoawayAndClose { error_code } => {
                     let _ = ctrl_tx.send(DriverCtrl::Goaway(Reason::from(error_code)));
+                    state.goaways_sent.fetch_add(1, Ordering::SeqCst);
                     // Give the driver a moment to flush the GOAWAY.
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     let _ = ctrl_tx.send(DriverCtrl::Stop);
@@ -937,6 +1004,23 @@ async fn run_script(
                 }
                 H2Step::Sleep(d) | H2Step::StallWindowFor(d) => {
                     tokio::time::sleep(d).await;
+                }
+                H2Step::AwaitTestSignal => {
+                    state.awaiting_test_signal.fetch_add(1, Ordering::SeqCst);
+                    let mut rx = state.test_signal.clone();
+                    let wait_result: Result<(), String> = async {
+                        loop {
+                            if *rx.borrow_and_update() {
+                                return Ok(());
+                            }
+                            rx.changed().await.map_err(|_| {
+                                "AwaitTestSignal: test signal channel closed".to_string()
+                            })?;
+                        }
+                    }
+                    .await;
+                    state.awaiting_test_signal.fetch_sub(1, Ordering::SeqCst);
+                    wait_result?;
                 }
                 H2Step::DropConnection => {
                     // Instruct the driver to stop; dropping the `Connection`

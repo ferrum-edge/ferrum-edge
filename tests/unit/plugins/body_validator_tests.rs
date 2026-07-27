@@ -2,9 +2,10 @@
 
 use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
-use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, Plugin, RequestContext, body_validator::BodyValidator, priority,
+use ferrum_edge::plugins::body_validator::{
+    BODY_VALIDATOR_CONFIG_KEYS, BODY_VALIDATOR_PROTOBUF_METHOD_KEYS, BodyValidator,
 };
+use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -1377,16 +1378,33 @@ async fn test_json_schema_multiple_of_currency_divisor() {
     assert_reject(plugin.before_proxy(&mut bad, &mut headers).await, Some(400));
 }
 
-// Large integral value: u64::MAX is exactly divisible by 3. The float path
-// misjudges this (u64::MAX as f64 rounds up), so the exact integer path is
-// required. The old absolute-EPSILON tolerance also wrongly rejected it.
+// Integral values inside the exactly-representable f64 range are judged with
+// exact arithmetic by the compiled validator.
 #[tokio::test]
 async fn test_json_schema_multiple_of_large_integral_value_uses_exact_modulo() {
+    let plugin = json_schema_plugin(serde_json::json!({"type": "integer", "multipleOf": 3}));
+    // 2^53 - 1 = 9007199254740991 has digit sum 76 and is not a multiple of 3;
+    // 9007199254740990 has digit sum 75 and is.
+    let mut ok = make_json_ctx("9007199254740990");
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ok, &mut headers).await);
+
+    let mut bad = make_json_ctx("9007199254740991");
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut bad, &mut headers).await, Some(400));
+}
+
+// Beyond 2^53 an integer instance is no longer exactly representable as f64.
+// The compiled validator resolves that conservatively — u64::MAX is a true
+// multiple of 3 but is reported as a violation — which is fail-closed and is
+// the documented trade-off of standards-compliant compilation.
+#[tokio::test]
+async fn test_json_schema_multiple_of_beyond_f64_precision_fails_closed() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "integer", "multipleOf": 3}));
     // u64::MAX = 18446744073709551615 = 3 * 6148914691236517205.
     let mut ctx = make_json_ctx("18446744073709551615");
     let mut headers = make_json_headers();
-    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
 
 // Large integral non-multiple is rejected.
@@ -2765,32 +2783,38 @@ async fn test_protobuf_missing_descriptor_only_rejects_configured_method_targets
 
 #[test]
 fn test_protobuf_invalid_message_type_degrades_gracefully() {
+    const MESSAGE_TYPE: &str = "nonexistent.BODY_VALIDATOR_CONFIG_CANARY_TYPE";
     let result = BodyValidator::new(&serde_json::json!({
         "protobuf_descriptor_path": test_descriptor_path(),
-        "protobuf_request_type": "nonexistent.MessageType"
+        "protobuf_request_type": MESSAGE_TYPE
     }));
     let err = result
         .err()
         .expect("expected error for invalid message type");
     assert!(
-        err.contains("protobuf_request_type 'nonexistent.MessageType' not found"),
+        err.contains("configured 'protobuf_request_type' was not found in the descriptor"),
         "got: {err}"
     );
+    assert!(!err.contains(MESSAGE_TYPE), "got: {err}");
 }
 
 #[test]
 fn test_protobuf_readable_malformed_descriptor_rejects_runtime_candidate() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("invalid.pb");
+    let path = dir
+        .path()
+        .join("BODY_VALIDATOR_CONFIG_CANARY_DESCRIPTOR_PATH.pb");
     std::fs::write(&path, b"not-a-file-descriptor-set").unwrap();
+    let path_text = path.to_string_lossy().into_owned();
     let config = json!({
-        "protobuf_descriptor_path": path.to_string_lossy(),
+        "protobuf_descriptor_path": path_text,
         "protobuf_request_type": "test.HelloRequest"
     });
     let error = BodyValidator::new(&config)
         .err()
         .expect("a readable malformed descriptor must reject the runtime candidate");
     assert!(error.contains("failed to parse protobuf descriptor"));
+    assert!(!error.contains("BODY_VALIDATOR_CONFIG_CANARY_DESCRIPTOR_PATH"));
 
     let gateway = GatewayConfig {
         plugin_configs: vec![body_validator_plugin_config("body-validator", true, config)],
@@ -2799,11 +2823,12 @@ fn test_protobuf_readable_malformed_descriptor_rejects_runtime_candidate() {
     let errors = gateway.validate_plugin_file_dependencies();
     assert_eq!(errors.len(), 1, "unexpected dependency errors: {errors:?}");
     assert!(errors[0].contains("failed to parse protobuf descriptor"));
+    assert!(!errors[0].contains("BODY_VALIDATOR_CONFIG_CANARY_DESCRIPTOR_PATH"));
 }
 
 #[test]
 fn test_protobuf_descriptor_file_dependency_reports_missing_path_once() {
-    let missing = "/nonexistent/path/shared-descriptor.bin";
+    let missing = "/nonexistent/BODY_VALIDATOR_CONFIG_CANARY_DESCRIPTOR_PATH/shared.bin";
     let gateway = GatewayConfig {
         plugin_configs: vec![
             body_validator_plugin_config(
@@ -2832,24 +2857,52 @@ fn test_protobuf_descriptor_file_dependency_reports_missing_path_once() {
         "shared descriptor paths must be read and reported once: {errors:?}"
     );
     assert!(errors[0].contains("failed to read protobuf descriptor file"));
+    assert!(!errors[0].contains("BODY_VALIDATOR_CONFIG_CANARY_DESCRIPTOR_PATH"));
 }
 
 #[test]
 fn test_protobuf_descriptor_file_dependency_validates_message_references() {
+    const MESSAGE_TYPE: &str = "missing.BODY_VALIDATOR_CONFIG_CANARY_TYPE";
     let gateway = GatewayConfig {
         plugin_configs: vec![body_validator_plugin_config(
             "body-validator",
             true,
             json!({
                 "protobuf_descriptor_path": test_descriptor_path(),
-                "protobuf_request_type": "missing.Request"
+                "protobuf_request_type": MESSAGE_TYPE
             }),
         )],
         ..Default::default()
     };
     let errors = gateway.validate_plugin_file_dependencies();
     assert_eq!(errors.len(), 1, "unexpected dependency errors: {errors:?}");
-    assert!(errors[0].contains("protobuf_request_type 'missing.Request' not found"));
+    assert!(
+        errors[0].contains("configured 'protobuf_request_type' was not found in the descriptor")
+    );
+    assert!(!errors[0].contains(MESSAGE_TYPE));
+}
+
+#[test]
+fn protobuf_method_resolution_errors_redact_method_path_and_type() {
+    const METHOD_PATH: &str = "/BODY_VALIDATOR_CONFIG_CANARY_METHOD/Call";
+    const MESSAGE_TYPE: &str = "missing.BODY_VALIDATOR_CONFIG_CANARY_METHOD_TYPE";
+    let config = json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_method_messages": {
+            "/BODY_VALIDATOR_CONFIG_CANARY_METHOD/Call": {
+                "request": MESSAGE_TYPE
+            }
+        }
+    });
+    let error = BodyValidator::new(&config)
+        .err()
+        .expect("missing per-method type must reject configuration");
+    assert_eq!(
+        error,
+        "body_validator: a 'protobuf_method_messages' request type was not found in the descriptor"
+    );
+    assert!(!error.contains(METHOD_PATH), "{error}");
+    assert!(!error.contains(MESSAGE_TYPE), "{error}");
 }
 
 #[test]
@@ -3302,6 +3355,96 @@ async fn parameter_entity_expanding_entity_declarations_is_rejected() {
 }
 
 #[tokio::test]
+async fn attlist_parameter_entity_expansion_is_rejected() {
+    // Bare `%many;` in the subset is already covered. The same expansion inside
+    // another markup declaration (ATTLIST) must still fail closed — that is the
+    // quote-aware `<!` skip path that charges parameter entities in markup.
+    let plugin = xml_plugin();
+    let body = concat!(
+        r#"<!DOCTYPE r ["#,
+        r#"<!ENTITY % many "<!ENTITY a 'x'><!ENTITY b 'y'">"#,
+        r#"<!ATTLIST r id CDATA %many;>"#,
+        r#"]><r/>"#
+    );
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn attlist_parameter_entity_count_exceeds_cap_when_nesting_allowed() {
+    let plugin = BodyValidator::new(&json!({
+        "validate_xml": true,
+        "xml_reject_nested_entities": false,
+        "xml_max_entities": 1
+    }))
+    .unwrap();
+    // The parameter entity declaration itself consumes the only allowed slot;
+    // expanding it into two more declarations must still exceed the cap.
+    let body = concat!(
+        r#"<!DOCTYPE r ["#,
+        r#"<!ENTITY % many "<!ENTITY a 'x'><!ENTITY b 'y'">"#,
+        r#"<!ATTLIST r id CDATA %many;>"#,
+        r#"]><r/>"#
+    );
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn attlist_parameter_entity_without_nested_declarations_is_allowed() {
+    let plugin = xml_plugin();
+    // Empty replacement text contributes zero nested declarations, so the
+    // markup charge is a no-op and the ATTLIST remains well-formed.
+    let body = concat!(
+        r#"<!DOCTYPE r ["#,
+        r#"<!ENTITY % empty "">"#,
+        r#"<!ATTLIST r id CDATA #IMPLIED%empty;>"#,
+        r#"]><r/>"#
+    );
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn quoted_parameter_entity_inside_attlist_is_not_charged() {
+    let plugin = xml_plugin();
+    // `%many;` appears only as a quoted default attribute value, so the
+    // expansion policy must not treat it as an active parameter reference.
+    let body = concat!(
+        r#"<!DOCTYPE r ["#,
+        r#"<!ENTITY % many "<!ENTITY a 'x'><!ENTITY b 'y'">"#,
+        r#"<!ATTLIST r id CDATA "%many;">"#,
+        r#"]><r/>"#
+    );
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn incomplete_attlist_still_charges_parameter_entity_references() {
+    let plugin = xml_plugin();
+    // Missing `>` forces the declaration-end scan to the end of the body; the
+    // unquoted `%many;` inside must still be charged and rejected.
+    let body = concat!(
+        r#"<!DOCTYPE r ["#,
+        r#"<!ENTITY % many "<!ENTITY a 'x'><!ENTITY b 'y'">"#,
+        r#"<!ATTLIST r id CDATA %many;"#
+    );
+    let mut ctx = make_xml_ctx(body);
+    let mut headers = make_xml_headers();
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
 async fn too_many_xml_entities_are_rejected() {
     let plugin = BodyValidator::new(&json!({
         "validate_xml": true,
@@ -3349,4 +3492,1639 @@ async fn nested_entity_rejection_can_be_disabled() {
     let mut headers = make_xml_headers();
 
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GHSA-w7x7-ppx9-5v74 — unknown configuration keys fail closed
+// ═══════════════════════════════════════════════════════════════════════
+
+fn reject_body(result: PluginResult) -> String {
+    match result {
+        PluginResult::Reject { body, .. } => body,
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_top_level_config_keys_are_rejected() {
+    // Each case pairs an intended-but-misspelled control with a valid rule,
+    // which is exactly the shape that used to be admitted while silently
+    // dropping the misspelled enforcement.
+    let configs = [
+        json!({
+            "required_fields": ["tenant"],
+            "response_json_scheam": {"type": "object"}
+        }),
+        json!({
+            "required_fields": ["tenant"],
+            "protobuf_reject_unknown_field": true
+        }),
+        json!({"validate_xml": true, "xml_reject_nested_entites": false}),
+        json!({"validate_xml": true, "content_type": ["application/xml"]}),
+        json!({
+            "required_fields": ["tenant"],
+            "grpc_max_decompressed_size_byte": 10
+        }),
+        json!({
+            "required_fields": ["tenant"],
+            "response_requred_fields": ["id"]
+        }),
+    ];
+    for config in configs {
+        let result = BodyValidator::new(&config);
+        let error = result.err().expect("unknown key must be rejected");
+        assert!(error.contains("unknown configuration key"), "{error}");
+    }
+}
+
+#[test]
+fn unknown_top_level_config_keys_are_rejected_by_shape_only_validation() {
+    // CP/admin admission uses the shape-only path; it must fail closed too.
+    let config = json!({
+        "required_fields": ["tenant"],
+        "response_json_scheam": {"type": "object"}
+    });
+    let result = BodyValidator::validate_config(&config);
+    let error = result.expect_err("shape-only validation must reject it");
+    assert!(error.contains("unknown configuration key"), "{error}");
+}
+
+#[test]
+fn unknown_protobuf_method_keys_are_rejected() {
+    let config = json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_method_messages": {
+            "/test.Greeter/SayHello": {
+                "request": "test.HelloRequest",
+                "respones": "test.HelloResponse"
+            }
+        }
+    });
+    let result = BodyValidator::new(&config);
+    let error = result.err().expect("misspelled direction must be rejected");
+    assert!(error.contains("has an unknown key"), "{error}");
+}
+
+fn assert_redacted_configuration_error(
+    config: serde_json::Value,
+    expected_message: &str,
+    forbidden: &[&str],
+) {
+    let runtime_error = BodyValidator::new(&config)
+        .err()
+        .expect("runtime construction must reject the invalid configuration");
+    let shape_error = BodyValidator::validate_config(&config)
+        .expect_err("shape-only admission must reject the invalid configuration");
+
+    for (surface, error) in [("runtime", runtime_error), ("shape-only", shape_error)] {
+        assert_eq!(
+            error, expected_message,
+            "{surface} rejection must use the stable categorical message"
+        );
+        for supplied in forbidden {
+            assert!(
+                !error.contains(*supplied),
+                "{surface} rejection must redact supplied text {supplied:?}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn configuration_errors_redact_supplied_schema_and_shape_text() {
+    const DRAFT: &str = "draft-BODY_VALIDATOR_CONFIG_CANARY";
+    const EXTERNAL_REF: &str =
+        "https://ref-user:BODY_VALIDATOR_CONFIG_CANARY_REF@example.com/schema";
+    const LOCAL_REF: &str = "#/$defs/BODY_VALIDATOR_CONFIG_CANARY_LOCAL_REF";
+    const ID_URI: &str = "https://id-user:BODY_VALIDATOR_CONFIG_CANARY_ID@example.com/schema";
+    const SCHEMA_URI: &str =
+        "https://schema-user:BODY_VALIDATOR_CONFIG_CANARY_SCHEMA@example.com/draft";
+    const PATTERN: &str = "(?P<BODY_VALIDATOR_CONFIG_CANARY_PATTERN>[";
+    const UNKNOWN_KEY: &str = "unknown_BODY_VALIDATOR_CONFIG_CANARY_KEY";
+    const XML_ENTRY: &str = "{https://BODY_VALIDATOR_CONFIG_CANARY_XML@example.com/ns";
+    const METHOD_PATH: &str = "/BODY_VALIDATOR_CONFIG_CANARY_METHOD/Call";
+    const METHOD_KEY: &str = "BODY_VALIDATOR_CONFIG_CANARY_METHOD_KEY";
+
+    assert_redacted_configuration_error(
+        json!({"json_schema_draft": DRAFT}),
+        "body_validator: 'json_schema_draft' must be 'draft2020-12' or 'draft7'",
+        &[DRAFT],
+    );
+    assert_redacted_configuration_error(
+        json!({"json_schema": {"$ref": EXTERNAL_REF}}),
+        "body_validator: 'json_schema' has a non-local '$ref'; only local references \
+         (starting with '#') are supported and no external reference is ever retrieved",
+        &[EXTERNAL_REF, "BODY_VALIDATOR_CONFIG_CANARY_REF"],
+    );
+    assert_redacted_configuration_error(
+        json!({"json_schema": {"$ref": LOCAL_REF}}),
+        "body_validator: 'json_schema' has a local '$ref' JSON Pointer that resolves nowhere",
+        &[LOCAL_REF, "BODY_VALIDATOR_CONFIG_CANARY_LOCAL_REF"],
+    );
+    assert_redacted_configuration_error(
+        json!({"json_schema": {"$id": ID_URI, "type": "object"}}),
+        "body_validator: 'json_schema' has a non-fragment '$id'; a base URI would allow \
+         external reference resolution",
+        &[ID_URI, "BODY_VALIDATOR_CONFIG_CANARY_ID"],
+    );
+    assert_redacted_configuration_error(
+        json!({"json_schema": {"$schema": SCHEMA_URI, "type": "object"}}),
+        "body_validator: 'json_schema' declares an unsupported '$schema'; configured draft is \
+         'draft2020-12'",
+        &[SCHEMA_URI, "BODY_VALIDATOR_CONFIG_CANARY_SCHEMA"],
+    );
+    assert_redacted_configuration_error(
+        json!({"json_schema": {"type": "string", "pattern": PATTERN}}),
+        "body_validator: 'json_schema' is not a valid draft2020-12 JSON Schema",
+        &[PATTERN, "BODY_VALIDATOR_CONFIG_CANARY_PATTERN"],
+    );
+    assert_redacted_configuration_error(
+        json!({
+            "required_fields": ["tenant"],
+            "unknown_BODY_VALIDATOR_CONFIG_CANARY_KEY": true
+        }),
+        &format!(
+            "body_validator: unknown configuration key; allowed keys: {}",
+            BODY_VALIDATOR_CONFIG_KEYS.join(", ")
+        ),
+        &[UNKNOWN_KEY, "BODY_VALIDATOR_CONFIG_CANARY_KEY"],
+    );
+    assert_redacted_configuration_error(
+        json!({"required_xml_elements": [XML_ENTRY]}),
+        "body_validator: 'required_xml_elements' entry at index 0 opens Clark notation with '{' \
+         but never closes it with '}'",
+        &[XML_ENTRY, "BODY_VALIDATOR_CONFIG_CANARY_XML"],
+    );
+    assert_redacted_configuration_error(
+        json!({
+            "protobuf_descriptor_path": test_descriptor_path(),
+            "protobuf_method_messages": {
+                "/BODY_VALIDATOR_CONFIG_CANARY_METHOD/Call": {
+                    "request": "test.HelloRequest",
+                    "BODY_VALIDATOR_CONFIG_CANARY_METHOD_KEY": true
+                }
+            }
+        }),
+        &format!(
+            "body_validator: a 'protobuf_method_messages' entry has an unknown key; allowed \
+             keys: {}",
+            BODY_VALIDATOR_PROTOBUF_METHOD_KEYS.join(", ")
+        ),
+        &[
+            METHOD_PATH,
+            METHOD_KEY,
+            "BODY_VALIDATOR_CONFIG_CANARY_METHOD",
+        ],
+    );
+}
+
+#[test]
+fn every_documented_config_key_is_accepted_together() {
+    // The allow-list must not be narrower than the real surface: a config
+    // that sets every key at once still constructs.
+    let config = json!({
+        "json_schema": {"type": "object"},
+        "json_schema_draft": "draft2020-12",
+        "required_fields": ["tenant"],
+        "validate_xml": true,
+        "required_xml_elements": ["item"],
+        "xml_max_entities": 10,
+        "xml_reject_nested_entities": true,
+        "content_types": ["application/json"],
+        "response_json_schema": {"type": "object"},
+        "response_required_fields": ["id"],
+        "response_validate_xml": true,
+        "response_required_xml_elements": ["result"],
+        "response_content_types": ["application/json"],
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_request_type": "test.HelloRequest",
+        "protobuf_response_type": "test.HelloResponse",
+        "protobuf_method_messages": {
+            "/test.Greeter/SayHello": {
+                "request": "test.HelloRequest",
+                "response": "test.HelloResponse"
+            }
+        },
+        "protobuf_reject_unknown_fields": true,
+        "grpc_max_decompressed_size_bytes": 1024
+    });
+
+    let object = config.as_object().expect("object config");
+    let mut exercised: Vec<&str> = object.keys().map(String::as_str).collect();
+    exercised.sort_unstable();
+    let mut allowed: Vec<&str> = BODY_VALIDATOR_CONFIG_KEYS.to_vec();
+    allowed.sort_unstable();
+    assert_eq!(exercised, allowed, "must exercise every allowed key");
+
+    BodyValidator::new(&config).expect("full config must construct");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GHSA-5883-wg84-7rhm — JSON Schema is compiled, not approximated
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn json_schema_local_ref_and_defs_are_enforced() {
+    let plugin = json_schema_plugin(json!({
+        "$defs": {
+            "Approved": {
+                "type": "object",
+                "required": ["approved"],
+                "properties": {"approved": {"const": true}}
+            }
+        },
+        "$ref": "#/$defs/Approved"
+    }));
+
+    for body in [r#"{}"#, r#"{"approved": false}"#] {
+        let mut ctx = make_json_ctx(body);
+        let mut headers = make_json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
+
+    let mut ctx = make_json_ctx(r#"{"approved": true}"#);
+    let mut headers = make_json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn local_pointer_into_literal_container_enables_request_unique_items_policy() {
+    let plugin = json_schema_plugin(json!({
+        "default": {
+            "hidden": {
+                "type": "array",
+                "uniqueItems": true
+            }
+        },
+        "$ref": "#/default/hidden"
+    }));
+
+    // `serde_json/preserve_order` makes these objects insertion-order-distinct.
+    // Reaching uniqueItems through the pointer must still enable construction-
+    // time canonicalization and enforce JSON's order-insensitive equality.
+    let mut ctx = make_json_ctx(r#"[{"a": 1, "b": 2}, {"b": 2, "a": 1}]"#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[tokio::test]
+async fn local_pointer_into_literal_container_enables_response_unique_items_policy() {
+    let plugin = response_schema_plugin(json!({
+        "examples": [{
+            "hidden": {
+                "type": "array",
+                "uniqueItems": true
+            }
+        }],
+        "$ref": "#/examples/0/hidden"
+    }));
+
+    let mut ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = br#"[{"left": 1, "right": 2}, {"right": 2, "left": 1}]"#;
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, body)
+            .await,
+        Some(502),
+    );
+}
+
+#[test]
+fn local_pointer_targets_apply_nested_forbidden_policy_in_both_directions() {
+    let schema = json!({
+        "examples": [{
+            "hidden": {
+                "properties": {
+                    "secret": {
+                        "$ref": "https://example.com/forbidden.json"
+                    }
+                }
+            }
+        }],
+        "$ref": "#/examples/0/hidden"
+    });
+
+    for config in [
+        json!({"json_schema": schema.clone()}),
+        json!({"response_json_schema": schema.clone()}),
+    ] {
+        let error = BodyValidator::new(&config)
+            .err()
+            .expect("referenced nested external policy must be rejected");
+        assert!(error.contains("non-local '$ref'"), "{error}");
+    }
+}
+
+#[test]
+fn unreferenced_literal_containers_remain_inactive_in_both_directions() {
+    let schema = json!({
+        "type": "string",
+        "default": {
+            "hidden": {
+                "properties": {
+                    "secret": {
+                        "$ref": "https://literal.example/not-active.json"
+                    }
+                }
+            }
+        }
+    });
+    for config in [
+        json!({"json_schema": schema.clone()}),
+        json!({"response_json_schema": schema.clone()}),
+    ] {
+        BodyValidator::new(&config)
+            .expect("an unreferenced literal container must not activate schema policy");
+    }
+}
+
+#[test]
+fn local_pointer_resolution_handles_cycles_root_and_encoded_segments() {
+    let cyclic = json!({
+        "default": {
+            "a": {"$ref": "#/default/b"},
+            "b": {"$ref": "#/default/a"}
+        },
+        "$ref": "#/default/a"
+    });
+    BodyValidator::new(&json!({"json_schema": cyclic}))
+        .expect("identity deduplication must terminate on a pointer cycle");
+
+    let root_cycle = json!({
+        "default": {
+            "literal": {
+                "$ref": "https://literal.example/not-active.json"
+            }
+        },
+        "$ref": "#"
+    });
+    BodyValidator::new(&json!({"json_schema": root_cycle}))
+        .expect("root '#' must deduplicate without activating literal default data");
+
+    let encoded = json!({
+        "default": {
+            "hidden schema": {
+                "a/b~c": {"type": "integer"}
+            }
+        },
+        "$ref": "#/default/hidden%20schema/a~1b~0c"
+    });
+    BodyValidator::new(&json!({"json_schema": encoded}))
+        .expect("percent decoding and JSON Pointer unescaping must match referencing");
+
+    let invalid_encoding = json!({
+        "default": {"hidden": {"type": "string"}},
+        "$ref": "#/default/%FF"
+    });
+    let error = BodyValidator::new(&json!({"json_schema": invalid_encoding}))
+        .err()
+        .expect("invalid UTF-8 pointer encoding must fail");
+    assert!(error.contains("invalid UTF-8 percent encoding"), "{error}");
+
+    for invalid_pointer in ["#/default/missing", "#/examples/not-an-index"] {
+        let schema = json!({
+            "default": {"hidden": {"type": "string"}},
+            "examples": [{"type": "string"}],
+            "$ref": invalid_pointer
+        });
+        let error = BodyValidator::new(&json!({"json_schema": schema}))
+            .err()
+            .expect("an invalid local pointer must fail construction");
+        assert!(
+            error.contains("resolves nowhere") || error.contains("invalid array index"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn percent_encoded_local_pointer_target_is_decisive_at_runtime() {
+    let plugin = json_schema_plugin(json!({
+        "default": {
+            "hidden schema": {
+                "a/b~c": {"type": "integer"}
+            }
+        },
+        "$ref": "#/default/hidden%20schema/a~1b~0c"
+    }));
+
+    let mut ctx = make_json_ctx("7");
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let mut ctx = make_json_ctx(r#""seven""#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[test]
+fn draft_specific_definition_maps_match_referencing_semantics() {
+    // referencing 0.46.5 does not walk `$defs` under Draft 7, so its contents
+    // remain literal when nothing points at them.
+    let draft7_literal = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "type": "string",
+            "$defs": {
+                "hidden": {
+                    "$ref": "https://literal.example/not-active.json"
+                }
+            }
+        }
+    });
+    BodyValidator::new(&draft7_literal).expect("Draft 7 $defs is not a schema container");
+
+    let draft7_dynamic_ref_literal = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "type": "string",
+            "$dynamicRef": "https://literal.example/not-active.json"
+        }
+    });
+    BodyValidator::new(&draft7_dynamic_ref_literal)
+        .expect("Draft 7 $dynamicRef is an unknown, non-reference keyword");
+
+    // A direct pointer still makes that same object an active schema target.
+    let draft7_referenced = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "$defs": {
+                "hidden": {
+                    "$ref": "https://example.com/forbidden.json"
+                }
+            },
+            "$ref": "#/$defs/hidden"
+        }
+    });
+    let error = BodyValidator::new(&draft7_referenced)
+        .err()
+        .expect("Draft 7 pointer target under $defs must be audited");
+    assert!(error.contains("non-local '$ref'"), "{error}");
+
+    // The library's 2020-12 walker deliberately retains `definitions` as a
+    // schema-bearing compatibility map in addition to `$defs`.
+    let draft202012_definitions = json!({
+        "json_schema": {
+            "definitions": {
+                "active": {
+                    "$ref": "https://example.com/forbidden.json"
+                }
+            }
+        }
+    });
+    let error = BodyValidator::new(&draft202012_definitions)
+        .err()
+        .expect("2020-12 definitions values are schema positions");
+    assert!(error.contains("non-local '$ref'"), "{error}");
+}
+
+#[test]
+fn anchor_targets_are_covered_by_the_ordinary_schema_position_walk() {
+    // referencing indexes anchors only at positions reached by its configured-
+    // draft child walker. `$defs/guarded` is therefore already audited without
+    // a separate anchor-target traversal.
+    let schema = json!({
+        "$defs": {
+            "guarded": {
+                "$anchor": "guarded",
+                "properties": {
+                    "secret": {
+                        "$ref": "https://example.com/forbidden.json"
+                    }
+                }
+            }
+        },
+        "$ref": "#guarded"
+    });
+    let error = BodyValidator::new(&json!({"json_schema": schema}))
+        .err()
+        .expect("policy at an anchored schema position must be enforced");
+    assert!(error.contains("non-local '$ref'"), "{error}");
+}
+
+#[tokio::test]
+async fn json_schema_nested_and_recursive_local_refs_are_enforced() {
+    let plugin = json_schema_plugin(json!({
+        "$defs": {
+            "Node": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "child": {"$ref": "#/$defs/Node"}
+                }
+            }
+        },
+        "$ref": "#/$defs/Node"
+    }));
+
+    let ok = r#"{"name": "a", "child": {"name": "b"}}"#;
+    let mut ctx = make_json_ctx(ok);
+    let mut headers = make_json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    let bad = r#"{"name": "a", "child": {"child": {"name": "c"}}}"#;
+    let mut ctx = make_json_ctx(bad);
+    let mut headers = make_json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn json_schema_union_type_array_is_enforced() {
+    let plugin = json_schema_plugin(json!({
+        "type": "object",
+        "properties": {"note": {"type": ["string", "null"]}}
+    }));
+
+    for body in [r#"{"note": "hi"}"#, r#"{"note": null}"#] {
+        let mut ctx = make_json_ctx(body);
+        let mut headers = make_json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_continue(result);
+    }
+
+    let mut ctx = make_json_ctx(r#"{"note": 7}"#);
+    let mut headers = make_json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn json_schema_property_named_id_compiles_for_request_and_response() {
+    let schema = json!({
+        "type": "object",
+        "required": ["id"],
+        "properties": {"id": {"type": "integer"}}
+    });
+
+    let request_plugin = json_schema_plugin(schema.clone());
+    let mut ctx = make_json_ctx(r#"{"id": 7}"#);
+    let mut headers = make_json_headers();
+    assert_continue(request_plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let response_plugin = response_schema_plugin(schema);
+    let mut ctx = make_response_ctx();
+    let headers = response_json_headers();
+    assert_continue(
+        response_plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"id": 7}"#)
+            .await,
+    );
+}
+
+#[test]
+fn schema_keyword_spellings_are_allowed_as_property_and_definition_names() {
+    let names = ["$ref", "$id", "$schema", "$vocabulary", "$dynamicRef"];
+    let mut properties = serde_json::Map::new();
+    let mut definitions = serde_json::Map::new();
+    for name in names {
+        properties.insert(name.to_string(), json!({"type": "string"}));
+        definitions.insert(name.to_string(), json!({"type": "string"}));
+    }
+
+    let draft202012 = json!({
+        "json_schema": {
+            "type": "object",
+            "properties": properties.clone(),
+            "$defs": definitions.clone()
+        }
+    });
+    BodyValidator::new(&draft202012).expect("2020-12 names are not active keywords");
+
+    let draft7 = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "type": "object",
+            "properties": properties,
+            "definitions": definitions
+        }
+    });
+    BodyValidator::new(&draft7).expect("Draft 7 names are not active keywords");
+}
+
+#[tokio::test]
+async fn schema_literal_objects_do_not_activate_schema_keywords() {
+    let literal = json!({
+        "id": 7,
+        "$ref": "https://literal.example/schema.json",
+        "$id": 9,
+        "$schema": false,
+        "$vocabulary": {"https://literal.example/vocab": true},
+        "$dynamicRef": "file:///literal.json"
+    });
+    let plugin = json_schema_plugin(json!({
+        "type": "object",
+        "required": ["enum_value", "const_value"],
+        "properties": {
+            "enum_value": {"enum": [literal.clone()]},
+            "const_value": {"const": literal.clone()},
+            "defaulted": {"type": "object", "default": literal.clone()},
+            "exampled": {"type": "object", "examples": [literal.clone()]}
+        },
+        "default": literal.clone(),
+        "examples": [literal.clone()]
+    }));
+    let body = json!({
+        "enum_value": literal.clone(),
+        "const_value": literal,
+        "defaulted": {},
+        "exampled": {}
+    })
+    .to_string();
+    let mut ctx = make_json_ctx(&body);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[test]
+fn non_local_references_are_rejected_in_supported_subschema_positions() {
+    let external = json!({"$ref": "https://example.com/nested.json"});
+    let draft202012 = [
+        json!({"properties": {"x": external.clone()}}),
+        json!({"patternProperties": {"^x": external.clone()}}),
+        json!({"$defs": {"x": external.clone()}}),
+        json!({"definitions": {"x": external.clone()}}),
+        json!({"dependentSchemas": {"x": external.clone()}}),
+        json!({"allOf": [external.clone()]}),
+        json!({"anyOf": [external.clone()]}),
+        json!({"oneOf": [external.clone()]}),
+        json!({"prefixItems": [external.clone()]}),
+        json!({"items": external.clone()}),
+        json!({"additionalProperties": external.clone()}),
+        json!({"unevaluatedProperties": external.clone()}),
+        json!({"contains": external.clone()}),
+        json!({"propertyNames": external.clone()}),
+        json!({"not": external.clone()}),
+        json!({"if": external.clone()}),
+        json!({"then": external.clone()}),
+        json!({"else": external.clone()}),
+        json!({"unevaluatedItems": external.clone()}),
+        json!({"contentSchema": external.clone()}),
+    ];
+    for schema in draft202012 {
+        let config = json!({"json_schema": schema});
+        let error = BodyValidator::new(&config)
+            .err()
+            .expect("nested non-local reference must be rejected");
+        assert!(error.contains("non-local '$ref'"), "{error}");
+    }
+
+    let draft7 = [
+        json!({"dependencies": {"x": external.clone()}}),
+        json!({"items": [true, external.clone()]}),
+        json!({"additionalItems": external}),
+    ];
+    for schema in draft7 {
+        let config = json!({
+            "json_schema_draft": "draft7",
+            "json_schema": schema
+        });
+        let error = BodyValidator::new(&config)
+            .err()
+            .expect("nested Draft 7 non-local reference must be rejected");
+        assert!(error.contains("non-local '$ref'"), "{error}");
+    }
+}
+
+#[test]
+fn nested_schema_nodes_still_enforce_reference_identifier_and_dialect_policy() {
+    let schemas = [
+        json!({"properties": {"x": {"$dynamicRef": "https://example.com/dynamic"}}}),
+        json!({"properties": {"x": {"$id": "https://example.com/base"}}}),
+        json!({"properties": {"x": {"id": "https://example.com/legacy-base"}}}),
+        json!({"properties": {"x": {"$vocabulary": {"https://example.com/v": true}}}}),
+        json!({
+            "properties": {
+                "x": {
+                    "$schema": "http://json-schema.org/draft-07/schema#"
+                }
+            }
+        }),
+    ];
+
+    for schema in schemas {
+        assert!(
+            BodyValidator::new(&json!({"json_schema": schema})).is_err(),
+            "nested schema policy must fail closed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn boolean_subschemas_compile_and_are_enforced() {
+    let plugin = json_schema_plugin(json!({
+        "type": "object",
+        "properties": {
+            "allowed": true,
+            "denied": false
+        }
+    }));
+
+    let mut ctx = make_json_ctx(r#"{"allowed": {"anything": true}}"#);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let mut ctx = make_json_ctx(r#"{"denied": null}"#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+#[test]
+fn malformed_schemas_fail_configuration_closed() {
+    let configs = [
+        // Invalid type name — used to be treated as "any type is valid".
+        json!({"json_schema": {"type": "objcet"}}),
+        // Malformed keyword shapes.
+        json!({"json_schema": {"required": "tenant"}}),
+        json!({"json_schema": {"properties": []}}),
+        json!({"json_schema": {"minLength": "3"}}),
+        // Unresolvable local reference.
+        json!({"json_schema": {"$ref": "#/$defs/Missing"}}),
+        // Non-local references would require retrieval.
+        json!({"json_schema": {"$ref": "https://example.com/s.json"}}),
+        json!({"json_schema": {"$ref": "file:///etc/schema.json"}}),
+        json!({"json_schema": {"$ref": "other.json#/$defs/X"}}),
+        // A base URI could re-point an otherwise local reference.
+        json!({
+            "json_schema": {"$id": "https://example.com/root", "type": "object"}
+        }),
+        // Custom vocabularies cannot be honoured.
+        json!({
+            "json_schema": {"$vocabulary": {"https://example.com/v": true}}
+        }),
+        // Draft mismatch must be explicit, not silently reinterpreted.
+        json!({
+            "json_schema": {
+                "$schema": "http://json-schema.org/draft-04/schema#",
+                "type": "object"
+            }
+        }),
+        json!({
+            "json_schema_draft": "draft4",
+            "json_schema": {"type": "object"}
+        }),
+        // The response direction uses the same compiler.
+        json!({"response_json_schema": {"type": "objcet"}}),
+        json!({
+            "response_json_schema": {"$ref": "https://example.com/s.json"}
+        }),
+    ];
+    for config in configs {
+        assert!(
+            BodyValidator::new(&config).is_err(),
+            "config should fail closed: {config:?}"
+        );
+        assert!(
+            BodyValidator::validate_config(&config).is_err(),
+            "shape-only validation should fail closed: {config:?}"
+        );
+    }
+}
+
+#[test]
+fn draft7_schemas_compile_under_the_matching_configured_draft() {
+    let config = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "definitions": {"Id": {"type": "string"}},
+            "properties": {"id": {"$ref": "#/definitions/Id"}}
+        }
+    });
+    BodyValidator::new(&config).expect("draft7 schema must compile");
+
+    let mismatched = json!({
+        "json_schema_draft": "draft2020-12",
+        "json_schema": {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object"
+        }
+    });
+    assert!(BodyValidator::new(&mismatched).is_err());
+}
+
+#[test]
+fn non_string_schema_keywords_fail_closed() {
+    // Active keyword values must be strings; a typed mismatch used to skip the
+    // decisive policy check while admission still reported the schema as live.
+    let cases = [
+        (json!({"$ref": true}), "non-string '$ref'"),
+        (json!({"$dynamicRef": 7}), "non-string '$dynamicRef'"),
+        (json!({"$id": false}), "non-string '$id'"),
+        (json!({"id": ["legacy"]}), "non-string 'id'"),
+        (json!({"$schema": {"uri": "x"}}), "non-string '$schema'"),
+    ];
+    for (schema, needle) in cases {
+        let error = BodyValidator::new(&json!({"json_schema": schema}))
+            .err()
+            .expect("non-string schema keyword must fail closed");
+        assert!(error.contains(needle), "expected {needle:?} in {error}");
+    }
+}
+
+#[test]
+fn draft7_schema_mismatch_names_the_configured_draft() {
+    let mismatched = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object"
+        }
+    });
+    let error = BodyValidator::new(&mismatched)
+        .err()
+        .expect("draft mismatch must fail closed");
+    assert!(error.contains("unsupported '$schema'"), "{error}");
+    assert!(
+        error.contains("draft7"),
+        "rejection must name the configured draft: {error}"
+    );
+}
+
+#[test]
+fn draft7_boolean_dependencies_are_active_schema_positions() {
+    // Draft 7 dependency values may be schemas (object or boolean) or property-
+    // name arrays. A boolean schema must be walked so `false` is decisive.
+    let config = json!({
+        "json_schema_draft": "draft7",
+        "json_schema": {
+            "type": "object",
+            "dependencies": {
+                "flag": true
+            }
+        }
+    });
+    BodyValidator::new(&config).expect("boolean dependency schema must compile");
+}
+
+#[test]
+fn local_pointer_rejects_scalar_and_array_out_of_range_targets() {
+    let array_oob = json!({
+        "examples": [{"type": "string"}],
+        "$ref": "#/examples/5"
+    });
+    let error = BodyValidator::new(&json!({"json_schema": array_oob}))
+        .err()
+        .expect("array out-of-range pointer must fail");
+    assert!(error.contains("resolves nowhere"), "{error}");
+
+    let through_scalar = json!({
+        "type": "string",
+        "$ref": "#/type/next"
+    });
+    let error = BodyValidator::new(&json!({"json_schema": through_scalar}))
+        .err()
+        .expect("pointer through a scalar must fail");
+    assert!(error.contains("resolves nowhere"), "{error}");
+}
+
+#[test]
+fn local_pointer_unusual_tilde_escapes_still_resolve() {
+    // referencing keeps unknown `~` escapes and a trailing `~` as literal text
+    // after the `~0` / `~1` substitutions. Construction must follow that exact
+    // spelling so a key that only exists under the library's unescape is found.
+    let unknown_escape = json!({
+        "default": {
+            "a~2b": {"type": "integer"}
+        },
+        "$ref": "#/default/a~2b"
+    });
+    BodyValidator::new(&json!({"json_schema": unknown_escape}))
+        .expect("unknown tilde escape must round-trip as a literal key");
+
+    let trailing_tilde = json!({
+        "default": {
+            "trail~": {"type": "string"}
+        },
+        "$ref": "#/default/trail~"
+    });
+    BodyValidator::new(&json!({"json_schema": trailing_tilde}))
+        .expect("trailing tilde must round-trip as a literal key");
+}
+
+#[test]
+fn schema_recursion_and_size_budgets_are_bounded() {
+    // 40 levels of nesting exceeds the 32-level budget.
+    let mut schema = json!({"type": "string"});
+    for _ in 0..40 {
+        schema = json!({"type": "object", "properties": {"next": schema}});
+    }
+    let deep = json!({"json_schema": schema});
+    let error = BodyValidator::new(&deep)
+        .err()
+        .expect("over-deep is rejected");
+    assert!(error.contains("schema budget"), "{error}");
+
+    // A wide schema past the node budget is rejected on size, not depth.
+    let mut properties = serde_json::Map::new();
+    for index in 0..12_000 {
+        properties.insert(format!("f{index}"), json!({"type": "string"}));
+    }
+    let properties = serde_json::Value::Object(properties);
+    let wide = json!({"json_schema": {"properties": properties}});
+    let error = BodyValidator::new(&wide)
+        .err()
+        .expect("over-wide is rejected");
+    assert!(error.contains("schema budget"), "{error}");
+
+    // Literal annotation data is still part of the supplied JSON value and
+    // cannot evade either budget merely because it is not a schema position.
+    let mut literal = json!("leaf");
+    for _ in 0..40 {
+        literal = json!({"annotation": literal});
+    }
+    let deep_literal = json!({
+        "json_schema": {
+            "type": "string",
+            "default": literal
+        }
+    });
+    let error = BodyValidator::new(&deep_literal)
+        .err()
+        .expect("over-deep literal annotation is rejected");
+    assert!(error.contains("schema budget"), "{error}");
+
+    let wide_literal = json!({
+        "json_schema": {
+            "type": "integer",
+            "enum": vec![json!(0); 20_000]
+        }
+    });
+    let error = BodyValidator::new(&wide_literal)
+        .err()
+        .expect("over-wide literal instance data is rejected");
+    assert!(error.contains("schema budget"), "{error}");
+}
+
+#[tokio::test]
+async fn schema_violations_do_not_echo_request_or_response_values() {
+    let request_plugin = json_schema_plugin(json!({
+        "type": "object",
+        "properties": {"ssn": {"const": "redacted"}}
+    }));
+    let mut ctx = make_json_ctx(r#"{"ssn": "123-45-6789"}"#);
+    let mut headers = make_json_headers();
+    let result = request_plugin.before_proxy(&mut ctx, &mut headers).await;
+    let body = reject_body(result);
+    assert!(
+        !body.contains("123-45-6789"),
+        "request rejection must not echo the rejected value: {body}"
+    );
+    assert!(
+        body.contains("/ssn"),
+        "request rejection should locate the failure: {body}"
+    );
+
+    let response_plugin = response_schema_plugin(json!({
+        "type": "object",
+        "properties": {"token": {"const": "redacted"}}
+    }));
+    let mut ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let body = br#"{"token": "upstream-secret"}"#;
+    let result = response_plugin
+        .on_final_response_body(&mut ctx, 200, &headers, body)
+        .await;
+    let body = reject_body(result);
+    assert!(
+        !body.contains("upstream-secret"),
+        "response rejection must not echo the upstream value: {body}"
+    );
+    assert!(
+        !body.contains("/token"),
+        "response rejection must not describe the upstream shape: {body}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GHSA-mg9q-6h9j-9mmv — XML well-formedness is parser-decided
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn malformed_xml_documents_are_rejected() {
+    let bodies = [
+        // Two document elements.
+        "<approved/><payload/>",
+        "<a></a><b></b>",
+        // Text outside the root element.
+        "<root/>trailing",
+        // Invalid XML names.
+        "<1root></1root>",
+        // Attribute grammar.
+        r#"<root role=admin></root>"#,
+        r#"<root role="safe" role="admin"></root>"#,
+        r#"<root role="unterminated></root>"#,
+        r#"<root role></root>"#,
+        // Undeclared or malformed entity references.
+        "<root>&undeclared;</root>",
+        "<root>bare & ampersand</root>",
+        // Malformed declaration and unterminated constructs.
+        "<?xml version=\"1.0\"><root/>",
+        "<root><!-- unterminated</root>",
+        "<root><![CDATA[unterminated</root>",
+        // Unknown namespace prefix.
+        r#"<ns:root></ns:root>"#,
+    ];
+    for body in bodies {
+        let plugin = xml_plugin();
+        let mut ctx = make_xml_ctx(body);
+        let mut headers = make_xml_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
+}
+
+#[tokio::test]
+async fn well_formed_xml_edge_cases_are_accepted() {
+    let bodies = [
+        // A quoted '>' inside an attribute value does not end the tag.
+        r#"<root attr="a > b"><child/></root>"#,
+        // Declared namespaces resolve.
+        NAMESPACED_XML,
+        // Predefined entities and character references are valid.
+        "<root>&amp;&lt;&#65;</root>",
+        // Comments around the root element are allowed.
+        "<!-- lead --><root/><!-- trail -->",
+    ];
+    for body in bodies {
+        let plugin = xml_plugin();
+        let mut ctx = make_xml_ctx(body);
+        let mut headers = make_xml_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_continue(result);
+    }
+}
+
+#[tokio::test]
+async fn exact_xml_document_text_preserves_outer_whitespace_semantics() {
+    let legal = " \t\r\n<root/>\r\n\t ";
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx(legal);
+    let mut headers = make_xml_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let plugin = BodyValidator::new(&json!({"response_validate_xml": true})).unwrap();
+    let mut ctx = make_response_ctx();
+    let headers = response_xml_headers();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, legal.as_bytes())
+            .await,
+    );
+
+    for body in ["\u{00a0}<root/>", "<root/>\u{0085}"] {
+        let plugin = xml_plugin();
+        let mut ctx = make_xml_ctx(body);
+        let mut headers = make_xml_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+        let plugin = BodyValidator::new(&json!({"response_validate_xml": true})).unwrap();
+        let mut ctx = make_response_ctx();
+        let headers = response_xml_headers();
+        assert_reject(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, body.as_bytes())
+                .await,
+            Some(502),
+        );
+    }
+}
+
+#[tokio::test]
+async fn external_xml_identifiers_are_rejected_for_request_and_response() {
+    let bodies = [
+        r#"<!DOCTYPE r SYSTEM "https://example.com/external.dtd"><r/>"#,
+        r#"<!DOCTYPE r PUBLIC "-//Example//DTD R 1.0//EN" "https://example.com/r.dtd"><r/>"#,
+        r#"<!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]><r>&x;</r>"#,
+        r#"<!DOCTYPE r [<!ENTITY x PUBLIC "-//a//b" "http://e/x">]><r>&x;</r>"#,
+        r#"<!DOCTYPE r [<!ENTITY % p SYSTEM "http://e/e.dtd">%p;]><r/>"#,
+    ];
+    for body in bodies {
+        let plugin = xml_plugin();
+        let mut ctx = make_xml_ctx(body);
+        let mut headers = make_xml_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+
+        let plugin = BodyValidator::new(&json!({"response_validate_xml": true})).unwrap();
+        let mut ctx = make_response_ctx();
+        let headers = response_xml_headers();
+        let result = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, body.as_bytes())
+            .await;
+        assert_reject(result, Some(502));
+    }
+}
+
+#[tokio::test]
+async fn internal_dtd_and_quoted_keyword_text_remain_valid() {
+    let bodies = [
+        r#"<!DOCTYPE r [<!ENTITY safe "hello">]><r>&safe;</r>"#,
+        r#"<!DOCTYPE r [<!ENTITY unused "<!DOCTYPE fake SYSTEM 'x'>">]><r/>"#,
+        r#"<r><!-- <!DOCTYPE fake SYSTEM "x"> --><![CDATA[<!DOCTYPE fake PUBLIC "x" "y">]]></r>"#,
+    ];
+    for body in bodies {
+        let plugin = xml_plugin();
+        let mut ctx = make_xml_ctx(body);
+        let mut headers = make_xml_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+        let plugin = BodyValidator::new(&json!({"response_validate_xml": true})).unwrap();
+        let mut ctx = make_response_ctx();
+        let headers = response_xml_headers();
+        assert_continue(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, body.as_bytes())
+                .await,
+        );
+    }
+}
+
+/// `item` in the `http://example.com/ns` namespace.
+const NAMESPACED_XML: &str = r#"<ns:root xmlns:ns="http://e.com/ns"><ns:item/></ns:root>"#;
+
+#[tokio::test]
+async fn required_xml_elements_match_parsed_expanded_names() {
+    // A bare configured name matches the local name in any namespace.
+    let plugin = xml_plugin_with_required(vec!["item"]);
+    let mut ctx = make_xml_ctx(NAMESPACED_XML);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    // Clark notation requires the expanded namespace URI to match too.
+    let required = vec!["{http://e.com/ns}item"];
+    let plugin = xml_plugin_with_required(required);
+    let mut ctx = make_xml_ctx(NAMESPACED_XML);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    let required = vec!["{http://e.com/other}item"];
+    let plugin = xml_plugin_with_required(required);
+    let mut ctx = make_xml_ctx(NAMESPACED_XML);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+
+    // "{}local" requires the element to be in no namespace.
+    let plugin = xml_plugin_with_required(vec!["{}item"]);
+    let mut ctx = make_xml_ctx("<root><item/></root>");
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_continue(result);
+
+    let plugin = xml_plugin_with_required(vec!["{}item"]);
+    let mut ctx = make_xml_ctx(NAMESPACED_XML);
+    let mut headers = make_xml_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+#[test]
+fn malformed_required_xml_element_entries_are_rejected() {
+    let configs = [
+        json!({"required_xml_elements": ["{http://example.com/ns"]}),
+        json!({"required_xml_elements": ["{http://example.com/ns}"]}),
+        json!({"response_required_xml_elements": ["{ns"]}),
+        // Local names must not embed Clark braces after the namespace closes.
+        json!({"required_xml_elements": ["item{bad}"]}),
+        json!({"response_required_xml_elements": ["{http://e.com/ns}a}b"]}),
+    ];
+    for config in configs {
+        assert!(
+            BodyValidator::new(&config).is_err(),
+            "malformed entry must be rejected: {config:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_response_xml_does_not_echo_the_upstream_body() {
+    let config = json!({"response_validate_xml": true});
+    let plugin = BodyValidator::new(&config).unwrap();
+    let mut ctx = make_response_ctx();
+    let headers = response_xml_headers();
+    let body = b"<approved/><secret>upstream-secret</secret>";
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, body)
+        .await;
+    let body = reject_body(result);
+    assert!(
+        !body.contains("upstream-secret"),
+        "XML rejection must not echo upstream content: {body}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GHSA-qvrp-m3v9-345m — proto2 required-field initialization
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The checked-in `tests/fixtures/test_validator.bin` fixture is proto3, which
+// has no `required` cardinality. These tests build a proto2
+// `FileDescriptorSet` in-process by encoding `descriptor.proto` messages
+// directly, so no `protoc` run or new fixture binary is needed.
+
+const PB_LABEL_OPTIONAL: u64 = 1;
+const PB_LABEL_REQUIRED: u64 = 2;
+const PB_LABEL_REPEATED: u64 = 3;
+const PB_TYPE_INT32: u64 = 5;
+const PB_TYPE_STRING: u64 = 9;
+const PB_TYPE_MESSAGE: u64 = 11;
+const PB_COMMAND: &str = ".t2.Command";
+const PB_MAP_ENTRY: &str = ".t2.MapHolder.EntriesEntry";
+
+fn pb_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn pb_tag(out: &mut Vec<u8>, field: u32, wire: u64) {
+    pb_varint(out, (u64::from(field) << 3) | wire);
+}
+
+fn pb_len_field(field: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    pb_tag(&mut out, field, 2);
+    pb_varint(&mut out, payload.len() as u64);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn pb_str_field(field: u32, value: &str) -> Vec<u8> {
+    pb_len_field(field, value.as_bytes())
+}
+
+fn pb_varint_field(field: u32, value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    pb_tag(&mut out, field, 0);
+    pb_varint(&mut out, value);
+    out
+}
+
+/// One `FieldDescriptorProto`.
+fn pb_field(name: &str, number: u32, label: u64, kind: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(pb_str_field(1, name));
+    out.extend(pb_varint_field(3, u64::from(number)));
+    out.extend(pb_varint_field(4, label));
+    out.extend(pb_varint_field(5, kind));
+    out
+}
+
+/// A message-typed `FieldDescriptorProto` (`type_name` is field 6).
+fn pb_message_field(name: &str, number: u32, label: u64, ty: &str) -> Vec<u8> {
+    let mut out = pb_field(name, number, label, PB_TYPE_MESSAGE);
+    out.extend(pb_str_field(6, ty));
+    out
+}
+
+/// Attach `oneof_index` (field 9) to an existing field descriptor.
+fn pb_in_oneof(mut field: Vec<u8>, index: u64) -> Vec<u8> {
+    field.extend(pb_varint_field(9, index));
+    field
+}
+
+/// One `DescriptorProto`.
+fn pb_message(name: &str, fields: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = pb_str_field(1, name);
+    for field in fields {
+        out.extend(pb_len_field(2, field));
+    }
+    out
+}
+
+fn pb_with_nested(mut message: Vec<u8>, nested: &[u8]) -> Vec<u8> {
+    message.extend(pb_len_field(3, nested));
+    message
+}
+
+/// Set `MessageOptions.map_entry` (options is field 7; map_entry is field 7).
+fn pb_as_map_entry(mut message: Vec<u8>) -> Vec<u8> {
+    let options = pb_varint_field(7, 1);
+    message.extend(pb_len_field(7, &options));
+    message
+}
+
+fn pb_with_oneof(mut message: Vec<u8>, name: &str) -> Vec<u8> {
+    let oneof = pb_str_field(1, name);
+    message.extend(pb_len_field(8, &oneof));
+    message
+}
+
+/// A proto2 `FileDescriptorSet` for package `t2`:
+///
+/// ```proto
+/// syntax = "proto2";
+/// package t2;
+/// message Command   { required string action = 1; optional int32 n = 2; }
+/// message Wrapper   { optional Command inner = 1; }
+/// message Batch     { repeated Command items = 1; }
+/// message MapHolder { map<string, Command> entries = 1; }
+/// message Choice    { oneof pick { Command cmd = 1; string other = 2; } }
+/// message Defaulted { required string label = 1; required int32 count = 2; }
+/// message Reply     { required string status = 1; }
+/// ```
+fn proto2_descriptor_set() -> Vec<u8> {
+    let action = pb_field("action", 1, PB_LABEL_REQUIRED, PB_TYPE_STRING);
+    let retries = pb_field("n", 2, PB_LABEL_OPTIONAL, PB_TYPE_INT32);
+    let command = pb_message("Command", &[action, retries]);
+
+    let inner = pb_message_field("inner", 1, PB_LABEL_OPTIONAL, PB_COMMAND);
+    let wrapper = pb_message("Wrapper", &[inner]);
+
+    let items = pb_message_field("items", 1, PB_LABEL_REPEATED, PB_COMMAND);
+    let batch = pb_message("Batch", &[items]);
+
+    let key = pb_field("key", 1, PB_LABEL_OPTIONAL, PB_TYPE_STRING);
+    let value = pb_message_field("value", 2, PB_LABEL_OPTIONAL, PB_COMMAND);
+    let entry = pb_message("EntriesEntry", &[key, value]);
+    let entry = pb_as_map_entry(entry);
+    let entries = pb_message_field("entries", 1, PB_LABEL_REPEATED, PB_MAP_ENTRY);
+    let map_holder = pb_message("MapHolder", &[entries]);
+    let map_holder = pb_with_nested(map_holder, &entry);
+
+    let cmd = pb_message_field("cmd", 1, PB_LABEL_OPTIONAL, PB_COMMAND);
+    let cmd = pb_in_oneof(cmd, 0);
+    let other = pb_field("other", 2, PB_LABEL_OPTIONAL, PB_TYPE_STRING);
+    let other = pb_in_oneof(other, 0);
+    let choice = pb_message("Choice", &[cmd, other]);
+    let choice = pb_with_oneof(choice, "pick");
+
+    let label = pb_field("label", 1, PB_LABEL_REQUIRED, PB_TYPE_STRING);
+    let count = pb_field("count", 2, PB_LABEL_REQUIRED, PB_TYPE_INT32);
+    let defaulted = pb_message("Defaulted", &[label, count]);
+
+    let status = pb_field("status", 1, PB_LABEL_REQUIRED, PB_TYPE_STRING);
+    let reply = pb_message("Reply", &[status]);
+
+    let mut file = pb_str_field(1, "t2.proto");
+    file.extend(pb_str_field(2, "t2"));
+    // `syntax` is intentionally omitted: absent means proto2.
+    let messages = [
+        command, wrapper, batch, map_holder, choice, defaulted, reply,
+    ];
+    for message in messages {
+        file.extend(pb_len_field(4, &message));
+    }
+    pb_len_field(1, &file)
+}
+
+fn proto2_descriptor_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bytes = proto2_descriptor_set();
+    std::fs::write(dir.path().join("t2.bin"), bytes).expect("write pb set");
+    dir
+}
+
+fn proto2_path(dir: &tempfile::TempDir) -> String {
+    dir.path().join("t2.bin").to_string_lossy().into_owned()
+}
+
+fn proto2_plugin(dir: &tempfile::TempDir, message: &str) -> BodyValidator {
+    let config = json!({
+        "protobuf_descriptor_path": proto2_path(dir),
+        "protobuf_request_type": message
+    });
+    BodyValidator::new(&config).expect("proto2 plugin config")
+}
+
+fn grpc_request_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    let grpc = "application/grpc".to_string();
+    headers.insert("content-type".to_string(), grpc);
+    headers.insert(":path".to_string(), "/t2.Svc/Run".to_string());
+    headers
+}
+
+fn grpc_response_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    let grpc = "application/grpc".to_string();
+    headers.insert("content-type".to_string(), grpc);
+    headers
+}
+
+fn grpc_ctx() -> RequestContext {
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/t2.Svc/Run".to_string(),
+    )
+}
+
+#[tokio::test]
+async fn proto2_missing_top_level_required_field_is_rejected() {
+    let dir = proto2_descriptor_dir();
+    let plugin = proto2_plugin(&dir, "t2.Command");
+
+    // The advisory's exact reproduction: a correctly framed, zero-length
+    // payload used to decode cleanly with no unknown fields.
+    let frame = grpc_frame(&[]);
+    assert_eq!(frame, vec![0, 0, 0, 0, 0]);
+    let headers = grpc_request_headers();
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_reject(result, Some(400));
+
+    // An initialized message still passes.
+    let frame = grpc_frame(&pb_str_field(1, "go"));
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn proto2_required_field_at_its_default_value_is_present() {
+    let dir = proto2_descriptor_dir();
+    let plugin = proto2_plugin(&dir, "t2.Defaulted");
+    let headers = grpc_request_headers();
+
+    let mut payload = pb_str_field(1, "");
+    payload.extend(pb_varint_field(2, 0));
+    let frame = grpc_frame(&payload);
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_continue(result);
+
+    // Dropping either presence marker makes the message uninitialized.
+    let frame = grpc_frame(&pb_str_field(1, ""));
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn proto2_missing_required_field_in_nested_message_is_rejected() {
+    let dir = proto2_descriptor_dir();
+    let plugin = proto2_plugin(&dir, "t2.Wrapper");
+    let headers = grpc_request_headers();
+
+    // An absent optional message field is fine.
+    let frame = grpc_frame(&[]);
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_continue(result);
+
+    // A present but uninitialized nested message is not.
+    let frame = grpc_frame(&pb_len_field(1, &[]));
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_reject(result, Some(400));
+
+    // An initialized nested message passes.
+    let inner = pb_str_field(1, "go");
+    let frame = grpc_frame(&pb_len_field(1, &inner));
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn proto2_required_fields_in_repeated_values_are_checked() {
+    let dir = proto2_descriptor_dir();
+    let plugin = proto2_plugin(&dir, "t2.Batch");
+    let headers = grpc_request_headers();
+
+    let ok = pb_str_field(1, "ok");
+    let mut payload = pb_len_field(1, &ok);
+    payload.extend(pb_len_field(1, &[]));
+    let frame = grpc_frame(&payload);
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_reject(result, Some(400));
+
+    let frame = grpc_frame(&pb_len_field(1, &ok));
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn proto2_required_fields_in_map_values_are_checked() {
+    let dir = proto2_descriptor_dir();
+    let plugin = proto2_plugin(&dir, "t2.MapHolder");
+    let headers = grpc_request_headers();
+
+    let mut entry = pb_str_field(1, "k");
+    entry.extend(pb_len_field(2, &[]));
+    let frame = grpc_frame(&pb_len_field(1, &entry));
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_reject(result, Some(400));
+
+    let mut entry = pb_str_field(1, "k");
+    entry.extend(pb_len_field(2, &pb_str_field(1, "go")));
+    let frame = grpc_frame(&pb_len_field(1, &entry));
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn proto2_required_fields_in_oneof_values_are_checked() {
+    let dir = proto2_descriptor_dir();
+    let plugin = proto2_plugin(&dir, "t2.Choice");
+    let headers = grpc_request_headers();
+
+    let frame = grpc_frame(&pb_len_field(1, &[]));
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_reject(result, Some(400));
+
+    // The other oneof arm carries no required field and stays valid.
+    let frame = grpc_frame(&pb_str_field(2, "text"));
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn proto2_initialization_is_enforced_for_compressed_frames() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let dir = proto2_descriptor_dir();
+    let plugin = proto2_plugin(&dir, "t2.Command");
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&[]).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut frame = Vec::with_capacity(5 + compressed.len());
+    frame.push(1);
+    let length = compressed.len() as u32;
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(&compressed);
+
+    let headers = grpc_request_headers();
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_reject(result, Some(400));
+}
+
+#[tokio::test]
+async fn proto2_initialization_applies_to_per_method_descriptors() {
+    let dir = proto2_descriptor_dir();
+    let config = json!({
+        "protobuf_descriptor_path": proto2_path(&dir),
+        "protobuf_method_messages": {
+            "/t2.Svc/Run": {"request": "t2.Command", "response": "t2.Reply"}
+        }
+    });
+    let plugin = BodyValidator::new(&config).expect("per-method config");
+
+    let headers = grpc_request_headers();
+    let frame = grpc_frame(&[]);
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_reject(result, Some(400));
+
+    let headers = grpc_response_headers();
+    let mut ctx = grpc_ctx();
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, &frame)
+        .await;
+    assert_reject(result, Some(502));
+
+    let frame = grpc_frame(&pb_str_field(1, "OK"));
+    let mut ctx = grpc_ctx();
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, &frame)
+        .await;
+    assert_continue(result);
+}
+
+#[tokio::test]
+async fn proto2_initialization_failures_do_not_echo_payload_values() {
+    let dir = proto2_descriptor_dir();
+    let plugin = proto2_plugin(&dir, "t2.Batch");
+    let headers = grpc_request_headers();
+
+    let secret = pb_str_field(1, "topsecret");
+    let mut payload = pb_len_field(1, &secret);
+    payload.extend(pb_len_field(1, &[]));
+    let frame = grpc_frame(&payload);
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    let body = reject_body(result);
+    assert!(
+        !body.contains("topsecret"),
+        "protobuf rejection must not echo payload values: {body}"
+    );
+    assert!(
+        body.contains("action"),
+        "rejection should name the descriptor field path: {body}"
+    );
+}
+
+#[tokio::test]
+async fn proto3_descriptors_are_unaffected_by_initialization_checks() {
+    // The proto3 fixture has no `required` cardinality, so an empty message
+    // stays valid exactly as before.
+    let plugin = protobuf_plugin();
+    let mut headers = HashMap::new();
+    let grpc = "application/grpc".to_string();
+    headers.insert("content-type".to_string(), grpc);
+    let path = "/test.Greeter/SayHello".to_string();
+    headers.insert(":path".to_string(), path);
+    let frame = grpc_frame(&[]);
+    let result = plugin.on_final_request_body(&headers, &frame).await;
+    assert_continue(result);
 }

@@ -30,6 +30,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::modes::mesh::config::MeshRuntimeOverlay;
+use crate::modes::mesh::revision::MeshRevisionDiagnostics;
 use crate::modes::mesh::runtime::XdsConvergenceSnapshot;
 use crate::modes::mesh::slice::MeshSlice;
 
@@ -170,6 +171,16 @@ pub struct MeshConfigDriftResponse {
     /// version strings embed config-change timestamps and content digests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub convergence: Option<XdsConvergenceSnapshot>,
+    /// Authoritative config-revision state (issue #2473): the accepted
+    /// `(authority, sequence)`, the most recent quarantine (stale fallback,
+    /// foreign authority, or missing revision), and the counters behind them.
+    ///
+    /// JWT-authenticated by construction — this block carries CP-supplied
+    /// authority strings and sequence numbers, which is exactly why they stay
+    /// off the unauthenticated `/metrics` surface (that gets only the
+    /// fixed-cardinality `ferrum_mesh_config_revision_rejections_total{reason}`
+    /// counter).
+    pub revision: MeshRevisionDiagnostics,
 }
 
 /// Inputs for the response builder. Kept as a struct so the unit tests
@@ -200,6 +211,9 @@ pub struct MeshConfigDriftInputs<'a> {
     /// `None` in native mode / before the first ADS response — the
     /// `convergence` block is then omitted from the response.
     pub convergence: Option<Arc<XdsConvergenceSnapshot>>,
+    /// Config-revision diagnostics from
+    /// [`crate::modes::mesh::runtime::MeshRuntimeState::revision_diagnostics`].
+    pub revision: MeshRevisionDiagnostics,
 }
 
 /// Build the response from staged inputs. Pure function — no I/O, no
@@ -250,6 +264,7 @@ pub fn build_response(inputs: MeshConfigDriftInputs<'_>) -> MeshConfigDriftRespo
         slice: slice_view,
         runtime_overlay: overlay_view,
         convergence: inputs.convergence.map(|snapshot| snapshot.as_ref().clone()),
+        revision: inputs.revision,
     }
 }
 
@@ -370,6 +385,18 @@ mod tests {
     use chrono::TimeZone;
     use std::collections::HashMap;
 
+    fn test_revision_diagnostics() -> MeshRevisionDiagnostics {
+        MeshRevisionDiagnostics {
+            accepted: None,
+            applied: None,
+            quarantined: None,
+            rejected_total: 0,
+            adopted_total: 0,
+            foreign_authority_adopt_secs: 300,
+            quarantine_active: false,
+        }
+    }
+
     fn install_time() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 5, 18, 19, 32, 11).unwrap()
     }
@@ -418,6 +445,7 @@ mod tests {
             source_cp_url: "grpc://cp.local:50051",
             include_overlay: true,
             convergence: None,
+            revision: test_revision_diagnostics(),
         });
 
         assert!(resp.slice.last_received_at.is_none());
@@ -444,6 +472,7 @@ mod tests {
             source_cp_url: "grpcs://cp.svc:50051",
             include_overlay: true,
             convergence: None,
+            revision: test_revision_diagnostics(),
         });
 
         assert_eq!(resp.slice.namespace.as_deref(), Some("alpha"));
@@ -567,6 +596,7 @@ mod tests {
             source_cp_url: "",
             include_overlay: false,
             convergence: None,
+            revision: test_revision_diagnostics(),
         });
         assert!(resp.runtime_overlay.is_none());
         // Slice block is still populated — the overlay flag only gates
@@ -589,6 +619,7 @@ mod tests {
             source_cp_url: "",
             include_overlay: true,
             convergence: None,
+            revision: test_revision_diagnostics(),
         });
         let overlay = resp
             .runtime_overlay
@@ -613,6 +644,7 @@ mod tests {
             source_cp_url: "",
             include_overlay: true,
             convergence: None,
+            revision: test_revision_diagnostics(),
         });
         assert_eq!(resp.slice.age_seconds, Some(0));
     }
@@ -660,6 +692,7 @@ mod tests {
             source_cp_url: "",
             include_overlay: false,
             convergence: Some(Arc::new(snapshot)),
+            revision: test_revision_diagnostics(),
         });
 
         let convergence = resp.convergence.expect("convergence block present");
@@ -688,6 +721,7 @@ mod tests {
             source_cp_url: "",
             include_overlay: false,
             convergence: None,
+            revision: test_revision_diagnostics(),
         });
         assert!(resp.convergence.is_none());
         let value = serde_json::to_value(&resp).expect("serialize");

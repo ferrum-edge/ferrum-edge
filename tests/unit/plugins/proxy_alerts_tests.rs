@@ -1733,17 +1733,23 @@ fn proxy_alerts_retain_proxies_clears_all_lifecycle_stores() {
 
 #[tokio::test]
 async fn old_generation_sample_cannot_repopulate_after_removal() {
+    // Lifecycle identity is namespace-qualified (`namespace|id`), so the
+    // seed/publish/check keys carry the summary's namespace.
     let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
-    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 1), ("p2", 1)]));
-    plugin.seed_lifecycle_state_for_test("p1", 1);
-    assert!(plugin.has_lifecycle_state_for_test("p1"));
+    plugin.retain_proxies(&std::collections::HashMap::from([
+        ("ferrum|p1", 1),
+        ("ferrum|p2", 1),
+    ]));
+    plugin.seed_lifecycle_state_for_test("ferrum|p1", 1);
+    assert!(plugin.has_lifecycle_state_for_test("ferrum|p1"));
 
     // Removal publish retires p1 rows and disarms generation 1.
-    plugin.retain_proxies(&std::collections::HashMap::from([("p2", 1)]));
-    assert!(!plugin.has_lifecycle_state_for_test("p1"));
+    plugin.retain_proxies(&std::collections::HashMap::from([("ferrum|p2", 1)]));
+    assert!(!plugin.has_lifecycle_state_for_test("ferrum|p1"));
 
     // Old in-flight sample admitted under generation 1 finishes after retain.
     let summary = TransactionSummary {
+        namespace: "ferrum".to_string(),
         proxy_id: Some("p1".to_string()),
         proxy_lifecycle_generation: Some(1),
         response_status_code: 500,
@@ -1751,27 +1757,29 @@ async fn old_generation_sample_cannot_repopulate_after_removal() {
     };
     Plugin::log(&plugin, &summary).await;
     assert!(
-        !plugin.has_lifecycle_state_for_test("p1"),
+        !plugin.has_lifecycle_state_for_test("ferrum|p1"),
         "old-generation completion after removal must not recreate lifecycle rows"
     );
 }
 
 #[tokio::test]
 async fn old_generation_sample_cannot_inherit_after_identical_id_recreate() {
+    // Namespace-qualified lifecycle identity throughout (`namespace|id`).
     let plugin = ProxyAlerts::new(&minimal_config(), http_client()).unwrap();
-    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 1)]));
-    plugin.seed_lifecycle_state_for_test("p1", 1);
-    assert!(plugin.has_lifecycle_state_for_test("p1"));
+    plugin.retain_proxies(&std::collections::HashMap::from([("ferrum|p1", 1)]));
+    plugin.seed_lifecycle_state_for_test("ferrum|p1", 1);
+    assert!(plugin.has_lifecycle_state_for_test("ferrum|p1"));
 
     // Delete then recreate the same proxy ID with a new ownership generation.
     plugin.retain_proxies(&std::collections::HashMap::new());
-    plugin.retain_proxies(&std::collections::HashMap::from([("p1", 2)]));
+    plugin.retain_proxies(&std::collections::HashMap::from([("ferrum|p1", 2)]));
     assert!(
-        !plugin.has_lifecycle_state_for_test("p1"),
+        !plugin.has_lifecycle_state_for_test("ferrum|p1"),
         "recreate must not keep prior rows"
     );
 
     let stale = TransactionSummary {
+        namespace: "ferrum".to_string(),
         proxy_id: Some("p1".to_string()),
         proxy_lifecycle_generation: Some(1),
         response_status_code: 500,
@@ -1779,11 +1787,12 @@ async fn old_generation_sample_cannot_inherit_after_identical_id_recreate() {
     };
     Plugin::log(&plugin, &stale).await;
     assert!(
-        !plugin.has_lifecycle_state_for_test("p1"),
+        !plugin.has_lifecycle_state_for_test("ferrum|p1"),
         "stale generation must not write into the replacement incarnation"
     );
 
     let fresh = TransactionSummary {
+        namespace: "ferrum".to_string(),
         proxy_id: Some("p1".to_string()),
         proxy_lifecycle_generation: Some(2),
         response_status_code: 500,
@@ -1793,7 +1802,7 @@ async fn old_generation_sample_cannot_inherit_after_identical_id_recreate() {
     // A single sample may only touch windows; seed-equivalent cooldown needs
     // breach+dispatch. Window ownership alone proves the new generation can write.
     assert!(
-        plugin.has_lifecycle_state_for_generation_for_test("p1", 2),
+        plugin.has_lifecycle_state_for_generation_for_test("ferrum|p1", 2),
         "replacement generation must be able to record fresh lifecycle state"
     );
 }

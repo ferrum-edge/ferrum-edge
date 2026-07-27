@@ -1435,6 +1435,40 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
         if let Some(proxy_id) = proxy_id {
             create_body["proxy_id"] = json!(proxy_id);
         }
+
+        // `kafka_logging` is refused under any backend egress policy that can
+        // deny an address, which includes this gateway's default posture:
+        // librdkafka resolves bootstrap hostnames itself and dials
+        // metadata-advertised brokers, and the pinned rdkafka exposes no
+        // connect/resolve callback, so those addresses cannot be screened.
+        // Assert the fail-closed admission contract instead of the CRUD
+        // round-trip. (It stays in PLUGIN_NAMES_UNDER_TEST because the registry
+        // parity assertion above must still cover it.)
+        if *plugin_name == "kafka_logging" {
+            let response = send_retrying_db_unavailable(
+                || {
+                    client
+                        .post(gateway.admin_url("/plugins/config"))
+                        .header("Authorization", &auth)
+                        .json(&create_body)
+                        .send()
+                },
+                "POST /plugins/config (kafka_logging)",
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "kafka_logging must be refused under a restrictive backend egress policy"
+            );
+            let body = response.text().await.unwrap_or_default();
+            assert!(
+                body.contains("cannot be admitted"),
+                "unexpected kafka_logging rejection body: {body}"
+            );
+            continue;
+        }
+
         admin_post_json(
             &client,
             gateway,

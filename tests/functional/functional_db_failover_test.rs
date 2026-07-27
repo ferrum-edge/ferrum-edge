@@ -191,7 +191,7 @@ fn seeded_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
 
 /// When the primary DB is unreachable and a failover URL is reachable, the
 /// gateway should successfully connect to the failover, run migrations there,
-/// and serve admin API traffic backed by that failover DB.
+/// serve admin reads, and fail closed for admin writes by default (issue #3001).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_db_failover_urls_startup() {
@@ -251,10 +251,29 @@ async fn test_db_failover_urls_startup() {
             continue;
         }
 
-        // Gateway is up backed by the failover DB. Verify admin API reads and
-        // writes succeed against it.
+        // Gateway is up backed by the failover DB. Reads succeed; writes fail closed.
         let client = reqwest::Client::new();
         let auth = auth_header(&jwt_secret, &jwt_issuer);
+
+        let health = client
+            .get(format!("http://127.0.0.1:{}/health", admin_port))
+            .header("Authorization", &auth)
+            .send()
+            .await
+            .expect("health")
+            .json::<serde_json::Value>()
+            .await
+            .expect("health json");
+        assert_eq!(
+            health["admin_writes_enabled"].as_bool(),
+            Some(false),
+            "admin writes must fail closed on failover by default"
+        );
+        assert_eq!(
+            health["database"]["failover_topology"]["primary_active"].as_bool(),
+            Some(false),
+            "health must expose failover topology"
+        );
 
         let list = client
             .get(format!("http://127.0.0.1:{}/proxies", admin_port))
@@ -279,12 +298,13 @@ async fn test_db_failover_urls_startup() {
             .send()
             .await
             .expect("create proxy");
-        assert!(
-            create.status().is_success(),
-            "POST /proxies should succeed against failover DB, got {}",
+        assert_eq!(
+            create.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "POST /proxies must be 503 on failover without FERRUM_DB_FAILOVER_ALLOW_WRITES, got {}",
             create.status()
         );
-        println!("  POST /proxies OK (write succeeded against failover DB)");
+        println!("  POST /proxies correctly fail-closed on failover DB");
 
         // Confirm the failover file actually exists on disk — proves the
         // gateway used failover, not some other fallback.
@@ -704,13 +724,15 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
 
         println!("  Gateway healthy after backup-only bootstrap");
 
-        // Poll `/health` until `admin_writes_enabled=true`. With a 1-second
-        // poll interval and a reachable failover, recovery typically happens
-        // within 3-5 seconds. Give it up to 20 seconds to be safe on slow CI.
+        // Poll `/health` until the failover DB is connected. Default fail-closed
+        // policy keeps admin_writes_enabled=false while on failover topology
+        // (issue #3001); recovery is evidenced by database.status=connected and
+        // ready=true, not by writable admin.
         let client = reqwest::Client::new();
         let health_url = format!("http://127.0.0.1:{}/health", admin_port);
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut recovered = false;
+        let mut last_health = serde_json::Value::Null;
         let health_auth = auth_header(&jwt_secret, &jwt_issuer);
         while std::time::Instant::now() < deadline {
             if let Ok(resp) = client
@@ -719,16 +741,23 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
                 .send()
                 .await
                 && let Ok(hjson) = resp.json::<serde_json::Value>().await
-                && hjson["admin_writes_enabled"].as_bool() == Some(true)
             {
-                recovered = true;
-                break;
+                last_health = hjson.clone();
+                if hjson["ready"].as_bool() == Some(true)
+                    && hjson["database"]["status"].as_str() == Some("connected")
+                {
+                    recovered = true;
+                    break;
+                }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
         if !recovered {
-            last_err = format!("attempt {}: failover reconnect never recovered", attempt);
+            last_err = format!(
+                "attempt {}: failover reconnect never recovered (last health={})",
+                attempt, last_health
+            );
             eprintln!("  {}", last_err);
             kill_child(child);
             if attempt < MAX_ATTEMPTS {
@@ -736,11 +765,32 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
             }
             continue;
         }
-        println!("  Health reports admin_writes_enabled=true (recovered via failover)");
+        println!("  Health reports database connected (recovered via failover)");
+        assert_eq!(
+            last_health["admin_writes_enabled"].as_bool(),
+            Some(false),
+            "admin writes must fail closed on failover topology by default"
+        );
+        assert_eq!(
+            last_health["database"]["failover_topology"]["primary_active"].as_bool(),
+            Some(false),
+            "health must expose redacted failover topology while failed over"
+        );
 
-        // Sanity check that migrations ran on the failover DB: an admin write
-        // would fail with "no such table" if they had been skipped.
+        // Reads stay available; mutations stay gated. A GET proves the failover
+        // schema/migrations path without accepting a write that failback would erase.
         let auth = auth_header(&jwt_secret, &jwt_issuer);
+        let list = client
+            .get(format!("http://127.0.0.1:{}/proxies", admin_port))
+            .header("Authorization", &auth)
+            .send()
+            .await
+            .expect("list proxies after failover recovery");
+        assert!(
+            list.status().is_success(),
+            "GET /proxies should succeed on failover (polling/reads preserved), got {}",
+            list.status()
+        );
         let create = client
             .post(format!("http://127.0.0.1:{}/proxies", admin_port))
             .header("Authorization", &auth)
@@ -755,12 +805,12 @@ async fn test_db_backup_bootstrap_recovers_via_failover_url() {
             .send()
             .await
             .expect("create proxy after recovery");
-        assert!(
-            create.status().is_success(),
-            "POST /proxies should succeed after failover recovery (migrations must have run), got {}",
-            create.status()
+        assert_eq!(
+            create.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "POST /proxies must be 503 while on failover without FERRUM_DB_FAILOVER_ALLOW_WRITES"
         );
-        println!("  Admin writes succeed against failover DB (migrations ran on reconnect)");
+        println!("  Admin reads succeed and writes fail closed on failover DB");
 
         assert!(
             failover_db_path.exists(),

@@ -526,9 +526,12 @@ pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
         return;
     }
     if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state
-            .circuit_breaker_cache
-            .get_or_create(&proxy.id, target_key, cb_config);
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            &proxy.id,
+            target_key,
+            cb_config,
+        );
         cb.record_neutral(true);
     }
 }
@@ -972,6 +975,7 @@ pub(crate) async fn handle_h3_websocket(
                     }
                     if let Some(cb_config) = &proxy.circuit_breaker {
                         let cb = state.circuit_breaker_cache.get_or_create(
+                            &proxy.namespace,
                             &proxy.id,
                             current_cb_target_key.as_deref(),
                             cb_config,
@@ -1036,6 +1040,7 @@ pub(crate) async fn handle_h3_websocket(
                     let mut retry_admitted_by_cb = true;
                     if !retry_path_mismatch && let Some(cb_config) = &proxy.circuit_breaker {
                         match state.circuit_breaker_cache.can_execute(
+                            &proxy.namespace,
                             &proxy.id,
                             retry_cb_target_key.as_deref(),
                             cb_config,
@@ -1092,6 +1097,7 @@ pub(crate) async fn handle_h3_websocket(
 
                 if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
@@ -1153,6 +1159,7 @@ pub(crate) async fn handle_h3_websocket(
     // Matches the H1/H2 path's behavior on the successful upgrade hop.
     if let Some(cb_config) = &proxy.circuit_breaker {
         let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
             &proxy.id,
             current_cb_target_key.as_deref(),
             cb_config,
@@ -1209,6 +1216,7 @@ pub(crate) async fn handle_h3_websocket(
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
             let upstream = crate::load_balancer::LoadBalancerCache::get_upstream_from(
                 &epoch.load_balancer,
+                &proxy.namespace,
                 upstream_id,
             );
             let default_cc = crate::config::types::HashOnCookieConfig::default();

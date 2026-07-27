@@ -343,6 +343,11 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Run ACME outbound-boundary regressions
+        run: cargo test --features acme --lib tls::acme::client::tests
+        env:
+          RUST_BACKTRACE: 1
+
   test-secrets:
     name: Secret Backends
     needs: ci-plan
@@ -677,6 +682,7 @@ jobs:
               integration::mesh_destination_rule_connection_pool_audit_tests
               integration::mesh_dr_service_entry_e2e_tests
               integration::mesh_sidecar_e2e_tests
+              integration::mesh_config_revision_tests
               integration::mesh_subscribe_validation_tests
               integration::cp_dp_grpc_tests
               integration::cp_grpc_handshake_admission_tests
@@ -885,6 +891,9 @@ jobs:
 
       - name: Run vendored tokio-tungstenite raw-takeover regression
         run: cargo test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
+
+      - name: Run vendored dimpl credential security regressions
+        run: cargo test --manifest-path vendor/dimpl-0.6.1-ferrum-patched/Cargo.toml --features test-hooks --test auto credential_security
 
       - name: Download integration tests archive
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

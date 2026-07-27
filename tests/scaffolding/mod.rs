@@ -138,9 +138,76 @@ pub fn file_mode_yaml_for_backend_with(port: u16, overrides: Value) -> String {
         "upstreams": [],
         "plugin_configs": [],
     });
-    to_yaml(&config)
+    to_file_mode_yaml(&config)
 }
 
-fn to_yaml(value: &Value) -> String {
-    serde_yaml::to_string(value).expect("serialize yaml")
+/// Render a JSON-shaped gateway config as file-mode YAML.
+///
+/// `serde_yaml::to_string` on a [`serde_json::Value`] emits an externally
+/// tagged enum the way JSON spells it — a singleton mapping such as
+/// `backoff: {fixed: {delay_ms: 1}}`. The file loader deserializes
+/// `GatewayConfig` from the retained `serde_yaml::Value` tree (so YAML-specific
+/// tags survive), and that deserializer only accepts a real YAML tag:
+/// `backoff: !fixed {delay_ms: 1}`. The JSON spelling aborts startup with
+/// `invalid type: map, expected a Value::Tagged enum`.
+///
+/// This helper rewrites the struct-variant enum nodes a `json!` fixture can
+/// contain, so tests can keep writing configs as JSON.
+pub fn to_file_mode_yaml(value: &Value) -> String {
+    let mut yaml: serde_yaml::Value = serde_yaml::to_value(value).expect("serialize yaml value");
+    tag_struct_variant_enums(&mut yaml);
+    serde_yaml::to_string(&yaml).expect("serialize yaml")
+}
+
+/// Variant-typed config keys whose YAML spelling needs an explicit tag.
+/// Keep this list narrow: only externally tagged enums with struct variants
+/// belong here. Unit variants (`response_body_mode: stream`) are plain
+/// strings and already deserialize.
+const STRUCT_VARIANT_KEYS: &[(&str, &[&str])] = &[("backoff", &["fixed", "exponential"])];
+
+fn tag_struct_variant_enums(value: &mut serde_yaml::Value) {
+    match value {
+        serde_yaml::Value::Sequence(items) => {
+            for item in items.iter_mut() {
+                tag_struct_variant_enums(item);
+            }
+        }
+        serde_yaml::Value::Mapping(map) => {
+            for (key, variants) in STRUCT_VARIANT_KEYS {
+                let tagged = tagged_variant(map.get(*key), variants);
+                if let Some(tagged) = tagged {
+                    map.insert(serde_yaml::Value::String((*key).to_string()), tagged);
+                }
+            }
+            for (_, child) in map.iter_mut() {
+                tag_struct_variant_enums(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `{fixed: {delay_ms: 1}}` → `!fixed {delay_ms: 1}`, but only when the
+/// singleton key names one of the enum's known variants. Anything else is
+/// left alone so an ordinary map never grows a tag.
+fn tagged_variant(
+    value: Option<&serde_yaml::Value>,
+    variants: &[&str],
+) -> Option<serde_yaml::Value> {
+    let serde_yaml::Value::Mapping(inner) = value? else {
+        return None;
+    };
+    if inner.len() != 1 {
+        return None;
+    }
+    let (variant, body) = inner.iter().next()?;
+    let name = variant.as_str()?;
+    if !variants.contains(&name) {
+        return None;
+    }
+    let tagged = serde_yaml::value::TaggedValue {
+        tag: serde_yaml::value::Tag::new(name),
+        value: body.clone(),
+    };
+    Some(serde_yaml::Value::Tagged(Box::new(tagged)))
 }

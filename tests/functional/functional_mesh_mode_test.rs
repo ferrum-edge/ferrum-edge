@@ -146,6 +146,18 @@ impl MeshConfigSync for StaticMeshControlPlane {
                 .map_err(|e| Status::internal(format!("serialize mesh slice: {e}")))?,
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
             heartbeat: false,
+            // The stub echoes the slice's own revision onto the envelope, the
+            // same duplicate-stamp contract the real CP honours; a mismatch is
+            // a consumer-side rejection (issue #2473).
+            config_authority: slice
+                .revision
+                .as_ref()
+                .map(|revision| revision.authority.clone())
+                .unwrap_or_default(),
+            config_sequence: slice
+                .revision
+                .as_ref()
+                .map_or(0, |revision| revision.sequence),
         };
         let heartbeat = MeshConfigUpdate {
             version: self.slice.version.clone(),
@@ -153,6 +165,8 @@ impl MeshConfigSync for StaticMeshControlPlane {
             mesh_slice_json: String::new(),
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
             heartbeat: true,
+            config_authority: String::new(),
+            config_sequence: 0,
         };
         let heartbeats = IntervalStream::new(tokio::time::interval(Duration::from_secs(60)))
             .map(move |_| Ok(heartbeat.clone()));

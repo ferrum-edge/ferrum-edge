@@ -177,16 +177,13 @@ pub(crate) fn publish_active_proxy_names(config: &crate::config::types::GatewayC
     let Some(registry) = CHARGEBACK_REGISTRY.get() else {
         return;
     };
-    let names = config
-        .proxies
-        .iter()
-        .map(|proxy| {
-            (
-                proxy.id.clone(),
-                proxy.name.clone().unwrap_or_else(|| "unknown".to_string()),
-            )
-        })
-        .collect();
+    let mut names: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for proxy in &config.proxies {
+        names.entry(proxy.namespace.clone()).or_default().insert(
+            proxy.id.clone(),
+            proxy.name.clone().unwrap_or_else(|| "unknown".to_string()),
+        );
+    }
     registry.set_active_proxy_names(names);
 }
 
@@ -247,32 +244,31 @@ type BandwidthAggregateKey = (String, String, ProtocolFamily, Arc<str>, Arc<str>
 /// (finding #24).
 ///
 /// The chargeback registry is a process-global singleton shared by every
-/// `api_chargeback` instance, but currency and namespace are properties of the
-/// individual instance (global / proxy / proxy_group scope), not of the
-/// process. Each instance holds an `InstanceScope` and passes it (alongside the
-/// per-request consumer) into the registry's `record_*` methods. The cold path
-/// (first record per unique key) stamps these `Arc<str>` onto the new
-/// [`ChargebackEntry`] with a cheap `Arc` clone; the hot path (cache hit)
-/// touches none of them, preserving the zero-allocation recording path.
-/// Multiple effective instances on one proxy are rejected (issue #2564).
+/// `api_chargeback` instance. Currency belongs to the individual instance
+/// (global / proxy / proxy_group scope), while namespace comes from the matched
+/// proxy. Each instance passes its `InstanceScope` and the transaction's proxy
+/// namespace into the registry's `record_*` methods. The cold path stamps
+/// immutable render metadata onto the new [`ChargebackEntry`]; the hot path
+/// touches none of it, preserving zero-allocation recording. Multiple effective
+/// instances on one proxy are rejected (issue #2564).
 #[derive(Clone)]
 pub struct InstanceScope {
     /// Instance currency label (e.g. "USD"). Emitted per-row at render time.
     pub currency: Arc<str>,
-    /// Pre-rendered Prometheus namespace label fragment, e.g.
-    /// `,namespace="ferrum"` (empty string when the namespace is empty). This is
-    /// the only namespace representation the renderers need: Prometheus appends
-    /// it verbatim and the JSON output does not carry a namespace field.
-    pub namespace_label: Arc<str>,
+    /// Instance namespace. Direct registry calls use this as the proxy namespace;
+    /// production hooks pass the matched proxy's namespace explicitly so a
+    /// gateway-wide global instance cannot conflate same-id tenant proxies.
+    #[allow(dead_code)]
+    // Read by external registry tests; production passes matched namespaces.
+    pub namespace: Arc<str>,
 }
 
 impl InstanceScope {
-    /// Build an instance scope from a currency and namespace, pre-rendering the
-    /// Prometheus label fragment once at construction.
+    /// Build an instance scope from a currency and owner namespace.
     pub fn new(currency: &str, namespace: &str) -> Self {
         Self {
             currency: Arc::from(currency),
-            namespace_label: Arc::from(Self::namespace_label_for(namespace).as_str()),
+            namespace: Arc::from(namespace),
         }
     }
 
@@ -291,8 +287,9 @@ impl InstanceScope {
 /// Estimated bytes one registry entry retains.
 ///
 /// Covers the owned `String` key, the `Arc<str>` metadata the entry clones
-/// (consumer, proxy id, proxy name, currency, namespace label), and a fixed
-/// allowance for the struct, its atomics, and DashMap's per-slot bookkeeping.
+/// (consumer, proxy id, proxy namespace, proxy name, currency, namespace
+/// label), and a fixed allowance for the struct, its atomics, and DashMap's
+/// per-slot bookkeeping.
 /// The value is an accounting estimate, not an allocator measurement; it is
 /// deliberately conservative so the configured ceiling is never exceeded in
 /// real terms.
@@ -300,21 +297,29 @@ fn entry_retained_bytes(
     key_len: usize,
     consumer_len: usize,
     proxy_id_len: usize,
+    proxy_namespace_len: usize,
     proxy_name_len: usize,
+    namespace_label_len: usize,
     scope: &InstanceScope,
 ) -> usize {
     key_len
         .saturating_add(consumer_len)
         .saturating_add(proxy_id_len)
+        .saturating_add(proxy_namespace_len)
         .saturating_add(proxy_name_len)
         .saturating_add(scope.currency.len())
-        .saturating_add(scope.namespace_label.len())
+        .saturating_add(namespace_label_len)
         .saturating_add(ENTRY_FIXED_OVERHEAD_BYTES)
 }
 
+// Keep the hot-path key fields as borrowed scalars: wrapping them in an
+// aggregate would add ceremony without reducing the call-site data flow, and
+// this helper deliberately writes directly into a reused thread-local buffer.
+#[allow(clippy::too_many_arguments)]
 fn write_chargeback_key(
     buf: &mut String,
     consumer: &str,
+    proxy_namespace: &str,
     proxy_id: &str,
     status_code: u16,
     protocol_family: ProtocolFamily,
@@ -328,11 +333,11 @@ fn write_chargeback_key(
         buf,
         "{}|{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
         consumer,
+        proxy_namespace,
         proxy_id,
         status_code,
         protocol_family.label(),
         scope.currency,
-        scope.namespace_label,
         prices.call.to_bits(),
         prices.bandwidth_sent.to_bits(),
         prices.bandwidth_received.to_bits()
@@ -352,30 +357,28 @@ fn write_chargeback_key(
 /// (`call_price`, `bw_price_sent`, `bw_price_received`) are config-derived
 /// constants fixed at entry creation.
 ///
-/// **Per-instance scoping (finding #24)**: `currency` and `namespace_label` are
-/// stored per entry (set from the constructing plugin instance) rather than in
-/// a single process-global, last-writer-wins registry field. A single process
-/// may host multiple `api_chargeback` instances on **different** proxies with
-/// different currencies/namespaces, so each exported row carries the currency
-/// and namespace of the instance that recorded it. Multiple effective instances
-/// on one proxy are rejected (issue #2564) because this registry has no
-/// ledger/instance dimension and would double-count the same client transaction.
+/// **Per-instance scoping (finding #24)**: `currency` is stored per entry from
+/// the constructing plugin instance rather than in a process-global,
+/// last-writer-wins registry field. Namespace is taken from the matched proxy,
+/// not the plugin owner, so a gateway-wide global instance keeps same-id tenant
+/// proxies distinct. Multiple effective instances on one proxy are rejected
+/// (issue #2564) because this registry has no ledger/instance dimension and
+/// would double-count the same client transaction.
 ///
-/// The `consumer`, `proxy_id`, `status_code`, `protocol_family`, prices,
-/// `currency`, and `namespace_label` fields are set once on creation and read
-/// during render. They are included in the DashMap key string so config reloads
-/// that change pricing create fresh entries instead of adding new traffic to
-/// stale prices, and so HTTP-family status-0 WebSocket bandwidth cannot share an
-/// entry with a stream session. The key is still a plain `String`, which lets
-/// the hot-path `get()` use a borrowed `&str` from a thread-local buffer with
-/// zero allocation.
+/// The `consumer`, proxy namespace/id, `status_code`, `protocol_family`, prices,
+/// and `currency` are set once on creation and read during render. They are
+/// included in the DashMap key string so config reloads that change pricing
+/// create fresh entries instead of adding new traffic to stale prices, and so
+/// HTTP-family status-0 WebSocket bandwidth cannot share an entry with a stream
+/// session. The key remains a plain `String`, which lets the hot-path `get()`
+/// use a borrowed `&str` from a thread-local buffer with zero allocation.
 ///
 /// **`proxy_name` is live display metadata (issue #2572)**: it is deliberately
 /// omitted from the registry key so a name-only reload keeps counter continuity
-/// under the stable `proxy_id`. Entries retain their admission-time name for a
-/// deterministic fallback after deletion, while renderers use the separately
-/// published current-proxy metadata snapshot. Late completions from a retired
-/// cache generation therefore cannot restore an old exported name.
+/// under the stable `(namespace, proxy_id)`. Entries retain their admission-time
+/// name for a deterministic fallback after deletion, while renderers use the
+/// separately published current-proxy metadata snapshot. Late completions from
+/// a retired cache generation therefore cannot restore an old exported name.
 ///
 /// For stream entries the `status_code` is `0` and there is exactly one entry
 /// per `(consumer, proxy_id, protocol_family=stream)` (streams have no HTTP
@@ -400,6 +403,8 @@ pub struct ChargebackEntry {
     // --- Render metadata (immutable after creation) ---
     pub consumer: Arc<str>,
     pub proxy_id: Arc<str>,
+    /// Raw matched proxy namespace for JSON output and live-name lookup.
+    pub proxy_namespace: Arc<str>,
     /// Admission-time fallback name for `proxy_id`. Active exports use the
     /// authoritative published metadata snapshot instead (issue #2572).
     pub proxy_name: Arc<str>,
@@ -410,8 +415,8 @@ pub struct ChargebackEntry {
     /// misattribute one another's charges.
     pub currency: Arc<str>,
     /// Pre-rendered Prometheus namespace label fragment, e.g.
-    /// `,namespace="ferrum"` (empty string when no namespace), of the instance
-    /// that created the entry.
+    /// `,namespace="ferrum"` (empty string when no namespace), of the matched
+    /// proxy that created the entry.
     pub namespace_label: Arc<str>,
     /// Bytes this entry reserved against the registry's retained-byte budget.
     /// Released verbatim on eviction so the counter stays exact.
@@ -429,6 +434,7 @@ impl ChargebackEntry {
         epoch: Instant,
         consumer: Arc<str>,
         proxy_id: Arc<str>,
+        proxy_namespace: Arc<str>,
         proxy_name: Arc<str>,
         status_code: u16,
         protocol_family: ProtocolFamily,
@@ -450,6 +456,7 @@ impl ChargebackEntry {
             bw_price_received,
             consumer,
             proxy_id,
+            proxy_namespace,
             proxy_name,
             status_code,
             protocol_family,
@@ -614,10 +621,13 @@ fn effective_api_chargeback_plugins_by_proxy(
 )> {
     use crate::config::types::PluginScope;
 
-    let plugin_by_id: HashMap<&str, &crate::config::types::PluginConfig> = config
+    // Association plugin_config_id values are namespace-local to the proxy. A
+    // bare-id index would bind a proxy to another tenant's same-id
+    // api_chargeback config (mirrors effective_mtls_auth_plugins_by_proxy).
+    let plugin_by_key: HashMap<(&str, &str), &crate::config::types::PluginConfig> = config
         .plugin_configs
         .iter()
-        .map(|plugin| (plugin.id.as_str(), plugin))
+        .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
         .collect();
     let global_chargeback: Vec<&crate::config::types::PluginConfig> = config
         .plugin_configs
@@ -637,14 +647,23 @@ fn effective_api_chargeback_plugins_by_proxy(
                 .plugins
                 .iter()
                 .filter_map(|association| {
-                    let plugin = *plugin_by_id.get(association.plugin_config_id.as_str())?;
+                    let plugin = *plugin_by_key.get(&(
+                        proxy.namespace.as_str(),
+                        association.plugin_config_id.as_str(),
+                    ))?;
                     let scope_applies = match plugin.scope {
-                        PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
+                        PluginScope::Proxy => {
+                            plugin.namespace == proxy.namespace
+                                && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+                        }
                         // Config validation already requires proxy-group
                         // instances to omit proxy_id. Applicability here mirrors
                         // the runtime merge, which is driven by scope plus the
-                        // proxy's explicit plugin association.
-                        PluginScope::ProxyGroup => true,
+                        // proxy's explicit plugin association — still
+                        // namespace-local so same-id group configs stay isolated.
+                        PluginScope::ProxyGroup => {
+                            plugin.namespace == proxy.namespace && plugin.proxy_id.is_none()
+                        }
                         PluginScope::Global => false,
                     };
                     (plugin.enabled && plugin.plugin_name == "api_chargeback" && scope_applies)
@@ -652,6 +671,10 @@ fn effective_api_chargeback_plugins_by_proxy(
                 })
                 .collect();
             let effective = if local_chargeback.is_empty() {
+                // Globals are gateway-wide at runtime (`PluginCache` merges the
+                // single global list into every proxy in every namespace), so
+                // this must NOT be namespace-filtered — only the association
+                // lookup above is namespace-local.
                 global_chargeback.clone()
             } else {
                 local_chargeback
@@ -770,7 +793,7 @@ const STREAM_STATUS_SENTINEL: u16 = 0;
 /// Chargeback registry holding per-consumer, per-proxy charge accumulators.
 ///
 /// **Key design**: The DashMap uses plain `String` keys formatted as
-/// `"consumer|proxy_id|status_code|protocol_family|currency|namespace_label|price_bits..."`.
+/// `"consumer|proxy_namespace|proxy_id|status_code|protocol_family|currency|price_bits..."`.
 /// Render metadata (consumer, proxy_id, status_code, protocol_family) is stored
 /// in the `ChargebackEntry` value and `protocol_family` is also part of the key
 /// so immutable family attribution cannot be fixed by insertion order.
@@ -789,8 +812,8 @@ pub struct ChargebackRegistry {
     /// singleton's lifetime; recorded so tests can assert the accepted
     /// generation's `PluginHttpClient::pool_shard_amount()` reached the map.
     shard_amount: usize,
-    /// Current display names from the published gateway configuration.
-    active_proxy_names: ArcSwap<HashMap<String, String>>,
+    /// Current display names keyed by raw proxy namespace and proxy id.
+    active_proxy_names: ArcSwap<HashMap<String, HashMap<String, String>>>,
     /// Advances whenever `active_proxy_names` is replaced. Render caches carry
     /// this generation so an overlapping reload cannot publish stale labels.
     proxy_metadata_generation: AtomicU64,
@@ -872,7 +895,7 @@ impl ChargebackRegistry {
     /// Replace live display metadata after a gateway configuration is
     /// published. This is a reload cold-path operation.
     #[doc(hidden)]
-    pub fn set_active_proxy_names(&self, names: HashMap<String, String>) {
+    pub fn set_active_proxy_names(&self, names: HashMap<String, HashMap<String, String>>) {
         let unchanged = {
             let current = self.active_proxy_names.load();
             current.as_ref() == &names
@@ -990,6 +1013,7 @@ impl ChargebackRegistry {
 
     /// Record a chargeable HTTP-family transaction (HTTP/1.1, H2, H3, gRPC,
     /// WebSocket upgrade). Status code is the response status.
+    #[allow(dead_code)] // External-test convenience wrapper; production supplies proxy namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn record_http(
         &self,
@@ -1004,8 +1028,39 @@ impl ChargebackRegistry {
         bw_price_sent: f64,
         bw_price_received: f64,
     ) {
+        self.record_http_in_namespace(
+            scope,
+            scope.namespace.as_ref(),
+            consumer,
+            proxy_id,
+            proxy_name,
+            status_code,
+            call_price,
+            bytes_sent,
+            bytes_received,
+            bw_price_sent,
+            bw_price_received,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_http_in_namespace(
+        &self,
+        scope: &InstanceScope,
+        proxy_namespace: &str,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        status_code: u16,
+        call_price: f64,
+        bytes_sent: u64,
+        bytes_received: u64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
+    ) {
         self.record_inner(
             scope,
+            proxy_namespace,
             consumer,
             proxy_id,
             proxy_name,
@@ -1024,6 +1079,7 @@ impl ChargebackRegistry {
     /// have no HTTP status code; entries are keyed by
     /// `(consumer, proxy_id, ProtocolFamily::Stream)` with the
     /// [`STREAM_STATUS_SENTINEL`].
+    #[allow(dead_code)] // External-test convenience wrapper; production supplies proxy namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn record_stream(
         &self,
@@ -1037,8 +1093,37 @@ impl ChargebackRegistry {
         bw_price_sent: f64,
         bw_price_received: f64,
     ) {
+        self.record_stream_in_namespace(
+            scope,
+            scope.namespace.as_ref(),
+            consumer,
+            proxy_id,
+            proxy_name,
+            connection_price,
+            bytes_sent,
+            bytes_received,
+            bw_price_sent,
+            bw_price_received,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_stream_in_namespace(
+        &self,
+        scope: &InstanceScope,
+        proxy_namespace: &str,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        connection_price: f64,
+        bytes_sent: u64,
+        bytes_received: u64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
+    ) {
         self.record_inner(
             scope,
+            proxy_namespace,
             consumer,
             proxy_id,
             proxy_name,
@@ -1053,6 +1138,7 @@ impl ChargebackRegistry {
         );
     }
 
+    #[allow(dead_code)] // External-test convenience wrapper; production supplies proxy namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn record_websocket_bandwidth(
         &self,
@@ -1065,8 +1151,35 @@ impl ChargebackRegistry {
         bw_price_sent: f64,
         bw_price_received: f64,
     ) {
+        self.record_websocket_bandwidth_in_namespace(
+            scope,
+            scope.namespace.as_ref(),
+            consumer,
+            proxy_id,
+            proxy_name,
+            bytes_sent,
+            bytes_received,
+            bw_price_sent,
+            bw_price_received,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_websocket_bandwidth_in_namespace(
+        &self,
+        scope: &InstanceScope,
+        proxy_namespace: &str,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        bytes_sent: u64,
+        bytes_received: u64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
+    ) {
         self.record_inner(
             scope,
+            proxy_namespace,
             consumer,
             proxy_id,
             proxy_name,
@@ -1090,11 +1203,11 @@ impl ChargebackRegistry {
     /// **Cold-path (first record per unique combination)**: Clones the per-instance
     /// `Arc<str>` render metadata (consumer/proxy/currency/namespace) and allocates
     /// the owned `String` key and a new `ChargebackEntry`. This runs once per unique
-    /// `(consumer, proxy, status_code, protocol_family, currency, namespace, prices)`
-    /// combination. The currency/namespace come from the recording plugin
-    /// instance's [`InstanceScope`], and are part of the key so multiple
-    /// instances never reuse an entry stamped with another instance's render
-    /// scope. `protocol_family` is part of the key so HTTP-family WebSocket
+    /// `(consumer, proxy namespace, proxy id, status_code, protocol_family,
+    /// currency, prices)` combination. Currency comes from the recording plugin
+    /// instance; namespace comes from the matched proxy. Both are part of the
+    /// key so global instances and same-id tenant proxies cannot reuse an entry
+    /// stamped with another scope. `protocol_family` is part of the key so HTTP-family WebSocket
     /// bandwidth and stream sessions stay distinct even when both use status
     /// `0` and identical prices. `proxy_name` is intentionally omitted from the
     /// key (issue #2572).
@@ -1114,6 +1227,7 @@ impl ChargebackRegistry {
     fn record_inner(
         &self,
         scope: &InstanceScope,
+        proxy_namespace: &str,
         consumer: &str,
         proxy_id: &str,
         proxy_name: &str,
@@ -1143,6 +1257,7 @@ impl ChargebackRegistry {
         let proxy_name = bounded_display(proxy_name, MAX_REGISTRY_IDENTITY_BYTES);
         self.record_admitted(
             scope,
+            proxy_namespace,
             &consumer,
             &proxy_id,
             proxy_name,
@@ -1166,6 +1281,7 @@ impl ChargebackRegistry {
     fn record_admitted(
         &self,
         scope: &InstanceScope,
+        proxy_namespace: &str,
         consumer: &str,
         proxy_id: &str,
         proxy_name: &str,
@@ -1192,6 +1308,7 @@ impl ChargebackRegistry {
             write_chargeback_key(
                 &mut buf,
                 consumer,
+                proxy_namespace,
                 proxy_id,
                 status_code,
                 protocol_family,
@@ -1212,20 +1329,17 @@ impl ChargebackRegistry {
 
         if !hit {
             // Cold path: allocate owned key + metadata for DashMap insertion.
-            // Currency/namespace come from the recording instance's scope so the
-            // entry is attributed to the instance that created it (finding #24).
+            // Currency comes from the recording instance; namespace comes from
+            // the matched proxy so global instances preserve tenant identity.
             // Capacity covers separators, status, protocol_family label
             // ("stream" is longest), and three 16-hex price bit fields.
             let mut owned_key = String::with_capacity(
-                consumer.len()
-                    + proxy_id.len()
-                    + scope.currency.len()
-                    + scope.namespace_label.len()
-                    + 74,
+                consumer.len() + proxy_namespace.len() + proxy_id.len() + scope.currency.len() + 74,
             );
             write_chargeback_key(
                 &mut owned_key,
                 consumer,
+                proxy_namespace,
                 proxy_id,
                 status_code,
                 protocol_family,
@@ -1239,11 +1353,14 @@ impl ChargebackRegistry {
             // Reserve the entry-key slot and its retained bytes BEFORE the key is
             // published, so concurrent cold-path inserts can never publish state
             // above the configured ceilings.
+            let namespace_label = InstanceScope::namespace_label_for(proxy_namespace);
             let entry_bytes = entry_retained_bytes(
                 owned_key.len(),
                 consumer.len(),
                 proxy_id.len(),
+                proxy_namespace.len(),
                 proxy_name.len(),
+                namespace_label.len(),
                 scope,
             );
             if !self.try_reserve(entry_bytes, identity_admission) {
@@ -1256,6 +1373,7 @@ impl ChargebackRegistry {
                     self.warn_on_admission("entry budget exhausted");
                     self.record_admitted(
                         scope,
+                        proxy_namespace,
                         OVERFLOW_CONSUMER_SENTINEL,
                         proxy_id,
                         proxy_name,
@@ -1284,6 +1402,7 @@ impl ChargebackRegistry {
                         self.epoch,
                         Arc::from(consumer),
                         Arc::from(proxy_id),
+                        Arc::from(proxy_namespace),
                         Arc::from(proxy_name),
                         status_code,
                         protocol_family,
@@ -1291,7 +1410,7 @@ impl ChargebackRegistry {
                         bw_price_sent,
                         bw_price_received,
                         Arc::clone(&scope.currency),
-                        Arc::clone(&scope.namespace_label),
+                        Arc::from(namespace_label),
                         entry_bytes,
                         identity_admission,
                     )
@@ -1515,7 +1634,8 @@ impl ChargebackRegistry {
         for entry in self.entries.iter() {
             let v = entry.value();
             let proxy_name = active_proxy_names
-                .get(v.proxy_id.as_ref())
+                .get(v.proxy_namespace.as_ref())
+                .and_then(|namespace| namespace.get(v.proxy_id.as_ref()))
                 .map(String::as_str)
                 .unwrap_or(v.proxy_name.as_ref());
             match v.protocol_family {
@@ -1651,7 +1771,8 @@ impl ChargebackRegistry {
         for entry in self.entries.iter() {
             let v = entry.value();
             let proxy_name = active_proxy_names
-                .get(v.proxy_id.as_ref())
+                .get(v.proxy_namespace.as_ref())
+                .and_then(|namespace| namespace.get(v.proxy_id.as_ref()))
                 .map(String::as_str)
                 .unwrap_or(v.proxy_name.as_ref());
             let agg = bw_aggregates
@@ -1891,7 +2012,8 @@ impl ChargebackRegistry {
             let bw_sent = v.bandwidth_charge_sent()?;
             let bw_received = v.bandwidth_charge_received()?;
             let proxy_name = active_proxy_names
-                .get(v.proxy_id.as_ref())
+                .get(v.proxy_namespace.as_ref())
+                .and_then(|namespace| namespace.get(v.proxy_id.as_ref()))
                 .map(String::as_str)
                 .unwrap_or(v.proxy_name.as_ref());
 
@@ -1910,7 +2032,7 @@ impl ChargebackRegistry {
                 .entry((
                     v.proxy_id.to_string(),
                     Arc::clone(&v.currency),
-                    Arc::clone(&v.namespace_label),
+                    Arc::clone(&v.proxy_namespace),
                 ))
                 .or_insert_with(|| ProxyAggregate {
                     proxy_name: proxy_name.to_string(),
@@ -1990,7 +2112,7 @@ impl ChargebackRegistry {
                 *proxy_id_counts.entry(proxy_id.as_str()).or_default() += 1;
             }
 
-            for ((proxy_id, _, namespace_label), agg) in proxies {
+            for ((proxy_id, _, proxy_namespace), agg) in proxies {
                 let mut proxy_per_call_charges = 0.0f64;
                 let mut proxy_calls = 0u64;
                 let mut status_objects = serde_json::Map::new();
@@ -2049,6 +2171,7 @@ impl ChargebackRegistry {
 
                 let mut proxy_obj = serde_json::json!({
                     "proxy_id": proxy_id,
+                    "namespace": proxy_namespace.as_ref(),
                     "proxy_name": agg.proxy_name,
                     "currency": agg.currency.as_ref(),
                     "protocol_family": protocol_family,
@@ -2075,10 +2198,10 @@ impl ChargebackRegistry {
                 let output_key = if proxy_id_counts.get(proxy_id.as_str()).copied().unwrap_or(0) > 1
                 {
                     format!(
-                        "{}|currency={}{}",
+                        "{}|currency={}|namespace={}",
                         proxy_id,
                         agg.currency.as_ref(),
-                        namespace_label.as_ref()
+                        proxy_namespace.as_ref()
                     )
                 } else {
                     proxy_id.clone()
@@ -2345,8 +2468,9 @@ impl Plugin for ApiChargeback {
         let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
 
-        self.registry.record_http(
+        self.registry.record_http_in_namespace(
             &self.scope,
+            &summary.namespace,
             consumer,
             proxy_id,
             proxy_name,
@@ -2374,8 +2498,9 @@ impl Plugin for ApiChargeback {
 
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
 
-        self.registry.record_stream(
+        self.registry.record_stream_in_namespace(
             &self.scope,
+            &summary.namespace,
             consumer,
             &summary.proxy_id,
             proxy_name,
@@ -2407,8 +2532,9 @@ impl Plugin for ApiChargeback {
             return;
         }
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
-        self.registry.record_websocket_bandwidth(
+        self.registry.record_websocket_bandwidth_in_namespace(
             &self.scope,
+            &summary.namespace,
             consumer,
             &summary.proxy_id,
             proxy_name,

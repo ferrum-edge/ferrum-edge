@@ -800,6 +800,14 @@ fn u24_to_usize(data: &[u8]) -> usize {
 /// 2. Wildcard host match (e.g., `*.example.com` matches any DNS name below `example.com`)
 /// 3. Fallback: first proxy with empty `hosts` (catch-all/default)
 /// 4. If no match and no fallback: `None`
+///
+/// Namespace-agnostic single-namespace helper.
+///
+/// **Not for runtime use.** Candidate IDs are matched against `config.proxies`
+/// by bare ID, so it cannot distinguish two namespaces that reuse one proxy ID.
+/// Every listener path resolves through
+/// [`resolve_proxy_by_sni_in_epoch`], which takes namespace-qualified
+/// candidates.
 #[allow(dead_code)] // Public test/library helper; runtime uses the RequestEpoch-indexed variant.
 pub fn resolve_proxy_by_sni<'a>(
     sni: Option<&str>,
@@ -807,27 +815,36 @@ pub fn resolve_proxy_by_sni<'a>(
     config: &crate::config::types::GatewayConfig,
 ) -> Option<&'a str> {
     resolve_proxy_by_sni_with_lookup(sni, proxy_ids, |proxy_id| {
-        config.proxies.iter().find(|p| p.id == proxy_id)
+        config.proxies.iter().find(|p| &p.id == proxy_id)
+    })
+    .map(String::as_str)
+}
+
+/// Resolve a shared passthrough listener's SNI to one of its namespace-qualified
+/// candidate proxies.
+///
+/// Candidates carry their owning namespace because a single `listen_port` may be
+/// shared by same-ID passthrough proxies in different namespaces; matching by
+/// bare ID would route one tenant's connection to another tenant's proxy.
+pub fn resolve_proxy_by_sni_in_epoch<'a>(
+    sni: Option<&str>,
+    candidates: &'a [crate::config::db_backend::NamespacedResourceId],
+    epoch: &crate::request_epoch::RequestEpoch,
+) -> Option<&'a crate::config::db_backend::NamespacedResourceId> {
+    resolve_proxy_by_sni_with_lookup(sni, candidates, |candidate| {
+        epoch.proxy_by_namespaced_id(&candidate.namespace, &candidate.id)
     })
 }
 
-pub fn resolve_proxy_by_sni_in_epoch<'a>(
+fn resolve_proxy_by_sni_with_lookup<'a, 'p, C>(
     sni: Option<&str>,
-    proxy_ids: &'a [String],
-    epoch: &crate::request_epoch::RequestEpoch,
-) -> Option<&'a str> {
-    resolve_proxy_by_sni_with_lookup(sni, proxy_ids, |proxy_id| epoch.proxy_by_id(proxy_id))
-}
+    candidates: &'a [C],
+    mut find_proxy: impl FnMut(&C) -> Option<&'p crate::config::types::Proxy>,
+) -> Option<&'a C> {
+    let mut fallback: Option<&'a C> = None;
+    let mut wildcard_match: Option<&'a C> = None;
 
-fn resolve_proxy_by_sni_with_lookup<'a, 'p>(
-    sni: Option<&str>,
-    proxy_ids: &'a [String],
-    mut find_proxy: impl FnMut(&str) -> Option<&'p crate::config::types::Proxy>,
-) -> Option<&'a str> {
-    let mut fallback: Option<&'a str> = None;
-    let mut wildcard_match: Option<&'a str> = None;
-
-    for proxy_id in proxy_ids {
+    for proxy_id in candidates {
         let Some(proxy) = find_proxy(proxy_id) else {
             continue;
         };
@@ -835,7 +852,7 @@ fn resolve_proxy_by_sni_with_lookup<'a, 'p>(
         if proxy.hosts.is_empty() {
             // Empty hosts = catch-all, use as fallback
             if fallback.is_none() {
-                fallback = Some(proxy_id.as_str());
+                fallback = Some(proxy_id);
             }
             continue;
         }
@@ -847,12 +864,12 @@ fn resolve_proxy_by_sni_with_lookup<'a, 'p>(
                     // earlier in `proxy_ids` must not steal traffic from an
                     // exact-host proxy (routing tier order: exact, wildcard,
                     // catch-all).
-                    return Some(proxy_id.as_str());
+                    return Some(proxy_id);
                 }
                 if wildcard_match.is_none()
                     && crate::config::types::wildcard_matches(host, hostname)
                 {
-                    wildcard_match = Some(proxy_id.as_str());
+                    wildcard_match = Some(proxy_id);
                 }
             }
         }

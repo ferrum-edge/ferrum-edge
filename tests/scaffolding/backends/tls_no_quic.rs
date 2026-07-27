@@ -2,8 +2,10 @@
 //! `http/1.1` in ALPN but has NO QUIC listener on the same port.
 //!
 //! Used to test the gateway's initial capability probe behaviour: it should
-//! classify `h2_tls = Supported` and `h3 = Unsupported` when the backend is
-//! reachable via TCP but not QUIC.
+//! classify `h3 = Unsupported` (or `Unknown` on soft QUIC timeouts) when the
+//! backend is reachable via TCP but not QUIC. `h2_tls` is `Supported` only
+//! when peer HTTP/2 SETTINGS complete; ALPN `h2` alone with an HTTP/1.1 peer
+//! may remain `Unknown`.
 //!
 //! This is a thin helper that pairs a [`super::tls::ScriptedTlsBackend`]
 //! (with `h2` + `http/1.1` ALPN) with an explicit "no UDP bound on this
@@ -39,10 +41,10 @@ pub fn tls_backend_without_quic(
 }
 
 /// Same as [`tls_backend_without_quic`] but pre-wired with a minimal script
-/// that reads an HTTP/1.1 request prelude (so the gateway's ALPN-learning
-/// pool probe passes) and writes a 200 OK response. Use when tests don't
-/// care about the request semantics — they only need the TCP path to be
-/// healthy while the UDP path is silent.
+/// that reads until an HTTP prelude terminator and writes a 200 OK response.
+/// Use when tests need the TCP path healthy while the UDP path is silent.
+/// Note: the gateway's H2 pool probe requires peer SETTINGS, so an HTTP/1.1
+/// peer that only advertises ALPN `h2` may leave `h2_tls` as `unknown`.
 pub fn tls_backend_without_quic_with_ok_response(
     listener: TcpListener,
     cert_pem: String,

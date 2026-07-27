@@ -1925,8 +1925,6 @@ dependencies = [
 [[package]]
 name = "dimpl"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef7eed0cf766b110880acdd89a860061dee42ed5f64df0fa43c80203e4f60916"
 dependencies = [
  "aes",
  "arrayvec",
@@ -1945,6 +1943,7 @@ dependencies = [
  "subtle",
  "time",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]
@@ -2266,6 +2265,7 @@ dependencies = [
  "http-body-util",
  "httpdate",
  "hyper 1.9.0",
+ "hyper-rustls 0.27.9",
  "hyper-util",
  "instant-acme",
  "instant-distance",

@@ -36,7 +36,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
@@ -505,6 +505,27 @@ impl GrpcConnectionPool {
         self.rr_counters.clear();
     }
 
+    /// Drop every cached sender for `proxy` so the next acquisition dials fresh.
+    ///
+    /// Call after a pooled `send_request` fails with hyper `is_canceled`
+    /// (request never left the client) while racing a backend GOAWAY /
+    /// connection-age close. Waiting for `is_closed()` on the next
+    /// `cached()` probe is racy — the dying sender can still look healthy
+    /// for one more poll — so the whole host shard ring is cleared.
+    /// Sibling shards reconnect lazily on the next miss.
+    pub fn invalidate_shards_for_proxy(&self, proxy: &Proxy) {
+        let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
+        let shard_count = pool_config.http2_connections_per_host.max(1);
+        let svid_generation = self.pool.manager().svid_generation_for_proxy(proxy);
+        self.with_pool_key(proxy, svid_generation, |key_buf| {
+            let base_len = key_buf.len();
+            for shard in 0..shard_count {
+                Self::write_shard_key_inplace(key_buf, base_len, shard);
+                self.pool.invalidate(key_buf);
+            }
+        });
+    }
+
     /// ⚠️  CRITICAL — DO NOT add fields to this key without careful analysis.
     /// Adding fields causes pool fragmentation and P95 latency regressions.
     /// See `ConnectionPool::create_pool_key` for detailed rationale.
@@ -767,9 +788,9 @@ impl GrpcPoolManager {
 
         // Resolve backend hostname via the shared DNS cache. Errors propagate
         // — no silent fallback to raw hostname that would bypass the cache.
-        let resolved_ip = self
+        let candidates = self
             .dns_cache
-            .resolve(
+            .resolve_candidates(
                 host,
                 proxy.dns_override.as_deref(),
                 proxy.dns_cache_ttl_seconds,
@@ -782,103 +803,121 @@ impl GrpcPoolManager {
                 )
             })?;
 
-        // Construct SocketAddr from the resolved IpAddr + port directly.
-        // This handles both IPv4 and IPv6 correctly without string formatting
-        // issues (IPv6 addresses from IpAddr::to_string() are unbracketed,
-        // which breaks "ip:port" string parsing).
-        let sock_addr = std::net::SocketAddr::new(resolved_ip, port);
-        let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-        let connect_started = Instant::now();
-
-        // Connect with timeout, using TcpSocket to set IP_BIND_ADDRESS_NO_PORT
-        // before connect() so the kernel can co-select ephemeral ports.
-        let tcp = tokio::time::timeout(
-            connect_timeout,
-            crate::socket_opts::connect_with_socket_opts(sock_addr),
-        )
-        .await
-        .map_err(|_| {
-            warn!(
-                "gRPC: connect timeout ({}ms) to backend {}",
-                proxy.backend_connect_timeout_ms, addr
-            );
-            GrpcProxyError::BackendTimeout {
-                kind: GrpcTimeoutKind::Connect,
-                message: format!(
-                    "Connect timeout after {}ms to {}",
-                    proxy.backend_connect_timeout_ms, addr
-                ),
-            }
-        })?
-        .map_err(|e| {
-            if crate::retry::is_port_exhaustion(&e) {
-                tracing::error!(
-                    "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
-                         reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
-                    addr,
-                    e
-                );
-            } else {
-                warn!("gRPC: failed to connect to backend {}: {}", addr, e);
-            }
-            GrpcProxyError::backend_unavailable_with_source(
-                GrpcBackendUnavailableKind::Connect,
-                format!("Connection failed: {}", e),
-                e,
-            )
-        })?;
-
-        // Disable Nagle for lower latency
-        let _ = tcp.set_nodelay(true);
-
-        // Apply TCP keepalive: honor the DestinationRule
-        // `connectionPool.tcp.tcpKeepalive` per-port override (keyed by the
-        // dial target's port, `proxy.backend_port`), falling back to the
-        // global pool keepalive. NOTE: keepalive is NOT in the pool key
-        // (forbidden by `.claude/rules/proxy-protocols.md`), and this
-        // connection is pooled+shared, so the first dispatcher to materialize
-        // the connection wins — same first-materializer tradeoff documented
-        // for `idleTimeout` / `maxRequestsPerConnection`.
         let pool_config = self.global_pool_config.for_proxy(proxy);
-        crate::socket_opts::apply_pooled_tcp_keepalive(
-            "grpc_proxy",
-            &tcp,
-            proxy
-                .dispatch_port_overrides
-                .as_ref()
-                .and_then(|m| m.get(&port))
-                .and_then(|o| o.tcp_keepalive.as_ref()),
-            pool_config.enable_http_keep_alive,
-            pool_config.tcp_keepalive_seconds,
-        );
-
+        let keepalive_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&port))
+            .and_then(|o| o.tcp_keepalive.as_ref());
         let use_tls = matches!(proxy.backend_scheme, Some(BackendScheme::Https));
 
-        if use_tls {
-            self.create_tls_connection(
-                tcp,
-                host,
-                proxy,
-                svid_generation,
-                connect_started,
-                connect_timeout,
-            )
+        // The candidate attempt includes TCP socket setup, negotiated ALPN h2
+        // when TLS is configured, and the Hyper H2 handshake. Cleartext h2c
+        // additionally observes the spawned driver for an immediate protocol
+        // rejection. A peer that accepts TCP but cannot establish the requested
+        // protocol must not pin this pool to that DNS address.
+        let result = if use_tls {
+            let tls_config = self.get_tls_config(proxy, svid_generation)?;
+            let connector = tokio_rustls::TlsConnector::from(tls_config);
+            let server_name =
+                crate::tls::backend::backend_tls_server_name_owned(&proxy.resolved_tls, host)
+                    .map_err(|e| {
+                        GrpcProxyError::backend_unavailable(
+                            GrpcBackendUnavailableKind::InvalidServerName,
+                            format!("Invalid server name: {}", e),
+                        )
+                    })?;
+
+            crate::dns::connect_candidates(&candidates, port, connect_timeout, |sock_addr| {
+                let connector = connector.clone();
+                let server_name = server_name.clone();
+                let pool_config = &pool_config;
+                async move {
+                    let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
+                        .await
+                        .map_err(|e| {
+                            GrpcProxyError::backend_unavailable_with_source(
+                                GrpcBackendUnavailableKind::Connect,
+                                format!("Connection failed: {}", e),
+                                e,
+                            )
+                        })?;
+                    let _ = tcp.set_nodelay(true);
+                    crate::socket_opts::apply_pooled_tcp_keepalive(
+                        "grpc_proxy",
+                        &tcp,
+                        keepalive_override,
+                        pool_config.enable_http_keep_alive,
+                        pool_config.tcp_keepalive_seconds,
+                    );
+                    self.create_tls_connection(tcp, connector, server_name, pool_config)
+                        .await
+                }
+            })
             .await
         } else {
-            self.create_h2c_connection(tcp, &pool_config, proxy, connect_started, connect_timeout)
-                .await
-        }
-    }
+            crate::dns::connect_candidates(&candidates, port, connect_timeout, |sock_addr| {
+                let pool_config = &pool_config;
+                async move {
+                    let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
+                        .await
+                        .map_err(|e| {
+                            GrpcProxyError::backend_unavailable_with_source(
+                                GrpcBackendUnavailableKind::Connect,
+                                format!("Connection failed: {}", e),
+                                e,
+                            )
+                        })?;
+                    let _ = tcp.set_nodelay(true);
+                    crate::socket_opts::apply_pooled_tcp_keepalive(
+                        "grpc_proxy",
+                        &tcp,
+                        keepalive_override,
+                        pool_config.enable_http_keep_alive,
+                        pool_config.tcp_keepalive_seconds,
+                    );
+                    self.create_h2c_connection(tcp, pool_config).await
+                }
+            })
+            .await
+        };
 
-    fn backend_connect_timeout_error(proxy: &Proxy, phase: &str) -> GrpcProxyError {
-        GrpcProxyError::BackendTimeout {
-            kind: GrpcTimeoutKind::Connect,
-            message: format!(
-                "Connect timeout after {}ms during {} to {}:{}",
-                proxy.backend_connect_timeout_ms, phase, proxy.backend_host, proxy.backend_port
-            ),
-        }
+        result
+            .map(|(sender, _)| sender)
+            .map_err(|error| match error {
+                crate::dns::CandidateConnectError::TimedOut { last_addr } => {
+                    warn!(
+                        "gRPC: protocol establishment budget exhausted ({}ms) for backend {} \
+                         (last={})",
+                        proxy.backend_connect_timeout_ms, host, last_addr
+                    );
+                    GrpcProxyError::BackendTimeout {
+                        kind: GrpcTimeoutKind::Connect,
+                        message: format!(
+                            "Connect timeout after {}ms establishing gRPC HTTP/2 to {}",
+                            proxy.backend_connect_timeout_ms, last_addr
+                        ),
+                    }
+                }
+                crate::dns::CandidateConnectError::Failed { last_addr, source } => {
+                    if crate::retry::is_port_exhaustion(&source) {
+                        tracing::error!(
+                            "gRPC: PORT EXHAUSTION connecting to backend {}: {} — \
+                             reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                            last_addr,
+                            source
+                        );
+                    } else {
+                        warn!(
+                            "gRPC: all DNS candidates failed protocol establishment for backend {} \
+                             (last={}): {}",
+                            host, last_addr, source
+                        );
+                    }
+                    source
+                }
+            })
     }
 
     /// Build an HTTP/2 client builder with keepalive and flow-control settings.
@@ -908,11 +947,8 @@ impl GrpcPoolManager {
             .max_frame_size(pool_config.http2_max_frame_size);
 
         if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Cap server-initiated streams (push) AND advertise our local
-            // initial cap on locally-initiated streams. The server's SETTINGS
-            // frame can raise the local cap later, but the initial value
-            // gives operators a starting bound that maps onto Istio's
-            // `http2MaxRequests` semantics for outbound concurrent requests.
+            // Preserve the configured initial outbound bound until the peer's
+            // SETTINGS frame replaces it.
             builder.max_concurrent_streams(max_streams);
             builder.initial_max_send_streams(max_streams as usize);
         }
@@ -925,36 +961,44 @@ impl GrpcPoolManager {
         &self,
         tcp: TcpStream,
         pool_config: &PoolConfig,
-        proxy: &Proxy,
-        connect_started: Instant,
-        connect_timeout: Duration,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let io = TokioIo::new(tcp);
         let builder = Self::build_h2_builder(pool_config);
 
-        let Some(remaining) =
-            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-        else {
-            return Err(Self::backend_connect_timeout_error(proxy, "h2c handshake"));
-        };
+        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2cHandshake,
+                format!("h2c handshake failed: {}", e),
+                e,
+            )
+        })?;
 
-        let (sender, conn) = tokio::time::timeout(remaining, builder.handshake(io))
-            .await
-            .map_err(|_| Self::backend_connect_timeout_error(proxy, "h2c handshake"))?
-            .map_err(|e| {
-                GrpcProxyError::backend_unavailable_with_source(
-                    GrpcBackendUnavailableKind::H2cHandshake,
-                    format!("h2c handshake failed: {}", e),
-                    e,
-                )
-            })?;
-
-        // Spawn the connection driver
+        // Unlike TLS-backed H2, h2c has no ALPN proof. Give the spawned driver
+        // one short observation window to surface an immediate protocol error
+        // (for example an HTTP/1.1 response to the prior-knowledge preface)
+        // before this DNS candidate is accepted.
+        let (driver_closed_tx, mut driver_closed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            if let Err(e) = conn.await {
+            let result = conn.await.map_err(|error| error.to_string());
+            if let Err(ref e) = result {
                 debug!("gRPC h2c connection closed: {}", e);
             }
+            let _ = driver_closed_tx.send(result);
         });
+        if let Ok(result) =
+            tokio::time::timeout(Duration::from_millis(25), &mut driver_closed_rx).await
+        {
+            let message = match result {
+                Ok(Err(message)) => format!("h2c handshake failed: {message}"),
+                Ok(Ok(())) => "h2c connection closed during handshake".to_string(),
+                Err(_) => "h2c connection driver ended during handshake".to_string(),
+            };
+            return Err(GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2cHandshake,
+                message.clone(),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            ));
+        }
 
         Ok(sender)
     }
@@ -963,65 +1007,37 @@ impl GrpcPoolManager {
     async fn create_tls_connection(
         &self,
         tcp: TcpStream,
-        host: &str,
-        proxy: &Proxy,
-        svid_generation: Option<u64>,
-        connect_started: Instant,
-        connect_timeout: Duration,
+        connector: tokio_rustls::TlsConnector,
+        server_name: rustls::pki_types::ServerName<'static>,
+        pool_config: &PoolConfig,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
-        use tokio_rustls::TlsConnector;
-
-        let tls_config = self.get_tls_config(proxy, svid_generation)?;
-        let connector = TlsConnector::from(tls_config);
-        let server_name =
-            crate::tls::backend::backend_tls_server_name_owned(&proxy.resolved_tls, host).map_err(
-                |e| {
-                    GrpcProxyError::backend_unavailable(
-                        GrpcBackendUnavailableKind::InvalidServerName,
-                        format!("Invalid server name: {}", e),
-                    )
-                },
-            )?;
-
-        let Some(remaining) =
-            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-        else {
-            return Err(Self::backend_connect_timeout_error(proxy, "TLS handshake"));
-        };
-
-        let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
-            .await
-            .map_err(|_| Self::backend_connect_timeout_error(proxy, "TLS handshake"))?
-            .map_err(|e| {
-                GrpcProxyError::backend_unavailable_with_source(
-                    GrpcBackendUnavailableKind::TlsHandshake,
-                    format!("TLS handshake failed: {}", e),
-                    e,
-                )
-            })?;
+        let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::TlsHandshake,
+                format!("TLS handshake failed: {}", e),
+                e,
+            )
+        })?;
+        if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
+            let message = "TLS peer did not negotiate ALPN h2".to_string();
+            return Err(GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::TlsHandshake,
+                message.clone(),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
+            ));
+        }
 
         let io = TokioIo::new(tls_stream);
-        let pool_config = self.global_pool_config.for_proxy(proxy);
-        let builder = Self::build_h2_builder(&pool_config);
+        let builder = Self::build_h2_builder(pool_config);
+        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
+            GrpcProxyError::backend_unavailable_with_source(
+                GrpcBackendUnavailableKind::H2Handshake,
+                format!("h2 handshake failed: {}", e),
+                e,
+            )
+        })?;
 
-        let Some(remaining) =
-            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-        else {
-            return Err(Self::backend_connect_timeout_error(proxy, "h2 handshake"));
-        };
-
-        let (sender, conn) = tokio::time::timeout(remaining, builder.handshake(io))
-            .await
-            .map_err(|_| Self::backend_connect_timeout_error(proxy, "h2 handshake"))?
-            .map_err(|e| {
-                GrpcProxyError::backend_unavailable_with_source(
-                    GrpcBackendUnavailableKind::H2Handshake,
-                    format!("h2 handshake failed: {}", e),
-                    e,
-                )
-            })?;
-
-        // Spawn the connection driver
+        // TLS negotiation already proved H2 via ALPN.
         tokio::spawn(async move {
             if let Err(e) = conn.await {
                 debug!("gRPC h2 TLS connection closed: {}", e);
@@ -1197,12 +1213,24 @@ pub enum GrpcBackendUnavailableKind {
     /// `request_reached_wire` returns true and the connect-failure retry
     /// path does not replay non-idempotent POSTs across the same stream.
     BackendRequest,
+    /// A pooled H2 `send_request` failed with hyper `is_canceled() == true`
+    /// while the outbound body was still fully buffered and replayable.
+    /// hyper's contract for that flag is that the request was **never
+    /// dispatched onto the wire** (typical race: backend GOAWAY /
+    /// `MaxConnectionAge` while the pool still handed out a sender that
+    /// passed a single `ready()` probe). Pre-wire under the unified
+    /// [`crate::retry::request_reached_wire`] boundary — maps to
+    /// [`crate::retry::ErrorClass::ConnectionPoolError`] so
+    /// `retry_on_connect_failure` can redial. Streaming / channel bodies
+    /// keep [`Self::BackendRequest`] even on `is_canceled` because the
+    /// upload may already be unreplayable.
+    DispatchCanceled,
 }
 
 impl GrpcBackendUnavailableKind {
     /// Returns `true` for kinds that represent a pre-wire failure (DNS,
-    /// connect, handshake) — safe to replay regardless of HTTP method
-    /// idempotency.
+    /// connect, handshake, never-dispatched pooled send) — safe to replay
+    /// regardless of HTTP method idempotency.
     ///
     /// Returns `false` for [`Self::BackendRequest`], which is emitted
     /// post-handshake from `send_request().await` and may have committed the
@@ -1216,7 +1244,8 @@ impl GrpcBackendUnavailableKind {
             | Self::TlsHandshake
             | Self::H2Handshake
             | Self::H2cHandshake
-            | Self::InvalidServerName => true,
+            | Self::InvalidServerName
+            | Self::DispatchCanceled => true,
             Self::BackendRequest => false,
         }
     }
@@ -2701,6 +2730,12 @@ async fn proxy_grpc_streaming_dispatch(
         }
     };
 
+    // Remaining-budget rewrite AFTER acquisition, for the same reason as the
+    // buffered path: a cold dial must not be re-added to the client's budget.
+    if let Some(deadline) = grpc_deadline_at {
+        apply_remaining_grpc_timeout_header(&mut headers, deadline);
+    }
+
     let mut backend_req = Request::new(grpc_body);
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
@@ -2721,6 +2756,12 @@ async fn proxy_grpc_streaming_dispatch(
                         "gRPC request payload size exceeds maximum of {} bytes",
                         max_grpc_recv_size_bytes
                     ));
+                }
+                // Streaming / channel uploads are unreplayable — keep post-wire
+                // classification even when hyper reports `is_canceled`, but still
+                // drop the stale pooled sender so the next RPC dials fresh.
+                if e.is_canceled() {
+                    grpc_pool.invalidate_shards_for_proxy(proxy);
                 }
                 error!("gRPC backend request failed (streaming body): {}", e);
                 GrpcProxyError::backend_unavailable_with_source(
@@ -2750,6 +2791,9 @@ async fn proxy_grpc_streaming_dispatch(
                         max_grpc_recv_size_bytes
                     ));
                 }
+                if e.is_canceled() {
+                    grpc_pool.invalidate_shards_for_proxy(proxy);
+                }
                 error!("gRPC backend request failed (streaming body): {}", e);
                 GrpcProxyError::backend_unavailable_with_source(
                     GrpcBackendUnavailableKind::BackendRequest,
@@ -2764,6 +2808,9 @@ async fn proxy_grpc_streaming_dispatch(
                     "gRPC request payload size exceeds maximum of {} bytes",
                     max_grpc_recv_size_bytes
                 ));
+            }
+            if e.is_canceled() {
+                grpc_pool.invalidate_shards_for_proxy(proxy);
             }
             error!("gRPC backend request failed (streaming body): {}", e);
             GrpcProxyError::backend_unavailable_with_source(
@@ -2934,16 +2981,24 @@ pub(crate) async fn proxy_grpc_request_core(
         headers.insert(hyper::header::HOST, val);
     }
 
-    // Parse gRPC deadline AFTER proxy_headers merge so that before_proxy plugins
-    // that add/replace/remove grpc-timeout are reflected in the effective timeout.
-    // Two distinct timeout regimes:
+    // Carry forward the receipt-anchored absolute deadline from
+    // `prepare_request_deadline` (parsed before before_proxy plugins and
+    // body awaits). Post-merge header mutations do not re-arm this budget;
+    // before_proxy plugins cannot extend or re-anchor RPC time limits via
+    // grpc-timeout. Two distinct timeout regimes:
     //  * client_grpc_deadline_at — a client-supplied absolute end-to-end
-    //    deadline. Pool acquisition consumes it together with the pool's own
+    //    deadline established once at request receipt (via
+    //    `prepare_request_deadline`, independent of the `grpc_deadline`
+    //    plugin). Pool acquisition consumes it together with the pool's own
     //    connect timeout. After acquisition, backend_read_timeout_ms may impose
     //    an earlier response ceiling, but it never acts as a connect timeout.
     //    The resulting response deadline bounds the header wait + body
     //    collection as ONE shared budget — otherwise a slow backend gets up to
     //    ~2x the client's stated deadline (the F11 bug this PR fixes).
+    //    Retries and backoff consume the SAME Instant; the relative
+    //    `grpc-timeout` header is rewritten to the remaining budget before
+    //    each attempt and is never re-anchored from the original relative
+    //    value at dispatch time.
     //  * per_phase_read_ms — the operator backend_read_timeout_ms safety net
     //    used when the client set no deadline. This is a PER-READ stall guard,
     //    not an RPC budget, so each phase (header wait, body collection) gets a
@@ -2951,11 +3006,7 @@ pub(crate) async fn proxy_grpc_request_core(
     //    newly time out a large buffered response from a slow-but-progressing
     //    backend that previously succeeded, so the two phases stay independent —
     //    matching the long-standing operator semantics and the streaming path.
-    let client_grpc_deadline_at = grpc_deadline_at.or_else(|| {
-        parse_grpc_timeout_ms(&headers).and_then(|grpc_ms| {
-            tokio::time::Instant::now().checked_add(Duration::from_millis(grpc_ms))
-        })
-    });
+    let client_grpc_deadline_at = grpc_deadline_at;
     let per_phase_read_ms =
         if client_grpc_deadline_at.is_none() && proxy.backend_read_timeout_ms > 0 {
             Some(proxy.backend_read_timeout_ms)
@@ -2995,6 +3046,16 @@ pub(crate) async fn proxy_grpc_request_core(
         grpc_pool.get_sender(proxy).await?
     };
 
+    // Rewrite the outbound `grpc-timeout` to the remaining budget AFTER pool
+    // acquisition. Computing it before the dial would forward a value that
+    // over-states the budget by however long the connect/handshake took (up to
+    // `backend_connect_timeout_ms` on a cold pool, or the whole retry backoff
+    // on a redial), which is the same re-arming class of error #2933 fixes,
+    // just at a smaller scale. Every attempt still gets exactly one rewrite.
+    if let Some(deadline) = client_grpc_deadline_at {
+        apply_remaining_grpc_timeout_header(backend_req.headers_mut(), deadline);
+    }
+
     // A client deadline remains one absolute end-to-end ceiling. Layer the
     // operator read timeout over response processing only, after connection
     // acquisition, and keep the earlier source typed for accounting.
@@ -3017,6 +3078,12 @@ pub(crate) async fn proxy_grpc_request_core(
     });
     let send_fut = sender.send_request(backend_req);
     let map_send_err = |e: hyper::Error| {
+        // Buffered unary/client bodies are fully held — hyper `is_canceled`
+        // proves the request never hit the wire, so classify pre-wire and
+        // drop the stale pooled sender for the next attempt / RPC.
+        if e.is_canceled() {
+            grpc_pool.invalidate_shards_for_proxy(proxy);
+        }
         error!("gRPC: backend request failed: {}", e);
         if e.is_timeout() {
             GrpcProxyError::BackendTimeout {
@@ -3024,8 +3091,13 @@ pub(crate) async fn proxy_grpc_request_core(
                 message: format!("Backend timeout: {}", e),
             }
         } else {
+            let kind = if e.is_canceled() {
+                GrpcBackendUnavailableKind::DispatchCanceled
+            } else {
+                GrpcBackendUnavailableKind::BackendRequest
+            };
             GrpcProxyError::backend_unavailable_with_source(
-                GrpcBackendUnavailableKind::BackendRequest,
+                kind,
                 format!("Backend error: {}", e),
                 e,
             )
@@ -3343,6 +3415,45 @@ pub fn is_grpc_content_type(headers: &hyper::HeaderMap) -> bool {
 /// Per the gRPC spec, the timeout is a positive integer followed by a unit suffix.
 pub fn parse_grpc_timeout_ms(headers: &hyper::HeaderMap) -> Option<u64> {
     parse_grpc_timeout_value(headers.get("grpc-timeout")?.to_str().ok()?)
+}
+
+/// Rewrite the outbound `grpc-timeout` header to the remaining budget of a
+/// receipt-anchored absolute deadline.
+///
+/// Call once per backend attempt (including the first), as late as possible —
+/// after the sender has been acquired — so the dial/handshake time is not
+/// silently handed back to the backend. Retries must forward
+/// the decremented remaining timeout rather than re-arming the client's
+/// original relative value. Formatting (millisecond precision when it fits the
+/// gRPC 8-digit wire limit, otherwise coarsened to seconds/minutes/hours) is
+/// shared with the `grpc_deadline` plugin so the two cannot drift.
+///
+/// An already-expired deadline forwards the minimum legal value `1m` rather
+/// than the invalid `0m`; the gateway's own `timeout_at` guards still terminate
+/// the RPC, so this only avoids handing the backend a malformed header.
+pub(crate) fn apply_remaining_grpc_timeout_header(
+    headers: &mut hyper::HeaderMap,
+    deadline: tokio::time::Instant,
+) {
+    let value = remaining_grpc_timeout_header_value(deadline);
+    headers.insert("grpc-timeout", value);
+}
+
+/// Build the wire value for the remaining portion of a receipt-anchored gRPC
+/// deadline. Shared by native gRPC (`HeaderMap`) and pass-through gRPC-Web
+/// (`reqwest::RequestBuilder`) so neither transport can re-arm the original
+/// relative header on a later attempt.
+pub(crate) fn remaining_grpc_timeout_header_value(
+    deadline: tokio::time::Instant,
+) -> hyper::header::HeaderValue {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let ms = crate::plugins::grpc_deadline::duration_millis_ceil_saturating(remaining).unwrap_or(1);
+    let timeout_val = crate::plugins::grpc_deadline::format_grpc_timeout_ms(ms.max(1));
+    // The shared formatter only emits ASCII digits plus one unit letter, all
+    // accepted by HeaderValue. Avoid unwrap/expect on the request path anyway;
+    // the minimum legal gRPC timeout is a safe fail-closed fallback.
+    hyper::header::HeaderValue::from_str(&timeout_val)
+        .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("1m"))
 }
 
 /// Parse a raw `grpc-timeout` header value (e.g. `"100m"`, `"1S"`) into
@@ -4027,13 +4138,23 @@ mod tests {
             .expect("failed to locate end of proxy_grpc_request_core body");
         let body = &tail[..fn_end];
 
-        // The caller-supplied typed deadline wins; parsing and anchoring the
-        // relative header is compatibility-only. Pool acquisition consumes
-        // only that client deadline (plus the pool's own connect timeout), and
-        // the backend read deadline is constructed afterwards.
+        // The caller-supplied typed deadline is the sole absolute budget.
+        // Reconstructing from the relative header at dispatch would re-arm
+        // a fresh full budget on every retry attempt.
         assert!(
-            body.contains("let client_grpc_deadline_at = grpc_deadline_at.or_else(||"),
-            "the request-scoped typed deadline must be the primary source"
+            body.contains("let client_grpc_deadline_at = grpc_deadline_at;"),
+            "the request-scoped typed deadline must be the sole absolute source"
+        );
+        assert!(
+            body.contains(
+                "apply_remaining_grpc_timeout_header(backend_req.headers_mut(), deadline)"
+            ),
+            "each attempt must forward a decremented remaining grpc-timeout, \
+             measured after pool acquisition"
+        );
+        assert!(
+            !body.contains("grpc_deadline_at.or_else(||"),
+            "must not re-parse and re-anchor grpc-timeout at dispatch time"
         );
         assert!(
             body.contains("timeout_at(client_deadline, grpc_pool.get_sender(proxy))"),
@@ -4062,12 +4183,10 @@ mod tests {
              {timeout_at} timeout_at calls."
         );
 
-        // The deadline Instant add must be overflow-guarded (checked_add) so a
-        // pathological client `grpc-timeout` cannot panic the request path.
+        // Operator backend_read_timeout Instant add must stay overflow-guarded.
         assert!(
-            body.contains("checked_add(Duration::from_millis("),
-            "the client deadline must use checked_add to avoid an Instant \
-             overflow panic on a pathological grpc-timeout."
+            body.contains("checked_add(Duration::from_millis(proxy.backend_read_timeout_ms)"),
+            "backend_read_timeout_ms must use checked_add to avoid an Instant overflow panic"
         );
 
         // The operator `backend_read_timeout_ms` fallback must stay PER-PHASE:

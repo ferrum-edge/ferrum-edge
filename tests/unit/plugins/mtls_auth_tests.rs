@@ -1,4 +1,5 @@
 use base64::Engine;
+use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::plugins::mtls_auth::{MtlsAuth, MtlsAuthConnectionCache};
@@ -1469,7 +1470,7 @@ fn test_consumer_index_mtls_delta() {
     );
 
     // Remove a consumer via delta
-    index.apply_delta(&[], &["c1".to_string()], &[]);
+    index.apply_delta(&[], &[NamespacedResourceId::new("ferrum", "c1")], &[]);
     assert!(
         index
             .find_by_mtls_identity("client-a.example.com")

@@ -2521,6 +2521,21 @@ pub struct GatewayConfig {
     pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
+    /// Authoritative mesh config revision for this snapshot (issue #2473).
+    ///
+    /// DERIVED, CP-in-memory only: `#[serde(skip)]`, so it never rides the
+    /// ConfigSync `config_json` wire (which is `deny_unknown_fields` on both
+    /// peers) and cannot break a mixed-patch CP/DP rollout. The mesh CP stamps
+    /// it from the durable `config_changes` sequence on every accepted full
+    /// load and delta, and `MeshSlice::from_gateway_config` copies it onto the
+    /// slice, which IS the wire contract the mesh data plane orders by.
+    ///
+    /// `None` means "this snapshot came from an authority with no shared
+    /// monotonic sequence" (K8s CRD controller, file source, tests); slices
+    /// built from it carry no revision and the DP gate stays inert unless it
+    /// has already accepted a revisioned slice.
+    #[serde(skip)]
+    pub mesh_revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -3249,6 +3264,8 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
     // Effective plugins for this proxy: associations + globals in the proxy's
     // namespace (unless a local instance shadows that plugin name — mirror
     // PluginCache tenancy and merge rules for the buffering screen only).
+    // Associations resolve by `(namespace, id)` so reused plugin ids in other
+    // tenants cannot false-reject this proxy.
     //
     // The screener owns an HTTP client, so build it lazily: proxies without an
     // effective plugin config never pay for one, and non-SNI proxies already
@@ -3359,44 +3376,21 @@ impl GatewayConfig {
         // `_`, so `__mesh-*` ids exist only via mesh materialization. Different
         // services' routes still conflict normally. Empty (and zero-cost)
         // outside mesh mode.
-        let mesh_sibling_owner: HashMap<String, (u8, usize)> = self
-            .mesh
-            .as_deref()
-            .map(|mesh| {
-                crate::modes::mesh::mesh_outbound_service_groups(mesh)
-                    .into_iter()
-                    .enumerate()
-                    .flat_map(|(service_index, group)| {
-                        group
-                            .siblings
-                            .into_iter()
-                            .map(move |(_, id)| (id, (0u8, service_index)))
-                    })
-                    .chain(
-                        crate::modes::mesh::mesh_inbound_service_groups(mesh)
-                            .into_iter()
-                            .enumerate()
-                            .flat_map(|(service_index, group)| {
-                                group
-                                    .siblings
-                                    .into_iter()
-                                    .map(move |(_, id)| (id, (1u8, service_index)))
-                            }),
-                    )
-                    .chain(
-                        crate::modes::mesh::mesh_ingress_listener_groups(mesh)
-                            .into_iter()
-                            .enumerate()
-                            .flat_map(|(service_index, group)| {
-                                group
-                                    .siblings
-                                    .into_iter()
-                                    .map(move |(_, id)| (id, (2u8, service_index)))
-                            }),
-                    )
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut mesh_sibling_owner: HashMap<String, HashMap<String, (u8, usize)>> = HashMap::new();
+        if let Some(mesh) = self.mesh.as_deref() {
+            let mut add_groups =
+                |direction, groups: Vec<crate::modes::mesh::MeshOutboundServiceGroup>| {
+                    for (service_index, group) in groups.into_iter().enumerate() {
+                        let by_id = mesh_sibling_owner.entry(group.namespace).or_default();
+                        for (_, id) in group.siblings {
+                            by_id.insert(id, (direction, service_index));
+                        }
+                    }
+                };
+            add_groups(0, crate::modes::mesh::mesh_outbound_service_groups(mesh));
+            add_groups(1, crate::modes::mesh::mesh_inbound_service_groups(mesh));
+            add_groups(2, crate::modes::mesh::mesh_ingress_listener_groups(mesh));
+        }
 
         for ((_, path), group) in &by_path {
             if group.len() < 2 {
@@ -3405,8 +3399,12 @@ impl GatewayConfig {
             for (i, proxy_a) in group.iter().enumerate() {
                 for proxy_b in group.iter().skip(i + 1) {
                     if let (Some(owner_a), Some(owner_b)) = (
-                        mesh_sibling_owner.get(proxy_a.id.as_str()),
-                        mesh_sibling_owner.get(proxy_b.id.as_str()),
+                        mesh_sibling_owner
+                            .get(proxy_a.namespace.as_str())
+                            .and_then(|by_id| by_id.get(proxy_a.id.as_str())),
+                        mesh_sibling_owner
+                            .get(proxy_b.namespace.as_str())
+                            .and_then(|by_id| by_id.get(proxy_b.id.as_str())),
                     ) && owner_a == owner_b
                     {
                         continue;
@@ -3463,10 +3461,13 @@ impl GatewayConfig {
     /// would install for each proxy. Any local proxy/proxy-group instance
     /// shadows all global instances of the same plugin type on that proxy.
     fn effective_mtls_auth_plugins_by_proxy(&self) -> Vec<(&Proxy, Vec<&PluginConfig>)> {
-        let plugin_by_id: HashMap<&str, &PluginConfig> = self
+        // Association plugin_config_id values are namespace-local to the
+        // proxy. A bare-id index would bind a proxy to another tenant's
+        // same-id mtls_auth config.
+        let plugin_by_key: HashMap<(&str, &str), &PluginConfig> = self
             .plugin_configs
             .iter()
-            .map(|plugin| (plugin.id.as_str(), plugin))
+            .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
             .collect();
         let global_mtls: Vec<&PluginConfig> = self
             .plugin_configs
@@ -3485,12 +3486,18 @@ impl GatewayConfig {
                     .plugins
                     .iter()
                     .filter_map(|association| {
-                        let plugin = *plugin_by_id.get(association.plugin_config_id.as_str())?;
+                        let plugin = *plugin_by_key.get(&(
+                            proxy.namespace.as_str(),
+                            association.plugin_config_id.as_str(),
+                        ))?;
                         let scope_applies = match plugin.scope {
                             PluginScope::Proxy => {
-                                plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+                                plugin.namespace == proxy.namespace
+                                    && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
                             }
-                            PluginScope::ProxyGroup => plugin.proxy_id.is_none(),
+                            PluginScope::ProxyGroup => {
+                                plugin.namespace == proxy.namespace && plugin.proxy_id.is_none()
+                            }
                             PluginScope::Global => false,
                         };
                         (plugin.enabled && plugin.plugin_name == "mtls_auth" && scope_applies)
@@ -3498,6 +3505,10 @@ impl GatewayConfig {
                     })
                     .collect();
                 let effective = if local_mtls.is_empty() {
+                    // Globals are gateway-wide at runtime (`PluginCache` merges
+                    // the single global list into every proxy in every
+                    // namespace), so this must NOT be namespace-filtered —
+                    // only the association lookup above is namespace-local.
                     global_mtls.clone()
                 } else {
                     local_mtls
@@ -3528,17 +3539,6 @@ impl GatewayConfig {
                 if !proxy.frontend_tls || proxy.passthrough {
                     errors.push(format!(
                         "Proxy '{}' cannot use mtls_auth PluginConfig '{}': stream mTLS authentication requires frontend_tls=true with TLS/DTLS termination (passthrough=false)",
-                        proxy.id, plugin.id
-                    ));
-                }
-                if scheme.is_udp()
-                    && plugin
-                        .config
-                        .get("allowed_ca_fingerprints_sha256")
-                        .is_some()
-                {
-                    errors.push(format!(
-                        "Proxy '{}' cannot use allowed_ca_fingerprints_sha256 from mtls_auth PluginConfig '{}': UDP/DTLS does not expose the verified certificate chain; use allowed_issuers with a pinned ca_certificate_pem",
                         proxy.id, plugin.id
                     ));
                 }
@@ -3714,41 +3714,51 @@ impl GatewayConfig {
     /// the upstream-level TLS — same behaviour as a proxy with no
     /// `upstream_subset` at all.
     pub fn resolve_upstream_tls(&mut self) {
-        // Build a map of upstream_id → TLS config for O(1) lookups.
-        let upstream_tls: HashMap<&str, BackendTlsConfig> = self
+        // Build a map of (namespace, upstream_id) → TLS config for O(1)
+        // lookups. Bare-id maps would last-win across tenants that share an
+        // upstream id and project the wrong TLS onto every referencing proxy.
+        let upstream_tls: HashMap<(&str, &str), BackendTlsConfig> = self
             .upstreams
             .iter()
-            .map(|u| (u.id.as_str(), BackendTlsConfig::from_upstream(u)))
+            .map(|u| {
+                (
+                    (u.namespace.as_str(), u.id.as_str()),
+                    BackendTlsConfig::from_upstream(u),
+                )
+            })
             .collect();
 
-        // Parallel map of (upstream_id, subset_name) → subset-resolved TLS,
-        // populated only for subsets that produced a non-empty TLS overlay at
-        // mesh apply time. Empty in the non-mesh / no-per-subset-TLS common
-        // case, so the per-proxy projection below pays at most one HashMap
-        // miss when `upstream_subset` is set.
-        let subset_tls: HashMap<(&str, &str), &BackendTlsConfig> = self
+        // Parallel map of (namespace, upstream_id, subset_name) → subset-
+        // resolved TLS, populated only for subsets that produced a non-empty
+        // TLS overlay at mesh apply time. Empty in the non-mesh /
+        // no-per-subset-TLS common case, so the per-proxy projection below
+        // pays at most one HashMap miss when `upstream_subset` is set.
+        let subset_tls: HashMap<(&str, &str, &str), &BackendTlsConfig> = self
             .upstreams
             .iter()
             .flat_map(|u| {
                 u.resolved_subset_tls
                     .iter()
                     .filter_map(move |(subset_name, resolved)| {
-                        resolved
-                            .tls
-                            .as_ref()
-                            .map(|tls| ((u.id.as_str(), subset_name.as_str()), tls))
+                        resolved.tls.as_ref().map(|tls| {
+                            (
+                                (u.namespace.as_str(), u.id.as_str(), subset_name.as_str()),
+                                tls,
+                            )
+                        })
                     })
             })
             .collect();
 
         for proxy in &mut self.proxies {
             proxy.resolved_tls = if let Some(ref uid) = proxy.upstream_id {
+                let ns = proxy.namespace.as_str();
                 let subset_override = proxy
                     .upstream_subset
                     .as_deref()
-                    .and_then(|name| subset_tls.get(&(uid.as_str(), name)).copied().cloned());
+                    .and_then(|name| subset_tls.get(&(ns, uid.as_str(), name)).copied().cloned());
                 subset_override
-                    .or_else(|| upstream_tls.get(uid.as_str()).cloned())
+                    .or_else(|| upstream_tls.get(&(ns, uid.as_str())).cloned())
                     .unwrap_or_else(BackendTlsConfig::default_verify)
             } else {
                 BackendTlsConfig::from_proxy(proxy)
@@ -3767,7 +3777,7 @@ impl GatewayConfig {
     /// Same pattern as `resolve_upstream_tls` — derived projection cached on
     /// the proxy so the request path never re-derives it.
     pub fn resolve_dispatch_port_overrides(&mut self) {
-        let by_upstream: HashMap<&str, HashMap<u16, ResolvedPortOverride>> = self
+        let by_upstream: HashMap<(&str, &str), HashMap<u16, ResolvedPortOverride>> = self
             .upstreams
             .iter()
             .filter(|u| !u.port_overrides.is_empty())
@@ -3780,29 +3790,33 @@ impl GatewayConfig {
                             .map(|resolved| (*port, resolved))
                     })
                     .collect();
-                (u.id.as_str(), ports)
+                ((u.namespace.as_str(), u.id.as_str()), ports)
             })
             .filter(|(_, m)| !m.is_empty())
             .collect();
 
         // Service-discovery top-level `connectionPool.http` fallback, applied by
         // the LB-selected port at dispatch when that port has no explicit
-        // per-port override. Keyed by upstream id, separate from the per-port
-        // map above so an explicit `portLevelSettings` entry still wins.
-        let fallback_by_upstream: HashMap<&str, ResolvedPortOverride> = self
+        // per-port override. Keyed by (namespace, upstream id), separate from
+        // the per-port map above so an explicit `portLevelSettings` entry
+        // still wins.
+        let fallback_by_upstream: HashMap<(&str, &str), ResolvedPortOverride> = self
             .upstreams
             .iter()
             .filter_map(|u| {
                 dispatch_port_override_fallback_from_upstream(u)
-                    .map(|resolved| (u.id.as_str(), resolved))
+                    .map(|resolved| ((u.namespace.as_str(), u.id.as_str()), resolved))
             })
             .collect();
 
         for proxy in &mut self.proxies {
-            let uid = proxy.upstream_id.as_deref();
-            proxy.dispatch_port_overrides = uid.and_then(|uid| by_upstream.get(uid)).cloned();
+            let key = proxy
+                .upstream_id
+                .as_deref()
+                .map(|uid| (proxy.namespace.as_str(), uid));
+            proxy.dispatch_port_overrides = key.and_then(|key| by_upstream.get(&key)).cloned();
             proxy.dispatch_port_override_fallback =
-                uid.and_then(|uid| fallback_by_upstream.get(uid)).cloned();
+                key.and_then(|key| fallback_by_upstream.get(&key)).cloned();
         }
     }
 
@@ -4290,13 +4304,20 @@ impl GatewayConfig {
     /// request-body-buffering plugins, `pool_enable_http2: false`), including
     /// DestinationRule per-port TLS overlays (issue #2954).
     pub fn validate_upstream_references(&self) -> Result<(), Vec<String>> {
-        let upstreams_by_id: HashMap<&str, &Upstream> =
-            self.upstreams.iter().map(|u| (u.id.as_str(), u)).collect();
+        // Upstream references are namespace-local. A bare-id index would accept
+        // a dangling same-namespace reference whenever another tenant owns
+        // that id, and would run mesh-transport / subset checks against the
+        // wrong upstream.
+        let upstreams_by_key: HashMap<(&str, &str), &Upstream> = self
+            .upstreams
+            .iter()
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
+            .collect();
         let mut errors = Vec::new();
 
         for proxy in &self.proxies {
             if let Some(ref uid) = proxy.upstream_id {
-                match upstreams_by_id.get(uid.as_str()) {
+                match upstreams_by_key.get(&(proxy.namespace.as_str(), uid.as_str())) {
                     Some(upstream) => {
                         if let Some(subset_name) = proxy.upstream_subset.as_deref() {
                             let subset_exists = upstream.subsets.as_ref().is_some_and(|subsets| {
@@ -4340,7 +4361,8 @@ impl GatewayConfig {
             // EFFECTIVE retry (the rule can add/replace/disable retry, which the
             // runtime applies via `route_override_retry` before dispatch).
             for override_dest in self.mesh_route_dispatch_override_destinations(proxy) {
-                if let Some(upstream) = upstreams_by_id.get(override_dest.upstream_id.as_str())
+                if let Some(upstream) = upstreams_by_key
+                    .get(&(proxy.namespace.as_str(), override_dest.upstream_id.as_str()))
                     && let Some(required) = first_effective_mesh_transport_conflict_with_mesh(
                         // The runtime recomputes `dispatch_port_overrides` from the
                         // OVERRIDE destination upstream when a rule swaps the
@@ -4367,10 +4389,11 @@ impl GatewayConfig {
             // combinations that cannot dispatch (retry / body-buffering /
             // pool_enable_http2=false), including DestinationRule per-port
             // TLS overlays projected onto this proxy.
-            let upstream = proxy
-                .upstream_id
-                .as_deref()
-                .and_then(|uid| upstreams_by_id.get(uid).copied());
+            let upstream = proxy.upstream_id.as_deref().and_then(|uid| {
+                upstreams_by_key
+                    .get(&(proxy.namespace.as_str(), uid))
+                    .copied()
+            });
             errors.extend(backend_tls_sni_direct_h2_conflict_messages(
                 proxy,
                 upstream,
@@ -4506,7 +4529,7 @@ impl GatewayConfig {
             if let Some(plugin) = self
                 .plugin_configs
                 .iter()
-                .find(|pc| pc.id == assoc.plugin_config_id)
+                .find(|pc| pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id)
             {
                 if plugin.enabled && plugin.plugin_name == "mesh_route_dispatch" {
                     shadows_global_dispatch = true;
@@ -4516,6 +4539,11 @@ impl GatewayConfig {
         }
         if !shadows_global_dispatch {
             for plugin in &self.plugin_configs {
+                // Deliberately NOT namespace-filtered: the association lookup
+                // above is namespace-local, but globals run on every proxy in
+                // every namespace at runtime. Skipping other tenants' globals
+                // here would hide their override destinations from
+                // `validate_upstream_references`' mesh-transport screen.
                 if plugin.scope == PluginScope::Global {
                     collect(plugin);
                 }
@@ -4526,11 +4554,19 @@ impl GatewayConfig {
 
     /// Validate plugin resource invariants and proxy/plugin associations.
     pub fn validate_plugin_references(&self) -> Result<(), Vec<String>> {
-        let proxy_ids: HashSet<&str> = self.proxies.iter().map(|p| p.id.as_str()).collect();
-        let plugin_by_id: HashMap<&str, &PluginConfig> = self
+        // Proxy and plugin identities are namespace-local. Bare-id indexes
+        // would accept a dangling same-namespace proxy_id whenever another
+        // tenant owns that id, and would resolve associations onto the wrong
+        // tenant's PluginConfig.
+        let proxy_keys: HashSet<(&str, &str)> = self
+            .proxies
+            .iter()
+            .map(|p| (p.namespace.as_str(), p.id.as_str()))
+            .collect();
+        let plugin_by_key: HashMap<(&str, &str), &PluginConfig> = self
             .plugin_configs
             .iter()
-            .map(|pc| (pc.id.as_str(), pc))
+            .map(|pc| ((pc.namespace.as_str(), pc.id.as_str()), pc))
             .collect();
         let mut errors = Vec::new();
 
@@ -4584,7 +4620,7 @@ impl GatewayConfig {
                 }
                 PluginScope::Proxy => match plugin.proxy_id.as_deref() {
                     Some(proxy_id) => {
-                        if !proxy_ids.contains(proxy_id) {
+                        if !proxy_keys.contains(&(plugin.namespace.as_str(), proxy_id)) {
                             errors.push(format!(
                                 "PluginConfig '{}' references non-existent proxy_id '{}'",
                                 plugin.id, proxy_id
@@ -4617,7 +4653,9 @@ impl GatewayConfig {
                     ));
                 }
 
-                match plugin_by_id.get(assoc.plugin_config_id.as_str()) {
+                match plugin_by_key
+                    .get(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+                {
                     Some(plugin) => match plugin.scope {
                         PluginScope::Global => {
                             errors.push(format!(
@@ -4657,10 +4695,12 @@ impl GatewayConfig {
         }
     }
 
-    /// Validate that all resource IDs are well-formed.
+    /// Validate that all resource IDs and namespaces are well-formed.
     ///
-    /// Checks every proxy, consumer, plugin_config, and upstream ID against
-    /// the `validate_resource_id` format rules.
+    /// Composite runtime keys use a delimiter that is excluded by the shared
+    /// ID/namespace grammar. Validate both halves at the config boundary so a
+    /// corrupt database row or untrusted file cannot make two tenant
+    /// identities collide after encoding.
     pub fn validate_resource_ids(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
@@ -4668,20 +4708,32 @@ impl GatewayConfig {
             if let Err(msg) = validate_resource_id(&proxy.id) {
                 errors.push(format!("Proxy ID: {}", msg));
             }
+            if let Err(msg) = validate_namespace(&proxy.namespace) {
+                errors.push(format!("Proxy '{}': {}", proxy.id, msg));
+            }
         }
         for consumer in &self.consumers {
             if let Err(msg) = validate_resource_id(&consumer.id) {
                 errors.push(format!("Consumer ID: {}", msg));
+            }
+            if let Err(msg) = validate_namespace(&consumer.namespace) {
+                errors.push(format!("Consumer '{}': {}", consumer.id, msg));
             }
         }
         for pc in &self.plugin_configs {
             if let Err(msg) = validate_resource_id(&pc.id) {
                 errors.push(format!("PluginConfig ID: {}", msg));
             }
+            if let Err(msg) = validate_namespace(&pc.namespace) {
+                errors.push(format!("PluginConfig '{}': {}", pc.id, msg));
+            }
         }
         for upstream in &self.upstreams {
             if let Err(msg) = validate_resource_id(&upstream.id) {
                 errors.push(format!("Upstream ID: {}", msg));
+            }
+            if let Err(msg) = validate_namespace(&upstream.namespace) {
+                errors.push(format!("Upstream '{}': {}", upstream.id, msg));
             }
         }
 
@@ -4694,16 +4746,21 @@ impl GatewayConfig {
 
     /// Validate that all resource IDs are unique within their type.
     ///
-    /// In database mode the DB PRIMARY KEY constraint enforces this.
-    /// In file mode there's no DB, so this catches duplicate IDs at
-    /// config load time.
+    /// In database mode the DB PRIMARY KEY / UNIQUE `(namespace, id)`
+    /// constraint enforces this. In file mode there's no DB, so this catches
+    /// duplicate IDs at config load time. Proxies, consumers, plugin configs,
+    /// and upstreams are all unique within a namespace — the same id may exist
+    /// in two tenants.
     pub fn validate_unique_resource_ids(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        let mut seen_proxy_ids: HashSet<&str> = HashSet::new();
+        let mut seen_proxy_ids: HashSet<(&str, &str)> = HashSet::new();
         for proxy in &self.proxies {
-            if !seen_proxy_ids.insert(&proxy.id) {
-                errors.push(format!("Duplicate proxy ID '{}'", proxy.id));
+            if !seen_proxy_ids.insert((&proxy.namespace, &proxy.id)) {
+                errors.push(format!(
+                    "Duplicate proxy ID '{}' in namespace '{}'",
+                    proxy.id, proxy.namespace
+                ));
             }
         }
 
@@ -4717,17 +4774,23 @@ impl GatewayConfig {
             }
         }
 
-        let mut seen_plugin_ids: HashSet<&str> = HashSet::new();
+        let mut seen_plugin_ids: HashSet<(&str, &str)> = HashSet::new();
         for pc in &self.plugin_configs {
-            if !seen_plugin_ids.insert(&pc.id) {
-                errors.push(format!("Duplicate plugin_config ID '{}'", pc.id));
+            if !seen_plugin_ids.insert((&pc.namespace, &pc.id)) {
+                errors.push(format!(
+                    "Duplicate plugin_config ID '{}' in namespace '{}'",
+                    pc.id, pc.namespace
+                ));
             }
         }
 
-        let mut seen_upstream_ids: HashSet<&str> = HashSet::new();
+        let mut seen_upstream_ids: HashSet<(&str, &str)> = HashSet::new();
         for upstream in &self.upstreams {
-            if !seen_upstream_ids.insert(&upstream.id) {
-                errors.push(format!("Duplicate upstream ID '{}'", upstream.id));
+            if !seen_upstream_ids.insert((&upstream.namespace, &upstream.id)) {
+                errors.push(format!(
+                    "Duplicate upstream ID '{}' in namespace '{}'",
+                    upstream.id, upstream.namespace
+                ));
             }
         }
 
@@ -4748,8 +4811,11 @@ impl GatewayConfig {
     ///   and at most one may have empty `hosts` (catch-all/default).
     pub fn validate_stream_proxies(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        // Map port -> list of proxy IDs that use it
-        let mut port_proxies: HashMap<u16, Vec<&str>> = HashMap::new();
+        // Retain the exact proxy entries for each shared port. Proxy IDs are
+        // unique only within a namespace, so resolving these entries later by
+        // bare ID can select the wrong tenant and let an invalid mixed
+        // passthrough/PROXY-protocol/host configuration pass validation.
+        let mut port_proxies: HashMap<u16, Vec<&Proxy>> = HashMap::new();
 
         for proxy in &self.proxies {
             if proxy.dispatch_kind.is_stream() {
@@ -4768,7 +4834,7 @@ impl GatewayConfig {
                         ));
                     }
                     Some(port) => {
-                        port_proxies.entry(port).or_default().push(&proxy.id);
+                        port_proxies.entry(port).or_default().push(proxy);
                     }
                 }
             } else if proxy.listen_port.is_some() {
@@ -4798,17 +4864,12 @@ impl GatewayConfig {
         }
 
         // Validate port sharing rules
-        for (port, proxy_ids) in &port_proxies {
-            if proxy_ids.len() <= 1 {
+        for (port, proxies_on_port) in &port_proxies {
+            if proxies_on_port.len() <= 1 {
                 continue; // No conflict for single-proxy ports
             }
 
             // All proxies sharing a port must have passthrough: true
-            let proxies_on_port: Vec<&Proxy> = proxy_ids
-                .iter()
-                .filter_map(|id| self.proxies.iter().find(|p| p.id == *id))
-                .collect();
-
             let all_passthrough = proxies_on_port.iter().all(|p| p.passthrough);
             if !all_passthrough {
                 let non_pt: Vec<&str> = proxies_on_port

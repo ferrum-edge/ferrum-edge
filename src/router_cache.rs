@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use tracing::{debug, warn};
 
-use crate::config::types::{GatewayConfig, Proxy, wildcard_matches};
+use crate::config::types::{GatewayConfig, Proxy, Upstream, wildcard_matches};
 
 thread_local! {
     /// Thread-local buffer for router cache key construction.
@@ -203,24 +203,25 @@ pub(crate) struct HostRouteTable {
     /// Pre-computed flag: true if any host-only routes exist (skip host-only path entirely when false).
     has_host_only_routes: bool,
     /// Mesh outbound per-port sibling groups, keyed by the **representative**
-    /// proxy id (the lowest-port sibling — the only one inserted into the
-    /// host/path tiers, since they are (host, path)-keyed and every sibling
-    /// shares its service's hosts + `/`). After a representative matches on
-    /// the outbound capture listener,
+    /// proxy namespace and id (the lowest-port sibling — the only one inserted
+    /// into the host/path tiers, since they are (host, path)-keyed and every
+    /// sibling shares its service's hosts + `/`). After a representative
+    /// matches on the outbound capture listener,
     /// [`HostRouteTable::select_mesh_outbound_port_route_with_authz_port`] swaps in the
     /// sibling whose service port equals the connection's captured original
     /// destination port. Built at route-table construction; empty outside
     /// mesh mode.
-    mesh_outbound_ports: HashMap<String, Arc<MeshOutboundPortGroup>>,
+    mesh_outbound_ports: HashMap<String, HashMap<String, Arc<MeshOutboundPortGroup>>>,
     /// Mesh sidecar INBOUND per-port sibling groups, keyed by the
-    /// representative proxy id — the inbound mirror of `mesh_outbound_ports`.
+    /// representative proxy namespace and id — the inbound mirror of
+    /// `mesh_outbound_ports`.
     /// After a representative matches on the inbound listener,
     /// [`HostRouteTable::select_mesh_inbound_port_route`] swaps in the sibling
     /// matching the connection's captured original destination port (container
     /// port; REDIRECT-captured plain inbound) or the request's pre-strip
     /// authority port (service port; peer-sidecar dials). Built at route-table
     /// construction; empty outside mesh mode.
-    mesh_inbound_ports: HashMap<String, Arc<MeshInboundPortGroup>>,
+    mesh_inbound_ports: HashMap<String, HashMap<String, Arc<MeshInboundPortGroup>>>,
     /// Raw-TCP mesh egress lookup: strict `(service VIP, service port)` →
     /// relay entry, consulted by the outbound capture accept loop BEFORE the
     /// stream is handed to hyper. Built forward from the prepared `mesh`
@@ -469,7 +470,11 @@ impl HostRouteTable {
         current: RouteMatch,
         orig_dst_port: Option<u16>,
     ) -> Result<(RouteMatch, Option<u16>), MeshOutboundPortSelectError> {
-        let Some(group) = self.mesh_outbound_ports.get(&current.proxy.id) else {
+        let Some(group) = self
+            .mesh_outbound_ports
+            .get(&current.proxy.namespace)
+            .and_then(|by_id| by_id.get(&current.proxy.id))
+        else {
             return Ok((current, None));
         };
         match orig_dst_port {
@@ -539,7 +544,11 @@ impl HostRouteTable {
         orig_dst_port: Option<u16>,
         authority_port: Option<u16>,
     ) -> Result<(RouteMatch, Option<u16>), MeshInboundPortSelectError> {
-        let Some(group) = self.mesh_inbound_ports.get(&current.proxy.id) else {
+        let Some(group) = self
+            .mesh_inbound_ports
+            .get(&current.proxy.namespace)
+            .and_then(|by_id| by_id.get(&current.proxy.id))
+        else {
             return Ok((current, None));
         };
         if group.declared_http_ports == 1 {
@@ -1822,6 +1831,15 @@ impl RouterCache {
         let mut catch_all_regex: Vec<RegexRouteEntry> = Vec::new();
         let mut exact_hosts_host_only: HashMap<String, Arc<Proxy>> = HashMap::new();
         let mut wildcard_hosts_host_only: HashMap<String, Arc<Proxy>> = HashMap::new();
+        let mut mesh_upstreams: HashMap<&str, HashMap<&str, &Upstream>> = HashMap::new();
+        if config.mesh.is_some() {
+            for upstream in &config.upstreams {
+                mesh_upstreams
+                    .entry(upstream.namespace.as_str())
+                    .or_default()
+                    .insert(upstream.id.as_str(), upstream);
+            }
+        }
 
         // ── Mesh outbound per-port sibling groups ──────────────────────────
         // The route tiers are (host, path)-keyed, so per-port outbound
@@ -1836,52 +1854,62 @@ impl RouterCache {
         // outbound-prefixed proxy no mesh service claims (operator-crafted
         // edge) stays ungrouped and inserts normally. Empty outside mesh
         // mode (`config.mesh` is `None`).
-        let mut mesh_outbound_ports: HashMap<String, Arc<MeshOutboundPortGroup>> = HashMap::new();
-        let mut mesh_inbound_ports: HashMap<String, Arc<MeshInboundPortGroup>> = HashMap::new();
+        let mut mesh_outbound_ports: HashMap<String, HashMap<String, Arc<MeshOutboundPortGroup>>> =
+            HashMap::new();
+        let mut mesh_inbound_ports: HashMap<String, HashMap<String, Arc<MeshInboundPortGroup>>> =
+            HashMap::new();
         // Non-representative siblings of BOTH directions: reachable only via
         // post-match port selection, never via the tiers.
-        let mut mesh_sibling_skip_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut mesh_sibling_skip_ids: HashMap<String, std::collections::HashSet<String>> =
+            HashMap::new();
         if let Some(mesh) = config.mesh.as_deref() {
             let group_members = |siblings: &[(u16, String)],
-                                 proxies: &HashMap<&str, &Proxy>|
+                                 namespace: &str,
+                                 proxies: &HashMap<&str, HashMap<&str, &Proxy>>|
              -> Vec<(u16, Arc<Proxy>)> {
                 let mut members: Vec<(u16, Arc<Proxy>)> = siblings
                     .iter()
                     .filter_map(|(port, id)| {
                         proxies
-                            .get(id.as_str())
+                            .get(namespace)
+                            .and_then(|by_id| by_id.get(id.as_str()))
                             .map(|p| (*port, Arc::new((*p).clone())))
                     })
                     .collect();
                 members.sort_by_key(|(port, _)| *port);
                 members
             };
-            let outbound_proxies: HashMap<&str, &Proxy> = config
-                .proxies
-                .iter()
-                .filter(|p| {
-                    !p.dispatch_kind.is_stream()
-                        && crate::modes::mesh::is_mesh_outbound_route_id(&p.id)
-                })
-                .map(|p| (p.id.as_str(), p))
-                .collect();
+            let mut outbound_proxies: HashMap<&str, HashMap<&str, &Proxy>> = HashMap::new();
+            for proxy in config.proxies.iter().filter(|p| {
+                !p.dispatch_kind.is_stream() && crate::modes::mesh::is_mesh_outbound_route_id(&p.id)
+            }) {
+                outbound_proxies
+                    .entry(proxy.namespace.as_str())
+                    .or_default()
+                    .insert(proxy.id.as_str(), proxy);
+            }
             for group in crate::modes::mesh::mesh_outbound_service_groups(mesh) {
-                let members = group_members(&group.siblings, &outbound_proxies);
+                let members = group_members(&group.siblings, &group.namespace, &outbound_proxies);
                 if members.is_empty() {
                     continue;
                 }
                 let representative_id = members[0].1.id.clone();
                 for (_, sibling) in members.iter().skip(1) {
-                    mesh_sibling_skip_ids.insert(sibling.id.clone());
+                    mesh_sibling_skip_ids
+                        .entry(sibling.namespace.clone())
+                        .or_default()
+                        .insert(sibling.id.clone());
                 }
-                mesh_outbound_ports.insert(
-                    representative_id,
-                    Arc::new(MeshOutboundPortGroup {
-                        declared_http_ports: group.declared_http_ports,
-                        ports: members,
-                    }),
-                );
+                mesh_outbound_ports
+                    .entry(group.namespace)
+                    .or_default()
+                    .insert(
+                        representative_id,
+                        Arc::new(MeshOutboundPortGroup {
+                            declared_http_ports: group.declared_http_ports,
+                            ports: members,
+                        }),
+                    );
             }
             // Inbound mirror: same forward derivation, reading the
             // local-inbound service view (`mesh_inbound_service_groups`). The
@@ -1891,28 +1919,31 @@ impl RouterCache {
             // original destination against its resolved CONTAINER port
             // (`backend_port`) and the request authority against its SERVICE
             // port (the group key).
-            let inbound_proxies: HashMap<&str, &Proxy> = config
-                .proxies
-                .iter()
-                .filter(|p| {
-                    !p.dispatch_kind.is_stream()
-                        && crate::modes::mesh::is_mesh_inbound_route_id(&p.id)
-                })
-                .map(|p| (p.id.as_str(), p))
-                .collect();
+            let mut inbound_proxies: HashMap<&str, HashMap<&str, &Proxy>> = HashMap::new();
+            for proxy in config.proxies.iter().filter(|p| {
+                !p.dispatch_kind.is_stream() && crate::modes::mesh::is_mesh_inbound_route_id(&p.id)
+            }) {
+                inbound_proxies
+                    .entry(proxy.namespace.as_str())
+                    .or_default()
+                    .insert(proxy.id.as_str(), proxy);
+            }
             for group in crate::modes::mesh::mesh_inbound_service_groups(mesh) {
                 let mut members: Vec<MeshInboundSibling> = group
                     .siblings
                     .iter()
                     .filter_map(|(service_port, id)| {
-                        inbound_proxies.get(id.as_str()).map(|p| {
-                            let route = Arc::new((*p).clone());
-                            MeshInboundSibling {
-                                authority_port: *service_port,
-                                orig_dst_match_port: route.backend_port,
-                                route,
-                            }
-                        })
+                        inbound_proxies
+                            .get(group.namespace.as_str())
+                            .and_then(|by_id| by_id.get(id.as_str()))
+                            .map(|p| {
+                                let route = Arc::new((*p).clone());
+                                MeshInboundSibling {
+                                    authority_port: *service_port,
+                                    orig_dst_match_port: route.backend_port,
+                                    route,
+                                }
+                            })
                     })
                     .collect();
                 members.sort_by_key(|sibling| sibling.authority_port);
@@ -1921,18 +1952,24 @@ impl RouterCache {
                 }
                 let representative_id = members[0].route.id.clone();
                 for sibling in members.iter().skip(1) {
-                    mesh_sibling_skip_ids.insert(sibling.route.id.clone());
+                    mesh_sibling_skip_ids
+                        .entry(sibling.route.namespace.clone())
+                        .or_default()
+                        .insert(sibling.route.id.clone());
                 }
-                mesh_inbound_ports.insert(
-                    representative_id,
-                    Arc::new(MeshInboundPortGroup {
-                        declared_http_ports: group.declared_http_ports,
-                        ports: members,
-                        // Service-port default inbound: authorize on the
-                        // container/backend port (Istio inbound authz).
-                        is_ingress: false,
-                    }),
-                );
+                mesh_inbound_ports
+                    .entry(group.namespace)
+                    .or_default()
+                    .insert(
+                        representative_id,
+                        Arc::new(MeshInboundPortGroup {
+                            declared_http_ports: group.declared_http_ports,
+                            ports: members,
+                            // Service-port default inbound: authorize on the
+                            // container/backend port (Istio inbound authz).
+                            is_ingress: false,
+                        }),
+                    );
             }
             // F6 §6.2: Sidecar ingress[] custom-listener siblings. Forward-derived
             // from the resolved listeners (`mesh_ingress_listener_groups`), keyed
@@ -1944,22 +1981,23 @@ impl RouterCache {
             // arm (`select_mesh_inbound_port_route`) disambiguates them with no
             // fork. Ingress and service-port defaults never coexist for one
             // workload (ingress replaces defaults at materialization).
-            let ingress_proxies: HashMap<&str, &Proxy> = config
-                .proxies
-                .iter()
-                .filter(|p| {
-                    !p.dispatch_kind.is_stream()
-                        && crate::modes::mesh::is_mesh_ingress_route_id(&p.id)
-                })
-                .map(|p| (p.id.as_str(), p))
-                .collect();
+            let mut ingress_proxies: HashMap<&str, HashMap<&str, &Proxy>> = HashMap::new();
+            for proxy in config.proxies.iter().filter(|p| {
+                !p.dispatch_kind.is_stream() && crate::modes::mesh::is_mesh_ingress_route_id(&p.id)
+            }) {
+                ingress_proxies
+                    .entry(proxy.namespace.as_str())
+                    .or_default()
+                    .insert(proxy.id.as_str(), proxy);
+            }
             for group in crate::modes::mesh::mesh_ingress_listener_groups(mesh) {
                 let mut members: Vec<MeshInboundSibling> = group
                     .siblings
                     .iter()
                     .filter_map(|(listener_port, id)| {
                         ingress_proxies
-                            .get(id.as_str())
+                            .get(group.namespace.as_str())
+                            .and_then(|by_id| by_id.get(id.as_str()))
                             .map(|p| MeshInboundSibling {
                                 authority_port: *listener_port,
                                 orig_dst_match_port: *listener_port,
@@ -1973,19 +2011,25 @@ impl RouterCache {
                 }
                 let representative_id = members[0].route.id.clone();
                 for sibling in members.iter().skip(1) {
-                    mesh_sibling_skip_ids.insert(sibling.route.id.clone());
+                    mesh_sibling_skip_ids
+                        .entry(sibling.route.namespace.clone())
+                        .or_default()
+                        .insert(sibling.route.id.clone());
                 }
-                mesh_inbound_ports.insert(
-                    representative_id,
-                    Arc::new(MeshInboundPortGroup {
-                        declared_http_ports: group.declared_http_ports,
-                        ports: members,
-                        // Sidecar ingress[]: authorize on the declared LISTENER
-                        // port (`authority_port`), not the `defaultEndpoint`
-                        // backend port — see `MeshInboundPortGroup::is_ingress`.
-                        is_ingress: true,
-                    }),
-                );
+                mesh_inbound_ports
+                    .entry(group.namespace)
+                    .or_default()
+                    .insert(
+                        representative_id,
+                        Arc::new(MeshInboundPortGroup {
+                            declared_http_ports: group.declared_http_ports,
+                            ports: members,
+                            // Sidecar ingress[]: authorize on the declared LISTENER
+                            // port (`authority_port`), not the `defaultEndpoint`
+                            // backend port — see `MeshInboundPortGroup::is_ingress`.
+                            is_ingress: true,
+                        }),
+                    );
             }
         }
 
@@ -1998,8 +2042,6 @@ impl RouterCache {
         let mut mesh_tcp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision> =
             HashMap::new();
         if let Some(mesh) = config.mesh.as_deref() {
-            let upstream_ids: std::collections::HashSet<&str> =
-                config.upstreams.iter().map(|u| u.id.as_str()).collect();
             for service in &mesh.services {
                 let tcp_ports = crate::modes::mesh::service_tcp_stream_ports(service);
                 if tcp_ports.is_empty() || service.cluster_ips.is_empty() {
@@ -2011,7 +2053,11 @@ impl RouterCache {
                         &service.name,
                         sp.port,
                     );
-                    let decision = if upstream_ids.contains(upstream_id.as_str()) {
+                    let upstream = mesh_upstreams
+                        .get(service.namespace.as_str())
+                        .and_then(|by_id| by_id.get(upstream_id.as_str()))
+                        .copied();
+                    let decision = if let Some(upstream) = upstream {
                         let mut relay_proxy = crate::modes::mesh::mesh_outbound_tcp_relay_proxy(
                             &service.namespace,
                             &service.name,
@@ -2024,13 +2070,11 @@ impl RouterCache {
                         // `Proxy.dispatch_port_overrides`, which the relay
                         // builders leave unset.
                         relay_proxy.dispatch_port_overrides =
-                            dispatch_port_overrides_for_upstream(config, &upstream_id);
+                            dispatch_port_overrides_for_upstream(upstream);
                         let relay_proxy = Arc::new(relay_proxy);
-                        let service_fqdn = config
-                            .upstreams
-                            .iter()
-                            .find(|u| u.id == upstream_id)
-                            .and_then(|u| u.name.clone())
+                        let service_fqdn = upstream
+                            .name
+                            .clone()
                             .unwrap_or_else(|| format!("{}.{}", service.name, service.namespace));
                         MeshTcpEgressDecision::Relay(Arc::new(MeshTcpEgressEntry {
                             upstream_id,
@@ -2067,14 +2111,16 @@ impl RouterCache {
             MeshTcpEgressDecision,
         > = HashMap::new();
         if let Some(mesh) = config.mesh.as_deref() {
-            let upstream_ids: std::collections::HashSet<&str> =
-                config.upstreams.iter().map(|u| u.id.as_str()).collect();
             for spec in crate::modes::mesh::mesh_outbound_tcp_bywl_upstreams(
                 &mesh.services,
                 &mesh.workloads,
                 mesh.multi_cluster.as_ref(),
             ) {
-                let decision = if upstream_ids.contains(spec.upstream_id.as_str()) {
+                let upstream = mesh_upstreams
+                    .get(spec.service.namespace.as_str())
+                    .and_then(|by_id| by_id.get(spec.upstream_id.as_str()))
+                    .copied();
+                let decision = if let Some(upstream) = upstream {
                     let mut relay_proxy = crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
                         &spec.service.namespace,
                         &spec.service.name,
@@ -2084,16 +2130,11 @@ impl RouterCache {
                     );
                     // Same per-port DR override projection as the VIP table.
                     relay_proxy.dispatch_port_overrides =
-                        dispatch_port_overrides_for_upstream(config, &spec.upstream_id);
+                        dispatch_port_overrides_for_upstream(upstream);
                     let relay_proxy = Arc::new(relay_proxy);
-                    let service_fqdn = config
-                        .upstreams
-                        .iter()
-                        .find(|u| u.id == spec.upstream_id)
-                        .and_then(|u| u.name.clone())
-                        .unwrap_or_else(|| {
-                            format!("{}.{}", spec.service.name, spec.service.namespace)
-                        });
+                    let service_fqdn = upstream.name.clone().unwrap_or_else(|| {
+                        format!("{}.{}", spec.service.name, spec.service.namespace)
+                    });
                     MeshTcpEgressDecision::Relay(Arc::new(MeshTcpEgressEntry {
                         upstream_id: spec.upstream_id,
                         relay_proxy,
@@ -2121,24 +2162,32 @@ impl RouterCache {
             MeshHttpEgressByWorkloadDecision,
         > = HashMap::new();
         if let Some(mesh) = config.mesh.as_deref() {
-            let upstream_ids: std::collections::HashSet<&str> =
-                config.upstreams.iter().map(|u| u.id.as_str()).collect();
-            let proxy_by_id: HashMap<&str, &Proxy> = config
+            let mut proxy_by_id: HashMap<&str, HashMap<&str, &Proxy>> = HashMap::new();
+            for proxy in config
                 .proxies
                 .iter()
                 .filter(|p| crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(&p.id))
-                .map(|p| (p.id.as_str(), p))
-                .collect();
+            {
+                proxy_by_id
+                    .entry(proxy.namespace.as_str())
+                    .or_default()
+                    .insert(proxy.id.as_str(), proxy);
+            }
             for spec in crate::modes::mesh::mesh_outbound_http_bywl_upstreams(
                 &mesh.services,
                 &mesh.workloads,
                 mesh.multi_cluster.as_ref(),
             ) {
+                let namespace = spec.service.namespace.as_str();
                 let decision = match (
-                    upstream_ids.contains(spec.upstream_id.as_str()),
-                    proxy_by_id.get(spec.proxy_id.as_str()),
+                    mesh_upstreams
+                        .get(namespace)
+                        .and_then(|by_id| by_id.get(spec.upstream_id.as_str())),
+                    proxy_by_id
+                        .get(namespace)
+                        .and_then(|by_id| by_id.get(spec.proxy_id.as_str())),
                 ) {
-                    (true, Some(proxy)) => MeshHttpEgressByWorkloadDecision::Route {
+                    (Some(_), Some(proxy)) => MeshHttpEgressByWorkloadDecision::Route {
                         proxy: Arc::new((**proxy).clone()),
                         service_port: spec.service_port.port,
                     },
@@ -2160,7 +2209,11 @@ impl RouterCache {
                                     proxy: new_proxy,
                                     service_port: new_port,
                                 },
-                            ) => existing_proxy.id != new_proxy.id || existing_port != new_port,
+                            ) => {
+                                existing_proxy.namespace != new_proxy.namespace
+                                    || existing_proxy.id != new_proxy.id
+                                    || existing_port != new_port
+                            }
                             (
                                 MeshHttpEgressByWorkloadDecision::CloseNotRoutable,
                                 MeshHttpEgressByWorkloadDecision::CloseNotRoutable,
@@ -2209,8 +2262,6 @@ impl RouterCache {
         let mut mesh_udp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision> =
             HashMap::new();
         if let Some(mesh) = config.mesh.as_deref() {
-            let upstream_ids: std::collections::HashSet<&str> =
-                config.upstreams.iter().map(|u| u.id.as_str()).collect();
             for service in &mesh.services {
                 let udp_ports = crate::modes::mesh::service_udp_stream_ports(service);
                 if udp_ports.is_empty() || service.cluster_ips.is_empty() {
@@ -2222,7 +2273,11 @@ impl RouterCache {
                         &service.name,
                         sp.port,
                     );
-                    let decision = if upstream_ids.contains(upstream_id.as_str()) {
+                    let upstream = mesh_upstreams
+                        .get(service.namespace.as_str())
+                        .and_then(|by_id| by_id.get(upstream_id.as_str()))
+                        .copied();
+                    let decision = if let Some(upstream) = upstream {
                         let mut relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
                             &service.namespace,
                             &service.name,
@@ -2239,13 +2294,11 @@ impl RouterCache {
                         // which reads `dispatch_port_overrides`) would ignore the
                         // DR (codex r5 P2).
                         relay_proxy.dispatch_port_overrides =
-                            dispatch_port_overrides_for_upstream(config, &upstream_id);
+                            dispatch_port_overrides_for_upstream(upstream);
                         let relay_proxy = Arc::new(relay_proxy);
-                        let service_fqdn = config
-                            .upstreams
-                            .iter()
-                            .find(|u| u.id == upstream_id)
-                            .and_then(|u| u.name.clone())
+                        let service_fqdn = upstream
+                            .name
+                            .clone()
                             .unwrap_or_else(|| format!("{}.{}", service.name, service.namespace));
                         MeshTcpEgressDecision::Relay(Arc::new(MeshTcpEgressEntry {
                             upstream_id,
@@ -2269,7 +2322,10 @@ impl RouterCache {
 
         for proxy in &config.proxies {
             if crate::modes::mesh::is_mesh_outbound_http_bywl_route_id(&proxy.id) {
-                mesh_sibling_skip_ids.insert(proxy.id.clone());
+                mesh_sibling_skip_ids
+                    .entry(proxy.namespace.clone())
+                    .or_default()
+                    .insert(proxy.id.clone());
             }
         }
 
@@ -2280,7 +2336,10 @@ impl RouterCache {
         {
             // Non-representative mesh per-port siblings (both directions) are
             // reachable only via post-match port selection, never via the tiers.
-            if mesh_sibling_skip_ids.contains(proxy.id.as_str()) {
+            if mesh_sibling_skip_ids
+                .get(proxy.namespace.as_str())
+                .is_some_and(|ids| ids.contains(proxy.id.as_str()))
+            {
                 continue;
             }
             let arc_proxy = Arc::new(proxy.clone());
@@ -2520,12 +2579,10 @@ impl RouterCache {
 /// `GatewayConfig::resolve_dispatch_port_overrides` for a single upstream, used
 /// to populate router-synthesized mesh egress relay proxies (which are NOT in
 /// `config.proxies`, so the GatewayConfig-level pass never touches them).
-/// Returns `None` when the upstream is absent or declares no port overrides.
+/// Returns `None` when the upstream declares no usable port overrides.
 fn dispatch_port_overrides_for_upstream(
-    config: &GatewayConfig,
-    upstream_id: &str,
+    upstream: &Upstream,
 ) -> Option<std::collections::HashMap<u16, crate::config::types::ResolvedPortOverride>> {
-    let upstream = config.upstreams.iter().find(|u| u.id == upstream_id)?;
     if upstream.port_overrides.is_empty() {
         return None;
     }
@@ -4297,6 +4354,16 @@ mod tests {
         }
     }
 
+    /// Test fixture for a materialized mesh proxy in the namespace encoded by
+    /// the mesh service fixtures below. Production materializers always stamp
+    /// the owning service namespace; the generic routing helper intentionally
+    /// defaults to Ferrum's ordinary config namespace instead.
+    fn minimal_default_mesh_proxy_for_routing(id: &str, listen_path: &str) -> Proxy {
+        let mut proxy = minimal_proxy_for_routing(id, listen_path);
+        proxy.namespace = "default".to_string();
+        proxy
+    }
+
     fn config_with_n_proxies(n: usize) -> GatewayConfig {
         let proxies = (0..n)
             .map(|i| minimal_proxy_for_routing(&format!("p{i}"), &format!("/p{i}")))
@@ -4316,7 +4383,8 @@ mod tests {
         // match the request's listener direction (and a non-mesh `None` listener
         // — e.g. the H3 frontend — drops every direction-scoped mesh route),
         // falling through to whatever lower-priority route remains (here, none).
-        let mut outbound = minimal_proxy_for_routing("__mesh-outbound-default-ratings-8080", "/");
+        let mut outbound =
+            minimal_default_mesh_proxy_for_routing("__mesh-outbound-default-ratings-8080", "/");
         outbound.hosts = vec!["ratings".to_string()];
         let config = GatewayConfig {
             proxies: vec![outbound],
@@ -4356,7 +4424,8 @@ mod tests {
 
         // The inbound prefix is the mirror image: served on the inbound listener,
         // dropped on the outbound listener.
-        let mut inbound = minimal_proxy_for_routing("__mesh-inbound-default-reviews-8080", "/");
+        let mut inbound =
+            minimal_default_mesh_proxy_for_routing("__mesh-inbound-default-reviews-8080", "/");
         inbound.hosts = vec!["reviews".to_string()];
         let config = GatewayConfig {
             proxies: vec![inbound],
@@ -4427,8 +4496,10 @@ mod tests {
     fn mesh_outbound_port_group_selects_sibling_by_orig_dst_port() {
         let mut proxies = Vec::new();
         for port in [8080u16, 80, 90] {
-            let mut p =
-                minimal_proxy_for_routing(&format!("__mesh-outbound-default-reviews-{port}"), "/");
+            let mut p = minimal_default_mesh_proxy_for_routing(
+                &format!("__mesh-outbound-default-reviews-{port}"),
+                "/",
+            );
             p.hosts = vec!["reviews".to_string()];
             proxies.push(p);
         }
@@ -4481,7 +4552,8 @@ mod tests {
     /// non-Linux), but a present orig-dst port still must match.
     #[test]
     fn mesh_outbound_single_port_group_without_orig_dst_keeps_route() {
-        let mut p = minimal_proxy_for_routing("__mesh-outbound-default-ratings-8080", "/");
+        let mut p =
+            minimal_default_mesh_proxy_for_routing("__mesh-outbound-default-ratings-8080", "/");
         p.hosts = vec!["ratings".to_string()];
         let config = GatewayConfig {
             proxies: vec![p],
@@ -4523,7 +4595,8 @@ mod tests {
     #[test]
     fn mesh_outbound_partially_materialized_multi_port_requires_orig_dst() {
         // The service declares HTTP ports 80 + 90, but only 80 materialized.
-        let mut p = minimal_proxy_for_routing("__mesh-outbound-default-reviews-80", "/");
+        let mut p =
+            minimal_default_mesh_proxy_for_routing("__mesh-outbound-default-reviews-80", "/");
         p.hosts = vec!["reviews".to_string()];
         let config = GatewayConfig {
             proxies: vec![p],
@@ -4564,7 +4637,7 @@ mod tests {
     /// selection is a no-op on it.
     #[test]
     fn mesh_outbound_unclaimed_reserved_prefix_is_not_grouped() {
-        let mut p = minimal_proxy_for_routing("__mesh-outbound-oddball", "/");
+        let mut p = minimal_default_mesh_proxy_for_routing("__mesh-outbound-oddball", "/");
         p.hosts = vec!["oddball".to_string()];
         let config = GatewayConfig {
             proxies: vec![p],
@@ -4586,25 +4659,34 @@ mod tests {
     /// independently routable instead of conflating them into one group.
     #[test]
     fn mesh_outbound_port_groups_are_per_service() {
-        let mut a80 = minimal_proxy_for_routing("__mesh-outbound-default-reviews-80", "/");
+        let mut a80 =
+            minimal_default_mesh_proxy_for_routing("__mesh-outbound-default-reviews-80", "/");
         a80.hosts = vec!["reviews".to_string()];
-        let mut a90 = minimal_proxy_for_routing("__mesh-outbound-default-reviews-90", "/");
+        let mut a90 =
+            minimal_default_mesh_proxy_for_routing("__mesh-outbound-default-reviews-90", "/");
         a90.hosts = vec!["reviews".to_string()];
-        let mut b = minimal_proxy_for_routing("__mesh-outbound-default-ratings-9080", "/");
+        let mut b =
+            minimal_default_mesh_proxy_for_routing("__mesh-outbound-default-ratings-9080", "/");
         b.hosts = vec!["ratings".to_string()];
-        // Lossy-join collision pair: their ids share the joined `{ns}-{name}`
-        // text, but they are distinct services with distinct hosts.
-        let mut c1 = minimal_proxy_for_routing("__mesh-outbound-a-b-c-80", "/");
+        // Lossy-join collision pair: both port-80 routes have the EXACT same
+        // generated id, but they are distinct namespaces/services/hosts.
+        let mut c1 = minimal_default_mesh_proxy_for_routing("__mesh-outbound-a-b-c-80", "/");
         c1.hosts = vec!["b-c.a.svc.cluster.local".to_string()];
-        let mut c2 = minimal_proxy_for_routing("__mesh-outbound-a-b-c-90", "/");
+        c1.namespace = "a".to_string();
+        let mut c1_sibling =
+            minimal_default_mesh_proxy_for_routing("__mesh-outbound-a-b-c-90", "/");
+        c1_sibling.hosts = vec!["b-c.a.svc.cluster.local".to_string()];
+        c1_sibling.namespace = "a".to_string();
+        let mut c2 = minimal_default_mesh_proxy_for_routing("__mesh-outbound-a-b-c-80", "/");
         c2.hosts = vec!["c.a-b.svc.cluster.local".to_string()];
+        c2.namespace = "a-b".to_string();
         let config = GatewayConfig {
-            proxies: vec![a80, a90, b, c1, c2],
+            proxies: vec![a80, a90, b, c1, c1_sibling, c2],
             mesh: mesh_block(&[
                 ("default", "reviews", &[80, 90]),
                 ("default", "ratings", &[9080]),
-                ("a", "b-c", &[80]),
-                ("a-b", "c", &[90]),
+                ("a", "b-c", &[80, 90]),
+                ("a-b", "c", &[80]),
             ]),
             ..GatewayConfig::default()
         };
@@ -4625,31 +4707,24 @@ mod tests {
             .expect("own port selects");
         assert_eq!(selected.proxy.id, "__mesh-outbound-default-reviews-90");
 
-        // Both collision-pair services stay routable under their own hosts —
-        // a backwards id parse would have grouped them and dropped one from
-        // the tiers entirely.
+        // Both collision-pair services stay routable under their own hosts and
+        // select only siblings from their own namespace.
         let rm = cache
             .find_proxy(Some("b-c.a.svc.cluster.local"), "/")
             .expect("first collision-pair service routes");
-        assert_eq!(
-            table
-                .select_mesh_outbound_port_route(rm, Some(80))
-                .expect("own port selects")
-                .proxy
-                .id,
-            "__mesh-outbound-a-b-c-80"
-        );
+        let selected = table
+            .select_mesh_outbound_port_route(rm, Some(90))
+            .expect("own sibling port selects");
+        assert_eq!(selected.proxy.namespace, "a");
+        assert_eq!(selected.proxy.id, "__mesh-outbound-a-b-c-90");
         let rm = cache
             .find_proxy(Some("c.a-b.svc.cluster.local"), "/")
             .expect("second collision-pair service routes");
-        assert_eq!(
-            table
-                .select_mesh_outbound_port_route(rm, Some(90))
-                .expect("own port selects")
-                .proxy
-                .id,
-            "__mesh-outbound-a-b-c-90"
-        );
+        let selected = table
+            .select_mesh_outbound_port_route(rm, Some(80))
+            .expect("own port selects");
+        assert_eq!(selected.proxy.namespace, "a-b");
+        assert_eq!(selected.proxy.id, "__mesh-outbound-a-b-c-80");
     }
 
     #[test]
@@ -5036,7 +5111,7 @@ mod tests {
     fn mesh_inbound_port_group_selects_sibling_by_signals() {
         let mut proxies = Vec::new();
         for (service_port, container_port) in [(80u16, 8080u16), (90, 9090)] {
-            let mut p = minimal_proxy_for_routing(
+            let mut p = minimal_default_mesh_proxy_for_routing(
                 &format!("__mesh-inbound-default-reviews-{service_port}"),
                 "/",
             );
@@ -5116,7 +5191,8 @@ mod tests {
     /// port all keep routing (selection adds no new requirement to them).
     #[test]
     fn mesh_inbound_single_port_group_keeps_route_unconditionally() {
-        let mut p = minimal_proxy_for_routing("__mesh-inbound-default-ratings-8080", "/");
+        let mut p =
+            minimal_default_mesh_proxy_for_routing("__mesh-inbound-default-ratings-8080", "/");
         p.hosts = vec!["ratings".to_string()];
         p.backend_port = 8081;
         let config = GatewayConfig {
@@ -5153,7 +5229,7 @@ mod tests {
         // ports, proving orig-dst matches the LISTENER port.
         let mut proxies = Vec::new();
         for (listener_port, backend_port) in [(8080u16, 5000u16), (8443, 6000)] {
-            let mut p = minimal_proxy_for_routing(
+            let mut p = minimal_default_mesh_proxy_for_routing(
                 &format!("__mesh-ingress-default-reviews-{listener_port}"),
                 "/",
             );
@@ -5232,7 +5308,8 @@ mod tests {
     #[test]
     fn mesh_ingress_single_listener_surfaces_listener_authz_port() {
         use crate::modes::mesh::config::{MeshConfig, ResolvedIngressListener};
-        let mut p = minimal_proxy_for_routing("__mesh-ingress-default-reviews-8443", "/");
+        let mut p =
+            minimal_default_mesh_proxy_for_routing("__mesh-ingress-default-reviews-8443", "/");
         p.hosts = vec!["reviews".to_string()];
         p.backend_port = 8080; // backend != listener
         let config = GatewayConfig {
@@ -5326,7 +5403,8 @@ mod tests {
         // Only listener 8080 resolved; listener 8443 was declared HTTP-family but
         // its endpoint was unroutable, so it is absent from local_ingress_listeners
         // yet counted in declared_ingress_http_ports.
-        let mut p = minimal_proxy_for_routing("__mesh-ingress-default-reviews-8080", "/");
+        let mut p =
+            minimal_default_mesh_proxy_for_routing("__mesh-ingress-default-reviews-8080", "/");
         p.hosts = vec!["reviews".to_string()];
         p.backend_port = 5000;
         let config = GatewayConfig {
@@ -5387,7 +5465,8 @@ mod tests {
     /// the round-2 ingress tightening does NOT regress single-port services.
     #[test]
     fn mesh_inbound_single_service_port_keeps_backcompat_passthrough() {
-        let mut p = minimal_proxy_for_routing("__mesh-inbound-default-reviews-80", "/");
+        let mut p =
+            minimal_default_mesh_proxy_for_routing("__mesh-inbound-default-reviews-80", "/");
         p.hosts = vec!["reviews".to_string()];
         p.backend_port = 8080;
         let config = GatewayConfig {
@@ -5423,7 +5502,8 @@ mod tests {
     /// demands a signal and never absorbs the skipped port's traffic.
     #[test]
     fn mesh_inbound_partial_group_still_demands_signal() {
-        let mut p = minimal_proxy_for_routing("__mesh-inbound-default-reviews-80", "/");
+        let mut p =
+            minimal_default_mesh_proxy_for_routing("__mesh-inbound-default-reviews-80", "/");
         p.hosts = vec!["reviews".to_string()];
         p.backend_port = 8080;
         let config = GatewayConfig {
@@ -5480,6 +5560,7 @@ mod tests {
         };
         let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
             "id": "__mesh-out-tcp-upstream-default-redis-6379",
+            "namespace": "default",
             "name": "redis.default.svc.cluster.local",
             "targets": [{"host": "10.0.0.5", "port": 6379}],
             "port_overrides": {
@@ -5650,6 +5731,7 @@ mod tests {
         };
         let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
             "id": "__mesh-out-udp-upstream-default-dns-53",
+            "namespace": "default",
             "name": "dns.default.svc.cluster.local",
             "targets": [{"host": "10.0.0.9", "port": 53}],
         }))
@@ -5762,6 +5844,7 @@ mod tests {
         );
         let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
             "id": bywl_id,
+            "namespace": "default",
             "name": "redis.default.svc.cluster.local",
             "targets": [{"host": "10.0.0.7", "port": 6380}],
         }))
@@ -5887,12 +5970,13 @@ mod tests {
             8080,
             canonical_ip,
         );
-        let mut proxy = minimal_proxy_for_routing(&proxy_id, "/");
+        let mut proxy = minimal_default_mesh_proxy_for_routing(&proxy_id, "/");
         proxy.hosts = vec!["bywl-default-reviews-8080-10-0-0-7.mesh.internal".to_string()];
         proxy.upstream_id = Some(upstream_id.clone());
         proxy.preserve_host_header = false;
         let upstream: crate::config::types::Upstream = serde_json::from_value(serde_json::json!({
             "id": upstream_id,
+            "namespace": "default",
             "name": "reviews.default.svc.cluster.local",
             "targets": [{"host": "10.0.0.7", "port": 18080}],
         }))
@@ -6003,13 +6087,14 @@ mod tests {
                 port,
                 canonical_ip,
             );
-            let mut proxy = minimal_proxy_for_routing(&proxy_id, "/");
+            let mut proxy = minimal_default_mesh_proxy_for_routing(&proxy_id, "/");
             proxy.hosts = vec![format!("bywl-default-{name}-{port}-10-0-0-7.mesh.internal")];
             proxy.upstream_id = Some(upstream_id.clone());
             proxies.push(proxy);
             upstreams.push(
                 serde_json::from_value(serde_json::json!({
                     "id": upstream_id,
+                    "namespace": "default",
                     "name": format!("{name}.default.svc.cluster.local"),
                     "targets": [{"host": "10.0.0.7", "port": 18080}],
                 }))

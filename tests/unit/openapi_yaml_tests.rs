@@ -6030,6 +6030,63 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
 }
 
 #[test]
+fn health_failover_topology_and_admin_writes_openapi_parity() {
+    // Issue #3001: authenticated /health exposes failover_topology and
+    // admin_writes_enabled reflects failover write gating.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let topology = json!({
+        "primary_active": false,
+        "allow_writes": false,
+        "opt_in_writes_enabled_during_window": false,
+        "failover_since_unix_ms": 1_700_000_000_000u64,
+        "active_url_redacted": "sqlite:///tmp/failover.db"
+    });
+    assert_component_validity(&spec, "DatabaseFailoverTopology", &topology, true);
+
+    let health = json!({
+        "status": "degraded",
+        "ready": true,
+        "admin_writes_enabled": false,
+        "database": {
+            "status": "connected",
+            "type": "sqlite",
+            "failover_topology": topology
+        }
+    });
+    assert_component_validity(&spec, "HealthResponse", &health, true);
+
+    let admin_writes = spec["components"]["schemas"]["HealthResponse"]["properties"]
+        ["admin_writes_enabled"]["description"]
+        .as_str()
+        .expect("admin_writes_enabled description");
+    assert!(
+        admin_writes.contains("FERRUM_DB_FAILOVER_ALLOW_WRITES")
+            || admin_writes.contains("failover"),
+        "admin_writes_enabled must document failover write blocking"
+    );
+    assert!(
+        admin_writes.contains("config-database")
+            || admin_writes.contains("config-store")
+            || admin_writes.contains("managed TLS"),
+        "admin_writes_enabled must clarify it is the config-database mutation signal, not managed TLS/ACME"
+    );
+
+    let topology_desc = spec["components"]["schemas"]["DatabaseFailoverTopology"]["description"]
+        .as_str()
+        .expect("DatabaseFailoverTopology description");
+    assert!(
+        topology_desc.contains("divergence-risk") || topology_desc.contains("divergence"),
+        "topology schema must document opt-in divergence-risk contract"
+    );
+    assert!(
+        !topology_desc.contains("fence") || topology_desc.contains("not a durable fence"),
+        "must not claim a durable failback fence"
+    );
+}
+
+#[test]
 fn no_proxy_runtime_metrics_snapshot_is_covered_by_openapi() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -7766,18 +7823,24 @@ fn admin_metrics_openapi_accepts_typed_mode_breaker_and_health_fixtures() {
         assert_component_validity(&spec, "AdminMetrics", &instance, true);
     }
 
-    // Conditional semantics: passive requires proxy_id; active forbids it.
+    // Conditional semantics: passive requires proxy_id; active requires upstream_id.
     assert_component_validity(
         &spec,
         "AdminMetricsUnhealthyTarget",
-        &serde_json::to_value(AdminMetricsUnhealthyTarget::active("10.0.0.1:80", 1))
-            .expect("active"),
+        &serde_json::to_value(AdminMetricsUnhealthyTarget::active(
+            "ferrum",
+            "upstream-a",
+            "10.0.0.1:80",
+            1,
+        ))
+        .expect("active"),
         true,
     );
     assert_component_validity(
         &spec,
         "AdminMetricsUnhealthyTarget",
         &serde_json::to_value(AdminMetricsUnhealthyTarget::passive(
+            "ferrum",
             "proxy-a",
             "10.0.0.1:80",
             1,
@@ -7789,6 +7852,7 @@ fn admin_metrics_openapi_accepts_typed_mode_breaker_and_health_fixtures() {
         &spec,
         "AdminMetricsUnhealthyTarget",
         &json!({
+            "namespace": "ferrum",
             "target": "10.0.0.1:80",
             "type": "passive",
             "since_epoch_ms": 1
@@ -9012,5 +9076,68 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
     assert!(
         section.contains("`bedrock`"),
         "docs must enumerate bedrock as an accepted provider"
+    );
+}
+
+#[test]
+fn body_validator_schema_is_closed_and_matches_the_runtime_key_set() {
+    use ferrum_edge::plugins::body_validator::{
+        BODY_VALIDATOR_CONFIG_KEYS, BODY_VALIDATOR_PROTOBUF_METHOD_KEYS,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/BodyValidatorConfig")
+        .expect("BodyValidatorConfig schema");
+
+    // Unknown keys must be refused by the published schema too, not just the
+    // runtime constructor (GHSA-w7x7-ppx9-5v74).
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let method_entry = schema
+        .pointer("/properties/protobuf_method_messages/additionalProperties")
+        .expect("protobuf_method_messages value schema");
+    assert_eq!(method_entry["additionalProperties"], json!(false));
+
+    // Runtime allow-list ↔ OpenAPI property parity, so a typo cannot drift
+    // back in through either side alone.
+    let mut documented: Vec<String> = schema["properties"]
+        .as_object()
+        .expect("BodyValidatorConfig properties")
+        .keys()
+        .cloned()
+        .collect();
+    let mut runtime: Vec<String> = BODY_VALIDATOR_CONFIG_KEYS
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect();
+    documented.sort();
+    runtime.sort();
+    assert_eq!(
+        documented, runtime,
+        "BodyValidatorConfig properties must match the runtime allow-list"
+    );
+
+    let mut documented: Vec<String> = method_entry["properties"]
+        .as_object()
+        .expect("protobuf method entry properties")
+        .keys()
+        .cloned()
+        .collect();
+    let mut runtime: Vec<String> = BODY_VALIDATOR_PROTOBUF_METHOD_KEYS
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect();
+    documented.sort();
+    runtime.sort();
+    assert_eq!(
+        documented, runtime,
+        "protobuf method entry keys must match the runtime allow-list"
+    );
+
+    assert_eq!(
+        schema["properties"]["json_schema_draft"]["enum"],
+        json!(["draft2020-12", "draft7"])
     );
 }

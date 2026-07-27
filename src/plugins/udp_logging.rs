@@ -92,7 +92,7 @@ const DTLS_ONLY_CONFIG_KEYS: &[&str] = &[
 /// Pre-materialized DTLS client identity and verifier for one plugin generation.
 #[derive(Clone)]
 pub(crate) struct CachedDtlsMaterial {
-    certificate: dimpl::DtlsCertificate,
+    certificate: dimpl::DtlsCertificateChain,
     server_name: Option<rustls::pki_types::ServerName<'static>>,
     server_cert_verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
 }

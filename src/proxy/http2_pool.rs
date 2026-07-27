@@ -14,8 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
+use std::time::Duration;
 use tracing::{debug, warn};
 
 use crate::config::PoolConfig;
@@ -55,6 +54,17 @@ thread_local! {
 /// streaming the client upload — mirroring the mesh-mTLS / HBONE pools.
 /// Callers wrap with `usize::MAX` when the operator limit is disabled (`0`).
 pub type Http2Sender = http2::SendRequest<SizeLimitedIncoming>;
+
+/// Terminal protocol outcome for one DNS candidate.
+///
+/// Negotiated HTTP/1.1 is a usable backend capability result, not a failed
+/// address attempt: the dispatcher can route it through reqwest. Keeping it in
+/// the successful candidate channel prevents a later transport or handshake
+/// failure from overwriting the downgrade signal.
+enum Http2CandidateOutcome {
+    Established(Http2Sender),
+    BackendSelectedHttp1 { pool_key: String },
+}
 
 /// Run `f` against a thread-local buffer pre-populated with the direct H2
 /// pool key for `proxy` (no shard suffix). Callers can append `#<shard>`
@@ -162,9 +172,9 @@ impl Http2PoolManager {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
-        let resolved_ip = self
+        let candidates = self
             .dns_cache
-            .resolve(
+            .resolve_candidates(
                 host,
                 proxy.dns_override.as_deref(),
                 proxy.dns_cache_ttl_seconds,
@@ -175,87 +185,121 @@ impl Http2PoolManager {
                 source: Some(BackendUnavailableSource::Dns),
             })?;
 
-        let sock_addr = std::net::SocketAddr::new(resolved_ip, port);
-        let addr = sock_addr.to_string();
         let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-        let connect_started = Instant::now();
-
-        let tcp = tokio::time::timeout(
-            connect_timeout,
-            crate::socket_opts::connect_with_socket_opts(sock_addr),
-        )
-        .await
-        .map_err(|_| Http2PoolError::BackendTimeout {
-            message: format!(
-                "Connect timeout after {}ms to {}",
-                proxy.backend_connect_timeout_ms, addr
-            ),
-            source: Some(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "backend connect timed out",
-            )),
-        })?
-        .map_err(|e| {
-            if crate::retry::is_port_exhaustion(&e) {
-                tracing::error!(
-                    "http2_pool: PORT EXHAUSTION connecting to backend {}: {} — \
-                     reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
-                    addr,
-                    e
-                );
-            } else {
-                warn!("http2_pool: failed to connect to backend {}: {}", addr, e);
-            }
-            Http2PoolError::BackendUnavailable {
-                message: format!("Connection refused: {}", e),
-                source: Some(BackendUnavailableSource::Io(e)),
-            }
-        })?;
-
-        let _ = tcp.set_nodelay(true);
-
         let pool_config = self.global_pool_config.for_proxy(proxy);
-        // Honor the DestinationRule `connectionPool.tcp.tcpKeepalive` per-port
-        // override (keyed by the dial target's port, `proxy.backend_port`),
-        // falling back to the global pool keepalive. NOTE: keepalive is NOT in
-        // the pool key (forbidden by `.claude/rules/proxy-protocols.md`), and
-        // this connection is pooled+shared, so the first dispatcher to
-        // materialize the connection wins — same first-materializer tradeoff
-        // documented for `idleTimeout` / `maxRequestsPerConnection`.
-        crate::socket_opts::apply_pooled_tcp_keepalive(
-            "http2_pool",
-            &tcp,
-            proxy
-                .dispatch_port_overrides
-                .as_ref()
-                .and_then(|m| m.get(&port))
-                .and_then(|o| o.tcp_keepalive.as_ref()),
-            pool_config.enable_http_keep_alive,
-            pool_config.tcp_keepalive_seconds,
-        );
+        let tls_config = self.get_tls_config(proxy, svid_generation)?;
+        let connector = tokio_rustls::TlsConnector::from(tls_config);
+        let server_name =
+            crate::tls::backend::backend_tls_server_name_owned(&proxy.resolved_tls, host).map_err(
+                |e| Http2PoolError::BackendUnavailable {
+                    message: format!("Invalid server name: {}", e),
+                    source: Some(BackendUnavailableSource::InvalidDnsName),
+                },
+            )?;
+        let keepalive_override = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&port))
+            .and_then(|o| o.tcp_keepalive.as_ref());
 
-        self.create_tls_connection(
-            tcp,
-            host,
-            proxy,
-            svid_generation,
-            connect_started,
-            connect_timeout,
-        )
+        crate::dns::connect_candidates(&candidates, port, connect_timeout, |sock_addr| {
+            let connector = connector.clone();
+            let server_name = server_name.clone();
+            let pool_config = &pool_config;
+            async move {
+                let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
+                    .await
+                    .map_err(|e| Http2PoolError::BackendUnavailable {
+                        message: format!("Connection refused: {}", e),
+                        source: Some(BackendUnavailableSource::Io(e)),
+                    })?;
+
+                let _ = tcp.set_nodelay(true);
+                // Honor the DestinationRule `connectionPool.tcp.tcpKeepalive`
+                // per-port override on every candidate attempt, falling back
+                // to the global pool keepalive. Keepalive is intentionally not
+                // in the pool key, so the first materializer still wins.
+                crate::socket_opts::apply_pooled_tcp_keepalive(
+                    "http2_pool",
+                    &tcp,
+                    keepalive_override,
+                    pool_config.enable_http_keep_alive,
+                    pool_config.tcp_keepalive_seconds,
+                );
+
+                let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
+                    Http2PoolError::BackendUnavailable {
+                        message: format!("TLS handshake failed: {}", e),
+                        source: Some(BackendUnavailableSource::Tls(e)),
+                    }
+                })?;
+
+                // A TCP-successful candidate is not usable by this pool until
+                // it negotiates ALPN h2 and completes the HTTP/2 handshake.
+                // Keep both phases inside the candidate attempt so a bad first
+                // address cannot suppress a healthy later DNS answer.
+                if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
+                    return Ok(Http2CandidateOutcome::BackendSelectedHttp1 {
+                        pool_key: self.pool_key_owned(proxy, svid_generation),
+                    });
+                }
+
+                let io = TokioIo::new(tls_stream);
+                let builder = Self::build_h2_builder(pool_config);
+                let (sender, conn) = builder.handshake(io).await.map_err(|e| {
+                    Http2PoolError::BackendUnavailable {
+                        message: format!("h2 handshake failed: {}", e),
+                        source: Some(BackendUnavailableSource::Hyper(e)),
+                    }
+                })?;
+
+                // ALPN has already proved H2 for this TLS candidate.
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        debug!("http2_pool: TLS connection closed: {}", e);
+                    }
+                });
+                Ok(Http2CandidateOutcome::Established(sender))
+            }
+        })
         .await
-    }
-
-    fn backend_connect_timeout_error(proxy: &Proxy, phase: &str) -> Http2PoolError {
-        Http2PoolError::BackendTimeout {
-            message: format!(
-                "Connect timeout after {}ms during {} to {}:{}",
-                proxy.backend_connect_timeout_ms, phase, proxy.backend_host, proxy.backend_port
-            ),
-            source: Some(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("backend {phase} timed out"),
-            )),
-        }
+        .map(|(outcome, _)| match outcome {
+            Http2CandidateOutcome::Established(sender) => Ok(sender),
+            Http2CandidateOutcome::BackendSelectedHttp1 { pool_key } => {
+                Err(Http2PoolError::BackendSelectedHttp1 { pool_key })
+            }
+        })
+        .map_err(|error| match error {
+            crate::dns::CandidateConnectError::TimedOut { last_addr } => {
+                Http2PoolError::BackendTimeout {
+                    message: format!(
+                        "Connect timeout after {}ms establishing HTTP/2 to {}",
+                        proxy.backend_connect_timeout_ms, last_addr
+                    ),
+                    source: Some(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "backend HTTP/2 establishment timed out",
+                    )),
+                }
+            }
+            crate::dns::CandidateConnectError::Failed { last_addr, source } => {
+                if crate::retry::is_port_exhaustion(&source) {
+                    tracing::error!(
+                        "http2_pool: PORT EXHAUSTION connecting to backend {}: {} — \
+                         reduce outbound connection rate or increase net.ipv4.ip_local_port_range",
+                        last_addr,
+                        source
+                    );
+                } else {
+                    warn!(
+                        "http2_pool: all DNS candidates failed HTTP/2 establishment for backend {} \
+                         (last={}): {}",
+                        host, last_addr, source
+                    );
+                }
+                source
+            }
+        })?
     }
 
     fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
@@ -280,11 +324,8 @@ impl Http2PoolManager {
             .max_frame_size(pool_config.http2_max_frame_size);
 
         if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Cap server-initiated streams (push) AND advertise our local
-            // initial cap on locally-initiated streams. The server's SETTINGS
-            // frame can raise the local cap later, but the initial value
-            // gives operators a starting bound that maps onto Istio's
-            // `http2MaxRequests` semantics for outbound concurrent requests.
+            // Cap server-initiated streams (push) and preserve the operator's
+            // initial outbound concurrency bound until peer SETTINGS arrive.
             builder.max_concurrent_streams(max_streams);
             builder.initial_max_send_streams(max_streams as usize);
         }
@@ -345,83 +386,6 @@ impl Http2PoolManager {
             tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             Ok::<rustls::ClientConfig, Http2PoolError>(tls_config)
         })
-    }
-
-    async fn create_tls_connection(
-        &self,
-        tcp: TcpStream,
-        host: &str,
-        proxy: &Proxy,
-        svid_generation: Option<u64>,
-        connect_started: Instant,
-        connect_timeout: Duration,
-    ) -> Result<Http2Sender, Http2PoolError> {
-        use tokio_rustls::TlsConnector;
-
-        let tls_config = self.get_tls_config(proxy, svid_generation)?;
-        let connector = TlsConnector::from(tls_config);
-        let server_name =
-            crate::tls::backend::backend_tls_server_name_owned(&proxy.resolved_tls, host).map_err(
-                |e| Http2PoolError::BackendUnavailable {
-                    message: format!("Invalid server name: {}", e),
-                    source: Some(BackendUnavailableSource::InvalidDnsName),
-                },
-            )?;
-
-        let Some(remaining) =
-            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-        else {
-            return Err(Self::backend_connect_timeout_error(proxy, "TLS handshake"));
-        };
-
-        let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
-            .await
-            .map_err(|_| Self::backend_connect_timeout_error(proxy, "TLS handshake"))?
-            .map_err(|e| Http2PoolError::BackendUnavailable {
-                message: format!("TLS handshake failed: {}", e),
-                source: Some(BackendUnavailableSource::Tls(e)),
-            })?;
-
-        // Inspect negotiated ALPN. rustls 0.22+ exposes the chosen protocol
-        // on the client session; `get_ref().1` is the `ClientConnection`.
-        // If the backend picked http/1.1 (or advertised nothing), short-circuit
-        // rather than trying an h2 handshake that will fail anyway. Capability
-        // learning happens outside this pool now, so we return the signal but
-        // do not cache it here.
-        let pool_key = self.pool_key_owned(proxy, svid_generation);
-        let negotiated_is_h2 = matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2"));
-        if !negotiated_is_h2 {
-            return Err(Http2PoolError::BackendSelectedHttp1 { pool_key });
-        }
-
-        let io = TokioIo::new(tls_stream);
-        let pool_config = self.global_pool_config.for_proxy(proxy);
-        let builder = Self::build_h2_builder(&pool_config);
-
-        let Some(remaining) =
-            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-        else {
-            return Err(Self::backend_connect_timeout_error(
-                proxy,
-                "HTTP/2 handshake",
-            ));
-        };
-
-        let (sender, conn) = tokio::time::timeout(remaining, builder.handshake(io))
-            .await
-            .map_err(|_| Self::backend_connect_timeout_error(proxy, "HTTP/2 handshake"))?
-            .map_err(|e| Http2PoolError::BackendUnavailable {
-                message: format!("h2 handshake failed: {}", e),
-                source: Some(BackendUnavailableSource::Hyper(e)),
-            })?;
-
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                debug!("http2_pool: TLS connection closed: {}", e);
-            }
-        });
-
-        Ok(sender)
     }
 }
 
@@ -1111,6 +1075,11 @@ fn classify_hyper_error(hyper_err: &hyper::Error) -> Option<crate::retry::ErrorC
     if hyper_err.is_timeout() {
         return Some(ErrorClass::ReadWriteTimeout);
     }
+    if hyper_err.is_canceled() {
+        // hyper contract: the request was never dispatched onto the wire.
+        // Treat as a stale pooled-sender / pool failure (pre-wire).
+        return Some(ErrorClass::ConnectionPoolError);
+    }
     if hyper_err.is_incomplete_message() {
         return Some(ErrorClass::ConnectionClosed);
     }
@@ -1120,6 +1089,51 @@ fn classify_hyper_error(hyper_err: &hyper::Error) -> Option<crate::retry::ErrorC
         return Some(ErrorClass::ProtocolError);
     }
     None
+}
+
+/// Classify a hyper error from `SendRequest::send_request` on an already-pooled
+/// HTTP/2 sender (direct-H2 dispatch).
+///
+/// `is_canceled` means the request was never dispatched (stale idle /
+/// GOAWAY race) and maps pre-wire. Other failures walk the hyper/io chain
+/// with `phase_is_connect = false` so mid-stream resets stay post-wire.
+/// Unknown errors default to [`ErrorClass::ProtocolError`] (post-wire
+/// conservative) rather than inventing a connect-class label.
+pub fn classify_pooled_h2_send_request_error(e: &hyper::Error) -> crate::retry::ErrorClass {
+    use crate::retry::ErrorClass;
+    if let Some(cls) = classify_hyper_error(e) {
+        return cls;
+    }
+    let mut current: Option<&(dyn std::error::Error + 'static)> =
+        std::error::Error::source(e as &dyn std::error::Error);
+    while let Some(node) = current {
+        if let Some(io_err) = node.downcast_ref::<std::io::Error>()
+            && let Some(cls) = classify_io_error(io_err, /* phase_is_connect */ false)
+        {
+            return normalize_pooled_h2_send_post_wire_class(cls);
+        }
+        current = node.source();
+    }
+    ErrorClass::ProtocolError
+}
+
+/// Keep source-chain classifications from turning an already-pooled H2 send
+/// into a connect failure.
+///
+/// `hyper::Error::is_canceled()` is handled before the source-chain walk and is
+/// the only proof that this dispatch never reached the wire. An inner
+/// `io::ErrorKind::ConnectionRefused` (or a platform port-exhaustion errno)
+/// cannot establish that boundary for an already-connected sender, so any
+/// connect-only class discovered below the hyper error must fail closed as a
+/// post-wire protocol error.
+pub(crate) fn normalize_pooled_h2_send_post_wire_class(
+    class: crate::retry::ErrorClass,
+) -> crate::retry::ErrorClass {
+    if crate::retry::request_reached_wire(class) {
+        class
+    } else {
+        crate::retry::ErrorClass::ProtocolError
+    }
 }
 
 /// Errors specific to HTTP/2 pool operations.

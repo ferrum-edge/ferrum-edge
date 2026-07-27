@@ -130,7 +130,8 @@ proxies:
 ## Certificate Requirements
 
 - **Format**: PEM encoded
-- **Certificate**: X.509 certificate chain
+- **Certificate**: X.509 certificate chain in leaf-first order. DTLS 1.2 and
+  1.3 transmit the complete configured client chain.
 - **Private Key**: Unencrypted private key (RSA or ECDSA), or a `pkcs11://` RSA signer URI when Ferrum is built with the `pkcs11` feature
 - **Sources**: File paths and `file://` URIs must be readable by the gateway process; inline PEM must contain the full PEM block
 

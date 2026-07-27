@@ -21,6 +21,8 @@
 //! `GrpcStep::{SendGoaway,SendRstStream,CloseAfterHeaders}` lowering.
 //! `GrpcStep::{AcceptStreamingRpc,ExpectReset}` cover the live bidi deadline
 //! cancellation path.
+//! `GrpcStep::AwaitTestSignal` / `H2Step::AwaitTestSignal` gate the pooled
+//! GOAWAY canceled-send regression so response headers land before GOAWAY.
 //! `H2Step::SendGoaway` (the non-closing graceful form) is intentionally
 //! reserved for in-flight graceful-drain coverage: the round-2 matrix needs
 //! a terminal connection fault, so it uses `SendGoawayAndClose` instead.
@@ -36,6 +38,7 @@ use crate::scaffolding::clients::{GrpcClient, Http2Client};
 use crate::scaffolding::file_mode_yaml_for_backend_with;
 use crate::scaffolding::harness::GatewayHarness;
 use crate::scaffolding::ports::reserve_port;
+use crate::scaffolding::to_file_mode_yaml;
 use bytes::Bytes;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -199,7 +202,10 @@ fn grpc_file_config_with_log_config(port: u16, overrides: Value, log_config: Val
             "enabled": true,
         }],
     });
-    serde_yaml::to_string(&config).expect("serialize yaml")
+    // `to_file_mode_yaml` tags the enum-typed nodes an override may carry
+    // (`retry.backoff`); a bare `serde_yaml::to_string` emits the JSON
+    // singleton-map spelling, which the file loader rejects.
+    to_file_mode_yaml(&config)
 }
 
 fn grpc_chargeback_file_config(port: u16, overrides: Value) -> String {
@@ -2505,6 +2511,390 @@ async fn h2_grpc_request_headers_strip_hop_by_hop_metadata() {
         stream.header("proxy-authorization").is_none(),
         "backend MUST NOT see hop-by-hop proxy-authorization metadata; headers={:?}",
         stream.headers
+    );
+}
+
+/// #2932: after a successful buffered unary RPC, the backend issues GOAWAY
+/// while keeping TCP open. The next buffered unary must retry on
+/// `DispatchCanceled` (hyper never-dispatched) when
+/// `retry_on_connect_failure` is enabled, redial a fresh connection, and
+/// complete with `grpc-status: 0` instead of a spurious UNAVAILABLE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .connection_scripts([
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::any()),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondStatus {
+                    code: 0,
+                    message: "",
+                },
+                // Park until the test confirms the warmup RPC completed. Hosted
+                // evidence showed GOAWAY in the same script burst as the warmup
+                // response racing hyper's client: request headers reached
+                // AcceptRpc (acceptors_waiting→0) while send_request still
+                // failed with "connection error" / grpc-status 14 before
+                // response headers were delivered. AwaitTestSignal makes that
+                // ordering an explicit fixture barrier instead of a sleep.
+                GrpcStep::AwaitTestSignal,
+                // Keep the socket open so the pool can still hand out the
+                // dying sender for one more send_request (hyper is_canceled).
+                GrpcStep::SendGoawayKeepOpen { error_code: 0 },
+                GrpcStep::Sleep(Duration::from_secs(2)),
+            ],
+            vec![
+                GrpcStep::AcceptRpc(MatchRpc::any()),
+                GrpcStep::SendInitialHeaders,
+                GrpcStep::RespondStatus {
+                    code: 0,
+                    message: "",
+                },
+            ],
+        ])
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = grpc_file_config(
+        backend_port,
+        json!({
+            "retry": {
+                "max_retries": 1,
+                "retry_on_connect_failure": true,
+                "backoff": { "fixed": { "delay_ms": 1 } },
+            },
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        // Force a single pooled sender so the second RPC reuses the GOAWAY'd
+        // connection instead of landing on a healthy sibling shard.
+        .env("FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST", "1")
+        // `accepted_connections()` is asserted below, so the reqwest `HEAD /`
+        // warmup must not add an extra dial to the count. Note this does NOT
+        // make the gateway cold: with warmup off, `modes::file::serve` sets
+        // `run_initial_refresh = true` and the backend-capability refresh task
+        // immediately probes this plaintext backend via
+        // `ProxyState::probe_h2c` -> `grpc_pool.get_sender()`. That probe uses
+        // a clone of this proxy whose only delta is a clamped connect timeout —
+        // a field deliberately excluded from the pool key — so it lands on the
+        // SAME single-shard gRPC pool entry the request path uses, and it is
+        // spawned rather than awaited before readiness.
+        // `wait_for_grpc_h2c_probe_accept_armed` below waits until that probe
+        // has finished inserting its sender *and* connection 0's AcceptRpc is
+        // parked, so the warmup RPC reuses the healthy probe sender instead of
+        // racing an empty-script teardown / dying-sender hand-out.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+
+    // Settle the startup capability probe on connection 0 before traffic so
+    // the warmup RPC is the first AcceptRpc on the GOAWAY script.
+    wait_for_grpc_h2c_probe_accept_armed(&harness, &backend, Duration::from_secs(5)).await;
+
+    let first = client
+        .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
+        .await
+        .expect("first RPC");
+    assert_eq!(
+        first.grpc_status(),
+        Some(0),
+        "warmup RPC must succeed: {first:?}; accepted_connections={}, \
+         acceptors_waiting={}, handshakes_completed={}, backend_step_errors={:?}\n\
+         --- captured gateway output ---\n{}",
+        backend.accepted_connections(),
+        backend.acceptors_waiting(),
+        backend.handshakes_completed(),
+        backend.step_errors().await,
+        harness.captured_combined().unwrap_or_default()
+    );
+    assert_eq!(
+        backend.accepted_connections(),
+        1,
+        "warmup must reuse the single probe-pooled sender; a proactive redial \
+         before GOAWAY would hide the DispatchCanceled path; \
+         handshakes={}, streams={}, backend_step_errors={:?}\n\
+         --- captured gateway output ---\n{}",
+        backend.handshakes_completed(),
+        backend.received_stream_count(),
+        backend.step_errors().await,
+        harness.captured_combined().unwrap_or_default()
+    );
+    assert_eq!(
+        backend.goaways_sent(),
+        0,
+        "GOAWAY must not fire until after the warmup RPC is observed complete"
+    );
+
+    // Release the scripted GOAWAY only after the warmup RPC completed, then
+    // wait until the fixture has actually issued it. Hyper may observe the
+    // GOAWAY either in the pool readiness check (proactive redial) or after
+    // handing out the stale sender (`is_canceled`); both are valid outcomes
+    // of the same race. Deterministic unit coverage below the functional
+    // layer verifies that the latter classifies pre-wire and is retryable.
+    wait_for_backend_awaiting_test_signal(&backend, Duration::from_secs(5)).await;
+    backend.release_test_signal();
+    wait_for_backend_goaway_sent(&backend, 1, Duration::from_secs(5)).await;
+
+    let second = client
+        .unary("/grpc/ferrum.Echo/Ping", Bytes::from_static(b""))
+        .await
+        .expect("second RPC");
+    assert_eq!(
+        second.grpc_status(),
+        Some(0),
+        "buffered unary after pooled GOAWAY must redial and succeed; got \
+         {second:?}; accepted_connections={}, backend_step_errors={:?}\n\
+         --- captured gateway output ---\n{}",
+        backend.accepted_connections(),
+        backend.step_errors().await,
+        harness.captured_combined().unwrap_or_default()
+    );
+    assert!(
+        backend.accepted_connections() >= 2,
+        "GOAWAY recovery must dial a fresh backend connection; \
+         accepted={}\n--- captured gateway output ---\n{}",
+        backend.accepted_connections(),
+        harness.captured_combined().unwrap_or_default()
+    );
+}
+
+/// Wait until the binary harness's startup h2c capability probe has finished
+/// `grpc_pool.get_sender()` and connection 0's scripted `AcceptRpc` is armed.
+///
+/// With `FERRUM_POOL_WARMUP_ENABLED=false` the binary harness still gets
+/// `run_initial_refresh = true` (see `modes::file::serve`), so a spawned
+/// capability-refresh pass dials plaintext backends through the shared gRPC
+/// pool via `probe_h2c` → `get_sender()`. Under
+/// `FERRUM_POOL_HTTP2_CONNECTIONS_PER_HOST=1` that probe occupies the only
+/// shard and inserts a pooled sender the request path will reuse.
+///
+/// Hosted evidence showed two failing sync strategies:
+/// * Waiting only for `h2c=supported` / handshake let warmup run before
+///   `AcceptRpc` was parked, or against a sender that was not yet usable.
+/// * Reserving connection 0 as an empty probe sink and sleeping past its
+///   end-of-script Stop still raced hyper's client-side close bookkeeping:
+///   warmup could observe `accepted_connections=2` yet fail with hyper
+///   `connection error` / grpc-status 14 (BackendRequest / connection_reset)
+///   without ever reaching a scripted `AcceptRpc`.
+///
+/// The production-observable barrier is therefore: registry `h2c=supported`
+/// (probe `get_sender` finished and cached the sender), server handshake
+/// complete, *and* `acceptors_waiting >= 1` (connection 0's AcceptRpc is
+/// blocked on the inbound stream channel). Warmup then reuses that healthy
+/// probe sender, exercises the GOAWAY → `DispatchCanceled` retry on the
+/// second RPC, and still fails closed if the probe never dials this backend.
+async fn wait_for_grpc_h2c_probe_accept_armed(
+    harness: &GatewayHarness,
+    backend: &ScriptedGrpcBackend,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(body) = harness.get_admin_json("/backend-capabilities").await
+            && let Some(entries) = body["entries"].as_array()
+            && let Some(entry) = entries.first()
+            && entry["grpc_transport"]["h2c"].as_str() == Some("supported")
+            && backend.handshakes_completed() >= 1
+            && backend.acceptors_waiting() >= 1
+        {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let registry = harness
+                .get_admin_json("/backend-capabilities")
+                .await
+                .unwrap_or_else(|e| json!({ "fetch_error": e.to_string() }));
+            panic!(
+                "startup h2c capability probe did not arm AcceptRpc within {timeout:?}; \
+                 registry={registry:?}; handshakes_completed={}, acceptors_waiting={}, \
+                 accepted_connections={}, backend_step_errors={:?}",
+                backend.handshakes_completed(),
+                backend.acceptors_waiting(),
+                backend.accepted_connections(),
+                backend.step_errors().await
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_backend_awaiting_test_signal(backend: &ScriptedGrpcBackend, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if backend.awaiting_test_signal() >= 1 {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "script did not park on AwaitTestSignal within {timeout:?}; \
+                 awaiting={}, goaways_sent={}, accepted={}, streams={}, \
+                 backend_step_errors={:?}",
+                backend.awaiting_test_signal(),
+                backend.goaways_sent(),
+                backend.accepted_connections(),
+                backend.received_stream_count(),
+                backend.step_errors().await
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for_backend_goaway_sent(
+    backend: &ScriptedGrpcBackend,
+    at_least: u32,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if backend.goaways_sent() >= at_least {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "fixture did not issue GOAWAY within {timeout:?}; \
+                 goaways_sent={}, awaiting_test_signal={}, accepted={}, \
+                 backend_step_errors={:?}",
+                backend.goaways_sent(),
+                backend.awaiting_test_signal(),
+                backend.accepted_connections(),
+                backend.step_errors().await
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// #2934: retry attempts must preserve duplicate metadata field lines from
+/// the real collected HeaderMap (not rebuild from stringified ctx.headers).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_retry_preserves_duplicate_metadata_on_second_attempt() {
+    let down = reserve_port().await.expect("reserve down port");
+    let down_port = down.port;
+    drop(down); // refuse connections
+
+    let up = reserve_port().await.expect("reserve up port");
+    let up_port = up.port;
+    let backend = ScriptedGrpcBackend::builder_plain(up.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondStatus {
+            code: 0,
+            message: "",
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let proxy = json!({
+        "id": "grpc-scripted",
+        "listen_path": "/grpc",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": down_port,
+        "strip_listen_path": true,
+        "upstream_id": "grpc-retry-md",
+        "retry": {
+            "max_retries": 1,
+            "retry_on_connect_failure": true,
+            "backoff": { "fixed": { "delay_ms": 1 } },
+        },
+        "backend_connect_timeout_ms": 500,
+        "backend_read_timeout_ms": 5000,
+        "backend_write_timeout_ms": 5000,
+    });
+    let config = json!({
+        "version": "1",
+        "proxies": [proxy],
+        "consumers": [],
+        "upstreams": [{
+            "id": "grpc-retry-md",
+            "algorithm": "round_robin",
+            "targets": [
+                { "host": "127.0.0.1", "port": down_port, "weight": 100 },
+                { "host": "127.0.0.1", "port": up_port, "weight": 100 },
+            ],
+        }],
+        "plugin_configs": [{
+            "id": "access-log",
+            "plugin_name": "stdout_logging",
+            "config": {},
+            "scope": "global",
+            "enabled": true,
+        }],
+    });
+    // Tagged-enum aware: `retry.backoff` must reach the loader as `!fixed`.
+    let yaml = to_file_mode_yaml(&config);
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("info")
+        .env("RUST_LOG", "info")
+        // Warmup would dial both targets at startup and advance the
+        // round-robin counter, so attempt 1 could land on the LIVE target and
+        // the retry path would never run — the assertion below would then
+        // pass against the un-fixed code.
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        .capture_output()
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+
+    let response = client
+        .unary_with_headers(
+            "/grpc/ferrum.Echo/Ping",
+            Bytes::from_static(b""),
+            &[("x-md", "a".to_string()), ("x-md", "b".to_string())],
+        )
+        .await
+        .expect("RPC response");
+    assert_eq!(response.grpc_status(), Some(0), "{response:?}");
+
+    // Prove the observed stream came from a RETRY, not from a first attempt
+    // that happened to select the live target. Without this the duplicate-
+    // metadata assertion is satisfied by the (always-correct) initial attempt.
+    let saw_grpc_retry = |logs: &str| logs.contains("Retrying gRPC backend request");
+    let logs = harness
+        .wait_for_log_contains(&saw_grpc_retry, Duration::from_secs(5))
+        .await;
+    assert!(
+        saw_grpc_retry(&logs),
+        "the gRPC retry loop must have fired (attempt 1 hit the refused port); \
+         without a retry this test cannot observe retry headers"
+    );
+
+    let streams = backend.received_streams().await;
+    assert_eq!(streams.len(), 1, "only the live target should see the RPC");
+    let md_values: Vec<&str> = streams[0]
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("x-md"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(
+        md_values,
+        ["a", "b"],
+        "retry attempt must forward duplicate x-md as two field lines; headers={:?}",
+        streams[0].headers
     );
 }
 

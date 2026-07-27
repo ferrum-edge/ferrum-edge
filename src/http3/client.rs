@@ -12,11 +12,10 @@
 //! for H3 backend targets and the H3 frontend server (`http3/server.rs`).
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -680,45 +679,6 @@ fn h3_backend_connect_timeout(proxy: &Proxy, host: &str, port: u16, phase: &str)
             proxy.backend_connect_timeout_ms, phase, host, port, proxy.id
         ),
     ))
-}
-
-async fn timeout_backend_connect<F>(
-    future: F,
-    connect_timeout: Duration,
-    proxy: &Proxy,
-    host: &str,
-    port: u16,
-    phase: &str,
-) -> Result<quinn::Connection, anyhow::Error>
-where
-    F: Future<Output = Result<quinn::Connection, quinn::ConnectionError>>,
-{
-    tokio::time::timeout(connect_timeout, future)
-        .await
-        .map_err(|_| h3_backend_connect_timeout(proxy, host, port, phase))?
-        .map_err(|e| anyhow::anyhow!("{} connection failed: {}", phase, e))
-}
-
-async fn timeout_backend_handshake<F, D>(
-    future: F,
-    connect_started: Instant,
-    connect_timeout: Duration,
-    proxy: &Proxy,
-    host: &str,
-    port: u16,
-    phase: &str,
-) -> Result<(D, H3SendRequest), anyhow::Error>
-where
-    F: Future<Output = Result<(D, H3SendRequest), h3::error::ConnectionError>>,
-{
-    let remaining = connect_timeout
-        .checked_sub(connect_started.elapsed())
-        .ok_or_else(|| h3_backend_connect_timeout(proxy, host, port, phase))?;
-
-    tokio::time::timeout(remaining, future)
-        .await
-        .map_err(|_| h3_backend_connect_timeout(proxy, host, port, phase))?
-        .map_err(|e| anyhow::anyhow!("{} handshake failed: {}", phase, e))
 }
 
 /// Error returned by [`Http3ConnectionPool`] when an HTTP/3 request fails.
@@ -1802,53 +1762,57 @@ impl Http3ConnectionPool {
 
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
-        let addr = resolve_backend_addr_cached(
+        let candidates = resolve_backend_addrs_cached(
             host,
-            port,
             &self.dns_cache,
             proxy.dns_override.as_deref(),
             proxy.dns_cache_ttl_seconds,
         )
         .await?;
 
-        let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
+        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        let tls_server_name =
+            crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
+        let (pooled, addr) =
+            crate::dns::connect_candidates(&candidates, port, connect_timeout, |addr| {
+                let client_config = client_config.clone();
+                async move {
+                    let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
+                    let connection = endpoint
+                        .connect_with(client_config, addr, tls_server_name)?
+                        .await
+                        .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))?;
+
+                    // Keep the H3 session setup inside the candidate attempt so a
+                    // QUIC-successful peer that cannot speak HTTP/3 cannot pin
+                    // this pool and suppress failover to a later DNS address.
+                    let quic_conn = connection.clone();
+                    let (mut driver, send_request) =
+                        h3::client::new(h3_quinn::Connection::new(connection))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
+
+                    tokio::spawn(async move {
+                        let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+                        debug!("HTTP/3 pool connection driver closed: {}", err);
+                    });
+                    Ok(H3PooledConnection::new(send_request, quic_conn))
+                }
+            })
+            .await
+            .map_err(|error| match error {
+                crate::dns::CandidateConnectError::TimedOut { .. } => {
+                    h3_backend_connect_timeout(proxy, host, port, "HTTP/3")
+                }
+                crate::dns::CandidateConnectError::Failed { source, .. } => source,
+            })?;
 
         debug!(
-            "HTTP/3 pool: connecting to {}:{} (resolved: {})",
+            "HTTP/3 pool: connected to {}:{} (resolved: {})",
             host, port, addr
         );
 
-        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-        let connect_started = Instant::now();
-        let tls_server_name =
-            crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
-        let connecting = endpoint.connect_with(client_config, addr, tls_server_name)?;
-        let connection =
-            timeout_backend_connect(connecting, connect_timeout, proxy, host, port, "QUIC").await?;
-
-        // Clone the quinn::Connection (`Arc`-based, cheap) before passing it
-        // into `h3_quinn::Connection::new` so the pool entry retains a handle
-        // for `close_reason()` health checks. h3_quinn would otherwise own
-        // the only ref via its internal stream-stream tasks.
-        let quic_conn = connection.clone();
-        let h3_handshake = h3::client::new(h3_quinn::Connection::new(connection));
-        let (mut driver, send_request) = timeout_backend_handshake(
-            h3_handshake,
-            connect_started,
-            connect_timeout,
-            proxy,
-            host,
-            port,
-            "HTTP/3",
-        )
-        .await?;
-
-        tokio::spawn(async move {
-            let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
-            debug!("HTTP/3 pool connection driver closed: {}", err);
-        });
-
-        Ok(H3PooledConnection::new(send_request, quic_conn))
+        Ok(pooled)
     }
 
     /// Create a new QUIC connection + h3 session to an explicit host/port
@@ -1893,52 +1857,57 @@ impl Http3ConnectionPool {
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(transport_config));
 
-        let addr = resolve_backend_addr_cached(
+        let candidates = resolve_backend_addrs_cached(
             host,
-            port,
             &self.dns_cache,
             proxy.dns_override.as_deref(),
             proxy.dns_cache_ttl_seconds,
         )
         .await?;
 
-        let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
+        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        let tls_server_name =
+            crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
+        let (pooled, addr) =
+            crate::dns::connect_candidates(&candidates, port, connect_timeout, |addr| {
+                let client_config = client_config.clone();
+                async move {
+                    let endpoint = self.get_shared_endpoint(addr.is_ipv6()).await?;
+                    let connection = endpoint
+                        .connect_with(client_config, addr, tls_server_name)?
+                        .await
+                        .map_err(|e| anyhow::anyhow!("QUIC connection failed: {}", e))?;
+
+                    // Keep the H3 session setup inside the candidate attempt so a
+                    // QUIC-successful peer that cannot speak HTTP/3 cannot pin
+                    // this pool and suppress failover to a later DNS address.
+                    let quic_conn = connection.clone();
+                    let (mut driver, send_request) =
+                        h3::client::new(h3_quinn::Connection::new(connection))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("HTTP/3 handshake failed: {}", e))?;
+
+                    tokio::spawn(async move {
+                        let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
+                        debug!("HTTP/3 pool connection driver closed: {}", err);
+                    });
+                    Ok(H3PooledConnection::new(send_request, quic_conn))
+                }
+            })
+            .await
+            .map_err(|error| match error {
+                crate::dns::CandidateConnectError::TimedOut { .. } => {
+                    h3_backend_connect_timeout(proxy, host, port, "HTTP/3")
+                }
+                crate::dns::CandidateConnectError::Failed { source, .. } => source,
+            })?;
 
         debug!(
-            "HTTP/3 pool: connecting to {}:{} (resolved: {})",
+            "HTTP/3 pool: connected to {}:{} (resolved: {})",
             host, port, addr
         );
 
-        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-        let connect_started = Instant::now();
-        let tls_server_name =
-            crate::tls::backend::backend_tls_server_name(&proxy.resolved_tls, host);
-        let connecting = endpoint.connect_with(client_config, addr, tls_server_name)?;
-        let connection =
-            timeout_backend_connect(connecting, connect_timeout, proxy, host, port, "QUIC").await?;
-
-        // See `create_connection` for why we clone the quinn::Connection
-        // before handing it to h3_quinn — the pool entry needs a handle for
-        // `close_reason()` health checks.
-        let quic_conn = connection.clone();
-        let h3_handshake = h3::client::new(h3_quinn::Connection::new(connection));
-        let (mut driver, send_request) = timeout_backend_handshake(
-            h3_handshake,
-            connect_started,
-            connect_timeout,
-            proxy,
-            host,
-            port,
-            "HTTP/3",
-        )
-        .await?;
-
-        tokio::spawn(async move {
-            let err = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
-            debug!("HTTP/3 pool connection driver closed: {}", err);
-        });
-
-        Ok(H3PooledConnection::new(send_request, quic_conn))
+        Ok(pooled)
     }
 
     /// Execute an HTTP/3 request on an existing SendRequest handle.
@@ -3293,34 +3262,26 @@ fn create_shared_quic_endpoint(is_ipv6: bool) -> Result<quinn::Endpoint, anyhow:
     Ok(endpoint)
 }
 
-/// Resolve a hostname:port to a SocketAddr using the shared DNS cache.
+/// Resolve a hostname to its rotated, policy-approved cached answer set.
 ///
 /// Uses the gateway's `DnsCache` exclusively — no fallback to system DNS.
 /// The cache is pre-warmed at startup and refreshes in the background.
-async fn resolve_backend_addr_cached(
+async fn resolve_backend_addrs_cached(
     host: &str,
-    port: u16,
     dns_cache: &crate::dns::DnsCache,
     dns_override: Option<&str>,
     dns_cache_ttl_seconds: Option<u64>,
-) -> Result<SocketAddr, anyhow::Error> {
-    // Fast path: IP literal needs no DNS
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
-    }
-
-    let ip = dns_cache
-        .resolve(host, dns_override, dns_cache_ttl_seconds)
+) -> Result<crate::dns::ResolvedAddresses, anyhow::Error> {
+    dns_cache
+        .resolve_candidates(host, dns_override, dns_cache_ttl_seconds)
         .await
-        .map_err(|e| anyhow::anyhow!("DNS resolution failed for {}:{}: {}", host, port, e))?;
-
-    Ok(SocketAddr::new(ip, port))
+        .map_err(|e| anyhow::anyhow!("DNS resolution failed for {}: {}", host, e))
 }
 
 /// Resolve a hostname:port to a SocketAddr (system DNS, no cache).
 ///
 /// Used only by `Http3Client` (test/integration client). The pool uses
-/// `resolve_backend_addr_cached` instead.
+/// `resolve_backend_addrs_cached` instead.
 async fn resolve_backend_addr(host: &str, port: u16) -> Result<SocketAddr, anyhow::Error> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, port));

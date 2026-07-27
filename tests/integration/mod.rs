@@ -59,6 +59,7 @@ mod log_schema_registry_tests;
 mod mesh_authz_e2e_tests;
 mod mesh_authz_negative_match_tests;
 mod mesh_bpf_metrics_scrape_tests;
+mod mesh_config_revision_tests;
 mod mesh_cross_cluster_egress_tests;
 mod mesh_destination_rule_connection_pool_audit_tests;
 mod mesh_destination_rule_locality_lb_tests;

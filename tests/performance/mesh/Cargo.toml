@@ -28,6 +28,7 @@ reqwest = { path = "../../../vendor/reqwest-0.13.3-ferrum-patched" }
 h3 = { path = "../../../vendor/h3-0.0.8-ferrum-patched" }
 tungstenite = { path = "../../../vendor/tungstenite-0.29.0-ferrum-patched" }
 tokio-tungstenite = { path = "../../../vendor/tokio-tungstenite-0.29.0-ferrum-patched" }
+dimpl = { path = "../../../vendor/dimpl-0.6.1-ferrum-patched" }
 
 [[bench]]
 name = "authz_match"

@@ -1,18 +1,30 @@
 //! Body Validation Plugin
 //!
 //! Validates JSON, XML, and gRPC protobuf request and response bodies against schemas.
-//! For JSON, validates against a JSON Schema. For XML, validates that the
-//! body is well-formed XML and optionally checks for required elements.
-//! For gRPC protobuf, validates against a compiled `FileDescriptorSet`.
+//! For JSON, configured schemas are compiled once at plugin construction with the
+//! `jsonschema` crate under an explicit draft and evaluated per request. For XML, the
+//! body is parsed with `roxmltree` and must be a well-formed XML document; required
+//! elements are matched on parsed (namespace-expanded) element names. For gRPC
+//! protobuf, the payload is decoded against a compiled `FileDescriptorSet` and every
+//! proto2 `required` field must be present, recursively.
 //!
 //! Request validation for JSON/XML runs in `before_proxy` (rejects with 400).
 //! Request validation for protobuf runs in `on_final_request_body` (rejects with 400).
 //! Response validation runs in `on_final_response_body` (rejects with 502)
 //! and requires response body buffering when configured.
+//!
+//! Every configuration surface is fail-closed: unknown top-level keys, unknown keys
+//! inside a `protobuf_method_messages` entry, malformed schemas, unsupported drafts
+//! or vocabularies, non-local `$ref`s, and schemas outside the compile budgets all
+//! make `BodyValidator::new` return an error, which keeps the last known-good
+//! plugin generation in place (`PluginFailurePolicy::FailClosed`).
 
 use async_trait::async_trait;
 use flate2::read::GzDecoder;
-use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
+use prost_reflect::{
+    Cardinality, DescriptorPool, DynamicMessage, MessageDescriptor, ReflectMessage, Syntax,
+    Value as ProtobufValue,
+};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -90,14 +102,60 @@ enum DescriptorLoadMode {
     ShapeOnly,
 }
 
+/// Every configuration key `body_validator` accepts at the top level.
+///
+/// Construction rejects anything outside this set so an operator, generated
+/// client, or control-plane typo can never silently drop an intended rule
+/// (GHSA-w7x7-ppx9-5v74). Keep in sync with
+/// `openapi.yaml#/components/schemas/BodyValidatorConfig`; parity is pinned by
+/// `tests/unit/openapi_yaml_tests.rs`.
+pub const BODY_VALIDATOR_CONFIG_KEYS: &[&str] = &[
+    "json_schema",
+    "json_schema_draft",
+    "required_fields",
+    "validate_xml",
+    "required_xml_elements",
+    "xml_max_entities",
+    "xml_reject_nested_entities",
+    "content_types",
+    "response_json_schema",
+    "response_required_fields",
+    "response_validate_xml",
+    "response_required_xml_elements",
+    "response_content_types",
+    "protobuf_descriptor_path",
+    "protobuf_request_type",
+    "protobuf_response_type",
+    "protobuf_method_messages",
+    "protobuf_reject_unknown_fields",
+    "grpc_max_decompressed_size_bytes",
+];
+
+/// Every key a single `protobuf_method_messages` entry accepts.
+pub const BODY_VALIDATOR_PROTOBUF_METHOD_KEYS: &[&str] = &["request", "response"];
+
+/// Which side of the exchange a validation failure belongs to. Response-side
+/// messages stay coarse so an upstream body's shape is not described back to
+/// the client.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Request,
+    Response,
+}
+
+struct CompiledJsonSchema {
+    validator: jsonschema::Validator,
+    canonicalize_object_order: bool,
+}
+
 pub struct BodyValidator {
     // ── Request validation config ──
-    /// JSON schema for request body validation (if configured).
-    json_schema: Option<Value>,
+    /// Compiled JSON Schema for request body validation (if configured).
+    json_validator: Option<CompiledJsonSchema>,
     /// Required JSON fields (simple validation without full JSON Schema).
     required_fields: Vec<String>,
-    /// Required XML elements in request bodies.
-    required_xml_elements: Vec<String>,
+    /// Required XML elements in request bodies, parsed into expanded names.
+    required_xml_elements: Vec<RequiredXmlElement>,
     /// Max `<!ENTITY` declarations allowed in an XML DOCTYPE before the body is
     /// rejected as a possible entity-expansion (billion-laughs) attack. Applies
     /// to both request and response XML when well-formedness validation runs.
@@ -107,20 +165,16 @@ pub struct BodyValidator {
     xml_reject_nested_entities: bool,
     /// Content types to validate for requests (empty = validate all).
     content_types: Vec<String>,
-    /// Pre-compiled regexes for JSON Schema `pattern` constraints (request).
-    compiled_patterns: HashMap<String, regex::Regex>,
 
     // ── Response validation config ──
-    /// JSON schema for response body validation (if configured).
-    response_json_schema: Option<Value>,
+    /// Compiled JSON Schema for response body validation (if configured).
+    response_json_validator: Option<CompiledJsonSchema>,
     /// Required JSON fields in response bodies.
     response_required_fields: Vec<String>,
-    /// Required XML elements in response bodies.
-    response_required_xml_elements: Vec<String>,
+    /// Required XML elements in response bodies, parsed into expanded names.
+    response_required_xml_elements: Vec<RequiredXmlElement>,
     /// Content types to validate for responses.
     response_content_types: Vec<String>,
-    /// Pre-compiled regexes for response JSON Schema `pattern` constraints.
-    response_compiled_patterns: HashMap<String, regex::Regex>,
 
     // ── Protobuf validation config ──
     /// Descriptor pool loaded from the compiled `FileDescriptorSet` binary.
@@ -138,6 +192,10 @@ pub struct BodyValidator {
     /// Missing or unreadable descriptor files fail closed for applicable gRPC
     /// traffic instead of silently disabling configured validation.
     protobuf_dependency_unavailable: bool,
+    /// Whether the loaded descriptor pool contains any proto2 file. Only proto2
+    /// has `required` fields, so proto3-only pools skip the initialization walk
+    /// entirely and keep the gRPC hot path allocation-free.
+    protobuf_pool_has_proto2: bool,
     /// Whether to reject messages with unknown field numbers.
     protobuf_reject_unknown_fields: bool,
     /// Maximum decompressed gRPC payload size; 0 disables the decompressed cap.
@@ -189,15 +247,30 @@ impl BodyValidator {
     }
 
     fn new_inner(config: &Value, descriptor_mode: DescriptorLoadMode) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(object) = config.as_object() else {
             return Err("body_validator: config must be an object".to_string());
+        };
+
+        // Fail closed on unknown keys before any default is applied so a typo
+        // can never replace a working policy with a weaker one.
+        if object
+            .keys()
+            .any(|key| !BODY_VALIDATOR_CONFIG_KEYS.contains(&key.as_str()))
+        {
+            return Err(format!(
+                "body_validator: unknown configuration key; allowed keys: {}",
+                BODY_VALIDATOR_CONFIG_KEYS.join(", ")
+            ));
         }
 
-        let json_schema = optional_schema(config, "json_schema")?.cloned();
+        let schema_draft = parse_schema_draft(optional_string(config, "json_schema_draft")?)?;
+        let json_validator = optional_compiled_schema(config, "json_schema", schema_draft)?;
         let required_fields = optional_string_vec(config, "required_fields")?.unwrap_or_default();
         let validate_xml = optional_bool(config, "validate_xml")?.unwrap_or(false);
-        let required_xml_elements =
-            optional_string_vec(config, "required_xml_elements")?.unwrap_or_default();
+        let required_xml_elements = parse_required_xml_elements(
+            optional_string_vec(config, "required_xml_elements")?.unwrap_or_default(),
+            "required_xml_elements",
+        )?;
         let xml_max_entities = optional_usize(config, "xml_max_entities")?.unwrap_or(100);
         let xml_reject_nested_entities =
             optional_bool(config, "xml_reject_nested_entities")?.unwrap_or(true);
@@ -205,13 +278,16 @@ impl BodyValidator {
             optional_content_types(config, "content_types")?.unwrap_or_else(default_content_types);
 
         // ── Response validation config ──
-        let response_json_schema = optional_schema(config, "response_json_schema")?.cloned();
+        let response_json_validator =
+            optional_compiled_schema(config, "response_json_schema", schema_draft)?;
         let response_required_fields =
             optional_string_vec(config, "response_required_fields")?.unwrap_or_default();
         let response_validate_xml =
             optional_bool(config, "response_validate_xml")?.unwrap_or(false);
-        let response_required_xml_elements =
-            optional_string_vec(config, "response_required_xml_elements")?.unwrap_or_default();
+        let response_required_xml_elements = parse_required_xml_elements(
+            optional_string_vec(config, "response_required_xml_elements")?.unwrap_or_default(),
+            "response_required_xml_elements",
+        )?;
         let response_content_types = optional_content_types(config, "response_content_types")?
             .unwrap_or_else(default_content_types);
 
@@ -225,6 +301,9 @@ impl BodyValidator {
             targets: protobuf_targets,
             dependency_unavailable: protobuf_dependency_unavailable,
         } = protobuf_config;
+        let protobuf_pool_has_proto2 = protobuf_pool
+            .as_ref()
+            .is_some_and(|pool| pool.files().any(|file| file.syntax() == Syntax::Proto2));
         let protobuf_reject_unknown_fields =
             optional_bool(config, "protobuf_reject_unknown_fields")?.unwrap_or(false);
         let grpc_max_decompressed_size_bytes =
@@ -239,8 +318,8 @@ impl BodyValidator {
             response_validate_xml || !response_required_xml_elements.is_empty();
 
         let has_json_xml_request =
-            json_schema.is_some() || !required_fields.is_empty() || has_xml_request_validation;
-        let has_json_xml_response = response_json_schema.is_some()
+            json_validator.is_some() || !required_fields.is_empty() || has_xml_request_validation;
+        let has_json_xml_response = response_json_validator.is_some()
             || !response_required_fields.is_empty()
             || has_xml_response_validation;
 
@@ -254,39 +333,24 @@ impl BodyValidator {
             );
         }
 
-        // Pre-compile all regex patterns found in schemas at config load time.
-        let mut compiled_patterns = HashMap::new();
-        if let Some(ref schema) = json_schema {
-            collect_patterns(schema, &mut compiled_patterns, "json_schema")?;
-        }
-        let mut response_compiled_patterns = HashMap::new();
-        if let Some(ref schema) = response_json_schema {
-            collect_patterns(
-                schema,
-                &mut response_compiled_patterns,
-                "response_json_schema",
-            )?;
-        }
-
         Ok(Self {
-            json_schema,
+            json_validator,
             required_fields,
             required_xml_elements,
             xml_max_entities,
             xml_reject_nested_entities,
             content_types,
-            compiled_patterns,
-            response_json_schema,
+            response_json_validator,
             response_required_fields,
             response_required_xml_elements,
             response_content_types,
-            response_compiled_patterns,
             _protobuf_pool: protobuf_pool,
             protobuf_request_descriptor,
             protobuf_response_descriptor,
             protobuf_method_messages,
             protobuf_targets,
             protobuf_dependency_unavailable,
+            protobuf_pool_has_proto2,
             protobuf_reject_unknown_fields,
             grpc_max_decompressed_size_bytes,
             has_request_validation,
@@ -300,14 +364,15 @@ impl BodyValidator {
     }
 
     fn validate_json_body(
-        &self,
         body: &str,
         required_fields: &[String],
-        json_schema: Option<&Value>,
-        compiled_patterns: &HashMap<String, regex::Regex>,
+        json_schema: Option<&CompiledJsonSchema>,
+        direction: Direction,
     ) -> Result<(), String> {
-        // Parse as JSON
-        let parsed: Value =
+        // Parse as JSON. `serde_json`'s own 128-level nesting limit bounds the
+        // instance depth the compiled validator then walks, so a deeply nested
+        // hostile body cannot drive unbounded recursion here.
+        let mut parsed: Value =
             serde_json::from_str(body).map_err(|e| format!("Invalid JSON: {}", e))?;
 
         // Check required fields
@@ -321,428 +386,89 @@ impl BodyValidator {
             return Err("Body must be a JSON object".to_string());
         }
 
-        // Validate against JSON Schema if provided
+        // Validate against the schema compiled at plugin construction. Nothing
+        // is compiled per request, and the reported message never echoes the
+        // rejected value.
         if let Some(schema) = json_schema {
-            Self::validate_against_schema_with(compiled_patterns, &parsed, schema)?;
+            // jsonschema 0.46.5 compares object members in insertion order for
+            // `uniqueItems` when serde_json's workspace-wide `preserve_order`
+            // feature is active. JSON object equality is order-insensitive, so
+            // canonicalize only for schemas that actually use `uniqueItems`.
+            // The flag is computed once by the schema-position audit; all other
+            // validators retain the existing request-path cost.
+            if schema.canonicalize_object_order {
+                parsed.sort_all_objects();
+            }
+            if let Err(error) = schema.validator.validate(&parsed) {
+                return Err(schema_violation_message(&error, direction));
+            }
         }
 
         Ok(())
     }
 
-    fn validate_against_schema_with(
-        compiled_patterns: &HashMap<String, regex::Regex>,
-        data: &Value,
-        schema: &Value,
-    ) -> Result<(), String> {
-        // --- enum constraint (applies to any type) ---
-        if let Some(enum_values) = schema.get("enum").and_then(|e| e.as_array())
-            && !enum_values.contains(data)
-        {
-            return Err(format!(
-                "Value {} is not one of the allowed enum values",
-                data
-            ));
-        }
-
-        // --- const constraint ---
-        if let Some(const_val) = schema.get("const")
-            && data != const_val
-        {
-            return Err(format!("Value must be {}", const_val));
-        }
-
-        // --- type checking ---
-        if let Some(schema_type) = schema.get("type").and_then(|t| t.as_str()) {
-            let type_valid = match schema_type {
-                "object" => data.is_object(),
-                "array" => data.is_array(),
-                "string" => data.is_string(),
-                "number" => data.is_number(),
-                "integer" => data.is_i64() || data.is_u64(),
-                "boolean" => data.is_boolean(),
-                "null" => data.is_null(),
-                _ => true,
-            };
-            if !type_valid {
-                return Err(format!(
-                    "Expected type '{}', got '{}'",
-                    schema_type,
-                    json_type_name(data)
-                ));
-            }
-        }
-
-        // --- string constraints ---
-        if let Some(s) = data.as_str() {
-            // JSON Schema specifies minLength/maxLength count Unicode code points,
-            // not bytes (RFC 8927 / JSON Schema Validation §6.3).
-            let char_count = s.chars().count() as u64;
-            if let Some(min) = schema.get("minLength").and_then(|v| v.as_u64())
-                && char_count < min
-            {
-                return Err(format!(
-                    "String length {} (code points) is less than minLength {}",
-                    char_count, min
-                ));
-            }
-            if let Some(max) = schema.get("maxLength").and_then(|v| v.as_u64())
-                && char_count > max
-            {
-                return Err(format!(
-                    "String length {} (code points) exceeds maxLength {}",
-                    char_count, max
-                ));
-            }
-            if let Some(pattern) = schema.get("pattern").and_then(|v| v.as_str()) {
-                if let Some(re) = compiled_patterns.get(pattern) {
-                    if !re.is_match(s) {
-                        return Err(format!(
-                            "String '{}' does not match pattern '{}'",
-                            s, pattern
-                        ));
-                    }
-                } else {
-                    return Err(format!(
-                        "Pattern '{}' was not compiled at config load time",
-                        pattern
-                    ));
-                }
-            }
-            if let Some(format_name) = schema.get("format").and_then(|v| v.as_str()) {
-                validate_format(s, format_name)?;
-            }
-        }
-
-        // --- numeric constraints ---
-        if let Some(n) = data.as_f64() {
-            if let Some(min) = schema.get("minimum").and_then(|v| v.as_f64())
-                && n < min
-            {
-                return Err(format!("Value {} is less than minimum {}", n, min));
-            }
-            if let Some(max) = schema.get("maximum").and_then(|v| v.as_f64())
-                && n > max
-            {
-                return Err(format!("Value {} exceeds maximum {}", n, max));
-            }
-            if let Some(ex_min) = schema.get("exclusiveMinimum").and_then(|v| v.as_f64())
-                && n <= ex_min
-            {
-                return Err(format!(
-                    "Value {} must be greater than exclusiveMinimum {}",
-                    n, ex_min
-                ));
-            }
-            if let Some(ex_max) = schema.get("exclusiveMaximum").and_then(|v| v.as_f64())
-                && n >= ex_max
-            {
-                return Err(format!(
-                    "Value {} must be less than exclusiveMaximum {}",
-                    n, ex_max
-                ));
-            }
-            if let Some(divisor) = schema.get("multipleOf")
-                && let Some(multiple) = divisor.as_f64()
-                && multiple != 0.0
-                && !value_is_multiple_of(data, divisor, n, multiple)
-            {
-                return Err(format!("Value {} is not a multiple of {}", n, multiple));
-            }
-        }
-
-        // --- required properties (object) ---
-        if let (Some(required), Some(data_obj)) = (
-            schema.get("required").and_then(|r| r.as_array()),
-            data.as_object(),
-        ) {
-            for req in required {
-                if let Some(field_name) = req.as_str()
-                    && !data_obj.contains_key(field_name)
-                {
-                    return Err(format!("Missing required property: {}", field_name));
-                }
-            }
-        }
-
-        // --- validate object properties ---
-        if let (Some(props), Some(data_obj)) = (
-            schema.get("properties").and_then(|p| p.as_object()),
-            data.as_object(),
-        ) {
-            for (key, prop_schema) in props {
-                if let Some(value) = data_obj.get(key) {
-                    Self::validate_against_schema_with(compiled_patterns, value, prop_schema)?;
-                }
-            }
-        }
-
-        // --- additionalProperties ---
-        if let Some(data_obj) = data.as_object() {
-            let defined_props = schema.get("properties").and_then(|p| p.as_object());
-            if let Some(additional) = schema.get("additionalProperties") {
-                if additional.as_bool() == Some(false) {
-                    for key in data_obj.keys() {
-                        if !defined_props.map(|d| d.contains_key(key)).unwrap_or(false) {
-                            return Err(format!("Additional property '{}' is not allowed", key));
-                        }
-                    }
-                } else if additional.is_object() {
-                    let defined_keys: std::collections::HashSet<&String> = defined_props
-                        .map(|d| d.keys().collect())
-                        .unwrap_or_default();
-                    for (key, value) in data_obj {
-                        if !defined_keys.contains(key) {
-                            Self::validate_against_schema_with(
-                                compiled_patterns,
-                                value,
-                                additional,
-                            )?;
-                        }
-                    }
-                }
-            }
-
-            // --- minProperties / maxProperties ---
-            if let Some(min) = schema.get("minProperties").and_then(|v| v.as_u64())
-                && (data_obj.len() as u64) < min
-            {
-                return Err(format!(
-                    "Object has {} properties, minimum is {}",
-                    data_obj.len(),
-                    min
-                ));
-            }
-            if let Some(max) = schema.get("maxProperties").and_then(|v| v.as_u64())
-                && (data_obj.len() as u64) > max
-            {
-                return Err(format!(
-                    "Object has {} properties, maximum is {}",
-                    data_obj.len(),
-                    max
-                ));
-            }
-        }
-
-        // --- array constraints ---
-        if let Some(arr) = data.as_array() {
-            if let Some(items_schema) = schema.get("items") {
-                for (i, item) in arr.iter().enumerate() {
-                    Self::validate_against_schema_with(compiled_patterns, item, items_schema)
-                        .map_err(|e| format!("Array item [{}]: {}", i, e))?;
-                }
-            }
-
-            if let Some(min) = schema.get("minItems").and_then(|v| v.as_u64())
-                && (arr.len() as u64) < min
-            {
-                return Err(format!("Array has {} items, minimum is {}", arr.len(), min));
-            }
-            if let Some(max) = schema.get("maxItems").and_then(|v| v.as_u64())
-                && (arr.len() as u64) > max
-            {
-                return Err(format!("Array has {} items, maximum is {}", arr.len(), max));
-            }
-            if schema.get("uniqueItems").and_then(|v| v.as_bool()) == Some(true) {
-                // O(n) average uniqueness check: serde_json's `Value` implements
-                // `Hash`/`Eq` consistently (its `Map` hashes order-independently),
-                // so a hash set of element references detects the first duplicate
-                // with the same semantics as pairwise `Value` equality, without the
-                // O(n^2) blowup on attacker-controlled array breadth (finding #16).
-                let mut seen: HashMap<&Value, usize> =
-                    HashMap::with_capacity(arr.len().min(MAX_UNIQUE_ITEMS_PREALLOC));
-                for (j, item) in arr.iter().enumerate() {
-                    if let Some(&i) = seen.get(item) {
-                        return Err(format!(
-                            "Array items at index {} and {} are not unique",
-                            i, j
-                        ));
-                    }
-                    seen.insert(item, j);
-                }
-            }
-        }
-
-        // --- composition: allOf, anyOf, oneOf, not ---
-        if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
-            for (i, sub_schema) in all_of.iter().enumerate() {
-                Self::validate_against_schema_with(compiled_patterns, data, sub_schema)
-                    .map_err(|e| format!("allOf[{}]: {}", i, e))?;
-            }
-        }
-
-        if let Some(any_of) = schema.get("anyOf").and_then(|v| v.as_array()) {
-            let matched = any_of.iter().any(|sub| {
-                Self::validate_against_schema_with(compiled_patterns, data, sub).is_ok()
-            });
-            if !matched {
-                return Err("Value does not match any of the anyOf schemas".to_string());
-            }
-        }
-
-        if let Some(one_of) = schema.get("oneOf").and_then(|v| v.as_array()) {
-            let match_count = one_of
-                .iter()
-                .filter(|sub| {
-                    Self::validate_against_schema_with(compiled_patterns, data, sub).is_ok()
-                })
-                .count();
-            if match_count != 1 {
-                return Err(format!(
-                    "Value must match exactly one oneOf schema, but matched {}",
-                    match_count
-                ));
-            }
-        }
-
-        if let Some(not_schema) = schema.get("not")
-            && Self::validate_against_schema_with(compiled_patterns, data, not_schema).is_ok()
-        {
-            return Err("Value must not match the 'not' schema".to_string());
-        }
-
-        Ok(())
-    }
-
+    /// Validate that a body is a well-formed XML document and contains every
+    /// configured required element.
+    ///
+    /// Well-formedness is decided by `roxmltree`, a maintained, namespace-aware,
+    /// non-fetching XML parser, rather than by a tag-balancing scan
+    /// (GHSA-mg9q-6h9j-9mmv). That means exactly one document element, XML `Name`
+    /// syntax, attribute grammar/quoting/uniqueness, character validity, entity
+    /// reference validity, and text placement are all enforced by the parser's
+    /// documented contract. The exact original string is parsed without Unicode
+    /// whitespace normalization. External entities are never retrieved.
+    ///
+    /// Two bounded pre-parse guards still run first because they encode policy the
+    /// parser has no opinion on: the configured `<!ENTITY` declaration cap /
+    /// nested-entity rejection, and outright rejection of external
+    /// (`SYSTEM`/`PUBLIC`) identifiers on both the DOCTYPE and entity
+    /// declarations. The parser is then given a node budget so a pathologically
+    /// wide document cannot allocate without bound.
     fn validate_xml_body(
         body: &str,
-        required_xml_elements: &[String],
+        required_xml_elements: &[RequiredXmlElement],
         max_entities: usize,
         reject_nested: bool,
     ) -> Result<(), String> {
-        // Basic well-formedness check: must start with < and have matching tags
-        let trimmed = body.trim();
-        if trimmed.is_empty() {
+        if body.is_empty() {
             return Err("Empty XML body".to_string());
         }
-        if !trimmed.starts_with('<') {
-            return Err("Invalid XML: must start with '<'".to_string());
+
+        // Reject entity-expansion bombs and external identifiers at the edge
+        // (Ferrum does not expand entities, but backends may).
+        check_xml_entity_expansion(body, max_entities, reject_nested)?;
+
+        let document = roxmltree::Document::parse_with_options(
+            body,
+            roxmltree::ParsingOptions {
+                // DTDs are permitted only so the configured entity policy above
+                // stays the authority on declaration count and nesting; the
+                // parser still applies its own billion-laughs limits (expansion
+                // depth 10, 255 references per reference) and never resolves an
+                // external entity.
+                allow_dtd: true,
+                nodes_limit: XML_MAX_NODES,
+            },
+        )
+        .map_err(|e| format!("Invalid XML: {}", xml_error_category(&e)))?;
+
+        if required_xml_elements.is_empty() {
+            return Ok(());
         }
 
-        // Reject entity-expansion bombs at the edge (Ferrum does not expand
-        // entities, but backends do). Required-element presence is enforced
-        // below via the parsed start-tag stack (`required_found`), which is
-        // CDATA/comment-spoof-proof — so the old `contains_xml_open_tag` scan
-        // from the WAF-hardening branch is intentionally dropped here.
-        check_xml_entity_expansion(trimmed, max_entities, reject_nested)?;
-
-        // Tag balance check with proper handling of CDATA, comments,
-        // processing instructions, and DOCTYPE declarations.
-        let bytes = trimmed.as_bytes();
-        let len = bytes.len();
-        let mut stack: Vec<&str> = Vec::new();
         let mut required_found = vec![false; required_xml_elements.len()];
-        let mut i = 0;
-
-        while i < len {
-            if bytes[i] != b'<' {
-                i += 1;
-                continue;
-            }
-
-            // We're at a '<' — determine what kind of construct follows
-            let remaining = &bytes[i..];
-
-            // CDATA section: <![CDATA[ ... ]]>
-            if remaining.starts_with(b"<![CDATA[") {
-                match find_subsequence(&bytes[i + 9..], b"]]>") {
-                    Some(end) => {
-                        i = i + 9 + end + 3;
-                        continue;
-                    }
-                    None => return Err("Unterminated CDATA section".to_string()),
+        for node in document.descendants().filter(roxmltree::Node::is_element) {
+            let name = node.tag_name();
+            for (idx, required) in required_xml_elements.iter().enumerate() {
+                if !required_found[idx] && required.matches(name.namespace(), name.name()) {
+                    required_found[idx] = true;
                 }
             }
-
-            // Comment: <!-- ... -->
-            if remaining.starts_with(b"<!--") {
-                match find_subsequence(&bytes[i + 4..], b"-->") {
-                    Some(end) => {
-                        i = i + 4 + end + 3;
-                        continue;
-                    }
-                    None => return Err("Unterminated XML comment".to_string()),
-                }
-            }
-
-            // Processing instruction: <? ... ?>
-            if remaining.len() >= 2 && remaining[1] == b'?' {
-                match find_subsequence(&bytes[i + 2..], b"?>") {
-                    Some(end) => {
-                        i = i + 2 + end + 2;
-                        continue;
-                    }
-                    None => return Err("Unterminated processing instruction".to_string()),
-                }
-            }
-
-            // DOCTYPE declaration: <!DOCTYPE ... >
-            if remaining.starts_with(b"<!") {
-                // Skip any <! declaration (DOCTYPE, etc.) — find matching >
-                match find_byte(&bytes[i + 2..], b'>') {
-                    Some(end) => {
-                        i = i + 2 + end + 1;
-                        continue;
-                    }
-                    None => return Err("Unterminated declaration".to_string()),
-                }
-            }
-
-            // Closing tag: </...>
-            if remaining.len() >= 2 && remaining[1] == b'/' {
-                match find_byte(&bytes[i + 2..], b'>') {
-                    Some(end) => {
-                        let tag_end = i + 2 + end;
-                        let Some(name) = xml_tag_name(trimmed, i + 2, tag_end) else {
-                            return Err("Invalid XML: empty closing tag".to_string());
-                        };
-                        let Some(open_name) = stack.pop() else {
-                            return Err(format!("Unexpected closing tag: {}", name));
-                        };
-                        if open_name != name {
-                            return Err(format!(
-                                "Mismatched XML closing tag: expected </{}>, got </{}>",
-                                open_name, name
-                            ));
-                        }
-                        i = i + 2 + end + 1;
-                        continue;
-                    }
-                    None => return Err("Unterminated closing tag".to_string()),
-                }
-            }
-
-            // Regular tag: <name ... /> or <name ... >
-            match find_byte(&bytes[i + 1..], b'>') {
-                Some(end) => {
-                    // Check if self-closing (ends with />, allowing whitespace between
-                    // attributes and the slash, e.g., <name attr="v" />). Walk
-                    // backward from `>` skipping XML whitespace per W3C XML 1.0 §2.3.
-                    let tag_end = i + 1 + end;
-                    let Some(name) = xml_tag_name(trimmed, i + 1, tag_end) else {
-                        return Err("Invalid XML: empty tag name".to_string());
-                    };
-                    for (idx, required) in required_xml_elements.iter().enumerate() {
-                        if !required_found[idx] && name == *required {
-                            required_found[idx] = true;
-                        }
-                    }
-                    let self_closing = is_self_closing_tag(bytes, i + 1, tag_end);
-                    if !self_closing {
-                        stack.push(name);
-                    }
-                    i = tag_end + 1;
-                }
-                None => return Err("Unterminated tag".to_string()),
-            }
-        }
-
-        if let Some(unclosed) = stack.last() {
-            return Err(format!("Unclosed XML tag: {}", unclosed));
         }
 
         for (idx, element) in required_xml_elements.iter().enumerate() {
             if !required_found[idx] {
-                return Err(format!("Missing required XML element: {}", element));
+                return Err(format!("Missing required XML element: {}", element.display));
             }
         }
 
@@ -761,6 +487,15 @@ impl BodyValidator {
         let payload = parse_grpc_frame(body, self.grpc_max_decompressed_size_bytes)?;
         let msg = DynamicMessage::decode(descriptor.clone(), payload.as_ref())
             .map_err(|e| format!("Protobuf decode failed: {}", e))?;
+        // Wire decoding does not enforce proto2 initialization, so a correctly
+        // framed message that omits a `required` field decodes cleanly
+        // (GHSA-qvrp-m3v9-345m). Walk the descriptor and reject any missing
+        // required field, including inside nested/repeated/map/extension values.
+        // This is independent of the unknown-field policy below.
+        if self.protobuf_pool_has_proto2 {
+            let mut budget = ProtobufWalkBudget::default();
+            check_proto2_required_fields(&msg, &mut budget)?;
+        }
         if self.protobuf_reject_unknown_fields {
             let unknown_count = msg.unknown_fields().count();
             if unknown_count > 0 {
@@ -791,7 +526,7 @@ impl BodyValidator {
 
     /// Whether JSON response validation rules are configured.
     fn has_json_response_validation(&self) -> bool {
-        self.response_json_schema.is_some() || !self.response_required_fields.is_empty()
+        self.response_json_validator.is_some() || !self.response_required_fields.is_empty()
     }
 
     /// Resolve the gRPC method path used for response descriptor lookup.
@@ -877,14 +612,6 @@ impl BodyValidator {
 /// the process.
 const DEFAULT_MAX_GRPC_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
 
-/// Upper bound on the initial capacity reserved for the `uniqueItems` hash set.
-/// The set still grows as needed for larger arrays; this only caps the single
-/// up-front reservation so a large declared array length cannot trigger one
-/// oversized allocation before any work is done (finding #16 defense-in-depth).
-/// The array length itself is already bounded by the request/response body-size
-/// limit, and the duplicate scan is O(n) average regardless of this value.
-const MAX_UNIQUE_ITEMS_PREALLOC: usize = 4096;
-
 fn parse_grpc_frame(
     body: &[u8],
     max_decompressed_size_bytes: usize,
@@ -944,22 +671,735 @@ fn default_grpc_max_decompressed_size_bytes() -> usize {
         .unwrap_or(DEFAULT_MAX_GRPC_DECOMPRESSED_SIZE)
 }
 
-fn optional_schema<'a>(
-    config: &'a Value,
+/// Supported JSON Schema dialects. There is no "whatever the library guesses"
+/// mode: a configured schema is always compiled under one explicit draft so an
+/// operator cannot end up with silently different keyword semantics.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SchemaDraft {
+    Draft7,
+    Draft202012,
+}
+
+impl SchemaDraft {
+    fn config_value(self) -> &'static str {
+        match self {
+            Self::Draft7 => "draft7",
+            Self::Draft202012 => "draft2020-12",
+        }
+    }
+
+    /// `$schema` URIs that name this draft.
+    fn schema_uris(self) -> &'static [&'static str] {
+        match self {
+            Self::Draft7 => &[
+                "http://json-schema.org/draft-07/schema#",
+                "https://json-schema.org/draft-07/schema#",
+                "http://json-schema.org/draft-07/schema",
+                "https://json-schema.org/draft-07/schema",
+            ],
+            Self::Draft202012 => &[
+                "https://json-schema.org/draft/2020-12/schema",
+                "http://json-schema.org/draft/2020-12/schema",
+                "https://json-schema.org/draft/2020-12/schema#",
+                "http://json-schema.org/draft/2020-12/schema#",
+            ],
+        }
+    }
+}
+
+/// Maximum nesting depth of a configured JSON Schema document.
+const MAX_SCHEMA_DEPTH: usize = 32;
+
+/// Maximum number of JSON nodes inspected while auditing a configured schema.
+const MAX_SCHEMA_NODES: usize = 20_000;
+
+/// Node budget handed to the XML parser so a pathologically wide document
+/// cannot allocate a tree without bound.
+const XML_MAX_NODES: u32 = 100_000;
+
+fn parse_schema_draft(raw: Option<&str>) -> Result<SchemaDraft, String> {
+    match raw {
+        None => Ok(SchemaDraft::Draft202012),
+        Some("draft2020-12") => Ok(SchemaDraft::Draft202012),
+        Some("draft7") => Ok(SchemaDraft::Draft7),
+        Some(_) => Err(
+            "body_validator: 'json_schema_draft' must be 'draft2020-12' or 'draft7'".to_string(),
+        ),
+    }
+}
+
+/// Read, audit, and compile an optional JSON Schema configuration field.
+///
+/// Compilation happens once, here, at plugin construction — never on the
+/// request path (GHSA-5883-wg84-7rhm). Anything the audit or the compiler
+/// rejects fails construction, which preserves the last known-good plugin
+/// generation instead of admitting a policy whose decisive constraints would
+/// silently never run.
+fn optional_compiled_schema(
+    config: &Value,
     field: &'static str,
-) -> Result<Option<&'a Value>, String> {
+    draft: SchemaDraft,
+) -> Result<Option<CompiledJsonSchema>, String> {
     let Some(value) = config.get(field) else {
         return Ok(None);
     };
-    if let Some(object) = value.as_object() {
-        if object.is_empty() {
-            return Err(format!("body_validator: '{field}' must not be empty"));
-        }
-        Ok(Some(value))
-    } else {
-        Err(format!(
+    let Some(object) = value.as_object() else {
+        return Err(format!(
             "body_validator: '{field}' must be a JSON Schema object"
-        ))
+        ));
+    };
+    if object.is_empty() {
+        return Err(format!("body_validator: '{field}' must not be empty"));
+    }
+
+    let audit = audit_schema(value, field, draft)?;
+
+    let options = match draft {
+        SchemaDraft::Draft7 => jsonschema::draft7::options(),
+        SchemaDraft::Draft202012 => jsonschema::draft202012::options(),
+    };
+    options
+        // `format` stays an asserted constraint in both drafts so the documented
+        // format vocabulary keeps rejecting bad values. Unknown format names
+        // remain advisory per the specification.
+        .should_validate_formats(true)
+        .build(value)
+        .map_err(|_| {
+            format!(
+                "body_validator: '{field}' is not a valid {} JSON Schema",
+                draft.config_value()
+            )
+        })
+        // A configured, non-empty, audited schema always yields a live
+        // validator here; `Ok(None)` above is reserved for "the operator did
+        // not configure this field at all", so an unconfigured surface stays
+        // unvalidated while a configured one can never degrade to `None`.
+        .map(|validator| {
+            Some(CompiledJsonSchema {
+                validator,
+                canonicalize_object_order: audit.has_unique_items,
+            })
+        })
+}
+
+#[derive(Default)]
+struct SchemaAudit {
+    has_unique_items: bool,
+}
+
+/// Bounded structural and semantic audit of a configured JSON Schema.
+///
+/// The compiler already rejects malformed keyword shapes, invalid type names,
+/// and bad regexes. The structural pass charges every JSON value, including
+/// literal instance data and annotations. The semantic pass applies keyword
+/// policy only at actual schema positions and follows the subschema-bearing
+/// keywords supported by Draft 7 and Draft 2020-12, plus any schema target
+/// reached through a supported local URI-fragment JSON Pointer.
+///
+/// Together the passes add the policy the library cannot express:
+///
+/// * every `$ref` / `$dynamicRef` must be a local fragment (`#...`), so no
+///   schema can cause a network or filesystem retrieval. The `jsonschema`
+///   dependency is built with `default-features = false`, which also removes
+///   the HTTP and file retrievers entirely — this is the explicit, message-
+///   bearing half of that defence.
+/// * `$id` / `id` must be fragment-only, so a base URI cannot re-point an
+///   otherwise local `$ref` at an external resource.
+/// * `$vocabulary` is refused outright: Ferrum cannot honour a custom
+///   vocabulary, and silently ignoring one is exactly the failure mode this
+///   advisory is about.
+/// * `$schema`, when present, must name the configured draft.
+/// * depth and node count stay inside fixed budgets across the complete value.
+fn audit_schema(
+    schema: &Value,
+    field: &'static str,
+    draft: SchemaDraft,
+) -> Result<SchemaAudit, String> {
+    let mut nodes = 0usize;
+    audit_schema_structure(schema, field, 0, &mut nodes)?;
+
+    let mut audit = SchemaAudit::default();
+    let mut visited = HashSet::new();
+    audit_schema_node(schema, schema, field, draft, &mut audit, &mut visited)?;
+    Ok(audit)
+}
+
+fn audit_schema_structure(
+    node: &Value,
+    field: &'static str,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), String> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return Err(format!(
+            "body_validator: '{field}' nests deeper than the {MAX_SCHEMA_DEPTH}-level schema budget"
+        ));
+    }
+    *nodes += 1;
+    if *nodes > MAX_SCHEMA_NODES {
+        return Err(format!(
+            "body_validator: '{field}' exceeds the {MAX_SCHEMA_NODES}-node schema budget"
+        ));
+    }
+
+    match node {
+        Value::Array(items) => {
+            for item in items {
+                audit_schema_structure(item, field, depth + 1, nodes)?;
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                audit_schema_structure(value, field, depth + 1, nodes)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn audit_schema_node(
+    node: &Value,
+    document: &Value,
+    field: &'static str,
+    draft: SchemaDraft,
+    audit: &mut SchemaAudit,
+    visited: &mut HashSet<usize>,
+) -> Result<(), String> {
+    // A JSON value cannot contain an in-memory cycle, but local references can
+    // revisit the same target indefinitely. Identity-based deduplication makes
+    // the semantic walk no larger than the already-budgeted supplied value.
+    let identity = std::ptr::from_ref(node) as usize;
+    if !visited.insert(identity) {
+        return Ok(());
+    }
+
+    // Both supported drafts allow boolean schemas. Scalars and arrays reached
+    // through malformed keyword shapes are left to the compiler to reject.
+    let Value::Object(map) = node else {
+        return Ok(());
+    };
+
+    let reference_keywords: &[&str] = match draft {
+        SchemaDraft::Draft7 => &["$ref"],
+        SchemaDraft::Draft202012 => &["$ref", "$dynamicRef"],
+    };
+    for &key in reference_keywords {
+        if let Some(value) = map.get(key) {
+            let Some(reference) = value.as_str() else {
+                return Err(format!(
+                    "body_validator: '{field}' has a non-string '{key}'"
+                ));
+            };
+            if !reference.starts_with('#') {
+                return Err(format!(
+                    "body_validator: '{field}' has a non-local '{key}'; \
+                     only local references (starting with '#') \
+                     are supported and no external reference is ever retrieved"
+                ));
+            }
+            if let Some(target) = local_json_pointer_target(document, reference, field, key)? {
+                audit_schema_node(target, document, field, draft, audit, visited)?;
+            }
+        }
+    }
+
+    for key in ["$id", "id"] {
+        if let Some(value) = map.get(key) {
+            let Some(id) = value.as_str() else {
+                return Err(format!(
+                    "body_validator: '{field}' has a non-string '{key}'"
+                ));
+            };
+            if !id.starts_with('#') {
+                return Err(format!(
+                    "body_validator: '{field}' has a non-fragment '{key}'; \
+                     a base URI would allow external reference resolution"
+                ));
+            }
+        }
+    }
+
+    if map.contains_key("$vocabulary") {
+        return Err(format!(
+            "body_validator: '{field}' declares '$vocabulary'; custom \
+             vocabularies are not supported and would not be enforced"
+        ));
+    }
+
+    if let Some(value) = map.get("$schema") {
+        let Some(uri) = value.as_str() else {
+            return Err(format!(
+                "body_validator: '{field}' has a non-string '$schema'"
+            ));
+        };
+        if !draft.schema_uris().contains(&uri) {
+            return Err(format!(
+                "body_validator: '{field}' declares an unsupported '$schema'; \
+                 configured draft is '{}'",
+                draft.config_value()
+            ));
+        }
+    }
+
+    if map.get("uniqueItems").and_then(Value::as_bool) == Some(true) {
+        audit.has_unique_items = true;
+    }
+
+    // These object-valued keywords contain schemas as their map values. The
+    // member names are instance-property/definition names, never keywords.
+    for keyword in ["properties", "patternProperties"] {
+        if let Some(subschemas) = map.get(keyword).and_then(Value::as_object) {
+            for subschema in subschemas.values() {
+                audit_schema_node(subschema, document, field, draft, audit, visited)?;
+            }
+        }
+    }
+
+    // Match referencing 0.46.5's configured-draft child maps. Draft 7 walks
+    // `definitions` only. Draft 2020-12 walks `$defs` and keeps its legacy
+    // `definitions` compatibility. A Draft 7 `$defs` value remains literal
+    // unless a local JSON Pointer explicitly reaches it above.
+    let definition_keywords: &[&str] = match draft {
+        SchemaDraft::Draft7 => &["definitions"],
+        SchemaDraft::Draft202012 => &["$defs", "definitions"],
+    };
+    for &keyword in definition_keywords {
+        if let Some(subschemas) = map.get(keyword).and_then(Value::as_object) {
+            for subschema in subschemas.values() {
+                audit_schema_node(subschema, document, field, draft, audit, visited)?;
+            }
+        }
+    }
+
+    match draft {
+        SchemaDraft::Draft7 => {
+            // A Draft 7 dependency value is either a schema or an array of
+            // property names. Arrays are literal names and are not traversed.
+            if let Some(dependencies) = map.get("dependencies").and_then(Value::as_object) {
+                for dependency in dependencies.values() {
+                    if dependency.is_object() || dependency.is_boolean() {
+                        audit_schema_node(dependency, document, field, draft, audit, visited)?;
+                    }
+                }
+            }
+        }
+        SchemaDraft::Draft202012 => {
+            if let Some(subschemas) = map.get("dependentSchemas").and_then(Value::as_object) {
+                for subschema in subschemas.values() {
+                    audit_schema_node(subschema, document, field, draft, audit, visited)?;
+                }
+            }
+        }
+    }
+
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(subschemas) = map.get(keyword).and_then(Value::as_array) {
+            for subschema in subschemas {
+                audit_schema_node(subschema, document, field, draft, audit, visited)?;
+            }
+        }
+    }
+
+    match draft {
+        SchemaDraft::Draft7 => {
+            if let Some(items) = map.get("items").and_then(Value::as_array) {
+                for subschema in items {
+                    audit_schema_node(subschema, document, field, draft, audit, visited)?;
+                }
+            }
+        }
+        SchemaDraft::Draft202012 => {
+            if let Some(subschemas) = map.get("prefixItems").and_then(Value::as_array) {
+                for subschema in subschemas {
+                    audit_schema_node(subschema, document, field, draft, audit, visited)?;
+                }
+            }
+        }
+    }
+
+    for keyword in [
+        "additionalProperties",
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(subschema) = map.get(keyword) {
+            audit_schema_node(subschema, document, field, draft, audit, visited)?;
+        }
+    }
+
+    match draft {
+        SchemaDraft::Draft7 => {
+            for keyword in ["items", "additionalItems"] {
+                if let Some(subschema) = map.get(keyword)
+                    && !subschema.is_array()
+                {
+                    audit_schema_node(subschema, document, field, draft, audit, visited)?;
+                }
+            }
+        }
+        SchemaDraft::Draft202012 => {
+            for keyword in [
+                "items",
+                "unevaluatedProperties",
+                "unevaluatedItems",
+                "contentSchema",
+            ] {
+                if let Some(subschema) = map.get(keyword) {
+                    audit_schema_node(subschema, document, field, draft, audit, visited)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve a supported local URI-fragment JSON Pointer exactly as
+/// `referencing` 0.46.5 does for a single schema document.
+///
+/// The fragment kind is selected before percent-decoding: `#` is the root,
+/// `#/...` is a pointer, and any other `#name` is an anchor. Pointer text after
+/// the leading slash is percent-decoded as one UTF-8 string, then object keys
+/// apply JSON Pointer `~1` / `~0` unescaping. Array segments use `usize::parse`
+/// directly, matching the library's accepted index spellings and failures.
+fn local_json_pointer_target<'a>(
+    document: &'a Value,
+    reference: &str,
+    field: &'static str,
+    keyword: &str,
+) -> Result<Option<&'a Value>, String> {
+    let fragment = reference
+        .strip_prefix('#')
+        .ok_or_else(|| format!("body_validator: '{field}' has a non-local '{keyword}'"))?;
+    if fragment.is_empty() || !fragment.starts_with('/') {
+        // The root was already visited. Anchor resources are indexed only while
+        // the library walks actual draft-specific schema positions, which this
+        // audit also visits, so there is no hidden anchor target to discover.
+        return Ok(None);
+    }
+
+    let decoded = percent_encoding::percent_decode_str(&fragment[1..])
+        .decode_utf8()
+        .map_err(|_| {
+            format!(
+                "body_validator: '{field}' has invalid UTF-8 percent encoding \
+                 in a local '{keyword}' JSON Pointer"
+            )
+        })?;
+    let mut target = document;
+    for raw_segment in decoded.split('/') {
+        target = match target {
+            Value::Array(items) => {
+                let index = raw_segment.parse::<usize>().map_err(|_| {
+                    format!(
+                        "body_validator: '{field}' has invalid array index in \
+                         a local '{keyword}' JSON Pointer"
+                    )
+                })?;
+                items.get(index).ok_or_else(|| {
+                    format!(
+                        "body_validator: '{field}' has a local '{keyword}' JSON \
+                         Pointer that resolves nowhere"
+                    )
+                })?
+            }
+            Value::Object(map) => {
+                let segment = unescape_json_pointer_segment(raw_segment);
+                map.get(segment.as_ref()).ok_or_else(|| {
+                    format!(
+                        "body_validator: '{field}' has a local '{keyword}' JSON \
+                         Pointer that resolves nowhere"
+                    )
+                })?
+            }
+            _ => {
+                return Err(format!(
+                    "body_validator: '{field}' has a local '{keyword}' JSON \
+                     Pointer that resolves nowhere"
+                ));
+            }
+        };
+    }
+    Ok(Some(target))
+}
+
+fn unescape_json_pointer_segment(segment: &str) -> Cow<'_, str> {
+    if !segment.contains('~') {
+        return Cow::Borrowed(segment);
+    }
+
+    let mut output = String::with_capacity(segment.len());
+    let mut chars = segment.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '~' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('0') => output.push('~'),
+            Some('1') => output.push('/'),
+            Some(next) => {
+                output.push('~');
+                output.push(next);
+            }
+            None => output.push('~'),
+        }
+    }
+    Cow::Owned(output)
+}
+
+/// Client-visible message for a compiled-schema violation.
+///
+/// The rejected instance value is never included. Request failures carry the
+/// instance location and the failing keyword so a caller can fix its own
+/// payload; response failures stay coarse so an upstream body's shape is not
+/// described back to the client.
+fn schema_violation_message(
+    error: &jsonschema::ValidationError<'_>,
+    direction: Direction,
+) -> String {
+    let keyword = error.schema_path().to_string();
+    let keyword = keyword
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("schema")
+        .to_string();
+    match direction {
+        Direction::Request => {
+            let location = error.instance_path().to_string();
+            let location = if location.is_empty() {
+                "(root)".to_string()
+            } else {
+                location
+            };
+            format!("JSON Schema validation failed at {location} (keyword '{keyword}')")
+        }
+        Direction::Response => format!(
+            "Response body does not satisfy the configured JSON Schema (keyword '{keyword}')"
+        ),
+    }
+}
+
+/// A configured required XML element name, matched against parsed element
+/// names rather than raw source bytes.
+///
+/// Entries are either a bare local name (`item`), which matches that local name
+/// in any namespace, or Clark notation (`{http://example.com/ns}item`), which
+/// requires both the expanded namespace URI and the local name to match. A
+/// literal `{}local` requires the element to be in no namespace.
+struct RequiredXmlElement {
+    display: String,
+    namespace: Option<String>,
+    local: String,
+}
+
+impl RequiredXmlElement {
+    fn matches(&self, namespace: Option<&str>, local: &str) -> bool {
+        if self.local != local {
+            return false;
+        }
+        match self.namespace.as_deref() {
+            None => true,
+            Some("") => namespace.is_none(),
+            Some(expected) => namespace == Some(expected),
+        }
+    }
+}
+
+fn parse_required_xml_elements(
+    raw: Vec<String>,
+    field: &'static str,
+) -> Result<Vec<RequiredXmlElement>, String> {
+    let mut parsed = Vec::with_capacity(raw.len());
+    for (index, entry) in raw.into_iter().enumerate() {
+        let (namespace, local) = match entry.strip_prefix('{') {
+            Some(rest) => match rest.split_once('}') {
+                Some((namespace, local)) => (Some(namespace.to_string()), local.to_string()),
+                None => {
+                    return Err(format!(
+                        "body_validator: '{field}' entry at index {index} opens Clark notation \
+                         with '{{' but never closes it with '}}'"
+                    ));
+                }
+            },
+            None => (None, entry.clone()),
+        };
+        if local.is_empty() {
+            return Err(format!(
+                "body_validator: '{field}' entry at index {index} has an empty local element name"
+            ));
+        }
+        if local.contains('{') || local.contains('}') {
+            return Err(format!(
+                "body_validator: '{field}' entry at index {index} has an invalid local element name"
+            ));
+        }
+        parsed.push(RequiredXmlElement {
+            display: entry,
+            namespace,
+            local,
+        });
+    }
+    Ok(parsed)
+}
+
+/// Stable, value-free category for an XML parse failure.
+///
+/// `roxmltree`'s own `Display` embeds parsed names and offsets; those are body
+/// content, so the client only ever sees the class of well-formedness error.
+fn xml_error_category(error: &roxmltree::Error) -> &'static str {
+    use roxmltree::Error as XmlError;
+    match error {
+        XmlError::InvalidXmlPrefixUri(_)
+        | XmlError::UnexpectedXmlUri(_)
+        | XmlError::UnexpectedXmlnsUri(_)
+        | XmlError::InvalidElementNamePrefix(_)
+        | XmlError::DuplicatedNamespace(_, _)
+        | XmlError::UnknownNamespace(_, _) => "namespace declaration is not well-formed",
+        XmlError::UnexpectedCloseTag(_, _, _)
+        | XmlError::UnexpectedEntityCloseTag(_)
+        | XmlError::UnclosedRootNode => "element tags are not balanced",
+        XmlError::UnknownEntityReference(_, _) | XmlError::MalformedEntityReference(_) => {
+            "entity reference is undeclared or malformed"
+        }
+        XmlError::EntityReferenceLoop(_) => "entity references expand recursively",
+        XmlError::InvalidAttributeValue(_) | XmlError::DuplicatedAttribute(_, _) => {
+            "attribute is malformed or duplicated"
+        }
+        XmlError::NoRootNode => "document has no root element",
+        XmlError::NodesLimitReached => "document exceeds the parser node budget",
+        XmlError::AttributesLimitReached => "element has too many attributes",
+        XmlError::NamespacesLimitReached => "document declares too many namespaces",
+        XmlError::UnexpectedDeclaration(_) => "XML declaration is misplaced or duplicated",
+        XmlError::DtdDetected => "document type declaration is not permitted",
+        XmlError::InvalidName(_) => "element or attribute name is not a valid XML name",
+        XmlError::NonXmlChar(_, _) => "document contains a character XML does not allow",
+        XmlError::InvalidChar(_, _, _) | XmlError::InvalidChar2(_, _, _) => {
+            "unexpected character in markup"
+        }
+        XmlError::InvalidString(_, _) => "unexpected token in markup",
+        XmlError::InvalidExternalID(_) => "external identifier is malformed",
+        XmlError::InvalidComment(_) => "comment is malformed",
+        XmlError::InvalidCharacterData(_) => "character data is malformed",
+        XmlError::UnknownToken(_) => "unrecognized markup",
+        XmlError::UnexpectedEndOfStream => "document ended before markup was complete",
+    }
+}
+
+/// Bounded budget for the recursive proto2 initialization walk.
+#[derive(Default)]
+struct ProtobufWalkBudget {
+    messages: usize,
+}
+
+/// Maximum message-nesting depth inspected while checking proto2 initialization.
+const MAX_PROTOBUF_MESSAGE_DEPTH: usize = 32;
+
+/// Maximum number of messages inspected while checking proto2 initialization.
+const MAX_PROTOBUF_MESSAGES: usize = 50_000;
+
+impl ProtobufWalkBudget {
+    fn charge(&mut self) -> Result<(), String> {
+        self.messages += 1;
+        if self.messages > MAX_PROTOBUF_MESSAGES {
+            return Err(
+                "Protobuf message exceeds the initialization inspection budget".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Recursively verify that every proto2 `required` field is present.
+///
+/// Presence, not value, is what is checked: a required scalar carrying its
+/// type's default value is present because proto2 tracks it with a hasbit, and
+/// prost-reflect's `has_field` reflects exactly that. proto3 descriptors have
+/// no `Required` cardinality, so proto3 messages are unaffected. Extensions,
+/// oneof members, repeated values, and map values are all walked. The error
+/// names the offending field path (descriptor metadata, configured by the
+/// operator) and never any payload value.
+fn check_proto2_required_fields(
+    message: &DynamicMessage,
+    budget: &mut ProtobufWalkBudget,
+) -> Result<(), String> {
+    check_proto2_required_fields_at(message, budget, 0, &mut String::new())
+}
+
+fn check_proto2_required_fields_at(
+    message: &DynamicMessage,
+    budget: &mut ProtobufWalkBudget,
+    depth: usize,
+    path: &mut String,
+) -> Result<(), String> {
+    if depth > MAX_PROTOBUF_MESSAGE_DEPTH {
+        return Err(
+            "Protobuf message nests deeper than the initialization inspection budget".to_string(),
+        );
+    }
+    budget.charge()?;
+
+    let descriptor = message.descriptor();
+    for field in descriptor.fields() {
+        if field.cardinality() == Cardinality::Required && !message.has_field(&field) {
+            let name = field.name();
+            return Err(format!("Missing required protobuf field: {path}{name}"));
+        }
+    }
+
+    // Only present values can be walked; an absent singular message field is
+    // legal unless it is itself `required`, which the loop above already
+    // rejected.
+    for (field, value) in message.fields() {
+        let restore = path.len();
+        path.push_str(field.name());
+        path.push('.');
+        check_proto2_required_in_value(value, budget, depth + 1, path)?;
+        path.truncate(restore);
+    }
+    // Only present extensions are iterable, and proto2 forbids `required`
+    // extension fields, so there is no presence check to make here — but an
+    // extension's message value can still carry required fields of its own.
+    for (extension, value) in message.extensions() {
+        let restore = path.len();
+        path.push('[');
+        path.push_str(extension.full_name());
+        path.push_str("].");
+        check_proto2_required_in_value(value, budget, depth + 1, path)?;
+        path.truncate(restore);
+    }
+    Ok(())
+}
+
+fn check_proto2_required_in_value(
+    value: &ProtobufValue,
+    budget: &mut ProtobufWalkBudget,
+    depth: usize,
+    path: &mut String,
+) -> Result<(), String> {
+    match value {
+        ProtobufValue::Message(nested) => {
+            check_proto2_required_fields_at(nested, budget, depth, path)
+        }
+        ProtobufValue::List(items) => {
+            for item in items {
+                check_proto2_required_in_value(item, budget, depth, path)?;
+            }
+            Ok(())
+        }
+        ProtobufValue::Map(entries) => {
+            for entry in entries.values() {
+                check_proto2_required_in_value(entry, budget, depth, path)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1146,11 +1586,12 @@ fn is_grpc_content_type(content_type: &str) -> bool {
         || ascii_starts_with_ignore_case(media_type, "application/grpc+")
 }
 
-/// Reject XML whose DOCTYPE declares an entity-expansion bomb ("billion
-/// laughs"). Ferrum does not expand entities; this protects backends that do.
-/// `max_entities` caps the number of `<!ENTITY` declarations; when
-/// `reject_nested` is set, any entity whose value references another
-/// general entity (the exponential-expansion signature) is rejected outright.
+/// Enforce bounded internal-entity policy and reject every external identifier.
+///
+/// Ferrum does not retrieve external resources or expand entities for business
+/// logic, but downstream parsers may. `max_entities` caps `<!ENTITY`
+/// declarations; when `reject_nested` is set, entity-expansion chains and
+/// parameter entities that generate declarations are rejected outright.
 fn check_xml_entity_expansion(
     body: &str,
     max_entities: usize,
@@ -1171,26 +1612,13 @@ fn check_xml_entity_expansion(
         if bytes[i] == b'%'
             && let Some((name, end)) = parameter_entity_reference_at(body, i)
         {
-            if let Some((_, expanded_entities)) = parameter_entities
-                .iter()
-                .find(|(entity_name, _)| entity_name == name)
-            {
-                let expanded_entities = *expanded_entities;
-                if expanded_entities > 0 {
-                    if reject_nested {
-                        return Err(
-                            "XML parameter entity expands to entity declarations (billion-laughs protection)"
-                                .to_string(),
-                        );
-                    }
-                    count = count.saturating_add(expanded_entities);
-                    if count > max_entities {
-                        return Err(format!(
-                            "XML declares more than {max_entities} entities after parameter entity expansion (possible entity-expansion attack)"
-                        ));
-                    }
-                }
-            }
+            charge_parameter_entity_reference(
+                name,
+                &parameter_entities,
+                &mut count,
+                max_entities,
+                reject_nested,
+            )?;
             i = end;
             continue;
         }
@@ -1232,6 +1660,15 @@ fn check_xml_entity_expansion(
             let decl_end = find_xml_declaration_end(&bytes[i..])
                 .map(|end| i + end)
                 .unwrap_or(bytes.len());
+            // External entity declarations are always refused: Ferrum never
+            // resolves them, but a downstream parser that does turns this into
+            // an XXE/SSRF primitive.
+            if entity_declaration_is_external(&body[i..decl_end]) {
+                return Err(
+                    "XML declares an external entity (SYSTEM/PUBLIC identifiers are not permitted)"
+                        .to_string(),
+                );
+            }
             if reject_nested && entity_value_references_nested_entity(&body[i..decl_end]) {
                 return Err(
                     "XML entity definition references another entity (billion-laughs protection)"
@@ -1244,11 +1681,153 @@ fn check_xml_entity_expansion(
                 parameter_entities.push((name.to_string(), entity_declaration_count(value)));
             }
             i = decl_end.saturating_add(1);
+        } else if remaining.starts_with(b"<!DOCTYPE") {
+            if doctype_declaration_is_external(&body[i..]) {
+                return Err(
+                    "XML DOCTYPE has an external SYSTEM/PUBLIC identifier, which is not permitted"
+                        .to_string(),
+                );
+            }
+            // Do not skip the complete DOCTYPE: its internal subset may contain
+            // entity declarations that the guards above must inspect.
+            i += b"<!DOCTYPE".len();
+        } else if remaining.starts_with(b"<!") {
+            // Skip other markup declarations quote-aware. This prevents text
+            // such as "<!DOCTYPE" or "<!ENTITY" inside a quoted ATTLIST value
+            // from being misclassified as a declaration of its own. Parameter
+            // entity references outside quotes still count toward policy.
+            let decl_end = find_xml_declaration_end(remaining)
+                .map(|end| i + end)
+                .unwrap_or(bytes.len());
+            charge_parameter_entity_references_in_markup(
+                body,
+                i,
+                decl_end,
+                &parameter_entities,
+                &mut count,
+                max_entities,
+                reject_nested,
+            )?;
+            i = decl_end.saturating_add(1);
         } else {
             i += 1;
         }
     }
     Ok(())
+}
+
+fn charge_parameter_entity_reference(
+    name: &str,
+    parameter_entities: &[(String, usize)],
+    count: &mut usize,
+    max_entities: usize,
+    reject_nested: bool,
+) -> Result<(), String> {
+    let Some((_, expanded_entities)) = parameter_entities
+        .iter()
+        .find(|(entity_name, _)| entity_name == name)
+    else {
+        return Ok(());
+    };
+    if *expanded_entities == 0 {
+        return Ok(());
+    }
+    if reject_nested {
+        return Err(
+            "XML parameter entity expands to entity declarations (billion-laughs protection)"
+                .to_string(),
+        );
+    }
+    *count = count.saturating_add(*expanded_entities);
+    if *count > max_entities {
+        return Err(format!(
+            "XML declares more than {max_entities} entities after parameter entity expansion (possible entity-expansion attack)"
+        ));
+    }
+    Ok(())
+}
+
+fn charge_parameter_entity_references_in_markup(
+    body: &str,
+    start: usize,
+    end: usize,
+    parameter_entities: &[(String, usize)],
+    count: &mut usize,
+    max_entities: usize,
+    reject_nested: bool,
+) -> Result<(), String> {
+    let bytes = body.as_bytes();
+    let mut quote = None;
+    let mut i = start;
+    while i < end {
+        match quote {
+            Some(current) if bytes[i] == current => quote = None,
+            Some(_) => {}
+            None if matches!(bytes[i], b'"' | b'\'') => quote = Some(bytes[i]),
+            None if bytes[i] == b'%' => {
+                if let Some((name, reference_end)) = parameter_entity_reference_at(body, i)
+                    && reference_end <= end
+                {
+                    charge_parameter_entity_reference(
+                        name,
+                        parameter_entities,
+                        count,
+                        max_entities,
+                        reject_nested,
+                    )?;
+                    i = reference_end;
+                    continue;
+                }
+            }
+            None => {}
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// True when the document type declaration itself carries an external subset.
+///
+/// XML's grammar places `SYSTEM` / `PUBLIC` immediately after the document
+/// name and before any internal subset, so this inspection never searches
+/// quoted literals, comments, or CDATA for keyword-looking text.
+fn doctype_declaration_is_external(decl: &str) -> bool {
+    let bytes = decl.as_bytes();
+    let needle = b"<!DOCTYPE";
+    if !bytes.starts_with(needle) {
+        return false;
+    }
+
+    let mut i = needle.len();
+    let name_separator = skip_xml_space(bytes, i);
+    if name_separator == i {
+        return false;
+    }
+    i = name_separator;
+
+    // The XML Name itself may be non-ASCII; its UTF-8 continuation bytes are
+    // all non-whitespace, so a byte scan safely finds the grammar delimiter.
+    while i < bytes.len() && !matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n' | b'[' | b'>') {
+        i += 1;
+    }
+    let external_separator = skip_xml_space(bytes, i);
+    if external_separator == i {
+        return false;
+    }
+    i = external_separator;
+
+    for keyword in [b"SYSTEM".as_slice(), b"PUBLIC".as_slice()] {
+        if bytes
+            .get(i..i + keyword.len())
+            .is_some_and(|candidate| candidate == keyword)
+            && bytes
+                .get(i + keyword.len())
+                .is_some_and(|next| matches!(next, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn find_xml_declaration_end(bytes: &[u8]) -> Option<usize> {
@@ -1263,6 +1842,31 @@ fn find_xml_declaration_end(bytes: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+/// True when an `<!ENTITY ...>` declaration names an external entity, i.e. its
+/// definition is a `SYSTEM` or `PUBLIC` external identifier rather than a
+/// quoted literal.
+fn entity_declaration_is_external(decl: &str) -> bool {
+    let bytes = decl.as_bytes();
+    let needle = b"<!ENTITY";
+    if bytes.len() < needle.len() || !bytes[..needle.len()].eq_ignore_ascii_case(needle) {
+        return false;
+    }
+    let mut i = needle.len();
+    i = skip_xml_space(bytes, i);
+    if bytes.get(i) == Some(&b'%') {
+        i += 1;
+        i = skip_xml_space(bytes, i);
+    }
+    // Entity name.
+    while i < bytes.len() && !matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    i = skip_xml_space(bytes, i);
+    // XML external identifier keywords are case-sensitive upper case.
+    decl.get(i..)
+        .is_some_and(|rest| rest.starts_with("SYSTEM") || rest.starts_with("PUBLIC"))
 }
 
 fn parameter_entity_declaration(decl: &str) -> Option<(&str, &str)> {
@@ -1546,17 +2150,33 @@ fn parse_protobuf_shape(config: &Value) -> Result<ProtobufShape, String> {
                         .to_string(),
                 );
             }
-            if !method_config.is_object() {
+            let Some(method_object) = method_config.as_object() else {
+                return Err(
+                    "body_validator: a 'protobuf_method_messages' entry must be an object"
+                        .to_string(),
+                );
+            };
+            // Reject unknown per-method keys before defaults so a misspelled
+            // direction cannot leave that direction unvalidated while the other
+            // direction keeps admission succeeding (GHSA-w7x7-ppx9-5v74).
+            if method_object
+                .keys()
+                .any(|key| !BODY_VALIDATOR_PROTOBUF_METHOD_KEYS.contains(&key.as_str()))
+            {
                 return Err(format!(
-                    "body_validator: protobuf_method_messages['{method_path}'] must be an object"
+                    "body_validator: a 'protobuf_method_messages' entry has an unknown key; \
+                     allowed keys: {}",
+                    BODY_VALIDATOR_PROTOBUF_METHOD_KEYS.join(", ")
                 ));
             }
             let request = optional_string(method_config, "request")?.map(str::to_string);
             let response = optional_string(method_config, "response")?.map(str::to_string);
             if request.is_none() && response.is_none() {
-                return Err(format!(
-                    "body_validator: protobuf_method_messages['{method_path}'] must configure 'request' or 'response'"
-                ));
+                return Err(
+                    "body_validator: a 'protobuf_method_messages' entry must configure 'request' \
+                     or 'response'"
+                        .to_string(),
+                );
             }
             if request.is_some() {
                 targets.method_requests.insert(method_path.clone());
@@ -1600,15 +2220,15 @@ impl ProtobufDescriptorLoadError {
 fn load_protobuf_descriptor_pool_inner(
     descriptor_path: &str,
 ) -> Result<DescriptorPool, ProtobufDescriptorLoadError> {
-    let descriptor_bytes = std::fs::read(descriptor_path).map_err(|error| {
-        ProtobufDescriptorLoadError::Unavailable(format!(
-            "body_validator: failed to read protobuf descriptor file '{descriptor_path}': {error}"
-        ))
+    let descriptor_bytes = std::fs::read(descriptor_path).map_err(|_| {
+        ProtobufDescriptorLoadError::Unavailable(
+            "body_validator: failed to read protobuf descriptor file".to_string(),
+        )
     })?;
-    DescriptorPool::decode(descriptor_bytes.as_slice()).map_err(|error| {
-        ProtobufDescriptorLoadError::Invalid(format!(
-            "body_validator: failed to parse protobuf descriptor '{descriptor_path}': {error}"
-        ))
+    DescriptorPool::decode(descriptor_bytes.as_slice()).map_err(|_| {
+        ProtobufDescriptorLoadError::Invalid(
+            "body_validator: failed to parse protobuf descriptor".to_string(),
+        )
     })
 }
 
@@ -1628,7 +2248,8 @@ fn resolve_protobuf_shape(
         .as_deref()
         .map(|name| {
             pool.get_message_by_name(name).ok_or_else(|| {
-                format!("body_validator: protobuf_request_type '{name}' not found in descriptor")
+                "body_validator: configured 'protobuf_request_type' was not found in the descriptor"
+                    .to_string()
             })
         })
         .transpose()?;
@@ -1637,7 +2258,8 @@ fn resolve_protobuf_shape(
         .as_deref()
         .map(|name| {
             pool.get_message_by_name(name).ok_or_else(|| {
-                format!("body_validator: protobuf_response_type '{name}' not found in descriptor")
+                "body_validator: configured 'protobuf_response_type' was not found in the descriptor"
+                    .to_string()
             })
         })
         .transpose()?;
@@ -1648,9 +2270,9 @@ fn resolve_protobuf_shape(
             .as_deref()
             .map(|name| {
                 pool.get_message_by_name(name).ok_or_else(|| {
-                    format!(
-                        "body_validator: method '{method_path}' request type '{name}' not found in descriptor"
-                    )
+                    "body_validator: a 'protobuf_method_messages' request type was not found in \
+                     the descriptor"
+                        .to_string()
                 })
             })
             .transpose()?;
@@ -1659,9 +2281,9 @@ fn resolve_protobuf_shape(
             .as_deref()
             .map(|name| {
                 pool.get_message_by_name(name).ok_or_else(|| {
-                    format!(
-                        "body_validator: method '{method_path}' response type '{name}' not found in descriptor"
-                    )
+                    "body_validator: a 'protobuf_method_messages' response type was not found in \
+                     the descriptor"
+                        .to_string()
                 })
             })
             .transpose()?;
@@ -1716,11 +2338,9 @@ fn load_protobuf_config(
 
     let pool = match load_protobuf_descriptor_pool_inner(descriptor_path) {
         Ok(pool) => pool,
-        Err(ProtobufDescriptorLoadError::Unavailable(error)) => {
+        Err(ProtobufDescriptorLoadError::Unavailable(_)) => {
             warn!(
                 plugin = "body_validator",
-                path = descriptor_path,
-                error = %error,
                 "Protobuf descriptor dependency is unavailable; applicable gRPC validation will fail closed"
             );
             return Ok(ProtobufConfig {
@@ -1749,268 +2369,9 @@ fn load_protobuf_config(
     })
 }
 
-/// Recursively walk a JSON Schema and pre-compile all `pattern` regex strings.
-fn collect_patterns(
-    schema: &Value,
-    patterns: &mut HashMap<String, regex::Regex>,
-    field: &'static str,
-) -> Result<(), String> {
-    if let Some(pattern_value) = schema.get("pattern") {
-        let pattern = pattern_value
-            .as_str()
-            .ok_or_else(|| format!("body_validator: '{field}' pattern values must be strings"))?;
-        if !patterns.contains_key(pattern) {
-            let re = regex::Regex::new(pattern).map_err(|e| {
-                format!("body_validator: invalid regex pattern '{pattern}' in '{field}': {e}")
-            })?;
-            patterns.insert(pattern.to_string(), re);
-        }
-    }
-
-    // Recurse into sub-schemas
-    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
-        for prop_schema in props.values() {
-            collect_patterns(prop_schema, patterns, field)?;
-        }
-    }
-    if let Some(items) = schema.get("items") {
-        collect_patterns(items, patterns, field)?;
-    }
-    if let Some(additional) = schema.get("additionalProperties")
-        && additional.is_object()
-    {
-        collect_patterns(additional, patterns, field)?;
-    }
-    for keyword in &["allOf", "anyOf", "oneOf"] {
-        if let Some(arr) = schema.get(*keyword).and_then(|v| v.as_array()) {
-            for sub in arr {
-                collect_patterns(sub, patterns, field)?;
-            }
-        }
-    }
-    if let Some(not_schema) = schema.get("not") {
-        collect_patterns(not_schema, patterns, field)?;
-    }
-    Ok(())
-}
-
 /// Find the position of a byte subsequence within a slice.
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Find the position of a single byte within a slice.
-fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
-    haystack.iter().position(|&b| b == needle)
-}
-
-fn xml_tag_name(body: &str, start_inclusive: usize, tag_end_exclusive: usize) -> Option<&str> {
-    let bytes = body.as_bytes();
-    let mut start = start_inclusive;
-    while start < tag_end_exclusive && is_xml_whitespace(bytes[start]) {
-        start += 1;
-    }
-    let mut end = start;
-    while end < tag_end_exclusive
-        && !is_xml_whitespace(bytes[end])
-        && !matches!(bytes[end], b'/' | b'>')
-    {
-        end += 1;
-    }
-    if end == start {
-        return None;
-    }
-    body.get(start..end)
-}
-
-/// Returns true if the bytes between `start_inclusive` (first byte after `<`)
-/// and `tag_end_exclusive` (position of the `>`) form a self-closing XML tag
-/// (i.e., end with `/`, optionally followed by XML whitespace before the `>`).
-///
-/// Per W3C XML 1.0 §2.3, XML whitespace is `#x20 | #x9 | #xD | #xA`.
-/// This correctly classifies `<foo/>`, `<foo />`, `<foo attr="v" />`,
-/// `<foo\n/>` as self-closing while keeping plain `<foo>` as opening.
-/// Empty tag text is treated as non-self-closing.
-fn is_self_closing_tag(bytes: &[u8], start_inclusive: usize, tag_end_exclusive: usize) -> bool {
-    if tag_end_exclusive <= start_inclusive {
-        return false;
-    }
-    let mut probe = tag_end_exclusive;
-    while probe > start_inclusive {
-        probe -= 1;
-        match bytes[probe] {
-            b' ' | b'\t' | b'\r' | b'\n' => continue,
-            b'/' => return true,
-            _ => return false,
-        }
-    }
-    false
-}
-
-fn is_xml_whitespace(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
-}
-
-/// Returns the value of an integral JSON number as `i128`, or `None` when the
-/// value is not an integer that fits a signed/unsigned 64-bit integer (i.e. it
-/// is fractional or out of range and must be handled with float reasoning).
-fn json_integer_i128(v: &Value) -> Option<i128> {
-    v.as_i64()
-        .map(i128::from)
-        .or_else(|| v.as_u64().map(i128::from))
-}
-
-fn pow10_i128(exp: u32) -> Option<i128> {
-    let mut value = 1_i128;
-    for _ in 0..exp {
-        value = value.checked_mul(10)?;
-    }
-    Some(value)
-}
-
-fn parse_json_decimal_number(text: &str) -> Option<(i128, i128)> {
-    let (mantissa, exponent) = match text.find(['e', 'E']) {
-        Some(index) => {
-            let exponent = text[index + 1..].parse::<i32>().ok()?;
-            (&text[..index], exponent)
-        }
-        None => (text, 0),
-    };
-
-    let (sign, digits_text) = match mantissa.as_bytes().first() {
-        Some(b'-') => (-1_i128, &mantissa[1..]),
-        Some(b'+') => (1_i128, &mantissa[1..]),
-        _ => (1_i128, mantissa),
-    };
-
-    let mut digits = String::with_capacity(digits_text.len());
-    let mut fractional_digits = 0_i32;
-    let mut seen_decimal = false;
-    for ch in digits_text.chars() {
-        match ch {
-            '0'..='9' => {
-                digits.push(ch);
-                if seen_decimal {
-                    fractional_digits += 1;
-                }
-            }
-            '.' if !seen_decimal => seen_decimal = true,
-            _ => return None,
-        }
-    }
-
-    let trimmed = digits.trim_start_matches('0');
-    let mut numerator = if trimmed.is_empty() {
-        0
-    } else {
-        trimmed.parse::<i128>().ok()?.checked_mul(sign)?
-    };
-
-    let scale = fractional_digits.checked_sub(exponent)?;
-    if scale < 0 {
-        numerator = numerator.checked_mul(pow10_i128(scale.unsigned_abs())?)?;
-        return Some((numerator, 1));
-    }
-
-    Some((numerator, pow10_i128(scale as u32)?))
-}
-
-fn json_decimal_rational(v: &Value) -> Option<(i128, i128)> {
-    parse_json_decimal_number(&v.as_number()?.to_string())
-}
-
-fn decimal_value_is_multiple_of(data: &Value, divisor: &Value) -> Option<bool> {
-    let (value_num, value_den) = json_decimal_rational(data)?;
-    let (divisor_num, divisor_den) = json_decimal_rational(divisor)?;
-    let divisor_product = divisor_num.checked_mul(value_den)?.checked_abs()?;
-    if divisor_product == 0 {
-        return None;
-    }
-    let value_product = value_num.checked_mul(divisor_den)?;
-    Some(value_product % divisor_product == 0)
-}
-
-/// Evaluates JSON Schema `multipleOf` for a numeric instance (finding #65).
-///
-/// When both the instance value and the divisor are integral, exact integer
-/// modulo is used so neither float representation error nor a magnitude-blind
-/// absolute tolerance can flip the verdict (e.g. `u64::MAX` is correctly a
-/// multiple of 3, which the float path misjudges). Decimal JSON numbers then
-/// use an exact rational check, so currency-like schemas such as
-/// `multipleOf: 0.01` neither reject true multiples nor admit large
-/// non-multiples through a wide float tolerance. `n`/`multiple` are the
-/// pre-extracted `f64` views of `data`/`divisor`.
-fn value_is_multiple_of(data: &Value, divisor: &Value, n: f64, multiple: f64) -> bool {
-    if let (Some(value_int), Some(divisor_int)) =
-        (json_integer_i128(data), json_integer_i128(divisor))
-        && divisor_int != 0
-    {
-        return value_int % divisor_int == 0;
-    }
-
-    if let Some(is_multiple) = decimal_value_is_multiple_of(data, divisor) {
-        return is_multiple;
-    }
-
-    // Float fallback: scale by the quotient to allow accumulated modulo error,
-    // but cap the window relative to the divisor so large non-multiples cannot
-    // pass merely because `n` is large.
-    let rem = (n % multiple).abs();
-    let abs_multiple = multiple.abs();
-    let quotient = (n / multiple).abs().max(1.0);
-    let tol = (8.0 * f64::EPSILON * quotient * abs_multiple).min(abs_multiple * 1e-9);
-    rem <= tol || (abs_multiple - rem).abs() <= tol
-}
-
-/// Validate common string formats (subset of JSON Schema format vocabulary).
-fn validate_format(s: &str, format_name: &str) -> Result<(), String> {
-    match format_name {
-        // Basic email check: contains exactly one @ with non-empty local and domain parts
-        "email"
-            if !s.contains('@')
-                || s.starts_with('@')
-                || s.ends_with('@')
-                || s.matches('@').count() != 1 =>
-        {
-            return Err(format!("'{}' is not a valid email format", s));
-        }
-        "ipv4" if s.parse::<std::net::Ipv4Addr>().is_err() => {
-            return Err(format!("'{}' is not a valid IPv4 address", s));
-        }
-        "ipv6" if s.parse::<std::net::Ipv6Addr>().is_err() => {
-            return Err(format!("'{}' is not a valid IPv6 address", s));
-        }
-        "uri" | "uri-reference"
-            if !s.contains(':') && !s.starts_with('/') && !s.starts_with('#') =>
-        {
-            return Err(format!("'{}' is not a valid URI", s));
-        }
-        "date-time" if chrono::DateTime::parse_from_rfc3339(s).is_err() => {
-            return Err(format!("'{}' is not a valid RFC 3339 date-time", s));
-        }
-        "date" if chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_err() => {
-            return Err(format!("'{}' is not a valid date (YYYY-MM-DD)", s));
-        }
-        "uuid" if uuid::Uuid::parse_str(s).is_err() => {
-            return Err(format!("'{}' is not a valid UUID", s));
-        }
-        _ => {
-            // Other format names, valid values, or unknown formats — no-op.
-            // Per JSON Schema spec, unknown formats are advisory.
-        }
-    }
-    Ok(())
-}
-
-fn json_type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
 }
 
 /// Helper to build a rejection `PluginResult` for protobuf validation failures.
@@ -2122,11 +2483,11 @@ impl Plugin for BodyValidator {
 
         // Determine validation type
         let result = if is_json_like_content_type(content_type) {
-            self.validate_json_body(
+            Self::validate_json_body(
                 body,
                 &self.required_fields,
-                self.json_schema.as_ref(),
-                &self.compiled_patterns,
+                self.json_validator.as_ref(),
+                Direction::Request,
             )
         } else if is_xml_like_content_type(content_type) && self.has_xml_request_validation {
             Self::validate_xml_body(
@@ -2182,7 +2543,7 @@ impl Plugin for BodyValidator {
             // it's also true for protobuf-only configs, which would otherwise
             // mis-treat a non-gRPC payload as malformed JSON.
             let has_json_validation =
-                self.json_schema.is_some() || !self.required_fields.is_empty();
+                self.json_validator.is_some() || !self.required_fields.is_empty();
             if !has_json_validation && !self.has_xml_request_validation {
                 return PluginResult::Continue;
             }
@@ -2200,11 +2561,11 @@ impl Plugin for BodyValidator {
             };
 
             let result = if is_json_like_content_type(content_type) && has_json_validation {
-                self.validate_json_body(
+                Self::validate_json_body(
                     body_str,
                     &self.required_fields,
-                    self.json_schema.as_ref(),
-                    &self.compiled_patterns,
+                    self.json_validator.as_ref(),
+                    Direction::Request,
                 )
             } else if is_xml_like_content_type(content_type) && self.has_xml_request_validation {
                 Self::validate_xml_body(
@@ -2414,11 +2775,11 @@ impl Plugin for BodyValidator {
 
         // Determine validation type
         let result = if is_json_like_content_type(content_type) {
-            self.validate_json_body(
+            Self::validate_json_body(
                 body_str,
                 &self.response_required_fields,
-                self.response_json_schema.as_ref(),
-                &self.response_compiled_patterns,
+                self.response_json_validator.as_ref(),
+                Direction::Response,
             )
         } else if is_xml_like_content_type(content_type) && self.has_xml_response_validation {
             Self::validate_xml_body(

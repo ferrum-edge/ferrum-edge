@@ -37,6 +37,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, LoadBalancerAlgorithm,
     MAX_TARGET_WEIGHT, PluginAssociation, PluginConfig, PluginScope, Proxy, ResponseBodyMode,
@@ -434,7 +435,11 @@ pub(crate) struct K8sAccumulator {
     pub mesh: MeshConfig,
     pub warnings: Vec<String>,
     reference_grants: HashSet<ReferenceGrantPermission>,
-    proxy_sources: HashMap<String, SourceKind>,
+    /// Ownership / precedence map keyed by Ferrum `(namespace, id)`.
+    /// Bare IDs are only unique within a namespace, and generated K8s IDs are
+    /// lossy across dashed namespace/name components, so a multi-namespace
+    /// translation must never key ownership by bare id alone.
+    proxy_sources: HashMap<NamespacedResourceId, SourceKind>,
     known_namespaces: HashSet<String>,
     /// Port-name → port-number index for collected `Service` objects, nested
     /// `namespace → service_name → port_name → port`. Built in the translator
@@ -625,8 +630,20 @@ impl K8sAccumulator {
         })
     }
 
+    pub(crate) fn proxy_source(&self, namespace: &str, id: &str) -> Option<SourceKind> {
+        let key = namespaced_resource_key(namespace, id)?;
+        self.proxy_sources.get(&key).copied()
+    }
+
     pub(crate) fn upsert_proxy(&mut self, proxy: Proxy, source: SourceKind) {
-        if let Some(existing_source) = self.proxy_sources.get(&proxy.id).copied() {
+        let Some(key) = namespaced_resource_key(&proxy.namespace, &proxy.id) else {
+            self.warnings.push(format!(
+                "proxy with empty namespace or id was ignored (namespace='{}', id='{}')",
+                proxy.namespace, proxy.id
+            ));
+            return;
+        };
+        if let Some(existing_source) = self.proxy_sources.get(&key).copied() {
             let istio_wins = self.options.prefer_istio_on_overlap
                 && existing_source == SourceKind::GatewayApi
                 && source == SourceKind::Istio;
@@ -636,32 +653,38 @@ impl K8sAccumulator {
 
             if gateway_loses {
                 self.warnings.push(format!(
-                    "Gateway API proxy '{}' ignored because Istio resource has precedence",
-                    proxy.id
+                    "Gateway API proxy '{}/{}' ignored because Istio resource has precedence",
+                    proxy.namespace, proxy.id
                 ));
                 return;
             }
 
-            if let Some(existing) = self.config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+            if let Some(existing) = self.config.proxies.iter_mut().find(|candidate| {
+                candidate.namespace == proxy.namespace && candidate.id == proxy.id
+            }) {
                 if istio_wins || !self.options.prefer_istio_on_overlap {
                     *existing = proxy;
-                    self.proxy_sources.insert(existing.id.clone(), source);
+                    self.proxy_sources.insert(key, source);
                 }
                 return;
             }
         }
 
-        self.proxy_sources.insert(proxy.id.clone(), source);
+        self.proxy_sources.insert(key, source);
         self.config.proxies.push(proxy);
     }
 
     pub(crate) fn upsert_upstream(&mut self, upstream: Upstream) {
-        if let Some(existing) = self
-            .config
-            .upstreams
-            .iter_mut()
-            .find(|candidate| candidate.id == upstream.id)
-        {
+        if namespaced_resource_key(&upstream.namespace, &upstream.id).is_none() {
+            self.warnings.push(format!(
+                "upstream with empty namespace or id was ignored (namespace='{}', id='{}')",
+                upstream.namespace, upstream.id
+            ));
+            return;
+        }
+        if let Some(existing) = self.config.upstreams.iter_mut().find(|candidate| {
+            candidate.namespace == upstream.namespace && candidate.id == upstream.id
+        }) {
             *existing = upstream;
         } else {
             self.config.upstreams.push(upstream);
@@ -1323,19 +1346,17 @@ pub(crate) fn attach_route_plugins_to_proxy(proxy: &mut Proxy, plugins: &[Plugin
 /// reaches a consumer. `apply_route_overrides: true` lets the plugin
 /// accept the empty-rules config.
 ///
-/// The id uses the reserved `__istio_vs_` prefix so (a) operators can
-/// recognize auto-emitted instances at a glance, (b) the prefix cannot
-/// collide with operator-chosen ids (validated names disallow leading
-/// underscores), and (c) `plugin_cache.rs` keys off the prefix to warn
-/// operators when this auto-emit shadows an operator-configured global
-/// `request_transformer`.
+/// The id uses the translator-owned `istio-vs-req-xform-` prefix so it remains
+/// recognizable and deterministic while satisfying the same resource-ID
+/// grammar enforced on CP-delivered full snapshots. Namespace-qualified
+/// ownership and the full proxy id keep distinct translated routes isolated.
 pub(crate) fn route_request_transformer_plugin_for_proxy(
     proxy_id: &str,
     namespace: &str,
 ) -> PluginConfig {
     let now = Utc::now();
     PluginConfig {
-        id: format!("__istio_vs_req_xform_{proxy_id}"),
+        id: format!("istio-vs-req-xform-{proxy_id}"),
         plugin_name: "request_transformer".to_string(),
         namespace: namespace.to_string(),
         config: serde_json::json!({
@@ -1353,14 +1374,14 @@ pub(crate) fn route_request_transformer_plugin_for_proxy(
 }
 
 /// Counterpart to [`route_request_transformer_plugin_for_proxy`] for response
-/// header transforms. Same `__istio_vs_` prefix convention.
+/// header transforms. Same valid translator-owned prefix convention.
 pub(crate) fn route_response_transformer_plugin_for_proxy(
     proxy_id: &str,
     namespace: &str,
 ) -> PluginConfig {
     let now = Utc::now();
     PluginConfig {
-        id: format!("__istio_vs_resp_xform_{proxy_id}"),
+        id: format!("istio-vs-resp-xform-{proxy_id}"),
         plugin_name: "response_transformer".to_string(),
         namespace: namespace.to_string(),
         config: serde_json::json!({
@@ -2583,6 +2604,18 @@ pub(crate) fn resource_id(prefix: &str, namespace: &str, name: &str, suffix: &st
     .replace(['/', '.'], "-")
 }
 
+/// Build a `(namespace, id)` ownership key, failing closed on empty components.
+///
+/// K8s-generated IDs are lossy across dashed namespace/name joins, and ordinary
+/// IDs are only unique within a namespace, so ownership maps must never fall
+/// back to a delimiter-encoded bare string.
+pub(crate) fn namespaced_resource_key(namespace: &str, id: &str) -> Option<NamespacedResourceId> {
+    if namespace.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some(NamespacedResourceId::new(namespace, id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2868,6 +2901,230 @@ mod tests {
         assert_eq!(
             workload_entry_service_key_from_host("example.com", "default", "cluster.local",),
             None
+        );
+    }
+
+    #[test]
+    fn namespaced_resource_key_rejects_empty_components() {
+        assert!(namespaced_resource_key("a", "id").is_some());
+        assert!(namespaced_resource_key("", "id").is_none());
+        assert!(namespaced_resource_key("a", "").is_none());
+        assert!(namespaced_resource_key("", "").is_none());
+    }
+
+    #[test]
+    fn upsert_proxy_keeps_same_bare_id_in_two_namespaces_and_scopes_precedence() {
+        let mut acc = K8sAccumulator::new(options("ferrum").with_source_namespaces(Vec::new()));
+        let shared_id = "lossy-shared-id";
+
+        let gateway_a = proxy_for_route(RouteProxySpec {
+            id: shared_id.to_string(),
+            namespace: "tenant-a".to_string(),
+            hosts: vec!["a.example.com".to_string()],
+            listen_path: Some("/a".to_string()),
+            strip_listen_path: false,
+            preserve_host_header: false,
+            backend_host: "a.svc".to_string(),
+            backend_port: 8080,
+            upstream_id: None,
+            backend_scheme: BackendScheme::Http,
+            listen_port: None,
+            retry: None,
+            backend_read_timeout_ms: None,
+        });
+        let istio_b = proxy_for_route(RouteProxySpec {
+            id: shared_id.to_string(),
+            namespace: "tenant-b".to_string(),
+            hosts: vec!["b.example.com".to_string()],
+            listen_path: Some("/b".to_string()),
+            strip_listen_path: false,
+            preserve_host_header: false,
+            backend_host: "b.svc".to_string(),
+            backend_port: 8081,
+            upstream_id: None,
+            backend_scheme: BackendScheme::Http,
+            listen_port: None,
+            retry: None,
+            backend_read_timeout_ms: None,
+        });
+        let gateway_b = proxy_for_route(RouteProxySpec {
+            id: shared_id.to_string(),
+            namespace: "tenant-b".to_string(),
+            hosts: vec!["b-gateway.example.com".to_string()],
+            listen_path: Some("/b-gateway".to_string()),
+            strip_listen_path: false,
+            preserve_host_header: false,
+            backend_host: "b-gateway.svc".to_string(),
+            backend_port: 8082,
+            upstream_id: None,
+            backend_scheme: BackendScheme::Http,
+            listen_port: None,
+            retry: None,
+            backend_read_timeout_ms: None,
+        });
+        let istio_a = proxy_for_route(RouteProxySpec {
+            id: shared_id.to_string(),
+            namespace: "tenant-a".to_string(),
+            hosts: vec!["a-istio.example.com".to_string()],
+            listen_path: Some("/a-istio".to_string()),
+            strip_listen_path: false,
+            preserve_host_header: false,
+            backend_host: "a-istio.svc".to_string(),
+            backend_port: 8083,
+            upstream_id: None,
+            backend_scheme: BackendScheme::Http,
+            listen_port: None,
+            retry: None,
+            backend_read_timeout_ms: None,
+        });
+
+        acc.upsert_proxy(gateway_a, SourceKind::GatewayApi);
+        acc.upsert_proxy(istio_b, SourceKind::Istio);
+        // Same bare id in tenant-b: Gateway API must lose to Istio only inside tenant-b.
+        acc.upsert_proxy(gateway_b, SourceKind::GatewayApi);
+        // Same bare id in tenant-a: Istio replaces Gateway API only inside tenant-a.
+        acc.upsert_proxy(istio_a, SourceKind::Istio);
+
+        assert_eq!(acc.config.proxies.len(), 2);
+        let proxy_a = acc
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.namespace == "tenant-a")
+            .expect("tenant-a proxy");
+        let proxy_b = acc
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.namespace == "tenant-b")
+            .expect("tenant-b proxy");
+        assert_eq!(proxy_a.id, shared_id);
+        assert_eq!(proxy_b.id, shared_id);
+        assert_eq!(proxy_a.backend_port, 8083);
+        assert_eq!(proxy_b.backend_port, 8081);
+        assert_eq!(
+            acc.proxy_source("tenant-a", shared_id),
+            Some(SourceKind::Istio)
+        );
+        assert_eq!(
+            acc.proxy_source("tenant-b", shared_id),
+            Some(SourceKind::Istio)
+        );
+        assert!(
+            acc.warnings.iter().any(|warning| {
+                warning.contains("tenant-b")
+                    && warning.contains(shared_id)
+                    && warning.contains("Istio resource has precedence")
+            }),
+            "Gateway API loss in tenant-b must be warned without touching tenant-a: {:?}",
+            acc.warnings
+        );
+    }
+
+    #[test]
+    fn upsert_upstream_keeps_same_bare_id_in_two_namespaces() {
+        let mut acc = K8sAccumulator::new(options("ferrum").with_source_namespaces(Vec::new()));
+        let shared_id = "lossy-upstream-id";
+
+        acc.upsert_upstream(upstream_for_route(
+            shared_id.to_string(),
+            "tenant-a".to_string(),
+            vec![RouteBackend {
+                host: "a.svc".to_string(),
+                port: 8080,
+                weight: 100,
+                service_namespace: None,
+                service_name: None,
+                service_port: None,
+            }],
+        ));
+        acc.upsert_upstream(upstream_for_route(
+            shared_id.to_string(),
+            "tenant-b".to_string(),
+            vec![RouteBackend {
+                host: "b.svc".to_string(),
+                port: 8081,
+                weight: 100,
+                service_namespace: None,
+                service_name: None,
+                service_port: None,
+            }],
+        ));
+        // Replace only tenant-a's upstream; tenant-b must survive.
+        acc.upsert_upstream(upstream_for_route(
+            shared_id.to_string(),
+            "tenant-a".to_string(),
+            vec![RouteBackend {
+                host: "a-updated.svc".to_string(),
+                port: 9090,
+                weight: 100,
+                service_namespace: None,
+                service_name: None,
+                service_port: None,
+            }],
+        ));
+
+        assert_eq!(acc.config.upstreams.len(), 2);
+        let upstream_a = acc
+            .config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == "tenant-a")
+            .expect("tenant-a upstream");
+        let upstream_b = acc
+            .config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == "tenant-b")
+            .expect("tenant-b upstream");
+        assert_eq!(upstream_a.targets[0].host, "a-updated.svc");
+        assert_eq!(upstream_a.targets[0].port, 9090);
+        assert_eq!(upstream_b.targets[0].host, "b.svc");
+        assert_eq!(upstream_b.targets[0].port, 8081);
+    }
+
+    #[test]
+    fn upsert_proxy_and_upstream_fail_closed_on_empty_identity() {
+        let mut acc = K8sAccumulator::new(options("ferrum").with_source_namespaces(Vec::new()));
+        acc.upsert_proxy(
+            proxy_for_route(RouteProxySpec {
+                id: String::new(),
+                namespace: "tenant-a".to_string(),
+                hosts: vec!["a.example.com".to_string()],
+                listen_path: Some("/a".to_string()),
+                strip_listen_path: false,
+                preserve_host_header: false,
+                backend_host: "a.svc".to_string(),
+                backend_port: 8080,
+                upstream_id: None,
+                backend_scheme: BackendScheme::Http,
+                listen_port: None,
+                retry: None,
+                backend_read_timeout_ms: None,
+            }),
+            SourceKind::GatewayApi,
+        );
+        acc.upsert_upstream(upstream_for_route(
+            "ok".to_string(),
+            String::new(),
+            vec![RouteBackend {
+                host: "a.svc".to_string(),
+                port: 8080,
+                weight: 100,
+                service_namespace: None,
+                service_name: None,
+                service_port: None,
+            }],
+        ));
+
+        assert!(acc.config.proxies.is_empty());
+        assert!(acc.config.upstreams.is_empty());
+        assert!(
+            acc.warnings
+                .iter()
+                .any(|warning| warning.contains("empty namespace or id")),
+            "empty identities must warn and fail closed: {:?}",
+            acc.warnings
         );
     }
 }

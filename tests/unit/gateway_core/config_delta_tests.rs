@@ -1,6 +1,7 @@
 //! Tests for config delta module
 
 use chrono::{DateTime, Utc};
+use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::*;
 use ferrum_edge::config_delta::ConfigDelta;
 use std::collections::HashMap;
@@ -188,7 +189,10 @@ fn test_detects_removed_proxy() {
     let new = GatewayConfig::default();
     let delta = ConfigDelta::compute(&old, &new);
     assert!(delta.added_proxies.is_empty());
-    assert_eq!(delta.removed_proxy_ids, vec!["p1"]);
+    assert_eq!(
+        delta.removed_proxy_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "p1")]
+    );
     assert!(delta.modified_proxies.is_empty());
 }
 
@@ -248,7 +252,10 @@ fn test_detects_consumer_changes() {
     let delta = ConfigDelta::compute(&old, &new);
     assert_eq!(delta.added_consumers.len(), 1);
     assert_eq!(delta.added_consumers[0].id, "c3");
-    assert_eq!(delta.removed_consumer_ids, vec!["c2"]);
+    assert_eq!(
+        delta.removed_consumer_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "c2")],
+    );
     assert_eq!(delta.modified_consumers.len(), 1);
     assert_eq!(delta.modified_consumers[0].id, "c1");
 }
@@ -280,7 +287,10 @@ fn test_detects_removed_upstream() {
     let new = GatewayConfig::default();
     let delta = ConfigDelta::compute(&old, &new);
     assert!(delta.added_upstreams.is_empty());
-    assert_eq!(delta.removed_upstream_ids, vec!["u1"]);
+    assert_eq!(
+        delta.removed_upstream_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "u1")],
+    );
     assert!(delta.modified_upstreams.is_empty());
 }
 
@@ -338,7 +348,10 @@ fn test_upstream_mixed_add_remove_modify() {
     let delta = ConfigDelta::compute(&old, &new);
     assert_eq!(delta.added_upstreams.len(), 1);
     assert_eq!(delta.added_upstreams[0].id, "u3");
-    assert_eq!(delta.removed_upstream_ids, vec!["u2"]);
+    assert_eq!(
+        delta.removed_upstream_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "u2")],
+    );
     assert_eq!(delta.modified_upstreams.len(), 1);
     assert_eq!(delta.modified_upstreams[0].id, "u1");
 }
@@ -383,7 +396,10 @@ fn test_detects_removed_plugin_config() {
     let new = GatewayConfig::default();
     let delta = ConfigDelta::compute(&old, &new);
     assert!(delta.added_plugin_configs.is_empty());
-    assert_eq!(delta.removed_plugin_config_ids, vec!["pc1"]);
+    assert_eq!(
+        delta.removed_plugin_config_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "pc1")],
+    );
     assert!(delta.modified_plugin_configs.is_empty());
     assert!(delta.global_plugin_configs_changed);
 }
@@ -436,7 +452,7 @@ fn test_proxy_ids_needing_plugin_rebuild_from_proxy_change() {
     };
     let delta = ConfigDelta::compute(&old, &new);
     let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
-    assert!(ids.contains("p1"));
+    assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
 }
 
 #[test]
@@ -469,7 +485,7 @@ fn test_proxy_ids_needing_plugin_rebuild_from_global_plugin_change() {
     let delta = ConfigDelta::compute(&old, &new);
     let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
     // Global plugin change should trigger rebuild for ALL proxies
-    assert!(ids.contains("p1"));
+    assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
 }
 
 #[test]
@@ -505,9 +521,9 @@ fn test_proxy_ids_needing_plugin_rebuild_when_global_plugin_changes_scope() {
     let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
 
     assert!(delta.global_plugin_configs_changed);
-    assert!(ids.contains("p1"));
+    assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
     assert!(
-        ids.contains("p2"),
+        ids.contains(&NamespacedResourceId::new(default_namespace(), "p2")),
         "a plugin moving away from global scope must rebuild proxies that only saw it via globals"
     );
 }
@@ -538,9 +554,9 @@ fn test_proxy_ids_needing_plugin_rebuild_from_removed_proxy_plugin_config() {
     let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
 
     assert!(!delta.global_plugin_configs_changed);
-    assert!(ids.contains("p1"));
+    assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
     assert!(
-        ids.contains("p2"),
+        ids.contains(&NamespacedResourceId::new(default_namespace(), "p2")),
         "plugin config deletion conservatively rebuilds all proxies because associations may cascade without proxy timestamps"
     );
 }
@@ -577,10 +593,16 @@ fn test_full_mixed_delta_all_entity_types() {
     let delta = ConfigDelta::compute(&old, &new);
 
     assert_eq!(delta.added_proxies.len(), 1);
-    assert_eq!(delta.removed_proxy_ids, vec!["p1"]);
+    assert_eq!(
+        delta.removed_proxy_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "p1")]
+    );
     assert!(delta.added_consumers.is_empty());
     assert_eq!(delta.modified_consumers.len(), 1);
-    assert_eq!(delta.removed_plugin_config_ids, vec!["pc1"]);
+    assert_eq!(
+        delta.removed_plugin_config_ids,
+        vec![NamespacedResourceId::new(default_namespace(), "pc1")],
+    );
     assert_eq!(delta.added_upstreams.len(), 1);
     assert_eq!(delta.modified_upstreams.len(), 1);
     assert!(!delta.is_empty());
@@ -781,7 +803,7 @@ fn test_plugin_rebuild_proxy_scoped_plugin_change() {
     };
     let delta = ConfigDelta::compute(&old, &new);
     let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
-    assert!(ids.contains("p1"));
+    assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
 }
 
 #[test]
@@ -815,9 +837,9 @@ fn test_plugin_rebuild_unrelated_proxy_not_affected() {
     };
     let delta = ConfigDelta::compute(&old, &new);
     let ids = delta.proxy_ids_needing_plugin_rebuild(&old, &new);
-    assert!(ids.contains("p1"));
+    assert!(ids.contains(&NamespacedResourceId::new(default_namespace(), "p1")));
     // p2 should NOT need rebuild since its plugin didn't change
-    assert!(!ids.contains("p2"));
+    assert!(!ids.contains(&NamespacedResourceId::new(default_namespace(), "p2")));
 }
 
 // --- Same timestamp not treated as modification ---

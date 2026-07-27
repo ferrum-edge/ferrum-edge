@@ -373,9 +373,14 @@ async fn h3_probe_classifies_backend_without_quic_as_h3_unsupported() {
         matches!(h3_class, "unsupported" | "unknown"),
         "expected h3=unsupported/unknown for backend without QUIC listener; got {h3_class}; entry: {entry:#?}"
     );
-    assert_eq!(
-        h2_class, "supported",
-        "expected h2_tls=supported for backend advertising h2 in ALPN; entry: {entry:#?}"
+    // Full H2 candidate establishment waits for peer SETTINGS. This scripted
+    // backend advertises ALPN h2 but speaks HTTP/1.1 afterward, so the probe
+    // may leave h2_tls as `unknown` rather than a false `supported` from the
+    // client-preface-only handshake. Either value still forces the
+    // cross-protocol bridge for the H3 request below.
+    assert!(
+        matches!(h2_class, "supported" | "unknown"),
+        "expected h2_tls=supported/unknown for backend advertising h2 in ALPN; entry: {entry:#?}"
     );
 
     // Fire an H3 request — the gateway should dispatch it through the

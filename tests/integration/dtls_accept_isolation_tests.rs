@@ -215,6 +215,7 @@ async fn try_spawn_dtls_gateway(
     let gate = Arc::new(GatedFirstStreamConnect::new(entered_tx, release_rx));
 
     let proxy = dtls_proxy(listen_port, backend_port);
+    let proxy_namespace = proxy.namespace.clone();
     let gateway_config = GatewayConfig {
         version: "1".to_string(),
         proxies: vec![proxy],
@@ -227,9 +228,10 @@ async fn try_spawn_dtls_gateway(
     };
     let plugin_cache =
         Arc::new(PluginCache::new(&gateway_config).expect("PluginCache builds with no plugins"));
-    prepend_proxy_plugin_for_test(&plugin_cache, PROXY_ID, gate)
+    prepend_proxy_plugin_for_test(&plugin_cache, &proxy_namespace, PROXY_ID, gate)
         .expect("inject gated stream-connect plugin");
-    let attached = plugin_cache.get_plugins_for_protocol(PROXY_ID, ProxyProtocol::Udp);
+    let attached =
+        plugin_cache.get_plugins_for_protocol(&proxy_namespace, PROXY_ID, ProxyProtocol::Udp);
     assert!(
         attached
             .iter()
@@ -268,6 +270,7 @@ async fn try_spawn_dtls_gateway(
         port: listen_port,
         bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
         proxy_id: PROXY_ID.to_string(),
+        proxy_namespace: proxy_namespace.clone(),
         dns_cache,
         request_epoch,
         health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),

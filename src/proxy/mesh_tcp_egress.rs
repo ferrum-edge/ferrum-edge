@@ -51,7 +51,7 @@ use super::{
     tcp_proxy,
 };
 use crate::identity::SpiffeId;
-use crate::load_balancer::LoadBalancerCache;
+use crate::load_balancer::{LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner};
 use crate::request_epoch::RequestEpoch;
 use crate::router_cache::MeshTcpEgressEntry;
 
@@ -85,8 +85,11 @@ pub(crate) async fn handle_mesh_tcp_egress(
     // effective port override exists. The per-port LB lane is stricter: it only
     // engages for selection-affecting policy fields, so passive-health-only
     // overrides can cap ejection by port without bypassing subset/upstream LB.
-    let override_port =
-        LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id);
+    let override_port = LoadBalancerCache::initial_dispatch_port_override_from(
+        lb,
+        &proxy.namespace,
+        &entry.upstream_id,
+    );
     let health_port_scope =
         backend_dispatch::stream_health_port_scope(proxy, lb, &entry.upstream_id, override_port);
     let port_lane = (health_port_scope.is_some()
@@ -107,6 +110,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
     if let Some(port) = port_lane {
         let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
             lb,
+            &proxy.namespace,
             &entry.upstream_id,
             Some(port),
             None,
@@ -132,6 +136,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
     let Some(selection) = (if let Some(port) = port_lane {
         LoadBalancerCache::select_target_for_port_from(
             lb,
+            &proxy.namespace,
             &entry.upstream_id,
             &lb_hash_key,
             port,
@@ -140,6 +145,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
     } else {
         LoadBalancerCache::select_target_from(
             lb,
+            &proxy.namespace,
             &entry.upstream_id,
             &lb_hash_key,
             Some(&health_ctx),
@@ -171,11 +177,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
 
     // Least-connection accounting parity with the HTTP relay path. Held across
     // the transport-specific dial and the relay; dropped on any early return.
-    let balancer = epoch
-        .load_balancer
-        .balancers()
-        .get(&entry.upstream_id)
-        .cloned();
+    let balancer = connection_balancer(&epoch.load_balancer, &proxy.namespace, &entry.upstream_id);
     let _lb_guard = LoadBalancerConnectionGuard::new(Some(Arc::clone(&target)), balancer);
 
     // Select the transport from the target's tag (mutually exclusive — the
@@ -379,7 +381,9 @@ pub(crate) async fn handle_mesh_tcp_egress(
         client_ip = %remote_addr.ip(),
         "Relaying captured raw-TCP connection over mesh CONNECT tunnel"
     );
-    let buffer_size = state.adaptive_buffer.get_buffer_size(&proxy.id);
+    let buffer_size = state
+        .adaptive_buffer
+        .get_buffer_size(&proxy.namespace, &proxy.id);
     let result = tcp_proxy::bidirectional_copy_for_relay(
         client_stream,
         tunnel,
@@ -394,6 +398,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
         observability.complete_tcp(&result);
     }
     state.adaptive_buffer.record_connection(
+        &proxy.namespace,
         &proxy.id,
         result
             .bytes_client_to_backend
@@ -432,6 +437,20 @@ pub(crate) async fn handle_mesh_tcp_egress(
             "Raw-TCP mesh egress relay completed"
         );
     }
+}
+
+/// Resolve the balancer that owns raw-TCP mesh egress connection accounting.
+///
+/// Balancer snapshots are keyed by `(namespace, upstream_id)`. Keeping this
+/// lookup behind the typed accessor prevents same-ID tenants from aliasing and
+/// avoids allocating a runtime key on the connection hot path.
+#[inline]
+pub(crate) fn connection_balancer(
+    snapshot: &LoadBalancerCacheInner,
+    namespace: &str,
+    upstream_id: &str,
+) -> Option<Arc<LoadBalancer>> {
+    snapshot.balancer(namespace, upstream_id).cloned()
 }
 
 fn stream_port_override_affects_selection(proxy: &crate::config::types::Proxy, port: u16) -> bool {
@@ -576,7 +595,9 @@ listen_port: 15001
         let snapshot = cache.load();
         let override_port =
             crate::load_balancer::LoadBalancerCache::initial_dispatch_port_override_from(
-                &snapshot, "orders",
+                &snapshot,
+                &proxy.namespace,
+                "orders",
             );
 
         let health_port_scope = super::backend_dispatch::stream_health_port_scope(

@@ -116,6 +116,15 @@ impl std::fmt::Debug for ProxyAlerts {
     }
 }
 
+thread_local! {
+    /// Reusable scratch buffer for the namespace-qualified lifecycle identity
+    /// (`namespace|proxy_id`). Borrowed strictly synchronously within one
+    /// `handle` call (no `.await`, no re-entry), so per-sample identity
+    /// composition stays allocation-free in steady state.
+    static OWNER_KEY_BUF: std::cell::RefCell<String> =
+        std::cell::RefCell::new(String::with_capacity(64));
+}
+
 impl ProxyAlerts {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
         let parsed = ProxyAlertsConfig::parse(config)?;
@@ -338,33 +347,64 @@ impl ProxyAlerts {
         if !self.enabled.load(Ordering::Acquire) {
             return;
         }
-        let proxy_id = sample.proxy_id().unwrap_or("");
-        if !proxy_id.is_empty()
-            && !self.owns_proxy_generation(proxy_id, sample.proxy_lifecycle_generation())
-        {
+        // Nothing to observe without a proxy identity (HTTP summaries may omit
+        // it); mirrors the historical `sample.proxy_id()?` short-circuit.
+        let Some(proxy_id) = sample.proxy_id() else {
             return;
-        }
-        let now = Utc::now();
-        let now_ms = monotonic_now_ms();
-        let in_quiet = self.quiet_hours.iter().any(|w| w.matches(now));
-        for rule in self.rules.iter() {
-            let Some(observation) = rule.observe(sample, &self.windows, now_ms) else {
-                continue;
-            };
-            self.process_observation(rule, &observation, sample, now_ms, now, in_quiet);
-        }
+        };
+        OWNER_KEY_BUF.with(|buf| {
+            let mut owner = buf.borrow_mut();
+            // Lifecycle identity is namespace-qualified (`namespace|id`) so the
+            // same proxy id in two tenants owns independent window/cooldown/
+            // recovery/ownership rows and cannot mutate or retain each other's.
+            crate::config::db_backend::write_namespaced_runtime_key(
+                &mut owner,
+                sample.namespace(),
+                proxy_id,
+            );
+            let owner_key = owner.as_str();
+            if !proxy_id.is_empty()
+                && !self.owns_proxy_generation(owner_key, sample.proxy_lifecycle_generation())
+            {
+                return;
+            }
+            let now = Utc::now();
+            let now_ms = monotonic_now_ms();
+            let in_quiet = self.quiet_hours.iter().any(|w| w.matches(now));
+            // `observe` re-derives the same namespace-qualified identity from the
+            // sample (its own thread-local scratch); `process_observation` reuses
+            // this `owner_key`. Both agree because the composition is identical.
+            for rule in self.rules.iter() {
+                let Some(observation) = rule.observe(sample, &self.windows, now_ms) else {
+                    continue;
+                };
+                self.process_observation(
+                    rule,
+                    &observation,
+                    sample,
+                    owner_key,
+                    now_ms,
+                    now,
+                    in_quiet,
+                );
+            }
+        });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_observation(
         &self,
         rule: &Rule,
         observation: &RuleObservation,
         sample: SampleInput<'_>,
+        owner_key: &str,
         now_ms: u64,
         now: chrono::DateTime<chrono::Utc>,
         in_quiet: bool,
     ) {
-        let proxy_id = sample.proxy_id().unwrap_or("");
+        // Namespace-qualified lifecycle identity; `sample` still carries the
+        // bare proxy name/namespace used for notification rendering.
+        let proxy_id = owner_key;
         let ownership_generation = sample
             .proxy_lifecycle_generation()
             .unwrap_or(UNARMED_PROXY_LIFECYCLE_GENERATION);
@@ -732,7 +772,7 @@ mod tests {
         assert_eq!(
             plugin.windows.snapshot_count(
                 0,
-                "p1",
+                "ferrum|p1",
                 UNARMED_PROXY_LIFECYCLE_GENERATION,
                 monotonic_now_ms(),
             ),
@@ -745,7 +785,7 @@ mod tests {
         assert_eq!(
             plugin.windows.snapshot_count(
                 0,
-                "p1",
+                "ferrum|p1",
                 UNARMED_PROXY_LIFECYCLE_GENERATION,
                 monotonic_now_ms(),
             ),
@@ -779,7 +819,7 @@ mod tests {
         assert_eq!(
             plugin
                 .recovery
-                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+                .current_state(0, "ferrum|p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             None
         );
     }
@@ -816,7 +856,7 @@ mod tests {
         assert!(
             plugin.cooldowns.try_acquire(
                 0,
-                "p1",
+                "ferrum|p1",
                 0,
                 60_000,
                 monotonic_now_ms(),
@@ -894,7 +934,7 @@ mod tests {
         assert_eq!(
             plugin
                 .recovery
-                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+                .current_state(0, "ferrum|p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             None
         );
 
@@ -903,7 +943,7 @@ mod tests {
         assert!(matches!(
             plugin
                 .recovery
-                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+                .current_state(0, "ferrum|p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             Some(RuleState::Active { .. })
         ));
     }
@@ -926,7 +966,7 @@ mod tests {
         let now_ms = monotonic_now_ms();
         assert!(plugin.cooldowns.try_acquire(
             0,
-            "p1",
+            "ferrum|p1",
             0,
             60_000,
             now_ms,
@@ -945,7 +985,7 @@ mod tests {
         assert_eq!(
             plugin
                 .recovery
-                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+                .current_state(0, "ferrum|p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             None,
             "a first trigger suppressed by cooldown must not create a resolvable incident"
         );
@@ -967,16 +1007,26 @@ mod tests {
             ]
         });
         let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
-        plugin
-            .recovery
-            .observe(0, "p1", true, 5_000, 1, UNARMED_PROXY_LIFECYCLE_GENERATION);
-        plugin
-            .recovery
-            .observe(0, "p1", false, 5_000, 2, UNARMED_PROXY_LIFECYCLE_GENERATION);
+        plugin.recovery.observe(
+            0,
+            "ferrum|p1",
+            true,
+            5_000,
+            1,
+            UNARMED_PROXY_LIFECYCLE_GENERATION,
+        );
+        plugin.recovery.observe(
+            0,
+            "ferrum|p1",
+            false,
+            5_000,
+            2,
+            UNARMED_PROXY_LIFECYCLE_GENERATION,
+        );
         assert!(matches!(
             plugin
                 .recovery
-                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+                .current_state(0, "ferrum|p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
             Some(RuleState::Recovering { .. })
         ));
 
@@ -994,6 +1044,8 @@ mod tests {
         };
 
         let sample = SampleInput::Http(&summary);
+        // Namespace-qualified lifecycle identity the plugin composes internally.
+        let owner_key = "ferrum|p1";
         let rule = &plugin.rules[0];
         let first_resolve_ms = 5_002;
         let observation = rule
@@ -1003,6 +1055,7 @@ mod tests {
             rule,
             &observation,
             sample,
+            owner_key,
             first_resolve_ms,
             chrono::Utc::now(),
             false,
@@ -1010,7 +1063,7 @@ mod tests {
         assert!(matches!(
             plugin
                 .recovery
-                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+                .current_state(0, owner_key, UNARMED_PROXY_LIFECYCLE_GENERATION),
             Some(RuleState::Recovering { .. })
         ));
 
@@ -1023,6 +1076,7 @@ mod tests {
             rule,
             &observation,
             sample,
+            owner_key,
             second_resolve_ms,
             chrono::Utc::now(),
             false,
@@ -1030,7 +1084,7 @@ mod tests {
         assert_eq!(
             plugin
                 .recovery
-                .current_state(0, "p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+                .current_state(0, owner_key, UNARMED_PROXY_LIFECYCLE_GENERATION),
             Some(RuleState::Healthy)
         );
     }

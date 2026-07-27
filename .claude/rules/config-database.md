@@ -68,6 +68,23 @@ paths:
 - SQL wraps multi-step CRUD in `sqlx::Transaction`.
 - MongoDB single-doc writes are atomic. Multi-doc atomicity requires `FERRUM_MONGO_REPLICA_SET`; otherwise flows must be idempotent with poll-cycle cleanup.
 - `FERRUM_DB_FAILOVER_URLS` uses the same `FERRUM_DB_TYPE`.
+- Admin config-database writes fail closed while the active pool is on a
+  failover URL unless `FERRUM_DB_FAILOVER_ALLOW_WRITES=true` (opt-in only for
+  operator-asserted synchronously replicated multi-primary topologies).
+  Polling/reads stay available. Opt-in allows automatic primary failback and
+  emits one bounded process-local divergence-risk marker for the failover
+  window (not a durable fence; cleared by restart). Topology/divergence
+  signals use redacted URLs only. Config-database mutation handlers admit under
+  a write-topology pin (SQL reconnect `RwLock` read / Mongo distinct
+  `admin_write_topology` `RwLock` read) retained for the full persistence
+  lifetime so a reconnect cannot redirect an already-admitted write; Mongo
+  admission continues to pin only `connection_generation` (publication
+  `try_write`s Admin topology then generation, both fail-fast; failover marks
+  before publish and primary marks after publish, both under those guards).
+  Managed TLS/ACME handlers use the non-topology write gate only (read-only +
+  database-unavailable) and must not pin or inherit sticky DB failover policy.
+  Observe-only `/health` uses the synchronous policy check;
+  `admin_writes_enabled` reports config-database mutation admission.
 - Runtime config polling is authoritative and primary-consistent: startup full loads, incremental change-log reads, relationship reads, cursor advancement, and accepted association state must not use SQL read replicas or MongoDB secondary read preferences.
 - `FERRUM_DB_READ_REPLICA_URL` is SQL-only and may offload eligible admin-only reads; writes and runtime polling always use primary. Replica query failure must mark the replica unavailable and retry the admin read on primary.
 - MongoDB replica-set failover comes from listing members in `FERRUM_DB_URL`; Ferrum's config store forces primary reads and ignores URL read preferences.

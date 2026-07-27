@@ -939,6 +939,7 @@ pub async fn run(
             store.set_full_load_page_size(env_config.db_full_load_page_size);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
+            store.set_failover_allow_writes(env_config.db_failover_allow_writes);
             let retention_policy = crate::admin::audit::AuditRetentionPolicy {
                 retention_days: env_config.audit_retention_days,
                 max_rows_per_namespace: env_config.audit_retention_max_rows,
@@ -1010,6 +1011,7 @@ pub async fn run(
             store.set_full_load_page_size(env_config.db_full_load_page_size);
             store.set_cert_expiry_warning_days(env_config.tls_cert_expiry_warning_days);
             store.set_backend_allow_ips(env_config.backend_allow_ips.clone());
+            store.set_failover_allow_writes(env_config.db_failover_allow_writes);
             let retention_policy = crate::admin::audit::AuditRetentionPolicy {
                 retention_days: env_config.audit_retention_days,
                 max_rows_per_namespace: env_config.audit_retention_max_rows,
@@ -1374,8 +1376,11 @@ pub async fn run(
         env_config.runtime_metrics_window_5m_seconds,
         shutdown_tx.subscribe(),
     );
-    let acme_renewal_handle =
-        crate::modes::start_acme_renewal_scheduler(&env_config, shutdown_tx.subscribe());
+    let acme_renewal_handle = crate::modes::start_acme_renewal_scheduler(
+        &env_config,
+        dns_cache.clone(),
+        shutdown_tx.subscribe(),
+    );
 
     let mut background_handles: Vec<JoinHandle<()>> = vec![
         dns_handle,

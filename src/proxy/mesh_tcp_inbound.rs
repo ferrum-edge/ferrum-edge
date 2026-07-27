@@ -62,9 +62,10 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     // TCP-protocol chain via its global fallback — which carries the
     // mesh-injected `__mesh_authz` global. A `Reject` closes the captured
     // connection (drop) instead of relaying to the app.
-    let plugins = epoch
-        .plugin_cache
-        .get_plugins_for_protocol(&proxy.id, ProxyProtocol::Tcp);
+    let plugins =
+        epoch
+            .plugin_cache
+            .plugins_for_protocol(&proxy.namespace, &proxy.id, ProxyProtocol::Tcp);
 
     // No global TCP chain resolved: relay immediately. There is no plugin state
     // to track and no policy to evaluate, so the connect/disconnect lifecycle is
@@ -173,9 +174,10 @@ pub(crate) async fn handle_mesh_tcp_inbound(
         proxy.effective_scheme(),
         consumer_index,
     );
+    stream_ctx.proxy_namespace = proxy.namespace.clone();
     stream_ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
     // Populated above for opaque-TLS captures; `None` for raw-TCP streams.
     stream_ctx.sni_hostname = sni_hostname;
     // Captured plaintext Sidecar inbound is, by direction, inbound mesh
@@ -316,7 +318,9 @@ pub(crate) async fn handle_mesh_tcp_inbound(
         client_ip = %client_ip,
         "Relaying captured sidecar raw-TCP inbound connection to loopback app"
     );
-    let buffer_size = state.adaptive_buffer.get_buffer_size(&proxy.id);
+    let buffer_size = state
+        .adaptive_buffer
+        .get_buffer_size(&proxy.namespace, &proxy.id);
     let result = tcp_proxy::bidirectional_copy_for_relay(
         client_stream,
         backend_stream,
@@ -328,6 +332,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     )
     .await;
     state.adaptive_buffer.record_connection(
+        &proxy.namespace,
         &proxy.id,
         result
             .bytes_client_to_backend
@@ -444,7 +449,9 @@ async fn relay_to_loopback(
         client_ip = %client_ip,
         "Relaying captured sidecar raw-TCP inbound connection to loopback app"
     );
-    let buffer_size = state.adaptive_buffer.get_buffer_size(&proxy.id);
+    let buffer_size = state
+        .adaptive_buffer
+        .get_buffer_size(&proxy.namespace, &proxy.id);
     let result = tcp_proxy::bidirectional_copy_for_relay(
         client_stream,
         backend_stream,
@@ -456,6 +463,7 @@ async fn relay_to_loopback(
     )
     .await;
     state.adaptive_buffer.record_connection(
+        &proxy.namespace,
         &proxy.id,
         result
             .bytes_client_to_backend

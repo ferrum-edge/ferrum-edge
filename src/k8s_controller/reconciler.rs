@@ -920,8 +920,8 @@ const K8S_MANAGED_PLUGIN_CONFIG_ID_PREFIXES: &[&str] = &[
     "istio-vs-mirror-",
     "istio-vs-mrd-",
     "istio-vs-rt-",
-    "__istio_vs_req_xform_",
-    "__istio_vs_resp_xform_",
+    "istio-vs-req-xform-",
+    "istio-vs-resp-xform-",
 ];
 
 fn managed_k8s_namespaces(

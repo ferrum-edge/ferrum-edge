@@ -352,6 +352,11 @@ impl SpecExpose {
         // setting independently of the shared plugin HTTP client, but we still
         // wire the gateway's shared DNS cache for consistent resolution + TTL.
         let mut builder = reqwest::Client::builder()
+            // Ignore ambient HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY process
+            // state: a selected proxy would resolve and dial the spec host
+            // itself, so the ultimate destination would never reach the
+            // `DnsCacheResolver` egress screen wired below.
+            .no_proxy()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             // Do not follow redirects: a 3xx from an allowed spec host could

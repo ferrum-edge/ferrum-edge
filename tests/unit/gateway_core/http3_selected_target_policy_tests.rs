@@ -278,7 +278,7 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
     );
     assert!(
         source.contains("let request_protocol = h3_plugin_protocol_for_request(")
-            && source.contains("epoch.plugin_cache.grpc_web_request_view(&proxy.id)"),
+            && source.contains(".grpc_web_request_view(&proxy.namespace, &proxy.id)"),
         "H3 gRPC-Web must retain its HTTP protocol key and use the composed cache view"
     );
     assert!(

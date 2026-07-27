@@ -666,7 +666,7 @@ impl<'a> BackendTlsConfigBuilder<'a> {
         // fully-built `rustls::ClientConfig` via `use_preconfigured_tls`, which
         // is the sole source of truth for the trust anchors anyway — the
         // built-in roots toggle never had any effect on this path.
-        let mut builder = reqwest::Client::builder();
+        let mut builder = reqwest::Client::builder().no_proxy();
         if self.skip_verification() {
             builder = builder.danger_accept_invalid_certs(true);
         }

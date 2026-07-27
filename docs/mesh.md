@@ -200,6 +200,7 @@ For remote-cluster discovery specifically, `GET /mesh/remote-clusters` names eac
 
 - RED: `ferrum_mesh_requests_total`, `ferrum_mesh_request_duration_ms` (carry SPIFFE identity + `connection_security_policy` labels).
 - Config freshness: `ferrum_mesh_config_last_received_timestamp_seconds{namespace}`.
+- Config ordering: `ferrum_mesh_config_revision_rejections_total{reason}` (`stale_revision` / `incomparable_authority` / `missing_revision` / `malformed_revision`) and `ferrum_mesh_config_revision_adoptions_total` — see [Authoritative Config Revisions And Stale-Fallback Rejection](#authoritative-config-revisions-and-stale-fallback-rejection). Fixed cardinality; the CP-supplied authority/sequence detail stays on the JWT-gated `GET /mesh/config-drift` `revision` block.
 - Identity: `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health{ca_type}`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_mtls_handshake_failures_total{reason}`.
 - Inbound posture: `ferrum_mesh_inbound_plaintext_allowed` — `1` when the mesh inbound listener was allowed up without enforced mTLS (dev opt-out posture; production mode refuses it), `0` otherwise.
 - Federation: `ferrum_mesh_federation_poll_failures_total`, `ferrum_mesh_federation_last_success_timestamp_seconds`, `ferrum_mesh_federation_bundle_age_seconds`.
@@ -1484,6 +1485,79 @@ Operator playbook:
 - **Spot a wedged xDS DP**: when `convergence.converged` is `false` with a non-empty `convergence.missing_required_types` on a starting DP, the first slice is blocked waiting on those types — cross-check `ferrum_xds_first_slice_nacks_total` for a malformed required resource (NACK loop) versus a CP that is simply not sending that type (no NACKs, type stays missing).
 
 A CP-side endpoint that reports what slice version the CP last published to each connected DP (so external tooling can diff "what the CP thinks each DP should have" against "what each DP reports here") is future work; this endpoint covers the DP-local half of the drift picture.
+
+## Authoritative Config Revisions And Stale-Fallback Rejection
+
+Multi-CP failover must never move a data plane *backwards*. A fallback control plane that missed a poll, is partitioned from the config store, or is simply lagging still serves a structurally valid slice — and installing it would reinstate deleted routes, endpoints, authorization policies, or trust material until failback. The slice `version` cannot arbitrate that: it is a rendering of the serving CP's local `GatewayConfig.loaded_at` wall clock, so it is not comparable across replicas, clock skew, or process restarts.
+
+Mesh slices therefore carry an authoritative **config revision** alongside `version`:
+
+```
+revision = (authority, sequence)
+```
+
+- **`authority`** names the ordering *domain*. Sequences are only comparable within one authority. Every CP replica reading the same config store advertises the same value (`FERRUM_MESH_CONFIG_AUTHORITY_ID`, default `db`), which is exactly what makes a primary's and a fallback's slices comparable.
+- **`sequence`** is a durable `config_changes` change-log cursor — not a clock and not a process-local counter. Its *domain* follows CP scope so identical-scope replicas stay convergent across restarts:
+  - Explicit `CpScope::Single` / `Set`: the maximum durable `latest_change_sequence(namespace)` over the configured namespaces — the same cursors incremental polling advances from. An unrelated namespace outside the scope cannot advance a restarted replica ahead of its still-running peer.
+  - `CpScope::All`: the store-wide `config_changes` high-water mark, because the dynamically discovered namespace list can shrink after the last resource in a namespace is deleted; without the global watermark a restarted All-scope CP would rewind. An in-process floor additionally protects full reload while the process is alive.
+
+Every namespace cursor—and, for sequenced `All`, the store-global watermark—is captured **before** the corresponding full resource loads begin. This is deliberately conservative across SQL snapshot transactions, replica-set Mongo snapshot transactions, and standalone Mongo's sequential reads: a write that commits after the boundary may already appear in the full snapshot and be harmlessly replayed by the next incremental poll, but an older snapshot can never be stamped with that later write's sequence or advance the polling cursor past it. In explicit `Single`/`Set` scope, a namespace whose boundary cannot be read is demoted independently: its resource load is skipped, its last-known-good resources and cursor are retained, and healthy namespaces continue. Sequenced `All` scope retains the entire prior snapshot on any boundary, load, or validation failure because a partial LKG aggregate cannot safely claim the store-global watermark. Unsequenced `All` scope (including a CP with the Kubernetes controller enabled) publishes no global revision, so it retains the same per-namespace LKG continuation: failed tenants keep their resources and cursors while healthy tenants refresh. The in-process floor is applied only after these safe captures as a monotonic lower bound; it is not a substitute for boundary ordering.
+
+The revision rides `MeshConfigUpdate.config_authority` / `config_sequence` on the native `MeshSubscribe` envelope (a duplicate of the slice's own value, validated for agreement exactly like `version`) and, on the xDS path, its own ECDS carrier (`ConfigRevisionCarrier`) so a native-built and an xDS-built slice materialize identical ordering metadata and pass through the same data-plane gate. Native remote-cluster discovery applies the same comparison per remote source after endpoint validation and before replacing last-good remote endpoints.
+
+### Comparison contract
+
+The data plane records the revision of the slice it accepted and compares every candidate **before** the `ArcSwap` replacement:
+
+| accepted | candidate | outcome |
+|---|---|---|
+| none | no revision (genuinely absent) | install (bootstrap) |
+| none | well-formed revision | install (bootstrap) |
+| any | present but ill-formed (blank / surrounding-whitespace / over-long / control-character authority) | **quarantine** (`malformed_revision`) — never silently downgraded to absent |
+| some | no revision | **quarantine** (`missing_revision`) |
+| same authority | `sequence >` accepted | install |
+| same authority | `sequence ==` accepted | install (reconnect replay / republish) |
+| same authority | `sequence <` accepted | **quarantine** (`stale_revision`) |
+| other authority | any | **quarantine** (`incomparable_authority`) |
+
+Equal sequences must install: reconnecting to the same CP replays that CP's initial slice at the unchanged revision, and quarantining it would break every ordinary reconnect.
+
+A **present but ill-formed** revision is distinct from an absent one. Centralized `MeshConfigUpdate` validation refuses an embedded (or envelope) ill-formed revision before install, and `MeshRevisionGate::admit` refuses the same shape even on bootstrap — including the xDS path, which reaches the shared gate without that update validator. Filtering an ill-formed authority to "absent" would otherwise let a hostile first frame with an empty envelope stamp pass as consistently unversioned, install, and retain no watermark. On the envelope, distinguish raw empty (`config_authority=""`, the proto default — genuinely absent) from raw non-empty whitespace (`"   "`): the latter is present/malformed and rejected with a bounded static diagnostic that does not echo the authority text. Genuinely absent revisions remain valid for unsequenced authorities (K8s controller / file protocol).
+
+A quarantined candidate mutates nothing — the last-good slice keeps serving, the receive metric and `last_received_at` do not advance, and no watcher is woken. On the native stream a quarantine also **drops the stream** so multi-CP failover moves off the lagging control plane; staying attached would only let it keep serving stale generations.
+
+On the xDS path the ADS response was already folded into the resource accumulator and ACKed before the slice was rebuilt, so the gate does not rewind it. That is deliberate: rewinding would desynchronize local state from versions already ACKed. A revision quarantine instead terminates ADS and triggers the existing multi-CP rotation. The accumulator is state-of-the-world state scoped to a single control-plane URL and is cleared wholesale on failover (`reset_for_new_control_plane`), so a quarantined CP's resources cannot mix into the next CP's slice. The last-good live slice remains untouched throughout.
+
+### Received versus applied (candidate lifecycle)
+
+Passing the freshness gate makes a slice the *received* candidate, not the serving one. The mesh proxy runtime is a second, independent gate: slice→config preparation or the proxy config apply can still refuse it, leaving the previous generation live. The gate therefore tracks two watermarks, both on `GET /mesh/config-drift`:
+
+- **`accepted`** — the highest revision admitted into the received slot. This is what candidate comparison runs against, so a burst of updates still orders correctly while an earlier one is mid-apply.
+- **`applied`** — the revision of the slice the proxy runtime last accepted. This is the authoritative last-good generation.
+
+When the runtime accepts a candidate, `applied` advances to it (including a content-no-op or equal-revision replay, where the runtime accepts with no config delta). When the runtime **refuses** one, `accepted` is rolled back to `applied`, so every revision between them stays eligible. Without that rollback, a single runtime-invalid slice published at a far-future sequence would advance the watermark past every valid revision beneath it and block recovery with a generation that never served a request — the exact lockout the reset endpoint exists to avoid needing. The rollback is keyed to the exact received candidate (`(authority, sequence)` equality plus received-slot identity), so a *late* rejection of N never disturbs an N+1 that arrived while N was being applied. A candidate refused before anything was ever applied returns the gate to no baseline at all, rather than poisoning startup and fallback. Runtime apply work also captures a gate-epoch token before asynchronous preparation; reset advances the epoch, so a pre-reset apply that completes late can update the serving-content snapshot without resurrecting either cleared watermark.
+
+### Intentional rollback
+
+Rolling configuration back is a **write**: it allocates new change-log sequences, so it reaches data planes as a *higher* revision carrying older content and installs normally. Replaying an old generation to move a data plane backwards is never a supported operation.
+
+### Reset semantics (no permanent lockout)
+
+Two escape hatches, both explicit:
+
+- A **foreign authority** observed continuously for `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS` (default 300 s, `0` disables) is adopted with a `warn!` and a bump of `ferrum_mesh_config_revision_adoptions_total`. The grace uses a monotonic process clock; NTP or manual wall-clock jumps cannot expire it early. This covers CP state loss and a deliberate source reset without an operator round trip.
+- `POST /mesh/config-revision/reset` (JWT + `operator` role) clears the accepted revision so the next slice from any authority is eligible. This is the documented recovery for the one case that is never auto-adopted: a sequence rewind *inside* one authority — a config store restored from backup without bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID`. Auto-adopting that would be indistinguishable from the rollback the gate exists to prevent. The reset installs nothing itself; the next slice still has to pass subscription binding and update validation.
+
+### Observability
+
+- `/metrics` (unauthenticated tier): `ferrum_mesh_config_revision_rejections_total{reason}` with `reason` ∈ `stale_revision` / `incomparable_authority` / `missing_revision` / `malformed_revision`, and `ferrum_mesh_config_revision_adoptions_total`. These process counters aggregate the local slice gate and native remote-discovery gates. Fixed cardinality — no CP-supplied authority string or sequence number reaches this surface.
+- `GET /mesh/config-drift` (JWT): the `revision` block carries the accepted and applied `(authority, sequence)` watermarks, the most recent quarantine (authority, sequence, reason, consecutive count, first/last seen), the totals, the effective adopt grace, and `quarantine_active` — the "stale fallback quarantined" signal to alert on. Every authority rendered on this surface — and in the reset response and its audit log line — is control-character-stripped and truncated to 64 characters; the raw control-plane string never leaves the gate, where exact ordering comparisons need it. An authority that is blank, has surrounding whitespace, is over-long, or contains control characters is refused as `malformed_revision` at the boundary and never becomes a watermark at all.
+
+### Scope and residuals
+
+- **Unsequenced authorities.** A CP running the Kubernetes CRD controller (`FERRUM_K8S_CONTROLLER_ENABLED=true`) publishes **no** revision: the controller reconciles CRDs into the in-memory snapshot on its own cadence with no cross-replica monotonic sequence to order against (a max-over-live-objects `metadata.resourceVersion` *decreases* when the highest-versioned object is deleted, and per-replica high-water marks diverge). Mixing sequenced DB snapshots with unsequenced controller snapshots inside one authority would make the gate flap, so such a CP publishes nothing and data planes apply no cross-CP ordering — the pre-existing behavior. Giving the K8s authority a shared monotonic revision (an informer list/bookmark `resourceVersion` watermark) is follow-up work. The same applies to `FERRUM_MESH_CONFIG_PROTOCOL=file`, which is inherently local and ordered by the operator's own edits.
+- **One store per authority, and matching CP scope.** Two CPs pointed at *different* config stores while advertising the same `FERRUM_MESH_CONFIG_AUTHORITY_ID` is a misconfiguration the gate cannot detect — their sequences are not comparable but claim to be. Give distinct stores distinct authority ids. Likewise, the replicas a data plane lists in `FERRUM_DP_CP_GRPC_URLS` must share a `FERRUM_CP_NAMESPACES` scope: differently scoped replicas can serve different content and must not claim equal revisions. Within one shared scope, full-load stamping uses the scope's sequence domain (max of explicit namespace cursors for `Single`/`Set`; store-global high-water mark for `All`) plus an in-process floor, so identical-scope replicas converge across restarts and an All-scope namespace disappearance cannot rewind publication. Native `MeshSlice::content_eq` deliberately ignores `revision`, so a revision-only stamp change does not fan out frames to already-subscribed clients.
+- **Remote-cluster discovery.** The multicluster remote-endpoint poller validates envelope/slice agreement through the shared validator and keeps a per-cluster revision gate across one-shot reconnect polls and source-identity rotations. Endpoint content and trust-domain boundaries are validated before provisional admission; the applied watermark commits only after the generation-checked endpoint-store install (including a live dedup), and a retired generation rolls admission back. Thus an invalid or non-installed far-future slice cannot poison recovery; stale/missing/foreign revisions fail the poll and preserve last-good endpoints. Removing the cluster declaration drops its endpoints and prunes its gate, while a still-declared URL/credential rotation retains the gate. The same `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS` policy controls foreign-authority adoption.
 
 ## DestinationRule
 

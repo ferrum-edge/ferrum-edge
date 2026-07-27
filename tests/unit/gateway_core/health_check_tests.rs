@@ -2,8 +2,8 @@
 
 use chrono::Utc;
 use ferrum_edge::config::types::{
-    ActiveHealthCheck, GatewayConfig, HealthCheckConfig, HealthProbeType, LoadBalancerAlgorithm,
-    PassiveHealthCheck, Upstream, UpstreamTarget, default_namespace,
+    ActiveHealthCheck, DEFAULT_NAMESPACE, GatewayConfig, HealthCheckConfig, HealthProbeType,
+    LoadBalancerAlgorithm, PassiveHealthCheck, Upstream, UpstreamTarget, default_namespace,
 };
 use ferrum_edge::health_check::HealthChecker;
 use std::collections::HashMap;
@@ -14,6 +14,11 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
 const TEST_PROXY: &str = "test-proxy";
+
+/// Namespace-qualified runtime key (`ferrum|id`) for the default test namespace.
+fn rk(id: &str) -> String {
+    ferrum_edge::config::db_backend::namespaced_runtime_key("ferrum", id)
+}
 
 fn make_target(host: &str, port: u16) -> UpstreamTarget {
     UpstreamTarget {
@@ -29,9 +34,10 @@ fn make_target(host: &str, port: u16) -> UpstreamTarget {
 
 /// Check if a target is passively unhealthy for a given proxy via the two-level index.
 fn is_passive_unhealthy(checker: &HealthChecker, proxy_id: &str, host_port: &str) -> bool {
+    let key = rk(proxy_id);
     checker
         .passive_health
-        .get(proxy_id)
+        .get(&key)
         .is_some_and(|ps| ps.unhealthy.contains_key(host_port))
 }
 
@@ -60,6 +66,7 @@ fn test_passive_health_marks_unhealthy() {
 
     for _ in 0..3 {
         checker.report_response(
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             "test-upstream",
             &target,
@@ -88,6 +95,7 @@ fn test_passive_health_recovers() {
 
     for _ in 0..2 {
         checker.report_response(
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             "test-upstream",
             &target,
@@ -99,6 +107,7 @@ fn test_passive_health_recovers() {
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -125,6 +134,7 @@ fn test_success_does_not_mark_unhealthy() {
 
     for _ in 0..100 {
         checker.report_response(
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             "test-upstream",
             &target,
@@ -153,6 +163,7 @@ fn test_connection_error_counts_as_failure_regardless_of_status_codes() {
 
     for _ in 0..2 {
         checker.report_response(
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             "test-upstream",
             &target,
@@ -184,6 +195,7 @@ fn test_connection_error_recovery_on_success() {
 
     for _ in 0..2 {
         checker.report_response(
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             "test-upstream",
             &target,
@@ -195,6 +207,7 @@ fn test_connection_error_recovery_on_success() {
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -222,6 +235,7 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
 
     for _ in 0..2 {
         checker.report_response(
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             "test-upstream",
             &target1,
@@ -230,6 +244,7 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
             Some(&config),
         );
         checker.report_response(
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             "test-upstream",
             &target2,
@@ -242,7 +257,11 @@ fn test_remove_stale_passive_targets_for_proxy_cleans_unhealthy() {
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend2:8080"));
 
     // Remove backend2 from the upstream for this proxy.
-    checker.remove_stale_passive_targets_for_proxy(TEST_PROXY, std::slice::from_ref(&target1));
+    checker.remove_stale_passive_targets_for_proxy(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        std::slice::from_ref(&target1),
+    );
 
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend2:8080"));
@@ -264,6 +283,7 @@ fn test_remove_stale_passive_targets_for_proxy_empty_list_clears_all() {
 
     for _ in 0..2 {
         checker.report_response(
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             "test-upstream",
             &target,
@@ -274,7 +294,7 @@ fn test_remove_stale_passive_targets_for_proxy_empty_list_clears_all() {
     }
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
-    checker.remove_stale_passive_targets_for_proxy(TEST_PROXY, &[]);
+    checker.remove_stale_passive_targets_for_proxy(DEFAULT_NAMESPACE, TEST_PROXY, &[]);
     assert_eq!(passive_unhealthy_count(&checker), 0);
 }
 
@@ -295,6 +315,7 @@ fn test_remove_stale_targets_no_op_when_all_present() {
 
     for _ in 0..2 {
         checker.report_response(
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             "test-upstream",
             &target1,
@@ -303,6 +324,7 @@ fn test_remove_stale_targets_no_op_when_all_present() {
             Some(&config),
         );
         checker.report_response(
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             "test-upstream",
             &target2,
@@ -312,7 +334,11 @@ fn test_remove_stale_targets_no_op_when_all_present() {
         );
     }
 
-    checker.remove_stale_passive_targets_for_proxy(TEST_PROXY, &[target1, target2]);
+    checker.remove_stale_passive_targets_for_proxy(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        &[target1, target2],
+    );
     assert_eq!(passive_unhealthy_count(&checker), 2);
 }
 
@@ -335,6 +361,7 @@ fn test_passive_health_isolated_across_proxies_sharing_upstream() {
     // Proxy-A sends large payloads → backend returns 500s
     for _ in 0..2 {
         checker.report_response(
+            "ferrum",
             "proxy-a",
             "test-upstream",
             &target,
@@ -355,6 +382,7 @@ fn test_passive_health_isolated_across_proxies_sharing_upstream() {
 
     // Proxy-B sends small payloads → backend returns 200s
     checker.report_response(
+        "ferrum",
         "proxy-b",
         "test-upstream",
         &target,
@@ -390,6 +418,7 @@ fn test_active_and_passive_health_are_independent() {
 
     for _ in 0..2 {
         checker.report_response(
+            "ferrum",
             "proxy-a",
             "test-upstream",
             &target,
@@ -457,6 +486,7 @@ fn test_prune_removed_proxies() {
     // Insert passive health state for 3 proxies by reporting responses
     for _ in 0..2 {
         checker.report_response(
+            "ferrum",
             "proxy1",
             "test-upstream",
             &target,
@@ -465,6 +495,7 @@ fn test_prune_removed_proxies() {
             Some(&config),
         );
         checker.report_response(
+            "ferrum",
             "proxy2",
             "test-upstream",
             &target,
@@ -473,6 +504,7 @@ fn test_prune_removed_proxies() {
             Some(&config),
         );
         checker.report_response(
+            "ferrum",
             "proxy3",
             "test-upstream",
             &target,
@@ -484,12 +516,15 @@ fn test_prune_removed_proxies() {
     assert_eq!(checker.passive_health.len(), 3);
 
     // Remove proxy1 and proxy3
-    checker.prune_removed_proxies(&["proxy1".to_string(), "proxy3".to_string()]);
+    checker.prune_removed_proxies(&[
+        ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy1"),
+        ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy3"),
+    ]);
 
     assert_eq!(checker.passive_health.len(), 1);
-    assert!(checker.passive_health.contains_key("proxy2"));
-    assert!(!checker.passive_health.contains_key("proxy1"));
-    assert!(!checker.passive_health.contains_key("proxy3"));
+    assert!(checker.passive_health.contains_key(&rk("proxy2")));
+    assert!(!checker.passive_health.contains_key(&rk("proxy1")));
+    assert!(!checker.passive_health.contains_key(&rk("proxy3")));
 }
 
 #[tokio::test]
@@ -527,6 +562,7 @@ fn test_passive_window_only_counts_recent_failures() {
 
     // Record 2 failures (under threshold)
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -535,6 +571,7 @@ fn test_passive_window_only_counts_recent_failures() {
         Some(&config),
     );
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -552,6 +589,7 @@ fn test_passive_window_only_counts_recent_failures() {
 
     // Record 1 more failure — the old 2 should have expired from the window
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -581,6 +619,7 @@ fn test_passive_window_failures_within_window_accumulate() {
 
     // All 3 failures within the 60s window
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -589,6 +628,7 @@ fn test_passive_window_failures_within_window_accumulate() {
         Some(&config),
     );
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -599,6 +639,7 @@ fn test_passive_window_failures_within_window_accumulate() {
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -627,6 +668,7 @@ fn test_passive_health_threshold_1_immediate_unhealthy() {
     };
 
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -658,6 +700,7 @@ fn test_connection_error_ignores_status_code_list() {
 
     // Status code 200 with connection_error=true should still count as failure
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -690,6 +733,7 @@ fn test_passive_health_per_target_isolation() {
 
     // Fail target_a only
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target_a,
@@ -698,6 +742,7 @@ fn test_passive_health_per_target_isolation() {
         Some(&config),
     );
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target_a,
@@ -732,6 +777,7 @@ fn test_recovery_clears_failures_then_re_threshold() {
     // Mark unhealthy
     for _ in 0..3 {
         checker.report_response(
+            DEFAULT_NAMESPACE,
             TEST_PROXY,
             "test-upstream",
             &target,
@@ -744,6 +790,7 @@ fn test_recovery_clears_failures_then_re_threshold() {
 
     // Recover with a success
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -756,6 +803,7 @@ fn test_recovery_clears_failures_then_re_threshold() {
     // Now it should take a full 3 failures again to mark unhealthy
     // (failure history was cleared on recovery)
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -764,6 +812,7 @@ fn test_recovery_clears_failures_then_re_threshold() {
         Some(&config),
     );
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -777,6 +826,7 @@ fn test_recovery_clears_failures_then_re_threshold() {
     );
 
     checker.report_response(
+        DEFAULT_NAMESPACE,
         TEST_PROXY,
         "test-upstream",
         &target,
@@ -796,7 +846,15 @@ fn test_no_passive_config_is_noop() {
 
     // Report with no passive config
     for _ in 0..100 {
-        checker.report_response(TEST_PROXY, "test-upstream", &target, 500, false, None);
+        checker.report_response(
+            DEFAULT_NAMESPACE,
+            TEST_PROXY,
+            "test-upstream",
+            &target,
+            500,
+            false,
+            None,
+        );
     }
 
     assert_eq!(
@@ -876,6 +934,7 @@ fn config_with_upstreams(upstreams: Vec<Upstream>) -> GatewayConfig {
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: None,
+        mesh_revision: None,
     }
 }
 
@@ -901,10 +960,10 @@ async fn test_restart_aborts_handles_for_removed_upstream() {
     // assert the restart prunes it.
     checker
         .active_unhealthy_targets
-        .insert("up-remove::remove-host:9002".to_string(), 12345);
+        .insert("ferrum|up-remove::remove-host:9002".to_string(), 12345);
     checker
         .active_unhealthy_targets
-        .insert("up-keep::keep-host:9001".to_string(), 67890);
+        .insert("ferrum|up-keep::keep-host:9001".to_string(), 67890);
 
     let after_remove = config_with_upstreams(vec![make_upstream_with_active_probe(
         "up-keep",
@@ -921,13 +980,13 @@ async fn test_restart_aborts_handles_for_removed_upstream() {
     assert!(
         !checker
             .active_unhealthy_targets
-            .contains_key("up-remove::remove-host:9002"),
+            .contains_key("ferrum|up-remove::remove-host:9002"),
         "stale unhealthy entry for removed upstream should be pruned"
     );
     assert!(
         checker
             .active_unhealthy_targets
-            .contains_key("up-keep::keep-host:9001"),
+            .contains_key("ferrum|up-keep::keep-host:9001"),
         "kept upstream's unhealthy state must survive the restart"
     );
 }
@@ -1190,7 +1249,8 @@ async fn test_take_then_restart_stops_probes_for_removed_target() {
     );
     assert!(
         !checker.active_unhealthy_targets.contains_key(&format!(
-            "up-remove::{}:{}",
+            "{}::{}:{}",
+            rk("up-remove"),
             addr_remove.ip(),
             addr_remove.port()
         )),
@@ -1198,7 +1258,8 @@ async fn test_take_then_restart_stops_probes_for_removed_target() {
     );
     assert!(
         !checker.has_active_target_state_for_test(&format!(
-            "up-remove::{}:{}",
+            "{}::{}:{}",
+            rk("up-remove"),
             addr_remove.ip(),
             addr_remove.port()
         )),
@@ -1398,7 +1459,15 @@ fn eject_once(
         healthy_after_seconds: healthy_after,
         ..PassiveHealthCheck::default()
     };
-    checker.report_response(proxy, upstream, target, 500, false, Some(&config));
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        proxy,
+        upstream,
+        target,
+        500,
+        false,
+        Some(&config),
+    );
 }
 
 #[tokio::test]
@@ -1434,6 +1503,7 @@ async fn per_port_only_passive_policy_recovers_via_entry_deadline() {
     );
 
     checker.report_response(
+        DEFAULT_NAMESPACE,
         "proxy-port",
         "up1",
         &target,
@@ -1449,7 +1519,7 @@ async fn per_port_only_passive_policy_recovers_via_entry_deadline() {
 
     // Backdate the entry deadline and recover synchronously (deterministic).
     {
-        let ps = checker.passive_health.get("proxy-port").unwrap();
+        let ps = checker.passive_health.get(&rk("proxy-port")).unwrap();
         let mut entry = ps.unhealthy.get_mut("10.0.0.8:8443").unwrap();
         entry.recover_at_ms = 1;
     }
@@ -1485,6 +1555,7 @@ async fn subset_only_passive_policy_recovers_via_entry_deadline() {
     assert_eq!(checker.active_task_count(), 1);
 
     checker.report_response(
+        DEFAULT_NAMESPACE,
         "proxy-sub",
         "up-sub",
         &target,
@@ -1495,7 +1566,7 @@ async fn subset_only_passive_policy_recovers_via_entry_deadline() {
     assert!(is_passive_unhealthy(&checker, "proxy-sub", "10.0.0.9:8080"));
 
     {
-        let ps = checker.passive_health.get("proxy-sub").unwrap();
+        let ps = checker.passive_health.get(&rk("proxy-sub")).unwrap();
         let mut entry = ps.unhealthy.get_mut("10.0.0.9:8080").unwrap();
         entry.recover_at_ms = 1;
     }
@@ -1524,25 +1595,41 @@ fn shared_endpoint_independent_cooldowns_across_proxies() {
     };
 
     let checker = HealthChecker::new();
-    checker.report_response("proxy-a", "up-a", &target, 500, false, Some(&short));
-    checker.report_response("proxy-b", "up-b", &target, 500, false, Some(&long));
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        "proxy-a",
+        "up-a",
+        &target,
+        500,
+        false,
+        Some(&short),
+    );
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        "proxy-b",
+        "up-b",
+        &target,
+        500,
+        false,
+        Some(&long),
+    );
     assert!(is_passive_unhealthy(&checker, "proxy-a", "10.0.0.8:8443"));
     assert!(is_passive_unhealthy(&checker, "proxy-b", "10.0.0.8:8443"));
 
     {
-        let ps = checker.passive_health.get("proxy-a").unwrap();
+        let ps = checker.passive_health.get(&rk("proxy-a")).unwrap();
         let entry = ps.unhealthy.get("10.0.0.8:8443").unwrap();
         assert_eq!(entry.recover_at_ms - entry.ejected_at_ms, 5_000);
     }
     {
-        let ps = checker.passive_health.get("proxy-b").unwrap();
+        let ps = checker.passive_health.get(&rk("proxy-b")).unwrap();
         let entry = ps.unhealthy.get("10.0.0.8:8443").unwrap();
         assert_eq!(entry.recover_at_ms - entry.ejected_at_ms, 300_000);
     }
 
     // Only A's deadline is due.
     {
-        let ps = checker.passive_health.get("proxy-a").unwrap();
+        let ps = checker.passive_health.get(&rk("proxy-a")).unwrap();
         ps.unhealthy.get_mut("10.0.0.8:8443").unwrap().recover_at_ms = 1;
     }
     checker.recover_due_passive_ejections();
@@ -1562,7 +1649,7 @@ async fn passive_recovery_deadline_survives_policy_reload() {
     // deadline must still govern this ejection.
     eject_once(&checker, TEST_PROXY, "up1", &target, 30);
     let original_deadline = {
-        let ps = checker.passive_health.get(TEST_PROXY).unwrap();
+        let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
         let entry = ps.unhealthy.get("backend1:8080").unwrap();
         assert_eq!(entry.recover_at_ms - entry.ejected_at_ms, 30_000);
         entry.recover_at_ms
@@ -1572,7 +1659,7 @@ async fn passive_recovery_deadline_survives_policy_reload() {
     checker.restart_with_shutdown(&config_with_upstreams(vec![reloaded]), None);
 
     let after_reload = {
-        let ps = checker.passive_health.get(TEST_PROXY).unwrap();
+        let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
         ps.unhealthy.get("backend1:8080").unwrap().recover_at_ms
     };
     assert_eq!(
@@ -1585,7 +1672,7 @@ async fn passive_recovery_deadline_survives_policy_reload() {
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 
     {
-        let ps = checker.passive_health.get(TEST_PROXY).unwrap();
+        let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
         ps.unhealthy.get_mut("backend1:8080").unwrap().recover_at_ms = 1;
     }
     checker.recover_due_passive_ejections();
@@ -1626,11 +1713,19 @@ async fn service_discovery_only_target_recovers_after_passive_ejection() {
         ..PassiveHealthCheck::default()
     };
     // Simulate SD publish: report failures for a target never present in static config.
-    checker.report_response(TEST_PROXY, "up-sd", &sd_target, 500, false, Some(&pasv));
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "up-sd",
+        &sd_target,
+        500,
+        false,
+        Some(&pasv),
+    );
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "sd-only-b:8080"));
 
     {
-        let ps = checker.passive_health.get(TEST_PROXY).unwrap();
+        let ps = checker.passive_health.get(&rk(TEST_PROXY)).unwrap();
         ps.unhealthy
             .get_mut("sd-only-b:8080")
             .unwrap()
@@ -1657,9 +1752,25 @@ fn success_based_recovery_still_clears_passive_ejection() {
         ..PassiveHealthCheck::default()
     };
     let checker = HealthChecker::new();
-    checker.report_response(TEST_PROXY, "up1", &target, 500, false, Some(&config));
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "up1",
+        &target,
+        500,
+        false,
+        Some(&config),
+    );
     assert!(is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
-    checker.report_response(TEST_PROXY, "up1", &target, 200, false, Some(&config));
+    checker.report_response(
+        DEFAULT_NAMESPACE,
+        TEST_PROXY,
+        "up1",
+        &target,
+        200,
+        false,
+        Some(&config),
+    );
     assert!(!is_passive_unhealthy(&checker, TEST_PROXY, "backend1:8080"));
 }
 

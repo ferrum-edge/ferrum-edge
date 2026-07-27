@@ -378,6 +378,18 @@ impl MeshGrpcServer {
     #[allow(clippy::result_large_err)]
     fn build_mesh_config_update_from_slice(slice: MeshSlice) -> Result<MeshConfigUpdate, Status> {
         let version = slice.version.clone();
+        // Duplicate the slice's own ordering revision onto the envelope
+        // (issue #2473), exactly as `version` is duplicated. Consumers refuse a
+        // frame whose two copies disagree, so both must be derived from the one
+        // slice here rather than from any ambient CP state.
+        let (config_authority, config_sequence) = slice
+            .revision
+            .as_ref()
+            .filter(|revision| revision.is_well_formed())
+            .map_or_else(
+                || (String::new(), 0),
+                |revision| (revision.authority.clone(), revision.sequence),
+            );
         let mesh_slice_json = serde_json::to_string(&slice).map_err(|e| {
             error!("Failed to serialize mesh slice: {}", e);
             Status::internal("Failed to serialize mesh slice")
@@ -388,6 +400,8 @@ impl MeshGrpcServer {
             mesh_slice_json,
             ferrum_version: FERRUM_VERSION.to_string(),
             heartbeat: false,
+            config_authority,
+            config_sequence,
         })
     }
 
@@ -398,6 +412,11 @@ impl MeshGrpcServer {
             mesh_slice_json: String::new(),
             ferrum_version: FERRUM_VERSION.to_string(),
             heartbeat: true,
+            // Heartbeats carry no slice, so they carry no ordering revision:
+            // they must never be able to advance (or be ordered against) the
+            // subscriber's accepted revision.
+            config_authority: String::new(),
+            config_sequence: 0,
         }
     }
 
@@ -424,6 +443,13 @@ impl MeshGrpcServer {
         bearer_namespaces: Option<&HashSet<String>>,
     ) -> Result<(MeshSlice, Option<MeshConfigUpdate>), Status> {
         let mut candidate = stream_config.clone();
+        // Advance the authoritative revision from the delta's durable change
+        // cursor before the slice is built (issue #2473). `max` guards a peer
+        // that sent no cursor (0): the per-stream base must never move
+        // backwards, or a subscriber would quarantine its own CP's frames.
+        if let Some(revision) = candidate.mesh_revision.as_mut() {
+            revision.sequence = revision.sequence.max(delta.sequence_cursor);
+        }
         apply_incremental_to_config_snapshot(&mut candidate, delta);
         candidate = Self::filter_config_for_request_and_scope(
             &candidate,

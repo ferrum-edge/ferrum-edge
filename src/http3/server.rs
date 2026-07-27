@@ -1720,7 +1720,7 @@ async fn handle_h3_request(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
 
     // Keep recognized gRPC-Web on its ordinary HTTP protocol key. The request
     // view below composes only grpc_method_router and grpc_deadline into that
@@ -1736,9 +1736,12 @@ async fn handle_h3_request(
     // gRPC-Web is promoted only for gRPC policy selection above and must not
     // become native gRPC merely because its policy chain is gRPC-scoped.
     ctx.set_request_http_flavor(detected_http_flavor);
+    // Namespace-composed lookup: the protocol snapshot is keyed by
+    // `namespace|proxy_id`, so a bare `proxy.id` would miss every proxy entry
+    // and fall back to the global policy chain.
     let initial_response_header_policy_plugins = epoch
         .plugin_cache
-        .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
+        .initial_response_header_policy_plugins(&proxy.namespace, &proxy.id, request_protocol);
 
     // Per-proxy HTTP method filtering (checked before plugins to save work).
     // Ordinary request hooks stay skipped, but terminal transaction logging
@@ -1784,9 +1787,13 @@ async fn handle_h3_request(
             .await?;
         }
         let logging_view = if grpc_web_response_content_type.is_some() {
-            epoch.plugin_cache.grpc_web_request_view(&proxy.id)
+            epoch
+                .plugin_cache
+                .grpc_web_request_view(&proxy.namespace, &proxy.id)
         } else {
-            epoch.plugin_cache.request_view(&proxy.id, request_protocol)
+            epoch
+                .plugin_cache
+                .request_view(&proxy.namespace, &proxy.id, request_protocol)
         };
         let logging_plugins = logging_view.plugins();
         log_pre_backend_rejected_request(
@@ -1833,9 +1840,13 @@ async fn handle_h3_request(
     // capability bitset, and buffering flag below is derived from the same
     // cache generation without retaining the full cache across awaits.
     let plugin_cache_view = if grpc_web_response_content_type.is_some() {
-        epoch.plugin_cache.grpc_web_request_view(&proxy.id)
+        epoch
+            .plugin_cache
+            .grpc_web_request_view(&proxy.namespace, &proxy.id)
     } else {
-        epoch.plugin_cache.request_view(&proxy.id, request_protocol)
+        epoch
+            .plugin_cache
+            .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
@@ -3142,7 +3153,7 @@ async fn handle_h3_request(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
 
     // Preserve the client's original request path for access logging — the
     // transaction summaries below source `request_path` from this, not the
@@ -3284,7 +3295,7 @@ async fn handle_h3_request(
     ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(selected_base_proxy.id.as_str());
+        .proxy_lifecycle_generation(&selected_base_proxy.namespace, &selected_base_proxy.id);
 
     let has_deferred_routing_header_hooks = backend_path_is_policy_bound
         && capabilities
@@ -6464,6 +6475,7 @@ async fn handle_h3_request(
                 // as a transport-level failure for CB tripping.
                 if let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
@@ -6510,8 +6522,7 @@ async fn handle_h3_request(
                 }
 
                 // Re-screen the rotated retry target BEFORE admission/dispatch:
-                // the native-H3 pool's `resolve_backend_addr_cached` fast-path
-                // returns IP literals without going through `DnsCache`, so a
+                // the native-H3 pool's cached resolver accepts IP literals, so a
                 // rotated denied literal / `dns_override` target (e.g. a warn-only
                 // DB/DP config carrying `169.254.169.254`) would otherwise be
                 // admitted and dialed here, bypassing the pre-loop screen that only
@@ -7419,9 +7430,12 @@ fn release_h3_circuit_breaker_probe_on_admission_reject(
         return;
     }
     if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state
-            .circuit_breaker_cache
-            .get_or_create(&proxy.id, target_key, cb_config);
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            &proxy.id,
+            target_key,
+            cb_config,
+        );
         cb.record_neutral(true);
     }
 }
@@ -7657,7 +7671,11 @@ pub(crate) fn inject_sticky_cookie(
             target,
         );
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(
+                &epoch.load_balancer,
+                &proxy.namespace,
+                upstream_id,
+            );
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -13266,6 +13284,7 @@ mod build_h3_backend_headers_tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            mesh_revision: None,
         };
         ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)
             .expect("minimal ProxyState should construct")

@@ -99,6 +99,10 @@ pub enum GrpcStep {
     /// Useful for proving that a gateway forwards server-streaming DATA before
     /// the backend reaches EOF.
     Sleep(Duration),
+    /// Block until the test calls [`ScriptedGrpcBackend::release_test_signal`].
+    /// Separates a completed RPC response from a later connection fault without
+    /// a wall-clock sleep.
+    AwaitTestSignal,
     /// Send the gRPC status trailer (`grpc-status: <code>` and
     /// `grpc-message: <message>` when non-empty). Implicitly closes the
     /// stream.
@@ -132,6 +136,10 @@ pub enum GrpcStep {
     CloseAfterHeaders,
     /// Send a GOAWAY with `error_code`, then close.
     SendGoaway { error_code: u32 },
+    /// Send a GOAWAY with `error_code` while keeping the TCP connection open
+    /// briefly. Used to race a pooled sender that still looks healthy after
+    /// a single `ready()` probe (connection-age / MaxConnectionAge).
+    SendGoawayKeepOpen { error_code: u32 },
     /// Send RST_STREAM on the current stream with `error_code`.
     SendRstStream { error_code: u32 },
     /// Wait for the gateway to reset the current response stream.
@@ -175,6 +183,20 @@ impl ScriptedGrpcBackendBuilder {
         for s in steps {
             self = self.step(s);
         }
+        self
+    }
+
+    /// Supply connection-indexed scripts. Connection 0 receives the first
+    /// script, connection 1 the second, and so on. Later connections reuse
+    /// the last script when the list is shorter than the accept count.
+    pub fn connection_scripts(mut self, scripts: impl IntoIterator<Item = Vec<GrpcStep>>) -> Self {
+        let h2_scripts = scripts.into_iter().map(|steps| {
+            steps
+                .into_iter()
+                .flat_map(lower_grpc_step)
+                .collect::<Vec<_>>()
+        });
+        self.h2_builder = self.h2_builder.connection_scripts(h2_scripts);
         self
     }
 
@@ -229,6 +251,26 @@ impl ScriptedGrpcBackend {
     /// Completed H2 handshakes.
     pub fn handshakes_completed(&self) -> u32 {
         self.inner.handshakes_completed()
+    }
+
+    /// Scripts currently blocked in `AcceptRpc` / `ExpectHeaders`.
+    pub fn acceptors_waiting(&self) -> u32 {
+        self.inner.acceptors_waiting()
+    }
+
+    /// Scripts currently blocked in [`GrpcStep::AwaitTestSignal`].
+    pub fn awaiting_test_signal(&self) -> u32 {
+        self.inner.awaiting_test_signal()
+    }
+
+    /// GOAWAY frames issued by the script.
+    pub fn goaways_sent(&self) -> u32 {
+        self.inner.goaways_sent()
+    }
+
+    /// Release every script blocked on [`GrpcStep::AwaitTestSignal`].
+    pub fn release_test_signal(&self) {
+        self.inner.release_test_signal();
     }
 
     /// Every RPC observed by `AcceptRpc`, in arrival order.
@@ -313,6 +355,7 @@ fn lower_grpc_step(step: GrpcStep) -> Vec<H2Step> {
             }]
         }
         GrpcStep::Sleep(duration) => vec![H2Step::Sleep(duration)],
+        GrpcStep::AwaitTestSignal => vec![H2Step::AwaitTestSignal],
         GrpcStep::RespondStatus { code, message } => {
             let mut trailers = vec![("grpc-status", code.to_string())];
             if !message.is_empty() {
@@ -374,6 +417,7 @@ fn lower_grpc_step(step: GrpcStep) -> Vec<H2Step> {
             H2Step::DropConnection,
         ],
         GrpcStep::SendGoaway { error_code } => vec![H2Step::SendGoawayAndClose { error_code }],
+        GrpcStep::SendGoawayKeepOpen { error_code } => vec![H2Step::SendGoaway { error_code }],
         GrpcStep::SendRstStream { error_code } => vec![H2Step::SendRstStream { error_code }],
         GrpcStep::ExpectReset(duration) => vec![H2Step::ExpectReset(duration)],
     }

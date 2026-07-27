@@ -84,6 +84,15 @@ fn update_for(slice: &MeshSlice) -> MeshConfigUpdate {
         mesh_slice_json: serde_json::to_string(slice).expect("slice serializes"),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         heartbeat: false,
+        config_authority: slice
+            .revision
+            .as_ref()
+            .map(|revision| revision.authority.clone())
+            .unwrap_or_default(),
+        config_sequence: slice
+            .revision
+            .as_ref()
+            .map_or(0, |revision| revision.sequence),
     }
 }
 
@@ -94,6 +103,8 @@ fn heartbeat() -> MeshConfigUpdate {
         mesh_slice_json: String::new(),
         ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         heartbeat: true,
+        config_authority: String::new(),
+        config_sequence: 0,
     }
 }
 

@@ -150,10 +150,53 @@ All outbound HTTP clients (proxy traffic, health check probes, plugin outbound c
 - **No DNS in the hot path**: Hostname resolution is always served from the in-memory cache, never from the network.
 - **Per-proxy `dns_override`**: When a proxy has a static `dns_override` IP, it is applied as a `resolve()` hint on the HTTP client, taking priority over the DNS cache for that specific hostname.
 - **Unified caching**: Proxy backends, upstream targets, health check probes, and plugin outbound calls (http_logging, tcp_logging, jwks_auth, etc.) all share the same DNS cache, benefiting from warmup and background refresh.
+- **Complete answer sets**: reqwest receives every policy-approved cached address, not only the first record. Its connector can therefore try alternates when an address is unavailable.
 
 Plugins declare their endpoint hostnames by implementing the `warmup_hostnames()` method on the `Plugin` trait. This allows the warmup phase to pre-resolve plugin endpoints alongside backend hostnames.
 
 LDAP warmup remains useful for early diagnostics, but it never authorizes a later dial. Each direct-bind, search-bind, and group-search connection performs a fresh uncached A+AAAA lookup, screens the complete answer set under `BackendEgressPolicy`, and rechecks the selected candidate immediately before connecting. The dial still presents the configured hostname for LDAPS/STARTTLS certificate and SNI verification.
+
+## Address Selection and Failover
+
+Positive answers retain at most 32 unique, policy-approved addresses in resolver
+order. Egress policy is evaluated independently for each address: denied
+candidates are omitted, approved candidates remain usable, and resolution fails
+closed when none remain. Static per-proxy and global overrides are one-address
+answer sets.
+
+Each cached answer set has a lock-free atomic cursor. A resolution returns the
+resolver-ordered set rotated left by that cursor, then advances the cursor by
+one. For `[A, B, C]`, consecutive resolutions therefore return `[A, B, C]`,
+`[B, C, A]`, `[C, A, B]`, and repeat. Fresh and stale cache hits use the same
+cursor, so stale-while-revalidate keeps distributing first attempts without
+changing failover order. Publishing a refreshed answer creates a new set and
+resets its cursor to the first address in the new resolver order.
+
+Reqwest receives that entire rotated iterator. Direct HTTP/2, HTTP/3, gRPC,
+WebSocket, TCP/TLS, DTLS, HBONE, and mesh-mTLS connectors establish the usable
+protocol transport across candidates in the same order. They share one
+`backend_connect_timeout_ms` wall-clock budget: when an attempt starts it
+receives `remaining_budget / candidates_left`; an immediate TCP, TLS, identity,
+ALPN, or protocol-handshake failure advances immediately, a stalled attempt
+cannot consume the share reserved for later addresses, and the last candidate
+receives all time remaining. Exhausting the overall budget is one
+connect-timeout failure, not a new timeout per address.
+
+Plain UDP has no comparable peer handshake. `UdpSocket::connect` only associates
+a local socket with a peer and normally succeeds even when that peer is
+unreachable or blackholed. A new UDP session therefore uses the first address
+in its rotated answer set and advances only when local socket bind/connect setup
+fails immediately. A later send error terminates or reports the established
+session; Ferrum does not replay the datagram to another candidate because the
+original delivery outcome is unknowable and replay could duplicate a one-way
+message. Rotation still gives deterministic per-session distribution. DTLS and
+UDP health probes can fail over when their handshake or response contract makes
+failure observable; generic fire-and-forget UDP cannot infer blackhole failover
+without an application-level acknowledgement contract.
+
+Only the socket peer changes during failover. The configured hostname remains
+the HTTP `Host`/`:authority`, TLS/QUIC/DTLS SNI and certificate-verification
+name, connection-pool identity, and redacted logging target.
 
 ## Resolution Priority
 

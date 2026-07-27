@@ -186,7 +186,18 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 /// millisecond precision whenever it fits, and only coarsen the unit when the
 /// 8-digit limit would otherwise be exceeded.
 fn format_grpc_timeout(d: Duration) -> String {
-    let ms = d.as_millis().min(u128::from(u64::MAX)) as u64;
+    format_grpc_timeout_ms(d.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+/// Format whole milliseconds as a valid `grpc-timeout` value.
+///
+/// Shared with the proxy's per-attempt remaining-budget rewrite
+/// (`grpc_proxy::apply_remaining_grpc_timeout_header`) so the plugin and the
+/// transport cannot drift on unit coarsening or the 8-digit wire limit.
+/// Callers that must not emit the invalid wire value `0m` are responsible for
+/// passing at least `1` — the deadline plugin deliberately keeps `0m` for an
+/// exhausted budget it is about to reject.
+pub(crate) fn format_grpc_timeout_ms(ms: u64) -> String {
     let candidates = [
         ('m', 1_u64),
         ('S', 1_000_u64),

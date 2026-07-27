@@ -159,7 +159,12 @@ impl ConsumerIndex {
     /// Uses O(1) HashMap removal by pre-indexing old credential keys instead of
     /// O(n) `.retain()` loops per consumer. This keeps delta application fast even
     /// at 100k+ consumers with thousands of modifications per reload.
-    pub fn apply_delta(&self, added: &[Consumer], removed_ids: &[String], modified: &[Consumer]) {
+    pub fn apply_delta(
+        &self,
+        added: &[Consumer],
+        removed_ids: &[crate::config::db_backend::NamespacedResourceId],
+        modified: &[Consumer],
+    ) {
         if added.is_empty() && removed_ids.is_empty() && modified.is_empty() {
             return;
         }
@@ -177,11 +182,15 @@ impl ConsumerIndex {
         let mut mtls_dns = current.mtls_dns_index.clone();
         let mut all: Vec<Arc<Consumer>> = current.all_consumers.as_ref().clone();
 
-        // Collect all IDs that need removal (deleted + modified consumers being re-inserted)
-        let ids_to_remove: HashSet<&str> = removed_ids
+        // Collect all identities that need removal (deleted + modified consumers being re-inserted)
+        let ids_to_remove: HashSet<(&str, &str)> = removed_ids
             .iter()
-            .map(|s| s.as_str())
-            .chain(modified.iter().map(|c| c.id.as_str()))
+            .map(|key| key.as_key())
+            .chain(
+                modified
+                    .iter()
+                    .map(|c| (c.namespace.as_str(), c.id.as_str())),
+            )
             .collect();
 
         // Track jwt/hmac credential count delta incrementally instead of
@@ -201,7 +210,7 @@ impl ConsumerIndex {
             let mut old_mtls_dns_keys: Vec<String> = Vec::new();
 
             for consumer in all.iter() {
-                if !ids_to_remove.contains(consumer.id.as_str()) {
+                if !ids_to_remove.contains(&(consumer.namespace.as_str(), consumer.id.as_str())) {
                     continue;
                 }
                 // Subtract old jwt/hmac counts for removed/modified consumers
@@ -245,21 +254,21 @@ impl ConsumerIndex {
             for key in &old_keyauth_keys {
                 // Only remove if the entry actually belongs to a consumer being removed
                 if let Some(existing) = keyauth.get(key)
-                    && ids_to_remove.contains(existing.id.as_str())
+                    && ids_to_remove.contains(&(existing.namespace.as_str(), existing.id.as_str()))
                 {
                     keyauth.remove(key);
                 }
             }
             for key in &old_basic_keys {
                 if let Some(existing) = basic.get(key)
-                    && ids_to_remove.contains(existing.id.as_str())
+                    && ids_to_remove.contains(&(existing.namespace.as_str(), existing.id.as_str()))
                 {
                     basic.remove(key);
                 }
             }
             for key in &old_identity_keys {
                 if let Some(existing) = identity.get(key)
-                    && ids_to_remove.contains(existing.id.as_str())
+                    && ids_to_remove.contains(&(existing.namespace.as_str(), existing.id.as_str()))
                 {
                     identity.remove(key);
                 }
@@ -267,7 +276,7 @@ impl ConsumerIndex {
             for (namespace, key) in &old_hmac_identity_keys {
                 if let Some(namespace_index) = hmac_identity.get_mut(namespace)
                     && let Some(existing) = namespace_index.get(key)
-                    && ids_to_remove.contains(existing.id.as_str())
+                    && ids_to_remove.contains(&(existing.namespace.as_str(), existing.id.as_str()))
                 {
                     namespace_index.remove(key);
                 }
@@ -275,21 +284,21 @@ impl ConsumerIndex {
             hmac_identity.retain(|_, namespace_index| !namespace_index.is_empty());
             for key in &old_mtls_keys {
                 if let Some(existing) = mtls.get(key)
-                    && ids_to_remove.contains(existing.id.as_str())
+                    && ids_to_remove.contains(&(existing.namespace.as_str(), existing.id.as_str()))
                 {
                     mtls.remove(key);
                 }
             }
             for key in &old_mtls_dns_keys {
                 if let Some(existing) = mtls_dns.get(key)
-                    && ids_to_remove.contains(existing.id.as_str())
+                    && ids_to_remove.contains(&(existing.namespace.as_str(), existing.id.as_str()))
                 {
                     mtls_dns.remove(key);
                 }
             }
 
             // Remove from all-consumers list (single pass with HashSet lookup)
-            all.retain(|c| !ids_to_remove.contains(c.id.as_str()));
+            all.retain(|c| !ids_to_remove.contains(&(c.namespace.as_str(), c.id.as_str())));
 
             Self::restore_shadowed_entries(
                 &all,

@@ -2101,9 +2101,10 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     id: &str,
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(response) = state.check_write_allowed() {
-        return Ok(response);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     if let Err(message) = validate_resource_id(id) {
         return Ok(super::json_response(
@@ -4967,9 +4968,10 @@ async fn handle_write<R: AdminResource>(
     namespace: &str,
     action: WriteAction<'_>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    if let Some(response) = state.check_write_allowed() {
-        return Ok(response);
-    }
+    let _write_permit = match state.admit_write().await {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
 
     if let WriteAction::Update { id } = action
         && let Err(message) = validate_resource_id(id)

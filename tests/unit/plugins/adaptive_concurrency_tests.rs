@@ -10,6 +10,7 @@ use ferrum_edge::PluginCache;
 use ferrum_edge::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
 };
+use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::{GatewayConfig, Proxy, UpstreamTarget};
 use ferrum_edge::plugins::adaptive_concurrency::AdaptiveConcurrency;
 use ferrum_edge::plugins::{
@@ -116,7 +117,7 @@ fn adaptive_plugin_from_cache(cache: &PluginCache) -> Arc<dyn Plugin> {
 
 fn adaptive_plugin_for_proxy(cache: &PluginCache, proxy_id: &str) -> Arc<dyn Plugin> {
     cache
-        .get_plugins(proxy_id)
+        .get_plugins("default", proxy_id)
         .iter()
         .find(|plugin| plugin.name() == "adaptive_concurrency")
         .cloned()
@@ -854,7 +855,7 @@ fn adaptive_concurrency_incremental_reload_keeps_streaming_permit_accounted() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from(["proxy-1".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -928,7 +929,7 @@ async fn adaptive_concurrency_global_route_refresh_preserves_unrelated_global_st
     );
     let cache = PluginCache::new(&config).expect("initial cache should build");
     let original_rate_limiter = cache
-        .get_plugins("proxy-1")
+        .get_plugins("default", "proxy-1")
         .iter()
         .find(|plugin| plugin.name() == "rate_limiting")
         .cloned()
@@ -950,7 +951,7 @@ async fn adaptive_concurrency_global_route_refresh_preserves_unrelated_global_st
         .expect("global adaptive route refresh should publish");
 
     let replacement_rate_limiter = cache
-        .get_plugins("proxy-1")
+        .get_plugins("default", "proxy-1")
         .iter()
         .find(|plugin| plugin.name() == "rate_limiting")
         .cloned()
@@ -1084,21 +1085,26 @@ fn adaptive_concurrency_scoped_detach_and_reattach_starts_fresh_state() {
         cache
             .apply_delta(
                 &detached,
-                &HashSet::from(["proxy-1".to_string()]),
+                &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
                 &[],
                 false,
             )
             .expect("last scoped association should detach");
         assert!(
             cache
-                .get_plugins("proxy-1")
+                .get_plugins("default", "proxy-1")
                 .iter()
                 .all(|plugin| plugin.name() != "adaptive_concurrency"),
             "{scope} policy should be absent after its last association is removed"
         );
 
         cache
-            .apply_delta(&config, &HashSet::from(["proxy-1".to_string()]), &[], false)
+            .apply_delta(
+                &config,
+                &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
+                &[],
+                false,
+            )
             .expect("scoped policy should reattach");
         let fresh_generation = expect_admitted(acquire_from_cache(&cache, &config));
         drop(fresh_generation);
@@ -1279,7 +1285,7 @@ fn adaptive_concurrency_direct_target_reload_reclaims_retired_key_capacity() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from(["proxy-1".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1464,7 +1470,7 @@ fn adaptive_concurrency_proxy_group_association_growth_keeps_old_permit_active()
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from(["proxy-2".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-2")]),
             &[],
             false,
         )
@@ -1524,7 +1530,7 @@ fn adaptive_concurrency_upstream_port_scope_change_resets_key_space() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from(["proxy-1".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1630,7 +1636,7 @@ fn adaptive_concurrency_global_inventory_excludes_scoped_overrides() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from(["proxy-2".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-2")]),
             &[],
             false,
         )
@@ -1700,7 +1706,7 @@ fn adaptive_concurrency_route_override_change_resets_target_key_space() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from(["proxy-1".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1770,7 +1776,7 @@ fn adaptive_concurrency_unchanged_upstream_subset_stays_compatible() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from(["proxy-1".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1832,7 +1838,7 @@ fn adaptive_concurrency_route_non_destination_change_stays_compatible() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from(["proxy-1".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1895,7 +1901,7 @@ fn adaptive_concurrency_mesh_direct_host_normalization_stays_compatible() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from(["proxy-1".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1960,7 +1966,7 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
     cache
         .apply_delta(
             &normalized_equivalent,
-            &HashSet::from(["proxy-1".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -1978,7 +1984,7 @@ fn adaptive_concurrency_mesh_direct_tls_identity_change_resets_key_space() {
     cache
         .apply_delta(
             &replacement,
-            &HashSet::from(["proxy-1".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -2090,7 +2096,7 @@ fn adaptive_concurrency_ai_and_mcp_non_destination_changes_stay_compatible() {
         cache
             .apply_delta(
                 &reloaded,
-                &HashSet::from(["proxy-1".to_string()]),
+                &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
                 &[],
                 false,
             )
@@ -2163,7 +2169,7 @@ fn adaptive_concurrency_route_priority_change_resets_winning_destination() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from(["proxy-1".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -2238,7 +2244,7 @@ fn adaptive_concurrency_route_association_order_resets_winning_destination() {
     cache
         .apply_delta(
             &reloaded,
-            &HashSet::from(["proxy-1".to_string()]),
+            &HashSet::from([NamespacedResourceId::new("default", "proxy-1")]),
             &[],
             false,
         )
@@ -2347,4 +2353,75 @@ fn adaptive_concurrency_invalid_reload_preserves_last_good_state() {
     drop(held);
     let released = expect_admitted(acquire_from_cache(&cache, &config));
     drop(released);
+}
+
+/// A shared (global / proxy-group) `adaptive_concurrency` instance serves
+/// proxies from every namespace through ONE limiter, and `key_by =
+/// proxy_target` is the default. The `proxy`-scope cache used to be keyed by
+/// the bare `proxy.id` while caching the namespace-qualified
+/// `proxy:{namespace}:{id}` scope, so the first tenant to warm the cache handed
+/// its own scope to a second tenant's same-id proxy and both were admitted
+/// against a single limiter row (issue #3094). Independent rows — and
+/// independent in-flight accounting — are the observable.
+#[test]
+fn proxy_scope_cache_keeps_same_id_proxies_in_two_namespaces_independent() {
+    let limiter = AdaptiveConcurrencyLimiter::new(16);
+    let config = limiter_config(4);
+
+    let mut tenant_a = proxy();
+    tenant_a.namespace = "tenant-a".to_string();
+    tenant_a.id = "api".to_string();
+    let mut tenant_b = proxy();
+    tenant_b.namespace = "tenant-b".to_string();
+    tenant_b.id = "api".to_string();
+
+    let backend = target("backend.local", 8080);
+
+    let permit_a = limiter
+        .try_acquire(&tenant_a, Some(&backend), Arc::clone(&config))
+        .expect("tenant-a request should be admitted");
+    assert_eq!(limiter.tracked_keys_count(), 1);
+
+    let permit_b = limiter
+        .try_acquire(&tenant_b, Some(&backend), Arc::clone(&config))
+        .expect("tenant-b request should be admitted");
+    assert_eq!(
+        limiter.tracked_keys_count(),
+        2,
+        "same proxy id in two namespaces must own independent limiter rows"
+    );
+
+    let snapshot_a = limiter
+        .snapshot(&tenant_a, Some(&backend), AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("tenant-a state should exist after acquire");
+    let snapshot_b = limiter
+        .snapshot(&tenant_b, Some(&backend), AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("tenant-b state should exist after acquire");
+    assert_eq!(snapshot_a.in_flight, 1);
+    assert_eq!(
+        snapshot_b.in_flight, 1,
+        "tenant-b in-flight must not accumulate onto tenant-a's row"
+    );
+
+    // Feedback on one tenant's row must not shrink the other tenant's limit.
+    permit_a.record_backend_outcome(BackendAdmissionOutcome {
+        response_status: 503,
+        connection_error: false,
+        error_class: None,
+        backend_elapsed: Duration::from_millis(5),
+    });
+    let after_a = limiter
+        .snapshot(&tenant_a, Some(&backend), AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("tenant-a state should still exist");
+    let after_b = limiter
+        .snapshot(&tenant_b, Some(&backend), AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("tenant-b state should still exist");
+    assert_eq!(after_a.limit, 2, "tenant-a absorbs its own 503 backoff");
+    assert_eq!(
+        after_b.limit, 4,
+        "tenant-b's limit must be untouched by tenant-a's backend failure"
+    );
+
+    drop(permit_a);
+    drop(permit_b);
 }

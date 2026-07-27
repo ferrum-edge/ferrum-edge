@@ -110,6 +110,270 @@ const ALLOWED_CONFIG_KEYS: &[&str] = &[
     "schema_ref",
 ];
 
+/// librdkafka's default Kafka port (`RD_KAFKA_PORT`, `rdkafka_protocol.h`).
+pub const KAFKA_DEFAULT_PORT: u16 = 9092;
+
+/// Protocol literals accepted before `://` in a bootstrap entry, in the order
+/// and spelling of librdkafka's `rd_kafka_secproto_names[]`
+/// (`src/rdkafka_broker.c`). Matching is case-insensitive.
+const KAFKA_SECPROTO_NAMES: &[&str] = &["plaintext", "ssl", "sasl_plaintext", "sasl_ssl"];
+
+/// One `bootstrap.servers` entry parsed with the pinned librdkafka grammar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KafkaBootstrapEntry {
+    /// Host exactly as librdkafka would keep it — IPv6 literals retain their
+    /// surrounding brackets, an empty host has already become `localhost`.
+    pub host: String,
+    pub port: u16,
+}
+
+impl KafkaBootstrapEntry {
+    /// The host with IPv6 brackets removed, suitable for `IpAddr` parsing and
+    /// for DNS lookups.
+    pub fn unbracketed_host(&self) -> &str {
+        self.host
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(&self.host)
+    }
+
+    /// The literal IP this entry designates, if any.
+    pub fn literal_ip(&self) -> Option<std::net::IpAddr> {
+        let host = self.unbracketed_host();
+        crate::config::types::egress_literal_ip(host)
+            .or_else(|| crate::config::types::egress_literal_ip(host.trim()))
+    }
+}
+
+/// Parse a `broker_list` / `bootstrap.servers` value with the same grammar as
+/// the pinned librdkafka (`rd_kafka_brokers_add0` +
+/// `rd_kafka_broker_name_parse`, librdkafka 2.12.1 via `rdkafka-sys 4.10.0`).
+///
+/// Ferrum's previous `host:port`-only reading was strictly narrower than what
+/// librdkafka accepts, so a protocol-prefixed literal such as
+/// `PLAINTEXT://169.254.169.254:9092` evaded literal-IP egress screening while
+/// still being dialed. The grammar implemented here is:
+///
+/// - Entries are separated by `,`; leading `,` and ` ` before an entry are
+///   skipped (librdkafka does not otherwise trim an entry).
+/// - An optional `proto://` prefix must name a supported security protocol
+///   (case-insensitive) and, when `security_protocol` is known, must equal it.
+///   Anything else is a parse error — librdkafka logs and **stops parsing the
+///   rest of the list**, so the producer silently ends up with fewer (or no)
+///   brokers. Ferrum rejects the configuration instead.
+/// - After `proto://`, everything from the first `/` onwards is dropped (URL
+///   path part).
+/// - Port detection: with `t` = last `:` and `t2` = first `:`, a port is split
+///   off only when `t == t2` (a single colon, i.e. IPv4/hostname) or the byte
+///   before `t` is `]` (a bracketed IPv6 literal). A bare `::1` therefore keeps
+///   both colons as part of the host and takes the default port.
+/// - An empty host becomes `localhost`.
+///
+/// `security_protocol` is the configured `security.protocol` value in
+/// librdkafka spelling; pass `None` to skip the protocol-match check (used by
+/// admin/config screening that only needs the destinations).
+pub fn parse_kafka_bootstrap_servers(
+    broker_list: &str,
+    security_protocol: Option<&str>,
+) -> Result<Vec<KafkaBootstrapEntry>, String> {
+    let mut entries = Vec::new();
+    let mut rest = broker_list;
+    loop {
+        // `rd_kafka_brokers_add0`: skip separator commas and spaces between
+        // entries, then stop at end of string.
+        let trimmed = rest.trim_start_matches([',', ' ']);
+        if trimmed.is_empty() {
+            break;
+        }
+        let (mut entry, remainder) = match trimmed.split_once(',') {
+            Some((entry, remainder)) => (entry, remainder),
+            None => (trimmed, ""),
+        };
+        rest = remainder;
+
+        if let Some(scheme_end) = entry.find("://") {
+            let scheme = &entry[..scheme_end];
+            if scheme.is_empty() {
+                return Err("broker_list entry has an empty protocol name".to_string());
+            }
+            let lowered = scheme.to_ascii_lowercase();
+            if !KAFKA_SECPROTO_NAMES.contains(&lowered.as_str()) {
+                return Err(format!(
+                    "broker_list entry uses unsupported protocol '{lowered}' \
+                     (expected one of plaintext/ssl/sasl_plaintext/sasl_ssl)"
+                ));
+            }
+            if let Some(configured) = security_protocol
+                && configured != lowered
+            {
+                return Err(format!(
+                    "broker_list entry protocol '{lowered}' does not match \
+                     security_protocol '{configured}'; librdkafka would reject the entry \
+                     and stop parsing the remaining brokers"
+                ));
+            }
+            entry = &entry[scheme_end + 3..];
+            // "Ignore anything that looks like the path part of an URL".
+            if let Some(path_start) = entry.find('/') {
+                entry = &entry[..path_start];
+            }
+        }
+
+        let mut host = entry;
+        let mut port = KAFKA_DEFAULT_PORT;
+        if let Some(last_colon) = host.rfind(':') {
+            let first_colon = host.find(':').unwrap_or(last_colon);
+            let preceded_by_bracket = host[..last_colon].ends_with(']');
+            if last_colon == first_colon || preceded_by_bracket {
+                port = c_atoi_u16(&host[last_colon + 1..]);
+                host = &host[..last_colon];
+            }
+        }
+        if host.is_empty() {
+            host = "localhost";
+        }
+
+        entries.push(KafkaBootstrapEntry {
+            host: host.to_string(),
+            port,
+        });
+    }
+
+    if entries.is_empty() {
+        return Err("'broker_list' must contain at least one broker address".to_string());
+    }
+    Ok(entries)
+}
+
+/// Emulate librdkafka's `atoi(t + 1)` port conversion, which consumes optional
+/// whitespace, an optional sign, then leading digits, ignores the remainder,
+/// and truncates into `uint16_t`. Never panics and never rejects: librdkafka
+/// does not either, so mirroring it keeps the parsed port faithful to the
+/// address the client would actually dial.
+fn c_atoi_u16(input: &str) -> u16 {
+    let bytes = input.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    let mut negative = false;
+    if idx < bytes.len() && (bytes[idx] == b'+' || bytes[idx] == b'-') {
+        negative = bytes[idx] == b'-';
+        idx += 1;
+    }
+    let mut value: i32 = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        value = value
+            .wrapping_mul(10)
+            .wrapping_add(i32::from(bytes[idx] - b'0'));
+        idx += 1;
+    }
+    if negative {
+        value = value.wrapping_neg();
+    }
+    value as u16
+}
+
+/// Normalize a configured `broker_list` the way [`KafkaLogging::new`] does
+/// before it becomes `bootstrap.servers`: trim each comma-separated entry and
+/// drop empty ones. Screening must run over this exact string so it sees what
+/// librdkafka sees.
+pub fn normalize_broker_list(broker_list: &str) -> String {
+    broker_list
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The configured `security.protocol` in librdkafka spelling, or the default
+/// when unset. Returns `None` when the value is present but unrecognized —
+/// `KafkaSecurityProtocol::parse` reports that shape error with a better
+/// message, and screening must not invent a protocol-mismatch error on top.
+fn configured_security_protocol(config: &Value) -> Option<String> {
+    match config.get("security_protocol") {
+        None | Some(Value::Null) => Some("plaintext".to_string()),
+        Some(Value::String(raw)) => {
+            let lowered = raw.trim().to_ascii_lowercase();
+            if lowered.is_empty() {
+                return Some("plaintext".to_string());
+            }
+            KAFKA_SECPROTO_NAMES
+                .contains(&lowered.as_str())
+                .then_some(lowered)
+        }
+        Some(_) => None,
+    }
+}
+
+/// Screen a `kafka_logging` configuration against the backend egress policy.
+///
+/// Two distinct checks, in order:
+///
+/// 1. **Bootstrap destinations.** `broker_list` is parsed with the pinned
+///    librdkafka grammar ([`parse_kafka_bootstrap_servers`]) and every literal
+///    destination is screened, so a protocol-prefixed literal such as
+///    `PLAINTEXT://169.254.169.254:9092` is rejected instead of slipping past a
+///    `host:port`-only reading. Entries librdkafka itself would refuse are
+///    rejected here rather than silently shrinking the broker list.
+///
+/// 2. **Unenforceable destinations — fail closed.** librdkafka resolves
+///    bootstrap hostnames itself and, after the first Metadata response,
+///    creates and dials brokers advertised by the cluster. Neither address ever
+///    reaches Ferrum's resolver. Enforcing them requires librdkafka's
+///    `connect_cb` / `resolve_cb`, and the pinned client (`rdkafka 0.39`,
+///    `rdkafka-sys 4.10.0+2.12.1`) exposes neither: `ThreadedProducer` builds
+///    its `NativeClientConfig` internally and `BaseProducer::from_client` is
+///    private, so there is no supported injection point. Rather than document a
+///    bypass of the gateway's outbound address boundary, `kafka_logging` is
+///    refused whenever the backend egress policy is able to deny any address.
+///    Under a fully-open policy nothing is being bypassed, so it is admitted.
+pub fn screen_kafka_broker_list_egress(
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
+    let Some(broker_list) = config.get("broker_list").and_then(Value::as_str) else {
+        // Shape errors (missing/empty/non-string) are reported by the
+        // constructor with actionable messages.
+        return Ok(());
+    };
+
+    // Screen exactly the string librdkafka will receive: the constructor
+    // normalizes `broker_list` by trimming each comma-separated entry and
+    // dropping empty ones before setting `bootstrap.servers`.
+    let normalized = normalize_broker_list(broker_list);
+    let security_protocol = configured_security_protocol(config);
+    let entries = parse_kafka_bootstrap_servers(&normalized, security_protocol.as_deref())
+        .map_err(|error| format!("kafka_logging: {error}"))?;
+
+    for entry in &entries {
+        if let Some(ip) = entry.literal_ip()
+            && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+        {
+            return Err(format!(
+                "broker_list IP {ip} denied by backend egress policy: {reason}"
+            ));
+        }
+    }
+
+    if !backend_allow_ips.is_fully_open() {
+        return Err(
+            "kafka_logging: cannot be admitted while a restrictive backend egress policy is in \
+             force: the pinned librdkafka client resolves bootstrap hostnames itself and dials \
+             brokers advertised by cluster metadata, and rdkafka 0.39 exposes no connect/resolve \
+             callback, so those addresses cannot be screened. Ferrum fails closed rather than \
+             leaving an unenforced egress path. Use a different log sink (http_logging, \
+             tcp_logging, ws_logging, loki_logging), or accept an unrestricted backend egress \
+             policy (FERRUM_BACKEND_ALLOW_IPS=both, no FERRUM_BACKEND_DENY_CIDRS, \
+             FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false)"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 /// `producer_config` keys that alias top-level security controls and must not
 /// silently override them after validation. Values are `(librdkafka key,
 /// authoritative top-level field)`.
@@ -1377,22 +1641,26 @@ impl KafkaLogging {
             )
         })?;
 
-        let broker_hostnames: Vec<String> = broker_list
-            .split(',')
-            .filter_map(|broker| {
-                let trimmed = broker.trim();
-                let host = if trimmed.starts_with('[') {
-                    trimmed
-                        .split(']')
-                        .next()
-                        .map(|value| value.trim_start_matches('['))
-                } else {
-                    trimmed.split(':').next()
-                };
-                host.filter(|value| !value.is_empty() && value.parse::<std::net::IpAddr>().is_err())
-                    .map(|value| value.to_string())
-            })
-            .collect();
+        // Re-screen at construction so no path can build a producer that
+        // librdkafka would dial outside the gateway's egress boundary. The
+        // central `screen_direct_client_endpoint_egress` already runs ahead of
+        // this for the registry path; direct/test construction goes through
+        // here.
+        screen_kafka_broker_list_egress(config, http_client.backend_allow_ips())?;
+
+        // Warmup hostnames use the same librdkafka grammar as the screen, so a
+        // protocol-prefixed or bracketed entry warms the host librdkafka will
+        // actually look up. Literal-IP entries need no warmup.
+        let broker_hostnames: Vec<String> = parse_kafka_bootstrap_servers(
+            &broker_list,
+            configured_security_protocol(config).as_deref(),
+        )
+        .map_err(|error| format!("kafka_logging: {error}"))?
+        .into_iter()
+        .filter(|entry| entry.literal_ip().is_none())
+        .map(|entry| entry.unbracketed_host().to_string())
+        .filter(|host| !host.is_empty())
+        .collect();
 
         let schema = resolve_schema(config, "kafka_logging", SchemaCapabilities::BASE)?;
 

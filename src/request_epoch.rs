@@ -19,10 +19,28 @@ use crate::plugin_cache::PluginCacheInner;
 use crate::router_cache::HostRouteTable;
 use crate::router_cache::RouterCache;
 
+thread_local! {
+    /// Reusable scratch buffer for `namespace|proxy_id` runtime keys used by
+    /// [`RequestEpoch::proxy_by_namespaced_id`].
+    ///
+    /// The borrow is strictly synchronous inside the lookup helper, is never
+    /// held across an `await`, and never re-enters: the returned reference
+    /// borrows the epoch's config, not this buffer. This keeps stream/request
+    /// proxy resolution allocation-free in steady state.
+    static PROXY_KEY_BUF: std::cell::RefCell<String> =
+        std::cell::RefCell::new(String::with_capacity(64));
+}
+
 #[derive(Clone)]
 pub struct RequestEpoch {
     pub(crate) config: Arc<GatewayConfig>,
-    pub(crate) proxy_index_by_id: Arc<HashMap<String, usize>>,
+    /// `namespace|id` -> index into `config.proxies`.
+    ///
+    /// Proxy IDs are unique only *within* a namespace, so this index must stay
+    /// keyed by the full `(namespace, id)` identity. A bare-ID index silently
+    /// drops one of two same-ID proxies and lets stream/SNI traffic resolve the
+    /// other tenant's proxy (issue #3094).
+    pub(crate) proxy_index_by_key: Arc<HashMap<String, usize>>,
     pub(crate) route_table: Arc<HostRouteTable>,
     pub(crate) plugin_cache: Arc<PluginCacheInner>,
     pub(crate) consumer_index: Arc<ConsumerIndexInner>,
@@ -33,21 +51,37 @@ pub struct RequestEpoch {
 }
 
 impl RequestEpoch {
-    pub(crate) fn proxy_by_id(&self, id: &str) -> Option<&Proxy> {
-        self.proxy_index_by_id
-            .get(id)
-            .and_then(|idx| self.config.proxies.get(*idx))
-            .filter(|proxy| proxy.id == id)
+    /// Namespace-qualified proxy lookup.
+    ///
+    /// This is the only proxy-by-identity accessor: every runtime caller must
+    /// know which namespace owns the proxy it is resolving. The returned
+    /// reference borrows the published config snapshot, so the thread-local
+    /// scratch borrow is released before the caller sees the result.
+    pub(crate) fn proxy_by_namespaced_id(&self, namespace: &str, id: &str) -> Option<&Proxy> {
+        let index = PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            crate::config::db_backend::write_namespaced_runtime_key(&mut key, namespace, id);
+            self.proxy_index_by_key.get(key.as_str()).copied()
+        })?;
+        self.config
+            .proxies
+            .get(index)
+            .filter(|proxy| proxy.id == id && proxy.namespace == namespace)
     }
 }
 
-pub(crate) fn build_proxy_index_by_id(config: &GatewayConfig) -> Arc<HashMap<String, usize>> {
+pub(crate) fn build_proxy_index_by_key(config: &GatewayConfig) -> Arc<HashMap<String, usize>> {
     Arc::new(
         config
             .proxies
             .iter()
             .enumerate()
-            .map(|(idx, proxy)| (proxy.id.clone(), idx))
+            .map(|(idx, proxy)| {
+                (
+                    crate::config::db_backend::namespaced_runtime_key(&proxy.namespace, &proxy.id),
+                    idx,
+                )
+            })
             .collect(),
     )
 }
@@ -68,6 +102,11 @@ mod tests {
     use serde_json::{Map, Value, json};
     use std::cell::Cell;
     use std::collections::HashMap;
+
+    /// Namespace-qualified runtime key (`ferrum|id`) for load-balancer lookups.
+    fn rk(id: &str) -> String {
+        crate::config::db_backend::namespaced_runtime_key("ferrum", id)
+    }
 
     fn proxy(id: &str, path: &str, plugins: Vec<&str>) -> Proxy {
         Proxy {
@@ -199,6 +238,7 @@ mod tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            mesh_revision: None,
         }
     }
 
@@ -233,7 +273,7 @@ mod tests {
         let current = store.load();
         RequestEpochStore::new(RequestEpoch {
             config: Arc::clone(&current.config),
-            proxy_index_by_id: Arc::clone(&current.proxy_index_by_id),
+            proxy_index_by_key: Arc::clone(&current.proxy_index_by_key),
             route_table: Arc::clone(&current.route_table),
             plugin_cache: Arc::clone(&current.plugin_cache),
             consumer_index: Arc::clone(&current.consumer_index),
@@ -339,7 +379,7 @@ mod tests {
         let epoch_a = store.load();
         let plugins_a = epoch_a
             .plugin_cache
-            .request_view("checkout", ProxyProtocol::Http)
+            .request_view("ferrum", "checkout", ProxyProtocol::Http)
             .plugins();
 
         let mut fault_b = static_fault();
@@ -376,7 +416,7 @@ mod tests {
         let epoch_b = store.load();
         let plugins_b = epoch_b
             .plugin_cache
-            .request_view("checkout", ProxyProtocol::Http)
+            .request_view("ferrum", "checkout", ProxyProtocol::Http)
             .plugins();
         assert!(!Arc::ptr_eq(&epoch_a, &epoch_b));
         assert!(matches!(
@@ -473,7 +513,7 @@ mod tests {
 
         let plugin_view = after
             .plugin_cache
-            .request_view("secure", ProxyProtocol::Http);
+            .request_view("ferrum", "secure", ProxyProtocol::Http);
         assert_eq!(plugin_view.auth_plugins().len(), 1);
     }
 
@@ -503,17 +543,74 @@ mod tests {
     }
 
     #[test]
+    fn proxy_index_resolves_same_id_in_two_namespaces_independently() {
+        let mut tenant_a = proxy("shared", "/a", vec![]);
+        tenant_a.namespace = "tenant-a".to_string();
+        let mut tenant_b = proxy("shared", "/b", vec![]);
+        tenant_b.namespace = "tenant-b".to_string();
+        let store = epoch_store(config(
+            vec![tenant_a.clone(), tenant_b.clone()],
+            vec![],
+            vec![],
+        ));
+
+        let epoch = store.load();
+        assert_eq!(
+            epoch
+                .proxy_by_namespaced_id("tenant-a", "shared")
+                .map(|proxy| proxy.listen_path.as_deref()),
+            Some(Some("/a"))
+        );
+        assert_eq!(
+            epoch
+                .proxy_by_namespaced_id("tenant-b", "shared")
+                .map(|proxy| proxy.listen_path.as_deref()),
+            Some(Some("/b"))
+        );
+        assert!(epoch.proxy_by_namespaced_id("ferrum", "shared").is_none());
+
+        // Removing tenant-a's proxy must not let a tenant-a lookup fall through
+        // to tenant-b's same-ID proxy.
+        let remaining = config(vec![tenant_b], vec![], vec![]);
+        store
+            .update_config(
+                |current| {
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::new(remaining.clone()),
+                        route_table: RouterCache::build_route_table_snapshot(&remaining),
+                        plugin_cache: Arc::clone(&current.plugin_cache),
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: true,
+                        lb_changed: false,
+                    }))
+                },
+                |_| {},
+            )
+            .unwrap_or_else(|error| panic!("removal should publish: {error}"));
+
+        let after = store.load();
+        assert!(after.proxy_by_namespaced_id("tenant-a", "shared").is_none());
+        assert_eq!(
+            after
+                .proxy_by_namespaced_id("tenant-b", "shared")
+                .map(|proxy| proxy.listen_path.as_deref()),
+            Some(Some("/b"))
+        );
+    }
+
+    #[test]
     fn proxy_by_id_index_tracks_published_config_snapshots() {
         let initial = config(vec![proxy("p1", "/one", vec![])], vec![], vec![]);
         let store = epoch_store(initial);
         let before = store.load();
         assert_eq!(
             before
-                .proxy_by_id("p1")
+                .proxy_by_namespaced_id("ferrum", "p1")
                 .map(|proxy| proxy.listen_path.as_deref()),
             Some(Some("/one"))
         );
-        assert!(before.proxy_by_id("p2").is_none());
+        assert!(before.proxy_by_namespaced_id("ferrum", "p2").is_none());
 
         let next_config = config(
             vec![
@@ -543,13 +640,13 @@ mod tests {
         let after_config_update = store.load();
         assert_eq!(
             after_config_update
-                .proxy_by_id("p1")
+                .proxy_by_namespaced_id("ferrum", "p1")
                 .map(|proxy| proxy.listen_path.as_deref()),
             Some(Some("/one-renamed"))
         );
         assert_eq!(
             after_config_update
-                .proxy_by_id("p2")
+                .proxy_by_namespaced_id("ferrum", "p2")
                 .map(|proxy| proxy.listen_path.as_deref()),
             Some(Some("/two"))
         );
@@ -561,7 +658,7 @@ mod tests {
         let after_lb_update = store.load();
         assert_eq!(
             after_lb_update
-                .proxy_by_id("p2")
+                .proxy_by_namespaced_id("ferrum", "p2")
                 .map(|proxy| proxy.listen_path.as_deref()),
             Some(Some("/two"))
         );
@@ -575,7 +672,7 @@ mod tests {
             vec![upstream("u1", vec![target("a.local", 80)])],
         );
         let current = LoadBalancerCache::build_inner(&old);
-        let old_balancer = current.get_balancer("u1").unwrap();
+        let old_balancer = current.get_balancer("ferrum", "u1").unwrap();
         let new = config(
             vec![proxy("p2", "/two", vec![])],
             vec![],
@@ -583,7 +680,7 @@ mod tests {
         );
 
         let next = LoadBalancerCache::build_delta_inner(&current, &new, &[], &[], &[]);
-        let next_balancer = next.get_balancer("u1").unwrap();
+        let next_balancer = next.get_balancer("ferrum", "u1").unwrap();
         assert!(Arc::ptr_eq(&old_balancer, &next_balancer));
     }
 
@@ -604,6 +701,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u1",
                         vec![target("a2.local", 81)],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -619,6 +717,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u2",
                         vec![target("b2.local", 82)],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -632,11 +731,11 @@ mod tests {
 
         let final_epoch = store.load();
         assert_eq!(
-            final_epoch.load_balancer.upstreams()["u1"].targets[0].host,
+            final_epoch.load_balancer.upstreams()[&rk("u1")].targets[0].host,
             "a2.local"
         );
         assert_eq!(
-            final_epoch.load_balancer.upstreams()["u2"].targets[0].host,
+            final_epoch.load_balancer.upstreams()[&rk("u2")].targets[0].host,
             "b2.local"
         );
         assert_eq!(final_epoch.route_generation, 1);
@@ -775,6 +874,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u1",
                         vec![target("b.local", 81)],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -797,7 +897,7 @@ mod tests {
         assert_eq!(next.lb_generation, 2);
         assert_eq!(observed_generations.get(), (1, 1, 2));
         assert_eq!(
-            next.load_balancer.upstreams()["u1"].targets[0].host,
+            next.load_balancer.upstreams()[&rk("u1")].targets[0].host,
             "b.local"
         );
         assert!(Arc::ptr_eq(&next, &store.load()));
@@ -840,6 +940,7 @@ mod tests {
             |current| {
                 Some(LoadBalancerCache::build_update_targets_inner(
                     &current.load_balancer,
+                    "ferrum",
                     "u1",
                     vec![target("b.local", 81)],
                     LoadBalancerAlgorithm::RoundRobin,
@@ -857,7 +958,7 @@ mod tests {
         assert!(Arc::ptr_eq(&before, &after));
         assert_eq!(after.lb_generation, u64::MAX);
         assert_eq!(
-            after.load_balancer.upstreams()["u1"].targets[0].host,
+            after.load_balancer.upstreams()[&rk("u1")].targets[0].host,
             "a.local"
         );
     }
@@ -904,7 +1005,7 @@ mod tests {
         let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
             let plugin = epoch
                 .plugin_cache
-                .get_plugins("p1")
+                .get_plugins(&rk("p1"))
                 .iter()
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
@@ -935,6 +1036,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u1",
                         vec![blue.clone(), replacement_green],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -996,7 +1098,7 @@ mod tests {
         let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
             let plugin = epoch
                 .plugin_cache
-                .get_plugins("p1")
+                .get_plugins(&rk("p1"))
                 .iter()
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
@@ -1026,6 +1128,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u1",
                         vec![first.clone(), added.clone()],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -1079,7 +1182,7 @@ mod tests {
         let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
             let plugin = epoch
                 .plugin_cache
-                .get_plugins("p1")
+                .get_plugins(&rk("p1"))
                 .iter()
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
@@ -1096,7 +1199,7 @@ mod tests {
         };
 
         let initial_epoch = store.load();
-        let old_target = initial_epoch.load_balancer.upstreams()["canary"].targets[0].clone();
+        let old_target = initial_epoch.load_balancer.upstreams()[&rk("canary")].targets[0].clone();
         match acquire(&initial_epoch, &old_target) {
             BackendAdmissionDecision::Admit(permit) => drop(permit),
             _ => panic!("initial route-override target should be admitted"),
@@ -1123,7 +1226,7 @@ mod tests {
 
         let replacement_epoch = store.load();
         let replacement_target =
-            replacement_epoch.load_balancer.upstreams()["canary"].targets[0].clone();
+            replacement_epoch.load_balancer.upstreams()[&rk("canary")].targets[0].clone();
         let held = match acquire(&replacement_epoch, &replacement_target) {
             BackendAdmissionDecision::Admit(permit) => permit,
             _ => panic!("replacement route-override target should be admitted"),
@@ -1162,7 +1265,7 @@ mod tests {
         let acquire = |epoch: &RequestEpoch, target: &UpstreamTarget| {
             let plugin = epoch
                 .plugin_cache
-                .get_plugins("p1")
+                .get_plugins(&rk("p1"))
                 .iter()
                 .find(|plugin| plugin.name() == "adaptive_concurrency")
                 .cloned()
@@ -1179,7 +1282,7 @@ mod tests {
         };
 
         let initial_epoch = store.load();
-        let first_target = initial_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+        let first_target = initial_epoch.load_balancer.upstreams()[&rk("u1")].targets[0].clone();
         let old_target_permit = match acquire(&initial_epoch, &first_target) {
             BackendAdmissionDecision::Admit(permit) => permit,
             _ => panic!("initial target should be admitted"),
@@ -1190,6 +1293,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u1",
                         vec![target("b.local", 81)],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -1203,7 +1307,7 @@ mod tests {
 
         let replacement_epoch = store.load();
         let replacement_target =
-            replacement_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+            replacement_epoch.load_balancer.upstreams()[&rk("u1")].targets[0].clone();
         match acquire(&initial_epoch, &first_target) {
             BackendAdmissionDecision::Reject {
                 status_code,
@@ -1254,6 +1358,7 @@ mod tests {
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u1",
                         vec![target("c.local", 82)],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -1266,7 +1371,7 @@ mod tests {
             .expect("second LB update should publish");
 
         let newest_epoch = store.load();
-        let newest_target = newest_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+        let newest_target = newest_epoch.load_balancer.upstreams()[&rk("u1")].targets[0].clone();
         match acquire(&replacement_epoch, &replacement_target) {
             BackendAdmissionDecision::Reject {
                 status_code,
@@ -1339,13 +1444,14 @@ mod tests {
         );
         let store = epoch_store(initial);
         let pinned_epoch = store.load();
-        let pinned_target = pinned_epoch.load_balancer.upstreams()["u1"].targets[0].clone();
+        let pinned_target = pinned_epoch.load_balancer.upstreams()[&rk("u1")].targets[0].clone();
 
         store
             .update_load_balancer(
                 |current| {
                     Some(LoadBalancerCache::build_update_targets_inner(
                         &current.load_balancer,
+                        "ferrum",
                         "u2",
                         vec![target("replacement-unrelated.local", 81)],
                         LoadBalancerAlgorithm::RoundRobin,
@@ -1359,7 +1465,7 @@ mod tests {
 
         let plugin = pinned_epoch
             .plugin_cache
-            .get_plugins("p1")
+            .get_plugins(&rk("p1"))
             .iter()
             .find(|plugin| plugin.name() == "adaptive_concurrency")
             .cloned()
@@ -1413,7 +1519,7 @@ impl RequestEpochStore {
             plugin_cache: plugin_cache.load_inner(),
             consumer_index: consumer_index.load_inner(),
             load_balancer: load_balancer_cache.load_inner(),
-            proxy_index_by_id: build_proxy_index_by_id(&config),
+            proxy_index_by_key: build_proxy_index_by_key(&config),
             config: Arc::new(config),
             config_generation: 1,
             route_generation: 1,
@@ -1439,7 +1545,7 @@ impl RequestEpochStore {
             return Ok(None);
         };
 
-        let proxy_index_by_id = build_proxy_index_by_id(&staged.config);
+        let proxy_index_by_key = build_proxy_index_by_key(&staged.config);
         let lb_generation = if staged.lb_changed {
             next_lb_generation(current.lb_generation)?
         } else {
@@ -1447,7 +1553,7 @@ impl RequestEpochStore {
         };
         let next = Arc::new(RequestEpoch {
             config: staged.config,
-            proxy_index_by_id,
+            proxy_index_by_key,
             route_table: staged.route_table,
             plugin_cache: staged.plugin_cache,
             consumer_index: staged.consumer_index,
@@ -1502,7 +1608,7 @@ impl RequestEpochStore {
         let lb_generation = next_lb_generation(current.lb_generation)?;
         let next = Arc::new(RequestEpoch {
             config: Arc::clone(&current.config),
-            proxy_index_by_id: Arc::clone(&current.proxy_index_by_id),
+            proxy_index_by_key: Arc::clone(&current.proxy_index_by_key),
             route_table: Arc::clone(&current.route_table),
             plugin_cache: Arc::clone(&current.plugin_cache),
             consumer_index: Arc::clone(&current.consumer_index),

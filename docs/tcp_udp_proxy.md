@@ -200,7 +200,7 @@ Set `frontend_tls: true` on a UDP proxy to accept DTLS-encrypted connections fro
 
 Like TCP+TLS, frontend DTLS handshakes complete before backend session creation. `on_stream_connect` plugins run after DTLS accept with client certificate context available when DTLS mTLS is enabled; handshake failures and plugin rejections do not create backend UDP or DTLS sessions. Negotiated ClientHello SNI is exposed on `StreamConnectionContext.sni_hostname` at connect and preserved on `StreamTransactionSummary.sni_hostname` at disconnect for logging sinks.
 
-Frontend DTLS uses `dimpl`, which currently surfaces only the client leaf certificate to Ferrum. Stream plugins receive that leaf in `StreamConnectionContext.tls_client_cert_der`; `tls_client_cert_chain_der` remains `None` for DTLS even when the client sent intermediates. Configure `FERRUM_DTLS_CLIENT_CA_CERT_PATH` with the CA/intermediate certificates needed to validate client leaves.
+Frontend DTLS preserves the peer's complete leaf-first certificate chain. Stream plugins receive the leaf in `StreamConnectionContext.tls_client_cert_der` (so certificate fingerprint behavior remains leaf-only) and the presented intermediates in `tls_client_cert_chain_der`, matching TCP/TLS context semantics. Ferrum validates the leaf plus transmitted intermediates against `FERRUM_DTLS_CLIENT_CA_CERT_PATH`.
 
 ```yaml
 proxies:
@@ -218,6 +218,13 @@ FERRUM_DTLS_CERT_PATH=/path/to/dtls-cert.pem
 FERRUM_DTLS_KEY_PATH=/path/to/dtls-key.pem
 ```
 
+The certificate source may contain a leaf-first PEM bundle. Ferrum parses every
+certificate, validates that the first certificate matches the private key, and
+transmits the complete configured chain in order for both DTLS 1.2 and 1.3.
+Peers may therefore trust only the root while the gateway supplies the
+intermediates. The root normally stays in the trust store rather than the
+transmitted bundle.
+
 With `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, file/provider/Kubernetes/managed-backed DTLS cert, key, client-CA, and CRL sources are watched and swapped for new DTLS sessions without rebinding the UDP listener.
 
 **Important:** DTLS requires ECDSA P-256 or P-384 certificates. RSA and Ed25519 keys are not supported by the underlying `dimpl` library.
@@ -227,6 +234,11 @@ With `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, file/provider/Kubernetes/ma
 Use `backend_scheme: dtls` to encrypt UDP datagrams to the backend using DTLS 1.2/1.3 (auto-negotiated). The gateway accepts plain UDP from clients and establishes a DTLS session per client to the backend.
 
 DTLS uses the same `backend_tls_*` proxy fields as TCP TLS:
+
+When DTLS client authentication is configured, `backend_tls_client_cert_path`
+may likewise be a leaf-first PEM bundle; Ferrum sends the full chain. Backend
+server verification consumes the complete chain presented by the peer, so a
+custom `backend_tls_server_ca_cert_path` can contain only the trust root.
 
 ```yaml
 proxies:
@@ -267,6 +279,10 @@ This provides full encryption: DTLS client → gateway (DTLS termination) → ga
 - The `udp_idle_timeout_seconds` setting applies to DTLS sessions the same as plain UDP
 - Frontend DTLS uses separate certificates from TLS (set via `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH`)
 - Frontend DTLS mTLS uses a separate trust store from TCP TLS mTLS (`FERRUM_DTLS_CLIENT_CA_CERT_PATH` vs `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`)
+- DTLS identity private-key byte owners, including reload-cache clones and
+  auto-negotiation fallback state, are cleared before release. Parsed signing
+  keys remain inside the selected cryptographic provider and follow that
+  provider's secret-memory lifecycle.
 
 ### Trust Store Model
 
@@ -284,6 +300,28 @@ The gateway uses separate trust stores for TCP and UDP encryption:
 The separation of TCP and UDP trust stores allows independent certificate rotation and different CA hierarchies for each protocol.
 
 ## Load Balancing
+
+### Multi-address DNS backends
+
+For a hostname target, TCP, TCP+TLS, DTLS, passthrough, and mesh stream
+connectors consume the shared DNS cache's complete rotated answer set. They try
+alternate IPv4 or IPv6 candidates deterministically through their relevant
+connect or handshake boundary within the proxy's single overall connect budget;
+a stalled candidate receives only its share of the remaining budget. Denied
+addresses are filtered independently and the dial fails closed if no approved
+address remains. TLS and DTLS continue to use `backend_host` (or the configured
+TLS name override) for SNI and certificate verification—the selected IP is only
+the socket peer.
+
+Plain UDP is different: it has no network handshake, and `UdpSocket::connect`
+does not prove that a peer is reachable. Each session deterministically selects
+the first address in its rotated set and advances only on an immediate local
+bind/connect setup error. Ferrum does not replay a datagram after a send error,
+because it cannot know whether the original reached the application and a retry
+could duplicate one-way traffic. Response-observable failover is available to
+DTLS and UDP health probes; generic plain-UDP blackholes require an
+application-level acknowledgement contract to detect. See
+[DNS address selection and failover](dns_resolver.md#address-selection-and-failover).
 
 Stream proxies support load balancing via upstreams, the same as HTTP proxies:
 
@@ -432,7 +470,7 @@ Notes:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRUM_STREAM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for all TCP/UDP listeners |
-| `FERRUM_DTLS_CERT_PATH` | (none) | PEM certificate for frontend DTLS termination (ECDSA P-256 or P-384) |
+| `FERRUM_DTLS_CERT_PATH` | (none) | Leaf-first PEM certificate bundle for frontend DTLS termination (ECDSA P-256 or P-384 leaf) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA certificate for verifying DTLS client certs (frontend mTLS). Separate from `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` used for TCP. |
 | `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` | `false` | Enables live reload for frontend TCP TLS, admin TLS, and frontend DTLS source changes |

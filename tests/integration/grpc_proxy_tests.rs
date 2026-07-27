@@ -4304,10 +4304,12 @@ async fn grpc_streaming_late_upload_overflow_during_response_records_neutral() {
     // backend proxy) and trip it to OPEN so the streaming request is admitted as
     // the sole HALF_OPEN probe.
     let cb_key = ferrum_edge::circuit_breaker::target_key(&backend_host, backend_port);
-    let cb =
-        inspect_state
-            .circuit_breaker_cache
-            .get_or_create(&proxy_id, Some(&cb_key), &cb_config);
+    let cb = inspect_state.circuit_breaker_cache.get_or_create(
+        "ferrum",
+        &proxy_id,
+        Some(&cb_key),
+        &cb_config,
+    );
     cb.record_failure(500, false, false);
     assert_eq!(
         cb.state_name(),
@@ -4434,10 +4436,12 @@ async fn grpc_streaming_clean_probe_heals_breaker_at_body_completion() {
     let inspect_state = state.clone();
 
     let cb_key = ferrum_edge::circuit_breaker::target_key(&backend_host, backend_port);
-    let cb =
-        inspect_state
-            .circuit_breaker_cache
-            .get_or_create(&proxy_id, Some(&cb_key), &cb_config);
+    let cb = inspect_state.circuit_breaker_cache.get_or_create(
+        "ferrum",
+        &proxy_id,
+        Some(&cb_key),
+        &cb_config,
+    );
     cb.record_failure(500, false, false);
     assert_eq!(
         cb.state_name(),
@@ -4525,10 +4529,12 @@ async fn grpc_streaming_closed_state_backend_failure_trips_breaker_at_header_tim
     let state = create_test_proxy_state(vec![proxy]);
     let inspect_state = state.clone();
     let cb_key = ferrum_edge::circuit_breaker::target_key(&backend_host, backend_port);
-    let cb =
-        inspect_state
-            .circuit_breaker_cache
-            .get_or_create(&proxy_id, Some(&cb_key), &cb_config);
+    let cb = inspect_state.circuit_breaker_cache.get_or_create(
+        "ferrum",
+        &proxy_id,
+        Some(&cb_key),
+        &cb_config,
+    );
     assert_eq!(cb.state_name(), "closed", "breaker should start CLOSED");
 
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
@@ -4578,4 +4584,104 @@ async fn grpc_streaming_closed_state_backend_failure_trips_breaker_at_header_tim
         "open",
         "breaker must remain OPEN after the upload terminates (no double-record)"
     );
+}
+
+/// #2933: without the `grpc_deadline` plugin, a client `grpc-timeout` is still
+/// receipt-anchored once. Connect-failure retries + backoff must terminate
+/// within ~1× the budget (plus a small slack), not ~N× by re-arming the
+/// relative header on every attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_timeout_without_deadline_plugin_is_one_anchored_budget_across_retries() {
+    let mut proxy = create_grpc_proxy("grpc-timeout-anchored", "/grpc", 9);
+    proxy.backend_connect_timeout_ms = 50;
+    proxy.retry = Some(RetryConfig {
+        max_retries: 3,
+        retryable_status_codes: Vec::new(),
+        retryable_methods: vec!["POST".to_string()],
+        backoff: BackoffStrategy::Fixed { delay_ms: 200 },
+        retry_on_connect_failure: true,
+    });
+    // Intentionally no grpc_deadline plugin — prepare_request_deadline still
+    // anchors the client header at receipt.
+    let state = create_test_proxy_state(vec![proxy]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let started = std::time::Instant::now();
+    let (status, headers, _body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_grpc_request(
+            gateway_addr,
+            "/grpc/pkg.Service/Method",
+            b"",
+            &[("grpc-timeout", "300m")],
+        ),
+    )
+    .await
+    .expect("anchored deadline request must finish")
+    .expect("anchored deadline request failed");
+    let elapsed = started.elapsed();
+
+    assert_eq!(status, 200);
+    let grpc_status = headers.get("grpc-status").map(String::as_str);
+    assert!(
+        matches!(grpc_status, Some("4") | Some("14")),
+        "expected DEADLINE_EXCEEDED or UNAVAILABLE, got {grpc_status:?} headers={headers:?}"
+    );
+    // 300ms budget + one 200ms backoff + generous CI slack. A re-arming bug
+    // would land near 4×300ms + 3×200ms ≈ 1.8s+.
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "anchored grpc-timeout must bound retries (~1× budget + slack); elapsed={elapsed:?}"
+    );
+}
+
+/// #2934 structural guard: retry must clone the real HeaderMap, not rebuild
+/// from stringified ctx.headers (which comma-joins duplicates / drops opaque).
+#[test]
+fn grpc_retry_loop_clones_real_header_map_not_string_rebuild() {
+    let src = include_str!("../../src/proxy/mod.rs");
+    assert!(
+        src.contains("let mut grpc_replay_headers = hyper::HeaderMap::new();"),
+        "the gRPC dispatch must reserve a real HeaderMap slot for retry replay"
+    );
+    assert!(
+        src.contains("grpc_replay_headers = grpc_headers.clone();"),
+        "the retry-capable dispatch branches must capture the collected \
+         HeaderMap before it moves into attempt 1"
+    );
+    assert!(
+        src.contains("let grpc_req_headers = grpc_replay_headers;"),
+        "retry loop must reuse the captured HeaderMap"
+    );
+    assert!(
+        src.contains("Retry attempts reuse the real collected HeaderMap"),
+        "document why we keep the real HeaderMap across retries"
+    );
+    // The old rebuild loop turned ctx.headers entries back into HeaderValues,
+    // comma-joining duplicates and dropping non-UTF-8 opaque values.
+    assert!(
+        !src.contains("let grpc_req_headers: hyper::HeaderMap = if grpc_has_retry {"),
+        "must not rebuild retry headers from stringified ctx.headers"
+    );
+}
+
+#[test]
+fn grpc_retry_header_map_clone_preserves_duplicates_and_opaque_bytes() {
+    // Mirrors the clone the retry loop now performs: duplicates stay as
+    // separate field lines, and non-UTF-8 opaque values survive.
+    let mut headers = hyper::HeaderMap::new();
+    headers.append("x-md", hyper::header::HeaderValue::from_static("a"));
+    headers.append("x-md", hyper::header::HeaderValue::from_static("b"));
+    // obs-text (0x80-0xFF) is legal opaque field-value material; control
+    // bytes like 0x01 are not and would fail HeaderValue construction.
+    headers.insert(
+        "x-bin",
+        hyper::header::HeaderValue::from_bytes(&[0xff, 0xfe, 0x80]).unwrap(),
+    );
+    let cloned = headers.clone();
+    let md: Vec<_> = cloned.get_all("x-md").iter().collect();
+    assert_eq!(md.len(), 2);
+    assert_eq!(md[0].as_bytes(), b"a");
+    assert_eq!(md[1].as_bytes(), b"b");
+    assert_eq!(cloned.get("x-bin").unwrap().as_bytes(), &[0xff, 0xfe, 0x80]);
 }

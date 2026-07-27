@@ -6598,6 +6598,101 @@ mod tests {
     }
 
     #[test]
+    fn lossy_virtual_service_ids_in_two_namespaces_both_survive() {
+        // resource_id joins with dashes, so ns `a` / name `b-c` collides with
+        // ns `a-b` / name `c` on the bare proxy and upstream id strings.
+        let vs_a = object_with_metadata(
+            "VirtualService",
+            "networking.istio.io/v1",
+            "b-c",
+            "a",
+            serde_json::json!({
+                "hosts": ["a.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/v1"}}],
+                    "route": [
+                        {"destination": {"host": "api-v1.a.svc.cluster.local", "port": {"number": 8080}}, "weight": 70},
+                        {"destination": {"host": "api-v2.a.svc.cluster.local", "port": {"number": 8081}}, "weight": 30}
+                    ]
+                }]
+            }),
+        );
+        let vs_b = object_with_metadata(
+            "VirtualService",
+            "networking.istio.io/v1",
+            "c",
+            "a-b",
+            serde_json::json!({
+                "hosts": ["b.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/v1"}}],
+                    "route": [
+                        {"destination": {"host": "api-v1.a-b.svc.cluster.local", "port": {"number": 9080}}, "weight": 60},
+                        {"destination": {"host": "api-v2.a-b.svc.cluster.local", "port": {"number": 9081}}, "weight": 40}
+                    ]
+                }]
+            }),
+        );
+
+        let expected_proxy_id = resource_id("istio-vs", "a", "b-c", "0");
+        let expected_upstream_id = resource_id("istio-vs-upstream", "a", "b-c", "0");
+        assert_eq!(
+            expected_proxy_id,
+            resource_id("istio-vs", "a-b", "c", "0"),
+            "fixture must exercise the lossy dash-join collision"
+        );
+        assert_eq!(
+            expected_upstream_id,
+            resource_id("istio-vs-upstream", "a-b", "c", "0"),
+            "fixture must exercise the lossy upstream dash-join collision"
+        );
+
+        let result = translate_k8s_objects(
+            &[vs_a, vs_b],
+            options().with_source_namespaces(vec!["a".to_string(), "a-b".to_string()]),
+        )
+        .expect("lossy cross-namespace VirtualServices must both translate");
+
+        let proxy_a = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.namespace == "a" && proxy.id == expected_proxy_id)
+            .expect("namespace a proxy must survive");
+        let proxy_b = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.namespace == "a-b" && proxy.id == expected_proxy_id)
+            .expect("namespace a-b proxy must survive");
+        assert_eq!(proxy_a.hosts, vec!["a.example.com".to_string()]);
+        assert_eq!(proxy_b.hosts, vec!["b.example.com".to_string()]);
+
+        let upstream_a = result
+            .config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == "a" && upstream.id == expected_upstream_id)
+            .expect("namespace a upstream must survive");
+        let upstream_b = result
+            .config
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == "a-b" && upstream.id == expected_upstream_id)
+            .expect("namespace a-b upstream must survive");
+        assert_eq!(upstream_a.targets[0].weight, 70);
+        assert_eq!(upstream_b.targets[0].weight, 60);
+        assert_eq!(
+            proxy_a.upstream_id.as_deref(),
+            Some(expected_upstream_id.as_str())
+        );
+        assert_eq!(
+            proxy_b.upstream_id.as_deref(),
+            Some(expected_upstream_id.as_str())
+        );
+    }
+
+    #[test]
     fn virtual_service_skips_zero_weight_destination_in_multi_destination_split() {
         let result = translate_k8s_objects(
             &[object(

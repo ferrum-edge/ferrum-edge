@@ -26,6 +26,7 @@ use crate::backend_conn_limit::{
     BackendConnectionGuard, BackendConnectionLimitExceeded, BackendConnectionLimiter,
 };
 use crate::circuit_breaker::CircuitBreakerCache;
+use crate::config::db_backend::NamespacedResourceId;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::BackendTlsConfigBuilder;
 
@@ -917,6 +918,11 @@ pub struct TcpListenerConfig {
     pub port: u16,
     pub bind_addr: IpAddr,
     pub proxy_id: String,
+    /// Namespace owning `proxy_id`. Supplied by the stream listener manager
+    /// from the desired listener's exact identity — never inferred, because a
+    /// same-ID proxy in another namespace would otherwise capture this
+    /// listener's runtime state (issue #3094).
+    pub proxy_namespace: String,
     pub config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
     pub request_epoch: Arc<RequestEpochStore>,
@@ -957,8 +963,12 @@ pub struct TcpListenerConfig {
     pub started: Arc<AtomicBool>,
     /// When set, this listener serves multiple passthrough proxies sharing the port.
     /// SNI from the ClientHello selects which proxy to route to.
-    /// When `None`, uses the single `proxy_id` (existing behavior).
-    pub sni_proxy_ids: Option<Vec<String>>,
+    /// When `None`, uses the single `proxy_id`/`proxy_namespace` (existing behavior).
+    ///
+    /// Candidates are namespace-qualified: one shared passthrough port may host
+    /// same-ID proxies owned by different namespaces, so resolution must select
+    /// on `(namespace, id)` rather than on a bare ID.
+    pub sni_proxy_ids: Option<Vec<NamespacedResourceId>>,
     /// Adaptive buffer tracker for dynamic copy buffer sizing.
     pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     /// Whether TCP Fast Open is enabled (from `FERRUM_TCP_FASTOPEN_ENABLED`).
@@ -1002,10 +1012,25 @@ pub struct TcpListenerConfig {
     pub trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
 }
 
+pub(crate) fn find_listener_proxy<'a>(
+    config: &'a GatewayConfig,
+    proxy_namespace: &str,
+    proxy_id: &str,
+) -> Option<&'a Proxy> {
+    config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == proxy_id && proxy.namespace == proxy_namespace)
+}
+
 #[derive(Clone)]
 struct TcpAcceptLoopState {
     port: u16,
     proxy_id: Arc<str>,
+    /// Namespace owning `proxy_id`. Carried from the listener's desired
+    /// identity so every epoch lookup and every piece of proxy-keyed runtime
+    /// state is resolved on the exact `(namespace, id)` pair.
+    proxy_namespace: Arc<str>,
     dns_cache: DnsCache,
     request_epoch: Arc<RequestEpochStore>,
     health_checker: Arc<HealthChecker>,
@@ -1019,7 +1044,7 @@ struct TcpAcceptLoopState {
     tcp_half_close_max_wait_seconds: u64,
     frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
-    sni_proxy_ids: Option<Vec<String>>,
+    sni_proxy_ids: Option<Vec<NamespacedResourceId>>,
     adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     tcp_fastopen_enabled: bool,
     overload: Arc<crate::overload::OverloadState>,
@@ -1247,6 +1272,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         port,
         bind_addr,
         proxy_id,
+        proxy_namespace,
         config,
         dns_cache,
         request_epoch,
@@ -1306,15 +1332,13 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
 
     // Convert to Arc<str> so per-connection clones are a cheap pointer bump.
     let proxy_id: Arc<str> = Arc::from(proxy_id);
+    let proxy_namespace: Arc<str> = Arc::from(proxy_namespace);
 
     // Pre-build backend TLS config if this proxy uses Tcps (TCP+TLS) backend scheme.
     // This avoids reading certificate files from disk on every connection.
     let backend_tls_cache: Option<Arc<CachedBackendTlsConfig>> = {
         let current_config = config.load();
-        current_config
-            .proxies
-            .iter()
-            .find(|p| *p.id == *proxy_id)
+        find_listener_proxy(&current_config, proxy_namespace.as_ref(), proxy_id.as_ref())
             // Passthrough proxies relay raw bytes without originating backend
             // TLS; their listener must not fail because unrelated TLS material
             // (global CA bundle / upstream-resolved fields) is unreadable.
@@ -1338,6 +1362,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     let loop_state = TcpAcceptLoopState {
         port,
         proxy_id: proxy_id.clone(),
+        proxy_namespace: proxy_namespace.clone(),
         dns_cache,
         request_epoch,
         health_checker,
@@ -1488,6 +1513,7 @@ async fn run_tcp_accept_loop(
 
                 let port = state.port;
                 let proxy_id = state.proxy_id.clone();
+                let proxy_namespace = state.proxy_namespace.clone();
                 let dns_cache = state.dns_cache.clone();
                 let request_epoch = state.request_epoch.clone();
                 let health_checker = state.health_checker.clone();
@@ -1545,7 +1571,7 @@ async fn run_tcp_accept_loop(
                     // consumption from one snapshot and route with another.
                     let epoch = request_epoch.load();
                     let proxy_protocol_enabled = epoch
-                        .proxy_by_id(proxy_id.as_ref())
+                        .proxy_by_namespaced_id(proxy_namespace.as_ref(), proxy_id.as_ref())
                         .and_then(|p| p.stream_proxy_protocol)
                         .unwrap_or(false);
 
@@ -1609,7 +1635,8 @@ async fn run_tcp_accept_loop(
                             &client_ip,
                             &node_waypoint_identity_warn_limiter,
                         );
-                    let base_proxy = epoch.proxy_by_id(proxy_id.as_ref());
+                    let base_proxy =
+                        epoch.proxy_by_namespaced_id(proxy_namespace.as_ref(), proxy_id.as_ref());
                     let consumer_index =
                         Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
 
@@ -1628,9 +1655,17 @@ async fn run_tcp_accept_loop(
                             .unwrap_or(BackendScheme::Tcp),
                         consumer_index,
                     );
-                    stream_ctx.proxy_lifecycle_generation = epoch
-                        .plugin_cache
-                        .proxy_lifecycle_generation(proxy_id.as_ref());
+                    // Authoritative owning namespace for this connection. SNI
+                    // resolution on a shared passthrough port may replace both
+                    // `proxy_id` and this field with the matched candidate's
+                    // identity; the disconnect path below reads it back so
+                    // plugin/lifecycle lookups stay on the right tenant.
+                    stream_ctx.proxy_namespace = proxy_namespace.to_string();
+                    stream_ctx.proxy_lifecycle_generation = base_proxy.and_then(|p| {
+                        epoch
+                            .plugin_cache
+                            .proxy_lifecycle_generation(&p.namespace, &p.id)
+                    });
                     // Populated above from the node-waypoint resolver in
                     // NodeWaypoint topology so `mesh_authz` enforces
                     // namespace/selector-scoped policies per source pod
@@ -1660,6 +1695,7 @@ async fn run_tcp_accept_loop(
                         stream,
                         remote_addr,
                         &proxy_id,
+                        &proxy_namespace,
                         &epoch,
                         &health_checker,
                         &dns_cache,
@@ -1692,14 +1728,20 @@ async fn run_tcp_accept_loop(
                     // config reloads; using the connection epoch preserves a
                     // consistent view of SNI-selected proxy metadata and
                     // stream plugins for the full connection lifetime.
-                    let final_proxy = epoch.proxy_by_id(&final_proxy_id);
-                    let plugins = epoch
-                        .plugin_cache
-                        .get_plugins_for_protocol(&final_proxy_id, ProxyProtocol::Tcp);
+                    // `stream_ctx.proxy_namespace` is the exact namespace this
+                    // connection was admitted under (listener identity, or the
+                    // SNI-matched candidate's namespace). Never re-derive it by
+                    // scanning: a same-ID proxy in another namespace would be
+                    // indistinguishable.
+                    let final_proxy_namespace = stream_ctx.proxy_namespace.clone();
+                    let final_proxy =
+                        epoch.proxy_by_namespaced_id(&final_proxy_namespace, &final_proxy_id);
+                    let plugins = epoch.plugin_cache.plugins_for_protocol(
+                        &final_proxy_namespace,
+                        &final_proxy_id,
+                        ProxyProtocol::Tcp,
+                    );
                     let proxy_name = stream_ctx.proxy_name.clone();
-                    let proxy_namespace = final_proxy
-                        .map(|p| p.namespace.clone())
-                        .unwrap_or_else(crate::config::types::default_namespace);
                     let backend_scheme = final_proxy
                         .map(|p| p.effective_scheme())
                         .unwrap_or(stream_ctx.backend_scheme);
@@ -1802,7 +1844,7 @@ async fn run_tcp_accept_loop(
                             None
                         };
                         let summary = StreamTransactionSummary {
-                            namespace: proxy_namespace,
+                            namespace: final_proxy_namespace,
                             proxy_id: final_proxy_id,
                             proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
                             proxy_name,
@@ -1925,6 +1967,7 @@ struct TcpConnParams {
 /// Lightweight snapshot of the proxy fields needed per TCP connection.
 /// Includes circuit breaker config and target key for circuit breaker checks.
 struct TcpConnCbInfo {
+    namespace: String,
     cb_config: Option<crate::config::types::CircuitBreakerConfig>,
     cb_target_key: Option<String>,
     is_half_open_probe: bool,
@@ -2042,6 +2085,9 @@ async fn handle_tcp_connection(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
     proxy_id: &str,
+    // Namespace owning the listener's `proxy_id`. Replaced per connection when
+    // SNI resolves a different namespace-qualified candidate.
+    proxy_namespace: &str,
     epoch: &RequestEpoch,
     health_checker: &HealthChecker,
     dns_cache: &DnsCache,
@@ -2052,7 +2098,7 @@ async fn handle_tcp_connection(
     frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
     stream_ctx: &mut StreamConnectionContext,
-    sni_proxy_ids: Option<&[String]>,
+    sni_proxy_ids: Option<&[NamespacedResourceId]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
     ktls_enabled: bool,
@@ -2084,6 +2130,7 @@ async fn handle_tcp_connection(
         client_stream,
         remote_addr,
         proxy_id,
+        proxy_namespace,
         epoch,
         health_checker,
         dns_cache,
@@ -2324,6 +2371,7 @@ async fn handle_tcp_connection_inner(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
     proxy_id: &str,
+    proxy_namespace: &str,
     epoch: &RequestEpoch,
     health_checker: &HealthChecker,
     dns_cache: &DnsCache,
@@ -2336,7 +2384,7 @@ async fn handle_tcp_connection_inner(
     start: Instant,
     backend_info: &mut TcpBackendInfo,
     stream_ctx: &mut StreamConnectionContext,
-    sni_proxy_ids: Option<&[String]>,
+    sni_proxy_ids: Option<&[NamespacedResourceId]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
     ktls_enabled: bool,
@@ -2362,8 +2410,11 @@ async fn handle_tcp_connection_inner(
     // --- SNI-based proxy resolution for shared passthrough ports ---
     // When multiple passthrough proxies share a listen_port, we must peek at
     // the ClientHello to extract SNI before looking up the proxy config.
-    let _resolved_proxy_id: Option<String>;
-    let proxy_id = if let Some(sni_ids) = sni_proxy_ids {
+    // A shared passthrough port may host same-ID proxies from different
+    // namespaces, so the match is a full `(namespace, id)` identity and both
+    // halves replace the listener's defaults for the rest of this connection.
+    let listener_namespace = proxy_namespace;
+    let resolved_identity: Option<NamespacedResourceId> = if let Some(sni_ids) = sni_proxy_ids {
         let sni = super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
         stream_ctx.sni_hostname = sni.clone();
 
@@ -2374,21 +2425,43 @@ async fn handle_tcp_connection_inner(
                     sni,
                     stream_ctx.listen_port
                 )
-            })?;
-        _resolved_proxy_id = Some(matched.to_string());
-        // Update stream_ctx to reflect the resolved proxy
-        stream_ctx.proxy_id = matched.to_string();
-        stream_ctx.proxy_name = epoch.proxy_by_id(matched).and_then(|p| p.name.clone());
-        _resolved_proxy_id.as_deref().unwrap_or(proxy_id)
+            })?
+            .clone();
+        // Update stream_ctx to reflect the resolved proxy identity.
+        stream_ctx.proxy_namespace = matched.namespace.clone();
+        stream_ctx.proxy_id = matched.id.clone();
+        stream_ctx.proxy_name = epoch
+            .proxy_by_namespaced_id(&matched.namespace, &matched.id)
+            .and_then(|p| p.name.clone());
+        Some(matched)
     } else {
-        _resolved_proxy_id = None;
-        proxy_id
+        None
+    };
+    let (proxy_namespace, proxy_id) = match &resolved_identity {
+        Some(resolved) => (resolved.namespace.as_str(), resolved.id.as_str()),
+        None => (listener_namespace, proxy_id),
     };
 
     // Look up the proxy config and extract only the fields we need.
     let proxy = epoch
-        .proxy_by_id(proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {} not found in config", proxy_id))?;
+        .proxy_by_namespaced_id(proxy_namespace, proxy_id)
+        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found in config"))?;
+
+    if resolved_identity.is_some() {
+        // The accept loop stamped the generation from the listener's
+        // REPRESENTATIVE identity (the first SNI candidate). SNI has now
+        // selected a different `(namespace, id)`, and the disconnect summary
+        // reports that matched identity — so the generation must be re-read for
+        // it. Leaving the representative's generation attached would hand
+        // `proxy_alerts` an ownership token minted for another tenant's
+        // lifecycle row, which fails the `owns_proxy_generation` check and
+        // silently drops every alert for the matched proxy (issue #3094).
+        // Mirrors the UDP capture path, which re-reads after its own
+        // resolution. Non-SNI listeners keep the accept-loop stamp.
+        stream_ctx.proxy_lifecycle_generation = epoch
+            .plugin_cache
+            .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
+    }
 
     let (params, cb_info) = {
         stream_ctx.proxy_id = proxy.id.clone();
@@ -2409,6 +2482,7 @@ async fn handle_tcp_connection_inner(
             .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
 
         let cb_info = TcpConnCbInfo {
+            namespace: proxy.namespace.clone(),
             cb_config: proxy.circuit_breaker.clone(),
             cb_target_key,
             is_half_open_probe: false,
@@ -2465,9 +2539,10 @@ async fn handle_tcp_connection_inner(
         remote_addr.ip(),
     )?;
 
-    let plugins = epoch
-        .plugin_cache
-        .get_plugins_for_protocol(proxy_id, ProxyProtocol::Tcp);
+    let plugins =
+        epoch
+            .plugin_cache
+            .plugins_for_protocol(&proxy.namespace, proxy_id, ProxyProtocol::Tcp);
 
     // Whether any plugin (e.g. the WAF) wants the opening client bytes captured
     // into `stream_ctx.first_bytes` before `on_stream_connect` runs. Computed
@@ -2543,6 +2618,7 @@ async fn handle_tcp_connection_inner(
         // half-open probe flag for the matching record_success/failure call.
         if let Some(ref cb_config) = cb_info.cb_config {
             match circuit_breaker_cache.can_execute(
+                &cb_info.namespace,
                 proxy_id,
                 cb_info.cb_target_key.as_deref(),
                 cb_config,
@@ -2601,18 +2677,19 @@ async fn handle_tcp_connection_inner(
         // half-open probe slot claimed by can_execute above is released —
         // otherwise an unresolvable passthrough hostname wedges HALF_OPEN
         // until reload.
-        let resolved_ip = match dns_cache
-            .resolve(
+        let candidates = match dns_cache
+            .resolve_candidates(
                 &params.backend_host,
                 params.dns_override.as_deref(),
                 params.dns_cache_ttl_seconds,
             )
             .await
         {
-            Ok(ip) => ip,
+            Ok(addresses) => addresses,
             Err(e) => {
                 if let Some(ref cb_config) = cb_info.cb_config {
                     let cb = circuit_breaker_cache.get_or_create(
+                        &cb_info.namespace,
                         proxy_id,
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
@@ -2635,9 +2712,6 @@ async fn handle_tcp_connection_inner(
                 ));
             }
         };
-        let addr = SocketAddr::new(resolved_ip, params.backend_port);
-        backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
-
         // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
         // the passthrough path. The cap is checked before connect so we don't
         // count failed handshakes against the cap. The guard's RAII drop
@@ -2663,6 +2737,7 @@ async fn handle_tcp_connection_inner(
                 // traffic cannot wedge HALF_OPEN.
                 if let Some(ref cb_config) = cb_info.cb_config {
                     let cb = circuit_breaker_cache.get_or_create(
+                        &cb_info.namespace,
                         proxy_id,
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
@@ -2683,19 +2758,35 @@ async fn handle_tcp_connection_inner(
 
         // Connect plain TCP to backend (no TLS origination — the client's encrypted
         // stream passes through directly to the backend which terminates TLS).
-        let backend_stream =
-            connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
-                .await
-                .inspect_err(|_| {
-                    if let Some(ref cb_config) = cb_info.cb_config {
-                        let cb = circuit_breaker_cache.get_or_create(
-                            proxy_id,
-                            cb_info.cb_target_key.as_deref(),
-                            cb_config,
-                        );
-                        cb.record_failure(502, true, cb_info.is_half_open_probe);
-                    }
-                })?;
+        let (backend_stream, addr) = crate::dns::connect_candidates(
+            &candidates,
+            params.backend_port,
+            connect_timeout,
+            |addr| {
+                connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
+                "Backend TCP connect budget exhausted after {}ms (last={})",
+                params.backend_connect_timeout_ms,
+                last_addr
+            ),
+            crate::dns::CandidateConnectError::Failed { source, .. } => source,
+        })
+        .inspect_err(|_| {
+            if let Some(ref cb_config) = cb_info.cb_config {
+                let cb = circuit_breaker_cache.get_or_create(
+                    &cb_info.namespace,
+                    proxy_id,
+                    cb_info.cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_failure(502, true, cb_info.is_half_open_probe);
+            }
+        })?;
+        backend_info.backend_resolved_ip = Some(addr.ip().to_string());
 
         // Apply DR `connectionPool.tcp.tcpKeepalive` on the freshly connected
         // backend socket. Best-effort: a `setsockopt` failure logs and
@@ -2707,7 +2798,7 @@ async fn handle_tcp_connection_inner(
         );
 
         let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
-        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+        let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
 
         // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
         // Passthrough mode is always plain-to-plain (no TLS termination/origination).
@@ -2758,6 +2849,7 @@ async fn handle_tcp_connection_inner(
         // gate only affects buffer-size adaptation.
         if copy_result.first_failure.is_none() {
             adaptive_buffer.record_connection(
+                &proxy.namespace,
                 proxy_id,
                 copy_result
                     .bytes_client_to_backend
@@ -2768,6 +2860,7 @@ async fn handle_tcp_connection_inner(
         // Record circuit breaker outcome.
         if let Some(ref cb_config) = cb_info.cb_config {
             let cb = circuit_breaker_cache.get_or_create(
+                &cb_info.namespace,
                 proxy_id,
                 cb_info.cb_target_key.as_deref(),
                 cb_config,
@@ -2942,28 +3035,36 @@ async fn handle_tcp_connection_inner(
     };
 
     // Helper: record circuit breaker failure for the current target.
-    let record_cb_failure = |cb_cache: &CircuitBreakerCache,
-                             proxy_id: &str,
-                             cb_info: &TcpConnCbInfo| {
-        if let Some(ref cb_config) = cb_info.cb_config {
-            let cb = cb_cache.get_or_create(proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
-            cb.record_failure(502, true, cb_info.is_half_open_probe);
-        }
-    };
+    let record_cb_failure =
+        |cb_cache: &CircuitBreakerCache, proxy_id: &str, cb_info: &TcpConnCbInfo| {
+            if let Some(ref cb_config) = cb_info.cb_config {
+                let cb = cb_cache.get_or_create(
+                    &cb_info.namespace,
+                    proxy_id,
+                    cb_info.cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_failure(502, true, cb_info.is_half_open_probe);
+            }
+        };
 
     // Helper: release a half-open probe slot claimed by `can_execute` without
     // recording success or failure. Used when the gateway rejects the
     // connection locally (DestinationRule maxConnections cap), which is not a
     // backend outcome — `record_neutral` decrements `half_open_in_flight` only
     // when a probe was held and leaves breaker health untouched.
-    let record_cb_neutral = |cb_cache: &CircuitBreakerCache,
-                             proxy_id: &str,
-                             cb_info: &TcpConnCbInfo| {
-        if let Some(ref cb_config) = cb_info.cb_config {
-            let cb = cb_cache.get_or_create(proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
-            cb.record_neutral(cb_info.is_half_open_probe);
-        }
-    };
+    let record_cb_neutral =
+        |cb_cache: &CircuitBreakerCache, proxy_id: &str, cb_info: &TcpConnCbInfo| {
+            if let Some(ref cb_config) = cb_info.cb_config {
+                let cb = cb_cache.get_or_create(
+                    &cb_info.namespace,
+                    proxy_id,
+                    cb_info.cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_neutral(cb_info.is_half_open_probe);
+            }
+        };
 
     // Connection-phase retry loop. Retries DNS resolution + backend connect
     // with a different load-balanced target on each attempt. Once a backend
@@ -2988,6 +3089,7 @@ async fn handle_tcp_connection_inner(
         // for actual probe requests.
         if let Some(ref cb_config) = current_cb_info.cb_config {
             match circuit_breaker_cache.can_execute(
+                &current_cb_info.namespace,
                 proxy_id,
                 current_cb_info.cb_target_key.as_deref(),
                 cb_config,
@@ -3021,6 +3123,7 @@ async fn handle_tcp_connection_inner(
                             current_port = next.1;
                             current_policy_port = next.2;
                             current_cb_info = TcpConnCbInfo {
+                                namespace: current_cb_info.namespace.clone(),
                                 cb_config: current_cb_info.cb_config.clone(),
                                 cb_target_key: params.upstream_id.as_ref().map(|_| {
                                     crate::circuit_breaker::target_key(&current_host, current_port)
@@ -3046,15 +3149,15 @@ async fn handle_tcp_connection_inner(
         }
 
         // Resolve backend IP via DNS
-        let resolved_ip = match dns_cache
-            .resolve(
+        let candidates = match dns_cache
+            .resolve_candidates(
                 &current_host,
                 params.dns_override.as_deref(),
                 params.dns_cache_ttl_seconds,
             )
             .await
         {
-            Ok(ip) => ip,
+            Ok(addresses) => addresses,
             Err(e) => {
                 // A backend-egress-policy denial means no backend was dialed, so
                 // keep circuit-breaker accounting neutral (a denied literal/rebound
@@ -3096,6 +3199,7 @@ async fn handle_tcp_connection_inner(
                     current_port = next.1;
                     current_policy_port = next.2;
                     current_cb_info = TcpConnCbInfo {
+                        namespace: current_cb_info.namespace.clone(),
                         cb_config: current_cb_info.cb_config.clone(),
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
@@ -3116,10 +3220,6 @@ async fn handle_tcp_connection_inner(
                 return Err(anyhow::anyhow!(err_msg));
             }
         };
-        let addr = SocketAddr::new(resolved_ip, current_port);
-        // DNS succeeded — record the resolved IP for logging.
-        backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
-
         // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
         // the non-passthrough connect path. Checked once per retry attempt
         // so failed dials don't consume slots; the guard's `Drop` impl
@@ -3174,6 +3274,7 @@ async fn handle_tcp_connection_inner(
                     current_port = next.1;
                     current_policy_port = next.2;
                     current_cb_info = TcpConnCbInfo {
+                        namespace: current_cb_info.namespace.clone(),
                         cb_config: current_cb_info.cb_config.clone(),
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
@@ -3207,34 +3308,58 @@ async fn handle_tcp_connection_inner(
         };
 
         // Attempt backend TCP connection (with optional TLS origination)
-        let connect_result = if is_backend_tls {
-            connect_backend_tls_cached(
-                addr,
-                &current_host,
-                connect_timeout,
-                cached_backend_tls,
-                params.tcp_fastopen_enabled,
-                overload,
-                current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
-                proxy_id,
-            )
-            .await
-            .map(|s| BackendStream::Tls(Box::new(s)))
-        } else {
-            connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
-                .await
-                .inspect(|stream| {
-                    apply_backend_tcp_keepalive(
-                        proxy_id,
-                        stream,
+        let current_host_ref = current_host.as_str();
+        let params_ref = &params;
+        let connect_result = crate::dns::connect_candidates(
+            &candidates,
+            current_port,
+            connect_timeout,
+            |addr| async move {
+                if is_backend_tls {
+                    connect_backend_tls_cached(
+                        addr,
+                        current_host_ref,
+                        connect_timeout,
+                        cached_backend_tls,
+                        params_ref.tcp_fastopen_enabled,
+                        overload,
                         current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
-                    );
-                })
-                .map(BackendStream::Plain)
-        };
+                        proxy_id,
+                    )
+                    .await
+                    .map(|stream| BackendStream::Tls(Box::new(stream)))
+                } else {
+                    connect_backend_plain(
+                        addr,
+                        connect_timeout,
+                        params_ref.tcp_fastopen_enabled,
+                        overload,
+                    )
+                    .await
+                    .inspect(|stream| {
+                        apply_backend_tcp_keepalive(
+                            proxy_id,
+                            stream,
+                            current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
+                        );
+                    })
+                    .map(BackendStream::Plain)
+                }
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
+                "Backend TCP connect budget exhausted after {}ms (last={})",
+                params.backend_connect_timeout_ms,
+                last_addr
+            ),
+            crate::dns::CandidateConnectError::Failed { source, .. } => source,
+        });
 
         match connect_result {
-            Ok(_stream) => {
+            Ok((_stream, addr)) => {
+                backend_info.backend_resolved_ip = Some(addr.ip().to_string());
                 // Connection succeeded — break out of retry loop with the
                 // address, carrying the inflight guard so the per-target
                 // counter is decremented at relay exit.
@@ -3269,6 +3394,7 @@ async fn handle_tcp_connection_inner(
                     current_port = next.1;
                     current_policy_port = next.2;
                     current_cb_info = TcpConnCbInfo {
+                        namespace: current_cb_info.namespace.clone(),
                         cb_config: current_cb_info.cb_config.clone(),
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
@@ -3319,7 +3445,7 @@ async fn handle_tcp_connection_inner(
     let copy_result = match client_stream {
         ClientRelayStream::Tls(tls_stream) => {
             let tls_stream = *tls_stream;
-            let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+            let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
             match backend_stream {
                 BackendStream::Tls(bs) => {
                     bidirectional_copy(
@@ -3432,7 +3558,7 @@ async fn handle_tcp_connection_inner(
             }
         }
         ClientRelayStream::Plain(client_stream) => {
-            let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+            let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
             match backend_stream {
                 BackendStream::Tls(bs) => {
                     used_splice = false;
@@ -3506,6 +3632,7 @@ async fn handle_tcp_connection_inner(
     // outage bursts.
     if copy_result.first_failure.is_none() {
         adaptive_buffer.record_connection(
+            &proxy.namespace,
             proxy_id,
             copy_result
                 .bytes_client_to_backend
@@ -3516,6 +3643,7 @@ async fn handle_tcp_connection_inner(
     // Record circuit breaker outcome based on copy result.
     if let Some(ref cb_config) = current_cb_info.cb_config {
         let cb = circuit_breaker_cache.get_or_create(
+            &current_cb_info.namespace,
             proxy_id,
             current_cb_info.cb_target_key.as_deref(),
             cb_config,
@@ -3611,8 +3739,11 @@ fn resolve_backend_target(
     lb_hash_key: &str,
 ) -> Result<TcpResolvedBackendTarget, anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
-        let override_port =
-            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
+        let override_port = LoadBalancerCache::initial_dispatch_port_override_from(
+            lb_snapshot,
+            &proxy.namespace,
+            upstream_id,
+        );
         let health_port_scope = crate::proxy::backend_dispatch::stream_health_port_scope(
             proxy,
             lb_snapshot,
@@ -3638,6 +3769,7 @@ fn resolve_backend_target(
             if let Some(port) = port_lane {
                 LoadBalancerCache::select_target_for_port_subset_from(
                     lb_snapshot,
+                    &proxy.namespace,
                     upstream_id,
                     lb_hash_key,
                     port,
@@ -3647,6 +3779,7 @@ fn resolve_backend_target(
             } else {
                 LoadBalancerCache::select_target_subset_from(
                     lb_snapshot,
+                    &proxy.namespace,
                     upstream_id,
                     lb_hash_key,
                     subset_name,
@@ -3656,6 +3789,7 @@ fn resolve_backend_target(
         } else if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
+                &proxy.namespace,
                 upstream_id,
                 lb_hash_key,
                 port,
@@ -3664,6 +3798,7 @@ fn resolve_backend_target(
         } else {
             LoadBalancerCache::select_target_from(
                 lb_snapshot,
+                &proxy.namespace,
                 upstream_id,
                 lb_hash_key,
                 Some(&health_ctx),
@@ -3747,6 +3882,7 @@ fn stream_port_override_affects_selection(
             || (override_config.hash_on.is_some()
                 && LoadBalancerCache::effective_algorithm_from(
                     lb_snapshot,
+                    &proxy.namespace,
                     upstream_id,
                     Some(port),
                     proxy.upstream_subset.as_deref(),
@@ -3769,6 +3905,7 @@ fn validate_stream_hash_on(
 ) -> Result<(), anyhow::Error> {
     let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
         lb_snapshot,
+        &proxy.namespace,
         upstream_id,
         Some(port),
         proxy.upstream_subset.as_deref(),
@@ -3942,7 +4079,7 @@ mod backend_target_selection_tests {
         proxy.upstream_id = Some("orders".to_string());
         let health_checker = HealthChecker::new();
         health_checker.active_unhealthy_targets.insert(
-            crate::load_balancer::target_key("orders", &unhealthy_target),
+            crate::load_balancer::target_key("ferrum|orders", &unhealthy_target),
             1,
         );
 
@@ -3970,6 +4107,7 @@ mod backend_target_selection_tests {
             ..Default::default()
         };
         health_checker.report_response(
+            &proxy.namespace,
             &proxy.id,
             "tcp-upstream",
             &unhealthy_target,
@@ -4119,7 +4257,7 @@ mod backend_target_selection_tests {
         let proxy = proxy_with_subset(None);
         let health_checker = HealthChecker::new();
         health_checker.active_unhealthy_targets.insert(
-            crate::load_balancer::target_key("orders", &unhealthy_target),
+            crate::load_balancer::target_key("ferrum|orders", &unhealthy_target),
             1,
         );
 
@@ -4252,7 +4390,7 @@ mod backend_target_selection_tests {
             .find_map(|i| {
                 let key = format!("198.51.100.{i}");
                 let initial = LoadBalancerCache::select_target_for_port_from(
-                    &snapshot, "orders", &key, 5432, None,
+                    &snapshot, "ferrum", "orders", &key, 5432, None,
                 )?;
                 let exclude = UpstreamTarget {
                     host: initial.target.host.clone(),
@@ -4264,10 +4402,11 @@ mod backend_target_selection_tests {
                     locality: None,
                 };
                 let expected = LoadBalancerCache::select_next_target_for_port_from(
-                    &snapshot, "orders", &key, 5432, &exclude, None,
+                    &snapshot, "ferrum", "orders", &key, 5432, &exclude, None,
                 )?;
                 let failed_host_key = LoadBalancerCache::select_next_target_for_port_from(
                     &snapshot,
+                    "ferrum",
                     "orders",
                     &initial.target.host,
                     5432,
@@ -4306,7 +4445,7 @@ mod backend_target_selection_tests {
             locality: None,
         };
         let expected = LoadBalancerCache::select_next_target_for_port_from(
-            &snapshot, "orders", &flow_key, 5432, &exclude, None,
+            &snapshot, "ferrum", "orders", &flow_key, 5432, &exclude, None,
         )
         .expect("expected retry target");
         assert_eq!(host, expected.host);
@@ -4830,6 +4969,7 @@ fn try_next_target(
         (Some(subset_name), Some(port)) => {
             LoadBalancerCache::select_next_target_for_port_subset_from(
                 lb_snapshot,
+                &proxy.namespace,
                 upstream_id,
                 lb_hash_key,
                 port,
@@ -4840,6 +4980,7 @@ fn try_next_target(
         }
         (Some(subset_name), None) => LoadBalancerCache::select_next_target_subset_from(
             lb_snapshot,
+            &proxy.namespace,
             upstream_id,
             lb_hash_key,
             subset_name,
@@ -4848,6 +4989,7 @@ fn try_next_target(
         ),
         (None, Some(port)) => LoadBalancerCache::select_next_target_for_port_from(
             lb_snapshot,
+            &proxy.namespace,
             upstream_id,
             lb_hash_key,
             port,
@@ -4856,6 +4998,7 @@ fn try_next_target(
         ),
         (None, None) => LoadBalancerCache::select_next_target_from(
             lb_snapshot,
+            &proxy.namespace,
             upstream_id,
             lb_hash_key,
             &exclude,

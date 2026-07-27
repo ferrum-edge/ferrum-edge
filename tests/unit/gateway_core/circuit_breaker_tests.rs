@@ -335,8 +335,8 @@ fn test_cache_creates_and_reuses() {
     let cache = CircuitBreakerCache::new();
     let config = default_config();
 
-    let cb1 = cache.get_or_create("proxy-1", None, &config);
-    let cb2 = cache.get_or_create("proxy-1", None, &config);
+    let cb1 = cache.get_or_create("ferrum", "proxy-1", None, &config);
+    let cb2 = cache.get_or_create("ferrum", "proxy-1", None, &config);
 
     // Should be the same instance
     assert!(Arc::ptr_eq(&cb1, &cb2));
@@ -461,16 +461,23 @@ fn test_cache_prune_removes_stale() {
     let cache = CircuitBreakerCache::new();
     let config = default_config();
 
-    cache.get_or_create("proxy-1", None, &config);
-    cache.get_or_create("proxy-2", None, &config);
-    cache.get_or_create("proxy-3", None, &config);
+    cache.get_or_create("ferrum", "proxy-1", None, &config);
+    cache.get_or_create("ferrum", "proxy-2", None, &config);
+    cache.get_or_create("ferrum", "proxy-3", None, &config);
 
-    cache.prune(&["proxy-1".to_string(), "proxy-3".to_string()]);
+    cache.prune(&[
+        ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy-1"),
+        ferrum_edge::config::db_backend::NamespacedResourceId::new("ferrum", "proxy-3"),
+    ]);
 
     // proxy-2 should still exist, proxy-1 and proxy-3 should be gone
-    assert!(cache.can_execute("proxy-2", None, &config).is_ok());
+    assert!(
+        cache
+            .can_execute("ferrum", "proxy-2", None, &config)
+            .is_ok()
+    );
     // Creating proxy-1 again should give a fresh breaker
-    let cb = cache.get_or_create("proxy-1", None, &config);
+    let cb = cache.get_or_create("ferrum", "proxy-1", None, &config);
     assert_eq!(cb.state_name(), "closed");
 }
 
@@ -478,14 +485,14 @@ fn test_cache_prune_removes_stale() {
 fn test_cache_replaces_on_config_change() {
     let cache = CircuitBreakerCache::new();
     let config1 = default_config();
-    let cb1 = cache.get_or_create("proxy-1", None, &config1);
+    let cb1 = cache.get_or_create("ferrum", "proxy-1", None, &config1);
 
     // Change the config
     let config2 = CircuitBreakerConfig {
         failure_threshold: 10,
         ..config1
     };
-    let cb2 = cache.get_or_create("proxy-1", None, &config2);
+    let cb2 = cache.get_or_create("ferrum", "proxy-1", None, &config2);
 
     // Should be a different instance
     assert!(!Arc::ptr_eq(&cb1, &cb2));
@@ -509,18 +516,26 @@ fn test_per_target_independent_breakers() {
     let tk_b = target_key("10.0.0.2", 8080);
 
     // Trip target A's breaker
-    let cb_a = cache.get_or_create("proxy-1", Some(&tk_a), &config);
+    let cb_a = cache.get_or_create("ferrum", "proxy-1", Some(&tk_a), &config);
     cb_a.record_failure(500, false, false);
     cb_a.record_failure(500, false, false);
     assert_eq!(cb_a.state_name(), "open");
 
     // Target B should still be closed
-    let cb_b = cache.get_or_create("proxy-1", Some(&tk_b), &config);
+    let cb_b = cache.get_or_create("ferrum", "proxy-1", Some(&tk_b), &config);
     assert_eq!(cb_b.state_name(), "closed");
-    assert!(cache.can_execute("proxy-1", Some(&tk_b), &config).is_ok());
+    assert!(
+        cache
+            .can_execute("ferrum", "proxy-1", Some(&tk_b), &config)
+            .is_ok()
+    );
 
     // Target A should be rejected
-    assert!(cache.can_execute("proxy-1", Some(&tk_a), &config).is_err());
+    assert!(
+        cache
+            .can_execute("ferrum", "proxy-1", Some(&tk_a), &config)
+            .is_err()
+    );
 }
 
 #[test]
@@ -536,14 +551,14 @@ fn test_per_target_does_not_share_with_direct_backend() {
     };
 
     // Trip breaker for proxy-1 with no target (direct backend)
-    let cb_direct = cache.get_or_create("proxy-1", None, &config);
+    let cb_direct = cache.get_or_create("ferrum", "proxy-1", None, &config);
     cb_direct.record_failure(500, false, false);
     cb_direct.record_failure(500, false, false);
     assert_eq!(cb_direct.state_name(), "open");
 
     // Same proxy with a target key should have its own breaker (closed)
     let tk = target_key("10.0.0.1", 8080);
-    let cb_target = cache.get_or_create("proxy-1", Some(&tk), &config);
+    let cb_target = cache.get_or_create("ferrum", "proxy-1", Some(&tk), &config);
     assert_eq!(cb_target.state_name(), "closed");
 }
 
@@ -553,8 +568,8 @@ fn test_per_target_same_instance_reuse() {
     let config = default_config();
     let tk = target_key("backend.local", 443);
 
-    let cb1 = cache.get_or_create("proxy-1", Some(&tk), &config);
-    let cb2 = cache.get_or_create("proxy-1", Some(&tk), &config);
+    let cb1 = cache.get_or_create("ferrum", "proxy-1", Some(&tk), &config);
+    let cb2 = cache.get_or_create("ferrum", "proxy-1", Some(&tk), &config);
 
     assert!(Arc::ptr_eq(&cb1, &cb2));
 }
@@ -568,19 +583,27 @@ fn test_prune_removes_all_targets_for_proxy() {
     let tk_b = target_key("10.0.0.2", 8080);
 
     // Create breakers for proxy-1 (two targets) and proxy-2 (one target)
-    cache.get_or_create("proxy-1", Some(&tk_a), &config);
-    cache.get_or_create("proxy-1", Some(&tk_b), &config);
-    cache.get_or_create("proxy-2", Some(&tk_a), &config);
+    cache.get_or_create("ferrum", "proxy-1", Some(&tk_a), &config);
+    cache.get_or_create("ferrum", "proxy-1", Some(&tk_b), &config);
+    cache.get_or_create("ferrum", "proxy-2", Some(&tk_a), &config);
 
     // Prune proxy-1 — should remove both target-scoped breakers
-    cache.prune(&["proxy-1".to_string()]);
+    cache.prune(
+        &[ferrum_edge::config::db_backend::NamespacedResourceId::new(
+            "ferrum", "proxy-1",
+        )],
+    );
 
     // proxy-1 targets should be gone (fresh breaker on re-create)
-    let cb = cache.get_or_create("proxy-1", Some(&tk_a), &config);
+    let cb = cache.get_or_create("ferrum", "proxy-1", Some(&tk_a), &config);
     assert_eq!(cb.state_name(), "closed");
 
     // proxy-2 target should still exist
-    assert!(cache.can_execute("proxy-2", Some(&tk_a), &config).is_ok());
+    assert!(
+        cache
+            .can_execute("ferrum", "proxy-2", Some(&tk_a), &config)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -611,15 +634,21 @@ fn test_tcp_direct_backend_circuit_breaker_opens() {
     };
 
     // Simulate two backend connect failures (no upstream → None target key).
-    let cb = cache.get_or_create("tcp-proxy-1", None, &config);
+    let cb = cache.get_or_create("ferrum", "tcp-proxy-1", None, &config);
     cb.record_failure(502, true, false);
-    assert!(cache.can_execute("tcp-proxy-1", None, &config).is_ok()); // Still closed after 1
+    assert!(
+        cache
+            .can_execute("ferrum", "tcp-proxy-1", None, &config)
+            .is_ok()
+    ); // Still closed after 1
 
     cb.record_failure(502, true, false);
     // After threshold, circuit should be open.
     assert_eq!(cb.state_name(), "open");
     assert!(
-        cache.can_execute("tcp-proxy-1", None, &config).is_err(),
+        cache
+            .can_execute("ferrum", "tcp-proxy-1", None, &config)
+            .is_err(),
         "Circuit breaker should reject after threshold failures"
     );
 }
@@ -640,14 +669,16 @@ fn test_tcp_upstream_backend_circuit_breaker_per_target() {
     let tk = target_key("backend.internal", 4000);
 
     // Simulate connection failures on the upstream target.
-    let cb = cache.get_or_create("tcp-proxy-2", Some(&tk), &config);
+    let cb = cache.get_or_create("ferrum", "tcp-proxy-2", Some(&tk), &config);
     cb.record_failure(502, true, false);
     cb.record_failure(502, true, false);
     assert_eq!(cb.state_name(), "open");
 
     // Proxy without this specific target should not be affected.
     assert!(
-        cache.can_execute("tcp-proxy-2", None, &config).is_ok(),
+        cache
+            .can_execute("ferrum", "tcp-proxy-2", None, &config)
+            .is_ok(),
         "Direct backend breaker should be independent of upstream-scoped breaker"
     );
 }
@@ -666,7 +697,7 @@ fn test_tcp_successful_connection_records_success() {
     };
 
     // Trip the breaker open.
-    let cb = cache.get_or_create("tcp-proxy-3", None, &config);
+    let cb = cache.get_or_create("ferrum", "tcp-proxy-3", None, &config);
     cb.record_failure(502, true, false);
     cb.record_failure(502, true, false);
     cb.record_failure(502, true, false);
@@ -695,13 +726,15 @@ fn test_udp_session_failure_records_failure() {
     };
 
     // Simulate two UDP socket connect failures.
-    let cb = cache.get_or_create("udp-proxy-1", None, &config);
+    let cb = cache.get_or_create("ferrum", "udp-proxy-1", None, &config);
     cb.record_failure(502, true, false);
     cb.record_failure(502, true, false);
 
     assert_eq!(cb.state_name(), "open");
     assert!(
-        cache.can_execute("udp-proxy-1", None, &config).is_err(),
+        cache
+            .can_execute("ferrum", "udp-proxy-1", None, &config)
+            .is_err(),
         "UDP circuit breaker should be open after repeated session creation failures"
     );
 }
@@ -719,7 +752,7 @@ fn test_udp_successful_session_records_success() {
         trip_on_connection_errors: true,
     };
 
-    let cb = cache.get_or_create("udp-proxy-2", None, &config);
+    let cb = cache.get_or_create("ferrum", "udp-proxy-2", None, &config);
     // One failure, then success — breaker should remain closed.
     cb.record_failure(502, true, false);
     cb.record_success(false);
@@ -744,12 +777,12 @@ fn test_stream_proxy_rejects_when_circuit_open() {
     };
 
     // Trip the breaker with a single failure.
-    let cb = cache.get_or_create("stream-proxy-cb", None, &config);
+    let cb = cache.get_or_create("ferrum", "stream-proxy-cb", None, &config);
     cb.record_failure(502, true, false);
     assert_eq!(cb.state_name(), "open");
 
     // Both TCP and UDP stream proxies call can_execute before opening sockets.
-    let result = cache.can_execute("stream-proxy-cb", None, &config);
+    let result = cache.can_execute("ferrum", "stream-proxy-cb", None, &config);
     assert!(
         result.is_err(),
         "can_execute must return Err when circuit is open"
@@ -997,16 +1030,16 @@ fn test_circuit_breaker_cache_max_entries_enforced() {
     let config = default_config();
 
     // Fill to capacity
-    cache.get_or_create("proxy1", Some("host1:8080"), &config);
-    cache.get_or_create("proxy2", Some("host2:8080"), &config);
-    cache.get_or_create("proxy3", Some("host3:8080"), &config);
+    cache.get_or_create("ferrum", "proxy1", Some("host1:8080"), &config);
+    cache.get_or_create("ferrum", "proxy2", Some("host2:8080"), &config);
+    cache.get_or_create("ferrum", "proxy3", Some("host3:8080"), &config);
 
     // At capacity — new key returns a transient breaker (not cached)
-    let _cb = cache.get_or_create("proxy4", Some("host4:8080"), &config);
+    let _cb = cache.get_or_create("ferrum", "proxy4", Some("host4:8080"), &config);
     assert_eq!(cache.len(), 3); // Still 3, not 4
 
     // Existing key can still be updated (config change)
-    cache.get_or_create("proxy1", Some("host1:8080"), &config);
+    cache.get_or_create("ferrum", "proxy1", Some("host1:8080"), &config);
     assert_eq!(cache.len(), 3);
 }
 
@@ -1019,14 +1052,14 @@ fn test_cache_replaces_existing_key_at_capacity_when_config_changes() {
         ..default_config()
     };
 
-    let cb1 = cache.get_or_create("proxy1", Some("host1:8080"), &config1);
+    let cb1 = cache.get_or_create("ferrum", "proxy1", Some("host1:8080"), &config1);
     cb1.record_failure(500, false, false);
     cb1.record_failure(500, false, false);
     cb1.record_failure(500, false, false);
     assert_eq!(cb1.state_name(), "open");
     assert_eq!(cache.len(), 1);
 
-    let cb2 = cache.get_or_create("proxy1", Some("host1:8080"), &config2);
+    let cb2 = cache.get_or_create("ferrum", "proxy1", Some("host1:8080"), &config2);
 
     assert_eq!(cache.len(), 1);
     assert!(!Arc::ptr_eq(&cb1, &cb2));
@@ -1042,15 +1075,15 @@ fn test_cache_capacity_transient_breakers_do_not_persist_state() {
         ..default_config()
     };
 
-    cache.get_or_create("cached", Some("host1:8080"), &config);
+    cache.get_or_create("ferrum", "cached", Some("host1:8080"), &config);
     assert_eq!(cache.len(), 1);
 
-    let transient = cache.get_or_create("overflow", Some("host2:8080"), &config);
+    let transient = cache.get_or_create("ferrum", "overflow", Some("host2:8080"), &config);
     transient.record_failure(500, false, false);
     assert_eq!(transient.state_name(), "open");
     assert_eq!(cache.len(), 1);
 
-    let fresh_transient = cache.get_or_create("overflow", Some("host2:8080"), &config);
+    let fresh_transient = cache.get_or_create("ferrum", "overflow", Some("host2:8080"), &config);
     assert_eq!(
         fresh_transient.state_name(),
         "closed",
@@ -1065,18 +1098,19 @@ fn test_circuit_breaker_prune_stale_targets() {
     let config = default_config();
 
     // Create breakers for multiple targets
-    cache.get_or_create("proxy1", Some("10.0.0.1:8080"), &config);
-    cache.get_or_create("proxy1", Some("10.0.0.2:8080"), &config);
-    cache.get_or_create("proxy1", Some("10.0.0.3:8080"), &config);
-    cache.get_or_create("proxy2", None, &config); // direct backend
+    cache.get_or_create("ferrum", "proxy1", Some("10.0.0.1:8080"), &config);
+    cache.get_or_create("ferrum", "proxy1", Some("10.0.0.2:8080"), &config);
+    cache.get_or_create("ferrum", "proxy1", Some("10.0.0.3:8080"), &config);
+    cache.get_or_create("ferrum", "proxy2", None, &config); // direct backend
 
-    // Only keep proxy1::10.0.0.1:8080 — the rest are stale
+    // Only keep ferrum|proxy1::10.0.0.1:8080 — the rest are stale. Active keys
+    // are namespace-qualified exactly as dispatch composes them.
     let mut active = std::collections::HashSet::new();
-    active.insert("proxy1::10.0.0.1:8080".to_string());
+    active.insert("ferrum|proxy1::10.0.0.1:8080".to_string());
     cache.prune_stale_targets(&active);
 
-    // Direct backend key (proxy2, no "::") should be preserved
-    assert_eq!(cache.len(), 2); // proxy1::10.0.0.1:8080 + proxy2
+    // Direct backend key (ferrum|proxy2, no "::") should be preserved
+    assert_eq!(cache.len(), 2); // ferrum|proxy1::10.0.0.1:8080 + ferrum|proxy2
 }
 
 #[test]
@@ -1084,10 +1118,10 @@ fn test_snapshot_includes_direct_and_target_scoped_breakers() {
     let cache = CircuitBreakerCache::new();
     let config = default_config();
 
-    let direct = cache.get_or_create("proxy-direct", None, &config);
+    let direct = cache.get_or_create("ferrum", "proxy-direct", None, &config);
     direct.record_failure(500, false, false);
 
-    let target = cache.get_or_create("proxy-target", Some("10.0.0.9:8080"), &config);
+    let target = cache.get_or_create("ferrum", "proxy-target", Some("10.0.0.9:8080"), &config);
     target.record_failure(500, false, false);
     target.record_failure(500, false, false);
     target.record_failure(500, false, false);
@@ -1096,10 +1130,10 @@ fn test_snapshot_includes_direct_and_target_scoped_breakers() {
     let snapshot = cache.snapshot();
 
     assert!(snapshot.iter().any(|(key, state, failures, successes)| {
-        key == "proxy-direct" && *state == "closed" && *failures == 1 && *successes == 0
+        key == "ferrum|proxy-direct" && *state == "closed" && *failures == 1 && *successes == 0
     }));
     assert!(snapshot.iter().any(|(key, state, failures, successes)| {
-        key == "proxy-target::10.0.0.9:8080"
+        key == "ferrum|proxy-target::10.0.0.9:8080"
             && *state == "open"
             && *failures == 3
             && *successes == 0
@@ -1175,8 +1209,8 @@ fn test_cache_keys_different_proxies_same_target() {
     let cache = CircuitBreakerCache::new();
     let config = default_config();
 
-    let cb_a = cache.get_or_create("proxy-a", Some("10.0.0.1:8080"), &config);
-    let cb_b = cache.get_or_create("proxy-b", Some("10.0.0.1:8080"), &config);
+    let cb_a = cache.get_or_create("ferrum", "proxy-a", Some("10.0.0.1:8080"), &config);
+    let cb_b = cache.get_or_create("ferrum", "proxy-b", Some("10.0.0.1:8080"), &config);
 
     // Trip one breaker
     cb_a.record_failure(500, false, false);
@@ -1420,12 +1454,12 @@ fn test_cache_max_entries_exceeded_returns_transient_breaker() {
     let config = default_config();
 
     // Fill the cache
-    cache.get_or_create("p1", Some("t1"), &config);
-    cache.get_or_create("p2", Some("t2"), &config);
+    cache.get_or_create("ferrum", "p1", Some("t1"), &config);
+    cache.get_or_create("ferrum", "p2", Some("t2"), &config);
     assert_eq!(cache.len(), 2);
 
     // Third entry should still return a breaker (transient) but not grow cache
-    let cb = cache.get_or_create("p3", Some("t3"), &config);
+    let cb = cache.get_or_create("ferrum", "p3", Some("t3"), &config);
     assert!(
         cb.can_execute().is_ok(),
         "Transient breaker should allow requests"
@@ -1443,7 +1477,7 @@ fn test_cache_config_change_replaces_breaker() {
     };
 
     // Create with config1 (failure_threshold=3) and trip it open
-    let cb1 = cache.get_or_create("proxy1", Some("target1"), &config1);
+    let cb1 = cache.get_or_create("ferrum", "proxy1", Some("target1"), &config1);
     cb1.record_failure(500, false, false);
     cb1.record_failure(500, false, false);
     cb1.record_failure(500, false, false);
@@ -1454,7 +1488,7 @@ fn test_cache_config_change_replaces_breaker() {
     );
 
     // Get with config2 — should replace the breaker (config changed)
-    let cb2 = cache.get_or_create("proxy1", Some("target1"), &config2);
+    let cb2 = cache.get_or_create("ferrum", "proxy1", Some("target1"), &config2);
 
     // New breaker should be fresh (closed, not open) proving replacement
     assert_eq!(cb2.state_name(), "closed");
@@ -1478,7 +1512,7 @@ fn test_concurrent_same_key_creation_shares_arc() {
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             barrier.wait();
-            cache.get_or_create("proxy-shared", Some("host:8080"), &config)
+            cache.get_or_create("ferrum", "proxy-shared", Some("host:8080"), &config)
         }));
     }
 
@@ -1516,7 +1550,7 @@ fn test_concurrent_same_key_failures_open_shared_breaker() {
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             barrier.wait();
-            let cb = cache.get_or_create("proxy-fail", Some("host:8080"), &config);
+            let cb = cache.get_or_create("ferrum", "proxy-fail", Some("host:8080"), &config);
             cb.record_failure(500, false, false);
             cb
         }));
@@ -1548,7 +1582,7 @@ fn test_concurrent_config_replacement_shares_new_generation() {
         ..default_config()
     };
 
-    let old = cache.get_or_create("proxy-replace", Some("host:8080"), &config1);
+    let old = cache.get_or_create("ferrum", "proxy-replace", Some("host:8080"), &config1);
     old.record_failure(500, false, false);
     assert_eq!(old.state_name(), "closed");
 
@@ -1560,7 +1594,7 @@ fn test_concurrent_config_replacement_shares_new_generation() {
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             barrier.wait();
-            cache.get_or_create("proxy-replace", Some("host:8080"), &config2)
+            cache.get_or_create("ferrum", "proxy-replace", Some("host:8080"), &config2)
         }));
     }
 
@@ -1601,7 +1635,7 @@ fn test_concurrent_distinct_key_burst_respects_max_entries() {
             barrier.wait();
             let proxy = format!("proxy-{i}");
             let target = format!("host-{i}:8080");
-            cache.get_or_create(&proxy, Some(&target), &config)
+            cache.get_or_create("ferrum", &proxy, Some(&target), &config)
         }));
     }
 
@@ -1627,10 +1661,10 @@ fn test_full_cache_overflow_returns_uncached_transient_breaker() {
         ..default_config()
     };
 
-    let cached = cache.get_or_create("cached", Some("host1:8080"), &config);
+    let cached = cache.get_or_create("ferrum", "cached", Some("host1:8080"), &config);
     assert_eq!(cache.len(), 1);
 
-    let transient = cache.get_or_create("overflow", Some("host2:8080"), &config);
+    let transient = cache.get_or_create("ferrum", "overflow", Some("host2:8080"), &config);
     assert!(!Arc::ptr_eq(&cached, &transient));
     transient.record_failure(500, false, false);
     assert_eq!(transient.state_name(), "open");
@@ -1638,7 +1672,7 @@ fn test_full_cache_overflow_returns_uncached_transient_breaker() {
 
     // Documented full-cache behavior: overflow breakers are not cached, so a
     // later call for the same overflow key gets a fresh closed instance.
-    let again = cache.get_or_create("overflow", Some("host2:8080"), &config);
+    let again = cache.get_or_create("ferrum", "overflow", Some("host2:8080"), &config);
     assert!(!Arc::ptr_eq(&transient, &again));
     assert_eq!(again.state_name(), "closed");
     assert_eq!(cache.len(), 1);
@@ -1648,7 +1682,7 @@ fn test_full_cache_overflow_returns_uncached_transient_breaker() {
         failure_threshold: 9,
         ..default_config()
     };
-    let replaced = cache.get_or_create("cached", Some("host1:8080"), &config2);
+    let replaced = cache.get_or_create("ferrum", "cached", Some("host1:8080"), &config2);
     assert!(!Arc::ptr_eq(&cached, &replaced));
     assert_eq!(replaced.config().failure_threshold, 9);
     assert_eq!(cache.len(), 1);
@@ -1754,7 +1788,7 @@ fn test_cache_can_execute_returns_probe_flag() {
     };
 
     // CLOSED: not a probe
-    let (cb, is_probe) = cache.can_execute("p1", None, &config).unwrap();
+    let (cb, is_probe) = cache.can_execute("ferrum", "p1", None, &config).unwrap();
     assert!(!is_probe);
 
     // Trip open
@@ -1762,7 +1796,7 @@ fn test_cache_can_execute_returns_probe_flag() {
     assert_eq!(cb.state_name(), "open");
 
     // HALF_OPEN: IS a probe
-    let (_cb2, is_probe2) = cache.can_execute("p1", None, &config).unwrap();
+    let (_cb2, is_probe2) = cache.can_execute("ferrum", "p1", None, &config).unwrap();
     assert!(is_probe2);
 }
 
@@ -2001,15 +2035,15 @@ fn peek_is_read_only_and_does_not_create_or_resurrect() {
     let tk = target_key("10.0.0.1", 8080);
 
     // Absent key: peek returns None and must NOT create an entry.
-    assert!(cache.peek("proxy-x", Some(&tk)).is_none());
+    assert!(cache.peek("ferrum", "proxy-x", Some(&tk)).is_none());
     assert_eq!(cache.len(), 0, "peek must not insert a breaker");
 
     // After a real admission the breaker is cached and peek observes it.
-    let _ = cache.can_execute("proxy-x", Some(&tk), &cfg_a);
+    let _ = cache.can_execute("ferrum", "proxy-x", Some(&tk), &cfg_a);
     assert_eq!(cache.len(), 1);
     assert_eq!(
         cache
-            .peek("proxy-x", Some(&tk))
+            .peek("ferrum", "proxy-x", Some(&tk))
             .expect("breaker is cached")
             .config()
             .failure_threshold,
@@ -2023,10 +2057,10 @@ fn peek_is_read_only_and_does_not_create_or_resurrect() {
         failure_threshold: cfg_a.failure_threshold + 5,
         ..default_config()
     };
-    let _new = cache.get_or_create("proxy-x", Some(&tk), &cfg_b);
+    let _new = cache.get_or_create("ferrum", "proxy-x", Some(&tk), &cfg_b);
     assert_eq!(cache.len(), 1, "reload replaces in place");
     let peeked_b = cache
-        .peek("proxy-x", Some(&tk))
+        .peek("ferrum", "proxy-x", Some(&tk))
         .expect("new breaker is cached");
     assert_eq!(
         peeked_b.config().failure_threshold,
@@ -2105,14 +2139,14 @@ fn can_execute_with_admission_epoch_returns_the_admitted_generation() {
 
     // CLOSED admission captures generation 0 and is not a probe.
     let (_cb, is_probe, epoch) = cache
-        .can_execute_with_admission_epoch(proxy_id, Some(&tk), &config)
+        .can_execute_with_admission_epoch("ferrum", proxy_id, Some(&tk), &config)
         .expect("closed admits");
     assert!(!is_probe, "closed-state admission is not a half-open probe");
     assert_eq!(epoch, 0, "closed admission captures the current generation");
 
     // Trip the breaker (generation -> 1).
     let (cb, _, _) = cache
-        .can_execute_with_admission_epoch(proxy_id, Some(&tk), &config)
+        .can_execute_with_admission_epoch("ferrum", proxy_id, Some(&tk), &config)
         .expect("still closed");
     cb.record_failure(500, false, false);
     assert_eq!(cb.state_name(), "open");
@@ -2120,7 +2154,7 @@ fn can_execute_with_admission_epoch_returns_the_admitted_generation() {
     // The next admission (timeout=0) is a HALF_OPEN probe and captures generation 1
     // — the cycle it is probing — not the pre-trip generation 0.
     let (_cb, is_probe, epoch) = cache
-        .can_execute_with_admission_epoch(proxy_id, Some(&tk), &config)
+        .can_execute_with_admission_epoch("ferrum", proxy_id, Some(&tk), &config)
         .expect("half-open admits a probe");
     assert!(is_probe, "open+timeout=0 admits a half-open probe");
     assert_eq!(

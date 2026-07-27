@@ -1,5 +1,7 @@
 use ferrum_edge::_test_support::{
-    DbPoolConfig, await_pool_connect_with_timeout, db_code_is_transient, db_diff_removed,
+    DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionTestHooks,
+    await_pool_connect_with_timeout, database_store_reconnect_as_failover_for_test,
+    database_store_set_reconnect_transition_hooks_for_test, db_code_is_transient, db_diff_removed,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
     db_wrap_mysql_isolation_read_error, effective_pool_connect_timeout_seconds,
     is_config_validation_rejection, mysql_config_change_lock_insert_sql,
@@ -2368,5 +2370,696 @@ fn assert_strict_nullable_string_decode(body: &str, mapper: &str, column: &str) 
     assert!(
         !body.contains(&format!("try_get::<String, _>(\"{column}\").ok()")),
         "{mapper} must not use try_get::<String, _>(\"{column}\").ok()"
+    );
+}
+
+#[tokio::test]
+async fn failover_write_gate_allows_failback_with_opt_in_risk_marker() {
+    // Issue #3001 contract B: default fail-closed admin writes on failover;
+    // opt-in permits writes and allows automatic primary failback with a
+    // process-local divergence-risk marker (no durable fence).
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let primary_rw_url = format!("sqlite:{}?mode=rw", primary_path.to_string_lossy());
+    let primary_create_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_rw_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    let status = store.failover_topology_status();
+    assert!(
+        !status.primary_active,
+        "startup must land on failover when primary is missing"
+    );
+    assert!(!status.allow_writes);
+    assert!(!status.opt_in_writes_enabled_during_window);
+
+    // Failback without opt-in remains available.
+    seed_sqlite_namespace(&primary_create_url, "primary-ns").await;
+    let active = store.try_failover_reconnect(&primary_rw_url).await.unwrap();
+    assert_eq!(active, primary_rw_url);
+    assert!(store.failover_topology_status().primary_active);
+
+    // Return to failover topology with opt-in enabled.
+    let mut store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &format!(
+            "sqlite:{}?mode=rw",
+            temp_dir.path().join("missing-primary.db").to_string_lossy()
+        ),
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    store.set_failover_allow_writes(true);
+    assert!(!store.failover_topology_status().primary_active);
+    assert!(
+        store
+            .failover_topology_status()
+            .opt_in_writes_enabled_during_window
+    );
+
+    sqlx::query(
+        "INSERT INTO upstreams (id, namespace, name, targets) VALUES ('failover-write', 'failover-ns', 'failover-name', '[]')",
+    )
+    .execute(&store.pool())
+    .await
+    .unwrap();
+
+    // Primary is reachable: failback is allowed under contract B. The
+    // process-local opt-in risk marker is cleared on mark_primary; operators
+    // rely on the bounded failback log (and sync multi-primary assertion).
+    let active = store
+        .try_failover_reconnect(&primary_rw_url)
+        .await
+        .expect("primary failback must proceed under opt-in contract B");
+    assert_eq!(active, primary_rw_url);
+    assert!(
+        store.failover_topology_status().primary_active,
+        "store must return to primary after successful failback"
+    );
+    assert!(
+        !store
+            .failover_topology_status()
+            .opt_in_writes_enabled_during_window,
+        "failback must clear the process-local window marker"
+    );
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["primary-ns".to_string()],
+        "after failback the active topology is the primary snapshot"
+    );
+}
+
+/// Issue #3001: a primary reconnect that pauses after pool publication (the
+/// deferred-migration window) must not let a concurrent failover publish and
+/// then be overwritten by a delayed `mark_primary` — that left the active pool
+/// on failover while `primary_active=true` and made `check_write_allowed` fail
+/// open. Rendezvous via test seams; no sleeps.
+#[tokio::test]
+async fn delayed_primary_reconnect_cannot_overwrite_later_failover_topology() {
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::{Mutex as AsyncMutex, oneshot};
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let primary_rw_url = format!("sqlite:{}?mode=rw", primary_path.to_string_lossy());
+    let primary_create_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    // Start on failover; seed both topologies so each reconnect can publish.
+    let store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_rw_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!store.failover_topology_status().primary_active);
+    seed_sqlite_namespace(&primary_create_url, "primary-ns").await;
+    seed_sqlite_namespace(&failover_url, "failover-ns").await;
+
+    let (primary_holding_tx, primary_holding_rx) = oneshot::channel::<()>();
+    let (primary_resume_tx, primary_resume_rx) = oneshot::channel::<()>();
+    let (failover_before_lock_tx, failover_before_lock_rx) = oneshot::channel::<()>();
+    let failover_holding = Arc::new(AtomicBool::new(false));
+
+    let primary_holding_tx = Arc::new(StdMutex::new(Some(primary_holding_tx)));
+    let primary_resume_rx = Arc::new(AsyncMutex::new(Some(primary_resume_rx)));
+    let failover_before_lock_tx = Arc::new(StdMutex::new(Some(failover_before_lock_tx)));
+
+    database_store_set_reconnect_transition_hooks_for_test(
+        &store,
+        Some(SqlReconnectTransitionTestHooks {
+            before_lock: Some(Arc::new({
+                let failover_before_lock_tx = Arc::clone(&failover_before_lock_tx);
+                move |topology| {
+                    let failover_before_lock_tx = Arc::clone(&failover_before_lock_tx);
+                    Box::pin(async move {
+                        if topology != SqlReconnectTopology::Failover {
+                            return;
+                        }
+                        if let Some(tx) = failover_before_lock_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    })
+                }
+            })),
+            while_holding: Some(Arc::new({
+                let primary_holding_tx = Arc::clone(&primary_holding_tx);
+                let primary_resume_rx = Arc::clone(&primary_resume_rx);
+                let failover_holding = Arc::clone(&failover_holding);
+                move |topology| {
+                    let primary_holding_tx = Arc::clone(&primary_holding_tx);
+                    let primary_resume_rx = Arc::clone(&primary_resume_rx);
+                    let failover_holding = Arc::clone(&failover_holding);
+                    Box::pin(async move {
+                        match topology {
+                            SqlReconnectTopology::Primary => {
+                                if let Some(tx) = primary_holding_tx.lock().unwrap().take() {
+                                    let _ = tx.send(());
+                                }
+                                if let Some(rx) = primary_resume_rx.lock().await.take() {
+                                    let _ = rx.await;
+                                }
+                            }
+                            SqlReconnectTopology::Failover => {
+                                failover_holding.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                }
+            })),
+        }),
+    );
+
+    let primary_store = store.clone();
+    let primary_url = primary_rw_url.clone();
+    let primary_task = tokio::spawn(async move { primary_store.reconnect(&primary_url).await });
+
+    primary_holding_rx
+        .await
+        .expect("primary reconnect must enter while_holding under the transition mutex");
+    assert!(
+        !store.failover_topology_status().primary_active,
+        "primary must stay fail-closed until mark_primary after the deferred window"
+    );
+
+    let failover_store = store.clone();
+    let failover_url_task = failover_url.clone();
+    let failover_task = tokio::spawn(async move {
+        database_store_reconnect_as_failover_for_test(&failover_store, &failover_url_task).await
+    });
+
+    failover_before_lock_rx
+        .await
+        .expect("failover reconnect must reach the transition mutex while primary holds it");
+    assert!(
+        !failover_holding.load(Ordering::SeqCst),
+        "failover must not enter while_holding while primary still holds the transition"
+    );
+
+    primary_resume_tx.send(()).expect("resume primary");
+    primary_task
+        .await
+        .expect("join primary")
+        .expect("primary reconnect");
+    failover_task
+        .await
+        .expect("join failover")
+        .expect("failover reconnect");
+    assert!(
+        failover_holding.load(Ordering::SeqCst),
+        "failover must enter while_holding only after primary releases the transition"
+    );
+
+    database_store_set_reconnect_transition_hooks_for_test(&store, None);
+
+    assert!(
+        !store.failover_topology_status().primary_active,
+        "later failover must own topology after the serialized primary transition"
+    );
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["failover-ns".to_string()],
+        "active pool must match the later failover publication"
+    );
+}
+
+/// Inverse of the delayed-primary race: a failover holding the transition
+/// after gate-before-publish must not observe a concurrent primary finalizing
+/// topology/pool out of order.
+#[tokio::test]
+async fn delayed_failover_reconnect_cannot_race_later_primary_topology() {
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::{Mutex as AsyncMutex, oneshot};
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let primary_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let store =
+        DatabaseStore::connect_with_pool_config("sqlite", &primary_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    seed_sqlite_namespace(&primary_url, "primary-ns").await;
+    seed_sqlite_namespace(&failover_url, "failover-ns").await;
+    assert!(store.failover_topology_status().primary_active);
+
+    let (failover_holding_tx, failover_holding_rx) = oneshot::channel::<()>();
+    let (failover_resume_tx, failover_resume_rx) = oneshot::channel::<()>();
+    let (primary_before_lock_tx, primary_before_lock_rx) = oneshot::channel::<()>();
+    let primary_holding = Arc::new(AtomicBool::new(false));
+
+    let failover_holding_tx = Arc::new(StdMutex::new(Some(failover_holding_tx)));
+    let failover_resume_rx = Arc::new(AsyncMutex::new(Some(failover_resume_rx)));
+    let primary_before_lock_tx = Arc::new(StdMutex::new(Some(primary_before_lock_tx)));
+
+    database_store_set_reconnect_transition_hooks_for_test(
+        &store,
+        Some(SqlReconnectTransitionTestHooks {
+            before_lock: Some(Arc::new({
+                let primary_before_lock_tx = Arc::clone(&primary_before_lock_tx);
+                move |topology| {
+                    let primary_before_lock_tx = Arc::clone(&primary_before_lock_tx);
+                    Box::pin(async move {
+                        if topology != SqlReconnectTopology::Primary {
+                            return;
+                        }
+                        if let Some(tx) = primary_before_lock_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    })
+                }
+            })),
+            while_holding: Some(Arc::new({
+                let failover_holding_tx = Arc::clone(&failover_holding_tx);
+                let failover_resume_rx = Arc::clone(&failover_resume_rx);
+                let primary_holding = Arc::clone(&primary_holding);
+                move |topology| {
+                    let failover_holding_tx = Arc::clone(&failover_holding_tx);
+                    let failover_resume_rx = Arc::clone(&failover_resume_rx);
+                    let primary_holding = Arc::clone(&primary_holding);
+                    Box::pin(async move {
+                        match topology {
+                            SqlReconnectTopology::Failover => {
+                                if let Some(tx) = failover_holding_tx.lock().unwrap().take() {
+                                    let _ = tx.send(());
+                                }
+                                if let Some(rx) = failover_resume_rx.lock().await.take() {
+                                    let _ = rx.await;
+                                }
+                            }
+                            SqlReconnectTopology::Primary => {
+                                primary_holding.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                }
+            })),
+        }),
+    );
+
+    let failover_store = store.clone();
+    let failover_url_task = failover_url.clone();
+    let failover_task = tokio::spawn(async move {
+        database_store_reconnect_as_failover_for_test(&failover_store, &failover_url_task).await
+    });
+
+    failover_holding_rx
+        .await
+        .expect("failover reconnect must enter while_holding after gate-before-publish");
+    assert!(
+        !store.failover_topology_status().primary_active,
+        "failover must flip the write gate before publication completes"
+    );
+
+    let primary_store = store.clone();
+    let primary_url_task = primary_url.clone();
+    let primary_task =
+        tokio::spawn(async move { primary_store.reconnect(&primary_url_task).await });
+
+    primary_before_lock_rx
+        .await
+        .expect("primary reconnect must reach the transition mutex while failover holds it");
+    assert!(
+        !primary_holding.load(Ordering::SeqCst),
+        "primary must not enter while_holding while failover still holds the transition"
+    );
+
+    failover_resume_tx.send(()).expect("resume failover");
+    failover_task
+        .await
+        .expect("join failover")
+        .expect("failover reconnect");
+    primary_task
+        .await
+        .expect("join primary")
+        .expect("primary reconnect");
+    assert!(
+        primary_holding.load(Ordering::SeqCst),
+        "primary must enter while_holding only after failover releases the transition"
+    );
+
+    database_store_set_reconnect_transition_hooks_for_test(&store, None);
+
+    assert!(
+        store.failover_topology_status().primary_active,
+        "later primary must own topology after the serialized failover transition"
+    );
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["primary-ns".to_string()],
+        "active pool must match the later primary publication"
+    );
+}
+
+/// Issue #3001: a mutation admitted on primary must pin write topology so a
+/// later failover reconnect cannot publish until the permit drops — closing the
+/// check-to-use race where the sync gate alone admitted on primary_active=true
+/// but persistence observed the newly published failover pool.
+#[tokio::test]
+async fn write_topology_permit_blocks_failover_until_dropped() {
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::oneshot;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let primary_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let store =
+        DatabaseStore::connect_with_pool_config("sqlite", &primary_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    seed_sqlite_namespace(&primary_url, "primary-ns").await;
+    seed_sqlite_namespace(&failover_url, "failover-ns").await;
+    assert!(store.failover_topology_status().primary_active);
+
+    let permit = store.acquire_write_topology_permit().await;
+    assert!(
+        permit.is_pinned(),
+        "SQL write admit must retain a reconnect-transition read pin"
+    );
+    assert!(
+        store.failover_topology_status().primary_active,
+        "pin must observe primary topology"
+    );
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["primary-ns".to_string()],
+        "pinned mutation must keep using the primary pool"
+    );
+
+    let (failover_before_lock_tx, failover_before_lock_rx) = oneshot::channel::<()>();
+    let (failover_holding_tx, failover_holding_rx) = oneshot::channel::<()>();
+    let failover_holding = Arc::new(AtomicBool::new(false));
+    let failover_before_lock_tx = Arc::new(StdMutex::new(Some(failover_before_lock_tx)));
+    let failover_holding_tx = Arc::new(StdMutex::new(Some(failover_holding_tx)));
+
+    database_store_set_reconnect_transition_hooks_for_test(
+        &store,
+        Some(SqlReconnectTransitionTestHooks {
+            before_lock: Some(Arc::new({
+                let failover_before_lock_tx = Arc::clone(&failover_before_lock_tx);
+                move |topology| {
+                    let failover_before_lock_tx = Arc::clone(&failover_before_lock_tx);
+                    Box::pin(async move {
+                        if topology != SqlReconnectTopology::Failover {
+                            return;
+                        }
+                        if let Some(tx) = failover_before_lock_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    })
+                }
+            })),
+            while_holding: Some(Arc::new({
+                let failover_holding = Arc::clone(&failover_holding);
+                let failover_holding_tx = Arc::clone(&failover_holding_tx);
+                move |topology| {
+                    let failover_holding = Arc::clone(&failover_holding);
+                    let failover_holding_tx = Arc::clone(&failover_holding_tx);
+                    Box::pin(async move {
+                        if topology != SqlReconnectTopology::Failover {
+                            return;
+                        }
+                        failover_holding.store(true, Ordering::SeqCst);
+                        if let Some(tx) = failover_holding_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    })
+                }
+            })),
+        }),
+    );
+
+    let failover_store = store.clone();
+    let failover_url_task = failover_url.clone();
+    let failover_task = tokio::spawn(async move {
+        database_store_reconnect_as_failover_for_test(&failover_store, &failover_url_task).await
+    });
+
+    failover_before_lock_rx.await.expect(
+        "failover reconnect must reach the transition write lock while the mutation pin is held",
+    );
+    // Deterministic: the writer cannot enter while_holding until readers drop.
+    assert!(
+        !failover_holding.load(Ordering::SeqCst),
+        "failover must not publish while a write-topology permit pins primary"
+    );
+    assert!(
+        store.failover_topology_status().primary_active,
+        "topology must stay primary for the pinned mutation's full lifetime"
+    );
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["primary-ns".to_string()],
+        "pinned mutation must not observe the failover pool mid-flight"
+    );
+
+    drop(permit);
+    failover_holding_rx
+        .await
+        .expect("failover must enter while_holding only after the write permit drops");
+    failover_task
+        .await
+        .expect("join failover")
+        .expect("failover reconnect");
+    database_store_set_reconnect_transition_hooks_for_test(&store, None);
+
+    assert!(!store.failover_topology_status().primary_active);
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["failover-ns".to_string()]
+    );
+}
+
+/// Inverse race: failover publication that wins the transition lock first must
+/// cause a subsequent admit to observe failover and fail closed (default
+/// allow_writes=false) — not persist on the newly published failover pool
+/// under a stale primary admission.
+#[tokio::test]
+async fn failover_before_admit_rejects_without_opt_in() {
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::{Mutex as AsyncMutex, oneshot};
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let primary_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let store =
+        DatabaseStore::connect_with_pool_config("sqlite", &primary_url, DbPoolConfig::default())
+            .await
+            .unwrap();
+    seed_sqlite_namespace(&primary_url, "primary-ns").await;
+    seed_sqlite_namespace(&failover_url, "failover-ns").await;
+
+    let (failover_holding_tx, failover_holding_rx) = oneshot::channel::<()>();
+    let (failover_resume_tx, failover_resume_rx) = oneshot::channel::<()>();
+    let failover_holding_tx = Arc::new(StdMutex::new(Some(failover_holding_tx)));
+    let failover_resume_rx = Arc::new(AsyncMutex::new(Some(failover_resume_rx)));
+
+    database_store_set_reconnect_transition_hooks_for_test(
+        &store,
+        Some(SqlReconnectTransitionTestHooks {
+            before_lock: None,
+            while_holding: Some(Arc::new({
+                let failover_holding_tx = Arc::clone(&failover_holding_tx);
+                let failover_resume_rx = Arc::clone(&failover_resume_rx);
+                move |topology| {
+                    let failover_holding_tx = Arc::clone(&failover_holding_tx);
+                    let failover_resume_rx = Arc::clone(&failover_resume_rx);
+                    Box::pin(async move {
+                        if topology != SqlReconnectTopology::Failover {
+                            return;
+                        }
+                        if let Some(tx) = failover_holding_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = failover_resume_rx.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                    })
+                }
+            })),
+        }),
+    );
+
+    let failover_store = store.clone();
+    let failover_url_task = failover_url.clone();
+    let failover_task = tokio::spawn(async move {
+        database_store_reconnect_as_failover_for_test(&failover_store, &failover_url_task).await
+    });
+
+    failover_holding_rx
+        .await
+        .expect("failover must hold the write lock after gate-before-publish");
+    assert!(!store.failover_topology_status().primary_active);
+
+    // Admit waits for the exclusive write lock, then evaluates policy under its
+    // read pin — must reject rather than persist on failover without opt-in.
+    let admit_store = store.clone();
+    let admit_task = tokio::spawn(async move {
+        let permit = admit_store.acquire_write_topology_permit().await;
+        let status = admit_store.failover_topology_status();
+        (
+            permit.is_pinned(),
+            status.primary_active,
+            status.allow_writes,
+        )
+    });
+
+    // Give the admit task a chance to block on the write lock (no sleeps: the
+    // resume channel is the only progress edge).
+    failover_resume_tx.send(()).expect("resume failover");
+    failover_task
+        .await
+        .expect("join failover")
+        .expect("failover reconnect");
+    let (pinned, primary_active, allow_writes) = admit_task.await.expect("join admit");
+    database_store_set_reconnect_transition_hooks_for_test(&store, None);
+
+    assert!(
+        pinned,
+        "admit after failover must still take a topology pin"
+    );
+    assert!(!primary_active, "admit must observe published failover");
+    assert!(
+        !allow_writes,
+        "default policy must leave allow_writes false so AdminState::admit_write returns 503"
+    );
+}
+
+/// Opt-in failover mutations must pin the failover generation so failback
+/// cannot split a multi-step mutation across topologies.
+#[tokio::test]
+async fn opt_in_write_permit_blocks_failback_until_dropped() {
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::oneshot;
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let primary_path = temp_dir.path().join("primary.db");
+    let failover_path = temp_dir.path().join("failover.db");
+    let primary_rw_url = format!("sqlite:{}?mode=rw", primary_path.to_string_lossy());
+    let primary_create_url = format!("sqlite:{}?mode=rwc", primary_path.to_string_lossy());
+    let failover_url = format!("sqlite:{}?mode=rwc", failover_path.to_string_lossy());
+
+    let mut store = DatabaseStore::connect_with_failover(
+        "sqlite",
+        &primary_rw_url,
+        std::slice::from_ref(&failover_url),
+        DbPoolConfig::default(),
+    )
+    .await
+    .unwrap();
+    store.set_failover_allow_writes(true);
+    seed_sqlite_namespace(&primary_create_url, "primary-ns").await;
+    seed_sqlite_namespace(&failover_url, "failover-ns").await;
+    assert!(!store.failover_topology_status().primary_active);
+    assert!(store.failover_topology_status().allow_writes);
+
+    let permit = store.acquire_write_topology_permit().await;
+    assert!(permit.is_pinned());
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["failover-ns".to_string()],
+        "opt-in mutation must stay on the pinned failover pool"
+    );
+
+    let (primary_before_lock_tx, primary_before_lock_rx) = oneshot::channel::<()>();
+    let (primary_holding_tx, primary_holding_rx) = oneshot::channel::<()>();
+    let primary_holding = Arc::new(AtomicBool::new(false));
+    let primary_before_lock_tx = Arc::new(StdMutex::new(Some(primary_before_lock_tx)));
+    let primary_holding_tx = Arc::new(StdMutex::new(Some(primary_holding_tx)));
+
+    database_store_set_reconnect_transition_hooks_for_test(
+        &store,
+        Some(SqlReconnectTransitionTestHooks {
+            before_lock: Some(Arc::new({
+                let primary_before_lock_tx = Arc::clone(&primary_before_lock_tx);
+                move |topology| {
+                    let primary_before_lock_tx = Arc::clone(&primary_before_lock_tx);
+                    Box::pin(async move {
+                        if topology != SqlReconnectTopology::Primary {
+                            return;
+                        }
+                        if let Some(tx) = primary_before_lock_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    })
+                }
+            })),
+            while_holding: Some(Arc::new({
+                let primary_holding = Arc::clone(&primary_holding);
+                let primary_holding_tx = Arc::clone(&primary_holding_tx);
+                move |topology| {
+                    let primary_holding = Arc::clone(&primary_holding);
+                    let primary_holding_tx = Arc::clone(&primary_holding_tx);
+                    Box::pin(async move {
+                        if topology != SqlReconnectTopology::Primary {
+                            return;
+                        }
+                        primary_holding.store(true, Ordering::SeqCst);
+                        if let Some(tx) = primary_holding_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    })
+                }
+            })),
+        }),
+    );
+
+    let primary_store = store.clone();
+    let primary_url = primary_create_url.clone();
+    let primary_task = tokio::spawn(async move { primary_store.reconnect(&primary_url).await });
+
+    primary_before_lock_rx
+        .await
+        .expect("failback must reach the transition write lock while the opt-in pin is held");
+    assert!(
+        !primary_holding.load(Ordering::SeqCst),
+        "failback must not publish while an opt-in failover write permit is held"
+    );
+    assert!(!store.failover_topology_status().primary_active);
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["failover-ns".to_string()]
+    );
+
+    drop(permit);
+    primary_holding_rx
+        .await
+        .expect("failback must enter while_holding only after the write permit drops");
+    primary_task
+        .await
+        .expect("join primary")
+        .expect("primary reconnect");
+    database_store_set_reconnect_transition_hooks_for_test(&store, None);
+
+    assert!(store.failover_topology_status().primary_active);
+    assert_eq!(
+        store.list_namespaces().await.unwrap(),
+        vec!["primary-ns".to_string()]
     );
 }

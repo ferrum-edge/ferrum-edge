@@ -24,6 +24,7 @@ PATCHES=(
   "tungstenite distinct frame-limit origin|tungstenite|0.29.0|snapview/tungstenite-rs|NONE|NONE|docs/upstream-tungstenite-patches/"
   "tungstenite optional auto_pong|tungstenite|0.29.0|snapview/tungstenite-rs|NONE|NONE|docs/upstream-tungstenite-patches/003-optional-auto-pong/"
   "tokio-tungstenite lossless raw takeover|tokio-tungstenite|0.29.0|snapview/tokio-tungstenite|380|NONE|docs/upstream-tungstenite-patches/"
+  "dimpl certificate chains and key zeroization|dimpl|0.6.1|algesten/dimpl|NONE|NONE|docs/upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/"
 )
 
 retire_signal=0

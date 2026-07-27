@@ -134,6 +134,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: None,
+        mesh_revision: None,
     };
     ProxyState::new(config, dns_cache, create_test_env_config(), None, None)
         .unwrap()
@@ -535,6 +536,7 @@ fn create_test_proxy_state_with_env(
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: None,
+        mesh_revision: None,
     };
     ProxyState::new(config, dns_cache, env_config, None, None)
         .unwrap()

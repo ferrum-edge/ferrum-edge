@@ -16,6 +16,7 @@ pub mod node_waypoint;
 pub mod outbound_enforcement;
 pub mod policy;
 pub mod policy_deny_log;
+pub mod revision;
 pub mod runtime;
 pub mod runtime_overlay_consumers;
 pub mod slice;
@@ -35,13 +36,15 @@ use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::conf_file::resolve_ferrum_var;
+use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{
-    BackendScheme, BackendTlsConfig, GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm,
-    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH,
-    PassiveHealthCheck, PluginAssociation, PluginConfig, PluginScope, Proxy,
-    ResolvedSubsetTrafficPolicy, ResponseBodyMode, SubsetDefinition, SubsetTrafficPolicy,
-    UPSTREAM_TARGET_SERVICE_NAME_TAG, UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG,
-    UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream, UpstreamPortOverride, UpstreamTarget,
+    BackendScheme, BackendTlsConfig, DispatchKind, GatewayConfig, HealthCheckConfig,
+    LoadBalancerAlgorithm, MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRIES,
+    MAX_BACKEND_TLS_SAN_ALLOW_LIST_ENTRY_LENGTH, PassiveHealthCheck, PluginAssociation,
+    PluginConfig, PluginScope, Proxy, ResolvedSubsetTrafficPolicy, ResponseBodyMode,
+    SubsetDefinition, SubsetTrafficPolicy, UPSTREAM_TARGET_SERVICE_NAME_TAG,
+    UPSTREAM_TARGET_SERVICE_NAMESPACE_TAG, UPSTREAM_TARGET_SERVICE_PORT_TAG, Upstream,
+    UpstreamPortOverride, UpstreamTarget,
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::dp_client::{DpGrpcTlsReload, GrpcJwtSecret, build_dp_grpc_tls_config};
@@ -84,6 +87,73 @@ pub const MESH_REQUEST_AUTH_PLUGIN_ID: &str = "__mesh_request_auth";
 pub const MESH_ACCESS_LOG_PLUGIN_ID: &str = "__mesh_access_log";
 pub const MESH_OUTBOUND_REGISTRY_PLUGIN_ID: &str = "__mesh_outbound_registry";
 pub const MESH_BPF_METRICS_PLUGIN_ID: &str = "__mesh_bpf_metrics";
+
+/// Exact identities created by one trusted mesh-materialization pass.
+///
+/// The constructor is private to this module: callers outside the
+/// materialization boundary can inspect an allowlist during runtime
+/// validation, but cannot bless arbitrary reserved-prefix IDs. The input
+/// snapshot is validated with the ordinary operator grammar before any mesh
+/// resources are injected, so every reserved identity collected afterward was
+/// created by the materializers in this module.
+#[derive(Debug, Default)]
+pub(crate) struct TrustedMeshGeneratedResourceIds {
+    proxies: HashMap<String, HashSet<String>>,
+    plugin_configs: HashMap<String, HashSet<String>>,
+    upstreams: HashMap<String, HashSet<String>>,
+}
+
+impl TrustedMeshGeneratedResourceIds {
+    fn from_materialized_config(config: &GatewayConfig) -> Self {
+        let mut trusted = Self::default();
+        for proxy in &config.proxies {
+            if proxy.id.starts_with("__mesh") {
+                trusted
+                    .proxies
+                    .entry(proxy.namespace.clone())
+                    .or_default()
+                    .insert(proxy.id.clone());
+            }
+        }
+        for plugin in &config.plugin_configs {
+            if plugin.id.starts_with("__mesh") {
+                trusted
+                    .plugin_configs
+                    .entry(plugin.namespace.clone())
+                    .or_default()
+                    .insert(plugin.id.clone());
+            }
+        }
+        for upstream in &config.upstreams {
+            if upstream.id.starts_with("__mesh") {
+                trusted
+                    .upstreams
+                    .entry(upstream.namespace.clone())
+                    .or_default()
+                    .insert(upstream.id.clone());
+            }
+        }
+        trusted
+    }
+
+    pub(crate) fn allows_proxy(&self, namespace: &str, id: &str) -> bool {
+        self.proxies
+            .get(namespace)
+            .is_some_and(|ids| ids.contains(id))
+    }
+
+    pub(crate) fn allows_plugin_config(&self, namespace: &str, id: &str) -> bool {
+        self.plugin_configs
+            .get(namespace)
+            .is_some_and(|ids| ids.contains(id))
+    }
+
+    pub(crate) fn allows_upstream(&self, namespace: &str, id: &str) -> bool {
+        self.upstreams
+            .get(namespace)
+            .is_some_and(|ids| ids.contains(id))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshTrafficDirection {
@@ -951,6 +1021,18 @@ fn prepare_normalized_gateway_config_for_mesh(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) -> Result<GatewayConfig, anyhow::Error> {
+    // This is the untrusted/operator boundary. Reserved mesh IDs are invalid
+    // here exactly like every other leading-underscore ID. Only after this
+    // strict gate succeeds may the trusted materializers below create reserved
+    // resources and record their exact `(kind, namespace, id)` identities for
+    // the post-materialization runtime swap check.
+    if let Err(errors) = config.validate_resource_ids() {
+        return Err(anyhow::anyhow!(
+            "Mesh input resource ID validation failed: {}",
+            errors.join("; ")
+        ));
+    }
+
     let mesh_errors = config.validate_mesh_fields();
     if !mesh_errors.is_empty() {
         return Err(anyhow::anyhow!(
@@ -1077,16 +1159,25 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
         return;
     }
 
-    let udp_proxy_ids: HashSet<String> = config
+    let mut udp_proxy_ids: HashMap<String, HashSet<String>> = HashMap::new();
+    for proxy in config
         .proxies
         .iter()
         .filter(|proxy| proxy.dispatch_kind.is_udp())
-        .map(|proxy| proxy.id.clone())
-        .collect();
+    {
+        udp_proxy_ids
+            .entry(proxy.namespace.clone())
+            .or_default()
+            .insert(proxy.id.clone());
+    }
     let udp_proxies: Vec<String> = config
         .proxies
         .iter()
-        .filter(|proxy| udp_proxy_ids.contains(&proxy.id))
+        .filter(|proxy| {
+            udp_proxy_ids
+                .get(proxy.namespace.as_str())
+                .is_some_and(|ids| ids.contains(proxy.id.as_str()))
+        })
         .map(|proxy| format!("{}/{}", proxy.namespace, proxy.id))
         .collect();
     let udp_services = strip_node_waypoint_udp_dtls_mesh_service_ports(config.mesh.as_deref_mut());
@@ -1107,14 +1198,17 @@ fn fail_closed_node_waypoint_udp_dtls_scoped_policies(
     }
 
     if !udp_proxy_ids.is_empty() {
-        config
-            .proxies
-            .retain(|proxy| !udp_proxy_ids.contains(&proxy.id));
+        config.proxies.retain(|proxy| {
+            !udp_proxy_ids
+                .get(proxy.namespace.as_str())
+                .is_some_and(|ids| ids.contains(proxy.id.as_str()))
+        });
         config.plugin_configs.retain(|plugin| {
-            plugin
-                .proxy_id
-                .as_deref()
-                .is_none_or(|proxy_id| !udp_proxy_ids.contains(proxy_id))
+            plugin.proxy_id.as_deref().is_none_or(|proxy_id| {
+                !udp_proxy_ids
+                    .get(plugin.namespace.as_str())
+                    .is_some_and(|ids| ids.contains(proxy_id))
+            })
         });
     }
     if !udp_upstreams.is_empty() {
@@ -1424,11 +1518,12 @@ fn mesh_source_workload_locality(mesh_slice: &MeshSlice) -> Option<&str> {
 /// `updated_at` again whenever it stamps `source_locality`/`locality_lb_strict`
 /// onto an upstream that entered the projection with `source_locality = None`
 /// (which a freshly materialized upstream ALWAYS does). `ConfigDelta` keys
-/// upstream identity on `id` and detects modification by `updated_at != old`
-/// (`src/config_delta.rs`), so without reconciliation EVERY mesh upstream would
-/// look "modified" on EVERY apply — and a "modified" upstream rebuilds a fresh
-/// `LoadBalancer` (`LoadBalancerCache::build_delta_inner`), discarding its
-/// round-robin counters, latency EWMAs, hash rings, and passive-health state.
+/// upstream identity on `(namespace, id)` and detects modification by
+/// `updated_at != old` (`src/config_delta.rs`), so without reconciliation EVERY
+/// mesh upstream would look "modified" on EVERY apply — and a "modified"
+/// upstream rebuilds a fresh `LoadBalancer`
+/// (`LoadBalancerCache::build_delta_inner`), discarding its round-robin
+/// counters, latency EWMAs, hash rings, and passive-health state.
 /// That means an unrelated mesh-only update (a federation/trust-bundle overlay
 /// refresh, or a remote-cluster scale event for a DIFFERENT service) would reset
 /// LB + health for every materialized upstream.
@@ -1447,13 +1542,18 @@ fn reconcile_mesh_upstream_timestamps(candidate: &mut GatewayConfig, previous: &
     if candidate.upstreams.is_empty() || previous.upstreams.is_empty() {
         return;
     }
-    let previous_by_id: HashMap<&str, &Upstream> = previous
+    let previous_by_id: HashMap<(&str, &str), &Upstream> = previous
         .upstreams
         .iter()
-        .map(|upstream| (upstream.id.as_str(), upstream))
+        .map(|upstream| {
+            (
+                (upstream.namespace.as_str(), upstream.id.as_str()),
+                upstream,
+            )
+        })
         .collect();
     for upstream in &mut candidate.upstreams {
-        if let Some(old) = previous_by_id.get(upstream.id.as_str())
+        if let Some(old) = previous_by_id.get(&(upstream.namespace.as_str(), upstream.id.as_str()))
             && upstream_content_eq(upstream, old)
         {
             // Content-identical to the last accepted projection: preserve the
@@ -1859,11 +1959,9 @@ fn materialize_east_west_gateway_proxies(
 
             let proxy = east_west_gateway_proxy(gateway, runtime.east_west_listen_port);
 
-            if let Some(existing) = config
-                .proxies
-                .iter_mut()
-                .find(|candidate| candidate.id == proxy.id)
-            {
+            if let Some(existing) = config.proxies.iter_mut().find(|candidate| {
+                candidate.namespace == proxy.namespace && candidate.id == proxy.id
+            }) {
                 *existing = proxy;
             } else {
                 config.proxies.push(proxy);
@@ -1936,11 +2034,9 @@ fn materialize_east_west_gateway_proxies(
     }
 
     for upstream in upstreams {
-        if let Some(existing) = config
-            .upstreams
-            .iter_mut()
-            .find(|candidate| candidate.id == upstream.id)
-        {
+        if let Some(existing) = config.upstreams.iter_mut().find(|candidate| {
+            candidate.namespace == upstream.namespace && candidate.id == upstream.id
+        }) {
             *existing = upstream;
         } else {
             config.upstreams.push(upstream);
@@ -1951,7 +2047,7 @@ fn materialize_east_west_gateway_proxies(
         if let Some(existing) = config
             .proxies
             .iter_mut()
-            .find(|candidate| candidate.id == proxy.id)
+            .find(|candidate| candidate.namespace == proxy.namespace && candidate.id == proxy.id)
         {
             *existing = proxy;
         } else {
@@ -2765,6 +2861,9 @@ pub(crate) fn service_http_family_ports(
 /// siblings (disambiguated by inbound orig-dst / the request authority port
 /// instead of the outbound capture's orig-dst).
 pub(crate) struct MeshOutboundServiceGroup {
+    /// Owning resource namespace. Generated sibling ids include namespace text
+    /// but the join is lossy, so every consumer must key by this field plus id.
+    pub namespace: String,
     /// How many HTTP-family ports the service DECLARES — which can exceed the
     /// materialized sibling count (e.g. an unresolved named `targetPort`
     /// produced no targets for one port). Orig-dst-less requests must fail
@@ -2790,6 +2889,7 @@ pub(crate) fn mesh_outbound_service_groups(
                 return None;
             }
             Some(MeshOutboundServiceGroup {
+                namespace: service.namespace.clone(),
                 declared_http_ports: http_ports.len(),
                 siblings: http_ports
                     .iter()
@@ -2894,6 +2994,7 @@ pub(crate) fn mesh_inbound_service_groups(
                 return None;
             }
             Some(MeshOutboundServiceGroup {
+                namespace: service.namespace.clone(),
                 declared_http_ports: http_ports.len(),
                 siblings: http_ports
                     .iter()
@@ -2923,9 +3024,9 @@ pub(crate) fn mesh_inbound_service_groups(
 pub(crate) fn mesh_ingress_listener_groups(
     mesh: &crate::modes::mesh::config::MeshConfig,
 ) -> Vec<MeshOutboundServiceGroup> {
-    if mesh.local_ingress_listeners.is_empty() {
+    let Some(first_listener) = mesh.local_ingress_listeners.first() else {
         return Vec::new();
-    }
+    };
     let siblings: Vec<(u16, String)> = mesh
         .local_ingress_listeners
         .iter()
@@ -2951,6 +3052,7 @@ pub(crate) fn mesh_ingress_listener_groups(
     // multi-listener group back to the single-listener no-signal pass-through.
     let declared_http_ports = mesh.declared_ingress_http_ports.max(siblings.len());
     vec![MeshOutboundServiceGroup {
+        namespace: first_listener.owner_namespace.clone(),
         declared_http_ports,
         siblings,
     }]
@@ -3596,7 +3698,9 @@ fn materialize_sidecar_inbound_proxies(
                 // overlapping bare-name host variant still wins first-materialized,
                 // exactly as before per-port siblings existed.
                 if config.proxies.iter().any(|p| {
-                    if sibling_ids.contains(p.id.as_str()) || p.dispatch_kind.is_stream() {
+                    if (p.namespace == service.namespace && sibling_ids.contains(p.id.as_str()))
+                        || p.dispatch_kind.is_stream()
+                    {
                         return false;
                     }
                     let shadows_or_collides = p.listen_path == proxy.listen_path
@@ -3613,7 +3717,11 @@ fn materialize_sidecar_inbound_proxies(
                     );
                     continue;
                 }
-                if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+                if let Some(existing) = config
+                    .proxies
+                    .iter_mut()
+                    .find(|p| p.namespace == proxy.namespace && p.id == proxy.id)
+                {
                     *existing = proxy;
                 } else {
                     config.proxies.push(proxy);
@@ -3858,7 +3966,9 @@ fn materialize_sidecar_ingress_listener_proxies(
         // ingress siblings (grouped by the router); another proxy still wins
         // first-materialized.
         if config.proxies.iter().any(|p| {
-            if sibling_ids.contains(p.id.as_str()) || p.dispatch_kind.is_stream() {
+            if (p.namespace == listener.owner_namespace && sibling_ids.contains(p.id.as_str()))
+                || p.dispatch_kind.is_stream()
+            {
                 return false;
             }
             let shadows_or_collides = p.listen_path == proxy.listen_path
@@ -3874,7 +3984,11 @@ fn materialize_sidecar_ingress_listener_proxies(
             );
             continue;
         }
-        if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+        if let Some(existing) = config
+            .proxies
+            .iter_mut()
+            .find(|p| p.namespace == proxy.namespace && p.id == proxy.id)
+        {
             *existing = proxy;
         } else {
             config.proxies.push(proxy);
@@ -4306,7 +4420,7 @@ fn materialize_mesh_outbound_proxies(
             // are skipped only for re-materialization idempotency. Stream proxies
             // route by `listen_port` and are skipped.
             if config.proxies.iter().any(|p| {
-                if p.id == proxy.id
+                if (p.namespace == proxy.namespace && p.id == proxy.id)
                     || p.dispatch_kind.is_stream()
                     || is_mesh_outbound_route_id(&p.id)
                 {
@@ -4345,12 +4459,20 @@ fn materialize_mesh_outbound_proxies(
                 targets,
                 now,
             );
-            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
             }
-            if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+            if let Some(existing) = config
+                .proxies
+                .iter_mut()
+                .find(|p| p.namespace == proxy.namespace && p.id == proxy.id)
+            {
                 *existing = proxy;
             } else {
                 config.proxies.push(proxy);
@@ -4396,12 +4518,20 @@ fn materialize_mesh_outbound_proxies(
                 now,
             );
             let proxy = mesh_outbound_http_bywl_route_proxy(&spec, now);
-            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
             }
-            if let Some(existing) = config.proxies.iter_mut().find(|p| p.id == proxy.id) {
+            if let Some(existing) = config
+                .proxies
+                .iter_mut()
+                .find(|p| p.namespace == proxy.namespace && p.id == proxy.id)
+            {
                 *existing = proxy;
             } else {
                 config.proxies.push(proxy);
@@ -4539,7 +4669,11 @@ fn materialize_mesh_outbound_tcp_upstreams(
                 targets,
                 now,
             );
-            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
@@ -4634,7 +4768,11 @@ fn materialize_mesh_outbound_tcp_upstreams(
             vec![target],
             now,
         );
-        if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+        if let Some(existing) = config
+            .upstreams
+            .iter_mut()
+            .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+        {
             *existing = upstream;
         } else {
             config.upstreams.push(upstream);
@@ -4754,7 +4892,11 @@ fn materialize_mesh_outbound_udp_upstreams(
                 targets,
                 now,
             );
-            if let Some(existing) = config.upstreams.iter_mut().find(|u| u.id == upstream.id) {
+            if let Some(existing) = config
+                .upstreams
+                .iter_mut()
+                .find(|u| u.namespace == upstream.namespace && u.id == upstream.id)
+            {
                 *existing = upstream;
             } else {
                 config.upstreams.push(upstream);
@@ -4873,7 +5015,7 @@ fn mesh_outbound_tcp_relay_proxy_with_id(
         hosts: Vec::new(),
         listen_path: None,
         backend_scheme: Some(scheme),
-        dispatch_kind: Default::default(),
+        dispatch_kind: DispatchKind::from(scheme),
         backend_host: String::new(),
         backend_port: 0,
         backend_path: None,
@@ -6461,7 +6603,11 @@ fn synthesize_mesh_outbound_cors_plugins(
         for service_port in service_http_family_ports(service) {
             let proxy_id =
                 mesh_outbound_proxy_id(&service.namespace, &service.name, service_port.port);
-            let Some(proxy) = config.proxies.iter_mut().find(|proxy| proxy.id == proxy_id) else {
+            let Some(proxy) = config
+                .proxies
+                .iter_mut()
+                .find(|proxy| proxy.namespace == service.namespace && proxy.id == proxy_id)
+            else {
                 // Not every declared HTTP port materializes (e.g. an
                 // unresolved named targetPort skips its sibling) — nothing to
                 // attach CORS to on a route that does not exist.
@@ -6532,7 +6678,7 @@ fn apply_destination_rules(
     // targetPort: 5353`) must map to its UDP upstream or its traffic policy is
     // silently dropped (codex r3).
     let multi_cluster = mesh_slice.multi_cluster.as_ref();
-    let mut outbound_upstream_owner_port: std::collections::HashMap<String, u16> = mesh_slice
+    let mut outbound_upstream_owner_port: HashMap<NamespacedResourceId, u16> = mesh_slice
         .services
         .iter()
         .flat_map(|svc| {
@@ -6540,19 +6686,28 @@ fn apply_destination_rules(
                 .into_iter()
                 .map(|sp| {
                     (
-                        mesh_outbound_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        NamespacedResourceId::new(
+                            svc.namespace.as_str(),
+                            mesh_outbound_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        ),
                         sp.port,
                     )
                 })
                 .chain(service_tcp_stream_ports(svc).into_iter().map(|sp| {
                     (
-                        mesh_outbound_tcp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        NamespacedResourceId::new(
+                            svc.namespace.as_str(),
+                            mesh_outbound_tcp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        ),
                         sp.port,
                     )
                 }))
                 .chain(service_udp_stream_ports(svc).into_iter().map(|sp| {
                     (
-                        mesh_outbound_udp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        NamespacedResourceId::new(
+                            svc.namespace.as_str(),
+                            mesh_outbound_udp_upstream_id(&svc.namespace, &svc.name, sp.port),
+                        ),
                         sp.port,
                     )
                 }))
@@ -6566,14 +6721,20 @@ fn apply_destination_rules(
     for spec in
         mesh_outbound_tcp_bywl_upstreams(&mesh_slice.services, &mesh_slice.workloads, multi_cluster)
     {
-        outbound_upstream_owner_port.insert(spec.upstream_id, spec.service_port.port);
+        outbound_upstream_owner_port.insert(
+            NamespacedResourceId::new(spec.service.namespace.as_str(), spec.upstream_id),
+            spec.service_port.port,
+        );
     }
     for spec in mesh_outbound_http_bywl_upstreams(
         &mesh_slice.services,
         &mesh_slice.workloads,
         multi_cluster,
     ) {
-        outbound_upstream_owner_port.insert(spec.upstream_id, spec.service_port.port);
+        outbound_upstream_owner_port.insert(
+            NamespacedResourceId::new(spec.service.namespace.as_str(), spec.upstream_id),
+            spec.service_port.port,
+        );
     }
 
     for dr in sorted_destination_rules {
@@ -6681,6 +6842,8 @@ fn apply_destination_rules(
             // below doesn't conflict with the immutable `from_upstream` read.
             let upstream_base_tls = BackendTlsConfig::from_upstream(upstream);
             let upstream_id_for_tls = upstream.id.clone();
+            let upstream_owner_key =
+                NamespacedResourceId::new(upstream.namespace.as_str(), upstream.id.as_str());
             // Captured owned (like `upstream_base_tls`) so the per-port
             // `entry()` mutable borrow below does not conflict with reading the
             // upstream's targets. Gates the ISTIO_MUTUAL CA-backed fail-closed:
@@ -6698,7 +6861,7 @@ fn apply_destination_rules(
                 // leak onto this upstream merely because their service port
                 // number appears as a fallback target's dial port.
                 let store_ports: Vec<u16> = if let Some(owning_port) =
-                    outbound_upstream_owner_port.get(&upstream.id)
+                    outbound_upstream_owner_port.get(&upstream_owner_key)
                 {
                     if port != owning_port {
                         debug!(
@@ -6759,7 +6922,8 @@ fn apply_destination_rules(
                     None
                 };
 
-                let is_owner_entry = outbound_upstream_owner_port.get(&upstream.id) == Some(port);
+                let is_owner_entry =
+                    outbound_upstream_owner_port.get(&upstream_owner_key) == Some(port);
                 // Seed a FRESH fanned slot's passive health from the upstream
                 // level — which carries this DR's top-level outlierDetection,
                 // applied above — so a PARTIAL per-port outlier override
@@ -7638,11 +7802,9 @@ fn materialize_egress_gateway_proxies(
 
     // Merge upstreams: replace existing by ID or append.
     for upstream in upstreams {
-        if let Some(existing) = config
-            .upstreams
-            .iter_mut()
-            .find(|candidate| candidate.id == upstream.id)
-        {
+        if let Some(existing) = config.upstreams.iter_mut().find(|candidate| {
+            candidate.namespace == upstream.namespace && candidate.id == upstream.id
+        }) {
             *existing = upstream;
         } else {
             config.upstreams.push(upstream);
@@ -7654,7 +7816,7 @@ fn materialize_egress_gateway_proxies(
         if let Some(existing) = config
             .proxies
             .iter_mut()
-            .find(|candidate| candidate.id == proxy.id)
+            .find(|candidate| candidate.namespace == proxy.namespace && candidate.id == proxy.id)
         {
             *existing = proxy;
         } else {
@@ -8626,9 +8788,11 @@ fn inject_mesh_global_plugins(
         let registry = mesh_slice.build_known_destinations(&runtime.cluster_domain);
         let outbound_listen_ports = mesh_outbound_registry_listen_ports(runtime);
         if outbound_listen_ports.is_empty() {
-            config
-                .plugin_configs
-                .retain(|p| p.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
+            remove_mesh_managed_plugin(
+                config,
+                MESH_OUTBOUND_REGISTRY_PLUGIN_ID,
+                &runtime.namespace,
+            );
         } else {
             let plugin_config = serde_json::json!({
                 "registry": registry,
@@ -8646,9 +8810,7 @@ fn inject_mesh_global_plugins(
         }
     } else {
         // Remove any stale instance (e.g., operator flipped policy back).
-        config
-            .plugin_configs
-            .retain(|p| p.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID);
+        remove_mesh_managed_plugin(config, MESH_OUTBOUND_REGISTRY_PLUGIN_ID, &runtime.namespace);
     }
 
     // Merge applicable Telemetry resources (most specific scope wins per section).
@@ -8746,9 +8908,7 @@ fn inject_mesh_global_plugins(
     // injected plugins are updated in place across upgrades.
     let access_log_config: Option<serde_json::Value> = match &merged_telemetry.access_logging {
         Some(al) if !al.enabled => {
-            config
-                .plugin_configs
-                .retain(|p| p.id != MESH_ACCESS_LOG_PLUGIN_ID);
+            remove_mesh_managed_plugin(config, MESH_ACCESS_LOG_PLUGIN_ID, &runtime.namespace);
             None
         }
         Some(al) => Some(match &al.filter {
@@ -8782,9 +8942,7 @@ fn inject_mesh_global_plugins(
             &runtime.namespace,
         );
     } else {
-        config
-            .plugin_configs
-            .retain(|p| p.id != MESH_BPF_METRICS_PLUGIN_ID);
+        remove_mesh_managed_plugin(config, MESH_BPF_METRICS_PLUGIN_ID, &runtime.namespace);
     }
 }
 
@@ -9002,9 +9160,7 @@ fn inject_mesh_request_auth_plugin(
     if applicable.is_empty() {
         // No applicable RequestAuthentication — remove any previously injected
         // mesh request auth plugin so it doesn't persist across config updates.
-        config
-            .plugin_configs
-            .retain(|plugin| plugin.id != MESH_REQUEST_AUTH_PLUGIN_ID);
+        remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace);
         return;
     }
 
@@ -9018,9 +9174,7 @@ fn inject_mesh_request_auth_plugin(
     }
 
     if providers.is_empty() {
-        config
-            .plugin_configs
-            .retain(|plugin| plugin.id != MESH_REQUEST_AUTH_PLUGIN_ID);
+        remove_mesh_managed_plugin(config, MESH_REQUEST_AUTH_PLUGIN_ID, &runtime.namespace);
         return;
     }
 
@@ -9108,7 +9262,7 @@ fn ensure_global_plugin(
     if let Some(existing) = config
         .plugin_configs
         .iter_mut()
-        .find(|plugin| plugin.id == id)
+        .find(|plugin| plugin.namespace == namespace && plugin.id == id)
     {
         *existing = mesh_plugin;
     } else if config
@@ -9124,6 +9278,12 @@ fn ensure_global_plugin(
     } else {
         config.plugin_configs.push(mesh_plugin);
     }
+}
+
+fn remove_mesh_managed_plugin(config: &mut GatewayConfig, id: &str, namespace: &str) {
+    config
+        .plugin_configs
+        .retain(|plugin| plugin.namespace != namespace || plugin.id != id);
 }
 
 pub async fn run(
@@ -9179,6 +9339,11 @@ pub async fn run(
     );
 
     let mesh_state = MeshRuntimeState::new();
+    // Config-revision freshness policy (issue #2473). Installed before any
+    // consumer is spawned so the first slice is already gated.
+    mesh_state.set_revision_policy(crate::modes::mesh::revision::MeshRevisionPolicy {
+        foreign_authority_adopt_secs: env_config.mesh_config_revision_adopt_secs,
+    });
     let federation_activation = FederationActivation::from_env_config(&env_config);
 
     let mut background_handles = Vec::new();
@@ -9306,14 +9471,23 @@ pub async fn run(
             );
         }
     }
-    let (bootstrap_config, initial_applied_mesh_slice) = wait_for_initial_mesh_config(
+    let (bootstrap_config, initial_applied_mesh_slice) = match wait_for_initial_mesh_config(
         &mesh_state,
         &runtime,
         federation_activation,
         shutdown_tx.subscribe(),
     )
     .await
-    .context("mesh runtime stopped before receiving a valid initial mesh slice")?;
+    {
+        Ok(v) => v,
+        Err(err) => {
+            // Config-consumer / gRPC TLS watcher tasks are already running.
+            // Drain them before surfacing the wait failure (issue #2372).
+            let err =
+                err.context("mesh runtime stopped before receiving a valid initial mesh slice");
+            return Err(fail_mesh_pre_owner(&shutdown_tx, background_handles, err).await);
+        }
+    };
     info!(
         mesh_global_plugins = bootstrap_config.plugin_configs.len(),
         mesh_slice_version = %initial_applied_mesh_slice.version,
@@ -9327,7 +9501,10 @@ pub async fn run(
         shutdown_tx,
         mesh_state,
         Some(initial_applied_mesh_slice),
-        background_handles,
+        MeshRuntimeBackgroundOwnership {
+            handles: background_handles,
+            finalize_global_plugins_on_shutdown: true,
+        },
     )
     .await
 }
@@ -9340,6 +9517,14 @@ fn ensure_runtime_config_protocol_supported(
     }
 }
 
+struct MeshRuntimeBackgroundOwnership {
+    handles: Vec<JoinHandle<()>>,
+    // External rollback probes share a process with unrelated plugin tests and
+    // must not stop process-global delivery generations. Production always
+    // passes true.
+    finalize_global_plugins_on_shutdown: bool,
+}
+
 async fn serve_mesh_runtime(
     env_config: EnvConfig,
     runtime: MeshRuntimeConfig,
@@ -9347,8 +9532,92 @@ async fn serve_mesh_runtime(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     mesh_state: MeshRuntimeState,
     initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
-    mut mesh_background_handles: Vec<JoinHandle<()>>,
+    background_ownership: MeshRuntimeBackgroundOwnership,
 ) -> Result<(), anyhow::Error> {
+    let MeshRuntimeBackgroundOwnership {
+        handles: mesh_background_handles,
+        finalize_global_plugins_on_shutdown,
+    } = background_ownership;
+    // Prep before MeshStartupOwner exists. Incoming `mesh_background_handles`
+    // already hold config-consumer / gRPC TLS watcher tasks from `run()`, so
+    // every error here must drain them (issue #2372 root review) rather than
+    // `?`-dropping the JoinHandles.
+    let prepared = prepare_mesh_runtime_before_owner(
+        &env_config,
+        &runtime,
+        config,
+        &shutdown_tx,
+        initial_applied_mesh_slice.as_ref(),
+    );
+    let (
+        dns_cache,
+        hostnames,
+        initial_dns_slice,
+        tls_policy,
+        crls,
+        bpf_metrics_state,
+        proxy_state,
+        health_check_handles,
+    ) = match prepared {
+        Ok(v) => v,
+        Err(err) => {
+            return Err(fail_mesh_pre_owner(&shutdown_tx, mesh_background_handles, err).await);
+        }
+    };
+
+    // Ownership transfers here: MeshStartupOwner takes the background handles
+    // so later arm/fail_with teardown is the sole cleanup path (no double-drain).
+    let mut owner = MeshStartupOwner::new(
+        shutdown_tx,
+        proxy_state,
+        health_check_handles,
+        mesh_background_handles,
+        env_config.shutdown_drain_seconds,
+        finalize_global_plugins_on_shutdown,
+    );
+    if let Err(err) = arm_mesh_runtime_startup(
+        &mut owner,
+        &env_config,
+        &runtime,
+        &dns_cache,
+        hostnames,
+        initial_dns_slice,
+        initial_applied_mesh_slice,
+        mesh_state,
+        tls_policy,
+        crls,
+        bpf_metrics_state,
+    )
+    .await
+    {
+        return Err(owner.fail_with(err).await);
+    }
+    owner.serve_until_shutdown().await
+}
+
+/// Fallible mesh prep up through `ProxyState` construction.
+///
+/// Callers must drain already-running background tasks on `Err` via
+/// [`fail_mesh_pre_owner`] before returning; this helper does not own those
+/// handles so ownership can transfer cleanly into [`MeshStartupOwner`] on success.
+type PreparedMeshRuntimeBeforeOwner = (
+    DnsCache,
+    Vec<(String, Option<String>, Option<u64>)>,
+    Option<MeshSlice>,
+    TlsPolicy,
+    tls::CrlList,
+    Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+    ProxyState,
+    Vec<JoinHandle<()>>,
+);
+
+fn prepare_mesh_runtime_before_owner(
+    env_config: &EnvConfig,
+    runtime: &MeshRuntimeConfig,
+    config: GatewayConfig,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    initial_applied_mesh_slice: Option<&Arc<MeshSlice>>,
+) -> Result<PreparedMeshRuntimeBeforeOwner, anyhow::Error> {
     // Fail closed on malformed UDP capture settings (codex r2 P2 / r3 P2),
     // BEFORE binding the DNS proxy or spawning any mesh background task. The
     // `udp_capture_listener()` helper feeding `listener_plan()` is infallible
@@ -9360,6 +9629,13 @@ async fn serve_mesh_runtime(
     // (which a later `?` would have left running for in-process retries/tests).
     crate::capture::udp_capture_settings_from_env()
         .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
+
+    if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::BeforeOwner {
+        let _ = take_mesh_startup_fault_inject();
+        return Err(anyhow::anyhow!(
+            "injected mesh startup failure before MeshStartupOwner"
+        ));
+    }
 
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: env_config.dns_overrides.clone(),
@@ -9399,14 +9675,14 @@ async fn serve_mesh_runtime(
             hostnames.push((target.host.clone(), None, None));
         }
     }
-    let initial_dns_slice = initial_applied_mesh_slice.as_ref().and_then(|slice| {
-        node_waypoint_dns_slice_for_prepared_config(&runtime, slice.as_ref(), &config)
+    let initial_dns_slice = initial_applied_mesh_slice.and_then(|slice| {
+        node_waypoint_dns_slice_for_prepared_config(runtime, slice.as_ref(), &config)
     });
 
     // Shared with `ferrum-edge validate` so env TLS/security surfaces cannot
     // drift between the two commands (issue #2976).
-    let tls_policy = startup_security::load_tls_policy(&env_config)?;
-    let crls = startup_security::load_crls_from_env(&env_config)?;
+    let tls_policy = startup_security::load_tls_policy(env_config)?;
+    let crls = startup_security::load_crls_from_env(env_config)?;
     // GAP-3D: on node-waypoint topology, create the SOCK_OPS metrics
     // state up front so plugin construction inside `ProxyState::new`
     // picks it up via PluginHttpClient and the spawned ringbuf consumer
@@ -9424,6 +9700,37 @@ async fn serve_mesh_runtime(
         Some(shutdown_tx.subscribe()),
         bpf_metrics_state.clone(),
     )?;
+
+    Ok((
+        dns_cache,
+        hostnames,
+        initial_dns_slice,
+        tls_policy,
+        crls,
+        bpf_metrics_state,
+        proxy_state,
+        health_check_handles,
+    ))
+}
+
+/// Post-`ProxyState` mesh initialization. Any `Err` is rolled back by the caller
+/// via [`MeshStartupOwner::fail_with`] so spawned tasks/netns managers drain.
+#[allow(clippy::too_many_arguments)]
+async fn arm_mesh_runtime_startup(
+    owner: &mut MeshStartupOwner,
+    env_config: &EnvConfig,
+    runtime: &MeshRuntimeConfig,
+    dns_cache: &DnsCache,
+    mut hostnames: Vec<(String, Option<String>, Option<u64>)>,
+    initial_dns_slice: Option<MeshSlice>,
+    initial_applied_mesh_slice: Option<Arc<MeshSlice>>,
+    mesh_state: MeshRuntimeState,
+    tls_policy: TlsPolicy,
+    crls: tls::CrlList,
+    bpf_metrics_state: Option<Arc<crate::ebpf::bpf_metrics::BpfMetricsState>>,
+) -> Result<(), anyhow::Error> {
+    let shutdown_tx = owner.shutdown_tx.clone();
+    let proxy_state = owner.proxy_state.clone();
     let proxy_state = if runtime.topology == MeshTopology::NodeWaypoint {
         info!(
             "Node-waypoint identity resolver enabled; unknown outbound capture socket cookies fail closed"
@@ -9441,14 +9748,14 @@ async fn serve_mesh_runtime(
             env_config.mesh_node_waypoint_cgroup_sweep_interval_secs,
             shutdown_tx.subscribe(),
         ) {
-            mesh_background_handles.push(handle);
+            owner.push_mesh_background(handle);
         }
         if let Some(handle) = node_waypoint::spawn_idle_identity_gc_task(
             resolver.clone(),
             env_config.mesh_node_waypoint_idle_gc_interval_secs,
             shutdown_tx.subscribe(),
         ) {
-            mesh_background_handles.push(handle);
+            owner.push_mesh_background(handle);
         }
         // Spawn the SOCK_OPS ringbuf consumer. When the kernel program
         // is not pinned (no node-agent on this host, kernel < 5.7, or
@@ -9457,7 +9764,7 @@ async fn serve_mesh_runtime(
         if let Some(state) = bpf_metrics_state.as_ref()
             && let Some(handle) = spawn_sock_ops_consumer_task(state.clone(), &shutdown_tx)
         {
-            mesh_background_handles.push(handle);
+            owner.push_mesh_background(handle);
         }
         // Spawn the orig-dst → identity bridge. It reads the pinned
         // FERRUM_ORIG_DST4/6 maps the node-agent populated, mirrors each
@@ -9475,11 +9782,12 @@ async fn serve_mesh_runtime(
         // code and CI-verified at the load/attach level (`ebpf-live`); it stays
         // unexercised on a live multi-pod datapath, where a tuple/byte-order or
         // enrollment miss fails closed (never misattributes).
-        mesh_background_handles.push(spawn_orig_dst_bridge_task(resolver.clone(), &shutdown_tx));
+        owner.push_mesh_background(spawn_orig_dst_bridge_task(resolver.clone(), &shutdown_tx));
         proxy_state.with_node_waypoint_identity_resolver(resolver)
     } else {
         proxy_state
     };
+    owner.set_proxy_state(proxy_state.clone());
     // Node-waypoint in-netns outbound capture listeners (opt-in). The default
     // outbound listener binds in the HOST netns, which a pod's loopback-rewritten
     // capture (`connect4` → 127.0.0.1:15001, `connect6` → [::1]:15001) can never
@@ -9573,7 +9881,7 @@ async fn serve_mesh_runtime(
                 ),
                 "Node-waypoint dual-family in-netns outbound capture listeners enabled"
             );
-            mesh_background_handles.push(tokio::spawn(async move {
+            owner.push_mesh_background(tokio::spawn(async move {
                 manager.run(manager_shutdown).await;
             }));
         }
@@ -9675,7 +9983,7 @@ async fn serve_mesh_runtime(
                     capture_port = settings.udp_outbound_port,
                     "Ambient per-pod-netns UDP capture producer enabled"
                 );
-                mesh_background_handles.push(tokio::spawn(async move {
+                owner.push_mesh_background(tokio::spawn(async move {
                     manager.run(manager_shutdown).await;
                 }));
             }
@@ -9698,7 +10006,7 @@ async fn serve_mesh_runtime(
                 registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
                 "Ambient UDP capture disabled; stale per-pod-netns UDP cleanup manager enabled"
             );
-            mesh_background_handles.push(tokio::spawn(async move {
+            owner.push_mesh_background(tokio::spawn(async move {
                 manager.run(manager_shutdown).await;
             }));
         }
@@ -9714,7 +10022,7 @@ async fn serve_mesh_runtime(
         handles: admin_handles,
         startup_signals: admin_startup_signals,
     } = start_mesh_admin_listeners(
-        &env_config,
+        env_config,
         &shutdown_tx,
         proxy_state.clone(),
         mesh_state.clone(),
@@ -9726,7 +10034,15 @@ async fn serve_mesh_runtime(
         &tls_policy,
         &crls,
     )?;
-    mesh_background_handles.extend(admin_handles);
+    owner.extend_mesh_background(admin_handles);
+    // Injected SVID/TLS/DNS-bind-class failures land after admin/netns side
+    // effects exist and before the final listener start-signal gate.
+    if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::BeforeStartupGate {
+        let _ = take_mesh_startup_fault_inject();
+        return Err(anyhow::anyhow!(
+            "injected mesh startup failure before startup_result gate"
+        ));
+    }
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,
@@ -9759,7 +10075,7 @@ async fn serve_mesh_runtime(
     // `prepare_gateway_config_for_native_slice` before `ProxyState::new`
     // existed, so the apply-loop wiring would otherwise miss it.
     if let Some(ref slice) = initial_applied_mesh_slice {
-        refresh_mesh_outbound_enforcement(&proxy_state, &runtime, slice);
+        refresh_mesh_outbound_enforcement(&proxy_state, runtime, slice);
     }
 
     // Resolve mTLS mode and start any CA-backed runtime SVID source before pool
@@ -9767,8 +10083,8 @@ async fn serve_mesh_runtime(
     // gateway SVID; if the first refresh runs while the slot is empty, HBONE
     // targets can remain Unknown until the next periodic refresh.
     let inbound_mtls_mode =
-        startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), &runtime)?;
-    validate_egress_gateway_mtls_config(&runtime, &env_config)?;
+        startup_inbound_mtls_mode(initial_applied_mesh_slice.as_deref(), runtime)?;
+    validate_egress_gateway_mtls_config(runtime, env_config)?;
     // Loud warning when stream egress is opted out of SVID-mTLS. The default
     // (false) terminates SVID-mTLS + runs mesh_authz on stream egress listeners
     // (parity with HTTP egress); enabling plaintext means any pod that can reach
@@ -9789,15 +10105,15 @@ async fn serve_mesh_runtime(
     let mesh_runtime_trust_overlay_slot = empty_mesh_inbound_trust_overlay_slot();
     let mesh_ca_svid_slot = start_mesh_ca_backend_svid_source(
         &proxy_state,
-        &runtime,
-        &env_config,
+        runtime,
+        env_config,
         mesh_runtime_trust_overlay_slot.clone(),
-        &mut mesh_background_handles,
+        owner.mesh_background_mut(),
         shutdown_tx.subscribe(),
     )
     .await?;
     let mesh_runtime_trust_overlay_slot = (mesh_ca_svid_slot.is_some()
-        || gateway_svid_material_configured(&env_config))
+        || gateway_svid_material_configured(env_config))
     .then_some(mesh_runtime_trust_overlay_slot);
 
     for host in proxy_state.plugin_cache.collect_warmup_hostnames() {
@@ -9814,35 +10130,37 @@ async fn serve_mesh_runtime(
     );
     proxy_state.start_service_discovery(Some(shutdown_tx.subscribe()));
 
-    let dns_handle =
-        dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe()));
-    let dns_retry_handle = dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe()));
-    let per_ip_cleanup_handle =
-        proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe()));
-    let overload_handle = crate::overload::start_monitor(
+    owner.push_core_handle(
+        dns_cache.start_background_refresh_with_shutdown(Some(shutdown_tx.subscribe())),
+    );
+    owner.set_dns_retry_handle(dns_cache.start_failed_retry_task(Some(shutdown_tx.subscribe())));
+    owner.set_per_ip_cleanup_handle(
+        proxy_state.start_per_ip_cleanup_task(Some(shutdown_tx.subscribe())),
+    );
+    owner.push_core_handle(crate::overload::start_monitor(
         proxy_state.overload.clone(),
         env_config.overload_config(),
         env_config.max_connections,
         env_config.max_requests,
         shutdown_tx.subscribe(),
-    );
-    let metrics_handle = crate::metrics::start_metrics_monitor(
+    ));
+    owner.push_core_handle(crate::metrics::start_metrics_monitor(
         proxy_state.request_count.clone(),
         proxy_state.status_counts.clone(),
         proxy_state.windowed_metrics.clone(),
         env_config.status_metrics_window_seconds,
         shutdown_tx.subscribe(),
-    );
-    let runtime_system_handle = crate::system_metrics::start_sampler(
+    ));
+    owner.push_core_handle(crate::system_metrics::start_sampler(
         Some(proxy_state.clone()),
         env_config.runtime_metrics_system_sample_interval_ms,
         shutdown_tx.subscribe(),
-    );
-    let runtime_window_handle = crate::runtime_metrics::start_window_rotator(
+    ));
+    owner.push_core_handle(crate::runtime_metrics::start_window_rotator(
         env_config.runtime_metrics_window_1m_seconds,
         env_config.runtime_metrics_window_5m_seconds,
         shutdown_tx.subscribe(),
-    );
+    ));
     // Start mesh DNS proxy if enabled
     let dns_proxy_handle = if runtime.dns_enabled {
         let dns_proxy = Arc::new(MeshDnsProxy::new(
@@ -9865,7 +10183,7 @@ async fn serve_mesh_runtime(
         })?;
         let dns_shutdown = shutdown_tx.subscribe();
         let dns_runner = dns_proxy.clone();
-        mesh_background_handles.push(tokio::spawn(async move {
+        owner.push_mesh_background(tokio::spawn(async move {
             dns_runner.run_bound(dns_sockets, dns_shutdown).await;
         }));
         info!(
@@ -9894,9 +10212,9 @@ async fn serve_mesh_runtime(
     // so the SVID-rotating server identity reads the live leaf and fails closed
     // when the slot is empty.
     let mesh_frontend_identity =
-        load_mesh_frontend_server_identity(&env_config, &proxy_state.gateway_svid_bundle)?;
+        load_mesh_frontend_server_identity(env_config, &proxy_state.gateway_svid_bundle)?;
     let inbound_mtls_modes_by_port =
-        resolve_inbound_mtls_modes_by_port(initial_applied_mesh_slice.as_deref(), &runtime);
+        resolve_inbound_mtls_modes_by_port(initial_applied_mesh_slice.as_deref(), runtime);
     let inbound_app_port_by_orig_dst_port =
         resolve_inbound_app_ports_by_orig_dst_port(initial_applied_mesh_slice.as_deref());
     let has_inbound_tls_termination_listener = runtime.has_inbound_tls_termination_listener();
@@ -9906,7 +10224,7 @@ async fn serve_mesh_runtime(
     // leave STRICT/PERMISSIVE overrides unable to build on the default path.
     // Passthrough-only topologies remain exempt through the listener-aware helper.
     let mut initial_inbound_tls_snapshot = mesh_inbound_tls_reload_snapshot_for_listener(
-        &env_config,
+        env_config,
         inbound_mtls_mode,
         inbound_mtls_modes_by_port.clone(),
         has_inbound_tls_termination_listener,
@@ -9918,10 +10236,10 @@ async fn serve_mesh_runtime(
     // material is configured — the listener then keeps operator-CA chain
     // verification. The slot is read live by the verifier and re-published on
     // slice apply so federated trust changes propagate lock-free.
-    let federation_activation = FederationActivation::from_env_config(&env_config);
+    let federation_activation = FederationActivation::from_env_config(env_config);
     let initial_federation_snapshot = mesh_state.federation_store().snapshot();
     let mesh_inbound_spiffe_slot = build_mesh_inbound_spiffe_slot_with_federation(
-        &env_config,
+        env_config,
         initial_applied_mesh_slice.as_deref(),
         Some(&initial_federation_snapshot),
         federation_activation,
@@ -9950,7 +10268,7 @@ async fn serve_mesh_runtime(
         mesh_inbound_spiffe_slot.clone(),
         mesh_runtime_trust_overlay_slot.clone(),
     ) {
-        mesh_background_handles.push(start_mesh_inbound_svid_rotation_republisher(
+        owner.push_mesh_background(start_mesh_inbound_svid_rotation_republisher(
             proxy_state.clone(),
             inbound_slot,
             trust_overlay_slot,
@@ -9959,7 +10277,7 @@ async fn serve_mesh_runtime(
         ));
     }
     let frontend_tls = load_mesh_frontend_tls(
-        &env_config,
+        env_config,
         &tls_policy,
         &crls,
         inbound_mtls_mode,
@@ -9970,7 +10288,7 @@ async fn serve_mesh_runtime(
     )?;
     let frontend_tls_by_port = if has_inbound_tls_termination_listener {
         load_mesh_frontend_tls_by_port(
-            &env_config,
+            env_config,
             &tls_policy,
             &crls,
             &inbound_mtls_modes_by_port,
@@ -9996,8 +10314,8 @@ async fn serve_mesh_runtime(
     let effective_inbound_mtls_modes_by_port =
         effective_inbound_mtls_modes_for_topology(&inbound_mtls_modes_by_port, runtime.topology);
     enforce_mesh_inbound_fail_closed(
-        &runtime,
-        &env_config,
+        runtime,
+        env_config,
         effective_inbound_mtls_mode,
         frontend_tls.as_ref(),
         mesh_inbound_spiffe_slot.as_ref(),
@@ -10005,8 +10323,8 @@ async fn serve_mesh_runtime(
     )?;
     for (&port, tls_config) in &frontend_tls_by_port {
         enforce_mesh_inbound_fail_closed(
-            &runtime,
-            &env_config,
+            runtime,
+            env_config,
             effective_inbound_mtls_modes_by_port[&port],
             tls_config.as_ref(),
             mesh_inbound_spiffe_slot.as_ref(),
@@ -10082,7 +10400,7 @@ async fn serve_mesh_runtime(
         proxy_state.plugin_cache.http_client().clone(),
         mesh_state.federation_store().clone(),
     );
-    mesh_background_handles.push(start_federation_poller_reconcile_task(
+    owner.push_mesh_background(start_federation_poller_reconcile_task(
         mesh_state.clone(),
         federation_manager,
         shutdown_tx.subscribe(),
@@ -10109,14 +10427,14 @@ async fn serve_mesh_runtime(
         });
         let remote_grpc_tls = multicluster::RemoteDiscoveryTlsConfig {
             tls_urls: build_dp_grpc_tls_config(
-                &env_config,
+                env_config,
                 &["https://remote-control-plane.invalid".to_string()],
                 "MeshRemoteDiscovery",
             )?,
             // The scheme is authoritative for plaintext remotes: a `grpc://` /
             // `http://` control_plane_url must NOT get DP gRPC TLS material
             // attached just because TLS env vars are set, or
-            // `fetch_remote_slice_endpoints` would attempt a TLS handshake
+            // `fetch_remote_slice` would attempt a TLS handshake
             // against a plaintext port. (`build_dp_grpc_tls_config(.., &[], ..)`
             // returns `Some(tls)` whenever any TLS env is set, independent of
             // scheme — so force `None` here.) A `grpcs://` / `https://` remote
@@ -10127,6 +10445,7 @@ async fn serve_mesh_runtime(
             env_config.mesh_remote_discovery_poll_interval_seconds,
             env_config.mesh_remote_discovery_poll_timeout_seconds,
             env_config.mesh_remote_discovery_max_stale_seconds,
+            env_config.mesh_config_revision_adopt_secs,
             remote_grpc_secret,
             runtime.node_id.clone(),
             runtime.namespace.clone(),
@@ -10201,7 +10520,7 @@ async fn serve_mesh_runtime(
             multicluster::native_source_factory,
         )
         .with_credentials(remote_discovery_credentials);
-        mesh_background_handles.push(start_remote_cluster_discovery_reconcile_task(
+        owner.push_mesh_background(start_remote_cluster_discovery_reconcile_task(
             mesh_state.clone(),
             remote_discovery_manager,
             federation_activation,
@@ -10210,7 +10529,7 @@ async fn serve_mesh_runtime(
         info!("Cross-cluster endpoint discovery reconciler running");
     }
 
-    let mesh_apply_handle = start_mesh_slice_apply_task(
+    owner.push_core_handle(start_mesh_slice_apply_task(
         mesh_state,
         proxy_state.clone(),
         runtime.clone(),
@@ -10224,14 +10543,14 @@ async fn serve_mesh_runtime(
         },
         shutdown_tx.subscribe(),
         dns_proxy_handle,
-    );
+    ));
 
     info!(
         listeners = runtime.listener_plan().len(),
         ?inbound_mtls_mode,
         "Mesh listener plan prepared"
     );
-    let mut listener_handles = Vec::new();
+    // Listener handles track through `owner` as they are spawned.
     // Admin listeners are startup-critical in mesh mode just like traffic
     // listeners. Keeping their bind signals in the same gate ensures a failed
     // admin bind cannot be hidden by the unconditional readiness store below.
@@ -10343,11 +10662,18 @@ async fn serve_mesh_runtime(
                 );
             }
         });
-        listener_handles.push(handle);
+        owner.push_listener(handle);
         startup_signals.push((label, started_rx));
     }
 
     let startup_result: Result<(), anyhow::Error> = async {
+        if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::InsideStartupGate {
+            let _ = take_mesh_startup_fault_inject();
+            return Err(anyhow::anyhow!(
+                "injected mesh startup failure inside startup_result gate"
+            ));
+        }
+
         proxy_state.initial_reconcile_stream_listeners().await?;
         wait_for_start_signals(startup_signals, Duration::from_secs(10)).await?;
         proxy_state
@@ -10359,61 +10685,7 @@ async fn serve_mesh_runtime(
         Ok(())
     }
     .await;
-    if let Err(e) = startup_result {
-        warn!(
-            "Mesh runtime startup failed after spawning tasks: {}; draining before returning",
-            e
-        );
-        let _ = shutdown_tx.send(true);
-        let _ =
-            await_mesh_listener_handles(listener_handles, shutdown_tx.clone(), "startup failure")
-                .await;
-        shutdown_and_join_mesh(
-            proxy_state,
-            MeshBackgroundTasks {
-                handles: vec![
-                    dns_handle,
-                    overload_handle,
-                    metrics_handle,
-                    runtime_system_handle,
-                    runtime_window_handle,
-                    mesh_apply_handle,
-                ],
-                dns_retry_handle,
-                per_ip_cleanup_handle,
-                health_check_handles,
-                mesh_background_handles,
-            },
-            env_config.shutdown_drain_seconds,
-        )
-        .await;
-        return Err(e);
-    }
-
-    let listener_result =
-        await_mesh_listener_handles(listener_handles, shutdown_tx.clone(), "shutdown").await;
-
-    shutdown_and_join_mesh(
-        proxy_state,
-        MeshBackgroundTasks {
-            handles: vec![
-                dns_handle,
-                overload_handle,
-                metrics_handle,
-                runtime_system_handle,
-                runtime_window_handle,
-                mesh_apply_handle,
-            ],
-            dns_retry_handle,
-            per_ip_cleanup_handle,
-            health_check_handles,
-            mesh_background_handles,
-        },
-        env_config.shutdown_drain_seconds,
-    )
-    .await;
-    info!("Mesh runtime mode shutting down");
-    listener_result?;
+    startup_result?;
     Ok(())
 }
 
@@ -10506,6 +10778,46 @@ fn start_mesh_admin_listeners(
         env_config.admin_max_connections_per_ip,
     ));
 
+    // Validate admin HTTPS TLS material BEFORE spawning any admin listener so a
+    // bad cert/key cannot orphan an already-running plaintext admin task
+    // (issue #2372 — handles must be known to the startup rollback owner).
+    // TLS loading goes through `startup_security` for validate/serve parity
+    // (issue #2976).
+    let admin_https_plan = if env_config.admin_https_port == 0 {
+        info!(
+            "{} — mesh admin HTTPS listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
+        );
+        None
+    } else if env_config.admin_https_listener_enabled() {
+        let admin_https_addr = env_config.admin_socket_addr(env_config.admin_https_port);
+        let admin_tls_config = startup_security::load_admin_tls_material(
+            env_config,
+            tls_policy,
+            crls,
+            "Invalid mesh admin TLS configuration",
+        )?;
+        let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
+            admin_tls_config.clone(),
+            env_config,
+            tls_policy,
+            crls,
+            Some(shutdown_tx.subscribe()),
+        );
+        if admin_reload_handles.watcher_handle.is_some() {
+            info!("Frontend TLS live reload enabled for mesh admin HTTPS");
+        }
+        Some((
+            admin_https_addr,
+            admin_tls_config,
+            admin_reload_handles.slot.clone(),
+            admin_reload_handles.watcher_handle,
+        ))
+    } else {
+        info!("Mesh admin TLS not configured - HTTPS listener disabled");
+        None
+    };
+
     if env_config.admin_http_port != 0 {
         let admin_http_addr = env_config.admin_socket_addr(env_config.admin_http_port);
         let shutdown = shutdown_tx.subscribe();
@@ -10551,32 +10863,12 @@ fn start_mesh_admin_listeners(
         );
     }
 
-    // Admin HTTPS listener (only if TLS is configured and the port is not
-    // disabled — port 0 is the repository-wide disable sentinel).
-    if env_config.admin_https_port == 0 {
-        info!(
-            "{} — mesh admin HTTPS listener disabled",
-            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
-        );
-    } else if env_config.admin_https_listener_enabled() {
-        let admin_https_addr = env_config.admin_socket_addr(env_config.admin_https_port);
-        let admin_tls_config = startup_security::load_admin_tls_material(
-            env_config,
-            tls_policy,
-            crls,
-            "Invalid mesh admin TLS configuration",
-        )?;
-        let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
-            admin_tls_config.clone(),
-            env_config,
-            tls_policy,
-            crls,
-            Some(shutdown_tx.subscribe()),
-        );
-        if admin_reload_handles.watcher_handle.is_some() {
-            info!("Frontend TLS live reload enabled for mesh admin HTTPS");
+    if let Some((admin_https_addr, admin_tls_config, admin_tls_slot, watcher_handle)) =
+        admin_https_plan
+    {
+        if let Some(handle) = watcher_handle {
+            handles.push(handle);
         }
-        let admin_tls_slot = admin_reload_handles.slot.clone();
         let shutdown = shutdown_tx.subscribe();
         let admin_https_limiter = admin_conn_limiter.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -10625,8 +10917,6 @@ fn start_mesh_admin_listeners(
             }
         }));
         startup_signals.push(("Mesh admin HTTPS listener".to_string(), started_rx));
-    } else {
-        info!("Mesh admin TLS not configured - HTTPS listener disabled");
     }
 
     if env_config.admin_http_port == 0 && !env_config.admin_https_listener_enabled() {
@@ -13140,6 +13430,10 @@ async fn apply_mesh_slice_generation(
     last_applied_slice: &mut Option<Arc<MeshSlice>>,
     dns_proxy: &Option<Arc<MeshDnsProxy>>,
 ) -> bool {
+    // Capture before any asynchronous preparation. An operator reset that
+    // lands while this generation is being built invalidates the token, so a
+    // late successful apply cannot resurrect the cleared freshness watermark.
+    let revision_apply_token = mesh_state.begin_revision_apply(base_slice);
     if has_termination_listener && !live_reload_enabled {
         let fixed_policy = proxy_state.mesh_inbound_tls_policy.load();
         if let Some((port, mode)) = newly_selectable_inbound_peer_auth_port_requires_reload(
@@ -13209,6 +13503,8 @@ async fn apply_mesh_slice_generation(
         federation_activation,
     ) {
         Ok(mut config) => {
+            let trusted_mesh_ids =
+                TrustedMeshGeneratedResourceIds::from_materialized_config(&config);
             let previous_config = proxy_state.config.load_full();
             // Materialized mesh upstreams are rebuilt with fresh per-apply
             // timestamps every slice apply (the materializers stamp `Utc::now()`
@@ -13259,7 +13555,7 @@ async fn apply_mesh_slice_generation(
             let dns_slice = dns_proxy.as_ref().and_then(|_| {
                 node_waypoint_dns_slice_for_prepared_config(runtime, base_slice, &config)
             });
-            let outcome = proxy_state.update_config(config);
+            let outcome = proxy_state.update_mesh_config(config, &trusted_mesh_ids);
             let applied = outcome.applied();
             let accepted = outcome.accepted();
             // Publish the node-waypoint resolver snapshot the instant the proxy
@@ -13283,7 +13579,13 @@ async fn apply_mesh_slice_generation(
             if accepted && let Some((resolver, snapshot)) = staged_policy_scopes {
                 resolver.install_policy_scope_snapshot(snapshot);
             }
-            record_mesh_slice_apply_result(mesh_state, last_applied_slice, base_slice, accepted);
+            record_mesh_slice_apply_result(
+                mesh_state,
+                last_applied_slice,
+                base_slice,
+                accepted,
+                revision_apply_token,
+            );
             if accepted {
                 publish_gateway_active_trust_bundles(
                     proxy_state,
@@ -13395,11 +13697,13 @@ fn start_mesh_slice_apply_task(
                 let slice_unchanged =
                     mesh_slice_matches_last_applied(last_applied_slice.as_deref(), slice);
                 if slice_unchanged && !federation_changed && !remote_changed {
+                    let revision_apply_token = mesh_state.begin_revision_apply(slice);
                     record_mesh_slice_apply_result(
                         &mesh_state,
                         &mut last_applied_slice,
                         slice,
                         true,
+                        revision_apply_token,
                     );
                     debug!(
                         mesh_slice_version = %slice.version,
@@ -13429,6 +13733,19 @@ fn start_mesh_slice_apply_task(
                         &dns_proxy,
                     )
                     .await;
+                    // Issue #2473 lifecycle: the freshness gate advanced its
+                    // accepted watermark when this slice entered the received
+                    // slot, but the proxy runtime is a second, independent
+                    // gate. A candidate the runtime just refused never became
+                    // the serving generation, so its revision must not keep the
+                    // watermark — otherwise one runtime-invalid slice published
+                    // at a far-future sequence would quarantine every valid
+                    // revision beneath it and block recovery. Roll back to the
+                    // last APPLIED revision, keyed to this exact received
+                    // candidate so a newer one received mid-apply is untouched.
+                    if !received_accepted {
+                        mesh_state.record_rejected_slice(&snapshot);
+                    }
                     // Finding 3 (accepted-remote/federation update vs rejected
                     // received slice): the discovery + federation pollers are
                     // keyed to the ACCEPTED slice, so they can publish overlay
@@ -13517,9 +13834,10 @@ fn record_mesh_slice_apply_result(
     last_applied_slice: &mut Option<Arc<MeshSlice>>,
     slice: &MeshSlice,
     applied: bool,
+    revision_apply_token: Option<revision::MeshRevisionApplyToken>,
 ) {
     if applied {
-        mesh_state.record_applied_slice(slice);
+        mesh_state.record_applied_slice_with_token(slice, revision_apply_token);
         *last_applied_slice = Some(Arc::new(slice.clone()));
     }
 }
@@ -13530,6 +13848,173 @@ struct MeshBackgroundTasks {
     per_ip_cleanup_handle: Option<JoinHandle<()>>,
     health_check_handles: Vec<JoinHandle<()>>,
     mesh_background_handles: Vec<JoinHandle<()>>,
+}
+
+/// Accumulates mesh startup side effects (tasks / listeners) as they are
+/// created so any later initialization error can signal shared shutdown and
+/// run bounded teardown before returning the original cause (issue #2372).
+struct MeshStartupOwner {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    proxy_state: ProxyState,
+    tasks: MeshBackgroundTasks,
+    listener_handles: Vec<JoinHandle<()>>,
+    drain_seconds: u64,
+    finalize_global_plugins_on_shutdown: bool,
+}
+
+impl MeshStartupOwner {
+    fn new(
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        proxy_state: ProxyState,
+        health_check_handles: Vec<JoinHandle<()>>,
+        mesh_background_handles: Vec<JoinHandle<()>>,
+        drain_seconds: u64,
+        finalize_global_plugins_on_shutdown: bool,
+    ) -> Self {
+        Self {
+            shutdown_tx,
+            proxy_state,
+            tasks: MeshBackgroundTasks {
+                handles: Vec::new(),
+                dns_retry_handle: None,
+                per_ip_cleanup_handle: None,
+                health_check_handles,
+                mesh_background_handles,
+            },
+            listener_handles: Vec::new(),
+            drain_seconds,
+            finalize_global_plugins_on_shutdown,
+        }
+    }
+
+    fn set_proxy_state(&mut self, proxy_state: ProxyState) {
+        self.proxy_state = proxy_state;
+    }
+
+    fn mesh_background_mut(&mut self) -> &mut Vec<JoinHandle<()>> {
+        &mut self.tasks.mesh_background_handles
+    }
+
+    fn push_mesh_background(&mut self, handle: JoinHandle<()>) {
+        self.tasks.mesh_background_handles.push(handle);
+    }
+
+    fn extend_mesh_background(&mut self, handles: impl IntoIterator<Item = JoinHandle<()>>) {
+        self.tasks.mesh_background_handles.extend(handles);
+    }
+
+    fn push_core_handle(&mut self, handle: JoinHandle<()>) {
+        self.tasks.handles.push(handle);
+    }
+
+    fn set_dns_retry_handle(&mut self, handle: Option<JoinHandle<()>>) {
+        self.tasks.dns_retry_handle = handle;
+    }
+
+    fn set_per_ip_cleanup_handle(&mut self, handle: Option<JoinHandle<()>>) {
+        self.tasks.per_ip_cleanup_handle = handle;
+    }
+
+    fn push_listener(&mut self, handle: JoinHandle<()>) {
+        self.listener_handles.push(handle);
+    }
+
+    /// Signal shutdown, drain listeners/tasks with a bound, preserve `err`.
+    async fn fail_with(self, err: anyhow::Error) -> anyhow::Error {
+        warn!(
+            "Mesh runtime startup failed after spawning tasks: {}; draining before returning",
+            err
+        );
+        let _ = self.shutdown_tx.send(true);
+        // Startup rollback must not wait forever on a stuck listener — bound the
+        // join and abort stragglers, then continue background teardown. Normal
+        // serve-until-shutdown keeps unbounded await semantics below.
+        join_mesh_listener_handles_bounded(
+            self.listener_handles,
+            MESH_STARTUP_LISTENER_DRAIN_TIMEOUT,
+            "startup failure",
+        )
+        .await;
+        shutdown_and_join_mesh(
+            self.proxy_state,
+            self.tasks,
+            self.drain_seconds,
+            self.finalize_global_plugins_on_shutdown,
+        )
+        .await;
+        err
+    }
+
+    /// Normal post-readiness serve path: wait for listeners, then graceful join.
+    async fn serve_until_shutdown(self) -> Result<(), anyhow::Error> {
+        let listener_result = await_mesh_listener_handles(
+            self.listener_handles,
+            self.shutdown_tx.clone(),
+            "shutdown",
+        )
+        .await;
+        shutdown_and_join_mesh(
+            self.proxy_state,
+            self.tasks,
+            self.drain_seconds,
+            self.finalize_global_plugins_on_shutdown,
+        )
+        .await;
+        info!("Mesh runtime mode shutting down");
+        listener_result?;
+        Ok(())
+    }
+}
+
+/// Bound for joining mesh background tasks during startup rollback.
+const MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound for joining mesh listeners during startup-failure rollback only.
+/// Normal serve-until-shutdown retains unbounded await semantics.
+const MESH_STARTUP_LISTENER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Signal shared shutdown and boundedly join already-running mesh background
+/// tasks after a failure that precedes [`MeshStartupOwner`] (initial-config wait
+/// or pre-`ProxyState` preparation). Preserves `err` as the returned cause.
+async fn fail_mesh_pre_owner(
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    handles: Vec<JoinHandle<()>>,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    warn!(
+        "Mesh runtime startup failed after spawning config consumers: {}; draining before returning",
+        err
+    );
+    let _ = shutdown_tx.send(true);
+    join_mesh_background_handles(handles, MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT).await;
+    err
+}
+
+/// Test-only fault injection for issue #2372 external probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum MeshStartupFaultInject {
+    #[default]
+    None,
+    /// Before `MeshStartupOwner` exists (UDP / TLS / CRL / ProxyState class).
+    BeforeOwner,
+    /// After side effects exist, before the final `startup_result` gate
+    /// (SVID / TLS / DNS-bind class failures).
+    BeforeStartupGate,
+    /// Inside the existing listener/start-signal `startup_result` gate.
+    InsideStartupGate,
+}
+
+std::thread_local! {
+    static MESH_STARTUP_FAULT_INJECT: std::cell::Cell<MeshStartupFaultInject> =
+        const { std::cell::Cell::new(MeshStartupFaultInject::None) };
+}
+
+fn take_mesh_startup_fault_inject() -> MeshStartupFaultInject {
+    MESH_STARTUP_FAULT_INJECT.with(|cell| cell.replace(MeshStartupFaultInject::None))
+}
+
+fn peek_mesh_startup_fault_inject() -> MeshStartupFaultInject {
+    MESH_STARTUP_FAULT_INJECT.with(|cell| cell.get())
 }
 
 async fn await_mesh_listener_handles(
@@ -13557,10 +14042,63 @@ async fn await_mesh_listener_handles(
     }
 }
 
+/// Join listener tasks with a bound during startup-failure rollback; abort any
+/// still-running listeners when the timeout elapses so a stuck accept loop
+/// cannot wedge rollback forever. Dropping JoinHandles alone would detach them.
+async fn join_mesh_listener_handles_bounded(
+    listener_handles: Vec<JoinHandle<()>>,
+    timeout: Duration,
+    reason: &str,
+) {
+    if listener_handles.is_empty() {
+        return;
+    }
+    let abort_handles: Vec<_> = listener_handles
+        .iter()
+        .map(|handle| handle.abort_handle())
+        .collect();
+    let drain = async {
+        for handle in listener_handles {
+            let _ = handle.await;
+        }
+    };
+    if tokio::time::timeout(timeout, drain).await.is_err() {
+        warn!(
+            reason,
+            "Mesh listeners did not drain within {}s during startup rollback; aborting stragglers",
+            timeout.as_secs()
+        );
+        for abort in abort_handles {
+            abort.abort();
+        }
+    }
+}
+
+/// Join background tasks with a bound; abort any still-running tasks when the
+/// timeout elapses so startup rollback cannot leave them detached forever.
+async fn join_mesh_background_handles(handles: Vec<JoinHandle<()>>, timeout: Duration) {
+    let abort_handles: Vec<_> = handles.iter().map(|handle| handle.abort_handle()).collect();
+    let drain = async {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    };
+    if tokio::time::timeout(timeout, drain).await.is_err() {
+        warn!(
+            "Mesh background tasks did not drain within {}s; aborting stragglers",
+            timeout.as_secs()
+        );
+        for abort in abort_handles {
+            abort.abort();
+        }
+    }
+}
+
 async fn shutdown_and_join_mesh(
     proxy_state: ProxyState,
     mut tasks: MeshBackgroundTasks,
     drain_seconds: u64,
+    finalize_global_plugins: bool,
 ) {
     proxy_state.stream_listener_manager.shutdown_all().await;
     crate::overload::begin_drain(&proxy_state.overload);
@@ -13581,13 +14119,225 @@ async fn shutdown_and_join_mesh(
     tasks.handles.extend(tasks.health_check_handles);
     tasks.handles.extend(tasks.mesh_background_handles);
 
-    crate::modes::file::join_background_handles(tasks.handles, Duration::from_secs(5)).await;
-    crate::observability_delivery::shutdown(Duration::from_millis(
-        proxy_state.env_config.log_shutdown_drain_timeout_ms,
-    ))
-    .await;
-    crate::plugins::api_chargeback_sink::finalize_all_snapshot_generations().await;
-    crate::plugins::kafka_logging::finalize_all_generations().await;
+    join_mesh_background_handles(tasks.handles, MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT).await;
+    if finalize_global_plugins {
+        crate::observability_delivery::shutdown(Duration::from_millis(
+            proxy_state.env_config.log_shutdown_drain_timeout_ms,
+        ))
+        .await;
+        crate::plugins::api_chargeback_sink::finalize_all_snapshot_generations().await;
+        crate::plugins::kafka_logging::finalize_all_generations().await;
+    }
+}
+
+/// External coverage seams for issue #2372 mesh startup rollback.
+///
+/// `src/main.rs` re-declares modules without the `_test_support` bridge, so this
+/// module is unused in the binary target — hence the module-scoped
+/// `allow(dead_code)`. Production code is not suppressed.
+#[allow(dead_code)]
+#[doc(hidden)]
+pub mod startup_rollback_test_seams {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Observable result for the external #2372 startup-rollback probes.
+    #[derive(Debug, Clone)]
+    pub struct MeshStartupRollbackProbe {
+        pub ok: bool,
+        pub error: Option<String>,
+        /// The netns-style sentinel observed the shared shutdown signal.
+        pub shutdown_observed: bool,
+        /// The sentinel finished its post-loop async teardown before return.
+        pub teardown_completed: bool,
+    }
+
+    /// Observable result for the bounded startup-failure listener join probe.
+    #[derive(Debug, Clone)]
+    pub struct MeshStartupListenerDrainProbe {
+        /// Join returned within a short wall-clock budget (not wedged forever).
+        pub returned_promptly: bool,
+        /// The stuck listener was aborted after the drain timeout.
+        pub stuck_aborted: bool,
+    }
+
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    fn probe_runtime_config() -> MeshRuntimeConfig {
+        MeshRuntimeConfig {
+            node_id: "node-a".to_string(),
+            namespace: "ferrum".to_string(),
+            cp_urls: vec!["http://127.0.0.1:1".to_string()],
+            config_protocol: MeshConfigProtocol::Native,
+            file_config_path: None,
+            topology: MeshTopology::Sidecar,
+            inbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            outbound_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            hbone_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            east_west_listen_port: DEFAULT_EAST_WEST_LISTEN_PORT,
+            egress_hbone_port: hbone::ISTIO_HBONE_PORT,
+            egress_mtls_port: crate::proxy::mesh_mtls_pool::ISTIO_SIDECAR_INBOUND_PORT,
+            egress_listen_addr: DEFAULT_EGRESS_LISTEN_ADDR.parse().unwrap(),
+            workload_spiffe_id: None,
+            waypoint_name: None,
+            xds_node_cluster: "ferrum".to_string(),
+            xds_stream_channel_capacity: 32,
+            xds_primary_retry_secs: 300,
+            xds_connect_timeout_seconds: 10,
+            trust_domain_aliases: Vec::new(),
+            trusted_hbone_assertors: Vec::new(),
+            workload_labels: HashMap::new(),
+            workload_svid_cert_path: None,
+            workload_svid_key_path: None,
+            workload_svid_trust_bundle_path: None,
+            ca_backend: CaBackend::None,
+            dns_enabled: false,
+            dns_listen_addr: DEFAULT_DNS_LISTEN_ADDR.parse().unwrap(),
+            dns_upstream_addr: DEFAULT_DNS_UPSTREAM_ADDR.parse().unwrap(),
+            dns_ttl_seconds: DEFAULT_DNS_TTL_SECONDS,
+            dns_max_concurrent_queries: DEFAULT_DNS_MAX_CONCURRENT_QUERIES,
+            dns_response_cache_max_entries: dns_proxy::DEFAULT_DNS_RESPONSE_CACHE_MAX_ENTRIES,
+            cluster_domain: dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
+            capture_mode: crate::capture::CaptureMode::Explicit,
+            outbound_traffic_policy: crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            outbound_registry_reject_status: 502,
+            sidecar_enforced: false,
+            sidecar_enforced_dry_run: false,
+            sidecar_identity_narrowing: false,
+            egress_stream_enabled: false,
+            egress_stream_allow_plaintext: false,
+            request_auth_require_exp: true,
+            locality_lb_strict: false,
+        }
+    }
+
+    fn probe_env_config() -> EnvConfig {
+        EnvConfig {
+            mode: crate::config::OperatingMode::Mesh,
+            pool_warmup_enabled: false,
+            shutdown_drain_seconds: 0,
+            accept_threads: 1,
+            admin_http_port: 0,
+            admin_https_port: 0,
+            frontend_tls_cert_path: Some("tests/certs/server.crt".to_string()),
+            frontend_tls_key_path: Some("tests/certs/server.key".to_string()),
+            ..EnvConfig::default()
+        }
+    }
+
+    /// Spawn a netns-manager-shaped sentinel: wait for shutdown, then run an
+    /// async teardown step before exiting. Rollback must await this completion.
+    fn spawn_netns_style_sentinel(
+        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        shutdown_observed: Arc<AtomicBool>,
+        teardown_completed: Arc<AtomicBool>,
+    ) -> JoinHandle<()> {
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+            shutdown_observed.store(true, Ordering::Release);
+            // Mimic NetnsUdpCaptureManager's post-loop async `shutdown_all`.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            teardown_completed.store(true, Ordering::Release);
+        })
+    }
+
+    async fn probe_with_fault(fault: MeshStartupFaultInject) -> MeshStartupRollbackProbe {
+        ensure_crypto_provider();
+        let env = probe_env_config();
+        let runtime = probe_runtime_config();
+        let config = prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).unwrap();
+        let mesh_state = MeshRuntimeState::new();
+        mesh_state.install_slice(MeshSlice {
+            version: chrono::Utc::now().to_rfc3339(),
+            ..MeshSlice::default()
+        });
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let shutdown_observed = Arc::new(AtomicBool::new(false));
+        let teardown_completed = Arc::new(AtomicBool::new(false));
+        let sentinel = spawn_netns_style_sentinel(
+            &shutdown_tx,
+            shutdown_observed.clone(),
+            teardown_completed.clone(),
+        );
+
+        MESH_STARTUP_FAULT_INJECT.with(|cell| cell.set(fault));
+        let result = serve_mesh_runtime(
+            env,
+            runtime,
+            config,
+            shutdown_tx,
+            mesh_state,
+            None,
+            MeshRuntimeBackgroundOwnership {
+                handles: vec![sentinel],
+                finalize_global_plugins_on_shutdown: false,
+            },
+        )
+        .await;
+        // Clear any unused inject so later tests cannot observe a stale fault.
+        let _ = take_mesh_startup_fault_inject();
+
+        MeshStartupRollbackProbe {
+            ok: result.is_ok(),
+            error: result.err().map(|e| e.to_string()),
+            shutdown_observed: shutdown_observed.load(Ordering::Acquire),
+            teardown_completed: teardown_completed.load(Ordering::Acquire),
+        }
+    }
+
+    /// Failure after admin/netns side effects, before the final startup_result gate.
+    pub async fn probe_failure_before_startup_result_gate_for_test() -> MeshStartupRollbackProbe {
+        probe_with_fault(MeshStartupFaultInject::BeforeStartupGate).await
+    }
+
+    /// Failure inside the existing listener/start-signal startup_result gate.
+    pub async fn probe_failure_inside_startup_result_gate_for_test() -> MeshStartupRollbackProbe {
+        probe_with_fault(MeshStartupFaultInject::InsideStartupGate).await
+    }
+
+    /// Failure before MeshStartupOwner exists (pre-ProxyState preparation).
+    pub async fn probe_failure_before_owner_for_test() -> MeshStartupRollbackProbe {
+        probe_with_fault(MeshStartupFaultInject::BeforeOwner).await
+    }
+
+    /// Stuck listeners must not wedge startup-failure rollback forever.
+    pub async fn probe_startup_failure_listener_join_is_bounded_for_test()
+    -> MeshStartupListenerDrainProbe {
+        let stuck = tokio::spawn(std::future::pending::<()>());
+        let stuck_abort = stuck.abort_handle();
+        let started = std::time::Instant::now();
+        join_mesh_listener_handles_bounded(
+            vec![stuck],
+            Duration::from_millis(20),
+            "startup failure probe",
+        )
+        .await;
+        let returned_promptly = started.elapsed() < Duration::from_millis(500);
+        // AbortHandle::is_finished becomes true once the aborted task ends.
+        let stuck_aborted = tokio::time::timeout(Duration::from_secs(1), async {
+            while !stuck_abort.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        MeshStartupListenerDrainProbe {
+            returned_promptly,
+            stuck_aborted,
+        }
+    }
 }
 
 fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
@@ -14465,7 +15215,10 @@ mod tests {
                 task_shutdown,
                 mesh_state,
                 None,
-                Vec::new(),
+                MeshRuntimeBackgroundOwnership {
+                    handles: Vec::new(),
+                    finalize_global_plugins_on_shutdown: true,
+                },
             )
             .await
         });
@@ -14908,6 +15661,60 @@ mod tests {
     }
 
     #[test]
+    fn mesh_outbound_materialization_qualifies_lossy_generated_ids() {
+        let service_and_workload =
+            |namespace: &str, name: &str, address: &str| -> (MeshService, Workload) {
+                let spiffe = format!("spiffe://cluster.local/ns/{namespace}/sa/{name}");
+                let mut service = http_mesh_service(name, 8080, &spiffe);
+                service.namespace = namespace.to_string();
+
+                let mut workload = workload_with_address(name, name, address);
+                workload.spiffe_id = SpiffeId::new(&spiffe).expect("spiffe id");
+                workload.namespace = namespace.to_string();
+                workload.selector.namespace = Some(namespace.to_string());
+                (service, workload)
+            };
+        let (service_a, workload_a) = service_and_workload("a", "b-c", "10.0.0.1");
+        let (service_b, workload_b) = service_and_workload("a-b", "c", "10.0.0.2");
+        let proxy_id_a = mesh_outbound_proxy_id("a", "b-c", 8080);
+        let proxy_id_b = mesh_outbound_proxy_id("a-b", "c", 8080);
+        let upstream_id_a = mesh_outbound_upstream_id("a", "b-c", 8080);
+        let upstream_id_b = mesh_outbound_upstream_id("a-b", "c", 8080);
+        assert_eq!(proxy_id_a, proxy_id_b, "proxy id join is lossy");
+        assert_eq!(upstream_id_a, upstream_id_b, "upstream id join is lossy");
+
+        let slice = MeshSlice {
+            namespace: "default".to_string(),
+            workloads: vec![workload_a, workload_b],
+            services: vec![service_a, service_b],
+            ..MeshSlice::default()
+        };
+        let mut config = GatewayConfig::default();
+        materialize_mesh_outbound_proxies(&mut config, &ambient_runtime(), &slice);
+
+        let proxy_namespaces: std::collections::HashSet<&str> = config
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.id == proxy_id_a)
+            .map(|proxy| proxy.namespace.as_str())
+            .collect();
+        let upstream_namespaces: std::collections::HashSet<&str> = config
+            .upstreams
+            .iter()
+            .filter(|upstream| upstream.id == upstream_id_a)
+            .map(|upstream| upstream.namespace.as_str())
+            .collect();
+        assert_eq!(
+            proxy_namespaces,
+            std::collections::HashSet::from(["a", "a-b"])
+        );
+        assert_eq!(
+            upstream_namespaces,
+            std::collections::HashSet::from(["a", "a-b"])
+        );
+    }
+
+    #[test]
     fn mesh_outbound_node_waypoint_dev_fallback_materializes_plaintext_captured_service_route() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/reviews";
         let slice = MeshSlice {
@@ -15204,6 +16011,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["reviews"],
             "the prepared config carries the slice-narrowed services view"
+        );
+    }
+
+    #[test]
+    fn mesh_runtime_resource_id_allowlist_is_exact_and_materialization_scoped() {
+        let runtime = test_mesh_runtime_config();
+        let prepared =
+            prepare_gateway_config_for_mesh(GatewayConfig::default(), &runtime).expect("prepare");
+        assert!(
+            prepared
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id.starts_with("__mesh")),
+            "fixture must contain a trusted mesh-generated resource"
+        );
+        assert!(
+            prepared.validate_resource_ids().is_err(),
+            "the ordinary external config boundary must stay strict"
+        );
+
+        let trusted = TrustedMeshGeneratedResourceIds::from_materialized_config(&prepared);
+        crate::proxy::validate_runtime_resource_ids(&prepared, Some(&trusted))
+            .expect("exact mesh-generated identities pass the runtime check");
+
+        let mut hostile = prepared;
+        let mut injected = hostile
+            .plugin_configs
+            .first()
+            .cloned()
+            .expect("managed plugin");
+        injected.id = "__mesh_hostile_after_materialization".to_string();
+        hostile.plugin_configs.push(injected);
+        let errors = crate::proxy::validate_runtime_resource_ids(&hostile, Some(&trusted))
+            .expect_err("an unrecorded reserved identity must still fail closed");
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("PluginConfig ID")
+                    && error.contains("__mesh_hostile_after_materialization")
+            }),
+            "unexpected runtime identity errors: {errors:?}"
         );
     }
 
@@ -16307,6 +17154,80 @@ mod tests {
                 .iter()
                 .all(|plugin| plugin.proxy_id.as_deref() != Some("operator-udp")),
             "proxy-scoped plugin config must not dangle after disabling UDP proxy"
+        );
+    }
+
+    #[test]
+    fn mesh_outbound_relay_builder_preserves_backend_protocol_dispatch() {
+        let tcp = mesh_outbound_tcp_relay_proxy("default", "redis", 6379, "tcp-upstream");
+        let udp = mesh_outbound_udp_relay_proxy("default", "dns", 53, "udp-upstream");
+
+        assert_eq!(tcp.backend_scheme, Some(BackendScheme::Tcp));
+        assert_eq!(tcp.dispatch_kind, DispatchKind::TcpRaw);
+        assert_eq!(udp.backend_scheme, Some(BackendScheme::Udp));
+        assert_eq!(udp.dispatch_kind, DispatchKind::UdpRaw);
+    }
+
+    #[test]
+    fn node_waypoint_udp_fail_closed_pruning_is_namespace_qualified() {
+        let mut udp_proxy =
+            mesh_outbound_udp_relay_proxy("default", "operator-dns", 53, "operator-upstream");
+        udp_proxy.id = "shared".to_string();
+        let mut other_proxy = destination_rule_test_proxy("shared", "other-upstream");
+        other_proxy.namespace = "tenant-b".to_string();
+
+        let plugin = |id: &str, namespace: &str| PluginConfig {
+            id: id.to_string(),
+            plugin_name: "tcp_logging".to_string(),
+            namespace: namespace.to_string(),
+            config: serde_json::json!({}),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("shared".to_string()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        // Scoped fail-closed is driven by mesh_authz plugin config with
+        // per_pod_policy_scoping, not by MeshConfig.mesh_policies alone.
+        let operator_authz = global_mesh_authz_plugin(
+            "operator-mesh-authz",
+            serde_json::json!({
+                "per_pod_policy_scoping": true,
+                "mesh_policies": [scoped_node_waypoint_deny_policy()],
+            }),
+        );
+        let mut config = GatewayConfig {
+            proxies: vec![udp_proxy, other_proxy],
+            plugin_configs: vec![
+                plugin("default-shared-plugin", "default"),
+                plugin("tenant-b-shared-plugin", "tenant-b"),
+                operator_authz,
+            ],
+            ..GatewayConfig::default()
+        };
+        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+
+        fail_closed_node_waypoint_udp_dtls_scoped_policies(&mut config, &runtime);
+
+        assert_eq!(config.proxies.len(), 1);
+        assert_eq!(config.proxies[0].namespace, "tenant-b");
+        assert_eq!(config.proxies[0].id, "shared");
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.namespace == "tenant-b"
+                    && plugin.id == "tenant-b-shared-plugin"),
+            "same-id proxy plugin in another namespace must survive UDP fail-closed pruning"
+        );
+        assert!(
+            !config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.namespace == "default" && plugin.id == "default-shared-plugin"),
+            "UDP proxy-scoped plugins must prune only within the UDP proxy's namespace"
         );
     }
 
@@ -20002,8 +20923,13 @@ mod tests {
             ..GatewayConfig::default()
         };
         // p2 selects subset v1 — should pick up the subset overlay.
+        // `resolve_upstream_tls` resolves upstream/subset TLS by
+        // `(namespace, upstream_id)`, so the proxy must declare the test
+        // upstream's namespace explicitly — the serde default is
+        // `DEFAULT_NAMESPACE` ("ferrum"), not `"default"`.
         let mut p2: Proxy = serde_json::from_value(serde_json::json!({
             "id": "p2",
+            "namespace": "default",
             "hosts": ["p2.example.com"],
             "backend_host": "",
             "backend_port": 0,
@@ -20533,6 +21459,7 @@ mod tests {
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             labels_ambiguous: false,
             version: "test".to_string(),
+            revision: None,
             workloads: Vec::new(),
             ambient_udp_source_workloads: Vec::new(),
             node_waypoint_assertors: Vec::new(),
@@ -21385,6 +22312,61 @@ mod tests {
                 .plugin_configs
                 .iter()
                 .all(|plugin| plugin.id != MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+        );
+    }
+
+    #[test]
+    fn mesh_managed_plugin_cleanup_is_namespace_qualified() {
+        let runtime = test_mesh_runtime_config();
+        let now = chrono::Utc::now();
+        let mut config = GatewayConfig {
+            plugin_configs: vec![
+                PluginConfig {
+                    id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
+                    plugin_name: "mesh_outbound_registry".to_string(),
+                    namespace: runtime.namespace.clone(),
+                    config: serde_json::json!({"registry": ["stale.default"]}),
+                    scope: PluginScope::Global,
+                    proxy_id: None,
+                    enabled: true,
+                    priority_override: None,
+                    api_spec_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                PluginConfig {
+                    id: MESH_OUTBOUND_REGISTRY_PLUGIN_ID.to_string(),
+                    plugin_name: "mesh_outbound_registry".to_string(),
+                    namespace: "tenant-b".to_string(),
+                    config: serde_json::json!({"registry": ["tenant-b.example"]}),
+                    scope: PluginScope::Global,
+                    proxy_id: None,
+                    enabled: true,
+                    priority_override: None,
+                    api_spec_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            ],
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice {
+            outbound_traffic_policy: Some(
+                crate::modes::mesh::config::OutboundTrafficPolicy::AllowAny,
+            ),
+            ..MeshSlice::default()
+        };
+
+        inject_mesh_global_plugins(&mut config, &runtime, &slice);
+
+        assert_eq!(
+            config
+                .plugin_configs
+                .iter()
+                .filter(|plugin| plugin.id == MESH_OUTBOUND_REGISTRY_PLUGIN_ID)
+                .map(|plugin| plugin.namespace.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tenant-b"]
         );
     }
 
@@ -22845,6 +23827,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reconcile_mesh_upstream_timestamps_is_namespace_qualified() {
+        let first_now = chrono::Utc::now();
+        let second_now = first_now + chrono::Duration::seconds(5);
+        let mut tenant_a = reconcile_test_upstream("shared", 8080, first_now);
+        tenant_a.namespace = "tenant-a".to_string();
+        let mut tenant_b = reconcile_test_upstream("shared", 9090, first_now);
+        tenant_b.namespace = "tenant-b".to_string();
+        let accepted = GatewayConfig {
+            upstreams: vec![tenant_a.clone(), tenant_b.clone()],
+            ..GatewayConfig::default()
+        };
+
+        tenant_a.created_at = second_now;
+        tenant_a.updated_at = second_now;
+        tenant_b.created_at = second_now;
+        tenant_b.updated_at = second_now;
+        let mut candidate = GatewayConfig {
+            upstreams: vec![tenant_b, tenant_a],
+            ..GatewayConfig::default()
+        };
+
+        reconcile_mesh_upstream_timestamps(&mut candidate, &accepted);
+
+        let reconciled_a = candidate
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == "tenant-a")
+            .expect("tenant-a upstream");
+        let reconciled_b = candidate
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.namespace == "tenant-b")
+            .expect("tenant-b upstream");
+        assert_eq!(reconciled_a.updated_at, first_now);
+        assert_eq!(reconciled_b.updated_at, first_now);
+        assert_eq!(reconciled_a.targets[0].port, 8080);
+        assert_eq!(reconciled_b.targets[0].port, 9090);
+    }
+
     /// #1806 codex r2 finding 3: a DR-only change to an SD upstream's top-level
     /// `connectionPool.http` alters the DERIVED `dispatch_port_override_fallback`
     /// while the SERIALIZED `Upstream` content stays byte-identical (the field is
@@ -23441,7 +24463,13 @@ mod tests {
             labels: [("app".to_string(), "api".to_string())].into(),
             ..MeshSlice::default()
         };
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, false);
+        record_mesh_slice_apply_result(
+            &mesh_state,
+            &mut last_applied_slice,
+            &rejected,
+            false,
+            None,
+        );
         assert!(last_applied_slice.is_none());
         assert!(mesh_state.applied_snapshot().as_ref().is_none());
         assert!(!mesh_slice_matches_last_applied(
@@ -23453,7 +24481,7 @@ mod tests {
             }
         ));
 
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, true);
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, true, None);
         assert!(mesh_state.applied_snapshot().as_ref().is_some());
         assert!(mesh_slice_matches_last_applied(
             last_applied_slice.as_deref(),
@@ -23480,12 +24508,12 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v1, true);
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v1, true, None);
         assert!(mesh_slice_matches_last_applied(
             last_applied_slice.as_deref(),
             &v2
         ));
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v2, true);
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v2, true, None);
 
         let applied = mesh_state.applied_snapshot();
         assert_eq!(
@@ -24172,6 +25200,9 @@ mod tests {
     fn mesh_runtime_updates_mesh_managed_global_plugin_by_id() {
         let runtime = test_mesh_runtime_config();
         let now = chrono::Utc::now();
+        // Reserved mesh IDs are illegal on the operator-input prepare boundary.
+        // Re-injection against prior materializer output updates the existing
+        // `(namespace, id)` row instead of duplicating it.
         let existing = PluginConfig {
             id: MESH_REQUEST_AUTH_PLUGIN_ID.to_string(),
             plugin_name: "jwks_auth".to_string(),
@@ -24189,20 +25220,19 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let config = GatewayConfig {
-            mesh: Some(Box::new(MeshConfig {
-                request_authentications: vec![test_request_authentication(
-                    "fresh",
-                    PolicyScope::MeshWide,
-                )],
-                ..MeshConfig::default()
-            })),
+        let fresh = test_request_authentication("fresh", PolicyScope::MeshWide);
+        let mut config = GatewayConfig {
             plugin_configs: vec![existing],
             ..GatewayConfig::default()
         };
+        let mesh_slice = MeshSlice {
+            namespace: "default".to_string(),
+            request_authentications: vec![fresh],
+            ..MeshSlice::default()
+        };
 
-        let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh config");
-        let jwks_plugins: Vec<_> = prepared
+        inject_mesh_request_auth_plugin(&mut config, &runtime, &mesh_slice);
+        let jwks_plugins: Vec<_> = config
             .plugin_configs
             .iter()
             .filter(|plugin| plugin.id == MESH_REQUEST_AUTH_PLUGIN_ID)

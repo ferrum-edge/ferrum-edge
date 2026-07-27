@@ -48,6 +48,7 @@ use crate::modes::mesh::config::{
     MeshVirtualServiceCorsPolicy, MultiClusterConfig, OutboundTrafficPolicy, PeerAuthentication,
     ResolvedIngressListener, ServiceEntry, TrustBundleSet, Workload,
 };
+use crate::modes::mesh::revision::MeshConfigRevision;
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 
 /// Common inner `type_url` prefix for every Ferrum mesh-slice carrier.
@@ -92,6 +93,13 @@ pub const FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_TYPE_URL: &str =
 /// instead of pass-through to the surviving sibling.
 pub const FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_PORTS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.SidecarIngressDeclaredPortsCarrier";
+/// Inner `type_url` for the authoritative mesh config revision (issue #2473).
+/// Carries the CP-replica-shared `(authority, sequence)` pair the DP freshness
+/// gate orders slices by, so an xDS-built slice materializes the same ordering
+/// metadata a native-built one does. Emitted only when the CP's config
+/// authority has a shared monotonic sequence.
+pub const FERRUM_ECDS_CONFIG_REVISION_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.ConfigRevisionCarrier";
 /// Inner `type_url` for the per-pod workload / endpoint carrier.
 pub const FERRUM_ECDS_WORKLOADS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WorkloadsCarrier";
@@ -171,6 +179,9 @@ pub enum MeshSliceCarrier {
     /// workload DECLARED (F6 §6.2). Emitted only when > 0 (the CP omits it
     /// otherwise); see [`FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_PORTS_TYPE_URL`].
     SidecarIngressDeclaredPorts(usize),
+    /// Authoritative mesh config revision (issue #2473); see
+    /// [`FERRUM_ECDS_CONFIG_REVISION_TYPE_URL`].
+    ConfigRevision(MeshConfigRevision),
     Workloads(Vec<Workload>),
     AmbientUdpSourceWorkloads(Vec<Workload>),
     NodeWaypointAssertors(Vec<SpiffeId>),
@@ -212,6 +223,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::SidecarIngressDeclaredPorts(_) => {
                 FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_PORTS_TYPE_URL
             }
+            MeshSliceCarrier::ConfigRevision(_) => FERRUM_ECDS_CONFIG_REVISION_TYPE_URL,
             MeshSliceCarrier::Workloads(_) => FERRUM_ECDS_WORKLOADS_TYPE_URL,
             MeshSliceCarrier::AmbientUdpSourceWorkloads(_) => {
                 FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL
@@ -246,6 +258,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::LocalIngressListeners(_) => "local-ingress-listeners",
             MeshSliceCarrier::SidecarIngressDeclared(_) => "sidecar-ingress-declared",
             MeshSliceCarrier::SidecarIngressDeclaredPorts(_) => "sidecar-ingress-declared-ports",
+            MeshSliceCarrier::ConfigRevision(_) => "config-revision",
             MeshSliceCarrier::Workloads(_) => "workloads",
             MeshSliceCarrier::AmbientUdpSourceWorkloads(_) => "ambient-udp-source-workloads",
             MeshSliceCarrier::NodeWaypointAssertors(_) => "node-waypoint-assertors",
@@ -275,6 +288,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::LocalIngressListeners(value) => encode(value),
             MeshSliceCarrier::SidecarIngressDeclared(value) => encode(value),
             MeshSliceCarrier::SidecarIngressDeclaredPorts(value) => encode(value),
+            MeshSliceCarrier::ConfigRevision(value) => encode(value),
             MeshSliceCarrier::Workloads(value) => encode(value),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => encode(value),
             MeshSliceCarrier::NodeWaypointAssertors(value) => encode(value),
@@ -324,6 +338,9 @@ impl MeshSliceCarrier {
             }
             FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_PORTS_TYPE_URL => {
                 MeshSliceCarrier::SidecarIngressDeclaredPorts(decode_json(value)?)
+            }
+            FERRUM_ECDS_CONFIG_REVISION_TYPE_URL => {
+                MeshSliceCarrier::ConfigRevision(decode_json(value)?)
             }
             FERRUM_ECDS_WORKLOADS_TYPE_URL => MeshSliceCarrier::Workloads(decode_json(value)?),
             FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL => {
@@ -395,6 +412,7 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         FERRUM_ECDS_SIDECAR_INGRESS_DECLARED_PORTS_TYPE_URL => {
             Some("ferrum-mesh-carrier/sidecar-ingress-declared-ports")
         }
+        FERRUM_ECDS_CONFIG_REVISION_TYPE_URL => Some("ferrum-mesh-carrier/config-revision"),
         FERRUM_ECDS_WORKLOADS_TYPE_URL => Some("ferrum-mesh-carrier/workloads"),
         FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL => {
             Some("ferrum-mesh-carrier/ambient-udp-source-workloads")
@@ -488,6 +506,13 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
         carriers.push(MeshSliceCarrier::SidecarIngressDeclaredPorts(
             slice.declared_ingress_http_ports,
         ));
+    }
+    // Authoritative config revision (issue #2473). Emitted only when the CP's
+    // config authority has a shared monotonic sequence; absence means "this
+    // authority is unordered", which the DP gate treats exactly like a native
+    // slice with no `revision` field.
+    if let Some(revision) = slice.revision.as_ref() {
+        carriers.push(MeshSliceCarrier::ConfigRevision(revision.clone()));
     }
     if !slice.workloads.is_empty() {
         carriers.push(MeshSliceCarrier::Workloads(slice.workloads.clone()));
@@ -586,6 +611,7 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         MeshSliceCarrier::SidecarIngressDeclaredPorts(value) => {
             slice.declared_ingress_http_ports = value
         }
+        MeshSliceCarrier::ConfigRevision(value) => slice.revision = Some(value),
         MeshSliceCarrier::Workloads(value) => slice.workloads = value,
         MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => {
             slice.ambient_udp_source_workloads = value
@@ -711,6 +737,7 @@ mod tests {
             }]),
             MeshSliceCarrier::SidecarIngressDeclared(true),
             MeshSliceCarrier::SidecarIngressDeclaredPorts(2),
+            MeshSliceCarrier::ConfigRevision(MeshConfigRevision::new("db", 42)),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(Vec::new()),
             MeshSliceCarrier::NodeWaypointAssertors(vec![
@@ -805,6 +832,7 @@ mod tests {
             MeshSliceCarrier::LocalIngressListeners(Vec::new()),
             MeshSliceCarrier::SidecarIngressDeclared(true),
             MeshSliceCarrier::SidecarIngressDeclaredPorts(2),
+            MeshSliceCarrier::ConfigRevision(MeshConfigRevision::new("db", 42)),
             MeshSliceCarrier::Workloads(Vec::new()),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(Vec::new()),
             MeshSliceCarrier::NodeWaypointAssertors(vec![

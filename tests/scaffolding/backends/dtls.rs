@@ -69,7 +69,7 @@ use super::udp::{DatagramMatcher, RecordedDatagram, UdpStep};
 /// same path the gateway's own functional tests use.
 pub struct DtlsConfig {
     dimpl_config: Arc<DimplConfig>,
-    certificate: dimpl::DtlsCertificate,
+    certificate: dimpl::DtlsCertificateChain,
 }
 
 impl DtlsConfig {
@@ -87,7 +87,7 @@ impl DtlsConfig {
             .map_err(|e| format!("generate self-signed dtls cert: {e}"))?;
         Ok(Self {
             dimpl_config: Arc::new(DimplConfig::default()),
-            certificate,
+            certificate: certificate.into(),
         })
     }
 }
@@ -409,7 +409,7 @@ mod tests {
             dimpl::certificate::generate_self_signed_certificate().expect("client cert");
         let params = ferrum_edge::dtls::BackendDtlsParams {
             config: Arc::new(dimpl::Config::default()),
-            certificate: client_cert,
+            certificate: client_cert.into(),
             server_name: None,
             server_cert_verifier: None,
             connect_timeout_ms: 10_000,

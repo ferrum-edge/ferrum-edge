@@ -179,7 +179,7 @@ fn websocket_upgrade_uses_websocket_protocol_for_auth_plugin_lookup() {
 
     assert_eq!(detect_http_flavor(&request), HttpFlavor::WebSocket);
 
-    let ws_view = cache.request_view(PROXY_ID, ProxyProtocol::WebSocket);
+    let ws_view = cache.request_view("ferrum", PROXY_ID, ProxyProtocol::WebSocket);
     let auth_plugins = ws_view.auth_plugins();
     assert_eq!(auth_plugins.len(), 1);
     assert_eq!(auth_plugins[0].name(), "key_auth");
@@ -189,7 +189,7 @@ fn websocket_upgrade_uses_websocket_protocol_for_auth_plugin_lookup() {
             .has(PluginCapabilities::HAS_AUTH_PLUGINS)
     );
 
-    let tcp_view = cache.request_view(PROXY_ID, ProxyProtocol::Tcp);
+    let tcp_view = cache.request_view("ferrum", PROXY_ID, ProxyProtocol::Tcp);
     assert!(
         tcp_view.auth_plugins().is_empty(),
         "HTTP-family key_auth must not leak into TCP, while WebSocket still gets it"
@@ -201,7 +201,7 @@ async fn websocket_upgrade_without_api_key_rejects_before_backend() {
     let config = gateway_config();
     let cache = PluginCache::new(&config).expect("plugin cache");
     let auth_plugins = cache
-        .request_view(PROXY_ID, ProxyProtocol::WebSocket)
+        .request_view("ferrum", PROXY_ID, ProxyProtocol::WebSocket)
         .auth_plugins();
     let consumer_index = ConsumerIndex::new(&config.consumers);
     let mut ctx = websocket_request_context(None);
@@ -231,7 +231,7 @@ async fn websocket_upgrade_with_invalid_api_key_preserves_plugin_reject() {
     let config = gateway_config();
     let cache = PluginCache::new(&config).expect("plugin cache");
     let auth_plugins = cache
-        .request_view(PROXY_ID, ProxyProtocol::WebSocket)
+        .request_view("ferrum", PROXY_ID, ProxyProtocol::WebSocket)
         .auth_plugins();
     let consumer_index = ConsumerIndex::new(&config.consumers);
     let mut ctx = websocket_request_context(Some("wrong-key"));
@@ -258,7 +258,7 @@ async fn websocket_upgrade_with_valid_api_key_identifies_consumer() {
     let config = gateway_config();
     let cache = PluginCache::new(&config).expect("plugin cache");
     let auth_plugins = cache
-        .request_view(PROXY_ID, ProxyProtocol::WebSocket)
+        .request_view("ferrum", PROXY_ID, ProxyProtocol::WebSocket)
         .auth_plugins();
     let consumer_index = ConsumerIndex::new(&config.consumers);
     let mut ctx = websocket_request_context(Some(VALID_API_KEY));

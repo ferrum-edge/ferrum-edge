@@ -15,8 +15,35 @@ use crossbeam_utils::CachePadded;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 
+use crate::config::db_backend::write_namespaced_runtime_key;
 use crate::config::types::{Proxy, UpstreamTarget};
 use crate::plugins::{BackendAdmissionOutcome, BackendAdmissionPermit};
+
+thread_local! {
+    /// Reusable scratch buffer for the `namespace|id` scope-cache lookup key.
+    ///
+    /// Taken out of the cell for the duration of the lookup and put back
+    /// afterwards, so a re-entrant call simply starts from an empty buffer
+    /// instead of panicking on a nested borrow (mirrors `adaptive_buffer`).
+    static SCOPE_KEY_SCRATCH: std::cell::Cell<String> =
+        const { std::cell::Cell::new(String::new()) };
+}
+
+/// Run `f` with the namespace-qualified `namespace|id` scope-cache key.
+///
+/// Hot-path contract: no allocation after the calling thread's scratch buffer
+/// has grown once. `f` must not call back into `with_namespaced_key` — a
+/// re-entrant call is still correct, it just allocates a fresh buffer.
+#[inline]
+fn with_namespaced_key<R>(namespace: &str, proxy_id: &str, f: impl FnOnce(&str) -> R) -> R {
+    SCOPE_KEY_SCRATCH.with(|slot| {
+        let mut key = slot.take();
+        write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+        let result = f(&key);
+        slot.set(key);
+        result
+    })
+}
 
 const EWMA_PREVIOUS_WEIGHT: u64 = 8;
 const EWMA_SAMPLE_WEIGHT: u64 = 2;
@@ -301,8 +328,13 @@ impl Drop for AdaptiveConcurrencyFeedbackGuard<'_> {
 
 struct AdaptiveConcurrencyTrackingSpace {
     inner: DashMap<AdaptiveConcurrencyKey, Arc<AdaptiveConcurrencyState>>,
-    /// Per-proxy scope cache for `proxy` scoping, keyed by stable `proxy.id`.
-    /// `upstream` scoping is intentionally not cached.
+    /// Per-proxy scope cache for `proxy` scoping, keyed by the
+    /// namespace-qualified `namespace|id` runtime key. A bare `proxy.id` key
+    /// would collide across tenants — a shared (global / proxy-group) limiter
+    /// instance serves proxies from every namespace, so the first tenant to
+    /// warm the cache would hand its own `proxy:{ns}:{id}` scope to another
+    /// tenant's same-id proxy and merge both into one limiter row (issue
+    /// #3094). `upstream` scoping is intentionally not cached.
     scope_cache: DashMap<Box<str>, Arc<str>>,
     tracked_keys: AtomicUsize,
 }
@@ -837,15 +869,15 @@ impl AdaptiveConcurrencyLimiter {
 
     /// Resolve the scope component of the key for `proxy` under `key_by`.
     /// `backend` scoping returns one shared constant. `proxy` scoping caches a
-    /// reused `Arc<str>` per `proxy.id` — which uniquely and stably identifies
-    /// the proxy, so the cached `proxy:{ns}:{id}` scope never goes stale.
+    /// reused `Arc<str>` per namespace-qualified `namespace|id` runtime key —
+    /// which uniquely and stably identifies the proxy, so the cached
+    /// `proxy:{ns}:{id}` scope never goes stale and never crosses tenants.
     /// `upstream` scoping is computed per call: its `upstream:{ns}:{upstream_id}`
     /// depends on the proxy's upstream, which can change across a reload while a
     /// shared (global/proxy_group) limiter instance — and this cache — is
-    /// preserved, so caching it by `proxy.id` would serve a stale upstream scope
-    /// (and keying by `upstream_id` alone could collide across namespaces). The
-    /// string is short, and the admission path already allocates the full key in
-    /// `build_key`.
+    /// preserved, so caching it by proxy identity would serve a stale upstream
+    /// scope. The string is short, and the admission path already allocates the
+    /// full key in `build_key`.
     fn resolve_scope(
         &self,
         tracking_space: &AdaptiveConcurrencyTrackingSpace,
@@ -860,18 +892,20 @@ impl AdaptiveConcurrencyLimiter {
                 proxy.upstream_id.as_deref(),
             )),
             AdaptiveConcurrencyKeyBy::Proxy => {
-                if let Some(cached) = tracking_space.scope_cache.get(proxy.id.as_str()) {
-                    return Arc::clone(cached.value());
-                }
-                let scope: Arc<str> = Arc::from(adaptive_concurrency_scope(
-                    key_by,
-                    proxy,
-                    proxy.upstream_id.as_deref(),
-                ));
-                tracking_space
-                    .scope_cache
-                    .insert(proxy.id.as_str().into(), Arc::clone(&scope));
-                scope
+                with_namespaced_key(&proxy.namespace, &proxy.id, |cache_key| {
+                    if let Some(cached) = tracking_space.scope_cache.get(cache_key) {
+                        return Arc::clone(cached.value());
+                    }
+                    let scope: Arc<str> = Arc::from(adaptive_concurrency_scope(
+                        key_by,
+                        proxy,
+                        proxy.upstream_id.as_deref(),
+                    ));
+                    tracking_space
+                        .scope_cache
+                        .insert(cache_key.into(), Arc::clone(&scope));
+                    scope
+                })
             }
         }
     }

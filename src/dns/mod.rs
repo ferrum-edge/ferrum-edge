@@ -24,9 +24,11 @@ use hickory_resolver::proto::rr::RData;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::future::Future;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -178,7 +180,10 @@ fn dns_name_without_trailing_root(name: impl std::fmt::Display) -> String {
 /// A cached DNS entry with TTL and stale-while-revalidate support.
 #[derive(Debug, Clone)]
 struct DnsCacheEntry {
-    addresses: Vec<IpAddr>,
+    addresses: Arc<[IpAddr]>,
+    /// Lock-free round-robin cursor shared by fresh and stale cache readers.
+    /// Replacing an answer set on refresh resets the cursor to zero.
+    next_start: Arc<AtomicU64>,
     expires_at: Instant,
     /// Deadline after which stale data is no longer served.
     stale_deadline: Instant,
@@ -209,6 +214,142 @@ struct DnsCacheEntry {
     /// failed-retry task is enabled, so decommissioned hostnames cannot
     /// occupy the cache forever.
     first_failed_at: Option<Instant>,
+}
+
+/// A bounded, policy-approved DNS answer set in deterministic dial order.
+///
+/// Cloning this value only bumps an `Arc`; iterating it does not allocate. The
+/// cache advances the start index atomically once per resolution so concurrent
+/// callers distribute first attempts across the answer set while preserving
+/// resolver order for failover.
+#[derive(Clone, Debug)]
+pub struct ResolvedAddresses {
+    addresses: Arc<[IpAddr]>,
+    start: usize,
+}
+
+impl ResolvedAddresses {
+    fn single(address: IpAddr) -> Self {
+        Self {
+            addresses: Arc::from([address]),
+            start: 0,
+        }
+    }
+
+    fn rotated(addresses: Arc<[IpAddr]>, next_start: &AtomicU64) -> Self {
+        let start = if addresses.len() > 1 {
+            next_start.fetch_add(1, Ordering::Relaxed) as usize % addresses.len()
+        } else {
+            0
+        };
+        Self { addresses, start }
+    }
+
+    pub fn len(&self) -> usize {
+        self.addresses.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.addresses.is_empty()
+    }
+
+    pub fn first(&self) -> Option<IpAddr> {
+        self.get(0)
+    }
+
+    pub fn get(&self, offset: usize) -> Option<IpAddr> {
+        if offset >= self.addresses.len() {
+            return None;
+        }
+        Some(self.addresses[(self.start + offset) % self.addresses.len()])
+    }
+
+    pub fn iter(&self) -> ResolvedAddressesIter<'_> {
+        ResolvedAddressesIter {
+            addresses: self,
+            offset: 0,
+        }
+    }
+}
+
+pub struct ResolvedAddressesIter<'a> {
+    addresses: &'a ResolvedAddresses,
+    offset: usize,
+}
+
+impl Iterator for ResolvedAddressesIter<'_> {
+    type Item = IpAddr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let address = self.addresses.get(self.offset)?;
+        self.offset += 1;
+        Some(address)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.addresses.len().saturating_sub(self.offset);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for ResolvedAddressesIter<'_> {}
+
+/// Failure returned after every DNS candidate was attempted.
+#[derive(Debug)]
+pub enum CandidateConnectError<E> {
+    TimedOut { last_addr: SocketAddr },
+    Failed { last_addr: SocketAddr, source: E },
+}
+
+/// Try a rotated DNS answer set sequentially within one wall-clock budget.
+///
+/// Each candidate receives an equal share of the budget remaining when its
+/// attempt starts (`remaining / candidates_left`). An immediate failure moves
+/// directly to the next address; a stalled attempt cannot consume a later
+/// candidate's reserved share. The last candidate receives all remaining time.
+pub async fn connect_candidates<T, E, F, Fut>(
+    addresses: &ResolvedAddresses,
+    port: u16,
+    overall_budget: Duration,
+    mut connect: F,
+) -> Result<(T, SocketAddr), CandidateConnectError<E>>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    debug_assert!(!addresses.is_empty());
+    let started = Instant::now();
+    let mut last_failure = None;
+
+    for (index, ip) in addresses.iter().enumerate() {
+        let addr = SocketAddr::new(ip, port);
+        let elapsed = started.elapsed();
+        let Some(remaining) = overall_budget.checked_sub(elapsed) else {
+            return Err(CandidateConnectError::TimedOut { last_addr: addr });
+        };
+        let candidates_left = addresses.len() - index;
+        let attempt_budget = remaining / u32::try_from(candidates_left).unwrap_or(u32::MAX);
+        match tokio::time::timeout(attempt_budget, connect(addr)).await {
+            Ok(Ok(value)) => return Ok((value, addr)),
+            Ok(Err(source)) => last_failure = Some((addr, source)),
+            Err(_) if candidates_left == 1 => {
+                return Err(CandidateConnectError::TimedOut { last_addr: addr });
+            }
+            Err(_) => {}
+        }
+    }
+
+    match last_failure {
+        Some((last_addr, source)) => Err(CandidateConnectError::Failed { last_addr, source }),
+        None => Err(CandidateConnectError::TimedOut {
+            last_addr: SocketAddr::new(
+                addresses
+                    .first()
+                    .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                port,
+            ),
+        }),
+    }
 }
 
 /// Exact identity of an error-cache generation selected for a failed retry.
@@ -287,6 +428,10 @@ impl DnsCache {
     /// seconds cannot overflow the `Instant + Duration` / `Duration * u32`
     /// arithmetic on the resolution hot path (a reachable panic).
     const MAX_TTL: Duration = Duration::from_secs(86_400);
+    /// Bound connector work and cache footprint for unusually large answers.
+    /// Resolver order is preserved; duplicates and denied candidates do not
+    /// consume a slot.
+    const MAX_ADDRESSES_PER_ANSWER: usize = 32;
 
     /// Consecutive failure count below which failed-retry outcomes stay at
     /// `warn`. After this many prior failures, subsequent retry attempt /
@@ -298,6 +443,23 @@ impl DnsCache {
     /// validation paths (for example, service discovery).
     pub fn backend_allow_ips(&self) -> crate::config::BackendEgressPolicy {
         self.backend_allow_ips.clone()
+    }
+
+    /// Clone this resolver while replacing only its dial-time egress policy.
+    ///
+    /// Security-sensitive helper clients such as ACME need the gateway's
+    /// configured resolver, hosts file, and static overrides, but deliberately
+    /// enforce a stricter address boundary than ordinary proxy backends. The
+    /// resolver/cache internals stay shared; every fresh result is evaluated
+    /// against the replacement policy before it is returned.
+    #[cfg(feature = "acme")]
+    pub(crate) fn with_backend_egress_policy(
+        &self,
+        backend_allow_ips: crate::config::BackendEgressPolicy,
+    ) -> Self {
+        let mut cloned = self.clone();
+        cloned.backend_allow_ips = backend_allow_ips;
+        cloned
     }
 
     pub fn new(config: DnsConfig) -> Self {
@@ -380,8 +542,6 @@ impl DnsCache {
         now.saturating_duration_since(first_failed_at) >= max_age
     }
 
-    /// Resolve a hostname to an IP address, using cache, overrides, or actual DNS.
-    ///
     /// Check whether a resolved IP is allowed by the backend IP policy.
     /// Returns `Ok(addr)` if allowed, `Err` if denied.
     fn check_backend_ip_policy(
@@ -400,13 +560,47 @@ impl DnsCache {
         Ok(addr)
     }
 
+    fn screen_backend_addresses_policy(
+        &self,
+        addresses: Vec<IpAddr>,
+        hostname: &str,
+    ) -> Result<Arc<[IpAddr]>, anyhow::Error> {
+        let mut approved = Vec::with_capacity(addresses.len().min(Self::MAX_ADDRESSES_PER_ANSWER));
+        let mut first_denial = None;
+        for addr in addresses {
+            if approved.len() == Self::MAX_ADDRESSES_PER_ANSWER {
+                break;
+            }
+            if approved.contains(&addr) {
+                continue;
+            }
+            match self.check_backend_ip_policy(addr, hostname) {
+                Ok(addr) => approved.push(addr),
+                Err(error) => {
+                    if first_denial.is_none() {
+                        first_denial = Some(error);
+                    }
+                }
+            }
+        }
+        if approved.is_empty() {
+            return Err(first_denial.unwrap_or_else(|| {
+                anyhow::anyhow!(
+                    "DNS resolution returned no policy-approved addresses for {}",
+                    hostname
+                )
+            }));
+        }
+        Ok(approved.into())
+    }
+
     fn check_backend_addresses_policy(
         &self,
         addresses: &[IpAddr],
         hostname: &str,
     ) -> Result<(), anyhow::Error> {
-        for &addr in addresses {
-            self.check_backend_ip_policy(addr, hostname)?;
+        for &address in addresses {
+            self.check_backend_ip_policy(address, hostname)?;
         }
         Ok(())
     }
@@ -418,7 +612,8 @@ impl DnsCache {
         record_type: Option<CachedRecordType>,
         ttl: Duration,
         original_per_proxy_ttl: Option<u64>,
-    ) -> Result<Vec<IpAddr>, anyhow::Error> {
+        consume_for_caller: bool,
+    ) -> Result<ResolvedAddresses, anyhow::Error> {
         // This is the single success insertion path for foreground resolves,
         // stale refreshes, proactive background refreshes, and failed-retry
         // recovery. Cache reads intentionally trust entries accepted here.
@@ -427,13 +622,15 @@ impl DnsCache {
         // overflow the `Instant + Duration` arithmetic below (or the
         // `Duration * u32` threshold in the proactive refresh loop).
         let ttl = ttl.min(Self::MAX_TTL);
-        self.check_backend_addresses_policy(&addresses, hostname)?;
+        let addresses = self.screen_backend_addresses_policy(addresses, hostname)?;
+        let next_start = Arc::new(AtomicU64::new(0));
         let cache_key = dns_hostname_key(hostname);
 
         self.cache.insert(
             cache_key.into_owned(),
             DnsCacheEntry {
                 addresses: addresses.clone(),
+                next_start: next_start.clone(),
                 expires_at: Instant::now() + ttl,
                 stale_deadline: Instant::now() + ttl + self.stale_ttl,
                 applied_ttl: ttl,
@@ -445,7 +642,14 @@ impl DnsCache {
             },
         );
 
-        Ok(addresses)
+        if consume_for_caller {
+            Ok(ResolvedAddresses::rotated(addresses, &next_start))
+        } else {
+            Ok(ResolvedAddresses {
+                addresses,
+                start: 0,
+            })
+        }
     }
 
     /// Resolution priority:
@@ -453,25 +657,29 @@ impl DnsCache {
     /// 2. Global static overrides
     /// 3. Cache (fresh → return immediately; stale → return + background refresh)
     /// 4. Actual DNS resolution via hickory-resolver
-    pub async fn resolve(
+    pub async fn resolve_candidates(
         &self,
         hostname: &str,
         per_proxy_override: Option<&str>,
         per_proxy_ttl: Option<u64>,
-    ) -> Result<IpAddr, anyhow::Error> {
+    ) -> Result<ResolvedAddresses, anyhow::Error> {
         let cache_key = dns_hostname_key(hostname);
         let cache_hostname = cache_key.as_ref();
 
         // 1. Check per-proxy static override first
         if let Some(ip_str) = per_proxy_override {
             let addr: IpAddr = ip_str.parse()?;
-            return self.check_backend_ip_policy(addr, hostname);
+            return Ok(ResolvedAddresses::single(
+                self.check_backend_ip_policy(addr, hostname)?,
+            ));
         }
 
         // 2. Check global overrides
         if let Some(ip_str) = self.global_overrides.get(cache_hostname) {
             let addr: IpAddr = ip_str.parse()?;
-            return self.check_backend_ip_policy(addr, hostname);
+            return Ok(ResolvedAddresses::single(
+                self.check_backend_ip_policy(addr, hostname)?,
+            ));
         }
 
         // 3. Check cache with stale-while-revalidate
@@ -483,7 +691,10 @@ impl DnsCache {
             // Fresh entry — return immediately
             if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
                 crate::runtime_metrics::global_ref().record_dns_hit();
-                return Ok(entry.addresses[0]);
+                return Ok(ResolvedAddresses::rotated(
+                    entry.addresses.clone(),
+                    &entry.next_start,
+                ));
             }
 
             // Stale but within stale window — return stale data, trigger background refresh
@@ -527,7 +738,10 @@ impl DnsCache {
                     );
                 }
                 crate::runtime_metrics::global_ref().record_dns_stale();
-                return Ok(entry.addresses[0]);
+                return Ok(ResolvedAddresses::rotated(
+                    entry.addresses.clone(),
+                    &entry.next_start,
+                ));
             }
 
             // Cached error that hasn't expired — return error immediately
@@ -549,6 +763,7 @@ impl DnsCache {
                     record_type,
                     ttl,
                     per_proxy_ttl,
+                    true,
                 ) {
                     Ok(addrs) => addrs,
                     Err(err) => {
@@ -559,10 +774,15 @@ impl DnsCache {
 
                 debug!(
                     "DNS resolved {} -> {:?} (native_ttl={:?}, effective_ttl={:?})",
-                    hostname, addrs[0], native_ttl, ttl
+                    hostname,
+                    addrs
+                        .first()
+                        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+                    native_ttl,
+                    ttl
                 );
                 crate::runtime_metrics::global_ref().record_dns_miss();
-                Ok(addrs[0])
+                Ok(addrs)
             }
             Ok(_) | Err(_) if cache_hostname == "localhost" => {
                 // Fallback for localhost — hickory-resolver may not read
@@ -576,6 +796,7 @@ impl DnsCache {
                     None,
                     ttl,
                     per_proxy_ttl,
+                    true,
                 ) {
                     Ok(addrs) => addrs,
                     Err(err) => {
@@ -585,7 +806,7 @@ impl DnsCache {
                 };
                 debug!("DNS resolved localhost -> {} (built-in fallback)", addr);
                 crate::runtime_metrics::global_ref().record_dns_miss();
-                Ok(addrs[0])
+                Ok(addrs)
             }
             Ok(_) => {
                 self.cache_error(cache_hostname, per_proxy_ttl);
@@ -600,6 +821,21 @@ impl DnsCache {
         }
     }
 
+    /// Resolve one address using the same rotating answer-set semantics as
+    /// production connectors. New connection code should use
+    /// [`Self::resolve_candidates`] so it can fail over.
+    pub async fn resolve(
+        &self,
+        hostname: &str,
+        per_proxy_override: Option<&str>,
+        per_proxy_ttl: Option<u64>,
+    ) -> Result<IpAddr, anyhow::Error> {
+        self.resolve_candidates(hostname, per_proxy_override, per_proxy_ttl)
+            .await?
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("DNS resolution returned no addresses for {}", hostname))
+    }
+
     /// Resolve a hostname to all known IP addresses (not just the first).
     ///
     /// Uses the same cache, overrides, and TTL logic as [`resolve`]. This is
@@ -611,114 +847,11 @@ impl DnsCache {
         per_proxy_override: Option<&str>,
         per_proxy_ttl: Option<u64>,
     ) -> Result<Vec<IpAddr>, anyhow::Error> {
-        let cache_key = dns_hostname_key(hostname);
-        let cache_hostname = cache_key.as_ref();
-
-        // 1. Per-proxy static override
-        if let Some(ip_str) = per_proxy_override {
-            let addr: IpAddr = ip_str.parse()?;
-            return Ok(vec![self.check_backend_ip_policy(addr, hostname)?]);
-        }
-
-        // 2. Global overrides
-        if let Some(ip_str) = self.global_overrides.get(cache_hostname) {
-            let addr: IpAddr = ip_str.parse()?;
-            return Ok(vec![self.check_backend_ip_policy(addr, hostname)?]);
-        }
-
-        // 3. Cache with stale-while-revalidate
-        let mut prior_per_proxy_ttl = None;
-        if let Some(entry) = self.cache.get(cache_hostname) {
-            let now = Instant::now();
-            prior_per_proxy_ttl = entry.original_per_proxy_ttl;
-
-            if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
-                crate::runtime_metrics::global_ref().record_dns_hit();
-                return Ok(entry.addresses.clone());
-            }
-
-            if entry.stale_deadline > now && !entry.addresses.is_empty() && !entry.is_error {
-                let host = cache_hostname.to_string();
-                if self.refreshing.insert(host.clone(), ()).is_none() {
-                    match self.refresh_semaphore.clone().try_acquire_owned() {
-                        Ok(permit) => {
-                            let cache = self.clone();
-                            let ttl = per_proxy_ttl.or(prior_per_proxy_ttl);
-                            tokio::spawn(async move {
-                                if let Err(e) = cache.refresh_entry(&host, ttl).await {
-                                    warn!("DNS stale refresh failed for {}: {}", host, e);
-                                }
-                                cache.refreshing.remove(&host);
-                                drop(permit);
-                            });
-                        }
-                        Err(_) => {
-                            self.refreshing.remove(&host);
-                        }
-                    }
-                }
-                crate::runtime_metrics::global_ref().record_dns_stale();
-                return Ok(entry.addresses.clone());
-            }
-
-            if entry.is_error && entry.expires_at > now {
-                crate::runtime_metrics::global_ref().record_dns_error();
-                anyhow::bail!("DNS resolution failed for {} (cached error)", hostname);
-            }
-        }
-
-        let per_proxy_ttl = per_proxy_ttl.or(prior_per_proxy_ttl);
-
-        // 4. Actual DNS resolution
-        match self.timed_resolve(cache_hostname).await {
-            Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
-                let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
-                let addrs = match self.cache_success_entry(
-                    cache_hostname,
-                    addrs,
-                    record_type,
-                    ttl,
-                    per_proxy_ttl,
-                ) {
-                    Ok(addrs) => addrs,
-                    Err(err) => {
-                        crate::runtime_metrics::global_ref().record_dns_error();
-                        return Err(err);
-                    }
-                };
-                crate::runtime_metrics::global_ref().record_dns_miss();
-                Ok(addrs)
-            }
-            Ok(_) | Err(_) if cache_hostname == "localhost" => {
-                let addr = self.localhost_addr();
-                let ttl = self.effective_ttl(Duration::from_secs(3600), per_proxy_ttl);
-                let addrs = match self.cache_success_entry(
-                    cache_hostname,
-                    vec![addr],
-                    None,
-                    ttl,
-                    per_proxy_ttl,
-                ) {
-                    Ok(addrs) => addrs,
-                    Err(err) => {
-                        crate::runtime_metrics::global_ref().record_dns_error();
-                        return Err(err);
-                    }
-                };
-                crate::runtime_metrics::global_ref().record_dns_miss();
-                Ok(addrs)
-            }
-            Ok(_) => {
-                self.cache_error(cache_hostname, per_proxy_ttl);
-                crate::runtime_metrics::global_ref().record_dns_error();
-                anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
-            }
-            Err(e) => {
-                self.cache_error(cache_hostname, per_proxy_ttl);
-                crate::runtime_metrics::global_ref().record_dns_error();
-                Err(e)
-            }
-        }
+        Ok(self
+            .resolve_candidates(hostname, per_proxy_override, per_proxy_ttl)
+            .await?
+            .iter()
+            .collect())
     }
 
     /// Resolve every A/AAAA address for security-sensitive connection setup.
@@ -782,7 +915,7 @@ impl DnsCache {
         }
 
         let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
-        self.cache_success_entry(hostname, addrs, record_type, ttl, per_proxy_ttl)?;
+        self.cache_success_entry(hostname, addrs, record_type, ttl, per_proxy_ttl, false)?;
 
         debug!(
             "DNS background refresh: {} refreshed (ttl={:?})",
@@ -843,7 +976,8 @@ impl DnsCache {
         self.cache.insert(
             cache_hostname.to_string(),
             DnsCacheEntry {
-                addresses: vec![],
+                addresses: Arc::from([]),
+                next_start: Arc::new(AtomicU64::new(0)),
                 expires_at: now + ttl,
                 stale_deadline: now + ttl, // no stale serving for errors
                 applied_ttl: ttl,
@@ -1266,7 +1400,7 @@ impl DnsCache {
         let ttl = ttl.min(Self::MAX_TTL);
         // Validate before taking the shard lock so a denied answer is never
         // published and the guard is not held across policy work.
-        self.check_backend_addresses_policy(&addresses, hostname)?;
+        let addresses = self.screen_backend_addresses_policy(addresses, hostname)?;
         let cache_key = dns_hostname_key(hostname);
         let now = Instant::now();
 
@@ -1277,6 +1411,7 @@ impl DnsCache {
                 }
                 occupied.insert(DnsCacheEntry {
                     addresses: addresses.clone(),
+                    next_start: Arc::new(AtomicU64::new(0)),
                     expires_at: now + ttl,
                     stale_deadline: now + ttl + self.stale_ttl,
                     applied_ttl: ttl,
@@ -1286,7 +1421,7 @@ impl DnsCache {
                     consecutive_failures: 0,
                     first_failed_at: None,
                 });
-                Ok(Some(addresses))
+                Ok(Some(addresses.as_ref().to_vec()))
             }
             Entry::Vacant(_) => Ok(None),
         }
@@ -1324,7 +1459,8 @@ impl DnsCache {
                 let first_failed_at = current.first_failed_at.or(Some(now));
                 let ttl = self.error_backoff_ttl(consecutive_failures);
                 occupied.insert(DnsCacheEntry {
-                    addresses: vec![],
+                    addresses: Arc::from([]),
+                    next_start: Arc::new(AtomicU64::new(0)),
                     expires_at: now + ttl,
                     stale_deadline: now + ttl,
                     applied_ttl: ttl,
@@ -1568,6 +1704,7 @@ impl DnsCache {
                                 record_type,
                                 refresh_ttl,
                                 per_proxy_ttl,
+                                false,
                             ) {
                                 Ok(_) => {
                                     debug!(
@@ -1939,20 +2076,45 @@ impl reqwest::dns::Resolve for DnsCacheResolver {
         let hostname = name.as_str().to_string();
 
         Box::pin(async move {
-            let ip = cache.resolve(&hostname, None, None).await.map_err(
-                |e| -> Box<dyn std::error::Error + Send + Sync> {
+            let addresses = cache
+                .resolve_candidates(&hostname, None, None)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                     Box::new(std::io::Error::other(e.to_string()))
-                },
-            )?;
+                })?;
 
             // reqwest expects an iterator of SocketAddr. The port is ignored
             // (reqwest uses the port from the URL), but SocketAddr requires one.
-            let addr: SocketAddr = SocketAddr::new(ip, 0);
-            let addrs: reqwest::dns::Addrs = Box::new(std::iter::once(addr));
+            let addrs: reqwest::dns::Addrs = Box::new(ReqwestAddrs {
+                addresses,
+                offset: 0,
+            });
             Ok(addrs)
         })
     }
 }
+
+struct ReqwestAddrs {
+    addresses: ResolvedAddresses,
+    offset: usize,
+}
+
+impl Iterator for ReqwestAddrs {
+    type Item = SocketAddr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let ip = self.addresses.get(self.offset)?;
+        self.offset += 1;
+        Some(SocketAddr::new(ip, 0))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.addresses.len().saturating_sub(self.offset);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for ReqwestAddrs {}
 
 #[cfg(test)]
 mod tests {
@@ -1975,6 +2137,258 @@ mod tests {
             stale_ttl_seconds: 0,
             ..DnsConfig::default()
         }
+    }
+
+    fn seed_answer(cache: &DnsCache, hostname: &str, addresses: Vec<IpAddr>, stale: bool) {
+        let now = Instant::now();
+        cache.cache.insert(
+            hostname.to_string(),
+            DnsCacheEntry {
+                addresses: addresses.into(),
+                next_start: Arc::new(AtomicU64::new(0)),
+                expires_at: if stale {
+                    now - Duration::from_secs(1)
+                } else {
+                    now + Duration::from_secs(60)
+                },
+                stale_deadline: now + Duration::from_secs(60),
+                applied_ttl: Duration::from_secs(60),
+                record_type_used: Some(CachedRecordType::A),
+                is_error: false,
+                original_per_proxy_ttl: None,
+                consecutive_failures: 0,
+                first_failed_at: None,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_and_stale_cache_hits_rotate_without_reordering_failover() {
+        let cache = DnsCache::new(DnsConfig::default());
+        let a = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+        let b = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
+        seed_answer(&cache, "rotate.test", vec![a, b], false);
+
+        let first: Vec<_> = cache
+            .resolve_candidates("rotate.test", None, None)
+            .await
+            .unwrap()
+            .iter()
+            .collect();
+        let second: Vec<_> = cache
+            .resolve_candidates("rotate.test", None, None)
+            .await
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(first, vec![a, b]);
+        assert_eq!(second, vec![b, a]);
+
+        seed_answer(&cache, "stale.test", vec![a, b], true);
+        let stale_first: Vec<_> = cache
+            .resolve_candidates("stale.test", None, None)
+            .await
+            .unwrap()
+            .iter()
+            .collect();
+        let stale_second: Vec<_> = cache
+            .resolve_candidates("stale.test", None, None)
+            .await
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(stale_first, vec![a, b]);
+        assert_eq!(stale_second, vec![b, a]);
+
+        cache
+            .cache_success_entry(
+                "refreshed.test",
+                vec![a, b],
+                Some(CachedRecordType::A),
+                Duration::from_secs(60),
+                None,
+                false,
+            )
+            .unwrap();
+        let after_refresh: Vec<_> = cache
+            .resolve_candidates("refreshed.test", None, None)
+            .await
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(after_refresh, vec![a, b]);
+    }
+
+    #[test]
+    fn policy_screens_each_candidate_and_fails_when_none_remain() {
+        let cache = DnsCache::new(DnsConfig {
+            backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+            ..DnsConfig::default()
+        });
+        let denied = IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254));
+        let approved = IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
+
+        let screened = cache
+            .screen_backend_addresses_policy(vec![denied, approved], "mixed.test")
+            .unwrap();
+        assert_eq!(screened.as_ref(), &[approved]);
+        assert!(
+            cache
+                .screen_backend_addresses_policy(vec![denied], "denied.test")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_candidates_fail_over_for_a_and_aaaa_answers() {
+        async fn exercise(listener: tokio::net::TcpListener, failed_ip: IpAddr) {
+            let live = listener.local_addr().unwrap();
+            let addresses = ResolvedAddresses {
+                addresses: Arc::from([failed_ip, live.ip()]),
+                start: 0,
+            };
+            let accepted = tokio::spawn(async move { listener.accept().await });
+            let (stream, selected) = connect_candidates(
+                &addresses,
+                live.port(),
+                Duration::from_secs(2),
+                tokio::net::TcpStream::connect,
+            )
+            .await
+            .unwrap();
+            assert_eq!(selected.ip(), live.ip());
+            drop(stream);
+            accepted.await.unwrap().unwrap();
+        }
+
+        let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        exercise(v4, "127.0.0.2".parse().unwrap()).await;
+
+        if let Ok(v6) = tokio::net::TcpListener::bind("[::1]:0").await {
+            exercise(v6, "::2".parse().unwrap()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failover_order_covers_a_and_aaaa_answer_sets() {
+        for (first, second) in [
+            (
+                "192.0.2.40".parse::<IpAddr>().unwrap(),
+                "192.0.2.41".parse::<IpAddr>().unwrap(),
+            ),
+            (
+                "2001:db8::40".parse::<IpAddr>().unwrap(),
+                "2001:db8::41".parse::<IpAddr>().unwrap(),
+            ),
+        ] {
+            let addresses = ResolvedAddresses {
+                addresses: Arc::from([first, second]),
+                start: 0,
+            };
+            let ((), selected) =
+                connect_candidates(&addresses, 443, Duration::from_secs(1), |addr| async move {
+                    if addr.ip() == first {
+                        Err(std::io::Error::other("first candidate unavailable"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await
+                .unwrap();
+            assert_eq!(selected.ip(), second);
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_attempts_share_one_overall_budget() {
+        let addresses = ResolvedAddresses {
+            addresses: Arc::from([
+                IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2)),
+            ]),
+            start: 0,
+        };
+        let started = Instant::now();
+        let result = connect_candidates(&addresses, 443, Duration::from_millis(40), |_| async {
+            std::future::pending::<()>().await;
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(CandidateConnectError::TimedOut { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn candidate_failover_keeps_hostname_connector_identity() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct ConnectorIdentity {
+            authority: &'static str,
+            tls_server_name: &'static str,
+        }
+
+        let identity = ConnectorIdentity {
+            authority: "backend.internal:443",
+            tls_server_name: "backend.internal",
+        };
+        let first = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 30));
+        let second = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 31));
+        let addresses = ResolvedAddresses {
+            addresses: Arc::from([first, second]),
+            start: 0,
+        };
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_attempts = seen.clone();
+
+        let (selected_identity, selected_addr) =
+            connect_candidates(&addresses, 443, Duration::from_secs(1), |addr| {
+                let seen_attempts = seen_attempts.clone();
+                async move {
+                    seen_attempts.lock().unwrap().push((addr, identity));
+                    if addr.ip() == first {
+                        Err(std::io::Error::other("first candidate unavailable"))
+                    } else {
+                        Ok(identity)
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(selected_addr.ip(), second);
+        assert_eq!(selected_identity, identity);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[
+                (SocketAddr::new(first, 443), identity),
+                (SocketAddr::new(second, 443), identity),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reqwest_resolver_exposes_the_entire_rotated_answer_set() {
+        use reqwest::dns::Resolve;
+
+        let cache = DnsCache::new(DnsConfig::default());
+        let a = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 20));
+        let b = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 21));
+        seed_answer(&cache, "reqwest.test", vec![a, b], false);
+        let resolver = DnsCacheResolver::new(cache);
+        let first: Vec<_> = resolver
+            .resolve("reqwest.test".parse().unwrap())
+            .await
+            .unwrap()
+            .collect();
+        let second: Vec<_> = resolver
+            .resolve("reqwest.test".parse().unwrap())
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(first, vec![SocketAddr::new(a, 0), SocketAddr::new(b, 0)]);
+        assert_eq!(second, vec![SocketAddr::new(b, 0), SocketAddr::new(a, 0)]);
     }
 
     #[test]
@@ -2002,6 +2416,7 @@ mod tests {
             Some(CachedRecordType::A),
             Duration::from_secs(60),
             Some(60),
+            true,
         );
 
         assert!(result.is_err());
@@ -2033,6 +2448,7 @@ mod tests {
             Some(CachedRecordType::A),
             Duration::from_secs(u64::MAX),
             None,
+            true,
         );
 
         assert!(
@@ -2203,7 +2619,8 @@ mod tests {
         cache.cache.insert(
             "127.0.0.1".to_string(),
             DnsCacheEntry {
-                addresses: vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+                addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]),
+                next_start: Arc::new(AtomicU64::new(0)),
                 expires_at: Instant::now() + Duration::from_secs(1),
                 stale_deadline: Instant::now() + Duration::from_secs(1),
                 applied_ttl: Duration::from_secs(600),
@@ -2240,7 +2657,8 @@ mod tests {
         cache.cache.insert(
             "127.0.0.1".to_string(),
             DnsCacheEntry {
-                addresses: addrs,
+                addresses: addrs.into(),
+                next_start: Arc::new(AtomicU64::new(0)),
                 expires_at: Instant::now() + refresh_ttl,
                 stale_deadline: Instant::now() + refresh_ttl + cache.stale_ttl,
                 applied_ttl: refresh_ttl,
@@ -2281,7 +2699,8 @@ mod tests {
         cache.cache.insert(
             "127.0.0.1".to_string(),
             DnsCacheEntry {
-                addresses: vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+                addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]),
+                next_start: Arc::new(AtomicU64::new(0)),
                 expires_at: Instant::now() + Duration::from_secs(4),
                 stale_deadline: Instant::now() + Duration::from_secs(60),
                 applied_ttl: Duration::from_secs(600),
@@ -2374,7 +2793,8 @@ mod tests {
         cache.cache.insert(
             "example.invalid".to_string(),
             DnsCacheEntry {
-                addresses: vec![IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))],
+                addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]),
+                next_start: Arc::new(AtomicU64::new(0)),
                 expires_at: Instant::now() + Duration::from_secs(60),
                 stale_deadline: Instant::now() + Duration::from_secs(60),
                 applied_ttl: Duration::from_secs(600),
@@ -2411,7 +2831,8 @@ mod tests {
         cache.cache.insert(
             "127.0.0.1".to_string(),
             DnsCacheEntry {
-                addresses: vec![],
+                addresses: Arc::from([]),
+                next_start: Arc::new(AtomicU64::new(0)),
                 expires_at: Instant::now() - Duration::from_secs(1),
                 stale_deadline: Instant::now() - Duration::from_secs(1),
                 applied_ttl: Duration::from_secs(5),
@@ -2442,7 +2863,8 @@ mod tests {
         cache.cache.insert(
             "127.0.0.1".to_string(),
             DnsCacheEntry {
-                addresses: vec![],
+                addresses: Arc::from([]),
+                next_start: Arc::new(AtomicU64::new(0)),
                 expires_at: Instant::now() - Duration::from_secs(1),
                 stale_deadline: Instant::now() - Duration::from_secs(1),
                 applied_ttl: Duration::from_secs(5),
@@ -2483,7 +2905,8 @@ mod tests {
         cache.cache.insert(
             hostname.to_string(),
             DnsCacheEntry {
-                addresses: vec![],
+                addresses: Arc::from([]),
+                next_start: Arc::new(AtomicU64::new(0)),
                 expires_at,
                 stale_deadline: expires_at,
                 applied_ttl: ttl,
@@ -2628,6 +3051,7 @@ mod tests {
                 None,
                 Duration::from_secs(60),
                 None,
+                true,
             )
             .expect("foreground success");
 
@@ -2642,7 +3066,7 @@ mod tests {
             .get(hostname)
             .expect("cleanup must retain the newer success generation");
         assert!(!entry.is_error);
-        assert_eq!(entry.addresses, vec![recovered]);
+        assert_eq!(entry.addresses.as_ref(), &[recovered]);
     }
 
     fn snapshot_error_generation(cache: &DnsCache, hostname: &str) -> FailedRetryGeneration {
@@ -2697,6 +3121,7 @@ mod tests {
                 None,
                 Duration::from_secs(30),
                 Some(30),
+                true,
             )
             .expect("foreground success");
 
@@ -2718,7 +3143,7 @@ mod tests {
 
         let entry = cache.cache.get("svc.example").expect("foreground entry");
         assert!(!entry.is_error);
-        assert_eq!(entry.addresses, vec![foreground_ip]);
+        assert_eq!(entry.addresses.as_ref(), &[foreground_ip]);
         assert_eq!(entry.original_per_proxy_ttl, Some(30));
         assert_eq!(entry.consecutive_failures, 0);
     }
@@ -2744,13 +3169,14 @@ mod tests {
                 None,
                 Duration::from_secs(45),
                 None,
+                true,
             )
             .expect("foreground success");
         assert!(!cache.apply_failed_retry_error("svc.example", &stale_generation, None));
         {
             let entry = cache.cache.get("svc.example").expect("success entry");
             assert!(!entry.is_error);
-            assert_eq!(entry.addresses, vec![foreground_ip]);
+            assert_eq!(entry.addresses.as_ref(), &[foreground_ip]);
         }
 
         // Re-seed an error, then advance the failure streak (as a concurrent
@@ -2804,7 +3230,7 @@ mod tests {
 
         let entry = cache.cache.get("svc.example").expect("recovered entry");
         assert!(!entry.is_error);
-        assert_eq!(entry.addresses, vec![recovered]);
+        assert_eq!(entry.addresses.as_ref(), &[recovered]);
         assert_eq!(entry.consecutive_failures, 0);
         assert!(entry.first_failed_at.is_none());
         assert_eq!(entry.original_per_proxy_ttl, Some(60));
@@ -2881,7 +3307,8 @@ mod tests {
             cache.cache.insert(
                 host.to_string(),
                 DnsCacheEntry {
-                    addresses: vec![IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))],
+                    addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]),
+                    next_start: Arc::new(AtomicU64::new(0)),
                     expires_at: now + Duration::from_secs(offset),
                     stale_deadline: now + Duration::from_secs(offset + 60),
                     applied_ttl: Duration::from_secs(offset),

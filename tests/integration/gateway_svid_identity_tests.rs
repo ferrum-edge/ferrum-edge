@@ -159,9 +159,10 @@ async fn proxy_state_auto_injects_gateway_workload_metrics_from_svid() {
         Some("spiffe://corp.example/ns/gateway/sa/edge")
     );
 
-    let plugins = state
-        .plugin_cache
-        .get_plugins_for_protocol("edge-proxy", ProxyProtocol::Http);
+    let plugins =
+        state
+            .plugin_cache
+            .get_plugins_for_protocol("ferrum", "edge-proxy", ProxyProtocol::Http);
     assert!(
         plugins
             .iter()

@@ -33,6 +33,25 @@ fn generate_ca(cn: &str) -> GeneratedCa {
     }
 }
 
+fn generate_intermediate_ca(parent: &GeneratedCa, cn: &str) -> GeneratedCa {
+    let key_pair =
+        KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate intermediate key");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("intermediate params");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    params.key_usages.push(KeyUsagePurpose::CrlSign);
+    let cert = params
+        .signed_by(&key_pair, &parent.issuer)
+        .expect("sign intermediate");
+    GeneratedCa {
+        cert_pem: cert.pem(),
+        issuer: Issuer::new(params, key_pair),
+    }
+}
+
 fn generate_signed_cert(ca: &GeneratedCa, cn: &str, sans: &[&str]) -> GeneratedCert {
     let key_pair =
         KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate leaf key");
@@ -99,7 +118,9 @@ async fn drain_dtls_client_outputs(
             dimpl::Output::ApplicationData(data) => {
                 *received = Some(data.to_vec());
             }
-            dimpl::Output::PeerCert(_) | dimpl::Output::KeyingMaterial(_, _) => {}
+            dimpl::Output::PeerCert(_)
+            | dimpl::Output::PeerCertChain(_)
+            | dimpl::Output::KeyingMaterial(_, _) => {}
             _ => {}
         }
     }
@@ -337,6 +358,13 @@ async fn test_dimpl_raw_handshake() {
                             drain_round
                         );
                     }
+                    dimpl::Output::PeerCertChain(chain) => {
+                        eprintln!(
+                            "[SERVER] PeerCertChain {} entries (drain {})",
+                            chain.len(),
+                            drain_round
+                        );
+                    }
                     dimpl::Output::Timeout(t) => {
                         eprintln!(
                             "[SERVER] Timeout +{:?} (drain {}, saw_connected={}, skipped={})",
@@ -387,6 +415,9 @@ async fn test_dimpl_raw_handshake() {
                         }
                         dimpl::Output::PeerCert(der) => {
                             eprintln!("[CLIENT] PeerCert {} bytes", der.len());
+                        }
+                        dimpl::Output::PeerCertChain(chain) => {
+                            eprintln!("[CLIENT] PeerCertChain {} entries", chain.len());
                         }
                         dimpl::Output::Timeout(t) => {
                             eprintln!("[CLIENT] Timeout +{:?}", t.duration_since(Instant::now()));
@@ -459,7 +490,7 @@ async fn test_dtls_client_server_handshake_and_echo() {
         .expect("build server config");
     let frontend_config = ferrum_edge::dtls::FrontendDtlsConfig {
         dimpl_config: Arc::new(server_config),
-        certificate: server_cert,
+        certificate: server_cert.into(),
         client_cert_verifier: None,
     };
 
@@ -511,7 +542,8 @@ async fn test_dtls_client_server_handshake_and_echo() {
     let params = ferrum_edge::dtls::BackendDtlsParams {
         config: Arc::new(client_config),
         certificate: dimpl::certificate::generate_self_signed_certificate()
-            .expect("generate client cert"),
+            .expect("generate client cert")
+            .into(),
         server_name: None,
         server_cert_verifier: None,
         connect_timeout_ms: 10_000,
@@ -604,7 +636,9 @@ async fn test_dtls_pem_cert_handshake() {
     let client_config = dimpl::Config::builder().build().expect("client config");
     let params = ferrum_edge::dtls::BackendDtlsParams {
         config: Arc::new(client_config),
-        certificate: dimpl::certificate::generate_self_signed_certificate().unwrap(),
+        certificate: dimpl::certificate::generate_self_signed_certificate()
+            .unwrap()
+            .into(),
         server_name: None,
         server_cert_verifier: None,
         connect_timeout_ms: 10_000,
@@ -628,6 +662,221 @@ async fn test_dtls_pem_cert_handshake() {
 
     assert_eq!(&reply, msg);
     conn.close().await;
+}
+
+#[test]
+fn test_dtls_loader_preserves_leaf_first_chain_and_validates_leaf_key() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let root = generate_ca("DTLS root");
+    let intermediate = generate_intermediate_ca(&root, "DTLS intermediate");
+    let leaf = generate_signed_cert(&intermediate, "localhost", &["localhost"]);
+    let bundle = format!("{}{}", leaf.cert_pem, intermediate.cert_pem);
+    let cert_path = write_pem(&temp_dir, "server-chain.pem", &bundle);
+    let key_path = write_pem(&temp_dir, "server.key", &leaf.key_pem);
+
+    let loaded = ferrum_edge::dtls::load_dtls_certificate(&cert_path, &key_path)
+        .expect("load leaf-first chain");
+    let leaf_der = rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
+        .next()
+        .expect("leaf PEM record")
+        .expect("parse leaf");
+    let intermediate_der = rustls_pemfile::certs(&mut intermediate.cert_pem.as_bytes())
+        .next()
+        .expect("intermediate PEM record")
+        .expect("parse intermediate");
+    assert_eq!(
+        loaded.certificates(),
+        &[leaf_der.to_vec(), intermediate_der.to_vec()]
+    );
+
+    let reversed_path = write_pem(
+        &temp_dir,
+        "server-chain-reversed.pem",
+        &format!("{}{}", intermediate.cert_pem, leaf.cert_pem),
+    );
+    let error = ferrum_edge::dtls::load_dtls_certificate(&reversed_path, &key_path)
+        .expect_err("intermediate-first bundle must fail leaf/key validation");
+    assert!(
+        error.to_string().contains("do not form a valid pair"),
+        "unexpected admission error: {error}"
+    );
+}
+
+#[test]
+fn test_dtls_loader_zeroizes_ferrum_managed_key_der_on_success_and_mismatch() {
+    use std::sync::{Arc, Mutex};
+
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let root = generate_ca("DTLS zeroize root");
+    let leaf = generate_signed_cert(&root, "localhost", &["localhost"]);
+    let other = generate_signed_cert(&root, "other.example", &["other.example"]);
+    let cert_path = write_pem(&temp_dir, "leaf.pem", &leaf.cert_pem);
+    let key_path = write_pem(&temp_dir, "leaf.key", &leaf.key_pem);
+    let mismatched_key_path = write_pem(&temp_dir, "other.key", &other.key_pem);
+
+    let key_der_len = {
+        let mut key_reader = leaf.key_pem.as_bytes();
+        rustls_pemfile::private_key(&mut key_reader)
+            .expect("parse leaf key PEM")
+            .expect("leaf key present")
+            .secret_der()
+            .len()
+    };
+    assert!(key_der_len > 0, "expected non-empty leaf key DER");
+
+    let success_observations = Arc::new(Mutex::new(Vec::new()));
+    let success_hook = {
+        let observations = Arc::clone(&success_observations);
+        move |zeroized: &[u8]| {
+            observations
+                .lock()
+                .expect("lock success zeroization observations")
+                .push(zeroized.to_vec());
+        }
+    };
+    let loaded =
+        ferrum_edge::_test_support::load_dtls_certificate_with_rustls_key_drop_hook_for_test(
+            &cert_path,
+            &key_path,
+            success_hook,
+        )
+        .expect("successful load must still admit a matching leaf/key pair");
+    assert_eq!(loaded.certificates().len(), 1);
+    {
+        let observations = success_observations
+            .lock()
+            .expect("lock success zeroization observations");
+        assert_eq!(
+            observations.len(),
+            1,
+            "success path must zeroize the Ferrum-managed rustls DER owner exactly once"
+        );
+        assert_eq!(observations[0].len(), key_der_len);
+        assert!(
+            observations[0].iter().all(|byte| *byte == 0),
+            "success-path drop hook must observe only zeroized private-key storage"
+        );
+    }
+    drop(loaded);
+
+    let mismatch_observations = Arc::new(Mutex::new(Vec::new()));
+    let mismatch_hook = {
+        let observations = Arc::clone(&mismatch_observations);
+        move |zeroized: &[u8]| {
+            observations
+                .lock()
+                .expect("lock mismatch zeroization observations")
+                .push(zeroized.to_vec());
+        }
+    };
+    let error =
+        ferrum_edge::_test_support::load_dtls_certificate_with_rustls_key_drop_hook_for_test(
+            &cert_path,
+            &mismatched_key_path,
+            mismatch_hook,
+        )
+        .expect_err("mismatched leaf/key pair must fail closed");
+    assert!(
+        error.to_string().contains("do not form a valid pair"),
+        "unexpected mismatch error: {error}"
+    );
+    let mismatched_key_der_len = {
+        let mut key_reader = other.key_pem.as_bytes();
+        rustls_pemfile::private_key(&mut key_reader)
+            .expect("parse mismatched key PEM")
+            .expect("mismatched key present")
+            .secret_der()
+            .len()
+    };
+    {
+        let observations = mismatch_observations
+            .lock()
+            .expect("lock mismatch zeroization observations");
+        assert_eq!(
+            observations.len(),
+            1,
+            "mismatch path must zeroize the Ferrum-managed rustls DER owner exactly once"
+        );
+        assert_eq!(observations[0].len(), mismatched_key_der_len);
+        assert!(
+            observations[0].iter().all(|byte| *byte == 0),
+            "mismatch-path drop hook must observe only zeroized private-key storage"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_dtls_server_transmits_intermediate_to_root_only_client() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let root = generate_ca("DTLS root");
+    let intermediate = generate_intermediate_ca(&root, "DTLS intermediate");
+    let leaf = generate_signed_cert(&intermediate, "localhost", &["localhost"]);
+    let cert_path = write_pem(
+        &temp_dir,
+        "server-chain.pem",
+        &format!("{}{}", leaf.cert_pem, intermediate.cert_pem),
+    );
+    let key_path = write_pem(&temp_dir, "server.key", &leaf.key_pem);
+    let root_path = write_pem(&temp_dir, "root.pem", &root.cert_pem);
+    let frontend_config =
+        ferrum_edge::dtls::build_frontend_dtls_config(&cert_path, &key_path, None, &[])
+            .expect("build chained frontend");
+    let server = Arc::new(
+        ferrum_edge::dtls::DtlsServer::bind(
+            "127.0.0.1:0".parse().expect("server bind address"),
+            frontend_config,
+        )
+        .await
+        .expect("bind chained server"),
+    );
+    let server_addr = server.local_addr();
+    let server_runner = server.clone();
+    tokio::spawn(async move {
+        let _ = server_runner.run().await;
+    });
+    let server_acceptor = server.clone();
+    tokio::spawn(async move {
+        if let Ok((conn, _)) = server_acceptor.accept().await
+            && let Ok(payload) = conn.recv().await
+        {
+            let _ = conn.send(&payload).await;
+        }
+    });
+
+    let client_socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+    client_socket
+        .connect(server_addr)
+        .await
+        .expect("connect client");
+    let proxy = build_dtls_proxy("localhost", server_addr.port(), Some(root_path));
+    let params = ferrum_edge::dtls::build_backend_dtls_config(
+        &proxy,
+        "localhost",
+        false,
+        &Arc::new(Vec::new()),
+        None,
+    )
+    .expect("build root-only client config");
+    let connection = tokio::time::timeout(
+        Duration::from_secs(10),
+        ferrum_edge::dtls::DtlsConnection::connect(client_socket, params),
+    )
+    .await
+    .expect("chain handshake timeout")
+    .expect("chain handshake must verify through transmitted intermediate");
+
+    connection.send(b"chain-ok").await.expect("send payload");
+    let echoed = tokio::time::timeout(Duration::from_secs(5), connection.recv())
+        .await
+        .expect("echo timeout")
+        .expect("receive echo");
+    assert_eq!(echoed, b"chain-ok");
 }
 
 #[tokio::test]
@@ -677,7 +926,7 @@ async fn test_dtls_server_accepts_strict_dtls13_client() {
                 .build()
                 .expect("build frontend config"),
         ),
-        certificate: server_cert,
+        certificate: server_cert.into(),
         client_cert_verifier: None,
     };
 
@@ -778,7 +1027,7 @@ async fn test_dtls_server_close_releases_socket() {
         dimpl::certificate::generate_self_signed_certificate().expect("generate server cert");
     let frontend_config = ferrum_edge::dtls::FrontendDtlsConfig {
         dimpl_config: Arc::new(dimpl::Config::builder().build().expect("build config")),
-        certificate: server_cert,
+        certificate: server_cert.into(),
         client_cert_verifier: None,
     };
 

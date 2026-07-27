@@ -505,8 +505,14 @@ paths:
       summary: Create an ACME HTTP-01, TLS-ALPN-01, or DNS-01 order
       description: |
         Creates an ACME order through the optional `acme` Cargo feature and
-        persists the returned HTTP-01, TLS-ALPN-01, or DNS-01 challenge material. When
-        Ferrum is built without that feature this endpoint returns
+        persists the returned HTTP-01, TLS-ALPN-01, or DNS-01 challenge material.
+        Every ACME URL must be HTTPS and remain on the configured directory's
+        normalized host and effective port. Ferrum rejects credential-directory
+        drift, legacy embedded endpoint sets, redirects, and any fresh DNS answer
+        containing a non-public address or more than 64 addresses. Fresh DNS and
+        all TCP candidates share one 30-second wall-clock deadline. Every ACME
+        response, including certificate chains, is capped at 1 MiB while streaming.
+        When Ferrum is built without the feature this endpoint returns
         `501 Not Implemented`.
       tags: [TLS]
       requestBody:
@@ -570,7 +576,10 @@ paths:
         `acme://certificates/{id}` record. Ferrum reuses persisted account
         credentials from the latest order for the certificate when available,
         or uses credentials supplied in the request. Finalize the returned
-        order after the selected challenge is reachable.
+        order after the selected challenge is reachable. The same HTTPS,
+        same-origin, shared 30-second fresh-DNS/TCP deadline, 64-address DNS limit,
+        public-egress checks, and 1 MiB streaming response cap used for initial
+        issuance apply to this renewal.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -648,6 +657,10 @@ paths:
         the order, fetches the issued certificate, and stores it as an
         `acme://certificates/{id}` record. The endpoint requires the optional
         `acme` Cargo feature and returns `501 Not Implemented` without it.
+        Persisted order and server-provided authorization, challenge, finalize,
+        and certificate URLs remain subject to the directory's HTTPS same-origin
+        policy, the shared 30-second fresh-DNS/TCP deadline, the complete-answer
+        public-address and 64-address checks, and the 1 MiB streaming response cap.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1607,14 +1620,16 @@ paths:
         still overflows, this endpoint returns HTTP 500 with an explicit error
         object instead of JSON `null` or Prometheus `inf`.
 
-        `proxy_name` is live display metadata for the stable `proxy_id` and is
-        not part of the registry key, so name-only reloads keep accumulated
-        counter values. Both formats resolve active IDs through the same
-        snapshot of the published configuration, so late retired-generation
-        traffic cannot restore an old name. As a Prometheus label, a rename
-        creates a controlled label transition whose new series carries the
-        existing cumulative value. Overlapping pricing generations collapse
-        under that authoritative current name.
+        Charge identity is the matched proxy's `(namespace, proxy_id)`, including
+        for gateway-wide global plugin instances. `proxy_name` is live display
+        metadata and is not part of the registry key, so name-only reloads keep
+        accumulated counter values. Both formats resolve active identities
+        through the same namespace-qualified snapshot of the published
+        configuration, so late retired-generation traffic cannot restore an old
+        name. As a Prometheus label, a rename creates a controlled label
+        transition whose new series carries the existing cumulative value.
+        Overlapping pricing generations collapse under that authoritative
+        current name.
 
         **Multi-node deployments**: Each gateway node accumulates charges independently.
         In CP/DP topologies, scrape every DP node and aggregate externally.
@@ -2873,7 +2888,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [slice]
+                required: [slice, revision]
                 properties:
                   slice:
                     type: object
@@ -3028,6 +3043,149 @@ paths:
                           True when the converged required-type versions are not
                           all identical — normal under resource warming after an
                           incremental (e.g. policy/workload-only ECDS) update.
+                  revision:
+                    type: object
+                    description: |
+                      Authoritative config-revision state for this DP's
+                      multi-CP freshness gate. `accepted` is the
+                      `(authority, sequence)` most recently admitted into the
+                      received slot; `applied` is the generation the proxy
+                      runtime actually accepted and is serving;
+                      `quarantined` describes the most recent slice the gate
+                      refused (a lagging fallback CP, a foreign ordering
+                      domain, or a slice carrying no revision while one is
+                      accepted). Always present in mesh mode.
+
+                      `accepted` briefly leads `applied` while a freshly
+                      received slice is being applied. If the proxy runtime
+                      then refuses that slice, `accepted` is rolled back to
+                      `applied` so revisions between the two stay eligible —
+                      a runtime-invalid slice at a far-future sequence can
+                      never lock the data plane out of recovery.
+
+                      This block is JWT-gated on purpose: the authority string
+                      and sequence numbers are control-plane-supplied, so
+                      `/metrics` carries only the fixed-cardinality
+                      `ferrum_mesh_config_revision_rejections_total{reason}`
+                      counter and `ferrum_mesh_config_revision_adoptions_total`.
+                      Every authority rendered in this block is
+                      control-character-stripped and truncated to 64
+                      characters.
+                    required:
+                      - rejected_total
+                      - adopted_total
+                      - foreign_authority_adopt_secs
+                      - quarantine_active
+                    properties:
+                      accepted:
+                        type: object
+                        description: |
+                          Revision most recently admitted into the received
+                          slot. Omitted when this DP has never accepted a
+                          revisioned slice (unversioned config authority, or
+                          pre-first-slice).
+                        required: [authority, sequence]
+                        properties:
+                          authority:
+                            type: string
+                            description: |
+                              Ordering domain
+                              (`FERRUM_MESH_CONFIG_AUTHORITY_ID` on the CP).
+                              Sequences are only comparable within one
+                              authority. Control-character-stripped and
+                              truncated to 64 characters.
+                          sequence:
+                            type: integer
+                            minimum: 0
+                            description: |
+                              Durable config-change sequence within
+                              `authority`. Monotonic; never a wall clock.
+                      applied:
+                        type: object
+                        description: |
+                          Revision of the slice the proxy runtime last
+                          accepted — the last-good generation serving traffic,
+                          and the rollback target when a received candidate is
+                          refused by the runtime. Normally equal to
+                          `accepted`. Omitted when no revisioned slice has been
+                          applied yet.
+                        required: [authority, sequence]
+                        properties:
+                          authority:
+                            type: string
+                            description: |
+                              Sanitized exactly like `accepted.authority`.
+                          sequence:
+                            type: integer
+                            minimum: 0
+                      quarantined:
+                        type: object
+                        description: |
+                          Most recent slice the freshness gate refused.
+                          Retained until a slice is accepted. Omitted when the
+                          gate has refused nothing since the last accept.
+                        required:
+                          - authority
+                          - sequence
+                          - reason
+                          - consecutive
+                          - first_seen_at
+                          - last_seen_at
+                        properties:
+                          authority:
+                            type: string
+                            description: |
+                              Refused authority, control-character-stripped and
+                              truncated to 64 characters. `<absent>` when the
+                              refused slice carried no revision.
+                          sequence:
+                            type: integer
+                            minimum: 0
+                          reason:
+                            type: string
+                            enum:
+                              [
+                                stale_revision,
+                                incomparable_authority,
+                                missing_revision,
+                                malformed_revision,
+                              ]
+                          consecutive:
+                            type: integer
+                            minimum: 1
+                            description: |
+                              Consecutive refusals of this same
+                              (authority, reason) pair.
+                          first_seen_at:
+                            type: string
+                            format: date-time
+                          last_seen_at:
+                            type: string
+                            format: date-time
+                      rejected_total:
+                        type: integer
+                        minimum: 0
+                        description: |
+                          Slices the gate has refused since process start.
+                      adopted_total:
+                        type: integer
+                        minimum: 0
+                        description: |
+                          Foreign authorities adopted after the grace period.
+                      foreign_authority_adopt_secs:
+                        type: integer
+                        minimum: 0
+                        description: |
+                          Effective `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`.
+                          `0` disables adoption, leaving
+                          `POST /mesh/config-revision/reset` as the only
+                          recovery from an incomparable authority.
+                      quarantine_active:
+                        type: boolean
+                        description: |
+                          True while the gate is holding the last-good slice
+                          against a refused candidate — the "stale fallback
+                          quarantined" operator signal.
               examples:
                 config-drift-populated:
                   value:
@@ -3067,6 +3225,24 @@ paths:
                       missing_required_types: []
                       converged: true
                       version_skew: true
+                    revision:
+                      accepted:
+                        authority: db
+                        sequence: 4821
+                      applied:
+                        authority: db
+                        sequence: 4821
+                      quarantined:
+                        authority: db
+                        sequence: 4780
+                        reason: stale_revision
+                        consecutive: 3
+                        first_seen_at: "2026-05-18T19:30:02Z"
+                        last_seen_at: "2026-05-18T19:32:05Z"
+                      rejected_total: 3
+                      adopted_total: 0
+                      foreign_authority_adopt_secs: 300
+                      quarantine_active: true
                 config-drift-pre-convergence:
                   summary: Mesh mode active but no slice accepted yet
                   value:
@@ -3085,8 +3261,97 @@ paths:
                         extension_configs: 0
                       source_protocol: native
                       source_cp_url: "grpcs://cp-primary.mesh.svc.cluster.local:50051"
+                    revision:
+                      rejected_total: 0
+                      adopted_total: 0
+                      foreign_authority_adopt_secs: 300
+                      quarantine_active: false
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No active mesh runtime state (not in mesh mode)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /mesh/config-revision/reset:
+    post:
+      operationId: resetMeshConfigRevision
+      summary: Clear this DP's accepted mesh config revision (freshness gate)
+      description: |
+        Clears the last-accepted authoritative config revision so the next
+        mesh slice from ANY config authority is eligible again.
+
+        The DP orders slices by `(authority, sequence)` and refuses one that is
+        older than — or from a different ordering domain than — the accepted
+        revision, so a lagging fallback control plane cannot roll the data
+        plane back to a stale generation during an HA failover. A **foreign**
+        authority is adopted automatically once it has been observed
+        continuously for `FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`; that grace
+        uses a monotonic process clock, so wall-clock jumps cannot expire it
+        early. A sequence
+        rewind **inside one authority** is never auto-adopted, because it is
+        indistinguishable from the rollback the gate exists to prevent — this
+        endpoint is the documented recovery for that case (a config store
+        restored from backup without bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID`).
+
+        Installs nothing by itself: the next slice still has to pass
+        subscription binding and update validation. The reset is logged with
+        the calling token's subject and the cleared revision.
+
+        Requires the `operator` role. Returns `404 Not Found` outside mesh mode.
+      tags: [Mesh Config Drift]
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Accepted revision cleared
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [reset]
+                  cleared_revision:
+                    type: [object, "null"]
+                    description: |
+                      The revision that was cleared, or `null` when the gate
+                      held no accepted revision. Clearing also drops the
+                      last-applied watermark, so a later runtime-refused slice
+                      cannot roll the gate back onto the generation this reset
+                      just released.
+                    required: [authority, sequence]
+                    properties:
+                      authority:
+                        type: string
+                        description: |
+                          Cleared ordering domain, control-character-stripped
+                          and truncated to 64 characters (a `(truncated)`
+                          suffix marks that). The authority is
+                          control-plane-supplied, so this response and the
+                          matching audit log line carry only the sanitized
+                          rendering.
+                      sequence:
+                        type: integer
+                        minimum: 0
+              examples:
+                cleared:
+                  value:
+                    status: reset
+                    cleared_revision:
+                      authority: db
+                      sequence: 4821
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           description: No active mesh runtime state (not in mesh mode)
           content:
@@ -5968,12 +6233,14 @@ components:
         directory_url:
           type: string
           description: >-
-            ACME directory URL. Must be an absolute `https` URL with a host. Literal
-            IP hosts must be public addresses; private/reserved literals (loopback,
-            RFC1918, link-local, ULA, and the `169.254.169.254` metadata address) are
-            rejected to limit SSRF. Hostnames are not resolved here, so a hostname that
-            points at a private IP is not blocked by this check — apply network-level
-            egress controls as well.
+            ACME directory URL. Must be an absolute `https` URL without userinfo or
+            a fragment. The host must be an ordinary DNS name or canonical IP
+            literal; percent-encoded and ambiguous legacy numeric IPv4 spellings
+            are rejected before DNS. The complete fresh A/AAAA answer must contain
+            at most 64 candidates and every candidate must be public. Fresh DNS
+            and all TCP attempts share a 30-second deadline. All server-provided
+            resource URLs must retain this URL's normalized host and effective
+            port, and every ACME response body is capped at 1 MiB while streaming.
         contact:
           type: array
           items:
@@ -5989,7 +6256,10 @@ components:
           description: ACME challenge type to prepare for this order.
         existing_account_credentials_json:
           type: string
-          description: Previously persisted instant-acme account credentials JSON. Persisted but never returned.
+          description: >-
+            Previously persisted instant-acme account credentials JSON. Its directory
+            must exactly match `directory_url`; legacy embedded `urls` sets are
+            rejected. Persisted but never returned.
         allow_overwrite:
           type: boolean
           default: false
@@ -6050,7 +6320,10 @@ components:
           description: ACME challenge type to prepare for the renewal order.
         existing_account_credentials_json:
           type: string
-          description: Optional instant-acme account credentials JSON. Persisted in the renewal order but never returned.
+          description: >-
+            Optional instant-acme account credentials JSON. Its directory must match
+            the certificate directory and legacy embedded `urls` sets are rejected.
+            Persisted in the renewal order but never returned.
         allow_overwrite:
           type: boolean
           default: false
@@ -10203,10 +10476,16 @@ components:
         admin_writes_enabled:
           type: boolean
           description: |
-            `true` when the admin API will accept writes. `false` when the
-            admin API is in read-only mode or when the database is currently
-            unavailable. When `false` and read-only mode is not configured,
-            `status` is forced to `degraded`.
+            `true` when the admin API will accept **config-database** mutations
+            (proxies/upstreams/consumers/plugins/credentials/API specs/batch/
+            restore). `false` when the admin API is in read-only mode, when the
+            database is currently unavailable, or when the active config-store
+            pool is on a `FERRUM_DB_FAILOVER_URLS` topology without
+            `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`. This signal does **not** gate
+            managed TLS / ACME store mutations, which use independent stores and
+            only the read-only / database-unavailable gates. When `false` and
+            read-only mode is not configured, `status` is forced to
+            `degraded`.
         timestamp:
           type: string
           format: date-time
@@ -10222,6 +10501,8 @@ components:
           description: |
             Database connectivity info. Present only when the gateway has a
             configured database (database/cp/dp modes); absent in file mode.
+            Authenticated detail only (with the rest of the detailed health
+            body).
           required: [status]
           properties:
             status:
@@ -10268,6 +10549,8 @@ components:
                       type: integer
                     active:
                       type: integer
+            failover_topology:
+              $ref: "#/components/schemas/DatabaseFailoverTopology"
         cached_config:
           type: object
           required: [available]
@@ -10340,6 +10623,19 @@ components:
               max_tool_name_bytes: 128
               max_tool_names_aggregate_bytes: 4096
               max_retained_record_bytes: 135424
+              max_redaction_scan_bytes: 1048576
+              max_entry_bytes: 861696
+              max_entry_retained_bytes: 1723522
+              buffer_max_bytes: 134217728
+              retained_bytes: 0
+              retained_byte_drops: 0
+              max_stream_reservation_secs: 900
+              stream_reservations_expired: 0
+              stream_hash_scope: capped
+              ack_policy: drain
+              ack_max_bytes: 65536
+              ack_timeout_ms: 1000
+              sink_healthy: true
 
     AiTranscriptAuditStatusSnapshot:
       type: object
@@ -10361,6 +10657,19 @@ components:
         - max_tool_name_bytes
         - max_tool_names_aggregate_bytes
         - max_retained_record_bytes
+        - max_redaction_scan_bytes
+        - max_entry_bytes
+        - max_entry_retained_bytes
+        - buffer_max_bytes
+        - retained_bytes
+        - retained_byte_drops
+        - max_stream_reservation_secs
+        - stream_reservations_expired
+        - stream_hash_scope
+        - ack_policy
+        - ack_max_bytes
+        - ack_timeout_ms
+        - sink_healthy
       properties:
         instance_id:
           type: integer
@@ -10405,6 +10714,82 @@ components:
             Coherent per-record retained-memory contract:
             max_request_bytes + max(max_response_bytes, max_stream_capture_bytes)
             + max_model_bytes + max_tool_names_aggregate_bytes.
+        max_redaction_scan_bytes:
+          type: integer
+          format: uint64
+          description: >-
+            Hard processing bound for redacted-mode request classification,
+            model/tool extraction, and shaping. Raw payloads above this are
+            never parsed/scanned/copied; oversized JSON POSTs are
+            conservatively audited with explicit omission evidence.
+        max_entry_bytes:
+          type: integer
+          format: uint64
+          description: >-
+            Maximum serialized JSON bytes for one admitted record. The derived
+            default covers worst-case JSON escaping of the capture contract.
+        max_entry_retained_bytes:
+          type: integer
+          format: uint64
+          description: >-
+            Maximum aggregate lease charge for one entry at max_entry_bytes:
+            2 * (max_entry_bytes + 1) + 128, covering the immutable queued
+            payload, one exact-capacity HTTP batch copy and JSON-array framing,
+            plus fixed queue/retry/delivery state.
+        buffer_max_bytes:
+          type: integer
+          format: uint64
+          description: >-
+            Aggregate retained-byte budget covering staged candidates,
+            fail-closed pre-commit reservations, active fail-open stream
+            capture reservations, and queued records.
+        retained_bytes:
+          type: integer
+          format: uint64
+          description: >-
+            Live aggregate retained bytes currently charged against
+            `buffer_max_bytes`. A gauge only — never transcript content.
+        retained_byte_drops:
+          type: integer
+          format: uint64
+          description: >-
+            Admissions refused because the aggregate retained-byte budget was
+            saturated. A rising value means the collector cannot keep up.
+        max_stream_reservation_secs:
+          type: integer
+          format: uint64
+          description: >-
+            Maximum lifetime of one active stream's audit capture, staging
+            entry, and reserved commit permit. Expiry clears capture/hash work
+            before accounting is released.
+        stream_reservations_expired:
+          type: integer
+          format: uint64
+          description: >-
+            Stream reservations and inspector capture state revoked by the
+            staging-lifetime deadline owner or repair sweep after exceeding
+            `max_stream_reservation_secs`. Non-zero means streams are
+            outliving their bound.
+        stream_hash_scope:
+          type: string
+          enum: [capped, full]
+          description: How much of a streamed response the keyed digest covers.
+        ack_policy:
+          type: string
+          enum: [drain, json]
+          description: How a collector acknowledgement is validated.
+        ack_max_bytes:
+          type: integer
+          format: uint64
+        ack_timeout_ms:
+          type: integer
+          format: uint64
+        sink_healthy:
+          type: boolean
+          description: >-
+            Whether the last completed batch delivery published a healthy sink
+            (2xx AND a fully drained/validated acknowledgement). Drives
+            `sink.on_sink_error: reject` admission.
 
     ServingListenerFailureSnapshot:
       type: object
@@ -10637,8 +11022,14 @@ components:
                 listener is serving.
               items:
                 type: object
-                required: [proxy_id, listen_port, error, kind]
+                required: [namespace, proxy_id, listen_port, error, kind]
                 properties:
+                  namespace:
+                    type: string
+                    description: |
+                      Namespace owning the proxy. Proxy IDs are unique only
+                      within a namespace, so `(namespace, proxy_id, listen_port)`
+                      is the identity of an entry.
                   proxy_id:
                     type: string
                     description: ID of the proxy whose stream listener is not serving.
@@ -10959,6 +11350,48 @@ components:
         escalated:
           type: boolean
 
+    DatabaseFailoverTopology:
+      type: object
+      description: |
+        Authenticated `/health` detail only. Present while the active config-store
+        pool points at a `FERRUM_DB_FAILOVER_URLS` entry. URLs are always redacted
+        (no userinfo). When `allow_writes` is false (default), config-database
+        admin mutations return 503 and `admin_writes_enabled` is false. When
+        `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`, those writes are permitted under
+        the operator's synchronously replicated multi-primary assertion; Ferrum
+        allows automatic primary failback and emits one bounded process-local
+        divergence-risk log for the window (not a durable fence; cleared by
+        restart). Managed TLS/ACME stores are independent and are not gated by
+        this topology. This object does not claim per-request mutation success.
+      required: [primary_active, allow_writes, opt_in_writes_enabled_during_window]
+      properties:
+        primary_active:
+          type: boolean
+          description: |
+            `false` while the active write/runtime pool is on a failover URL.
+            DNS/TLS reconnect paths target the configured primary URL and set
+            this `true` only after a successful primary reconnect; failover
+            reconnects keep it `false`.
+        allow_writes:
+          type: boolean
+          description: |
+            Current value of `FERRUM_DB_FAILOVER_ALLOW_WRITES` on this store.
+        opt_in_writes_enabled_during_window:
+          type: boolean
+          description: |
+            Sticky process-local marker: opt-in writes were enabled at any point
+            during the current failover window. Conservative risk signal only;
+            does not count admitted, rejected, or successful mutations.
+        failover_since_unix_ms:
+          type: integer
+          format: uint64
+          description: Unix epoch milliseconds when failover topology became active.
+        active_url_redacted:
+          type: string
+          description: |
+            Credential-free redaction of the active DB URL (`redact_url`).
+            Never contains userinfo.
+
     DatabaseDeltaPollingHealth:
       type: object
       description: |
@@ -11256,11 +11689,19 @@ components:
         Direct-backend proxies (no upstream) emit one per-proxy entry without
         `target`. Proxies with upstream targets emit one independent breaker per
         target and include `target` as `host:port`.
-      required: [proxy_id, state, failure_count, success_count]
+
+        Runtime cache keys are namespace-qualified; authenticated admin output
+        keeps the original resource id in `proxy_id` and exposes `namespace`
+        separately so same-id tenants remain distinguishable.
+      required: [namespace, proxy_id, state, failure_count, success_count]
       properties:
+        namespace:
+          type: string
+          description: Namespace that owns this proxy
+          example: ferrum
         proxy_id:
           type: string
-          description: ID of the proxy this circuit breaker protects
+          description: ID of the proxy this circuit breaker protects (not namespace-qualified)
         target:
           type: string
           description: |
@@ -11286,15 +11727,26 @@ components:
       type: object
       description: |
         One unhealthy target excluded from load balancing. Active health checks
-        are upstream-scoped (`type=active`, no `proxy_id`). Passive health checks
-        are proxy-scoped (`type=passive` and always include `proxy_id`).
-      required: [target, type, since_epoch_ms]
+        are upstream-scoped (`type=active`, `upstream_id` present, no `proxy_id`).
+        Passive health checks are proxy-scoped (`type=passive`, `proxy_id` present,
+        no `upstream_id`). Namespace is always explicit so same-id resources in
+        different tenants remain distinguishable.
+      required: [namespace, target, type, since_epoch_ms]
       properties:
+        namespace:
+          type: string
+          description: Namespace that owns this health entry
+          example: ferrum
         proxy_id:
           type: string
           description: |
             Proxy that owns this passive health entry. Required when
             `type` is `passive`; omitted when `type` is `active`.
+        upstream_id:
+          type: string
+          description: |
+            Upstream that owns this active health entry. Required when
+            `type` is `active`; omitted when `type` is `passive`.
         target:
           type: string
           description: "Target in host:port format"
@@ -11317,12 +11769,15 @@ components:
             required: [type]
           then:
             required: [proxy_id]
+            not:
+              required: [upstream_id]
         - if:
             properties:
               type:
                 const: active
             required: [type]
           then:
+            required: [upstream_id]
             not:
               required: [proxy_id]
 
@@ -11341,6 +11796,29 @@ components:
           items:
             $ref: "#/components/schemas/AdminMetricsUnhealthyTarget"
 
+    AdminMetricsUpstreamConnections:
+      type: object
+      description: |
+        Active connection counts for one upstream. Namespace and upstream_id are
+        separate fields so same-id upstreams in different tenants stay distinct.
+      required: [namespace, upstream_id, targets]
+      properties:
+        namespace:
+          type: string
+          description: Namespace that owns this upstream
+          example: ferrum
+        upstream_id:
+          type: string
+          description: Upstream ID (not namespace-qualified)
+          example: upstream-users
+        targets:
+          type: object
+          additionalProperties:
+            type: integer
+          description: |
+            Map of `host:port` → active_connection_count. Only targets with
+            count > 0 are included.
+
     AdminMetricsLoadBalancers:
       type: object
       description: |
@@ -11349,14 +11827,12 @@ components:
         distribution across targets and spotting hot targets.
       properties:
         active_connections:
-          type: object
-          additionalProperties:
-            type: object
-            additionalProperties:
-              type: integer
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminMetricsUpstreamConnections"
           description: |
-            Nested map: upstream_id → { "host:port" → active_connection_count }.
-            Only targets with count > 0 are included.
+            One entry per upstream that currently has active connections.
+            Identity is `(namespace, upstream_id)`; target keys remain `host:port`.
 
     AdminMetricsCaches:
       type: object
@@ -12172,7 +12648,7 @@ components:
     KafkaLoggingConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds blocking-pool scheduling plus the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload."
+      description: "Plugin: kafka_logging — Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses an async channel to decouple the proxy hot path from Kafka I/O, with librdkafka handling batching, compression, and delivery retries. Local queue admission is distinct from terminal broker acknowledgement; flush_timeout_seconds bounds blocking-pool scheduling plus the owned shutdown/reload producer flush. KeepLastKnownGood admission rejects invalid startup configuration and preserves the previous accepted generation on invalid reload. Requires a fully-open backend egress policy: librdkafka resolves bootstrap hostnames itself and dials brokers advertised by cluster metadata, and the pinned client exposes no connect/resolve callback, so those addresses cannot be screened. Admission returns 400 whenever FERRUM_BACKEND_* policy can deny any address (including the default posture). broker_list is parsed with librdkafka's [proto://]host[:port] grammar, so protocol-prefixed denied literals and protocol prefixes that disagree with security_protocol are rejected."
       required:
         - broker_list
         - topic
@@ -15316,7 +15792,8 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported)."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims."
+      additionalProperties: false
       properties:
         reject_missing_security_header:
           type: boolean
@@ -15325,6 +15802,7 @@ components:
         timestamp:
           type: object
           description: WS-Security Timestamp validation
+          additionalProperties: false
           properties:
             require:
               type: boolean
@@ -15334,7 +15812,9 @@ components:
               type: integer
               format: uint64
               default: 300
-              description: Maximum age (seconds) of the Created timestamp before rejection
+              minimum: 1
+              maximum: 86400
+              description: Maximum age (seconds) of the Created timestamp before rejection. Zero is rejected because it would accept no timestamp at all.
             require_expires:
               type: boolean
               default: false
@@ -15343,7 +15823,9 @@ components:
               type: integer
               format: uint64
               default: 300
-              description: Clock skew tolerance (seconds) for timestamp validation
+              minimum: 0
+              maximum: 3600
+              description: Clock skew tolerance (seconds) for timestamp validation. Zero is permitted (strictest). The maximum keeps every admitted value inside representable duration arithmetic.
         username_token:
           type: object
           description: |
@@ -15354,6 +15836,7 @@ components:
             still perform PasswordText/PasswordDigest verification against
             process-local dummy material. Structural token or policy failures
             remain distinct.
+          additionalProperties: false
           properties:
             enabled:
               type: boolean
@@ -15369,15 +15852,19 @@ components:
               items:
                 type: object
                 required: [username, password]
+                additionalProperties: false
                 properties:
                   username:
                     type: string
+                    minLength: 1
                   password:
                     type: string
-              description: Allowed username/password pairs for UsernameToken authentication
+                    minLength: 1
+              description: Allowed username/password pairs for UsernameToken authentication. Every entry must be an object with non-empty username and password; a malformed entry is rejected rather than dropped, and duplicate usernames are rejected because credential selection is first-wins.
         x509_signature:
           type: object
           description: X.509 certificate signature verification
+          additionalProperties: false
           properties:
             enabled:
               type: boolean
@@ -15387,16 +15874,19 @@ components:
               type: array
               items:
                 type: string
-              description: PEM file paths of trusted signing certificates (matched by SHA-256 fingerprint)
+                minLength: 1
+              description: PEM file paths of trusted signing certificates (matched by SHA-256 fingerprint). Non-string or empty entries are rejected rather than dropped.
             allowed_algorithms:
               type: array
+              minItems: 1
               items:
                 type: string
                 enum: [rsa-sha256, rsa-sha1]
               default: [rsa-sha256]
-              description: Allowed XMLDSig signature algorithms
+              description: Allowed XMLDSig signature algorithms. Unsupported values are rejected rather than dropped.
             allowed_digest_algorithms:
               type: array
+              minItems: 1
               items:
                 type: string
                 enum: [sha256, sha1]
@@ -15442,6 +15932,7 @@ components:
             On any failure the request is rejected with HTTP 401. Unsupported
             canonicalization or transform algorithms fail closed; inclusive c14n,
             comments, XPath, XSLT, and other XMLDSIG transforms are not supported.
+          additionalProperties: false
           properties:
             enabled:
               type: boolean
@@ -15451,6 +15942,7 @@ components:
               type: array
               items:
                 type: string
+                minLength: 1
               description: |
                 SAML Issuer URIs that are accepted as the source of an assertion.
                 Required when `enabled` is true. The Issuer string inside the
@@ -15459,6 +15951,7 @@ components:
               type: array
               items:
                 type: string
+                minLength: 1
               description: |
                 PEM file paths of IdP X.509 signing certificates. The cert
                 presented inside the assertion's `KeyInfo` must match one of
@@ -15467,6 +15960,7 @@ components:
                 updating this list and restarting (no live reload).
             allowed_signature_algorithms:
               type: array
+              minItems: 1
               items:
                 type: string
                 enum: [rsa-sha256, rsa-sha1]
@@ -15478,6 +15972,7 @@ components:
                 of `allowed_digest_algorithms`.
             allowed_digest_algorithms:
               type: array
+              minItems: 1
               items:
                 type: string
                 enum: [sha256, sha1]
@@ -15490,30 +15985,65 @@ components:
                 can choose any combination.
             audience:
               type: string
+              minLength: 1
               description: |
                 Optional. When set, the assertion's
                 `Conditions/AudienceRestriction/Audience` must match this
                 string exactly. Use this to bind assertions to the specific
-                service this proxy fronts.
+                service this proxy fronts. Must be a non-empty string when
+                present — a wrong-typed value is rejected rather than silently
+                removing audience binding.
             clock_skew_seconds:
               type: integer
               format: uint64
               default: 300
-              description: Clock skew tolerance (seconds) for SAML NotBefore / NotOnOrAfter.
+              minimum: 0
+              maximum: 3600
+              description: Clock skew tolerance (seconds) for SAML NotBefore / NotOnOrAfter. Zero is permitted (strictest); the maximum keeps every admitted value inside representable duration arithmetic.
         nonce:
           type: object
-          description: Nonce replay protection cache (PasswordDigest only)
+          description: |
+            Nonce replay protection cache (PasswordDigest only). A nonce is
+            retained only after its PasswordDigest verifies, and the cache is
+            bounded on three independent axes: per-nonce encoded length,
+            retained entries, and retained key UTF-8 payload bytes counted once
+            per shared immutable key allocation. An exact ordered age index
+            provides O(log n) expiry/oldest operations without a lookup-map
+            scan or stale queue. One request examines at most 64 indexed
+            entries; if that bounded work cannot make room the request fails
+            closed (HTTP 401) rather than accepting a nonce whose replay window
+            cannot be recorded. This is the only canonical shape; there is no
+            `nonce_replay_protection` alias.
+          additionalProperties: false
           properties:
             cache_ttl_seconds:
               type: integer
               format: uint64
               default: 300
-              description: How long to remember nonces for replay detection (seconds)
+              minimum: 1
+              maximum: 86400
+              description: How long to remember nonces for replay detection (seconds). Zero is rejected because it would make replay detection inert.
             max_cache_size:
               type: integer
               format: uint64
               default: 10000
-              description: Maximum nonce cache entries before eviction sweep
+              minimum: 1
+              maximum: 1000000
+              description: Maximum retained nonce entries. Zero is rejected because it would make replay detection inert. Expiry and exact-oldest eviction use an ordered age index and examine at most 64 entries per request.
+            max_encoded_length:
+              type: integer
+              format: uint64
+              default: 512
+              minimum: 16
+              maximum: 4096
+              description: Maximum length of the encoded wsse:Nonce value, enforced before Base64 decoding and before any cache insertion so an oversized nonce is never decoded or retained.
+            max_total_cache_bytes:
+              type: integer
+              format: uint64
+              default: 8388608
+              minimum: 4096
+              maximum: 1073741824
+              description: Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length.
 
     CorsExactOrigin:
       oneOf:
@@ -17437,11 +17967,48 @@ components:
 
     BodyValidatorConfig:
       type: object
-      description: "Plugin: body_validator — JSON Schema, XML, and gRPC protobuf validation for request/response bodies."
+      additionalProperties: false
+      description: >-
+        Plugin: body_validator — JSON Schema, XML, and gRPC protobuf validation
+        for request/response bodies. Unknown top-level keys and unknown keys
+        inside a protobuf_method_messages entry are rejected at construction, so
+        a typo can never silently disable an intended rule; the plugin is
+        fail-closed, and a rejected configuration keeps the last known-good
+        generation. Configured JSON Schemas are compiled once at construction
+        under an explicit draft, XML bodies are parsed by a real XML parser, and
+        decoded protobuf messages must satisfy proto2 required-field
+        initialization. Configuration errors use value-free field and category
+        messages; supplied keys, paths, URIs, schema values, XML entries, and
+        compiler diagnostics are not reproduced.
       properties:
         json_schema:
           type: object
-          description: JSON Schema for request body validation
+          description: >-
+            JSON Schema for request body validation. Compiled at plugin
+            construction under json_schema_draft; a malformed schema, an unknown
+            or unsupported keyword shape, an invalid type name, a non-local
+            $ref/$dynamicRef, a non-fragment $id/id, a $vocabulary declaration,
+            a $schema naming another draft, or a schema exceeding the 32-level /
+            20000-node budget fails construction. Reference and identifier
+            policy applies only at actual schema positions; property/definition
+            names and unreferenced literal annotation/instance objects are not
+            interpreted as keywords. A supported local URI-fragment JSON Pointer
+            makes its object/boolean target an actual schema even under a
+            normally literal or unknown container; pointer percent-decoding,
+            escaping, root handling, and cycles match the validator library.
+            Draft 7 walks definitions but not $defs unless directly referenced;
+            Draft 2020-12 walks both. Budgets count every JSON node in the
+            supplied value.
+        json_schema_draft:
+          type: string
+          enum: [draft2020-12, draft7]
+          default: draft2020-12
+          description: >-
+            JSON Schema dialect used to compile json_schema and
+            response_json_schema. There is no auto-detect mode; a schema whose
+            $schema names a different draft is rejected. $dynamicRef has
+            reference semantics only under draft2020-12 and remains an unknown,
+            inert keyword under draft7.
         required_fields:
           type: array
           items:
@@ -17451,13 +18018,24 @@ components:
         validate_xml:
           type: boolean
           default: false
-          description: Enable XML well-formedness validation
+          description: >-
+            Enable XML well-formedness validation. The body must parse as a
+            single well-formed XML document (one root element, valid names,
+            attribute grammar and uniqueness, valid characters, declared entity
+            references, no text outside the root). The original text is parsed
+            without Unicode whitespace trimming. External SYSTEM/PUBLIC
+            identifiers on the DOCTYPE or an entity declaration are always
+            rejected; external entities are never retrieved.
         required_xml_elements:
           type: array
           items:
             type: string
           default: []
-          description: Required XML element names
+          description: >-
+            Required XML element names, matched against parsed element names.
+            A bare name matches that local name in any namespace; Clark notation
+            ("{http://example.com/ns}item") requires the expanded namespace URI
+            and local name to match, and "{}item" requires no namespace.
         xml_max_entities:
           type: integer
           format: uint64
@@ -17487,7 +18065,11 @@ components:
             actual headers do not match and are skipped.
         response_json_schema:
           type: object
-          description: JSON Schema for response body validation
+          description: >-
+            JSON Schema for response body validation. Compiled at plugin
+            construction under json_schema_draft with the same fail-closed rules
+            as json_schema. Response-side violations are reported to the client
+            without the rejected upstream value or its instance location.
         response_required_fields:
           type: array
           items:
@@ -17497,6 +18079,10 @@ components:
         response_validate_xml:
           type: boolean
           default: false
+          description: >-
+            Enable response XML well-formedness validation with the same exact-
+            text parsing and external DOCTYPE/entity identifier rejection as
+            validate_xml.
         response_required_xml_elements:
           type: array
           items:
@@ -17529,6 +18115,7 @@ components:
           type: object
           additionalProperties:
             type: object
+            additionalProperties: false
             properties:
               request:
                 type: string
@@ -17536,11 +18123,19 @@ components:
               response:
                 type: string
                 description: Fully-qualified protobuf message type for response validation
-          description: Per-method message type overrides keyed by gRPC path
+          description: >-
+            Per-method message type overrides keyed by gRPC path. Each entry
+            accepts only 'request' and 'response'; any other key rejects the
+            configuration.
         protobuf_reject_unknown_fields:
           type: boolean
           default: false
-          description: Reject messages containing field numbers not in the descriptor
+          description: >-
+            Reject messages containing field numbers not in the descriptor. This
+            is independent of proto2 required-field initialization, which is
+            always enforced: a decoded message that omits any proto2 required
+            field, at the top level or inside a present nested/repeated/map/
+            extension message value, is rejected regardless of this setting.
         grpc_max_decompressed_size_bytes:
           type: integer
           format: uint64
@@ -19119,7 +19714,7 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Authenticated /health exposes effective admitted ceilings without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, sampling/admission, or record emission. The local staging entry is the instance's commit capability and is consumed by atomic removal at buffered or stream-terminal commit. Orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Retention is bounded by BOTH record count (sink.buffer_capacity) and an aggregate retained-byte budget (limits.buffer_max_bytes / limits.max_entry_bytes) covering staged candidates, fail-closed pre-commit reservations, active fail-open stream capture, exact pre-serialized queue payloads, JSON-array assembly, and every sequential retry. A fail-open stream reserves the maximum retained-record charge before copying response bytes and transfers that lease at terminal enqueue; a fail-closed stream reuses its pre-commit lease. Retry clones share immutable Bytes rather than deep-cloning records; reqwest receives the already-escaped exact-capacity JSON body rather than reserializing it. In redacted_body, limits.max_redaction_scan_bytes is checked before JSON classification/model/tool extraction/redaction; oversized JSON POSTs are conservatively audited as possible streaming AI requests with explicit omission evidence rather than bypassing audit. Streamed keyed hashing is bounded by capture.stream_hash, and active-stream reservations by limits.max_stream_reservation_secs. Authenticated /health exposes effective admitted ceilings plus live retained_bytes/retained_byte_drops/stream_reservations_expired/sink_healthy gauges without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only and conservatively classified oversized capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id/sample markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, stream reservations, sampling/admission, or record emission. The local staging entry is consumed by atomic removal at buffered or ordinary stream-terminal commit. Expiry first revokes capture/hash work and releases all staging/queue/byte owners; its single-fire request-owned terminal slot carries only the local sampling roll needed for a body-free best-effort fallback and cannot be created from shared peer markers. Orphan/reservation sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
@@ -19156,6 +19751,11 @@ components:
               type: boolean
               default: true
               description: "Extract tool/function names from the request body."
+            stream_hash:
+              type: string
+              enum: [capped, full]
+              default: capped
+              description: "How much of a streamed (SSE) response the exported keyed HMAC-SHA256 response_hash covers. capped (default) stops hashing at limits.max_stream_capture_bytes, so limits.max_stream_capture_bytes bounds audit CPU as well as retained bytes and an indefinitely long high-bandwidth stream cannot keep a keyed hash running for the life of the connection; the digest is then marked response_hash_scope=partial, carries the exact response_hash_bytes it covered, and is domain-separated so it can never collide with or be presented as a full-stream digest. full is the explicit opt-in for deployments whose evidence chain genuinely re-derives the provider's complete response, and accepts unbounded per-byte keyed-hashing cost. The response_hash is a tamper-evidence/correlation token over the captured transcript, not an integrity attestation of the client's byte stream — abnormally terminated and downstream-cut streams already omit it entirely. Buffered (non-streamed) responses are complete by construction and always hash full."
         sampling:
           type: [object, "null"]
           additionalProperties: false
@@ -19249,7 +19849,112 @@ components:
               default: 65536
               description: >-
                 Maximum retained SSE stream-capture bytes. Hard maximum
-                1048576. Counts toward the cross-field aggregate.
+                1048576. Counts toward the cross-field aggregate. Also bounds
+                the streamed keyed digest unless capture.stream_hash is full.
+            max_redaction_scan_bytes:
+              type: integer
+              minimum: 4096
+              maximum: 8388608
+              default: 1048576
+              description: >-
+                Independent hard processing bound for redacted-mode request
+                classification, model/tool extraction, and body shaping. In
+                mode=redacted_body the raw length is checked before serde_json:
+                payloads above this bound are never JSON-parsed, model/tool
+                scanned, redaction-scanned, or copied into an excerpt. An
+                oversized POST application/json is conservatively audited as a
+                possible AI request and treated as potentially streaming (so
+                capture does not buffer a possibly unbounded SSE response);
+                parse-derived model/tool fields are omitted and fail-closed
+                queue/byte admission still applies. The record carries
+                request_body_omitted_reason / response_body_omitted_reason =
+                redaction_scan_limit with the body_truncated flag set. Hashes,
+                envelope, status, and bounded guardrail metadata still export.
+                Streaming redacted capture enforces this bound while chunks
+                arrive: if it is smaller than max_stream_capture_bytes, no
+                more than max_redaction_scan_bytes is copied and crossing the
+                bound records response_body_omitted_reason =
+                redaction_scan_limit rather than exporting a raw boundary
+                fragment. The keyed digest still follows capture.stream_hash
+                until reservation expiry revokes all audit work. mode=full_body
+                caps on a UTF-8 boundary first and never scans past the cap, so
+                it is unaffected.
+            max_entry_bytes:
+              type: integer
+              minimum: 1
+              maximum: 16777216
+              description: >-
+                Maximum serialized JSON bytes for one admitted record. Queue
+                admission first performs an allocation-free bounded counting
+                serialization, then serializes into one exact-capacity immutable
+                Bytes payload. The default/minimum is derived from the configured
+                capture limits and worst-case JSON escaping:
+                6 * (max_request_bytes + max(max_response_bytes,
+                max_stream_capture_bytes) + 256 + 4096 + 8192). The hard maximum
+                is 16777216. A complete record whose bounded envelope still
+                exceeds this ceiling is dropped/rejected, never partially
+                serialized.
+            buffer_max_bytes:
+              type: integer
+              minimum: 65536
+              maximum: 268435456
+              default: 134217728
+              description: >-
+                Aggregate retained-byte budget for one plugin instance,
+                covering staged request candidates, fail-closed pre-commit
+                reservations, active fail-open stream capture, immutable
+                pre-serialized queue payloads, one exact-capacity JSON-array
+                request body, and every sequential retry.
+                sink.buffer_capacity bounds the RECORD COUNT only;
+                without this budget a slow collector can retain capacity x
+                attacker-shaped record bytes. Retry clones share Bytes and do
+                not deep-clone transcript fields; reqwest does not reserialize
+                the batch. The exact per-record lease is
+                2 * (serialized_record_bytes + 1) + 128. Admission is (count AND
+                bytes) and is enforced atomically before publication; leases
+                release on every completion, discard, TTL-sweep,
+                reservation-expiry, and failed-batch path. Saturation follows
+                sink.on_buffer_full (drop or reject). Must be at least
+                2 * (max_entry_bytes + 1) + 128. Live retained_bytes and
+                retained_byte_drops are exposed on authenticated /health.
+            max_stream_reservation_secs:
+              type: integer
+              minimum: 1
+              maximum: 86400
+              default: 900
+              description: >-
+                Maximum lifetime of one active stream's staging entry and its
+                reserved commit permit. An active stream is exempt from the
+                one-hour orphan TTL, so without this bound a never-ending
+                stream, or one whose terminal hook is lost, would hold a
+                staging slot, a queue permit, and its retained bytes forever
+                until all reservations were exhausted. The staging entry owns
+                one cancellable single-fire deadline from first active response
+                selection until staging is actually consumed or dropped. It
+                revokes even an idle selection with no concrete inspector at
+                its deadline without waiting for another request or chunk, and
+                remains armed after normal inspector terminal claim while
+                staging is retained for the immediate transaction-log fallback.
+                Normal staging consumption wakes and cancels the task promptly;
+                the amortized sweep remains a repair net. Both paths dynamically
+                resolve and first revoke any current per-stream response
+                accumulator and keyed HMAC through narrowly scoped shared state,
+                then release the queue permit, staging slot, staging lease, and
+                worst-case queued-record lease exactly once. An atomic
+                fired/cancelled token makes deadline, sweep, terminal,
+                inspector-drop, and log-fallback races single-fire.
+                Later bytes forward unchanged without capture or hash work. No
+                global tombstone remains for the live connection: inspector
+                drop publishes a body-free request-owned handoff only when the
+                stream actually terminates.
+                Normal or abnormal late termination emits at most one
+                best-effort fallback without request/response excerpts or
+                hashes and without resurrecting the released commit permit.
+                The process-global live-slot map is capped at 4096 and expiry
+                releases that capacity; the remaining stream-owned handle has
+                no capture/hash/accounting state.
+                Reclamations are logged and counted in
+                stream_reservations_expired on authenticated /health.
         sink:
           type: object
           required: [endpoint_url]
@@ -19308,7 +20013,24 @@ components:
               type: string
               enum: [warn, reject]
               default: warn
-              description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
+              description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Sink health is published from the COMPLETE delivery outcome, never from response headers alone: the acknowledgement body is drained and validated under sink.ack_max_bytes / sink.ack_timeout_ms first, and a 2xx whose acknowledgement stalls, overruns its bound, fails transport, or fails ack_policy validation is an ambiguous delivery that marks the sink unhealthy AND returns the batch for retry. Any non-2xx collector response also marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Hysteresis: health drops on the first failed or ambiguous delivery with no damping, and is restored only by a 2xx whose acknowledgement fully drained and validated; each retry attempt re-publishes, so recovery happens on the attempt that actually succeeded. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe."
+            ack_policy:
+              type: string
+              enum: [drain, json]
+              default: drain
+              description: "How a collector acknowledgement is validated before sink health is published. drain: read the acknowledgement to EOF under sink.ack_max_bytes and sink.ack_timeout_ms, discarding the bytes (content is not inspected). json: additionally require a JSON object that does not report rejected records — a non-object/unparseable body, a non-zero/non-empty errors|failed|rejected|error_count field, or a status string outside the unequivocal affirmative set ok|success|accepted|created fails the batch. Ambiguous partial-delivery values such as partial_ok are unhealthy even without an explicit failure count. Acknowledgement bytes are never retained beyond the bound and never logged; only compiled-in failure classes appear in diagnostics, so a hostile collector cannot echo captured transcript content back into gateway logs."
+            ack_max_bytes:
+              type: integer
+              minimum: 64
+              maximum: 1048576
+              default: 65536
+              description: "Hard bound on the acknowledgement body read from the collector. An advertised Content-Length above this, or a stream that exceeds it, fails the batch instead of buffering unbounded collector output into the flush worker."
+            ack_timeout_ms:
+              type: integer
+              minimum: 1
+              maximum: 30000
+              default: 1000
+              description: "Maximum time spent draining/validating one acknowledgement after headers arrive. Separate from the plugin HTTP client request timeout so a stalled acknowledgement cannot pin a flush worker for the full request budget."
         privacy:
           type: [object, "null"]
           additionalProperties: false
@@ -22081,13 +22803,19 @@ components:
                 additionalProperties:
                   type: object
                   properties:
+                    proxy_id:
+                      type: string
+                      description: Stable ID of the matched proxy within `namespace`.
+                    namespace:
+                      type: string
+                      description: Namespace of the matched proxy for this charge row.
                     proxy_name:
                       type: string
                       description: |
-                        Live display name for the stable `proxy_id`. Not part of
-                        the in-memory chargeback key, so name-only reloads
+                        Live display name for the stable `(namespace, proxy_id)`.
+                        Not part of the in-memory chargeback key, so name-only reloads
                         preserve accumulated counter values. JSON and Prometheus
-                        resolve active IDs through the same snapshot of the
+                        resolve active identities through the same snapshot of the
                         published configuration; late retired-generation traffic
                         cannot restore an old name. As a Prometheus label, a
                         rename creates a controlled label transition whose new

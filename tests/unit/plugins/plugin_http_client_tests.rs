@@ -542,3 +542,174 @@ async fn default_get_client_still_speaks_http1_to_plain_sinks() {
         "default client must remain HTTP/1.1 capable: {head}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Ambient proxy isolation for every policy-governed plugin client family
+// (GHSA-c4pj-vq6x-53rw). reqwest enables system-proxy discovery by default; a
+// selected proxy dials the destination itself, so the ultimate address never
+// reaches Ferrum's `DnsCacheResolver` egress screen.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn plugin_http2_companion_client_ignores_ambient_proxy_environment() {
+    let proxy = MockServer::start().await;
+    let client = {
+        let _env_lock = crate::unit::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
+        default_client()
+    };
+
+    let _ = client
+        .get_http2()
+        .get("http://198.51.100.1:9/no-proxy-canary")
+        .timeout(Duration::from_millis(200))
+        .send()
+        .await;
+
+    assert_eq!(
+        proxy.received_requests().await.unwrap_or_default().len(),
+        0,
+        "the HTTP/2 companion must share the shared client's no-proxy posture"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn plugin_http_client_ignores_ambient_proxy_even_with_non_matching_no_proxy() {
+    // `NO_PROXY` only ever *narrows* reqwest's proxy selection. A `NO_PROXY`
+    // that does not cover the destination is the worst case: without
+    // `.no_proxy()` the request would be relayed.
+    let proxy = MockServer::start().await;
+    let client = {
+        let _env_lock = crate::unit::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
+        // SAFETY: the repository-wide ENV_LOCK is held, and ProxyEnvGuard
+        // restores NO_PROXY when it drops at the end of this block.
+        unsafe { std::env::set_var("NO_PROXY", "unrelated.invalid") };
+        default_client()
+    };
+
+    let _ = client
+        .get()
+        .get("http://198.51.100.1:9/no-proxy-canary")
+        .timeout(Duration::from_millis(200))
+        .send()
+        .await;
+
+    assert_eq!(
+        proxy.received_requests().await.unwrap_or_default().len(),
+        0,
+        "a non-matching NO_PROXY must not re-enable ambient proxying"
+    );
+}
+
+/// Every policy-governed `reqwest` client family, as source text.
+///
+/// A behavioural test can only reach the client families that are reachable
+/// from a plugin constructor; the fallback builders inside
+/// `build_dns_cached_fallback_client` only run when a configured build fails,
+/// and `api_chargeback_sink`'s dedicated client needs TLS material on disk.
+/// This guard therefore asserts the invariant at the construction site so a new
+/// builder — or a dropped `.no_proxy()` — fails CI instead of silently
+/// reopening the bypass.
+const POLICY_GOVERNED_CLIENT_SOURCES: &[(&str, &str)] = &[
+    (
+        "src/tls/backend.rs",
+        include_str!("../../../src/tls/backend.rs"),
+    ),
+    (
+        "src/health_check.rs",
+        include_str!("../../../src/health_check.rs"),
+    ),
+    (
+        "src/plugins/utils/http_client.rs",
+        include_str!("../../../src/plugins/utils/http_client.rs"),
+    ),
+    (
+        "src/plugins/api_chargeback_sink.rs",
+        include_str!("../../../src/plugins/api_chargeback_sink.rs"),
+    ),
+    (
+        "src/plugins/spec_expose.rs",
+        include_str!("../../../src/plugins/spec_expose.rs"),
+    ),
+    (
+        "src/plugins/load_testing.rs",
+        include_str!("../../../src/plugins/load_testing.rs"),
+    ),
+];
+
+#[test]
+fn every_policy_governed_reqwest_builder_disables_ambient_proxies() {
+    const NEEDLE: &str = "reqwest::Client::builder()";
+    let mut checked = 0usize;
+    for (path, source) in POLICY_GOVERNED_CLIENT_SOURCES {
+        let mut offset = 0usize;
+        while let Some(found) = source[offset..].find(NEEDLE) {
+            let start = offset + found;
+            offset = start + NEEDLE.len();
+            // Skip prose: doc comments and `//` comments mention the builder by
+            // name without constructing one.
+            let line_start = source[..start].rfind('\n').map_or(0, |idx| idx + 1);
+            if source[line_start..start].trim_start().starts_with("//") {
+                continue;
+            }
+            // The builder chain runs to the statement terminator.
+            let chain_end = source[start..]
+                .find(';')
+                .map(|end| start + end)
+                .unwrap_or(source.len());
+            let chain = &source[start..chain_end];
+            assert!(
+                chain.contains(".no_proxy()"),
+                "{path}: a policy-governed reqwest client builder does not call .no_proxy(); \
+                 ambient HTTP_PROXY/HTTPS_PROXY/ALL_PROXY would bypass backend egress policy.\n\
+                 offending chain:\n{chain}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 11,
+        "expected to find every policy-governed client builder family, only found {checked}"
+    );
+}
+
+#[test]
+fn health_check_fallback_propagates_construction_failure_without_panic() {
+    let source = POLICY_GOVERNED_CLIENT_SOURCES
+        .iter()
+        .find(|(path, _)| *path == "src/health_check.rs")
+        .map(|(_, source)| *source)
+        .expect("health_check.rs is a policy-governed client source");
+    let start = source
+        .find("fn build_dns_cached_fallback_client(")
+        .expect("health-check fallback helper present");
+    let rest = &source[start..];
+    let end = rest
+        .find("\nfn accept_health_check_client(")
+        .expect("health-check accept helper present");
+    let helper = &rest[..end];
+    assert!(
+        helper.contains("Result<reqwest::Client, reqwest::Error>"),
+        "health-check fallback must propagate construction failure as Result"
+    );
+    assert!(
+        !helper.contains("panic!"),
+        "health-check fallback must not panic on construction failure"
+    );
+    let code_mentions_default_ctor = helper.lines().any(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with("//")
+            && !trimmed.starts_with("///")
+            && !trimmed.starts_with('*')
+            && trimmed.contains("Client::new()")
+    });
+    assert!(
+        !code_mentions_default_ctor,
+        "health-check fallback must not re-enable ambient proxies via Client::new()"
+    );
+}

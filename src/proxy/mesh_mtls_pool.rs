@@ -1079,7 +1079,13 @@ impl MeshMtlsConnectionPool {
             return Ok(sender);
         }
 
-        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
+        let effective_connect_timeout_ms = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&app_policy_port))
+            .and_then(|o| o.connect_timeout_ms)
+            .unwrap_or(proxy.backend_connect_timeout_ms);
+        let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
         let creation_started = Instant::now();
         let creation_lock = self
             .creation_locks
@@ -1090,7 +1096,7 @@ impl MeshMtlsConnectionPool {
             .await
             .map_err(|_| HbonePoolError::ConnectTimeout {
                 addr: format!("{target_host}:{mtls_port}"),
-                timeout_ms: proxy.backend_connect_timeout_ms,
+                timeout_ms: effective_connect_timeout_ms,
             })?;
         // Double-check under the creation lock: a coalesced waiter may find the
         // winner's connection already inserted.
@@ -1101,7 +1107,7 @@ impl MeshMtlsConnectionPool {
         let remaining = crate::pool::remaining_connect_timeout(creation_started, connect_timeout)
             .ok_or_else(|| HbonePoolError::ConnectTimeout {
             addr: format!("{target_host}:{mtls_port}"),
-            timeout_ms: proxy.backend_connect_timeout_ms,
+            timeout_ms: effective_connect_timeout_ms,
         })?;
         // Snapshot the SVID and CRL slots before dialing: the SPIFFE TLS
         // resolver/verifier use these snapshots for the handshake, so an
@@ -1129,6 +1135,8 @@ impl MeshMtlsConnectionPool {
                 sni_override,
                 pool_config,
                 keepalive_override,
+                remaining,
+                effective_connect_timeout_ms,
                 crls_before_dial.clone(),
             ),
         )
@@ -1149,7 +1157,7 @@ impl MeshMtlsConnectionPool {
                     .record_pool_failure(crate::runtime_metrics::PoolKind::MeshMtls);
                 return Err(HbonePoolError::ConnectTimeout {
                     addr: format!("{target_host}:{mtls_port}"),
-                    timeout_ms: proxy.backend_connect_timeout_ms,
+                    timeout_ms: effective_connect_timeout_ms,
                 });
             }
         };
@@ -1290,11 +1298,13 @@ impl MeshMtlsConnectionPool {
         sni_override: Option<&str>,
         pool_config: &PoolConfig,
         keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
+        connect_budget: Duration,
+        effective_connect_timeout_ms: u64,
         crls: crate::tls::CrlList,
     ) -> Result<MeshMtlsSender, HbonePoolError> {
-        let resolved_ip = self
+        let candidates = self
             .dns_cache
-            .resolve(
+            .resolve_candidates(
                 target_host,
                 proxy.dns_override.as_deref(),
                 proxy.dns_cache_ttl_seconds,
@@ -1304,41 +1314,6 @@ impl MeshMtlsConnectionPool {
                 host: target_host.to_string(),
                 message: e.to_string(),
             })?;
-        let sock_addr = std::net::SocketAddr::new(resolved_ip, mtls_port);
-        let addr = sock_addr.to_string();
-        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
-        let connect_started = Instant::now();
-
-        let tcp = tokio::time::timeout(
-            connect_timeout,
-            crate::socket_opts::connect_with_socket_opts(sock_addr),
-        )
-        .await
-        .map_err(|_| HbonePoolError::ConnectTimeout {
-            addr: addr.clone(),
-            timeout_ms: proxy.backend_connect_timeout_ms,
-        })?
-        .map_err(|source| HbonePoolError::Connect {
-            addr: addr.clone(),
-            source,
-        })?;
-        let _ = tcp.set_nodelay(true);
-        // Honor the DR `connectionPool.tcp.tcpKeepalive` per-port override
-        // resolved by the caller for the app port (NOT this transport
-        // `mtls_port`), falling back to the global pool keepalive. NOTE:
-        // keepalive is NOT in the pool key (forbidden by
-        // `.claude/rules/proxy-protocols.md`), and mesh-mTLS pool connections
-        // are shared, so the first dispatcher to materialize the connection
-        // wins — same first-materializer tradeoff as `idleTimeout` /
-        // `maxRequestsPerConnection`.
-        crate::socket_opts::apply_pooled_tcp_keepalive(
-            "mesh_mtls_pool",
-            &tcp,
-            keepalive_override,
-            pool_config.enable_http_keep_alive,
-            pool_config.tcp_keepalive_seconds,
-        );
-
         // Plain mesh HTTP over mTLS speaks h2 to the peer sidecar's frontend
         // (which advertises h2 and preface-sniffs via `auto`), so advertise h2
         // only.
@@ -1374,79 +1349,96 @@ impl MeshMtlsConnectionPool {
                 }
             })?;
 
-        let Some(remaining) =
-            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-        else {
-            return Err(HbonePoolError::ConnectTimeout {
-                addr,
-                timeout_ms: proxy.backend_connect_timeout_ms,
-            });
-        };
-        let tls_stream = tokio::time::timeout(remaining, connector.connect(server_name, tcp))
-            .await
-            .map_err(|_| HbonePoolError::ConnectTimeout {
-                addr: addr.clone(),
-                timeout_ms: proxy.backend_connect_timeout_ms,
-            })?
-            .map_err(|e| HbonePoolError::TlsHandshake {
-                host: target_host.to_string(),
-                message: e.to_string(),
-            })?;
-
-        let mut builder = http2::Builder::new(TokioExecutor::new());
-        builder.timer(TokioTimer::new());
-        if pool_config.enable_http2 {
-            builder
-                .keep_alive_interval(Duration::from_secs(
-                    pool_config.http2_keep_alive_interval_seconds,
-                ))
-                .keep_alive_timeout(Duration::from_secs(
-                    pool_config.http2_keep_alive_timeout_seconds,
-                ))
-                .max_concurrent_reset_streams(4096);
-        }
-        builder
-            .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
-            .initial_connection_window_size(pool_config.http2_initial_connection_window_size)
-            .adaptive_window(pool_config.http2_adaptive_window)
-            .max_frame_size(pool_config.http2_max_frame_size);
-        if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            builder.max_concurrent_streams(max_streams);
-            builder.initial_max_send_streams(max_streams as usize);
-        }
-
-        let Some(remaining) =
-            crate::pool::remaining_connect_timeout(connect_started, connect_timeout)
-        else {
-            return Err(HbonePoolError::ConnectTimeout {
-                addr,
-                timeout_ms: proxy.backend_connect_timeout_ms,
-            });
-        };
-        let io = TokioIo::new(tls_stream);
-        let (sender, connection) = tokio::time::timeout(remaining, builder.handshake(io))
-            .await
-            .map_err(|_| HbonePoolError::ConnectTimeout {
-                addr,
-                timeout_ms: proxy.backend_connect_timeout_ms,
-            })?
-            .map_err(|e| HbonePoolError::H2Handshake {
-                host: target_host.to_string(),
-                message: e.to_string(),
-            })?;
-
-        // Connection driver exits when all sender handles are dropped.
-        // In-flight requests are covered by RequestGuard on the dispatch path.
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                debug!(
-                    "mesh_mtls_pool: sidecar mTLS HTTP/2 connection closed: {}",
-                    e
+        crate::dns::connect_candidates(&candidates, mtls_port, connect_budget, |sock_addr| {
+            let connector = connector.clone();
+            let server_name = server_name.clone();
+            async move {
+                let tcp = crate::socket_opts::connect_with_socket_opts(sock_addr)
+                    .await
+                    .map_err(|source| HbonePoolError::Connect {
+                        addr: sock_addr.to_string(),
+                        source,
+                    })?;
+                let _ = tcp.set_nodelay(true);
+                // Apply the app-port DR keepalive override to every candidate
+                // socket, not only to the first TCP-successful address.
+                crate::socket_opts::apply_pooled_tcp_keepalive(
+                    "mesh_mtls_pool",
+                    &tcp,
+                    keepalive_override,
+                    pool_config.enable_http_keep_alive,
+                    pool_config.tcp_keepalive_seconds,
                 );
-            }
-        });
 
-        Ok(sender)
+                let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
+                    HbonePoolError::TlsHandshake {
+                        host: target_host.to_string(),
+                        message: e.to_string(),
+                    }
+                })?;
+                if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
+                    return Err(HbonePoolError::TlsHandshake {
+                        host: target_host.to_string(),
+                        message: "peer did not negotiate ALPN h2".to_string(),
+                    });
+                }
+
+                let mut builder = http2::Builder::new(TokioExecutor::new());
+                builder.timer(TokioTimer::new());
+                if pool_config.enable_http2 {
+                    builder
+                        .keep_alive_interval(Duration::from_secs(
+                            pool_config.http2_keep_alive_interval_seconds,
+                        ))
+                        .keep_alive_timeout(Duration::from_secs(
+                            pool_config.http2_keep_alive_timeout_seconds,
+                        ))
+                        .max_concurrent_reset_streams(4096);
+                }
+                builder
+                    .initial_stream_window_size(pool_config.http2_initial_stream_window_size)
+                    .initial_connection_window_size(
+                        pool_config.http2_initial_connection_window_size,
+                    )
+                    .adaptive_window(pool_config.http2_adaptive_window)
+                    .max_frame_size(pool_config.http2_max_frame_size);
+                if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+                    builder.max_concurrent_streams(max_streams);
+                }
+
+                let io = TokioIo::new(tls_stream);
+                let (sender, connection) =
+                    builder
+                        .handshake(io)
+                        .await
+                        .map_err(|e| HbonePoolError::H2Handshake {
+                            host: target_host.to_string(),
+                            message: e.to_string(),
+                        })?;
+
+                // TLS ALPN already proved H2 for this sidecar candidate.
+                tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        debug!(
+                            "mesh_mtls_pool: sidecar mTLS HTTP/2 connection closed: {}",
+                            e
+                        );
+                    }
+                });
+                Ok(sender)
+            }
+        })
+        .await
+        .map(|(sender, _)| sender)
+        .map_err(|error| match error {
+            crate::dns::CandidateConnectError::TimedOut { last_addr } => {
+                HbonePoolError::ConnectTimeout {
+                    addr: last_addr.to_string(),
+                    timeout_ms: effective_connect_timeout_ms,
+                }
+            }
+            crate::dns::CandidateConnectError::Failed { source, .. } => source,
+        })
     }
 }
 

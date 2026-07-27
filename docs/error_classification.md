@@ -41,7 +41,8 @@ Each dispatcher hands its native error type to a classifier; every classifier re
 | Protocol | Classifier | Input | Technique |
 |---|---|---|---|
 | HTTP/1.1 (reqwest) | [`classify_reqwest_error`](../src/retry.rs) | `&reqwest::Error` | `is_connect()` / `is_timeout()` typed methods → typed source-chain walk for io/TLS/DNS → bounded substring fallback inside the `is_connect()` branch |
-| HTTP/2 (direct pool) | [`classify_http2_pool_error`](../src/proxy/http2_pool.rs) | `&Http2PoolError` (typed enum) | Pattern match on typed variants → typed source-chain walk (io/hyper/rustls) → minimal Display fallback |
+| HTTP/2 (direct pool acquisition) | [`classify_http2_pool_error`](../src/proxy/http2_pool.rs) | `&Http2PoolError` (typed enum) | Pattern match on typed variants → typed source-chain walk (io/hyper/rustls) → minimal Display fallback |
+| HTTP/2 (pooled request send) | [`classify_pooled_h2_send_request_error`](../src/proxy/http2_pool.rs) | `&hyper::Error` | Hyper typed predicates → post-wire io source-chain walk → conservative `ProtocolError` fallback |
 | HTTP/3 (native pool) | [`classify_http3_error`](../src/http3/client.rs) | `&dyn Error` | Typed walk for `quinn::ConnectionError` / `quinn::ConnectError` / `io::Error` → anchored substring fallback for `h3::Error` Display |
 | gRPC | [`classify_grpc_proxy_error`](../src/retry.rs) | `&GrpcProxyError` (typed enum with kinds) | Pattern match on `BackendUnavailable.kind: GrpcBackendUnavailableKind` → typed `is_port_exhaustion` source walk → no message substring matching |
 | WebSocket / generic boxed | [`classify_boxed_error`](../src/retry.rs) | `&dyn Error` | Typed walk: `StreamSetupError` (TCP/UDP setup) → `tokio_tungstenite::tungstenite::Error` (RFC 6455 ConnectionClosed/AlreadyClosed/Protocol) → `io::Error` → `hyper::Error` → bounded Display/Debug fallback |
@@ -49,6 +50,8 @@ Each dispatcher hands its native error type to a classifier; every classifier re
 | Streaming response body | [`classify_body_error`](../src/retry.rs) | `&dyn Error` | Typed walk for io/hyper, returns `(ErrorClass, client_disconnected: bool)` |
 
 The H3 pool returns a typed [`H3PoolError`](../src/http3/client.rs) whose `request_on_wire()` flag is the **authoritative** body-on-wire signal — `connection_error` is derived directly from `!e.request_on_wire()` at H3 dispatch sites, NOT from the class. See [docs/http3.md](http3.md) for that contract.
+
+Direct-H2 pool acquisition and pooled request dispatch have different phase boundaries. Acquisition errors are pre-wire. Once a pooled sender is acquired, `hyper::Error::is_canceled()` is the only typed proof that dispatch never occurred; every other known or unknown send failure is post-wire. In particular, a connect-only class inferred from an inner I/O source is normalized to `ProtocolError`, because an inner `ConnectionRefused` or port-exhaustion errno cannot prove that an already-pooled request was never sent.
 
 ## Stream-family typed errors (`StreamSetupError`)
 
@@ -97,10 +100,19 @@ The cause/direction mappers walk the chain via `find_stream_setup_error()` — `
 | `H2cHandshake` | `ConnectionRefused` | HTTP/2 cleartext handshake — fails before any stream is opened, so request bytes never reach the application layer (pre-wire) |
 | `InvalidServerName` | `DnsLookupError` | rustls rejected the SNI name (pre-wire) |
 | `BackendRequest` | `ConnectionReset` | hyper `send_request` failed post-handshake — request bytes may already be on the wire, so this is **post-wire** by definition. Excluded from `is_connect_class()` so `retry_on_connect_failure` cannot bypass `retry_on_methods` and replay non-idempotent POSTs |
+| `DispatchCanceled` | `ConnectionPoolError` | Pooled H2 `send_request` returned hyper `is_canceled` while the outbound body was still fully buffered — hyper's contract that the request was **never dispatched**. Pre-wire / connect-class so `retry_on_connect_failure` can redial after invalidating the stale sender. Streaming / channel bodies keep `BackendRequest` even on `is_canceled` because the upload may already be unreplayable |
 
 `GrpcBackendUnavailableKind::is_connect_class()` enumerates the pre-wire kinds; the gRPC and H3→gRPC retry loops use it to decide whether `retry_on_connect_failure` is eligible for a given failure. A regression test (`test_every_connect_class_kind_classifies_as_pre_wire`) enforces the invariant that every connect-class kind classifies to `!request_reached_wire(class)` so the retry-loop predicate and the canonical wire boundary cannot drift.
 
 Construction sites attach a typed `source` so [`is_port_exhaustion`](../src/retry.rs)'s typed `io::Error::raw_os_error == EADDRNOTAVAIL` walk works on every gRPC dispatch path — not just the message-substring fallback.
+
+## Response body-read failures
+
+A body-read failure after the response headers arrived is always post-wire: `connection_error` stays `false` and `retry_on_connect_failure` can never replay a request the backend already processed.
+
+The eager-buffer path (`buffered_backend_response_from_body_read` in [`src/proxy/mod.rs`](../src/proxy/mod.rs)) classifies through `classify_reqwest_error` rather than hardcoding one class. Because reqwest's per-request `RequestBuilder::timeout()` (`backend_read_timeout_ms`) covers through body completion, a stalled backend surfaces here as `ReadWriteTimeout` and is reported as **504**, matching the direct-H2 arm's `HyperBodyCollectError::ReadTimeout` and the native-H3 read-timeout arm. Every other class keeps the 502. Identical backend behavior therefore produces the same status and `error_class` on every transport, so `TransactionSummary`, operator dashboards, and circuit-breaker `failure_status_codes` matching cannot diverge by dispatch path.
+
+A pre-wire class is impossible on that path (`classify_reqwest_error` only returns connect-class verdicts under `e.is_connect()`), but one is coerced to `ConnectionReset` anyway so the `connection_error == !request_reached_wire(error_class)` boundary holds even if the classifier changes.
 
 ## WebSocket graceful close
 

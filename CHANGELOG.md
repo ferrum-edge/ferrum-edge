@@ -9,6 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Plugin egress no longer inherits ambient proxy configuration
+  (GHSA-c4pj-vq6x-53rw). Backend dispatch `reqwest` clients (via
+  `BackendTlsConfigBuilder::build_reqwest`), active health-check clients
+  (primary, custom-TLS, and degraded DNS-cached fallbacks), the dedicated
+  ClickHouse client built by `api_chargeback_sink` for custom CA / mTLS /
+  relaxed-verification settings, and the dedicated `spec_expose` and
+  `load_testing` clients now call `reqwest::ClientBuilder::no_proxy()` like the
+  shared `PluginHttpClient` and its fallback builders. With a proxy selected
+  from `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`, Ferrum resolved and screened
+  the *proxy* while the proxy resolved and connected to the configured hostname,
+  so the ultimate destination never passed `BackendEgressPolicy`. A CI guard
+  now fails if any policy-governed `reqwest` builder drops `.no_proxy()`.
+- `ws_logging` now enforces backend egress policy on the address it actually
+  dials (GHSA-mp2j-gjfp-2vm8). Every connection and reconnection resolves the
+  endpoint fresh (bypassing both DNS cache layers), rejects the complete A+AAAA
+  answer if any candidate is denied, rechecks each candidate immediately before
+  its socket is opened, and dials only screened addresses. The configured
+  hostname is retained as the TLS SNI / certificate identity and the WebSocket
+  `Host` authority. Previously the endpoint was handed to `tokio-tungstenite`,
+  which resolved and dialed it outside the policy, so a hostname could rebind to
+  a denied address between admission and any later reconnect.
+- `kafka_logging` bootstrap parsing now matches the pinned librdkafka grammar
+  (`[proto://]host[:port]`, URL-path truncation, bracketed-IPv6 port rules,
+  empty host → `localhost`), so protocol-prefixed denied literals such as
+  `PLAINTEXT://169.254.169.254:9092` are rejected instead of evading a
+  `host:port`-only screen. Entries whose protocol prefix disagrees with
+  `security_protocol` are rejected rather than silently truncating the broker
+  list the way librdkafka would.
+- ACME issuance and renewal now route every connection through a
+  Ferrum-controlled, public-only fresh-DNS connector; reject mixed/private DNS
+  answers, answers above 64 addresses, ambiguous legacy numeric IPv4 host
+  spellings, endpoint origin drift, credential-directory mismatch, legacy
+  credential URL sets, hostile order resource URLs, redirects, and response
+  bodies above 1 MiB while preserving HTTPS hostname/certificate verification.
+  Fresh DNS plus all TCP candidates share one 30-second wall-clock budget.
+  **Breaking:** ACME servers that advertise endpoints on another host or port,
+  and pre-0.4 `instant-acme` credentials with embedded `urls`, must be migrated
+  to the configured directory origin (#2407).
+- `body_validator` now enforces the validation it advertises on all four of its
+  surfaces. Configured JSON Schemas are compiled once at plugin construction with
+  the `jsonschema` crate under an explicit draft (`json_schema_draft`, default
+  `draft2020-12`) instead of being interpreted by a partial handwritten
+  evaluator, so `$ref`/`$defs`, union types, conditionals, and other standard
+  keywords take effect and malformed schemas, invalid type names, non-local
+  references, `$vocabulary` declarations, and over-budget schemas fail
+  configuration closed; local JSON Pointer targets are policy-audited even under
+  normally literal containers, and no external reference is ever retrieved. XML
+  bodies are parsed exactly, without Unicode whitespace trimming, with
+  `roxmltree` rather than scanned for balanced tags, so multiple roots, text
+  outside the root, invalid names or characters, malformed/unquoted/duplicate
+  attributes, and undeclared entity references are rejected. External
+  `SYSTEM`/`PUBLIC` identifiers on either the DOCTYPE or an entity declaration
+  are refused outright, and `required_xml_elements` matches parsed
+  namespace-expanded names. Decoded gRPC protobuf messages must satisfy
+  proto2 `required`-field initialization recursively, including inside present
+  nested, repeated, map, and extension message values. Unknown top-level config
+  keys and unknown keys inside a `protobuf_method_messages` entry are rejected
+  before defaults, so a typo can no longer silently replace enforcement with a
+  weaker policy. This is a breaking configuration change; see the
+  [Safe Upgrade Guide](docs/upgrade_guide.md#body-validator-enforcement-hardening).
 - **`request_deduplication` Redis ownership is now atomically fenced**
   (GHSA-f72h-jm2p-mc73). Ownership and completion share one versioned operation
   record per logical key. Completion is a compare-and-set on the owner's exact
@@ -98,6 +158,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [Safe Upgrade Guide](docs/upgrade_guide.md#response-cache-shared-storage-hardening).
 
 ### Changed
+
+- **Breaking:** `kafka_logging` now fails closed under any restrictive backend
+  egress policy, including the default posture. librdkafka resolves bootstrap
+  hostnames itself and dials brokers advertised by cluster metadata, and the
+  pinned `rdkafka 0.39` exposes no connect/resolve callback, so those addresses
+  cannot be screened. The plugin is admitted only under a fully-open policy
+  (`FERRUM_BACKEND_ALLOW_IPS=both`, no `FERRUM_BACKEND_DENY_CIDRS`,
+  `FERRUM_BACKEND_BLOCK_DANGEROUS_RANGES=false`). Deployments that need Kafka log
+  shipping under a restrictive policy should ship through a policy-aware sink
+  (`http_logging`, `tcp_logging`, `ws_logging`, `loki_logging`) and bridge to
+  Kafka outside the gateway. See
+  [Backend Egress / SSRF Protection](docs/configuration.md#kafka_logging-requires-a-fully-open-egress-policy).
 
 - Authenticated `/metrics` now renders TLS certificate gauges from a cached,
   non-secret TLS inventory snapshot and performs no certificate, private-key,

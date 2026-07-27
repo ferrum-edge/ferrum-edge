@@ -98,6 +98,7 @@ fn build_mesh_authz_for_workload(
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
+        mesh_revision: None,
     };
     let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
     let authz_config = prepared
@@ -1325,6 +1326,7 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
+        mesh_revision: None,
     };
     let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
     let authz_cfg = prepared

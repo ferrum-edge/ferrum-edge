@@ -447,6 +447,7 @@ pub fn gateway_config_with_mesh(
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
+        mesh_revision: None,
     }
 }
 

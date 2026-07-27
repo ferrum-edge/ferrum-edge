@@ -133,7 +133,9 @@ are **not serving** after the most recent config reconcile — hard bind failure
 **plus** listeners deferred or degraded for a config reason. A listener-task
 failure that occurs asynchronously after reconcile is appended immediately. Each
 entry carries a `kind` that classifies why; shared SNI listeners emit one entry
-for every affected proxy ID:
+for every affected proxy. Entries are identified by
+`(namespace, proxy_id, listen_port)` because proxy IDs are unique only within a
+namespace:
 
 ```json
 "stream_listeners": {
@@ -141,8 +143,8 @@ for every affected proxy ID:
   "dtls_demux_sessions": [],
   "bind_failures_total": 2,
   "bind_failures": [
-    { "proxy_id": "tcp-echo", "listen_port": 9100, "error": "Port 9100 is already in use on 0.0.0.0: Address already in use (os error 98)", "kind": "bind_failed" },
-    { "proxy_id": "udp-dtls", "listen_port": 8853, "error": "Deferred: frontend_tls UDP listener requires DTLS cert/key material (not yet loaded)", "kind": "frontend_dtls_deferred" }
+    { "namespace": "ferrum", "proxy_id": "tcp-echo", "listen_port": 9100, "error": "Port 9100 is already in use on 0.0.0.0: Address already in use (os error 98)", "kind": "bind_failed" },
+    { "namespace": "tenant-b", "proxy_id": "udp-dtls", "listen_port": 8853, "error": "Deferred: frontend_tls UDP listener requires DTLS cert/key material (not yet loaded)", "kind": "frontend_dtls_deferred" }
   ]
 }
 ```

@@ -850,6 +850,38 @@ mod inner {
     /// same reason — without it, every "failover" attempt would just ping the
     /// dead client and the gateway would never recover for standalone
     /// (non-replica-set) MongoDB deployments.
+    /// Topology label passed to Mongo reconnect publication test hooks
+    /// (issue #3001).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum MongoReconnectTopology {
+        Primary,
+        Failover,
+    }
+
+    /// Async callback installed by external tests around
+    /// [`MongoStore::publish_reconnected_bundle`]'s publication/topology
+    /// critical section. Production leaves hooks unset.
+    pub type MongoReconnectTransitionHook = Arc<
+        dyn Fn(
+                MongoReconnectTopology,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + Sync,
+    >;
+
+    /// Optional test seams for proving Mongo primary/failover publication
+    /// serialization without sleeps. Both callbacks are no-ops when unset.
+    #[derive(Clone, Default)]
+    pub struct MongoReconnectTransitionTestHooks {
+        /// Invoked immediately before the fail-fast Admin + generation
+        /// `try_write` acquisition.
+        pub before_lock: Option<MongoReconnectTransitionHook>,
+        /// Invoked while publication guards are held, after connection
+        /// ArcSwap (and after failover `mark_failover`), before primary
+        /// `mark_primary` finalizes the transition.
+        pub while_holding: Option<MongoReconnectTransitionHook>,
+    }
+
     #[derive(Clone)]
     pub struct MongoStore {
         // The live client, database handle, and any generated TLS PEM paths.
@@ -857,11 +889,27 @@ mod inner {
         // client can still open sockets, then removes them when the final old
         // bundle reference is dropped.
         connection: Arc<ArcSwap<MongoConnectionBundle>>,
-        // Admission operations hold the read side from lock acquisition
-        // through validation, mutation, and owner-qualified release. A
-        // reconnect must take the write side before swapping `connection`, so
-        // one protected operation can never straddle MongoDB generations.
+        // Admission operations hold the read side from acquisition through
+        // mutation completion / response construction. A reconnect must take
+        // the write side before swapping `connection`, so one protected
+        // admission can never straddle MongoDB generations.
+        //
+        // Distinct from [`Self::admin_write_topology`]: Tokio's fair
+        // `RwLock` is not reentrant, and Admin mutations that already hold a
+        // write-topology pin commonly enter CRUD/admission paths that also
+        // pin this generation. Nesting both on one lock self-deadlocks when a
+        // reconnect writer races between the outer permit and the inner
+        // admission acquire (issue #3001).
         connection_generation: Arc<tokio::sync::RwLock<()>>,
+        // Admin write-topology pin (issue #3001 check-to-use race). Mutations
+        // take the shared read side via
+        // [`DatabaseBackend::acquire_write_topology_permit`]; every connection
+        // publication path `try_write`s this lock *before*
+        // `connection_generation` (fail-fast, never nested with admission).
+        // Lock order on publication: `admin_write_topology` then
+        // `connection_generation`. Readers never take both locks nested on the
+        // same fair RwLock.
+        admin_write_topology: Arc<tokio::sync::RwLock<()>>,
         // Multi-step admission guards outlive an individual trait call. Their owner
         // token indexes the exact connection bundle and generation pin that
         // every clear/replay batch must borrow until explicit release.
@@ -884,6 +932,13 @@ mod inner {
         audit_max_rows_prune_gates:
             Arc<DashMap<String, crate::admin::audit::AuditMaxRowsPruneGate>>,
         failover_urls: Vec<String>,
+        /// Sticky failover topology / write-window state (issue #3001).
+        failover_topology: crate::config::db_backend::DbFailoverTopologyState,
+        /// External-test hooks around [`Self::publish_reconnected_bundle`].
+        /// Empty in production; see
+        /// [`Self::set_reconnect_transition_hooks_for_test`].
+        reconnect_transition_test_hooks:
+            Arc<std::sync::Mutex<Option<MongoReconnectTransitionTestHooks>>>,
         replica_set_configured: Arc<AtomicBool>,
     }
 
@@ -961,6 +1016,7 @@ mod inner {
             Ok(Self {
                 connection: Arc::new(ArcSwap::from_pointee(connection)),
                 connection_generation: Arc::new(tokio::sync::RwLock::new(())),
+                admin_write_topology: Arc::new(tokio::sync::RwLock::new(())),
                 persistent_admission_pins: Arc::new(DashMap::new()),
                 retained_admission_pins: Arc::new(DashMap::new()),
                 conn_settings,
@@ -971,6 +1027,8 @@ mod inner {
                 audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
                 audit_max_rows_prune_gates: Arc::new(DashMap::new()),
                 failover_urls: Vec::new(),
+                failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
+                reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: Arc::new(AtomicBool::new(replica_set_configured)),
             })
         }
@@ -1371,6 +1429,9 @@ mod inner {
                                     crate::config::db_backend::redact_url(url)
                                 );
                                 store.failover_urls = failover_urls.to_vec();
+                                store
+                                    .failover_topology
+                                    .mark_failover(&crate::config::db_backend::redact_url(url));
                                 return Ok(store);
                             }
                             Err(e) => {
@@ -1403,11 +1464,66 @@ mod inner {
             self.connection.load_full()
         }
 
-        fn install_reconnected_bundle(
+        async fn install_reconnected_bundle(
             &self,
             new_connection: MongoConnectionBundle,
             replica_set_configured: bool,
+            primary_url_redacted: &str,
         ) -> Result<(), anyhow::Error> {
+            self.publish_reconnected_bundle(
+                new_connection,
+                replica_set_configured,
+                MongoReconnectTopology::Primary,
+                primary_url_redacted,
+            )
+            .await
+        }
+
+        /// Publish a rebuilt connection under the Admin + admission gates.
+        ///
+        /// Transition contract (issue #3001, parity with SQL
+        /// `DatabaseStore::reconnect_for_topology`):
+        /// - Connection construction happens *before* this method, so a failed
+        ///   build never changes topology.
+        /// - Lock order (deadlock-free, both fail-fast `try_write`, no
+        ///   unbounded wait):
+        ///   1. `admin_write_topology` — blocks publication while an Admin
+        ///      mutation holds [`DatabaseBackend::acquire_write_topology_permit`]
+        ///   2. `connection_generation` — blocks publication while admission
+        ///      pins the current generation
+        /// - Readers never nest both locks on the same fair `RwLock`. Admin
+        ///   permits use only (1); admission uses only (2); publication takes
+        ///   exclusive sides in that order. A deferred reconnect leaves
+        ///   topology untouched.
+        /// - Failover: `mark_failover` runs *before* the ArcSwap so
+        ///   `admit_write()` / `check_write_allowed()` can never observe a
+        ///   failover connection while `primary_active` is still true.
+        /// - Primary: ArcSwap runs *before* `mark_primary` so writes stay
+        ///   fail-closed until the primary connection is published; both
+        ///   steps complete while the same publication guards are held so a
+        ///   concurrent failover cannot publish and then be overwritten only
+        ///   in metadata by a delayed `mark_primary` (fail-open).
+        /// - After the gate flips, publication cannot fail (swap is infallible
+        ///   under the held guards), so there is no post-flip restore path.
+        ///
+        /// Covered callers: [`Self::install_reconnected_bundle`] (primary
+        /// `reconnect`) and [`Self::reconnect_failover`]
+        /// (`try_failover_reconnect` failover URLs).
+        async fn publish_reconnected_bundle(
+            &self,
+            new_connection: MongoConnectionBundle,
+            replica_set_configured: bool,
+            topology: MongoReconnectTopology,
+            url_redacted: &str,
+        ) -> Result<(), anyhow::Error> {
+            self.invoke_reconnect_transition_hook(|hooks| hooks.before_lock.as_ref(), topology)
+                .await;
+            // Fail-fast: never wait for Admin mutation topology pins.
+            let _admin_topology_guard = self.admin_write_topology.try_write().map_err(|_| {
+                anyhow::anyhow!(
+                    "MongoDB reconnect deferred while an Admin write-topology permit pins the current connection"
+                )
+            })?;
             // Never swap generations while an admission guard is validating,
             // mutating, cleaning up, or spanning a restore rollback. In
             // particular, an uncertain write retains a read pin indefinitely;
@@ -1418,10 +1534,168 @@ mod inner {
                     "MongoDB reconnect deferred while an mTLS DNS admission operation pins the current connection generation"
                 )
             })?;
+            if topology == MongoReconnectTopology::Failover {
+                self.failover_topology.mark_failover(url_redacted);
+            }
             let _old_connection = self.connection.swap(Arc::new(new_connection));
             self.replica_set_configured
                 .store(replica_set_configured, Ordering::Release);
+            // Test seam: hold publication guards across the primary
+            // mark_primary window so a concurrent failover cannot interleave
+            // and then be overwritten only in metadata.
+            self.invoke_reconnect_transition_hook(|hooks| hooks.while_holding.as_ref(), topology)
+                .await;
+            if topology == MongoReconnectTopology::Primary {
+                self.failover_topology.mark_primary(url_redacted);
+            }
             Ok(())
+        }
+
+        /// Install (or clear) async test hooks around Mongo publication /
+        /// topology finalization. Production leaves this unset.
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub fn set_reconnect_transition_hooks_for_test(
+            &self,
+            hooks: Option<MongoReconnectTransitionTestHooks>,
+        ) {
+            let mut guard = self
+                .reconnect_transition_test_hooks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = hooks;
+        }
+
+        async fn invoke_reconnect_transition_hook(
+            &self,
+            select: impl Fn(&MongoReconnectTransitionTestHooks) -> Option<&MongoReconnectTransitionHook>,
+            topology: MongoReconnectTopology,
+        ) {
+            let hook = {
+                let guard = self
+                    .reconnect_transition_test_hooks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.as_ref().and_then(&select).cloned()
+            };
+            if let Some(hook) = hook {
+                hook(topology).await;
+            }
+        }
+
+        /// Rebuild the client against a failover URL and mark sticky failover
+        /// topology (issue #3001). Distinct from [`DatabaseBackend::reconnect`],
+        /// which always records a primary topology transition.
+        async fn reconnect_failover(&self, db_url: &str) -> Result<(), anyhow::Error> {
+            let (new_connection, replica_set_configured) = Self::build_connection_bundle(
+                db_url,
+                &self.conn_settings,
+                self.conn_settings.tls_enabled,
+                self.conn_settings.tls_ca_cert_path.as_deref(),
+                self.conn_settings.tls_client_cert_path.as_deref(),
+                self.conn_settings.tls_client_key_path.as_deref(),
+                self.conn_settings.tls_insecure,
+            )
+            .await?;
+            // Gate-before-publish: see `publish_reconnected_bundle` contract.
+            self.publish_reconnected_bundle(
+                new_connection,
+                replica_set_configured,
+                MongoReconnectTopology::Failover,
+                &crate::config::db_backend::redact_url(db_url),
+            )
+            .await?;
+            Ok(())
+        }
+
+        /// Lazy `MongoStore` for white-box topology/publication tests.
+        ///
+        /// Builds a driver `Client` against empty hosts (no live MongoDB). Used
+        /// by external unit tests through `_test_support` to prove Admin /
+        /// admission publication gating without network I/O.
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub fn new_unconnected_for_test(failover_urls: Vec<String>) -> Result<Self, anyhow::Error> {
+            let settings = MongoConnSettings {
+                database_name: "test".to_string(),
+                app_name: None,
+                replica_set: None,
+                auth_mechanism: None,
+                server_selection_timeout_secs: Some(1),
+                connect_timeout_secs: Some(1),
+                tls_enabled: false,
+                tls_ca_cert_path: None,
+                tls_client_cert_path: None,
+                tls_client_key_path: None,
+                tls_insecure: false,
+            };
+            let opts = mongodb::options::ClientOptions::builder()
+                .hosts(vec![])
+                .build();
+            // Empty-host ClientOptions is lazy; construction does not dial.
+            let client = mongodb::Client::with_options(opts.clone()).map_err(|error| {
+                anyhow::anyhow!("Client::with_options rejected empty hosts: {error}")
+            })?;
+            let lease_client = mongodb::Client::with_options(opts).map_err(|error| {
+                anyhow::anyhow!("lease Client::with_options rejected empty hosts: {error}")
+            })?;
+            let db = client.database(&settings.database_name);
+            let connection = MongoConnectionBundle::new(client, db, lease_client, Vec::new());
+            Ok(Self {
+                connection: Arc::new(ArcSwap::from_pointee(connection)),
+                connection_generation: Arc::new(tokio::sync::RwLock::new(())),
+                admin_write_topology: Arc::new(tokio::sync::RwLock::new(())),
+                persistent_admission_pins: Arc::new(DashMap::new()),
+                retained_admission_pins: Arc::new(DashMap::new()),
+                conn_settings: settings,
+                db_type_str: "mongodb".to_string(),
+                slow_query_threshold_ms: None,
+                cert_expiry_warning_days: crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS,
+                backend_allow_ips: crate::config::BackendEgressPolicy::unrestricted(),
+                audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
+                audit_max_rows_prune_gates: Arc::new(DashMap::new()),
+                failover_urls,
+                failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
+                reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
+                replica_set_configured: Arc::new(AtomicBool::new(false)),
+            })
+        }
+
+        /// Publish a synthetic connection bundle through the production
+        /// publication helper (Admin + admission fail-fast gates).
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub async fn try_publish_reconnected_bundle_for_test(
+            &self,
+            database_name: &str,
+            topology: MongoReconnectTopology,
+            url_redacted: &str,
+        ) -> Result<(), anyhow::Error> {
+            let opts = mongodb::options::ClientOptions::builder()
+                .hosts(vec![])
+                .build();
+            let client = mongodb::Client::with_options(opts.clone()).map_err(|error| {
+                anyhow::anyhow!("Client::with_options rejected empty hosts: {error}")
+            })?;
+            let lease_client = mongodb::Client::with_options(opts).map_err(|error| {
+                anyhow::anyhow!("lease Client::with_options rejected empty hosts: {error}")
+            })?;
+            let db = client.database(database_name);
+            let connection = MongoConnectionBundle::new(client, db, lease_client, Vec::new());
+            self.publish_reconnected_bundle(connection, false, topology, url_redacted)
+                .await
+        }
+
+        /// Admission-generation read pin used by external tests to simulate an
+        /// in-flight mTLS DNS admission without talking to MongoDB.
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub async fn acquire_connection_generation_pin_for_test(
+            &self,
+        ) -> tokio::sync::OwnedRwLockReadGuard<()> {
+            self.connection_generation.clone().read_owned().await
+        }
+
+        /// Active database name from the published connection bundle.
+        #[allow(dead_code)] // exercised via external unit tests through the lib target
+        pub fn published_database_name_for_test(&self) -> String {
+            self.db().name().to_string()
         }
 
         /// Aggregation-pipeline update that takes or holds a renewable lease.
@@ -5275,6 +5549,28 @@ mod inner {
             false
         }
 
+        fn failover_topology_status(&self) -> crate::config::db_backend::DbFailoverTopologyStatus {
+            self.failover_topology.status()
+        }
+
+        fn set_failover_allow_writes(&mut self, allow: bool) {
+            self.failover_topology.set_allow_writes(allow);
+        }
+
+        async fn acquire_write_topology_permit(
+            &self,
+        ) -> crate::config::db_backend::DbWriteTopologyPermit {
+            // Shared read pin on the Admin-only topology gate. Distinct from
+            // `connection_generation` so mutations may later enter admission /
+            // CRUD paths that take that generation read without nesting the
+            // same fair Tokio `RwLock` (non-reentrant). Publication
+            // `try_write`s this lock first, then `connection_generation`, so
+            // an in-flight mutation cannot be redirected and reconnect stays
+            // fail-fast while either pin is held.
+            let guard = self.admin_write_topology.clone().read_owned().await;
+            crate::config::db_backend::DbWriteTopologyPermit::pinned(guard)
+        }
+
         fn set_slow_query_threshold(&mut self, threshold_ms: Option<u64>) {
             self.slow_query_threshold_ms = threshold_ms;
         }
@@ -5624,6 +5920,25 @@ mod inner {
             let doc = self
                 .config_changes()
                 .find_one(doc! { "namespace": namespace })
+                .sort(doc! { "sequence": -1 })
+                .await?;
+            let Some(doc) = doc else {
+                return Ok(0);
+            };
+            match doc.get("sequence") {
+                Some(Bson::Int64(value)) if *value >= 0 => Ok(*value as u64),
+                Some(Bson::Int32(value)) if *value >= 0 => Ok(*value as u64),
+                other => anyhow::bail!(
+                    "MongoDB config_changes row has invalid sequence: {:?}",
+                    other
+                ),
+            }
+        }
+
+        async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
+            let doc = self
+                .config_changes()
+                .find_one(doc! {})
                 .sort(doc! { "sequence": -1 })
                 .await?;
             let Some(doc) = doc else {
@@ -9642,6 +9957,10 @@ mod inner {
             // actually talk to MongoDB. On `Err` the swap is skipped and the
             // existing (possibly degraded) client stays in place — same
             // contract as `DatabaseStore::reconnect` for sqlx.
+            //
+            // Callers pass the configured primary URL. Failover reconnects use
+            // `reconnect_failover` so an active failover URL is never labeled
+            // primary (issue #3001).
             let (new_connection, replica_set_configured) = Self::build_connection_bundle(
                 db_url,
                 &self.conn_settings,
@@ -9653,13 +9972,20 @@ mod inner {
             )
             .await?;
 
-            // Atomic swap. Readers that already loaded the old `Client` or
+            // Atomic swap + topology finalization under the same publication
+            // guards. Readers that already loaded the old `Client` or
             // `Database` handle keep using it (in-flight commands complete);
             // the next call to `db()`/`client()` picks up the new handle. Any
             // generated TLS files are owned by the same bundle as the driver
             // client, so old files are deleted only after the final old bundle
-            // reference is dropped.
-            self.install_reconnected_bundle(new_connection, replica_set_configured)?;
+            // reference is dropped. Primary `mark_primary` runs after the swap
+            // but still under the guards (issue #3001 fail-open race).
+            self.install_reconnected_bundle(
+                new_connection,
+                replica_set_configured,
+                &crate::config::db_backend::redact_url(db_url),
+            )
+            .await?;
 
             info!(
                 "MongoDB client reconnected to {} (replica_set={})",
@@ -9680,32 +10006,47 @@ mod inner {
             // Try primary first. `reconnect()` rebuilds the underlying
             // `Client` against the primary URL and pings it; on success
             // the swap is committed and the gateway is back on the
-            // primary.
-            if self.reconnect(primary_url).await.is_ok() {
-                info!(
-                    "Reconnected to primary MongoDB ({})",
-                    crate::config::db_backend::redact_url(primary_url)
-                );
-                return Ok(primary_url.to_string());
+            // primary. Opt-in failover windows emit one divergence-risk
+            // marker via mark_primary (issue #3001 contract B); failback
+            // is not fenced.
+            match self.reconnect(primary_url).await {
+                Ok(()) => {
+                    info!(
+                        "Reconnected to primary MongoDB ({})",
+                        crate::config::db_backend::redact_url(primary_url)
+                    );
+                    return Ok(primary_url.to_string());
+                }
+                Err(error) => {
+                    warn!(
+                        "Primary MongoDB reconnect failed: {}",
+                        crate::config::db_backend::redact_error_text(&error, &[primary_url])
+                    );
+                }
             }
 
             // Try failover URLs in order. The first one that successfully
             // pings wins; subsequent URLs are not tried until the next
             // failover-reconnect cycle.
             for (i, url) in self.failover_urls.iter().enumerate() {
-                if self.reconnect(url).await.is_ok() {
-                    info!(
-                        "Reconnected to failover MongoDB #{} ({})",
-                        i + 1,
-                        crate::config::db_backend::redact_url(url)
-                    );
-                    return Ok(url.clone());
+                match self.reconnect_failover(url).await {
+                    Ok(()) => {
+                        info!(
+                            "Reconnected to failover MongoDB #{} ({})",
+                            i + 1,
+                            crate::config::db_backend::redact_url(url)
+                        );
+                        return Ok(url.clone());
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Failover MongoDB #{} ({}) reconnect failed: {}",
+                            i + 1,
+                            crate::config::db_backend::redact_url(url),
+                            crate::config::db_backend::redact_error_text(&error, &[url])
+                        );
+                    }
                 }
-                warn!(
-                    "Failover MongoDB #{} ({}) reconnect failed",
-                    i + 1,
-                    crate::config::db_backend::redact_url(url)
-                );
             }
 
             Err(anyhow::anyhow!(
@@ -13204,6 +13545,7 @@ mod inner {
             MongoStore {
                 connection: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(connection)),
                 connection_generation: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+                admin_write_topology: std::sync::Arc::new(tokio::sync::RwLock::new(())),
                 persistent_admission_pins: std::sync::Arc::new(DashMap::new()),
                 retained_admission_pins: std::sync::Arc::new(DashMap::new()),
                 conn_settings: settings,
@@ -13214,6 +13556,8 @@ mod inner {
                 audit_retention: crate::admin::audit::AuditRetentionPolicy::default(),
                 audit_max_rows_prune_gates: std::sync::Arc::new(DashMap::new()),
                 failover_urls,
+                failover_topology: crate::config::db_backend::DbFailoverTopologyState::new(),
+                reconnect_transition_test_hooks: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 replica_set_configured: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     false,
                 )),
@@ -13304,14 +13648,45 @@ mod inner {
 
             let admission_pin = store.connection_generation.clone().read_owned().await;
             let blocked = store
-                .install_reconnected_bundle(connection_bundle("blocked_failover"), false)
+                .install_reconnected_bundle(
+                    connection_bundle("blocked_failover"),
+                    false,
+                    "mongodb://primary.example/test",
+                )
+                .await
                 .expect_err("an admission pin must block reconnect/failover bundle replacement");
             assert!(blocked.to_string().contains("admission operation pins"));
             assert_eq!(store.db().name(), "test");
             drop(admission_pin);
 
+            let admin_pin = store.admin_write_topology.clone().read_owned().await;
+            let blocked_admin = store
+                .install_reconnected_bundle(
+                    connection_bundle("blocked_admin"),
+                    false,
+                    "mongodb://primary.example/test",
+                )
+                .await
+                .expect_err("an Admin write-topology pin must block bundle replacement");
+            assert!(
+                blocked_admin
+                    .to_string()
+                    .contains("Admin write-topology permit")
+            );
+            assert_eq!(store.db().name(), "test");
+            // Nested admission acquire while Admin pin is held must not deadlock
+            // (distinct fair RwLocks).
+            let nested_admission = store.connection_generation.clone().read_owned().await;
+            drop(nested_admission);
+            drop(admin_pin);
+
             store
-                .install_reconnected_bundle(connection_bundle("after_failover"), false)
+                .install_reconnected_bundle(
+                    connection_bundle("after_failover"),
+                    false,
+                    "mongodb://primary.example/test",
+                )
+                .await
                 .expect("the bundle may swap after the admission generation pin is released");
 
             let guard_owner = "settled-owner".to_string();
@@ -13328,11 +13703,21 @@ mod inner {
                 },
             );
             store
-                .install_reconnected_bundle(connection_bundle("still_blocked"), false)
+                .install_reconnected_bundle(
+                    connection_bundle("still_blocked"),
+                    false,
+                    "mongodb://primary.example/test",
+                )
+                .await
                 .expect_err("a persistent admission pin must block bundle replacement");
             let _ = store.persistent_admission_pins.remove(&guard_owner);
             store
-                .install_reconnected_bundle(connection_bundle("recovered_failover"), false)
+                .install_reconnected_bundle(
+                    connection_bundle("recovered_failover"),
+                    false,
+                    "mongodb://primary.example/test",
+                )
+                .await
                 .expect("settled cleanup failure must release the local generation pin");
 
             // Accessor must now return the swapped handle. If it kept a
@@ -14001,7 +14386,12 @@ mod inner {
     }
 }
 
-pub use inner::MongoStore;
+#[allow(unused_imports)]
+// The binary target has no `_test_support` consumer for these test seams.
+pub use inner::{
+    MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
+    MongoStore,
+};
 // Narrow crate-internal test seams (exposed only through `_test_support`): the
 // timeout-precedence application and the identity reservation rollback/release
 // accounting. Everything else stays module-private in `inner`.

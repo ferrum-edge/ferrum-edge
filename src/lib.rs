@@ -91,6 +91,7 @@ pub mod _test_support {
     use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 
     use crate::config::types::{AuthMode, BackendScheme};
+    use crate::modes::mesh::startup_rollback_test_seams as mesh_startup_rollback_seams;
     use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
 
@@ -297,12 +298,17 @@ pub mod _test_support {
     /// DTLS frontend listener without widening the production plugin catalog.
     /// Build the request epoch after calling this so the published snapshot
     /// includes the injected plugin.
+    ///
+    /// `namespace` is required: the plugin cache is keyed by the full
+    /// `(namespace, proxy_id)` identity, so an injection under a bare id would
+    /// never be resolved by the request path.
     pub fn prepend_proxy_plugin_for_test(
         cache: &crate::PluginCache,
+        namespace: &str,
         proxy_id: &str,
         plugin: Arc<dyn Plugin>,
     ) -> Result<(), String> {
-        cache.prepend_proxy_plugin_for_test(proxy_id, plugin)
+        cache.prepend_proxy_plugin_for_test(namespace, proxy_id, plugin)
     }
 
     /// Deterministic allocator helper for proxy lifecycle ownership generations.
@@ -340,9 +346,99 @@ pub mod _test_support {
     pub fn incremental_plugin_rebuild_targets_for_test(
         current: &crate::config::types::GatewayConfig,
         candidate: &crate::config::types::GatewayConfig,
-    ) -> HashSet<String> {
+    ) -> HashSet<crate::config::db_backend::NamespacedResourceId> {
         let delta = crate::config_delta::ConfigDelta::compute(current, candidate);
         crate::proxy::plugin_rebuild_targets_for_incremental_stage(current, candidate, &delta)
+    }
+
+    /// Whether the published plugin cache still holds a proxy plugin list for
+    /// `(namespace, id)`.
+    pub fn plugin_cache_contains_proxy_for_test(
+        cache: &crate::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> bool {
+        let key = crate::config::db_backend::namespaced_runtime_key(namespace, proxy_id);
+        cache.load_inner().proxy_plugins.contains_key(&key)
+    }
+
+    /// Resolve a proxy's protocol-filtered plugin list the way the TCP/UDP/mesh
+    /// stream paths do: through the namespace-composing `PluginCacheInner`
+    /// accessor (thread-local key scratch, no per-lookup `String`).
+    pub fn plugins_for_protocol_for_test(
+        cache: &crate::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        cache
+            .load_inner()
+            .plugins_for_protocol(namespace, proxy_id, protocol)
+    }
+
+    /// Resolve the same protocol plugin list with a BARE proxy ID — the
+    /// spelling that misses every namespace-keyed protocol entry and silently
+    /// falls back to the global chain (issue #3094). Exposed only so
+    /// regression coverage can pin that difference; production stream paths
+    /// must never look up by raw ID.
+    pub fn plugins_for_protocol_by_bare_proxy_id_for_test(
+        cache: &crate::PluginCache,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        cache
+            .load_inner()
+            .get_plugins_for_protocol(proxy_id, protocol)
+    }
+
+    /// Resolve a proxy's initial-response-header policy chain the way the
+    /// HTTP/3 request path does: through the namespace-composing
+    /// `PluginCacheInner` accessor.
+    pub fn initial_response_header_policy_plugins_for_test(
+        cache: &crate::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        cache
+            .load_inner()
+            .initial_response_header_policy_plugins(namespace, proxy_id, protocol)
+    }
+
+    /// Resolve the same chain with a BARE proxy ID — the spelling that misses
+    /// every namespace-keyed protocol entry and silently falls back to the
+    /// global chain (issue #3094). Exposed only so regression coverage can pin
+    /// that difference; production code must never look up by raw ID.
+    pub fn initial_response_header_policy_plugins_by_bare_proxy_id_for_test(
+        cache: &crate::PluginCache,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> Arc<Vec<Arc<dyn Plugin>>> {
+        cache
+            .load_inner()
+            .get_initial_response_header_policy_plugins(proxy_id, protocol)
+    }
+
+    /// Whether the service-discovery loop would prune `proxy`'s passive-health
+    /// state for a discovery update on upstream `(upstream_namespace,
+    /// upstream_id)`. Exposes the namespace-qualified proxy-selection predicate
+    /// so regression coverage can prove a discovery update in one tenant never
+    /// prunes a same-id upstream's proxy in another tenant (issue #3094).
+    pub fn proxy_targets_discovered_upstream_for_test(
+        proxy: &crate::config::types::Proxy,
+        upstream_namespace: &str,
+        upstream_id: &str,
+    ) -> bool {
+        crate::service_discovery::proxy_targets_discovered_upstream(
+            proxy,
+            upstream_namespace,
+            upstream_id,
+        )
+    }
+
+    /// Service-discovery task ownership key for a namespace-scoped upstream.
+    pub fn service_discovery_task_key_for_test(namespace: &str, upstream_id: &str) -> String {
+        crate::service_discovery::service_discovery_task_key(namespace, upstream_id)
     }
 
     // ── plugins/grpc_deadline + proxy rejection finalization ────────────────
@@ -350,6 +446,32 @@ pub mod _test_support {
         duration: std::time::Duration,
     ) -> Option<u64> {
         crate::plugins::grpc_deadline::duration_millis_ceil_saturating(duration)
+    }
+
+    pub fn apply_remaining_grpc_timeout_header_for_test(
+        headers: &mut hyper::HeaderMap,
+        deadline: tokio::time::Instant,
+    ) {
+        crate::proxy::grpc_proxy::apply_remaining_grpc_timeout_header(headers, deadline);
+    }
+
+    pub fn direct_h2_send_request_error_response_for_class_for_test(
+        error_class: crate::retry::ErrorClass,
+        resolved_ip: Option<String>,
+    ) -> crate::retry::BackendResponse {
+        crate::proxy::direct_h2_send_request_error_response_for_class(error_class, resolved_ip)
+    }
+
+    pub fn normalize_pooled_h2_send_post_wire_class_for_test(
+        error_class: crate::retry::ErrorClass,
+    ) -> crate::retry::ErrorClass {
+        crate::proxy::http2_pool::normalize_pooled_h2_send_post_wire_class(error_class)
+    }
+
+    pub fn eager_buffer_body_read_status_and_class_for_test(
+        class: crate::retry::ErrorClass,
+    ) -> (u16, crate::retry::ErrorClass) {
+        crate::proxy::eager_buffer_body_read_status_and_class(class)
     }
 
     pub fn set_grpc_deadline_budget_for_test(
@@ -448,7 +570,7 @@ pub mod _test_support {
         proxy_id: &str,
     ) -> GrpcWebPluginViewForTest {
         let inner = cache.load_inner();
-        let view = inner.grpc_web_request_view(proxy_id);
+        let view = inner.grpc_web_request_view("ferrum", proxy_id);
         GrpcWebPluginViewForTest {
             plugins: view
                 .plugins()
@@ -1091,6 +1213,80 @@ pub mod _test_support {
         crate::plugins::soap_ws_security::decode_soap_xml_body_for_test(bytes, content_type)
     }
 
+    /// Exact replay-state observation for deterministic external tests.
+    ///
+    /// `retained_key_bytes` counts each nonce string once. `shared_key_entries`
+    /// counts age-index entries whose `Arc<str>` points at the exact allocation
+    /// used by the lookup map, so tests can pin the no-duplicate-key contract.
+    pub struct SoapNonceReplaySnapshotForTest {
+        pub entry_count: usize,
+        pub age_index_entry_count: usize,
+        pub retained_key_bytes: usize,
+        pub recomputed_key_bytes: usize,
+        pub shared_key_entries: usize,
+        pub last_expired_removals: usize,
+        pub last_forced_candidates: usize,
+        pub max_maintenance_entries: usize,
+    }
+
+    /// Controllable-time harness for the PasswordDigest nonce replay state.
+    ///
+    /// The production plugin remains the implementation under test; this seam
+    /// only supplies explicit `Instant` values and atomic observations.
+    pub struct SoapNonceReplayHarness {
+        plugin: crate::plugins::soap_ws_security::SoapWsSecurity,
+        epoch: std::time::Instant,
+    }
+
+    impl SoapNonceReplayHarness {
+        pub fn new(config: &serde_json::Value) -> Result<Self, String> {
+            Ok(Self {
+                plugin: crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?,
+                epoch: std::time::Instant::now(),
+            })
+        }
+
+        pub fn claim(&self, nonce: &str) -> Result<(), String> {
+            self.plugin.check_nonce_replay(nonce)
+        }
+
+        pub fn claim_at(&self, nonce: &str, elapsed: std::time::Duration) -> Result<(), String> {
+            let now = self
+                .epoch
+                .checked_add(elapsed)
+                .ok_or_else(|| "soap nonce test clock overflow".to_string())?;
+            self.plugin.check_nonce_replay_at_for_tests(nonce, now)
+        }
+
+        pub fn snapshot(&self) -> Result<SoapNonceReplaySnapshotForTest, String> {
+            let snapshot = self.plugin.nonce_replay_observation_for_tests()?;
+            Ok(SoapNonceReplaySnapshotForTest {
+                entry_count: snapshot.entry_count,
+                age_index_entry_count: snapshot.age_index_entry_count,
+                retained_key_bytes: snapshot.retained_key_bytes,
+                recomputed_key_bytes: snapshot.recomputed_key_bytes,
+                shared_key_entries: snapshot.shared_key_entries,
+                last_expired_removals: snapshot.last_expired_removals,
+                last_forced_candidates: snapshot.last_forced_candidates,
+                max_maintenance_entries: snapshot.max_maintenance_entries,
+            })
+        }
+    }
+
+    /// One-shot proof that map/index drift cannot be recovered as a fresh
+    /// admission. The inconsistent plugin never escapes this helper.
+    pub fn soap_nonce_inconsistent_state_outcome_for_test(
+        config: &serde_json::Value,
+    ) -> Result<String, String> {
+        let plugin = crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?;
+        plugin.check_nonce_replay("nonce-consistency-seed")?;
+        plugin.corrupt_nonce_age_index_for_tests()?;
+        match plugin.check_nonce_replay("nonce-consistency-probe") {
+            Ok(()) => Err("soap nonce inconsistent state admitted a probe".to_string()),
+            Err(error) => Ok(error),
+        }
+    }
+
     /// Schema type-cache stats for an openapi_validator instance: `(cached nodes,
     /// request-time fallback computes)`. Cached nodes are filled once per
     /// registered schema during ConversionPlan compile (#3024).
@@ -1103,6 +1299,14 @@ pub mod _test_support {
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
+    }
+
+    pub fn tcp_listener_proxy_for_test(
+        config: &crate::config::types::GatewayConfig,
+        proxy_namespace: &str,
+        proxy_id: &str,
+    ) -> Option<crate::config::types::Proxy> {
+        crate::proxy::tcp_proxy::find_listener_proxy(config, proxy_namespace, proxy_id).cloned()
     }
 
     /// Mirror the TCP accept-loop disconnect summary contract: `duration_ms`
@@ -2312,7 +2516,73 @@ pub mod _test_support {
     }
 
     // ── config/db_loader ─────────────────────────────────────────────────────
-    pub use crate::config::db_loader::DbPoolConfig;
+    pub use crate::config::db_loader::{
+        DbPoolConfig, SqlReconnectTopology, SqlReconnectTransitionHook,
+        SqlReconnectTransitionTestHooks,
+    };
+
+    /// Install (or clear) SQL reconnect transition test hooks on one store.
+    pub fn database_store_set_reconnect_transition_hooks_for_test(
+        store: &crate::config::db_loader::DatabaseStore,
+        hooks: Option<SqlReconnectTransitionTestHooks>,
+    ) {
+        store.set_reconnect_transition_hooks_for_test(hooks);
+    }
+
+    /// Drive a failover-topology reconnect without the primary-first probe in
+    /// `try_failover_reconnect` (issue #3001 transition serialization tests).
+    pub async fn database_store_reconnect_as_failover_for_test(
+        store: &crate::config::db_loader::DatabaseStore,
+        db_url: &str,
+    ) -> Result<(), anyhow::Error> {
+        store.reconnect_as_failover(db_url).await
+    }
+
+    // ── config/mongo_store: Admin write-topology / publication test seams ────
+    pub use crate::config::mongo_store::{
+        MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
+    };
+
+    /// Lazy Mongo store (no live MongoDB) for topology publication tests.
+    pub fn mongo_store_new_unconnected_for_test(
+        failover_urls: Vec<String>,
+    ) -> Result<crate::config::mongo_store::MongoStore, anyhow::Error> {
+        crate::config::mongo_store::MongoStore::new_unconnected_for_test(failover_urls)
+    }
+
+    /// Publish through Mongo's production Admin+admission fail-fast gates.
+    pub async fn mongo_store_try_publish_reconnected_bundle_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        database_name: &str,
+        topology: MongoReconnectTopology,
+        url_redacted: &str,
+    ) -> Result<(), anyhow::Error> {
+        store
+            .try_publish_reconnected_bundle_for_test(database_name, topology, url_redacted)
+            .await
+    }
+
+    /// Install (or clear) Mongo reconnect publication test hooks.
+    pub fn mongo_store_set_reconnect_transition_hooks_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        hooks: Option<MongoReconnectTransitionTestHooks>,
+    ) {
+        store.set_reconnect_transition_hooks_for_test(hooks);
+    }
+
+    /// Simulate an in-flight admission generation pin without talking to Mongo.
+    pub async fn mongo_store_acquire_connection_generation_pin_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+    ) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        store.acquire_connection_generation_pin_for_test().await
+    }
+
+    /// Active published Mongo database name (white-box accessor).
+    pub fn mongo_store_published_database_name_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+    ) -> String {
+        store.published_database_name_for_test()
+    }
 
     // ── config/batch_atomicity ───────────────────────────────────────────────
     pub use crate::config::batch_atomicity::{AtomicBatchFault, AtomicBatchPhase};
@@ -3780,6 +4050,34 @@ pub mod _test_support {
         crate::proxy::body::inspected_streaming_body(rx)
     }
 
+    pub fn mesh_tcp_egress_connection_accounting_for_test(
+        cache: &crate::load_balancer::LoadBalancerCache,
+        namespace: &str,
+        upstream_id: &str,
+        target: &crate::config::types::UpstreamTarget,
+    ) -> Option<(i64, i64)> {
+        let snapshot = cache.load_inner();
+        let balancer =
+            crate::proxy::mesh_tcp_egress_connection_balancer(&snapshot, namespace, upstream_id)?;
+        let target_key = crate::load_balancer::target_host_port_key(target);
+        let guard = crate::proxy::LoadBalancerConnectionGuard::new(
+            Some(Arc::new(target.clone())),
+            Some(Arc::clone(&balancer)),
+        );
+        let during = balancer
+            .active_connections
+            .get(&target_key)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        drop(guard);
+        let after = balancer
+            .active_connections
+            .get(&target_key)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        Some((during, after))
+    }
+
     pub fn h3_plugin_protocol_for_request_for_test(
         flavor: crate::config::types::HttpFlavor,
         grpc_web_request: bool,
@@ -3885,6 +4183,20 @@ pub mod _test_support {
     /// [`crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test`].
     pub fn dtls_stale_session_removal_preserves_newer_generation_for_test() -> Result<(), String> {
         crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test()
+    }
+
+    /// Observe Ferrum-managed DTLS loader key DER after zeroization and before
+    /// the backing allocation is released (issue #3224 loader ownership path).
+    pub fn load_dtls_certificate_with_rustls_key_drop_hook_for_test(
+        cert_path: &str,
+        key_path: &str,
+        drop_hook: impl Fn(&[u8]) + Send + Sync + 'static,
+    ) -> Result<dimpl::DtlsCertificateChain, anyhow::Error> {
+        crate::dtls::load_dtls_certificate_with_key_drop_hook(
+            cert_path,
+            key_path,
+            Some(std::sync::Arc::new(drop_hook)),
+        )
     }
 
     pub fn udp_logging_dtls_send_timeout_requires_sender_reset_for_test() -> bool {
@@ -4262,6 +4574,34 @@ pub mod _test_support {
     pub fn node_agent_cleanup_failure_preserves_original_error_probe_for_test()
     -> NodeAgentStartupCleanupProbe {
         node_agent_cleanup_seams::probe_cleanup_failure_preserves_original_error_for_test()
+    }
+
+    // ── mesh startup-rollback seams (issue #2372) ────────────────────────────
+    pub type MeshStartupRollbackProbe = mesh_startup_rollback_seams::MeshStartupRollbackProbe;
+    pub type MeshStartupListenerDrainProbe =
+        mesh_startup_rollback_seams::MeshStartupListenerDrainProbe;
+
+    /// Failure after admin/netns side effects, before the final startup_result gate.
+    pub async fn mesh_startup_failure_before_startup_result_gate_probe_for_test()
+    -> MeshStartupRollbackProbe {
+        mesh_startup_rollback_seams::probe_failure_before_startup_result_gate_for_test().await
+    }
+
+    /// Failure inside the existing listener/start-signal startup_result gate.
+    pub async fn mesh_startup_failure_inside_startup_result_gate_probe_for_test()
+    -> MeshStartupRollbackProbe {
+        mesh_startup_rollback_seams::probe_failure_inside_startup_result_gate_for_test().await
+    }
+
+    /// Failure before MeshStartupOwner exists (pre-ProxyState preparation).
+    pub async fn mesh_startup_failure_before_owner_probe_for_test() -> MeshStartupRollbackProbe {
+        mesh_startup_rollback_seams::probe_failure_before_owner_for_test().await
+    }
+
+    /// Stuck listeners must not wedge startup-failure rollback forever.
+    pub async fn mesh_startup_failure_listener_join_bounded_probe_for_test()
+    -> MeshStartupListenerDrainProbe {
+        mesh_startup_rollback_seams::probe_startup_failure_listener_join_is_bounded_for_test().await
     }
 
     // ── load_balancer first-wave counter seams ───────────────────────────────

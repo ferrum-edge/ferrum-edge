@@ -1,0 +1,1285 @@
+diff --git a/.cargo-ok b/.cargo-ok
+new file mode 100644
+index 0000000..5f8b795
+--- /dev/null
++++ b/.cargo-ok
+@@ -0,0 +1 @@
++{"v":1}
+\ No newline at end of file
+diff --git a/Cargo.lock b/Cargo.lock
+index 4cc380f..258913c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -515,6 +515,7 @@ dependencies = [
+  "x25519-dalek",
+  "x509-cert",
+  "x509-parser",
++ "zeroize",
+ ]
+ 
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+index 6986a97..a23da43 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -56,6 +56,7 @@ default = [
+     "aws-lc-rs",
+     "rcgen",
+ ]
++test-hooks = []
+ rcgen = [
+     "dep:rcgen",
+     "aws-lc-rs",
+@@ -223,6 +224,9 @@ version = "0.2"
+ optional = true
+ default-features = false
+ 
++[dependencies.zeroize]
++version = "1"
++
+ [dev-dependencies.bytes]
+ version = "1"
+ 
+diff --git a/Cargo.toml.orig b/Cargo.toml.orig
+index 197158c..c605826 100644
+--- a/Cargo.toml.orig
++++ b/Cargo.toml.orig
+@@ -15,6 +15,7 @@ rust-version = "1.85.0"
+ 
+ [features]
+ default = ["aws-lc-rs", "rcgen"]
++test-hooks = []
+ 
+ # Default crypto provider
+ aws-lc-rs = ["dep:aws-lc-rs", "dep:ccm", "dep:aes", "_crypto-common"]
+@@ -46,6 +47,7 @@ rand = "0.9"
+ time = { version = "0.3", features = ["formatting"] }
+ arrayvec = "0.7.6"
+ subtle = "2.6"
++zeroize = "1"
+ 
+ der = { version = "0.7", optional = true }
+ pkcs8 = { version = "0.10", features = ["pem"], optional = true }
+diff --git a/src/auto.rs b/src/auto.rs
+index e1ac4cc..5a51f26 100644
+--- a/src/auto.rs
++++ b/src/auto.rs
+@@ -29,7 +29,7 @@ use crate::dtls13::message::SignatureAlgorithmsExtension;
+ use crate::dtls13::message::SupportedGroupsExtension;
+ use crate::dtls13::message::UseSrtpExtension;
+ use crate::types::NamedGroup;
+-use crate::{Config, DtlsCertificate, Error, Output, SeededRng};
++use crate::{Config, DtlsCertificateChain, Error, Output, SeededRng};
+ // Extension type constants
+ const EXT_SUPPORTED_GROUPS: u16 = 0x000A;
+ const EXT_EC_POINT_FORMATS: u16 = 0x000B;
+@@ -261,7 +261,7 @@ impl HybridClientHello {
+ pub(crate) struct ClientPending {
+     hybrid: HybridClientHello,
+     config: Arc<Config>,
+-    certificate: DtlsCertificate,
++    certificate: DtlsCertificateChain,
+     /// Pre-built wire packet (record header + handshake fragment).
+     wire_packet: Buf,
+     /// Whether the wire_packet hasn't been polled yet.
+@@ -277,7 +277,7 @@ pub(crate) struct ClientPending {
+ impl ClientPending {
+     pub fn new(
+         config: Arc<Config>,
+-        certificate: DtlsCertificate,
++        certificate: DtlsCertificateChain,
+         now: Instant,
+     ) -> Result<Self, Error> {
+         let hybrid = HybridClientHello::new(&config)?;
+@@ -338,7 +338,14 @@ impl ClientPending {
+         Output::Timeout(next)
+     }
+ 
+-    pub fn into_parts(self) -> (HybridClientHello, Arc<Config>, DtlsCertificate, Instant) {
++    pub fn into_parts(
++        self,
++    ) -> (
++        HybridClientHello,
++        Arc<Config>,
++        DtlsCertificateChain,
++        Instant,
++    ) {
+         (self.hybrid, self.config, self.certificate, self.last_now)
+     }
+ }
+diff --git a/src/crypto/aws_lc_rs/sign.rs b/src/crypto/aws_lc_rs/sign.rs
+index d1cc2b8..905bc24 100644
+--- a/src/crypto/aws_lc_rs/sign.rs
++++ b/src/crypto/aws_lc_rs/sign.rs
+@@ -130,9 +130,11 @@ impl KeyProvider for AwsLcKeyProvider {
+                     public_key: None,
+                 };
+ 
+-                let pkcs8_der = pkcs8
+-                    .to_der()
+-                    .map_err(|_| "Failed to encode PKCS#8".to_string())?;
++                let pkcs8_der = zeroize::Zeroizing::new(
++                    pkcs8
++                        .to_der()
++                        .map_err(|_| "Failed to encode PKCS#8".to_string())?,
++                );
+ 
+                 let p256_curve = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+                 if curve_oid == p256_curve {
+@@ -163,7 +165,7 @@ impl KeyProvider for AwsLcKeyProvider {
+         // Check if it's a PEM encoded key
+         if let Ok(pem_str) = str::from_utf8(key_der) {
+             if pem_str.contains("-----BEGIN") {
+-                if let Ok((_label, doc)) = pkcs8::Document::from_pem(pem_str) {
++                if let Ok((_label, doc)) = pkcs8::SecretDocument::from_pem(pem_str) {
+                     return self.load_private_key(doc.as_bytes());
+                 }
+             }
+diff --git a/src/crypto/rust_crypto/sign.rs b/src/crypto/rust_crypto/sign.rs
+index 42f01f1..9bbcac5 100644
+--- a/src/crypto/rust_crypto/sign.rs
++++ b/src/crypto/rust_crypto/sign.rs
+@@ -150,9 +150,11 @@ impl KeyProvider for RustCryptoKeyProvider {
+                     public_key: None,
+                 };
+ 
+-                let pkcs8_der = pkcs8
+-                    .to_der()
+-                    .map_err(|_| "Failed to encode PKCS#8".to_string())?;
++                let pkcs8_der = zeroize::Zeroizing::new(
++                    pkcs8
++                        .to_der()
++                        .map_err(|_| "Failed to encode PKCS#8".to_string())?,
++                );
+ 
+                 let p256_curve = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+                 if curve_oid == p256_curve {
+@@ -173,7 +175,7 @@ impl KeyProvider for RustCryptoKeyProvider {
+         // Check if it's a PEM encoded key
+         if let Ok(pem_str) = str::from_utf8(key_der) {
+             if pem_str.contains("-----BEGIN") {
+-                if let Ok((_label, doc)) = pkcs8::Document::from_pem(pem_str) {
++                if let Ok((_label, doc)) = pkcs8::SecretDocument::from_pem(pem_str) {
+                     return self.load_private_key(doc.as_bytes());
+                 }
+             }
+diff --git a/src/dtls12/client.rs b/src/dtls12/client.rs
+index 9357a7e..564bedd 100644
+--- a/src/dtls12/client.rs
++++ b/src/dtls12/client.rs
+@@ -29,7 +29,7 @@ use crate::dtls12::message::{CompressionMethod, ContentType, Cookie};
+ use crate::dtls12::message::{DigitallySigned, Dtls12CipherSuite};
+ use crate::dtls12::message::{ExtensionType, KeyExchangeAlgorithm, MessageType, ProtocolVersion};
+ use crate::dtls12::message::{Random, SessionId, SignatureAndHashAlgorithm, UseSrtpExtension};
+-use crate::{Config, DtlsCertificate, Error, KeyingMaterial, Output};
++use crate::{Config, DtlsCertificateChain, Error, KeyingMaterial, Output};
+ 
+ /// DTLS client
+ pub struct Client {
+@@ -85,6 +85,7 @@ pub struct Client {
+ #[derive(Debug, PartialEq, Eq)]
+ pub(crate) enum LocalEvent {
+     PeerCert,
++    PeerCertChain,
+     Connected,
+     KeyingMaterial(ArrayVec<u8, 88>, SrtpProfile),
+ }
+@@ -125,24 +126,25 @@ impl Client {
+         random: Random,
+         handshake_fragment: &[u8],
+         config: std::sync::Arc<Config>,
+-        certificate: DtlsCertificate,
++        certificate: DtlsCertificateChain,
+         now: Instant,
+     ) -> Result<Client, Error> {
+         assert!(
+-            !certificate.certificate.is_empty(),
++            certificate
++                .certificates()
++                .first()
++                .is_some_and(|certificate| !certificate.is_empty()),
+             "Client certificate cannot be empty"
+         );
+-        // unwrap: malformed private_key bytes are a programmer error from the
+-        // caller who constructed DtlsCertificate; panic matches the prior
+-        // CryptoContext::new behavior which also panicked on empty/invalid
+-        // key material.
+         let private_key = config
+             .crypto_provider()
+             .key_provider
+-            .load_private_key(&certificate.private_key)
++            .load_private_key(certificate.private_key())
+             .expect("Failed to parse client private key");
++        let (certificate_chain, private_key_bytes) = certificate.into_parts();
++        drop(private_key_bytes);
+         let auth = AuthMode::Certificate {
+-            certificate: certificate.certificate,
++            certificate_chain,
+             private_key,
+         };
+         let mut engine = Engine::new(config, auth);
+@@ -863,6 +865,7 @@ impl State {
+         // Send the server certificate as an event
+         if !client.server_certificates.is_empty() {
+             client.local_events.push_back(LocalEvent::PeerCert);
++            client.local_events.push_back(LocalEvent::PeerCertChain);
+         }
+ 
+         if client.certificate_verify {
+@@ -1252,8 +1255,9 @@ fn handshake_create_client_hello(
+ 
+ fn handshake_create_certificate(body: &mut Buf, engine: &mut Engine) -> Result<(), Error> {
+     let crypto = engine.crypto_context();
+-    crypto.serialize_client_certificate(body);
+-    Ok(())
++    crypto
++        .serialize_client_certificate(body)
++        .map_err(Error::CryptoError)
+ }
+ 
+ fn handshake_create_client_key_exchange(body: &mut Buf, engine: &mut Engine) -> Result<(), Error> {
+@@ -1369,17 +1373,16 @@ fn handshake_create_certificate_verify(body: &mut Buf, engine: &mut Engine) -> R
+ }
+ 
+ impl LocalEvent {
+-    pub fn into_output<'a>(self, buf: &'a mut [u8], peer_certs: &[Buf]) -> Output<'a> {
++    pub fn into_output<'a>(self, _buf: &'a mut [u8], peer_certs: &[Buf]) -> Output<'a> {
+         match self {
+-            LocalEvent::PeerCert => {
+-                let l = peer_certs[0].len();
+-                assert!(
+-                    l <= buf.len(),
+-                    "Output buffer too small for peer certificate"
+-                );
+-                buf[..l].copy_from_slice(&peer_certs[0]);
+-                Output::PeerCert(&buf[..l])
+-            }
++            LocalEvent::PeerCert => Output::PeerCert(peer_certs[0].as_ref().to_vec().into()),
++            LocalEvent::PeerCertChain => Output::PeerCertChain(
++                peer_certs
++                    .iter()
++                    .map(|certificate| certificate.as_ref().to_vec())
++                    .collect::<Vec<_>>()
++                    .into(),
++            ),
+             LocalEvent::Connected => Output::Connected,
+             LocalEvent::KeyingMaterial(m, profile) => {
+                 Output::KeyingMaterial(KeyingMaterial::new(&m), profile)
+diff --git a/src/dtls12/context.rs b/src/dtls12/context.rs
+index 9b42511..3e1dae7 100644
+--- a/src/dtls12/context.rs
++++ b/src/dtls12/context.rs
+@@ -74,8 +74,8 @@ pub struct CryptoContext {
+ pub enum AuthMode {
+     /// Certificate-based authentication (ECDHE_ECDSA suites).
+     Certificate {
+-        /// DER-encoded certificate.
+-        certificate: Vec<u8>,
++        /// DER-encoded certificates in leaf-first transmitted order.
++        certificate_chain: Vec<Vec<u8>>,
+         /// Parsed signing key for the certificate.
+         private_key: Box<dyn crypto::SigningKey>,
+     },
+@@ -396,25 +396,34 @@ impl CryptoContext {
+     /// state machine routes around this path via `cs.is_psk()` checks before
+     /// reaching Certificate serialization. Violating the invariant is a
+     /// programmer bug and panics.
+-    pub fn get_client_certificate(&self) -> Certificate {
+-        let AuthMode::Certificate { certificate, .. } = &self.auth else {
++    pub fn get_client_certificate(&self, source: &mut Buf) -> Result<Certificate, String> {
++        let AuthMode::Certificate {
++            certificate_chain,
++            ..
++        } = &self.auth
++        else {
+             panic!("get_client_certificate called in PSK mode");
+         };
+-        let cert = Asn1Cert(0..certificate.len());
+         let mut certs = ArrayVec::new();
+-        certs.push(cert);
+-        Certificate::new(certs)
++        for certificate in certificate_chain {
++            let start = source.len();
++            source.extend_from_slice(certificate);
++            let end = source.len();
++            certs
++                .try_push(Asn1Cert(start..end))
++                .map_err(|_| "DTLS certificate chain exceeds parser capacity".to_string())?;
++        }
++        Ok(Certificate::new(certs))
+     }
+ 
+     /// Serialize client certificate for authentication.
+     ///
+     /// Same invariant as [`Self::get_client_certificate`]: cert-mode only.
+-    pub fn serialize_client_certificate(&self, output: &mut Buf) {
+-        let cert = self.get_client_certificate();
+-        let AuthMode::Certificate { certificate, .. } = &self.auth else {
+-            panic!("serialize_client_certificate called in PSK mode");
+-        };
+-        cert.serialize(certificate, output);
++    pub fn serialize_client_certificate(&self, output: &mut Buf) -> Result<(), String> {
++        let mut source = Buf::new();
++        let cert = self.get_client_certificate(&mut source)?;
++        cert.serialize(&source, output);
++        Ok(())
+     }
+ 
+     /// Sign the provided data using the client's private key.
+@@ -616,14 +625,15 @@ mod tests {
+ 
+     #[cfg(feature = "rcgen")]
+     fn cert_auth_mode(config: &Config) -> AuthMode {
+-        let cert = crate::certificate::generate_self_signed_certificate().expect("generate cert");
++        let mut cert =
++            crate::certificate::generate_self_signed_certificate().expect("generate cert");
+         let private_key = config
+             .crypto_provider()
+             .key_provider
+             .load_private_key(&cert.private_key)
+             .expect("parse key");
+         AuthMode::Certificate {
+-            certificate: cert.certificate,
++            certificate_chain: vec![std::mem::take(&mut cert.certificate)],
+             private_key,
+         }
+     }
+diff --git a/src/dtls12/message/certificate.rs b/src/dtls12/message/certificate.rs
+index 4b00808..cc7a461 100644
+--- a/src/dtls12/message/certificate.rs
++++ b/src/dtls12/message/certificate.rs
+@@ -30,7 +30,12 @@ impl Certificate {
+             let offset =
+                 certs_base_offset + (rest.as_ptr() as usize - certs_data.as_ptr() as usize);
+             let (new_rest, cert) = Asn1Cert::parse(rest, offset)?;
+-            certificate_list.push(cert);
++            certificate_list.try_push(cert).map_err(|_| {
++                nom::Err::Failure(nom::error::Error::new(
++                    rest,
++                    nom::error::ErrorKind::TooLarge,
++                ))
++            })?;
+             rest = new_rest;
+         }
+ 
+diff --git a/src/dtls12/server.rs b/src/dtls12/server.rs
+index 8d3d335..3410450 100644
+--- a/src/dtls12/server.rs
++++ b/src/dtls12/server.rs
+@@ -125,22 +125,27 @@ enum State {
+ 
+ impl Server {
+     /// Create a new DTLS server
+-    pub fn new(config: Arc<Config>, certificate: crate::DtlsCertificate, now: Instant) -> Server {
++    pub fn new(
++        config: Arc<Config>,
++        certificate: crate::DtlsCertificateChain,
++        now: Instant,
++    ) -> Server {
+         assert!(
+-            !certificate.certificate.is_empty(),
++            certificate
++                .certificates()
++                .first()
++                .is_some_and(|certificate| !certificate.is_empty()),
+             "Server certificate cannot be empty"
+         );
+-        // unwrap: malformed private_key bytes are a programmer error from the
+-        // caller who constructed DtlsCertificate; panic matches the prior
+-        // CryptoContext::new behavior which also panicked on empty/invalid
+-        // key material.
+         let private_key = config
+             .crypto_provider()
+             .key_provider
+-            .load_private_key(&certificate.private_key)
++            .load_private_key(certificate.private_key())
+             .expect("Failed to parse server private key");
++        let (certificate_chain, private_key_bytes) = certificate.into_parts();
++        drop(private_key_bytes);
+         let auth = AuthMode::Certificate {
+-            certificate: certificate.certificate,
++            certificate_chain,
+             private_key,
+         };
+         let engine = Engine::new(config, auth);
+@@ -724,6 +729,7 @@ impl State {
+             }
+ 
+             server.local_events.push_back(LocalEvent::PeerCert);
++            server.local_events.push_back(LocalEvent::PeerCertChain);
+         }
+ 
+         Ok(Self::AwaitClientKeyExchange)
+@@ -1173,8 +1179,9 @@ fn verify_cookie(
+ 
+ fn handshake_create_certificate(body: &mut Buf, engine: &mut Engine) -> Result<(), Error> {
+     let crypto = engine.crypto_context();
+-    crypto.serialize_client_certificate(body);
+-    Ok(())
++    crypto
++        .serialize_client_certificate(body)
++        .map_err(Error::CryptoError)
+ }
+ 
+ fn handshake_create_server_hello(
+diff --git a/src/dtls13/client.rs b/src/dtls13/client.rs
+index b18408d..1a9489d 100644
+--- a/src/dtls13/client.rs
++++ b/src/dtls13/client.rs
+@@ -129,6 +129,7 @@ pub struct Client {
+ #[derive(Debug, PartialEq, Eq)]
+ pub(crate) enum LocalEvent {
+     PeerCert,
++    PeerCertChain,
+     Connected,
+     KeyingMaterial(ArrayVec<u8, 88>, SrtpProfile),
+ }
+@@ -172,7 +173,7 @@ impl Client {
+     pub(crate) fn new_from_hybrid(
+         hybrid: crate::auto::HybridClientHello,
+         config: std::sync::Arc<crate::Config>,
+-        certificate: crate::DtlsCertificate,
++        certificate: crate::DtlsCertificateChain,
+         now: Instant,
+     ) -> Result<Client, Error> {
+         let mut engine = Engine::new(config, certificate);
+@@ -786,6 +787,7 @@ impl State {
+         // Emit PeerCert event
+         if !client.server_certificates.is_empty() {
+             client.local_events.push_back(LocalEvent::PeerCert);
++            client.local_events.push_back(LocalEvent::PeerCertChain);
+         }
+ 
+         client.engine.advance_peer_handshake_seq();
+@@ -938,7 +940,7 @@ impl State {
+         // This clears the old ClientHello flight from flight_saved_records.
+         client.engine.flight_begin(5);
+ 
+-        let has_cert = !client.engine.certificate_der().is_empty();
++        let has_cert = !client.engine.certificate_chain().is_empty();
+ 
+         if has_cert {
+             let context = client.cert_request_context.as_deref().unwrap_or(&[]);
+@@ -1298,15 +1300,20 @@ pub(crate) fn handshake_create_certificate(
+     src.extend_from_slice(context);
+     let context_end = src.len();
+ 
+-    let cert_start = src.len();
+-    src.extend_from_slice(engine.certificate_der());
+-    let cert_end = src.len();
+-
+     let mut certificate_list = ArrayVec::new();
+-    certificate_list.push(CertificateEntry {
+-        cert: Asn1Cert(cert_start..cert_end),
+-        extensions_range: 0..0,
+-    });
++    for certificate in engine.certificate_chain() {
++        let cert_start = src.len();
++        src.extend_from_slice(certificate);
++        let cert_end = src.len();
++        certificate_list
++            .try_push(CertificateEntry {
++                cert: Asn1Cert(cert_start..cert_end),
++                extensions_range: 0..0,
++            })
++            .map_err(|_| {
++                Error::CryptoError("DTLS certificate chain exceeds parser capacity".to_string())
++            })?;
++    }
+ 
+     let certificate = Certificate {
+         context_range: context_start..context_end,
+@@ -1514,17 +1521,16 @@ fn parse_certificate_request(cr_data: &[u8], base_offset: usize) -> Result<Optio
+ // =========================================================================
+ 
+ impl LocalEvent {
+-    pub fn into_output<'a>(self, buf: &'a mut [u8], peer_certs: &[Buf]) -> Output<'a> {
++    pub fn into_output<'a>(self, _buf: &'a mut [u8], peer_certs: &[Buf]) -> Output<'a> {
+         match self {
+-            LocalEvent::PeerCert => {
+-                let l = peer_certs[0].len();
+-                assert!(
+-                    l <= buf.len(),
+-                    "Output buffer too small for peer certificate"
+-                );
+-                buf[..l].copy_from_slice(&peer_certs[0]);
+-                Output::PeerCert(&buf[..l])
+-            }
++            LocalEvent::PeerCert => Output::PeerCert(peer_certs[0].as_ref().to_vec().into()),
++            LocalEvent::PeerCertChain => Output::PeerCertChain(
++                peer_certs
++                    .iter()
++                    .map(|certificate| certificate.as_ref().to_vec())
++                    .collect::<Vec<_>>()
++                    .into(),
++            ),
+             LocalEvent::Connected => Output::Connected,
+             LocalEvent::KeyingMaterial(m, profile) => {
+                 Output::KeyingMaterial(KeyingMaterial::new(&m), profile)
+diff --git a/src/dtls13/engine.rs b/src/dtls13/engine.rs
+index 71e3f97..1900e63 100644
+--- a/src/dtls13/engine.rs
++++ b/src/dtls13/engine.rs
+@@ -28,7 +28,7 @@ use crate::dtls13::message::Sequence;
+ use crate::timer::ExponentialBackoff;
+ use crate::types::{HashAlgorithm, Random};
+ use crate::window::ReplayWindow;
+-use crate::{Config, DtlsCertificate, Error, Output, SeededRng};
++use crate::{Config, DtlsCertificateChain, Error, Output, SeededRng};
+ 
+ const MAX_DEFRAGMENT_PACKETS: usize = 50;
+ 
+@@ -41,7 +41,7 @@ pub struct Engine {
+     config: Arc<Config>,
+ 
+     /// Saved certificate
+-    certificate: DtlsCertificate,
++    certificate: DtlsCertificateChain,
+ 
+     /// Seedable random number generator for deterministic testing
+     rng: SeededRng,
+@@ -198,7 +198,7 @@ struct Entry {
+ }
+ 
+ impl Engine {
+-    pub fn new(config: Arc<Config>, certificate: DtlsCertificate) -> Self {
++    pub fn new(config: Arc<Config>, certificate: DtlsCertificateChain) -> Self {
+         let mut rng = SeededRng::new(config.rng_seed());
+ 
+         let flight_backoff =
+@@ -207,7 +207,7 @@ impl Engine {
+         let signing_key = config
+             .crypto_provider()
+             .key_provider
+-            .load_private_key(&certificate.private_key)
++            .load_private_key(certificate.private_key())
+             .expect("Failed to load private key");
+ 
+         let aead_encryption_threshold =
+@@ -257,7 +257,7 @@ impl Engine {
+         }
+     }
+ 
+-    pub fn into_fallback(self) -> (Arc<Config>, DtlsCertificate) {
++    pub fn into_fallback(self) -> (Arc<Config>, DtlsCertificateChain) {
+         (self.config, self.certificate)
+     }
+ 
+@@ -321,8 +321,8 @@ impl Engine {
+             .any(|cs| cs.suite() == suite)
+     }
+ 
+-    pub fn certificate_der(&self) -> &[u8] {
+-        &self.certificate.certificate
++    pub fn certificate_chain(&self) -> &[Vec<u8>] {
++        self.certificate.certificates()
+     }
+ 
+     pub fn signing_key(&mut self) -> &mut dyn SigningKey {
+diff --git a/src/dtls13/message/certificate.rs b/src/dtls13/message/certificate.rs
+index 605592a..4d214cc 100644
+--- a/src/dtls13/message/certificate.rs
++++ b/src/dtls13/message/certificate.rs
+@@ -54,10 +54,17 @@ impl Certificate {
+             let extensions_range = (certs_base_offset + ext_relative)
+                 ..(certs_base_offset + ext_relative + ext_slice.len());
+ 
+-            certificate_list.push(CertificateEntry {
+-                cert,
+-                extensions_range,
+-            });
++            certificate_list
++                .try_push(CertificateEntry {
++                    cert,
++                    extensions_range,
++                })
++                .map_err(|_| {
++                    nom::Err::Failure(nom::error::Error::new(
++                        rest,
++                        nom::error::ErrorKind::TooLarge,
++                    ))
++                })?;
+             rest = r;
+         }
+ 
+diff --git a/src/dtls13/server.rs b/src/dtls13/server.rs
+index 71f3dfd..9f98b57 100644
+--- a/src/dtls13/server.rs
++++ b/src/dtls13/server.rs
+@@ -66,7 +66,7 @@ use crate::dtls13::message::SupportedGroupsExtension;
+ use crate::dtls13::message::SupportedVersionsClientHello;
+ use crate::dtls13::message::SupportedVersionsServerHello;
+ use crate::dtls13::message::UseSrtpExtension;
+-use crate::{Config, DtlsCertificate, Error, Output};
++use crate::{Config, DtlsCertificateChain, Error, Output};
+ 
+ /// Magic random value indicating HelloRetryRequest (RFC 8446 Section 4.1.3).
+ const HRR_RANDOM: [u8; 32] = [
+@@ -167,7 +167,7 @@ enum State {
+ 
+ impl Server {
+     /// Create a new DTLS 1.3 server.
+-    pub fn new(config: Arc<Config>, certificate: DtlsCertificate, now: Instant) -> Server {
++    pub fn new(config: Arc<Config>, certificate: DtlsCertificateChain, now: Instant) -> Server {
+         let engine = Engine::new(config, certificate);
+         Self::new_with_engine(engine, now, false)
+     }
+@@ -178,7 +178,11 @@ impl Server {
+     /// in `supported_versions`, the server returns [`Error::Dtls12Fallback`]
+     /// instead of a fatal security error, allowing the caller to switch
+     /// to a DTLS 1.2 server.
+-    pub fn new_auto(config: Arc<Config>, certificate: DtlsCertificate, now: Instant) -> Server {
++    pub fn new_auto(
++        config: Arc<Config>,
++        certificate: DtlsCertificateChain,
++        now: Instant,
++    ) -> Server {
+         let engine = Engine::new(config, certificate);
+         Self::new_with_engine(engine, now, true)
+     }
+@@ -227,7 +231,14 @@ impl Server {
+     ///
+     /// 1. Switching a server pending (auto-mode) to dtls12 server
+     /// 2. set_active(true), turning a server pending (auto-mode) to a ClientPending
+-    pub fn into_parts(self) -> (Arc<Config>, DtlsCertificate, Instant, VecDeque<Buf>) {
++    pub fn into_parts(
++        self,
++    ) -> (
++        Arc<Config>,
++        DtlsCertificateChain,
++        Instant,
++        VecDeque<Buf>,
++    ) {
+         let (config, cert) = self.engine.into_fallback();
+         (config, cert, self.last_now, self.retained_hello)
+     }
+@@ -962,6 +973,7 @@ impl State {
+         // Emit PeerCert event
+         if !server.client_certificates.is_empty() {
+             server.local_events.push_back(LocalEvent::PeerCert);
++            server.local_events.push_back(LocalEvent::PeerCertChain);
+         }
+ 
+         // Client's Certificate means our flight was received; stop retransmitting
+diff --git a/src/lib.rs b/src/lib.rs
+index 1777e2f..5024618 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -48,8 +48,9 @@
+ //!
+ //! ## Certificate model
+ //! During the handshake the engine emits
+-//! [`Output::PeerCert`][peer_cert] with the peer's leaf
+-//! certificate (DER). The crate uses that certificate to verify DTLS
++//! [`Output::PeerCert`][peer_cert] with the peer's leaf certificate and
++//! [`Output::PeerCertChain`] with the complete leaf-first chain (DER).
++//! The crate uses the leaf certificate to verify DTLS
+ //! handshake messages, but it does not perform any PKI validation. Your
+ //! application is responsible for validating the peer certificate according to
+ //! your policy (fingerprint, chain building, name/EKU checks, pinning, etc.).
+@@ -69,6 +70,7 @@
+ //! - `Timeout(Instant)`: schedule a timer and call `handle_timeout` at/after it
+ //! - `Connected`: handshake complete
+-//! - `PeerCert(&[u8])`: peer leaf certificate (DER) — validate in your app
++//! - `PeerCert(Arc<[u8]>)`: peer leaf certificate (DER) — validate in your app
++//! - `PeerCertChain(Arc<[Vec<u8>]>)`: complete peer chain, leaf first
+ //! - `KeyingMaterial(KeyingMaterial, SrtpProfile)`: DTLS‑SRTP export
+ //! - `ApplicationData(&[u8])`: plaintext received from peer
+ //! - `CloseNotify`: peer sent a graceful shutdown alert
+@@ -199,8 +201,10 @@
+ extern crate log;
+ 
+ use std::fmt;
++use std::ops::Deref;
+ use std::sync::Arc;
+ use std::time::Instant;
++use zeroize::Zeroize;
+ 
+ // Shared types used by both DTLS versions
+ mod types;
+@@ -244,7 +248,99 @@ mod timer;
+ mod rng;
+ pub(crate) use rng::SeededRng;
+ 
+-/// Certificate and private key pair.
++/// DER-encoded private key bytes that are cleared before their allocation is
++/// released.
++pub struct DtlsPrivateKey {
++    bytes: Vec<u8>,
++    #[cfg(feature = "test-hooks")]
++    drop_hook: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
++}
++
++impl DtlsPrivateKey {
++    /// Wrap DER-encoded private key bytes in a zeroizing owner.
++    pub fn new(bytes: Vec<u8>) -> Self {
++        Self {
++            bytes,
++            #[cfg(feature = "test-hooks")]
++            drop_hook: None,
++        }
++    }
++
++    /// Construct a key with a deterministic post-zeroization observer.
++    ///
++    /// This exists only for downstream security regression tests. The hook
++    /// receives the still-live allocation after every byte has been cleared,
++    /// avoiding reads from freed memory.
++    #[cfg(feature = "test-hooks")]
++    pub fn new_with_drop_hook(
++        bytes: Vec<u8>,
++        drop_hook: impl Fn(&[u8]) + Send + Sync + 'static,
++    ) -> Self {
++        Self {
++            bytes,
++            drop_hook: Some(Arc::new(drop_hook)),
++        }
++    }
++}
++
++impl Clone for DtlsPrivateKey {
++    fn clone(&self) -> Self {
++        Self {
++            bytes: self.bytes.clone(),
++            #[cfg(feature = "test-hooks")]
++            drop_hook: self.drop_hook.clone(),
++        }
++    }
++}
++
++impl Drop for DtlsPrivateKey {
++    fn drop(&mut self) {
++        // Keep the initialized length intact until the test hook runs so it
++        // can deterministically observe every live key byte as zero. The Vec
++        // allocation is released immediately after this Drop implementation.
++        self.bytes.as_mut_slice().zeroize();
++        #[cfg(feature = "test-hooks")]
++        if let Some(hook) = self.drop_hook.as_ref() {
++            hook(&self.bytes);
++        }
++    }
++}
++
++impl zeroize::ZeroizeOnDrop for DtlsPrivateKey {}
++
++impl Deref for DtlsPrivateKey {
++    type Target = [u8];
++
++    fn deref(&self) -> &Self::Target {
++        &self.bytes
++    }
++}
++
++impl AsRef<[u8]> for DtlsPrivateKey {
++    fn as_ref(&self) -> &[u8] {
++        &self.bytes
++    }
++}
++
++impl From<Vec<u8>> for DtlsPrivateKey {
++    fn from(bytes: Vec<u8>) -> Self {
++        Self::new(bytes)
++    }
++}
++
++impl fmt::Debug for DtlsPrivateKey {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_tuple("DtlsPrivateKey")
++            .field(&self.bytes.len())
++            .finish()
++    }
++}
++
++/// Leaf certificate and private key pair.
++///
++/// Existing single-certificate callers can keep using this type. The private
++/// key bytes and every clone are explicitly cleared on drop. Endpoint state
++/// immediately converts this compatibility type into [`DtlsPrivateKey`].
+ #[derive(Clone)]
+ pub struct DtlsCertificate {
+     /// Certificate in DER format.
+@@ -253,6 +349,14 @@ pub struct DtlsCertificate {
+     pub private_key: Vec<u8>,
+ }
+ 
++impl Drop for DtlsCertificate {
++    fn drop(&mut self) {
++        self.private_key.as_mut_slice().zeroize();
++    }
++}
++
++impl zeroize::ZeroizeOnDrop for DtlsCertificate {}
++
+ impl fmt::Debug for DtlsCertificate {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         f.debug_struct("DtlsCertificate")
+@@ -262,6 +366,119 @@ impl fmt::Debug for DtlsCertificate {
+     }
+ }
+ 
++/// Leaf-first certificate chain and its matching leaf private key.
++///
++/// The chain is kept in configured order and transmitted in full by both DTLS
++/// 1.2 and DTLS 1.3 certificate-authenticated handshakes.
++#[derive(Clone)]
++pub struct DtlsCertificateChain {
++    certificates: Vec<Vec<u8>>,
++    private_key: DtlsPrivateKey,
++}
++
++impl DtlsCertificateChain {
++    /// Maximum certificate count supported by the DTLS message parsers.
++    pub const MAX_CERTIFICATES: usize = 32;
++
++    /// Build a validated leaf-first certificate chain.
++    pub fn new(
++        certificates: Vec<Vec<u8>>,
++        private_key: impl Into<DtlsPrivateKey>,
++    ) -> Result<Self, String> {
++        // Convert before any fallible chain validation so failed construction
++        // still drops a zeroizing key owner.
++        let private_key = private_key.into();
++        if certificates.is_empty() {
++            return Err("DTLS certificate chain cannot be empty".to_string());
++        }
++        if certificates.len() > Self::MAX_CERTIFICATES {
++            return Err(format!(
++                "DTLS certificate chain contains {} certificates; maximum is {}",
++                certificates.len(),
++                Self::MAX_CERTIFICATES
++            ));
++        }
++        if let Some((index, _)) = certificates
++            .iter()
++            .enumerate()
++            .find(|(_, certificate)| certificate.is_empty())
++        {
++            return Err(format!(
++                "DTLS certificate chain entry {} cannot be empty",
++                index + 1
++            ));
++        }
++
++        const U24_MAX: usize = 0x00ff_ffff;
++        let mut encoded_len = 0usize;
++        for (index, certificate) in certificates.iter().enumerate() {
++            if certificate.len() > U24_MAX {
++                return Err(format!(
++                    "DTLS certificate chain entry {} exceeds the 24-bit wire length",
++                    index + 1
++                ));
++            }
++            // DTLS 1.3 adds a two-byte per-entry extensions length. Enforce
++            // the larger representation so the same credential is safe for
++            // explicit 1.2, explicit 1.3, and auto/fallback paths.
++            encoded_len = encoded_len
++                .checked_add(5 + certificate.len())
++                .ok_or_else(|| "DTLS certificate chain length overflow".to_string())?;
++        }
++        if encoded_len > U24_MAX {
++            return Err("DTLS certificate chain exceeds the 24-bit wire length".to_string());
++        }
++
++        if private_key.is_empty() {
++            return Err("DTLS private key cannot be empty".to_string());
++        }
++
++        Ok(Self {
++            certificates,
++            private_key,
++        })
++    }
++
++    /// Certificates in transmitted leaf-first order.
++    pub fn certificates(&self) -> &[Vec<u8>] {
++        &self.certificates
++    }
++
++    /// Leaf certificate used for signatures and fingerprints.
++    pub fn leaf_certificate(&self) -> &[u8] {
++        self.certificates
++            .first()
++            .map(Vec::as_slice)
++            .unwrap_or_default()
++    }
++
++    pub(crate) fn private_key(&self) -> &[u8] {
++        &self.private_key
++    }
++
++    pub(crate) fn into_parts(self) -> (Vec<Vec<u8>>, DtlsPrivateKey) {
++        (self.certificates, self.private_key)
++    }
++}
++
++impl From<DtlsCertificate> for DtlsCertificateChain {
++    fn from(mut certificate: DtlsCertificate) -> Self {
++        Self {
++            certificates: vec![std::mem::take(&mut certificate.certificate)],
++            private_key: DtlsPrivateKey::new(std::mem::take(&mut certificate.private_key)),
++        }
++    }
++}
++
++impl fmt::Debug for DtlsCertificateChain {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("DtlsCertificateChain")
++            .field("certificates", &self.certificates.len())
++            .field("private_key", &self.private_key.len())
++            .finish()
++    }
++}
++
+ /// Sans-IO DTLS endpoint (client or server).
+ ///
+ /// New instances start in the **server role**. Call
+@@ -452,10 +669,15 @@ impl Dtls {
+     /// time tracking for timeouts and retransmissions.
+     ///
+     /// During the handshake, the peer's leaf certificate is surfaced via
+-    /// [`Output::PeerCert`]. It is up to the application to validate that
+-    /// certificate according to its security policy.
+-    pub fn new_12(config: Arc<Config>, certificate: DtlsCertificate, now: Instant) -> Self {
+-        let inner = Inner::Server12(Server12::new(config, certificate, now));
++    /// [`Output::PeerCert`] and its complete leaf-first chain via
++    /// [`Output::PeerCertChain`]. It is up to the application to validate the
++    /// chain according to its security policy.
++    pub fn new_12(
++        config: Arc<Config>,
++        certificate: impl Into<DtlsCertificateChain>,
++        now: Instant,
++    ) -> Self {
++        let inner = Inner::Server12(Server12::new(config, certificate.into(), now));
+         Dtls { inner: Some(inner) }
+     }
+ 
+@@ -485,10 +707,15 @@ impl Dtls {
+     /// before the handshake begins.
+     ///
+     /// During the handshake, the peer's leaf certificate is surfaced via
+-    /// [`Output::PeerCert`]. It is up to the application to validate that
+-    /// certificate according to its security policy.
+-    pub fn new_13(config: Arc<Config>, certificate: DtlsCertificate, now: Instant) -> Self {
+-        let inner = Inner::Server13(Server13::new(config, certificate, now));
++    /// [`Output::PeerCert`] and its complete leaf-first chain via
++    /// [`Output::PeerCertChain`]. It is up to the application to validate the
++    /// chain according to its security policy.
++    pub fn new_13(
++        config: Arc<Config>,
++        certificate: impl Into<DtlsCertificateChain>,
++        now: Instant,
++    ) -> Self {
++        let inner = Inner::Server13(Server13::new(config, certificate.into(), now));
+         Dtls { inner: Some(inner) }
+     }
+ 
+@@ -506,7 +733,12 @@ impl Dtls {
+     /// and 1.3 servers and forks into the correct handshake once the
+     /// server responds. If the configuration only enables PSK DTLS 1.2
+     /// suites, `new_auto` delegates to the DTLS 1.2 PSK state machine.
+-    pub fn new_auto(config: Arc<Config>, certificate: DtlsCertificate, now: Instant) -> Self {
++    pub fn new_auto(
++        config: Arc<Config>,
++        certificate: impl Into<DtlsCertificateChain>,
++        now: Instant,
++    ) -> Self {
++        let certificate = certificate.into();
+         let inner = if is_dtls12_psk_only(config.as_ref()) {
+             Inner::Server12(Server12::new_psk(config, now))
+         } else {
+@@ -851,6 +1083,11 @@ pub enum Output<'a> {
+     /// Applications must validate this certificate independently (chain,
+     /// name/EKU checks, pinning, etc.).
+-    PeerCert(&'a [u8]),
++    PeerCert(Arc<[u8]>),
++    /// The complete peer certificate chain in leaf-first DER order.
++    ///
++    /// This event follows [`Self::PeerCert`] so existing leaf fingerprint
++    /// consumers keep their established semantics.
++    PeerCertChain(Arc<[Vec<u8>]>),
+     /// Extracted DTLS-SRTP keying material and selected SRTP profile.
+     KeyingMaterial(KeyingMaterial, SrtpProfile),
+     /// Received application data plaintext.
+@@ -866,6 +1103,7 @@ impl fmt::Debug for Output<'_> {
+             Self::Timeout(v) => write!(f, "Timeout({:?})", v),
+             Self::Connected => write!(f, "Connected"),
+             Self::PeerCert(v) => write!(f, "PeerCert({})", v.len()),
++            Self::PeerCertChain(v) => write!(f, "PeerCertChain({})", v.len()),
+             Self::KeyingMaterial(v, p) => write!(f, "KeyingMaterial({}, {:?})", v.len(), p),
+             Self::ApplicationData(v) => write!(f, "ApplicationData({})", v.len()),
+             Self::CloseNotify => write!(f, "CloseNotify"),
+@@ -1050,11 +1288,11 @@ mod test {
+     #[test]
+     #[should_panic(expected = "Server certificate cannot be empty")]
+     fn new_12_panics_on_empty_certificate() {
+-        let cert = generate_self_signed_certificate().expect("Failed to generate cert");
++        let mut cert = generate_self_signed_certificate().expect("Failed to generate cert");
+         let config = Arc::new(Config::default());
+         let empty = DtlsCertificate {
+             certificate: vec![],
+-            private_key: cert.private_key,
++            private_key: std::mem::take(&mut cert.private_key),
+         };
+         let _ = Dtls::new_12(config, empty, Instant::now());
+     }
+diff --git a/tests/auto/common.rs b/tests/auto/common.rs
+index ef9babe..919a551 100644
+--- a/tests/auto/common.rs
++++ b/tests/auto/common.rs
+@@ -13,6 +13,7 @@ pub struct DrainedOutputs {
+     pub packets: Vec<Vec<u8>>,
+     pub connected: bool,
+     pub peer_cert: Option<Vec<u8>>,
++    pub peer_cert_chain: Option<Vec<Vec<u8>>>,
+     pub keying_material: Option<(Vec<u8>, SrtpProfile)>,
+     pub app_data: Vec<Vec<u8>>,
+     pub timeout: Option<Instant>,
+@@ -42,6 +43,9 @@ pub fn drain_outputs(endpoint: &mut Dtls) -> DrainedOutputs {
+             Output::Packet(p) => result.packets.push(p.to_vec()),
+             Output::Connected => result.connected = true,
+             Output::PeerCert(cert) => result.peer_cert = Some(cert.to_vec()),
++            Output::PeerCertChain(chain) => {
++                result.peer_cert_chain = Some(chain.iter().cloned().collect());
++            }
+             Output::KeyingMaterial(km, profile) => {
+                 result.keying_material = Some((km.to_vec(), profile));
+             }
+diff --git a/tests/auto/credential_security.rs b/tests/auto/credential_security.rs
+new file mode 100644
+index 0000000..5955e70
+--- /dev/null
++++ b/tests/auto/credential_security.rs
+@@ -0,0 +1,222 @@
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use dimpl::certificate::generate_self_signed_certificate;
++use dimpl::{Config, Dtls, DtlsCertificate, DtlsCertificateChain, DtlsPrivateKey, ProtocolVersion};
++use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
++
++use crate::common::{default_config, deliver_packets, drain_outputs};
++
++fn hooked_key(bytes: Vec<u8>, observations: Arc<Mutex<Vec<Vec<u8>>>>) -> DtlsPrivateKey {
++    DtlsPrivateKey::new_with_drop_hook(bytes, move |zeroized| {
++        observations
++            .lock()
++            .expect("lock zeroization observations")
++            .push(zeroized.to_vec());
++    })
++}
++
++#[test]
++fn private_key_clones_and_failed_construction_zeroize_before_drop() {
++    let observations = Arc::new(Mutex::new(Vec::new()));
++    let key = hooked_key(vec![0xa5; 48], observations.clone());
++    let clone_one = key.clone();
++    let clone_two = clone_one.clone();
++
++    drop(key);
++    drop(clone_one);
++    drop(clone_two);
++
++    let failed_key = hooked_key(vec![0x5a; 48], observations.clone());
++    assert!(DtlsCertificateChain::new(Vec::new(), failed_key).is_err());
++
++    let observations = observations.lock().expect("lock zeroization observations");
++    assert_eq!(observations.len(), 4);
++    assert!(
++        observations
++            .iter()
++            .all(|bytes| bytes.iter().all(|byte| *byte == 0)),
++        "drop hook must observe only zeroized private-key storage"
++    );
++}
++
++#[test]
++fn dtls13_shutdown_zeroizes_retained_private_key_owner() {
++    let observations = Arc::new(Mutex::new(Vec::new()));
++    let mut identity = generate_self_signed_certificate().expect("identity");
++    let chain = DtlsCertificateChain::new(
++        vec![std::mem::take(&mut identity.certificate)],
++        hooked_key(identity.private_key.as_slice().to_vec(), observations.clone()),
++    )
++    .expect("identity chain");
++    let endpoint = Dtls::new_13(default_config(), chain, Instant::now());
++
++    drop(endpoint);
++
++    let observations = observations.lock().expect("lock zeroization observations");
++    assert_eq!(observations.len(), 1);
++    assert!(
++        observations[0].iter().all(|byte| *byte == 0),
++        "shutdown must clear the retained DTLS 1.3 fallback credential"
++    );
++}
++
++#[test]
++fn auto_server_fallback_zeroizes_transferred_private_key_owner() {
++    let observations = Arc::new(Mutex::new(Vec::new()));
++    let mut server_identity = generate_self_signed_certificate().expect("server identity");
++    let server_chain = DtlsCertificateChain::new(
++        vec![std::mem::take(&mut server_identity.certificate)],
++        hooked_key(
++            server_identity.private_key.as_slice().to_vec(),
++            observations.clone(),
++        ),
++    )
++    .expect("server chain");
++    let client_identity = generate_self_signed_certificate().expect("client identity");
++    let config = default_config();
++    let now = Instant::now();
++    let mut client = Dtls::new_12(config.clone(), client_identity, now);
++    client.set_active(true);
++    let mut server = Dtls::new_auto(config, server_chain, now);
++
++    let mut tick = now;
++    let mut client_connected = false;
++    let mut server_connected = false;
++    for _ in 0..80 {
++        client.handle_timeout(tick).expect("client timeout");
++        server.handle_timeout(tick).expect("server timeout");
++        let client_output = drain_outputs(&mut client);
++        let server_output = drain_outputs(&mut server);
++        client_connected |= client_output.connected;
++        server_connected |= server_output.connected;
++        deliver_packets(&client_output.packets, &mut server);
++        deliver_packets(&server_output.packets, &mut client);
++        if client_connected && server_connected {
++            break;
++        }
++        tick += Duration::from_millis(10);
++    }
++
++    assert!(client_connected && server_connected);
++    assert_eq!(server.protocol_version(), Some(ProtocolVersion::DTLS1_2));
++    drop(server);
++
++    let observations = observations.lock().expect("lock zeroization observations");
++    assert!(!observations.is_empty());
++    assert!(
++        observations
++            .iter()
++            .all(|bytes| bytes.iter().all(|byte| *byte == 0)),
++        "fallback and shutdown must zeroize every retained owner"
++    );
++}
++
++fn assert_server_chain_transmitted_with_identity(
++    version: ProtocolVersion,
++    mut server_identity: DtlsCertificate,
++    intermediates: Vec<Vec<u8>>,
++) {
++    let client_identity = generate_self_signed_certificate().expect("client identity");
++    let mut expected_chain = vec![server_identity.certificate.clone()];
++    expected_chain.extend(intermediates);
++    let server_chain = DtlsCertificateChain::new(
++        expected_chain.clone(),
++        std::mem::take(&mut server_identity.private_key),
++    )
++    .expect("server chain");
++    let config = Arc::new(Config::default());
++    let now = Instant::now();
++    let mut client = match version {
++        ProtocolVersion::DTLS1_2 => Dtls::new_12(config.clone(), client_identity, now),
++        ProtocolVersion::DTLS1_3 => Dtls::new_13(config.clone(), client_identity, now),
++        other => panic!("unsupported test version: {other:?}"),
++    };
++    client.set_active(true);
++    let mut server = match version {
++        ProtocolVersion::DTLS1_2 => Dtls::new_12(config, server_chain, now),
++        ProtocolVersion::DTLS1_3 => Dtls::new_13(config, server_chain, now),
++        other => panic!("unsupported test version: {other:?}"),
++    };
++
++    let mut tick = now;
++    let mut received_leaf = None;
++    let mut received_chain = None;
++    for _ in 0..80 {
++        client.handle_timeout(tick).expect("client timeout");
++        server.handle_timeout(tick).expect("server timeout");
++        let client_output = drain_outputs(&mut client);
++        let server_output = drain_outputs(&mut server);
++        if client_output.peer_cert.is_some() {
++            received_leaf = client_output.peer_cert;
++        }
++        if client_output.peer_cert_chain.is_some() {
++            received_chain = client_output.peer_cert_chain;
++        }
++        deliver_packets(&client_output.packets, &mut server);
++        deliver_packets(&server_output.packets, &mut client);
++        if received_chain.is_some() {
++            break;
++        }
++        tick += Duration::from_millis(10);
++    }
++
++    assert_eq!(received_leaf, Some(expected_chain[0].clone()));
++    assert_eq!(received_chain, Some(expected_chain));
++}
++
++fn assert_server_chain_transmitted(version: ProtocolVersion) {
++    assert_server_chain_transmitted_with_identity(
++        version,
++        generate_self_signed_certificate().expect("server identity"),
++        vec![vec![0x30, 0x03, 0x02, 0x01, 0x01]],
++    );
++}
++
++fn large_server_identity() -> DtlsCertificate {
++    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("large identity key");
++    let names: Vec<String> = (0..128)
++        .map(|index| format!("dtls-{index:03}.certificate-buffer-regression.example.test"))
++        .collect();
++    let params = CertificateParams::new(names).expect("large identity params");
++    let certificate = params
++        .self_signed(&key_pair)
++        .expect("large self-signed identity");
++    let identity = DtlsCertificate {
++        certificate: certificate.der().to_vec(),
++        private_key: key_pair.serialize_der(),
++    };
++    assert!(
++        identity.certificate.len() > 2048,
++        "fixture must exceed drain_outputs' poll buffer"
++    );
++    identity
++}
++
++#[test]
++fn dtls12_transmits_full_certificate_chain_in_configured_order() {
++    assert_server_chain_transmitted(ProtocolVersion::DTLS1_2);
++}
++
++#[test]
++fn dtls13_transmits_full_certificate_chain_in_configured_order() {
++    assert_server_chain_transmitted(ProtocolVersion::DTLS1_3);
++}
++
++#[test]
++fn dtls12_peer_leaf_output_is_not_limited_by_poll_buffer() {
++    assert_server_chain_transmitted_with_identity(
++        ProtocolVersion::DTLS1_2,
++        large_server_identity(),
++        Vec::new(),
++    );
++}
++
++#[test]
++fn dtls13_peer_leaf_output_is_not_limited_by_poll_buffer() {
++    assert_server_chain_transmitted_with_identity(
++        ProtocolVersion::DTLS1_3,
++        large_server_identity(),
++        Vec::new(),
++    );
++}
+diff --git a/tests/auto/main.rs b/tests/auto/main.rs
+index 195d12b..f6e1b3c 100644
+--- a/tests/auto/main.rs
++++ b/tests/auto/main.rs
+@@ -1,4 +1,6 @@
+ mod common;
++#[cfg(feature = "test-hooks")]
++mod credential_security;
+ mod cross_matrix;
+ mod handshake;
+ mod server_fallback;

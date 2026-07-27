@@ -327,6 +327,41 @@ async fn non_consumer_delete_records_drive_removals_without_resource_row_scans()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn global_change_sequence_survives_namespace_scope_shrink() {
+    let (store, _temp_dir) = sqlite_store().await;
+    let mut surviving = test_upstream("surviving", "127.0.0.1", 8080);
+    surviving.namespace = "tenant-a".to_string();
+    store
+        .create_upstream(&surviving)
+        .await
+        .expect("surviving namespace write must succeed");
+    let surviving_sequence = store
+        .latest_change_sequence("tenant-a")
+        .await
+        .expect("surviving namespace sequence must load");
+
+    let mut removed = test_upstream("removed", "127.0.0.1", 8081);
+    removed.namespace = "tenant-b".to_string();
+    store
+        .create_upstream(&removed)
+        .await
+        .expect("removed namespace write must succeed");
+    store
+        .delete_upstream("tenant-b", "removed")
+        .await
+        .expect("removed namespace delete must succeed");
+
+    let global_sequence = store
+        .latest_global_change_sequence()
+        .await
+        .expect("store-wide sequence must load");
+    assert!(
+        global_sequence > surviving_sequence,
+        "a restarted CP must retain the deleted namespace's newer generation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn consumer_delete_requires_authoritative_reload_for_quarantine_rehydration() {
     let (store, _temp_dir) = sqlite_store().await;
     let ts = Utc::now().to_rfc3339();

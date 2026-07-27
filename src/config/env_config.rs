@@ -1137,6 +1137,13 @@ pub struct EnvConfig {
     /// order. All URLs must use the same `FERRUM_DB_TYPE` and share TLS settings.
     pub db_failover_urls: Vec<String>,
 
+    /// When `false` (default), admin writes are rejected with 503 while the
+    /// active pool points at a `FERRUM_DB_FAILOVER_URLS` entry. Set `true` only
+    /// for synchronously replicated multi-primary topologies where failover
+    /// writes are durable on the configured primary; otherwise failback can
+    /// republish a stale primary snapshot. See issue #3001.
+    pub db_failover_allow_writes: bool,
+
     /// Connection URL for a SQL read replica database. When set, eligible
     /// admin-only reads can use this replica and fall back to primary if the
     /// replica is unreachable. Runtime config polling and Admin API writes
@@ -1360,6 +1367,26 @@ pub struct EnvConfig {
     /// slice builder also narrows `workloads` to SPIFFE identities referenced
     /// by admitted services. Default `false` for a one-release rollout window.
     pub mesh_sidecar_identity_narrowing: bool,
+    /// CP-side: ordering domain this control plane advertises for authoritative
+    /// mesh config revisions (`FERRUM_MESH_CONFIG_AUTHORITY_ID`, issue #2473).
+    ///
+    /// Every CP replica reading the SAME config store must advertise the SAME
+    /// value, because the sequence numbers they publish come from that store's
+    /// shared `config_changes` change log. Bump it after a deliberate source
+    /// reset (restore from backup, migration to a new store) so data planes see
+    /// a new ordering domain rather than a silent sequence rewind. Empty
+    /// disables revision publication entirely. Ignored when the K8s CRD
+    /// controller is enabled (that authority has no shared monotonic sequence).
+    pub mesh_config_authority_id: String,
+    /// DP-side: seconds a foreign config authority must be observed
+    /// continuously before the mesh data plane adopts it
+    /// (`FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`, issue #2473).
+    ///
+    /// The no-permanent-lockout bound for control-plane state loss and
+    /// deliberate source resets. `0` disables adoption, leaving
+    /// `POST /mesh/config-revision/reset` as the only recovery. A sequence
+    /// rewind INSIDE one authority is never auto-adopted.
+    pub mesh_config_revision_adopt_secs: u64,
     /// Opt-in for stream-family (TCP/UDP) egress proxy materialization in
     /// `EgressGateway` topology. Default `false`. When enabled, the per-port
     /// stream egress listeners terminate SVID-mTLS (reusing the mesh-inbound
@@ -2447,6 +2474,7 @@ impl Default for EnvConfig {
             file_config_path: None,
             db_config_backup_path: None,
             db_failover_urls: Vec::new(),
+            db_failover_allow_writes: false,
             db_read_replica_url: None,
             db_slow_query_threshold_ms: None,
             db_full_load_page_size: 10_000,
@@ -2493,6 +2521,10 @@ impl Default for EnvConfig {
             mesh_sidecar_enforced: false,
             mesh_sidecar_enforced_dry_run: false,
             mesh_sidecar_identity_narrowing: false,
+            mesh_config_authority_id: crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID
+                .to_string(),
+            mesh_config_revision_adopt_secs:
+                crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             mesh_egress_stream_enabled: false,
             mesh_egress_stream_allow_plaintext: false,
             mesh_peer_auth_live_reload_enabled: false,
@@ -2816,6 +2848,7 @@ impl EnvConfig {
             db_tls_watch_interval_seconds: u64 = "FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS" => 30u64, clamp(1u64, 3600u64);
             file_config_path: Option<String> = "FERRUM_FILE_CONFIG_PATH";
             db_config_backup_path: Option<String> = "FERRUM_DB_CONFIG_BACKUP_PATH";
+            db_failover_allow_writes: bool = "FERRUM_DB_FAILOVER_ALLOW_WRITES" => false;
             db_read_replica_url: Option<String> = "FERRUM_DB_READ_REPLICA_URL";
             db_slow_query_threshold_ms: Option<u64> = "FERRUM_DB_SLOW_QUERY_THRESHOLD_MS";
             db_full_load_page_size: u64 = "FERRUM_DB_FULL_LOAD_PAGE_SIZE" => 10_000u64, clamp(100u64, 100_000u64);
@@ -2916,6 +2949,8 @@ impl EnvConfig {
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
+            mesh_config_authority_id: String = "FERRUM_MESH_CONFIG_AUTHORITY_ID" => crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID.to_string();
+            mesh_config_revision_adopt_secs: u64 = "FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS" => crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
             mesh_egress_stream_enabled: bool = "FERRUM_MESH_EGRESS_STREAM_ENABLED" => false;
             mesh_egress_stream_allow_plaintext: bool = "FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT" => false;
             mesh_peer_auth_live_reload_enabled: bool = "FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED" => false;
@@ -3535,6 +3570,7 @@ impl EnvConfig {
             file_config_path,
             db_config_backup_path,
             db_failover_urls,
+            db_failover_allow_writes,
             db_read_replica_url,
             db_slow_query_threshold_ms,
             db_full_load_page_size,
@@ -3581,6 +3617,8 @@ impl EnvConfig {
             mesh_sidecar_enforced,
             mesh_sidecar_enforced_dry_run,
             mesh_sidecar_identity_narrowing,
+            mesh_config_authority_id,
+            mesh_config_revision_adopt_secs,
             mesh_egress_stream_enabled,
             mesh_egress_stream_allow_plaintext,
             mesh_peer_auth_live_reload_enabled,
@@ -4549,6 +4587,24 @@ impl EnvConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        if matches!(&self.mode, OperatingMode::ControlPlane)
+            && !self.k8s_controller_enabled
+            && !self.mesh_config_authority_id.is_empty()
+        {
+            let authority = crate::modes::mesh::revision::MeshConfigRevision::new(
+                self.mesh_config_authority_id.as_str(),
+                0,
+            );
+            if !authority.is_well_formed() {
+                return Err(format!(
+                    "FERRUM_MESH_CONFIG_AUTHORITY_ID must be empty or a \
+                     printable, control-character-free value with no surrounding \
+                     whitespace and no longer than {} bytes",
+                    crate::modes::mesh::revision::MAX_AUTHORITY_LEN
+                ));
+            }
+        }
+
         match &self.mode {
             OperatingMode::Database | OperatingMode::ControlPlane => {
                 if self.db_type.is_none() {

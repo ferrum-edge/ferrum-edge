@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
+use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
@@ -46,13 +47,14 @@ struct ListenerHandle {
     /// routing change tears the listener down instead of silently pairing the
     /// stale cached TLS config with connections routed to a new backend.
     backend_routing_key: Option<StreamBackendRoutingKey>,
-    /// Sorted SNI-group member proxy IDs for shared `__sni_{port}` passthrough
-    /// listeners (`None` for individual listeners). Part of the restart key:
-    /// the accept loop captures the candidate-ID list at spawn, so a
+    /// Sorted SNI-group member proxy identities for shared `__sni_{port}`
+    /// passthrough listeners (`None` for individual listeners). Part of the
+    /// restart key: the accept loop captures the candidate list at spawn, so a
     /// membership change (proxy added to / removed from a shared passthrough
     /// port) must restart the listener or new connections keep routing
-    /// against the stale set.
-    sni_ids: Option<Vec<String>>,
+    /// against the stale set. Candidates are namespace-qualified because a
+    /// shared port can host same-ID passthrough proxies from two namespaces.
+    sni_ids: Option<Vec<NamespacedResourceId>>,
     started: Arc<AtomicBool>,
     tcp_metrics: Option<Arc<TcpProxyMetrics>>,
     udp_metrics: Option<Arc<UdpProxyMetrics>>,
@@ -130,7 +132,13 @@ impl StreamBackendRoutingKey {
             let mut targets: Vec<(String, u16)> = config
                 .upstreams
                 .iter()
-                .find(|u| u.id.as_str() == upstream_id.as_str())
+                .find(|u| {
+                    // Upstream references are namespace-local. A bare-id match
+                    // would latch onto another tenant's same-id upstream and
+                    // gate TLS-cache retention against the wrong target set.
+                    u.namespace.as_str() == proxy.namespace.as_str()
+                        && u.id.as_str() == upstream_id.as_str()
+                })
                 .map(|u| {
                     // Mirror `LoadBalancer::with_subsets_and_port_overrides`:
                     // a target belongs to a subset when its tags contain
@@ -361,17 +369,60 @@ impl StreamListenerDegradation {
 /// listener — a hard bind failure (e.g. a port conflict on a CP-pushed proxy in
 /// DP mode) OR a listener deferred/degraded for a config reason — is observable
 /// rather than only warn-logged. The `kind` field classifies which.
+///
+/// Identity is `(namespace, proxy_id, listen_port)`: proxy IDs are unique only
+/// within a namespace, so a bare-ID record would let one tenant's rebind clear
+/// another tenant's failure (issue #3094).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StreamBindFailure {
+    pub namespace: String,
     pub proxy_id: String,
     pub listen_port: u16,
     pub error: String,
     pub kind: StreamListenerDegradation,
 }
 
+impl StreamBindFailure {
+    fn new(
+        identity: &NamespacedResourceId,
+        listen_port: u16,
+        error: impl Into<String>,
+        kind: StreamListenerDegradation,
+    ) -> Self {
+        Self {
+            namespace: identity.namespace.clone(),
+            proxy_id: identity.id.clone(),
+            listen_port,
+            error: error.into(),
+            kind,
+        }
+    }
+
+    fn same_resource(&self, other: &Self) -> bool {
+        self.namespace == other.namespace
+            && self.proxy_id == other.proxy_id
+            && self.listen_port == other.listen_port
+    }
+}
+
+/// Exact `(namespace, id)` config lookup for a stream proxy.
+///
+/// Stream listeners must never resolve a proxy by bare ID: a same-ID proxy in
+/// another namespace would match first and bind that tenant's routing/TLS
+/// identity onto this listener.
+fn find_proxy_by_identity<'a>(
+    config: &'a GatewayConfig,
+    identity: &NamespacedResourceId,
+) -> Option<&'a Proxy> {
+    config
+        .proxies
+        .iter()
+        .find(|p| p.id == identity.id && p.namespace == identity.namespace)
+}
+
 fn listener_failures(
-    proxy_id: &str,
-    sni_ids: Option<&[String]>,
+    identity: &NamespacedResourceId,
+    sni_ids: Option<&[NamespacedResourceId]>,
     listen_port: u16,
     error: &str,
     kind: StreamListenerDegradation,
@@ -379,19 +430,9 @@ fn listener_failures(
     match sni_ids {
         Some(ids) => ids
             .iter()
-            .map(|id| StreamBindFailure {
-                proxy_id: id.clone(),
-                listen_port,
-                error: error.to_string(),
-                kind,
-            })
+            .map(|candidate| StreamBindFailure::new(candidate, listen_port, error, kind))
             .collect(),
-        None => vec![StreamBindFailure {
-            proxy_id: proxy_id.to_string(),
-            listen_port,
-            error: error.to_string(),
-            kind,
-        }],
+        None => vec![StreamBindFailure::new(identity, listen_port, error, kind)],
     }
 }
 
@@ -401,9 +442,10 @@ fn append_bind_failure(
 ) {
     snapshot.rcu(|current| {
         let mut next = (**current).clone();
-        if let Some(existing) = next.iter_mut().find(|existing| {
-            existing.proxy_id == failure.proxy_id && existing.listen_port == failure.listen_port
-        }) {
+        if let Some(existing) = next
+            .iter_mut()
+            .find(|existing| existing.same_resource(&failure))
+        {
             *existing = failure.clone();
         } else {
             next.push(failure.clone());
@@ -414,13 +456,17 @@ fn append_bind_failure(
 
 fn remove_bind_failures(
     snapshot: &arc_swap::ArcSwap<Vec<StreamBindFailure>>,
-    proxy_ids: &[String],
+    identities: &[NamespacedResourceId],
 ) {
     snapshot.rcu(|current| {
         Arc::new(
             current
                 .iter()
-                .filter(|failure| !proxy_ids.contains(&failure.proxy_id))
+                .filter(|failure| {
+                    !identities.iter().any(|identity| {
+                        identity.namespace == failure.namespace && identity.id == failure.proxy_id
+                    })
+                })
                 .cloned()
                 .collect(),
         )
@@ -429,9 +475,10 @@ fn remove_bind_failures(
 
 fn merge_bind_failures(base: &mut Vec<StreamBindFailure>, additional: &[StreamBindFailure]) {
     for failure in additional {
-        if let Some(existing) = base.iter_mut().find(|existing| {
-            existing.proxy_id == failure.proxy_id && existing.listen_port == failure.listen_port
-        }) {
+        if let Some(existing) = base
+            .iter_mut()
+            .find(|existing| existing.same_resource(failure))
+        {
             *existing = failure.clone();
         } else {
             base.push(failure.clone());
@@ -451,6 +498,7 @@ mod bind_failure_snapshot_tests {
         let snapshot = arc_swap::ArcSwap::from_pointee(Vec::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let failure = StreamBindFailure {
+            namespace: "ferrum".to_string(),
             proxy_id: "async-bind".to_string(),
             listen_port: 9443,
             error: "TCP stream listener task failed: address already in use".to_string(),
@@ -478,6 +526,7 @@ mod bind_failure_snapshot_tests {
     fn async_listener_failure_survives_later_reconcile_snapshot() {
         let async_failures = arc_swap::ArcSwap::from_pointee(Vec::new());
         let failure = StreamBindFailure {
+            namespace: "ferrum".to_string(),
             proxy_id: "async-bind".to_string(),
             listen_port: 9443,
             error: "TCP stream listener task failed: accept loop exited".to_string(),
@@ -494,6 +543,37 @@ mod bind_failure_snapshot_tests {
         assert_eq!(later_reconcile[0].proxy_id, "async-bind");
         assert_eq!(later_reconcile[0].listen_port, 9443);
     }
+}
+
+/// One configured stream proxy that wants a listener, resolved from config
+/// during [`StreamListenerManager::reconcile`] and keyed by its
+/// `(namespace, id)` identity.
+struct DesiredStreamProxy {
+    port: u16,
+    scheme: BackendScheme,
+    frontend_tls: bool,
+    passthrough: bool,
+    /// Whether the proxy declares `hosts`; a lone passthrough proxy with hosts
+    /// still needs SNI resolution so its host predicates are enforced.
+    has_hosts: bool,
+    backend_tls_reload_key: Option<BackendTlsReloadKey>,
+}
+
+/// One listener the reconcile pass wants running: either an individual proxy
+/// (keyed `namespace|id`) or a shared SNI passthrough group (keyed
+/// `__sni_{port}`).
+struct DesiredStreamListener {
+    /// Exact owning identity for this listener's representative proxy. For SNI
+    /// groups this is the first (sorted) candidate; per-connection resolution
+    /// picks the concrete tenant from [`Self::sni_ids`]. Never inferred and
+    /// never defaulted — it is carried from the config entry that produced it.
+    identity: NamespacedResourceId,
+    port: u16,
+    scheme: BackendScheme,
+    frontend_tls: bool,
+    passthrough: bool,
+    backend_tls_reload_key: Option<BackendTlsReloadKey>,
+    sni_ids: Option<Vec<NamespacedResourceId>>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1019,7 +1099,7 @@ impl StreamListenerManager {
     ///
     /// `build_config` is invoked once per active DTLS listener so the caller
     /// can rebuild a fresh `FrontendDtlsConfig` for each (cloning the
-    /// `DtlsCertificate` and verifier is cheap; the dimpl `Config` itself
+    /// `DtlsCertificateChain` and verifier is cheap; the dimpl `Config` itself
     /// can be re-used since the build is symmetric). Existing in-flight
     /// DTLS sessions keep the snapshot they handshake with until they end;
     /// new sessions pick up the swapped material on the next ClientHello.
@@ -1107,143 +1187,141 @@ impl StreamListenerManager {
         let active_crl_fingerprint = crl_list_fingerprint(&self.crls.load_full());
         let mut listeners = self.listeners.lock().await;
 
-        // Collect all desired stream proxies from config
-        let desired: std::collections::HashMap<
-            String,
-            (u16, BackendScheme, bool, bool, Option<BackendTlsReloadKey>),
-        > = current_config
-            .proxies
-            .iter()
-            .filter(|p| p.dispatch_kind.is_stream())
-            .filter_map(|p| {
-                p.listen_port.map(|port| {
-                    // Passthrough proxies relay raw bytes and never build the
-                    // cached backend TLS config, so they carry no reload key:
-                    // backend TLS material (or its absence) must neither
-                    // restart them nor block them from starting.
-                    let backend_tls_reload_key = if p.dispatch_kind
-                        == crate::config::types::DispatchKind::TcpTls
-                        && !p.passthrough
-                    {
-                        Some(BackendTlsReloadKey::from_proxy(
-                            p,
-                            self.tls_ca_bundle_path.as_deref(),
-                            active_crl_fingerprint.as_deref(),
-                        ))
-                    } else {
-                        None
-                    };
-                    (
-                        p.id.clone(),
+        // Collect all desired stream proxies from config, keyed by the full
+        // `(namespace, id)` identity. Two namespaces may reuse one proxy ID (IDs
+        // are unique only per namespace), so a bare-ID key would silently drop
+        // one tenant's listener and attach the survivor's runtime state to the
+        // wrong namespace (issue #3094).
+        let desired: std::collections::HashMap<NamespacedResourceId, DesiredStreamProxy> =
+            current_config
+                .proxies
+                .iter()
+                .filter(|p| p.dispatch_kind.is_stream())
+                .filter_map(|p| {
+                    p.listen_port.map(|port| {
+                        // Passthrough proxies relay raw bytes and never build the
+                        // cached backend TLS config, so they carry no reload key:
+                        // backend TLS material (or its absence) must neither
+                        // restart them nor block them from starting.
+                        let backend_tls_reload_key = if p.dispatch_kind
+                            == crate::config::types::DispatchKind::TcpTls
+                            && !p.passthrough
+                        {
+                            Some(BackendTlsReloadKey::from_proxy(
+                                p,
+                                self.tls_ca_bundle_path.as_deref(),
+                                active_crl_fingerprint.as_deref(),
+                            ))
+                        } else {
+                            None
+                        };
                         (
-                            port,
-                            p.effective_scheme(),
-                            p.frontend_tls,
-                            p.passthrough,
-                            backend_tls_reload_key,
-                        ),
-                    )
+                            NamespacedResourceId::new(p.namespace.clone(), p.id.clone()),
+                            DesiredStreamProxy {
+                                port,
+                                scheme: p.effective_scheme(),
+                                frontend_tls: p.frontend_tls,
+                                passthrough: p.passthrough,
+                                has_hosts: !p.hosts.is_empty(),
+                                backend_tls_reload_key,
+                            },
+                        )
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
         // Detect passthrough port groups that must be resolved by SNI.
         // Multiple passthrough proxies sharing a port need one shared listener keyed by
         // "__sni_{port}". A single passthrough proxy with configured hosts also needs
         // SNI resolution so those host predicates are enforced instead of becoming a
         // port-wide catch-all.
-        let mut passthrough_groups: std::collections::HashMap<u16, Vec<String>> =
+        //
+        // Grouping is by port because the OS port is the shared resource: a port
+        // may legitimately be shared by passthrough proxies from different
+        // namespaces (per-namespace uniqueness allows it). Candidates therefore
+        // stay namespace-qualified so SNI resolution selects the right tenant.
+        let mut passthrough_groups: std::collections::HashMap<u16, Vec<NamespacedResourceId>> =
             std::collections::HashMap::new();
-        for (proxy_id, (port, _protocol, _frontend_tls, passthrough, _)) in &desired {
-            if *passthrough {
+        for (identity, entry) in &desired {
+            if entry.passthrough {
                 passthrough_groups
-                    .entry(*port)
+                    .entry(entry.port)
                     .or_default()
-                    .push(proxy_id.clone());
+                    .push(identity.clone());
             }
         }
         passthrough_groups.retain(|_, ids| {
             ids.len() > 1
-                || ids.iter().any(|id| {
-                    current_config
-                        .proxies
-                        .iter()
-                        .any(|p| p.id.as_str() == id.as_str() && !p.hosts.is_empty())
-                })
+                || ids
+                    .iter()
+                    .any(|id| desired.get(id).is_some_and(|entry| entry.has_hosts))
         });
-        // Sort IDs for stable comparison on reconcile
+        // Sort identities for stable comparison on reconcile.
         for ids in passthrough_groups.values_mut() {
-            ids.sort();
+            ids.sort_by(|a, b| (&a.namespace, &a.id).cmp(&(&b.namespace, &b.id)));
         }
 
         // Build the effective desired map: individual proxies + SNI group entries.
         // Proxies in a group are replaced by a single "__sni_{port}" entry.
-        let grouped_proxy_ids: std::collections::HashSet<&str> = passthrough_groups
-            .values()
-            .flat_map(|ids| ids.iter().map(|s| s.as_str()))
-            .collect();
+        let grouped_proxy_ids: std::collections::HashSet<&NamespacedResourceId> =
+            passthrough_groups.values().flatten().collect();
 
-        #[allow(clippy::type_complexity)]
-        let mut effective_desired: std::collections::HashMap<
-            String,
-            (
-                u16,
-                BackendScheme,
-                bool,
-                bool,
-                Option<BackendTlsReloadKey>,
-                Option<Vec<String>>,
-            ),
-        > = std::collections::HashMap::new();
+        let mut effective_desired: std::collections::HashMap<String, DesiredStreamListener> =
+            std::collections::HashMap::new();
 
-        for (proxy_id, (port, scheme, frontend_tls, passthrough, backend_tls_reload_key)) in
-            &desired
-        {
-            if grouped_proxy_ids.contains(proxy_id.as_str()) {
+        for (identity, entry) in &desired {
+            if grouped_proxy_ids.contains(identity) {
                 continue; // Handled as part of a group below
             }
             effective_desired.insert(
-                proxy_id.clone(),
-                (
-                    *port,
-                    *scheme,
-                    *frontend_tls,
-                    *passthrough,
-                    backend_tls_reload_key.clone(),
-                    None,
-                ),
+                identity.runtime_key(),
+                DesiredStreamListener {
+                    identity: identity.clone(),
+                    port: entry.port,
+                    scheme: entry.scheme,
+                    frontend_tls: entry.frontend_tls,
+                    passthrough: entry.passthrough,
+                    backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
+                    sni_ids: None,
+                },
             );
         }
         for (port, ids) in &passthrough_groups {
             let key = format!("__sni_{}", port);
-            // Use the first proxy's scheme for the listener
-            if let Some((_, scheme, frontend_tls, passthrough, backend_tls_reload_key)) =
-                desired.get(&ids[0])
-            {
+            // Use the first proxy's scheme for the listener. `ids[0]` is also the
+            // listener's *representative* identity: the accept path re-resolves
+            // the concrete tenant per connection from `sni_ids`.
+            if let Some(entry) = desired.get(&ids[0]) {
                 effective_desired.insert(
                     key,
-                    (
-                        *port,
-                        *scheme,
-                        *frontend_tls,
-                        *passthrough,
-                        backend_tls_reload_key.clone(),
-                        Some(ids.clone()),
-                    ),
+                    DesiredStreamListener {
+                        identity: ids[0].clone(),
+                        port: entry.port,
+                        scheme: entry.scheme,
+                        frontend_tls: entry.frontend_tls,
+                        passthrough: entry.passthrough,
+                        backend_tls_reload_key: entry.backend_tls_reload_key.clone(),
+                        sni_ids: Some(ids.clone()),
+                    },
                 );
             }
         }
 
         // Drop durable task failures only when their configured proxy has
         // disappeared. Failures for still-desired proxies survive unrelated
-        // reconciles until the listener is actually rebound below.
-        let desired_proxy_ids: std::collections::HashSet<&str> =
-            desired.keys().map(String::as_str).collect();
+        // reconciles until the listener is actually rebound below. Retention is
+        // namespace-qualified so removing one tenant's proxy cannot keep (or
+        // clear) another tenant's same-ID failure entry.
         self.async_bind_failures.rcu(|current| {
             Arc::new(
                 current
                     .iter()
-                    .filter(|failure| desired_proxy_ids.contains(failure.proxy_id.as_str()))
+                    .filter(|failure| {
+                        desired.contains_key(&NamespacedResourceId::new(
+                            failure.namespace.clone(),
+                            failure.proxy_id.clone(),
+                        ))
+                    })
                     .cloned()
                     .collect(),
             )
@@ -1274,8 +1352,15 @@ impl StreamListenerManager {
                 continue;
             }
 
-            let Some((port, scheme, frontend_tls, passthrough, backend_tls_reload_key, sni_ids)) =
-                effective_desired.get(key)
+            let Some(DesiredStreamListener {
+                identity,
+                port,
+                scheme,
+                frontend_tls,
+                passthrough,
+                backend_tls_reload_key,
+                sni_ids,
+            }) = effective_desired.get(key)
             else {
                 to_remove.push(key.clone());
                 continue;
@@ -1336,36 +1421,33 @@ impl StreamListenerManager {
             // teardown, port closed, failure reported) instead of serving
             // stale material from the previous sources.
             if !identity_changed && *scheme == BackendScheme::Tcps {
-                let proxy_id = sni_ids.as_ref().and_then(|ids| ids.first()).unwrap_or(key);
                 let content_only_rotation =
                     match (&handle.backend_tls_reload_key, backend_tls_reload_key) {
                         (Some(old), Some(new)) => old.same_tls_sources(new),
                         _ => false,
                     };
-                let current_routing_key = current_config
-                    .proxies
-                    .iter()
-                    .find(|p| p.id.as_str() == proxy_id.as_str())
+                let current_routing_key = find_proxy_by_identity(&current_config, identity)
                     .map(|p| StreamBackendRoutingKey::from_proxy(p, &current_config));
                 let routing_unchanged = handle.backend_routing_key.is_some()
                     && handle.backend_routing_key == current_routing_key;
                 if content_only_rotation
                     && routing_unchanged
                     && let Err(msg) =
-                        self.validate_backend_tls_config(&current_config, proxy_id, *port)
+                        self.validate_backend_tls_config(&current_config, identity, *port)
                 {
                     error!(
-                        proxy_id = %proxy_id,
+                        namespace = %identity.namespace,
+                        proxy_id = %identity.id,
                         port = *port,
                         "Backend TLS material rotated to invalid content; keeping the previous stream listener running: {}",
                         msg
                     );
-                    degraded.push(StreamBindFailure {
-                        proxy_id: proxy_id.clone(),
-                        listen_port: *port,
-                        error: format!("{} (kept previous listener running)", msg),
-                        kind: StreamListenerDegradation::BackendTlsRotationInvalid,
-                    });
+                    degraded.push(StreamBindFailure::new(
+                        identity,
+                        *port,
+                        format!("{} (kept previous listener running)", msg),
+                        StreamListenerDegradation::BackendTlsRotationInvalid,
+                    ));
                     continue;
                 }
             }
@@ -1391,14 +1473,23 @@ impl StreamListenerManager {
         }
 
         // Start listeners for new or restarted entries
-        for (key, (port, scheme, frontend_tls, passthrough, backend_tls_reload_key, sni_ids)) in
-            &effective_desired
-        {
+        for (key, desired_listener) in &effective_desired {
             if listeners.contains_key(key) {
                 continue;
             }
-            // Resolve the proxy_id to use (first in group or the individual proxy_id)
-            let proxy_id = sni_ids.as_ref().and_then(|ids| ids.first()).unwrap_or(key);
+            let DesiredStreamListener {
+                identity,
+                port,
+                scheme,
+                frontend_tls,
+                passthrough,
+                backend_tls_reload_key,
+                sni_ids,
+            } = desired_listener;
+            // Exact owning identity for this listener, carried from the config
+            // entry that produced it (first SNI candidate for a shared group).
+            // Never re-derived by scanning and never defaulted.
+            let proxy_id = &identity.id;
 
             // Skip frontend_tls proxies when the required encryption config is not yet loaded.
             // For TCP: needs rustls ServerConfig. For UDP: needs DTLS cert/key paths.
@@ -1414,15 +1505,13 @@ impl StreamListenerManager {
                             port = port,
                             "Deferring UDP listener start: frontend_tls requires DTLS cert/key"
                         );
-                        degraded.push(StreamBindFailure {
-                            proxy_id: proxy_id.clone(),
-                            listen_port: *port,
-                            error:
-                                "Deferred: frontend_tls UDP listener requires DTLS cert/key material \
-                                 (not yet loaded)"
-                                    .to_string(),
-                            kind: StreamListenerDegradation::FrontendDtlsDeferred,
-                        });
+                        degraded.push(StreamBindFailure::new(
+                            identity,
+                            *port,
+                            "Deferred: frontend_tls UDP listener requires DTLS cert/key material \
+                             (not yet loaded)",
+                            StreamListenerDegradation::FrontendDtlsDeferred,
+                        ));
                         continue;
                     }
                 } else if self.frontend_tls_config.load().is_none() {
@@ -1431,15 +1520,13 @@ impl StreamListenerManager {
                         port = port,
                         "Deferring TCP listener start: frontend_tls requires TLS config"
                     );
-                    degraded.push(StreamBindFailure {
-                        proxy_id: proxy_id.clone(),
-                        listen_port: *port,
-                        error:
-                            "Deferred: frontend_tls TCP listener requires a rustls ServerConfig \
-                             (not yet loaded)"
-                                .to_string(),
-                        kind: StreamListenerDegradation::FrontendTlsDeferred,
-                    });
+                    degraded.push(StreamBindFailure::new(
+                        identity,
+                        *port,
+                        "Deferred: frontend_tls TCP listener requires a rustls ServerConfig \
+                         (not yet loaded)",
+                        StreamListenerDegradation::FrontendTlsDeferred,
+                    ));
                     continue;
                 }
             }
@@ -1449,20 +1536,21 @@ impl StreamListenerManager {
             // upstream-supplied, or the global CA bundle) must not block them.
             if *scheme == BackendScheme::Tcps
                 && !*passthrough
-                && let Err(msg) = self.validate_backend_tls_config(&current_config, proxy_id, *port)
+                && let Err(msg) = self.validate_backend_tls_config(&current_config, identity, *port)
             {
                 error!(
+                    namespace = %identity.namespace,
                     proxy_id = %proxy_id,
                     port = *port,
                     "Stream listener backend TLS validation failed: {}",
                     msg
                 );
-                degraded.push(StreamBindFailure {
-                    proxy_id: proxy_id.clone(),
-                    listen_port: *port,
-                    error: msg,
-                    kind: StreamListenerDegradation::BackendTlsInvalid,
-                });
+                degraded.push(StreamBindFailure::new(
+                    identity,
+                    *port,
+                    msg,
+                    StreamListenerDegradation::BackendTlsInvalid,
+                ));
                 continue;
             }
 
@@ -1489,7 +1577,7 @@ impl StreamListenerManager {
                     msg
                 );
                 degraded.extend(listener_failures(
-                    proxy_id,
+                    identity,
                     sni_ids.as_deref(),
                     port_val,
                     &msg,
@@ -1499,9 +1587,18 @@ impl StreamListenerManager {
             }
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let rebound_proxy_ids = sni_ids.clone().unwrap_or_else(|| vec![proxy_id.clone()]);
+            let rebound_proxy_ids = sni_ids.clone().unwrap_or_else(|| vec![identity.clone()]);
             remove_bind_failures(&self.async_bind_failures, &rebound_proxy_ids);
             let proxy_id_owned = proxy_id.clone();
+            // Owning namespace for this listener's proxy, carried verbatim from
+            // the desired-listener identity built out of the config entry.
+            // Runtime state keyed by proxy identity (the adaptive batch-limit
+            // EWMA, lifecycle generations) must be namespace-qualified so a
+            // same-id proxy in another tenant cannot share or prune it. There is
+            // no scan and no default-namespace fallback: an inferred namespace
+            // would silently attach one tenant's state to another's.
+            let proxy_namespace_owned = identity.namespace.clone();
+            let listener_identity = identity.clone();
             let config = self.config.clone();
             let dns_cache = self.dns_cache.clone();
             let request_epoch = self.request_epoch.clone();
@@ -1533,29 +1630,24 @@ impl StreamListenerManager {
                                         proxy_id = %proxy_id,
                                         "Failed to build frontend DTLS config: {}", e
                                     );
-                                    degraded.push(StreamBindFailure {
-                                        proxy_id: proxy_id.clone(),
-                                        listen_port: *port,
-                                        error: format!(
-                                            "Failed to build frontend DTLS config: {}",
-                                            e
-                                        ),
-                                        kind: StreamListenerDegradation::FrontendDtlsBuildFailed,
-                                    });
+                                    degraded.push(StreamBindFailure::new(
+                                        identity,
+                                        *port,
+                                        format!("Failed to build frontend DTLS config: {}", e),
+                                        StreamListenerDegradation::FrontendDtlsBuildFailed,
+                                    ));
                                     continue;
                                 }
                             }
                         }
                         None => {
                             // Should not happen — guarded above, but be safe
-                            degraded.push(StreamBindFailure {
-                                proxy_id: proxy_id.clone(),
-                                listen_port: *port,
-                                error: "Deferred: frontend DTLS material unavailable at listener \
-                                        spawn"
-                                    .to_string(),
-                                kind: StreamListenerDegradation::FrontendDtlsDeferred,
-                            });
+                            degraded.push(StreamBindFailure::new(
+                                identity,
+                                *port,
+                                "Deferred: frontend DTLS material unavailable at listener spawn",
+                                StreamListenerDegradation::FrontendDtlsDeferred,
+                            ));
                             continue;
                         }
                     }
@@ -1586,7 +1678,7 @@ impl StreamListenerManager {
                 let async_failure_tx = async_failure_tx.clone();
                 let failure_proxy_ids = sni_ids
                     .clone()
-                    .unwrap_or_else(|| vec![proxy_id_owned.clone()]);
+                    .unwrap_or_else(|| vec![listener_identity.clone()]);
                 // Reserve a oneshot so the listener can publish the live
                 // `Arc<DtlsServer>` back here once it has bound. Only meaningful
                 // for actual DTLS listeners; plain UDP listeners drop the
@@ -1602,6 +1694,7 @@ impl StreamListenerManager {
                         port: port_val,
                         bind_addr,
                         proxy_id: proxy_id_owned.clone(),
+                        proxy_namespace: proxy_namespace_owned,
                         dns_cache,
                         request_epoch,
                         health_checker,
@@ -1639,13 +1732,13 @@ impl StreamListenerManager {
                             "{}",
                             msg
                         );
-                        for failure_proxy_id in failure_proxy_ids {
-                            let failure = StreamBindFailure {
-                                proxy_id: failure_proxy_id,
-                                listen_port: port_val,
-                                error: msg.clone(),
-                                kind: StreamListenerDegradation::BindFailed,
-                            };
+                        for failure_identity in &failure_proxy_ids {
+                            let failure = StreamBindFailure::new(
+                                failure_identity,
+                                port_val,
+                                msg.clone(),
+                                StreamListenerDegradation::BindFailed,
+                            );
                             append_bind_failure(&async_bind_failures, failure.clone());
                             append_bind_failure(&bind_failures, failure.clone());
                             let _ = async_failure_tx.send(failure);
@@ -1725,12 +1818,13 @@ impl StreamListenerManager {
                 let async_failure_tx = async_failure_tx.clone();
                 let failure_proxy_ids = sni_ids
                     .clone()
-                    .unwrap_or_else(|| vec![proxy_id_owned.clone()]);
+                    .unwrap_or_else(|| vec![listener_identity.clone()]);
                 let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
                         bind_addr,
                         proxy_id: proxy_id_owned.clone(),
+                        proxy_namespace: proxy_namespace_owned,
                         config,
                         dns_cache,
                         request_epoch,
@@ -1771,13 +1865,13 @@ impl StreamListenerManager {
                             "{}",
                             msg
                         );
-                        for failure_proxy_id in failure_proxy_ids {
-                            let failure = StreamBindFailure {
-                                proxy_id: failure_proxy_id,
-                                listen_port: port_val,
-                                error: msg.clone(),
-                                kind: StreamListenerDegradation::BindFailed,
-                            };
+                        for failure_identity in &failure_proxy_ids {
+                            let failure = StreamBindFailure::new(
+                                failure_identity,
+                                port_val,
+                                msg.clone(),
+                                StreamListenerDegradation::BindFailed,
+                            );
                             append_bind_failure(&async_bind_failures, failure.clone());
                             append_bind_failure(&bind_failures, failure.clone());
                             let _ = async_failure_tx.send(failure);
@@ -1789,6 +1883,7 @@ impl StreamListenerManager {
 
             info!(
                 listener_key = %key,
+                namespace = %identity.namespace,
                 proxy_id = %proxy_id,
                 port = port,
                 scheme = %scheme,
@@ -1799,10 +1894,7 @@ impl StreamListenerManager {
             // keep-old-listener path on TLS rotation can verify routing has
             // not drifted since this listener's backend TLS cache was built.
             let backend_routing_key = if backend_tls_reload_key.is_some() {
-                current_config
-                    .proxies
-                    .iter()
-                    .find(|p| p.id.as_str() == proxy_id.as_str())
+                find_proxy_by_identity(&current_config, identity)
                     .map(|p| StreamBackendRoutingKey::from_proxy(p, &current_config))
             } else {
                 None
@@ -1899,17 +1991,13 @@ impl StreamListenerManager {
     fn validate_backend_tls_config(
         &self,
         current_config: &GatewayConfig,
-        proxy_id: &str,
+        identity: &NamespacedResourceId,
         port: u16,
     ) -> Result<(), String> {
-        let Some(proxy) = current_config
-            .proxies
-            .iter()
-            .find(|p| p.id.as_str() == proxy_id)
-        else {
+        let Some(proxy) = find_proxy_by_identity(current_config, identity) else {
             return Err(format!(
-                "Backend TLS config failed for stream listener on port {}: proxy not found",
-                port
+                "Backend TLS config failed for stream listener on port {}: proxy {}/{} not found",
+                port, identity.namespace, identity.id
             ));
         };
         super::tcp_proxy::build_cached_backend_tls_config(
@@ -1980,23 +2068,24 @@ impl StreamListenerManager {
 
         loop {
             let current_config = self.config.load();
-            let desired: Vec<(String, u16, BackendScheme, bool, bool, bool)> = current_config
-                .proxies
-                .iter()
-                .filter(|p| p.dispatch_kind.is_stream())
-                .filter_map(|p| {
-                    p.listen_port.map(|port| {
-                        (
-                            p.id.clone(),
-                            port,
-                            p.effective_scheme(),
-                            p.frontend_tls,
-                            p.passthrough,
-                            !p.hosts.is_empty(),
-                        )
+            let desired: Vec<(NamespacedResourceId, u16, BackendScheme, bool, bool, bool)> =
+                current_config
+                    .proxies
+                    .iter()
+                    .filter(|p| p.dispatch_kind.is_stream())
+                    .filter_map(|p| {
+                        p.listen_port.map(|port| {
+                            (
+                                NamespacedResourceId::new(p.namespace.clone(), p.id.clone()),
+                                port,
+                                p.effective_scheme(),
+                                p.frontend_tls,
+                                p.passthrough,
+                                !p.hosts.is_empty(),
+                            )
+                        })
                     })
-                })
-                .collect();
+                    .collect();
 
             if desired.is_empty() {
                 return Ok(());
@@ -2017,8 +2106,11 @@ impl StreamListenerManager {
                 let listeners = self.listeners.lock().await;
                 desired
                     .iter()
-                    .all(|(proxy_id, port, scheme, frontend_tls, passthrough, _)| {
-                        // For SNI groups, the listener key is "__sni_{port}" not the proxy_id.
+                    .all(|(identity, port, scheme, frontend_tls, passthrough, _)| {
+                        // For SNI groups the listener key is "__sni_{port}";
+                        // individual listeners are keyed by the namespace-
+                        // qualified `namespace|id` runtime key, matching
+                        // `reconcile`'s `effective_desired`.
                         let key = if *passthrough
                             && pt_ports
                                 .get(port)
@@ -2026,7 +2118,7 @@ impl StreamListenerManager {
                         {
                             format!("__sni_{}", port)
                         } else {
-                            proxy_id.clone()
+                            identity.runtime_key()
                         };
                         listeners.get(&key).is_some_and(|handle| {
                             handle.listen_port == *port
@@ -2062,8 +2154,12 @@ impl StreamListenerManager {
     /// is not injected (e.g. unit tests that build a manager standalone).
     pub async fn shutdown_all(&self) {
         let mut listeners = self.listeners.lock().await;
-        for (proxy_id, handle) in listeners.drain() {
-            info!(proxy_id = %proxy_id, port = handle.listen_port, "Shutting down stream listener");
+        for (listener_key, handle) in listeners.drain() {
+            info!(
+                listener_key = %listener_key,
+                port = handle.listen_port,
+                "Shutting down stream listener"
+            );
             let _ = handle.shutdown_tx.send(true);
         }
     }
@@ -2476,6 +2572,64 @@ mod tests {
             key_a,
             StreamBackendRoutingKey::from_proxy(&proxy, &v1_is_a),
             "unchanged subset membership must compare equal"
+        );
+    }
+
+    #[test]
+    fn stream_backend_routing_key_resolves_upstream_by_namespace() {
+        // Same upstream id in two tenants must not latch TLS routing onto the
+        // foreign tenant's targets (issue #3094).
+        let proxy: Proxy = serde_json::from_value(serde_json::json!({
+            "id": "p1",
+            "namespace": "tenant-a",
+            "listen_path": "/",
+            "backend_scheme": "tcp",
+            "backend_host": "127.0.0.1",
+            "backend_port": 9000,
+            "listen_port": 9443,
+            "upstream_id": "u1",
+        }))
+        .expect("proxy deserialize");
+
+        // Insert the foreign upstream first so a bare-id find would wrongly
+        // prefer it.
+        let config_both = GatewayConfig {
+            upstreams: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "u1",
+                    "namespace": "tenant-b",
+                    "algorithm": "round_robin",
+                    "targets": [{"host": "foreign.example", "port": 443}],
+                }))
+                .expect("upstream deserialize"),
+                serde_json::from_value(serde_json::json!({
+                    "id": "u1",
+                    "namespace": "tenant-a",
+                    "algorithm": "round_robin",
+                    "targets": [{"host": "local.example", "port": 443}],
+                }))
+                .expect("upstream deserialize"),
+            ],
+            ..GatewayConfig::default()
+        };
+
+        let key = StreamBackendRoutingKey::from_proxy(&proxy, &config_both);
+        assert_eq!(
+            key.upstream_targets.as_deref(),
+            Some(&[("local.example".to_string(), 443u16)][..]),
+            "routing key must use the same-namespace upstream, not a same-id foreign one"
+        );
+
+        // Drop the local upstream: the foreign same-id entry must not fill in.
+        let config_foreign_only = GatewayConfig {
+            upstreams: vec![config_both.upstreams[0].clone()],
+            ..GatewayConfig::default()
+        };
+        let missing = StreamBackendRoutingKey::from_proxy(&proxy, &config_foreign_only);
+        assert_eq!(
+            missing.upstream_targets.as_deref(),
+            Some(&[][..]),
+            "a dangling same-namespace upstream_id must yield an empty target set"
         );
     }
 }

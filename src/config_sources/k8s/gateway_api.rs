@@ -17,11 +17,12 @@ use super::{
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sAccumulator, K8sObject, K8sResourceKey,
     K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
     RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
-    invalid_resource, mesh_route_dispatch_plugin_from_rules, optional_port_field,
-    optional_target_weight_field, port_from_u64, proxy_for_route, resource_id,
+    invalid_resource, mesh_route_dispatch_plugin_from_rules, namespaced_resource_key,
+    optional_port_field, optional_target_weight_field, port_from_u64, proxy_for_route, resource_id,
     route_backends_require_node_waypoint_authz, route_request_transformer_plugin_for_proxy,
     service_dns_name, string_array, string_field, upstream_for_route,
 };
+use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{PluginConfig, Proxy};
 
 // Use an absolute DNS name (trailing dot) so resolvers must query this exact
@@ -1006,17 +1007,26 @@ fn upsert_http_route_resources(
     proxies: Vec<Proxy>,
     plugins: Vec<PluginConfig>,
 ) {
-    let mut plugins_by_proxy: HashMap<String, Vec<PluginConfig>> = HashMap::new();
+    let mut plugins_by_proxy: HashMap<NamespacedResourceId, Vec<PluginConfig>> = HashMap::new();
     for plugin in plugins {
         if let Some(proxy_id) = plugin.proxy_id.clone() {
-            plugins_by_proxy.entry(proxy_id).or_default().push(plugin);
+            let Some(key) = namespaced_resource_key(&plugin.namespace, &proxy_id) else {
+                acc.warnings.push(format!(
+                    "route plugin '{}/{}' with empty namespace or proxy_id was ignored",
+                    plugin.namespace, plugin.id
+                ));
+                continue;
+            };
+            plugins_by_proxy.entry(key).or_default().push(plugin);
         } else {
             acc.config.plugin_configs.push(plugin);
         }
     }
 
     for proxy in proxies {
-        let route_plugins = plugins_by_proxy.remove(&proxy.id).unwrap_or_default();
+        let route_plugins = namespaced_resource_key(&proxy.namespace, &proxy.id)
+            .and_then(|key| plugins_by_proxy.remove(&key))
+            .unwrap_or_default();
         if !merge_http_route_proxy(acc, proxy.clone(), &route_plugins) {
             acc.upsert_proxy(proxy, SourceKind::GatewayApi);
             acc.config.plugin_configs.extend(route_plugins);
@@ -1046,12 +1056,17 @@ fn merge_http_route_proxy(
         .iter()
         .find(|plugin| plugin.plugin_name == "mesh_route_dispatch");
     let existing_id = acc.config.proxies[existing_index].id.clone();
+    let existing_namespace = acc.config.proxies[existing_index].namespace.clone();
     let mut route_action_plugins: Vec<PluginConfig> = route_plugins
         .iter()
         .filter(|plugin| plugin.plugin_name != "mesh_route_dispatch")
         .filter_map(|plugin| retarget_route_action_plugin(plugin.clone(), &existing_id))
         .collect();
-    let existing_dispatch_index = dispatch_plugin_index(&acc.config.plugin_configs, &existing_id);
+    let existing_dispatch_index = dispatch_plugin_index(
+        &acc.config.plugin_configs,
+        &existing_namespace,
+        &existing_id,
+    );
     if new_dispatch.is_none() && existing_dispatch_index.is_none() {
         return false;
     }
@@ -1096,6 +1111,7 @@ fn merge_http_route_proxy(
     route_action_plugins.retain(|plugin| {
         !acc.config.plugin_configs.iter().any(|existing| {
             existing.plugin_name == plugin.plugin_name
+                && existing.namespace == existing_namespace
                 && existing.proxy_id.as_deref() == Some(existing_id.as_str())
         })
     });
@@ -1111,15 +1127,21 @@ fn merge_http_route_proxy(
 }
 
 fn can_merge_http_route_proxy(acc: &K8sAccumulator, existing: &Proxy, proxy: &Proxy) -> bool {
-    acc.proxy_sources.get(&existing.id) == Some(&SourceKind::GatewayApi)
+    acc.proxy_source(&existing.namespace, &existing.id) == Some(SourceKind::GatewayApi)
         && existing.namespace == proxy.namespace
         && existing.listen_path == proxy.listen_path
         && existing.hosts == proxy.hosts
 }
 
-fn dispatch_plugin_index(plugins: &[PluginConfig], proxy_id: &str) -> Option<usize> {
+fn dispatch_plugin_index(
+    plugins: &[PluginConfig],
+    namespace: &str,
+    proxy_id: &str,
+) -> Option<usize> {
     plugins.iter().position(|plugin| {
-        plugin.plugin_name == "mesh_route_dispatch" && plugin.proxy_id.as_deref() == Some(proxy_id)
+        plugin.plugin_name == "mesh_route_dispatch"
+            && plugin.namespace == namespace
+            && plugin.proxy_id.as_deref() == Some(proxy_id)
     })
 }
 
@@ -1140,8 +1162,8 @@ fn retarget_dispatch_plugin(mut plugin: PluginConfig, proxy_id: &str) -> PluginC
 
 fn retarget_route_action_plugin(mut plugin: PluginConfig, proxy_id: &str) -> Option<PluginConfig> {
     plugin.id = match plugin.plugin_name.as_str() {
-        "request_transformer" => format!("__istio_vs_req_xform_{proxy_id}"),
-        "response_transformer" => format!("__istio_vs_resp_xform_{proxy_id}"),
+        "request_transformer" => format!("istio-vs-req-xform-{proxy_id}"),
+        "response_transformer" => format!("istio-vs-resp-xform-{proxy_id}"),
         _ => return None,
     };
     plugin.proxy_id = Some(proxy_id.to_string());
@@ -6052,7 +6074,7 @@ mod tests {
         assert_eq!(request_transformer.proxy_id.as_deref(), Some(proxy_id));
         assert_eq!(
             request_transformer.id,
-            format!("__istio_vs_req_xform_{proxy_id}")
+            format!("istio-vs-req-xform-{proxy_id}")
         );
         assert!(
             result.config.proxies[0]
@@ -7934,6 +7956,146 @@ mod tests {
         assert_eq!(
             result.config.proxies[0].backend_host,
             "db.default.svc.corp.example"
+        );
+    }
+
+    #[test]
+    fn lossy_http_route_ids_in_two_namespaces_both_survive_with_scoped_plugins() {
+        // resource_id joins with dashes, so ns `a` / name `b-c` collides with
+        // ns `a-b` / name `c` on the bare proxy/plugin id string.
+        let mut route_a = object_in_namespace(
+            "HTTPRoute",
+            "a",
+            serde_json::json!({
+                "hostnames": ["a.example.com"],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "method": "GET"
+                    }],
+                    "filters": [{
+                        "type": "RequestHeaderModifier",
+                        "requestHeaderModifier": {
+                            "set": [{"name": "X-Tenant", "value": "a"}]
+                        }
+                    }],
+                    "backendRefs": [{"name": "api-a", "port": 8080}]
+                }, {
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "method": "POST"
+                    }],
+                    "backendRefs": [{"name": "api-a-post", "port": 8081}]
+                }]
+            }),
+        );
+        route_a.metadata.name = "b-c".to_string();
+
+        let mut route_b = object_in_namespace(
+            "HTTPRoute",
+            "a-b",
+            serde_json::json!({
+                "hostnames": ["b.example.com"],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "method": "GET"
+                    }],
+                    "filters": [{
+                        "type": "RequestHeaderModifier",
+                        "requestHeaderModifier": {
+                            "set": [{"name": "X-Tenant", "value": "a-b"}]
+                        }
+                    }],
+                    "backendRefs": [{"name": "api-b", "port": 9080}]
+                }, {
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "method": "POST"
+                    }],
+                    "backendRefs": [{"name": "api-b-post", "port": 9081}]
+                }]
+            }),
+        );
+        route_b.metadata.name = "c".to_string();
+
+        let result = translate_k8s_objects(
+            &[route_a, route_b],
+            options().with_source_namespaces(vec!["a".to_string(), "a-b".to_string()]),
+        )
+        .expect("lossy cross-namespace HTTPRoutes must both translate");
+
+        let expected_id = resource_id("gwapi-route", "a", "b-c", "httproute-0");
+        assert_eq!(
+            expected_id,
+            resource_id("gwapi-route", "a-b", "c", "httproute-0"),
+            "fixture must exercise the lossy dash-join collision"
+        );
+
+        let proxy_a = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.namespace == "a" && proxy.id == expected_id)
+            .expect("namespace a proxy must survive");
+        let proxy_b = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.namespace == "a-b" && proxy.id == expected_id)
+            .expect("namespace a-b proxy must survive");
+        assert_eq!(proxy_a.hosts, vec!["a.example.com".to_string()]);
+        assert_eq!(proxy_b.hosts, vec!["b.example.com".to_string()]);
+
+        let dispatch_a = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.plugin_name == "mesh_route_dispatch"
+                    && plugin.namespace == "a"
+                    && plugin.proxy_id.as_deref() == Some(expected_id.as_str())
+            })
+            .expect("namespace a must keep its own dispatch plugin");
+        let dispatch_b = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.plugin_name == "mesh_route_dispatch"
+                    && plugin.namespace == "a-b"
+                    && plugin.proxy_id.as_deref() == Some(expected_id.as_str())
+            })
+            .expect("namespace a-b must keep its own dispatch plugin");
+        assert_eq!(
+            dispatch_a.config["rules"]
+                .as_array()
+                .map(|rules| rules.len()),
+            Some(2),
+            "Gateway API merge within namespace a must still combine GET+POST rules"
+        );
+        assert_eq!(
+            dispatch_b.config["rules"]
+                .as_array()
+                .map(|rules| rules.len()),
+            Some(2),
+            "Gateway API merge within namespace a-b must still combine GET+POST rules"
+        );
+        assert!(
+            result.config.plugin_configs.iter().any(|plugin| {
+                plugin.plugin_name == "request_transformer"
+                    && plugin.namespace == "a"
+                    && plugin.proxy_id.as_deref() == Some(expected_id.as_str())
+            }),
+            "tenant a request_transformer must not be suppressed by tenant a-b"
+        );
+        assert!(
+            result.config.plugin_configs.iter().any(|plugin| {
+                plugin.plugin_name == "request_transformer"
+                    && plugin.namespace == "a-b"
+                    && plugin.proxy_id.as_deref() == Some(expected_id.as_str())
+            }),
+            "tenant a-b request_transformer must not be suppressed by tenant a"
         );
     }
 

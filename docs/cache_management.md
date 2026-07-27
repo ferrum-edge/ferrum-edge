@@ -198,11 +198,11 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **What it stores:** Used nonces for replay protection in WS-Security authentication.
 
-**Default limit:** 10,000 entries.
+**Default limit:** 10,000 entries and 8 MiB total retained nonce-key UTF-8 payload bytes, with each encoded nonce capped at 512 characters. The byte counter counts each canonical encoded nonce's one shared immutable string allocation once; it does not claim to include hash/tree node or reference-count control-block overhead, which remains bounded by the entry cap.
 
-**Config field:** `nonce_replay_protection.max_cache_size` (default 10,000) and `nonce_replay_protection.cache_ttl_seconds` (default 300s).
+**Config fields:** `nonce.max_cache_size` (default 10,000), `nonce.cache_ttl_seconds` (default 300s), `nonce.max_encoded_length` (default 512), and `nonce.max_total_cache_bytes` (default 8,388,608). These are the canonical names; there is no `nonce_replay_protection` alias and that object is rejected as an unknown configuration key.
 
-**Cleanup mechanism:** TTL-based expiration. When the cache reaches `max_cache_size`, expired entries are purged first. If still at capacity after purging, the oldest 10% of entries are forcibly evicted to make room.
+**Cleanup mechanism:** TTL-based expiration through an exact `BTreeMap` age index. The lookup map and age index share the same immutable nonce allocation, so the index does not retain a second nonce string and cannot accumulate stale queue records. A nonce is retained only after its PasswordDigest verifies, and its encoded length is checked before Base64 decoding. When either the entry cap or retained-key-byte cap is reached, the age index removes expired entries first, then selects exact-oldest live entries. One request examines at most 64 indexed entries total and every examined/removed entry costs O(log n); no request scans the lookup map or constructs candidates proportional to `max_cache_size`. Live forced-eviction candidates are committed only if that bounded batch can make room. If the budget is exhausted, state is inconsistent/poisoned, or checked accounting cannot make room, the request fails closed (HTTP 401) without discarding the staged live entries or accepting a nonce whose replay window cannot be recorded. Admission, eviction, and retained-byte accounting share one narrow mutex so concurrent claims cannot overshoot either hard cap (same-key races resolve as replay or in-place refresh without a new reservation).
 
 ### LDAP Auth Cache
 
@@ -282,8 +282,10 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 | `request_deduplication` | `max_entries` | `10000` | Maximum tracked idempotency keys |
 | `request_deduplication` | `max_entry_size_bytes` | `1048576` | Maximum retained completed response entry |
 | `request_deduplication` | `max_total_size_bytes` | `104857600` | Exact maximum retained local completed response-entry bytes |
-| `soap_ws_security` | `nonce_replay_protection.max_cache_size` | `10000` | Maximum tracked nonces |
-| `soap_ws_security` | `nonce_replay_protection.cache_ttl_seconds` | `300` | Nonce expiry TTL |
+| `soap_ws_security` | `nonce.max_cache_size` | `10000` | Maximum tracked nonces |
+| `soap_ws_security` | `nonce.cache_ttl_seconds` | `300` | Nonce expiry TTL |
+| `soap_ws_security` | `nonce.max_encoded_length` | `512` | Maximum encoded `wsse:Nonce` length |
+| `soap_ws_security` | `nonce.max_total_cache_bytes` | `8388608` | Maximum retained nonce-key UTF-8 payload bytes (one count per shared key allocation) |
 | `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results |
 | `ldap_auth` | `cache_ttl_seconds` | `0` | LDAP cache entry TTL (`0` = disabled; maximum `86400`) |
 | `jwks_auth` | `jwks_refresh_interval_secs` | `900` | JWKS key set refresh interval |

@@ -1,0 +1,2 @@
+# Unified patch context lines intentionally retain their one-byte diff marker.
+*.patch whitespace=-blank-at-eol

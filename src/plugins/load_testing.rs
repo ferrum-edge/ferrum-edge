@@ -547,6 +547,11 @@ gateway_port in 1–65535"
         let gateway_base_url = format!("{}://127.0.0.1:{}", scheme, gateway_port);
 
         let mut load_test_builder = reqwest::Client::builder()
+            // Ignore ambient HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY process
+            // state so self-directed load traffic cannot be relayed off-box by
+            // inherited proxy environment (matches the shared PluginHttpClient
+            // builders).
+            .no_proxy()
             .danger_accept_invalid_certs(gateway_tls_no_verify)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_millis(request_timeout_ms));

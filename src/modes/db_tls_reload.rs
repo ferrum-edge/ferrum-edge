@@ -1,9 +1,14 @@
 //! Database TLS source reload support for DB-backed modes.
 //!
 //! The watcher fingerprints configured database TLS material sources. On a
-//! validated byte change it rebuilds the effective DB URLs and asks the active
-//! database backend to reconnect, letting SQL and MongoDB stores preserve their
-//! existing atomic swap behavior.
+//! validated byte change it rebuilds the effective primary DB URL
+//! (`FERRUM_DB_URL`) and asks the active database backend to reconnect,
+//! letting SQL and MongoDB stores preserve their existing atomic swap
+//! behavior. While sticky failover is active, a successful primary TLS
+//! reconnect records primary topology (and may emit the opt-in
+//! divergence-risk marker); it never labels a failover URL as primary.
+//! Failover-URL TLS refresh continues to go through failover reconnect
+//! paths after poll failure.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

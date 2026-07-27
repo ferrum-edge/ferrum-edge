@@ -142,12 +142,14 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   },
   "circuit_breakers": [
     {
+      "namespace": "ferrum",
       "proxy_id": "proxy-payments-v2",
       "state": "closed",
       "failure_count": 0,
       "success_count": 0
     },
     {
+      "namespace": "ferrum",
       "proxy_id": "proxy-legacy-billing",
       "target": "10.0.2.1:8080",
       "state": "open",
@@ -155,6 +157,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
       "success_count": 0
     },
     {
+      "namespace": "ferrum",
       "proxy_id": "proxy-legacy-billing",
       "target": "10.0.2.2:8080",
       "state": "closed",
@@ -162,6 +165,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
       "success_count": 0
     },
     {
+      "namespace": "ferrum",
       "proxy_id": "proxy-search",
       "state": "half_open",
       "failure_count": 3,
@@ -172,11 +176,14 @@ curl -s -H "Authorization: Bearer $TOKEN" \
     "unhealthy_target_count": 2,
     "unhealthy_targets": [
       {
+        "namespace": "ferrum",
+        "upstream_id": "upstream-payments",
         "target": "10.0.3.12:8080",
         "type": "active",
         "since_epoch_ms": 1711720800000
       },
       {
+        "namespace": "ferrum",
         "proxy_id": "proxy-legacy-billing",
         "target": "10.0.5.7:8080",
         "type": "passive",
@@ -185,17 +192,25 @@ curl -s -H "Authorization: Bearer $TOKEN" \
     ]
   },
   "load_balancers": {
-    "active_connections": {
-      "upstream-users": {
-        "10.0.1.1:8080": 24,
-        "10.0.1.2:8080": 19,
-        "10.0.1.3:8080": 22
+    "active_connections": [
+      {
+        "namespace": "ferrum",
+        "upstream_id": "upstream-users",
+        "targets": {
+          "10.0.1.1:8080": 24,
+          "10.0.1.2:8080": 19,
+          "10.0.1.3:8080": 22
+        }
       },
-      "upstream-orders": {
-        "10.0.2.1:8080": 8,
-        "10.0.2.2:8080": 11
+      {
+        "namespace": "ferrum",
+        "upstream_id": "upstream-orders",
+        "targets": {
+          "10.0.2.1:8080": 8,
+          "10.0.2.2:8080": 11
+        }
       }
-    }
+    ]
   },
   "caches": {
     "router": {
@@ -275,9 +290,12 @@ The `http` pool has additional detail fields:
 
 Array of circuit breaker states. For proxies with upstream targets, each target has its own independent breaker (per-target). For direct-backend proxies (no upstream), the breaker is per-proxy. Only proxies that have a `circuit_breaker` config and have been accessed appear in this list.
 
+Runtime cache keys are namespace-qualified (`namespace|proxy_id` / `namespace|proxy_id::host:port`). Authenticated admin output keeps the original resource id in `proxy_id` and exposes `namespace` separately so same-id tenants remain distinguishable.
+
 | Field | Type | Description |
 |-------|------|-------------|
-| `proxy_id` | string | ID of the proxy this circuit breaker protects |
+| `namespace` | string | Namespace that owns this proxy |
+| `proxy_id` | string | ID of the proxy this circuit breaker protects (not namespace-qualified) |
 | `target` | string | *(optional)* Upstream target `host:port` this breaker is scoped to. Present for per-target (upstream) breakers; omitted for direct-backend (per-proxy) breakers |
 | `state` | string | Current state: `closed` (normal), `open` (rejecting with 503), or `half_open` (probing for recovery) |
 | `failure_count` | integer | Consecutive failures in the current state. In `closed`, this increments toward the failure threshold. In `open`, it reflects the count that triggered the opening |
@@ -297,12 +315,14 @@ Health check state showing which upstream targets are currently marked unhealthy
 | Field | Type | Description |
 |-------|------|-------------|
 | `unhealthy_target_count` | integer | Number of targets currently unhealthy |
+| `unhealthy_targets[].namespace` | string | Namespace that owns this health entry |
 | `unhealthy_targets[].target` | string | Target in `host:port` format |
 | `unhealthy_targets[].type` | string | `active` for periodic probe failures; `passive` for failures observed on proxied requests |
 | `unhealthy_targets[].proxy_id` | string | *(conditional)* Proxy that owns a passive entry. Required when `type` is `passive`; omitted when `type` is `active` |
+| `unhealthy_targets[].upstream_id` | string | *(conditional)* Upstream that owns an active entry. Required when `type` is `active`; omitted when `type` is `passive` |
 | `unhealthy_targets[].since_epoch_ms` | integer | Unix epoch milliseconds when the target was marked unhealthy |
 
-Targets are marked unhealthy by either **passive** health checks (monitoring proxied request failures; always include `proxy_id`) or **active** health checks (periodic HTTP/TCP/UDP probes; upstream-scoped, no `proxy_id`). Once healthy again, they are removed from this list and re-included in load balancing.
+Targets are marked unhealthy by either **passive** health checks (monitoring proxied request failures; always include `proxy_id`) or **active** health checks (periodic HTTP/TCP/UDP probes; upstream-scoped with `upstream_id`, no `proxy_id`). Once healthy again, they are removed from this list and re-included in load balancing.
 
 ### `load_balancers`
 
@@ -310,7 +330,7 @@ Active connection counts per upstream target. Only useful when using the `least_
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `active_connections` | object | Nested map: `upstream_id` → `{ "host:port": count }`. Only targets with `count > 0` are included. Empty upstreams (no active requests) are omitted |
+| `active_connections` | array | One object per upstream with active connections. Each entry has `namespace`, `upstream_id`, and `targets` (`host:port` → count). Only targets with `count > 0` are included. Empty upstreams (no active requests) are omitted |
 
 **What to look for:**
 

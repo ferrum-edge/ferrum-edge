@@ -8,14 +8,23 @@
 //! class bucketing, adapted for tokio's `copy_bidirectional_with_sizes` API.
 //!
 //! **Design invariants:**
+//! - Proxy identity is the `(namespace, id)` pair, never a bare proxy id. Two
+//!   tenants that reuse the same proxy id must never share adaptive state, and
+//!   removing one tenant's proxy must not prune the other's.
 //! - Lock-free hot path: `DashMap` sharded reads + `AtomicU64` CAS loops only.
 //! - Zero allocation on hot path: `get_buffer_size()` / `get_batch_limit()` do
-//!   one DashMap read + one atomic load + three comparisons.
+//!   one DashMap read + two atomic loads + three comparisons. The
+//!   `namespace|id` lookup key is written into a reusable thread-local scratch
+//!   buffer instead of a per-event `format!`.
 //! - `record_connection()` / `record_batch_cycle()` allocate only on first-seen
-//!   proxy_id (DashMap insert); subsequent calls are CAS-only.
+//!   `(namespace, id)` (DashMap insert); subsequent calls are CAS-only.
 
 use dashmap::DashMap;
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::config::db_backend::{namespaced_runtime_key, write_namespaced_runtime_key};
 
 // ── EWMA constants ──────────────────────────────────────────────────────────
 
@@ -137,6 +146,33 @@ fn update_ewma(current: &AtomicU64, sample: u64, alpha_fp: u64) {
     }
 }
 
+// ── Namespace-qualified lookup key ──────────────────────────────────────────
+
+thread_local! {
+    /// Reusable scratch buffer for the `namespace|id` lookup key.
+    ///
+    /// Taken out of the cell for the duration of the lookup and put back
+    /// afterwards, so a re-entrant call simply starts from an empty buffer
+    /// instead of panicking on a nested borrow.
+    static KEY_SCRATCH: Cell<String> = const { Cell::new(String::new()) };
+}
+
+/// Run `f` with the namespace-qualified `namespace|id` key for this proxy.
+///
+/// Hot-path contract: no allocation after the calling thread's scratch buffer
+/// has grown once. `f` must not call back into `with_namespaced_key` — a
+/// re-entrant call is still correct, it just allocates a fresh buffer.
+#[inline]
+fn with_namespaced_key<R>(namespace: &str, proxy_id: &str, f: impl FnOnce(&str) -> R) -> R {
+    KEY_SCRATCH.with(|slot| {
+        let mut key = slot.take();
+        write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+        let result = f(&key);
+        slot.set(key);
+        result
+    })
+}
+
 // ── Public tracker ──────────────────────────────────────────────────────────
 
 /// Adaptive buffer and batch limit tracker.
@@ -144,7 +180,8 @@ fn update_ewma(current: &AtomicU64, sample: u64, alpha_fp: u64) {
 /// Maintains per-proxy EWMA of bytes-per-connection and datagrams-per-batch-cycle,
 /// selecting optimal buffer sizes and batch limits for new connections.
 pub struct AdaptiveBufferTracker {
-    /// Per-proxy state, keyed by proxy_id.
+    /// Per-proxy state, keyed by the namespace-qualified `namespace|id` runtime
+    /// key so same-id proxies in different namespaces stay isolated.
     state: DashMap<String, ProxyBufferState>,
     /// EWMA alpha as fixed-point (e.g., 300 = 0.3).
     alpha_fp: u64,
@@ -196,19 +233,68 @@ impl AdaptiveBufferTracker {
         }
     }
 
+    // ── Shared state access ─────────────────────────────────────────────
+
+    /// Read the existing state for `(namespace, proxy_id)` without allocating.
+    #[inline]
+    fn read_state<R>(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        read: impl FnOnce(&ProxyBufferState) -> R,
+    ) -> Option<R> {
+        with_namespaced_key(namespace, proxy_id, |key| {
+            self.state.get(key).map(|entry| read(&entry))
+        })
+    }
+
+    /// Apply `update` to the state for `(namespace, proxy_id)`, creating it on
+    /// first sight. Only the first-seen insert allocates an owned key.
+    #[inline]
+    fn update_state(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        update: impl FnOnce(&ProxyBufferState),
+    ) {
+        // Fast path: the entry already exists, so the scratch key suffices.
+        let deferred = with_namespaced_key(namespace, proxy_id, |key| match self.state.get(key) {
+            Some(entry) => {
+                update(&entry);
+                None
+            }
+            None => Some(update),
+        });
+        // Slow path: first sample for this tenant-scoped proxy.
+        if let Some(update) = deferred {
+            let entry = self
+                .state
+                .entry(namespaced_runtime_key(namespace, proxy_id))
+                .or_insert_with(ProxyBufferState::new);
+            update(&entry);
+        }
+    }
+
     // ── Buffer size (TCP / WS tunnel) ───────────────────────────────────
 
-    /// Returns the recommended buffer size for a new connection on the given proxy.
+    /// Returns the recommended buffer size for a new connection on the given
+    /// namespace-qualified proxy.
     ///
-    /// Hot path: one DashMap read + one atomic load + three comparisons.
+    /// Hot path: one DashMap read + two atomic loads + three comparisons.
     /// Returns `default_buffer_size` when disabled or no data for this proxy.
-    pub fn get_buffer_size(&self, proxy_id: &str) -> usize {
+    pub fn get_buffer_size(&self, namespace: &str, proxy_id: &str) -> usize {
         if !self.buffer_enabled {
             return self.default_buffer_size;
         }
-        let ewma = match self.state.get(proxy_id) {
-            Some(entry) => entry.bytes_ewma.load(Ordering::Relaxed),
-            None => return self.default_buffer_size,
+        // Read both EWMAs under one lookup: the jitter bump below needs the
+        // same entry, and a second lookup would double the hot-path cost.
+        let Some((ewma, jitter_ewma)) = self.read_state(namespace, proxy_id, |entry| {
+            (
+                entry.bytes_ewma.load(Ordering::Relaxed),
+                entry.jitter_ewma.load(Ordering::Relaxed),
+            )
+        }) else {
+            return self.default_buffer_size;
         };
         if ewma == UNSET {
             return self.default_buffer_size;
@@ -217,11 +303,8 @@ impl AdaptiveBufferTracker {
         // If jitter EWMA > 10ms, bump up one tier for safety margin.
         // High jitter indicates lossy/variable real-time traffic that benefits
         // from larger buffers to absorb burst arrivals.
-        if let Some(entry) = self.state.get(proxy_id) {
-            let jitter_ewma = entry.jitter_ewma.load(Ordering::Relaxed);
-            if jitter_ewma != UNSET && jitter_ewma > JITTER_BUMP_THRESHOLD_US && tier < 3 {
-                tier += 1;
-            }
+        if jitter_ewma != UNSET && jitter_ewma > JITTER_BUMP_THRESHOLD_US && tier < 3 {
+            tier += 1;
         }
         BUFFER_TIER_SIZES[tier].clamp(self.min_buffer_size, self.max_buffer_size)
     }
@@ -229,17 +312,15 @@ impl AdaptiveBufferTracker {
     /// Record total bytes transferred on a completed connection.
     ///
     /// Updates the per-proxy bytes EWMA. First sample seeds directly.
-    /// Allocates only on first-seen proxy_id (DashMap insert).
-    pub fn record_connection(&self, proxy_id: &str, total_bytes: u64) {
+    /// Allocates only on a first-seen `(namespace, proxy_id)` (DashMap insert).
+    pub fn record_connection(&self, namespace: &str, proxy_id: &str, total_bytes: u64) {
         if !self.buffer_enabled {
             return;
         }
-        let entry = self
-            .state
-            .entry(proxy_id.to_string())
-            .or_insert_with(ProxyBufferState::new);
-        update_ewma(&entry.bytes_ewma, total_bytes, self.alpha_fp);
-        entry.bytes_sample_count.fetch_add(1, Ordering::Relaxed);
+        self.update_state(namespace, proxy_id, |entry| {
+            update_ewma(&entry.bytes_ewma, total_bytes, self.alpha_fp);
+            entry.bytes_sample_count.fetch_add(1, Ordering::Relaxed);
+        });
     }
 
     // ── Jitter tracking (UDP real-time traffic) ──────────────────────────
@@ -248,30 +329,30 @@ impl AdaptiveBufferTracker {
     /// Jitter is |actual_interval - expected_interval| in microseconds.
     /// Used to adapt UDP buffers for real-time traffic (VoIP, gaming).
     #[allow(dead_code)] // Wired into UDP proxy path incrementally.
-    pub fn record_jitter(&self, proxy_id: &str, jitter_us: u64) {
+    pub fn record_jitter(&self, namespace: &str, proxy_id: &str, jitter_us: u64) {
         if !self.buffer_enabled {
             return;
         }
-        let entry = self
-            .state
-            .entry(proxy_id.to_string())
-            .or_insert_with(ProxyBufferState::new);
-        update_ewma(&entry.jitter_ewma, jitter_us, self.alpha_fp);
+        self.update_state(namespace, proxy_id, |entry| {
+            update_ewma(&entry.jitter_ewma, jitter_us, self.alpha_fp);
+        });
     }
 
     // ── Batch limit (UDP) ───────────────────────────────────────────────
 
-    /// Returns the recommended batch limit for the next recv cycle on the given proxy.
+    /// Returns the recommended batch limit for the next recv cycle on the given
+    /// namespace-qualified proxy.
     ///
     /// Hot path: one DashMap read + one atomic load + three comparisons.
     /// Returns `default_batch_limit` when disabled or no data.
-    pub fn get_batch_limit(&self, proxy_id: &str) -> usize {
+    pub fn get_batch_limit(&self, namespace: &str, proxy_id: &str) -> usize {
         if !self.batch_enabled {
             return self.default_batch_limit;
         }
-        let ewma = match self.state.get(proxy_id) {
-            Some(entry) => entry.dgram_ewma.load(Ordering::Relaxed),
-            None => return self.default_batch_limit,
+        let Some(ewma) = self.read_state(namespace, proxy_id, |entry| {
+            entry.dgram_ewma.load(Ordering::Relaxed)
+        }) else {
+            return self.default_batch_limit;
         };
         if ewma == UNSET {
             return self.default_batch_limit;
@@ -283,25 +364,29 @@ impl AdaptiveBufferTracker {
     /// Record datagrams drained in one batch cycle.
     ///
     /// Updates the per-proxy dgram EWMA. First sample seeds directly.
-    pub fn record_batch_cycle(&self, proxy_id: &str, datagrams_drained: u64) {
+    pub fn record_batch_cycle(&self, namespace: &str, proxy_id: &str, datagrams_drained: u64) {
         if !self.batch_enabled {
             return;
         }
-        let entry = self
-            .state
-            .entry(proxy_id.to_string())
-            .or_insert_with(ProxyBufferState::new);
-        update_ewma(&entry.dgram_ewma, datagrams_drained, self.alpha_fp);
-        entry.dgram_sample_count.fetch_add(1, Ordering::Relaxed);
+        self.update_state(namespace, proxy_id, |entry| {
+            update_ewma(&entry.dgram_ewma, datagrams_drained, self.alpha_fp);
+            entry.dgram_sample_count.fetch_add(1, Ordering::Relaxed);
+        });
     }
 
     // ── Maintenance ─────────────────────────────────────────────────────
 
     /// Remove state for proxies that no longer exist in the config.
-    /// Called on config reload to prevent unbounded DashMap growth.
-    pub fn prune_missing(&self, active_proxy_ids: &[&str]) {
-        self.state
-            .retain(|key, _| active_proxy_ids.contains(&key.as_str()));
+    ///
+    /// Called on config reload to prevent unbounded DashMap growth. Active
+    /// proxies are identified by their `(namespace, id)` pair, so pruning one
+    /// tenant's proxy leaves a same-id proxy in another namespace untouched.
+    pub fn prune_missing(&self, active_proxies: &[(&str, &str)]) {
+        let active: HashSet<String> = active_proxies
+            .iter()
+            .map(|(namespace, id)| namespaced_runtime_key(namespace, id))
+            .collect();
+        self.state.retain(|key, _| active.contains(key.as_str()));
     }
 }
 
@@ -377,38 +462,48 @@ mod tests {
         assert_eq!(inverted.default_buffer_size, 8192);
     }
 
+    const NS: &str = "ferrum";
+
+    /// Internal state lookup mirroring the tracker's own key derivation.
+    fn state_key(namespace: &str, proxy_id: &str) -> String {
+        namespaced_runtime_key(namespace, proxy_id)
+    }
+
     #[test]
     fn get_buffer_size_uses_default_until_enabled_samples_exist() {
         let tracker = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 64);
 
-        assert_eq!(tracker.get_buffer_size("missing"), 65_536);
-        tracker.record_batch_cycle("p1", 500);
+        assert_eq!(tracker.get_buffer_size(NS, "missing"), 65_536);
+        tracker.record_batch_cycle(NS, "p1", 500);
 
-        assert_eq!(tracker.get_buffer_size("p1"), 65_536);
-        assert_eq!(tracker.get_batch_limit("p1"), 2000);
+        assert_eq!(tracker.get_buffer_size(NS, "p1"), 65_536);
+        assert_eq!(tracker.get_batch_limit(NS, "p1"), 2000);
     }
 
     #[test]
     fn disabled_buffer_recording_keeps_default_and_does_not_allocate_state() {
         let tracker = AdaptiveBufferTracker::new(false, true, 300, 8192, 262_144, 65_536, 64);
 
-        tracker.record_connection("p1", 8 * 1024 * 1024);
+        tracker.record_connection(NS, "p1", 8 * 1024 * 1024);
 
-        assert_eq!(tracker.get_buffer_size("p1"), 65_536);
-        assert!(tracker.state.get("p1").is_none());
+        assert_eq!(tracker.get_buffer_size(NS, "p1"), 65_536);
+        assert!(tracker.state.get(&state_key(NS, "p1")).is_none());
     }
 
     #[test]
     fn connection_samples_seed_then_smooth_into_buffer_tiers() {
         let tracker = AdaptiveBufferTracker::new(true, true, 500, 8192, 262_144, 65_536, 64);
 
-        tracker.record_connection("p1", 1024);
-        assert_eq!(tracker.get_buffer_size("p1"), 8192);
+        tracker.record_connection(NS, "p1", 1024);
+        assert_eq!(tracker.get_buffer_size(NS, "p1"), 8192);
 
-        tracker.record_connection("p1", 8 * 1024 * 1024);
-        assert_eq!(tracker.get_buffer_size("p1"), 262_144);
+        tracker.record_connection(NS, "p1", 8 * 1024 * 1024);
+        assert_eq!(tracker.get_buffer_size(NS, "p1"), 262_144);
 
-        let state = tracker.state.get("p1").expect("proxy state should exist");
+        let state = tracker
+            .state
+            .get(&state_key(NS, "p1"))
+            .expect("proxy state should exist");
         assert_eq!(state.bytes_sample_count.load(Ordering::Relaxed), 2);
         assert_eq!(state.bytes_ewma.load(Ordering::Relaxed), 4_194_816);
     }
@@ -416,54 +511,57 @@ mod tests {
     #[test]
     fn buffer_selection_clamps_selected_tier_to_configured_bounds() {
         let min_limited = AdaptiveBufferTracker::new(true, true, 300, 65_536, 262_144, 65_536, 64);
-        min_limited.record_connection("p1", 1024);
-        assert_eq!(min_limited.get_buffer_size("p1"), 65_536);
+        min_limited.record_connection(NS, "p1", 1024);
+        assert_eq!(min_limited.get_buffer_size(NS, "p1"), 65_536);
 
         let max_limited = AdaptiveBufferTracker::new(true, true, 300, 8192, 32 * 1024, 8192, 64);
-        max_limited.record_connection("p1", 8 * 1024 * 1024);
-        assert_eq!(max_limited.get_buffer_size("p1"), 32 * 1024);
+        max_limited.record_connection(NS, "p1", 8 * 1024 * 1024);
+        assert_eq!(max_limited.get_buffer_size(NS, "p1"), 32 * 1024);
     }
 
     #[test]
     fn jitter_bumps_buffer_tier_when_above_threshold() {
         let tracker = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 64);
 
-        tracker.record_connection("p1", 32 * 1024);
-        tracker.record_jitter("p1", JITTER_BUMP_THRESHOLD_US);
-        assert_eq!(tracker.get_buffer_size("p1"), 32 * 1024);
+        tracker.record_connection(NS, "p1", 32 * 1024);
+        tracker.record_jitter(NS, "p1", JITTER_BUMP_THRESHOLD_US);
+        assert_eq!(tracker.get_buffer_size(NS, "p1"), 32 * 1024);
 
-        tracker.record_jitter("p1", JITTER_BUMP_THRESHOLD_US + 4);
-        assert_eq!(tracker.get_buffer_size("p1"), 64 * 1024);
+        tracker.record_jitter(NS, "p1", JITTER_BUMP_THRESHOLD_US + 4);
+        assert_eq!(tracker.get_buffer_size(NS, "p1"), 64 * 1024);
     }
 
     #[test]
     fn batch_limit_uses_defaults_when_disabled_or_unsampled() {
         let disabled = AdaptiveBufferTracker::new(true, false, 300, 8192, 262_144, 65_536, 128);
-        disabled.record_batch_cycle("p1", 10_000);
+        disabled.record_batch_cycle(NS, "p1", 10_000);
 
-        assert_eq!(disabled.get_batch_limit("missing"), 128);
-        assert_eq!(disabled.get_batch_limit("p1"), 128);
-        assert!(disabled.state.get("p1").is_none());
+        assert_eq!(disabled.get_batch_limit(NS, "missing"), 128);
+        assert_eq!(disabled.get_batch_limit(NS, "p1"), 128);
+        assert!(disabled.state.get(&state_key(NS, "p1")).is_none());
 
         let unsampled = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 128);
-        unsampled.record_connection("p1", 8 * 1024);
-        assert_eq!(unsampled.get_batch_limit("p1"), 128);
+        unsampled.record_connection(NS, "p1", 8 * 1024);
+        assert_eq!(unsampled.get_batch_limit(NS, "p1"), 128);
     }
 
     #[test]
     fn batch_samples_seed_then_smooth_into_limit_tiers() {
         let tracker = AdaptiveBufferTracker::new(true, true, 500, 8192, 262_144, 65_536, 64);
 
-        tracker.record_batch_cycle("p1", 9);
-        assert_eq!(tracker.get_batch_limit("p1"), 64);
+        tracker.record_batch_cycle(NS, "p1", 9);
+        assert_eq!(tracker.get_batch_limit(NS, "p1"), 64);
 
-        tracker.record_batch_cycle("p1", 191);
-        assert_eq!(tracker.get_batch_limit("p1"), 2000);
+        tracker.record_batch_cycle(NS, "p1", 191);
+        assert_eq!(tracker.get_batch_limit(NS, "p1"), 2000);
 
-        tracker.record_batch_cycle("p1", 5000);
-        assert_eq!(tracker.get_batch_limit("p1"), 6000);
+        tracker.record_batch_cycle(NS, "p1", 5000);
+        assert_eq!(tracker.get_batch_limit(NS, "p1"), 6000);
 
-        let state = tracker.state.get("p1").expect("proxy state should exist");
+        let state = tracker
+            .state
+            .get(&state_key(NS, "p1"))
+            .expect("proxy state should exist");
         assert_eq!(state.dgram_sample_count.load(Ordering::Relaxed), 3);
         assert_eq!(state.dgram_ewma.load(Ordering::Relaxed), 2550);
     }
@@ -472,19 +570,19 @@ mod tests {
     fn prune_missing_removes_only_inactive_proxy_state() {
         let tracker = AdaptiveBufferTracker::new(true, true, 300, 8192, 262_144, 65_536, 64);
 
-        tracker.record_connection("keep", 1024);
-        tracker.record_batch_cycle("drop", 100);
-        tracker.record_jitter("drop", 20_000);
-        tracker.prune_missing(&["keep"]);
+        tracker.record_connection(NS, "keep", 1024);
+        tracker.record_batch_cycle(NS, "drop", 100);
+        tracker.record_jitter(NS, "drop", 20_000);
+        tracker.prune_missing(&[(NS, "keep")]);
 
-        assert!(tracker.state.get("keep").is_some());
-        assert!(tracker.state.get("drop").is_none());
+        assert!(tracker.state.get(&state_key(NS, "keep")).is_some());
+        assert!(tracker.state.get(&state_key(NS, "drop")).is_none());
     }
 
     #[test]
     fn test_record_jitter_disabled() {
         let tracker = AdaptiveBufferTracker::new(false, false, 300, 8192, 262_144, 65_536, 64);
-        tracker.record_jitter("p1", 15_000);
-        assert!(tracker.state.get("p1").is_none());
+        tracker.record_jitter(NS, "p1", 15_000);
+        assert!(tracker.state.get(&state_key(NS, "p1")).is_none());
     }
 }

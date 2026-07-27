@@ -105,6 +105,7 @@ fn create_mesh_proxy_state_with_config(
         frontend_tls_namespace_sources: Vec::new(),
         trust_bundles: None,
         mesh: None,
+        mesh_revision: None,
     };
     let env_config = EnvConfig {
         mode: OperatingMode::Mesh,

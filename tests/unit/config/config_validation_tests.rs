@@ -533,6 +533,14 @@ fn cp_full_and_incremental_rejection_share_plugin_security_composition_validatio
         shared.contains("validate_plugin_security_composition_candidate("),
         "the shared rejecting contract must include plugin security composition"
     );
+    let rejecting_fn = shared
+        .find("pub(crate) fn collect_rejecting_runtime_config_errors(")
+        .expect("shared rejecting contract function");
+    let rejecting_body = &shared[rejecting_fn..];
+    assert!(
+        rejecting_body.contains("config.validate_resource_ids()"),
+        "shared rejecting contract must fail closed on malformed IDs/namespaces"
+    );
 
     let control_plane = include_str!("../../../src/modes/control_plane.rs");
     let full_start = control_plane
@@ -640,7 +648,7 @@ fn runtime_plugin_file_dependency_validation_runs_off_async_workers() {
 }
 
 #[test]
-fn runtime_plugin_composition_validation_scopes_global_correlation_by_namespace() {
+fn runtime_plugin_composition_validation_treats_globals_as_gateway_wide() {
     let global_correlation = |id: &str, namespace: &str| PluginConfig {
         id: id.to_string(),
         plugin_name: "correlation_id".to_string(),
@@ -665,8 +673,10 @@ fn runtime_plugin_composition_validation_scopes_global_correlation_by_namespace(
     let errors =
         ferrum_edge::_test_support::collect_rejecting_runtime_config_errors_for_test(&config);
     assert!(
-        errors.is_empty(),
-        "global correlation owners in independent namespace slices must not conflict: {errors:?}"
+        errors
+            .iter()
+            .any(|error| error.contains("duplicate effective header_name")),
+        "global correlation owners are installed gateway-wide and must conflict: {errors:?}"
     );
 }
 

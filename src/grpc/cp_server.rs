@@ -39,7 +39,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::stream;
 use serde::Serialize;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -198,6 +198,39 @@ impl CpScope {
             }
             CpScope::All => "ALL namespaces (cluster-wide)".to_string(),
         }
+    }
+
+    /// Durable mesh config-revision sequence for a CP full load (issue #2473).
+    ///
+    /// The sequence domain must match what incremental polling advances from,
+    /// otherwise identical-scope replicas diverge across a restart:
+    ///
+    /// - [`CpScope::Single`] / [`CpScope::Set`]: maximum of the durable
+    ///   per-namespace `latest_change_sequence` cursors for the explicit scope.
+    ///   An unrelated namespace's change must not advance (or permanently
+    ///   quarantine) a restarted peer that never observed that namespace.
+    /// - [`CpScope::All`]: the store-global `config_changes` high-water mark,
+    ///   because the dynamically discovered namespace list can shrink after the
+    ///   last resource in a namespace is deleted and a restarted CP would
+    ///   otherwise rewind past that deleted namespace's sequences.
+    ///
+    /// `floor` is the in-process published high-water mark so an in-process
+    /// full reload cannot stamp backwards either.
+    pub fn mesh_full_load_sequence(
+        &self,
+        scoped_namespace_sequences: &HashMap<String, u64>,
+        store_global_sequence: u64,
+        floor: u64,
+    ) -> u64 {
+        let domain = match self {
+            CpScope::Single(_) | CpScope::Set(_) => scoped_namespace_sequences
+                .values()
+                .copied()
+                .max()
+                .unwrap_or(0),
+            CpScope::All => store_global_sequence,
+        };
+        domain.max(floor)
     }
 }
 

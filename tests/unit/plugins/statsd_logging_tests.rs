@@ -592,7 +592,7 @@ async fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebu
     let omitted = PluginCache::new(&bad_gateway)
         .expect("cache construction must omit the failed optional statsd plugin");
     assert!(
-        omitted.get_plugins("p1").is_empty(),
+        omitted.get_plugins("ferrum", "p1").is_empty(),
         "unknown-key statsd_logging must be omitted, not silently defaulted"
     );
 
@@ -605,14 +605,17 @@ async fn test_statsd_logging_optional_fail_open_on_file_mode_load_and_cache_rebu
         ..GatewayConfig::default()
     };
     let cache = PluginCache::new(&valid_gateway).expect("valid statsd config constructs");
-    assert_eq!(cache.get_plugins("p1").len(), 1);
-    assert_eq!(cache.get_plugins("p1")[0].name(), "statsd_logging");
+    assert_eq!(cache.get_plugins("ferrum", "p1").len(), 1);
+    assert_eq!(
+        cache.get_plugins("ferrum", "p1")[0].name(),
+        "statsd_logging"
+    );
 
     cache
         .rebuild(&bad_gateway)
         .expect("OptionalFailOpen reload omits bad statsd rather than rejecting the generation");
     assert!(
-        cache.get_plugins("p1").is_empty(),
+        cache.get_plugins("ferrum", "p1").is_empty(),
         "reload with unknown keys must drop the previously published statsd instance"
     );
 }

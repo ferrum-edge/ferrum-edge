@@ -1,6 +1,7 @@
 use base64::Engine;
 use chrono::Utc;
 use ferrum_edge::PluginCache;
+use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::config::types::{
     CURRENT_CONFIG_VERSION, GatewayConfig, MAX_COUNTRY_MMDB_SIZE_BYTES, PluginConfig, PluginScope,
@@ -854,7 +855,9 @@ async fn accepted_generation_hands_every_distinct_mmdb_path_to_cache_build() {
     PluginCache::new(&GatewayConfig::default())
         .expect("an unrelated cache build must not consume the accepted handoff");
     let cache = PluginCache::new(&loaded).expect("cache build claims both validated snapshots");
-    let plugins = cache.request_view("http", ProxyProtocol::Http).plugins();
+    let plugins = cache
+        .request_view("ferrum", "http", ProxyProtocol::Http)
+        .plugins();
     let geo_plugins = plugins
         .iter()
         .filter(|plugin| plugin.name() == "geo_restriction")
@@ -956,7 +959,12 @@ async fn delta_budget_counts_retained_and_rebuilt_mmdb_snapshots() {
     std::fs::write(&second_path, replacement).unwrap();
     config.plugin_configs[1].updated_at = "2026-01-01T00:00:01Z".parse().unwrap();
     cache
-        .apply_delta(&config, &HashSet::from(["p2".to_string()]), &[], false)
+        .apply_delta(
+            &config,
+            &HashSet::from([NamespacedResourceId::new("ferrum", "p2")]),
+            &[],
+            false,
+        )
         .unwrap();
 
     assert_eq!(
@@ -964,7 +972,9 @@ async fn delta_budget_counts_retained_and_rebuilt_mmdb_snapshots() {
         (original_bytes.len() as u64) * 2,
         "the resulting generation budget includes p1's retained snapshot and p2's rebuilt snapshot"
     );
-    let p1_plugins = cache.request_view("p1", ProxyProtocol::Http).plugins();
+    let p1_plugins = cache
+        .request_view("ferrum", "p1", ProxyProtocol::Http)
+        .plugins();
     let p1_geo = p1_plugins
         .iter()
         .find(|plugin| plugin.name() == "geo_restriction")
@@ -974,7 +984,9 @@ async fn delta_budget_counts_retained_and_rebuilt_mmdb_snapshots() {
         p1_geo.on_request_received(&mut p1).await,
         PluginResult::Reject { .. }
     ));
-    let p2_plugins = cache.request_view("p2", ProxyProtocol::Http).plugins();
+    let p2_plugins = cache
+        .request_view("ferrum", "p2", ProxyProtocol::Http)
+        .plugins();
     let p2_geo = p2_plugins
         .iter()
         .find(|plugin| plugin.name() == "geo_restriction")

@@ -121,6 +121,7 @@ use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde::ser::{Serialize, SerializeMap};
 use serde_json::Value;
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
@@ -2736,6 +2737,21 @@ impl RequestContext {
         self.response_stream_id
     }
 
+    /// Request-owned handoff used by inspector tasks to publish terminal state
+    /// before the completion signal wakes [`Plugin::on_response_stream_terminated`].
+    ///
+    /// State placed here is bounded by this response's configured inspector
+    /// chain plus a hard per-request ceiling, and drops with the request
+    /// context if terminal processing itself is cancelled; it is never a
+    /// process-global tombstone.
+    pub fn response_stream_handoff(&self) -> Option<ResponseStreamHandoff> {
+        self.response_stream_completion
+            .as_ref()
+            .map(|completion| ResponseStreamHandoff {
+                completion: Arc::clone(completion),
+            })
+    }
+
     /// Return the authoritative client IP as a canonical typed address.
     ///
     /// The value is parsed at most once after trusted-forwarding resolution and
@@ -4369,6 +4385,15 @@ pub trait ResponseStreamInspector: Send {
     /// the chain. Earlier inspectors can use this to discard pre-cut state that
     /// no longer represents the client-visible stream.
     fn on_downstream_terminated(&mut self) {}
+
+    /// Called immediately before the owning stream task publishes inspector
+    /// completion to terminal hooks.
+    ///
+    /// Inspectors that use a drop-time ownership handoff can publish it here so
+    /// [`Plugin::on_response_stream_terminated`] cannot race the inspector's
+    /// ordinary field drop. The default is a no-op; this is not a per-chunk
+    /// hook.
+    fn on_before_drop(&mut self) {}
 }
 
 /// Compose the stream inspectors of several plugins into one, so a response with
@@ -4394,11 +4419,22 @@ pub fn chain_response_stream_inspectors(
 }
 
 static NEXT_RESPONSE_STREAM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_RESPONSE_STREAM_HANDOFF_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+const MAX_RESPONSE_STREAM_HANDOFFS_PER_REQUEST: usize = 256;
 
-#[derive(Debug)]
+/// Allocate a process-unique key for one plugin instance's typed response
+/// stream handoff.
+pub fn allocate_response_stream_handoff_id() -> u64 {
+    NEXT_RESPONSE_STREAM_HANDOFF_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+type ResponseStreamHandoffEntries = Vec<(u64, Arc<dyn Any + Send + Sync>)>;
+
 struct ResponseStreamCompletion {
     completed: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
+    handoffs: std::sync::Mutex<ResponseStreamHandoffEntries>,
 }
 
 impl ResponseStreamCompletion {
@@ -4406,7 +4442,30 @@ impl ResponseStreamCompletion {
         Self {
             completed: std::sync::atomic::AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
+            handoffs: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn publish<T: Any + Send + Sync>(&self, key: u64, value: Arc<T>) {
+        let Ok(mut handoffs) = self.handoffs.lock() else {
+            return;
+        };
+        if handoffs.iter().any(|(existing, _)| *existing == key) {
+            return;
+        }
+        if handoffs.len() >= MAX_RESPONSE_STREAM_HANDOFFS_PER_REQUEST {
+            return;
+        }
+        handoffs.push((key, value));
+    }
+
+    fn take<T: Any + Send + Sync>(&self, key: u64) -> Option<Arc<T>> {
+        let value = {
+            let mut handoffs = self.handoffs.lock().ok()?;
+            let index = handoffs.iter().position(|(existing, _)| *existing == key)?;
+            handoffs.swap_remove(index).1
+        };
+        Arc::downcast::<T>(value).ok()
     }
 
     fn complete(&self) {
@@ -4429,6 +4488,34 @@ impl ResponseStreamCompletion {
             }
             notified.await;
         }
+    }
+}
+
+impl std::fmt::Debug for ResponseStreamCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResponseStreamCompletion")
+            .field(
+                "completed",
+                &self.completed.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Cloneable, request-owned terminal-state handoff for response inspectors.
+#[derive(Clone)]
+pub struct ResponseStreamHandoff {
+    completion: Arc<ResponseStreamCompletion>,
+}
+
+impl ResponseStreamHandoff {
+    pub fn publish<T: Any + Send + Sync>(&self, key: u64, value: Arc<T>) {
+        self.completion.publish(key, value);
+    }
+
+    pub fn take<T: Any + Send + Sync>(&self, key: u64) -> Option<Arc<T>> {
+        self.completion.take(key)
     }
 }
 
@@ -4458,6 +4545,11 @@ impl ResponseStreamInspector for CompletionNotifyingInspector {
 
 impl Drop for CompletionNotifyingInspector {
     fn drop(&mut self) {
+        // Publish inspector-owned terminal handoffs before waking terminal
+        // hooks. Rust drops fields only after this Drop implementation returns,
+        // which is too late for inspectors whose fallback correlation is
+        // intentionally created at task termination.
+        self.inner.on_before_drop();
         self.completion.complete();
     }
 }
@@ -4515,14 +4607,17 @@ pub(crate) fn create_response_stream_inspector_for_enabled_plugins(
 
     ctx.response_stream_id =
         Some(NEXT_RESPONSE_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let completion = Arc::new(ResponseStreamCompletion::new());
+    // Factories receive `&RequestContext`, so publish the request-owned handoff
+    // before invoking them. It is cleared again below when every factory
+    // declines the concrete response.
+    ctx.response_stream_completion = Some(Arc::clone(&completion));
     let inspectors: Vec<_> = plugins
         .iter()
         .filter_map(|plugin| plugin.response_stream_inspector(ctx, response_status, content_type))
         .collect();
     let inspector = chain_response_stream_inspectors(inspectors);
     if let Some(inspector) = inspector {
-        let completion = Arc::new(ResponseStreamCompletion::new());
-        ctx.response_stream_completion = Some(Arc::clone(&completion));
         Some(Box::new(CompletionNotifyingInspector {
             inner: inspector,
             completion,
@@ -4714,6 +4809,12 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
             carry = released.freeze();
         }
         ResponseStreamAction::Forward(carry)
+    }
+
+    fn on_before_drop(&mut self) {
+        for inspector in &mut self.inspectors {
+            inspector.on_before_drop();
+        }
     }
 }
 
@@ -5566,6 +5667,15 @@ pub struct StreamConnectionContext {
     /// metadata is only a compatibility projection of this lifecycle state.
     correlation_ids: CorrelationIdState,
     pub proxy_id: String,
+    /// Namespace owning `proxy_id` for this connection/session.
+    ///
+    /// Proxy IDs are unique only within a namespace, so every proxy-keyed
+    /// runtime lookup (plugin cache, lifecycle generation, adaptive buffer)
+    /// must be qualified by this. Stamped by the TCP/UDP accept paths from the
+    /// listener's exact identity, and replaced with the matched candidate's
+    /// namespace when SNI resolves a shared passthrough port. Defaults to the
+    /// gateway default namespace for externally constructed contexts.
+    pub proxy_namespace: String,
     pub proxy_name: Option<String>,
     /// Ownership generation captured at stream admission. Carried into
     /// [`StreamTransactionSummary`] so `proxy_alerts` can reject disconnect
@@ -5656,6 +5766,7 @@ impl StreamConnectionContext {
             canonical_client_ip: CanonicalClientIpCache::default(),
             correlation_ids: CorrelationIdState::default(),
             proxy_id,
+            proxy_namespace: crate::config::types::default_namespace(),
             proxy_name,
             proxy_lifecycle_generation: None,
             listen_port,
@@ -8385,10 +8496,12 @@ pub(crate) fn screen_redis_endpoint_egress(
 /// the shared resolver. A denied literal endpoint must still be rejected at
 /// config-load so file/admin/DB/CP-DP admission is consistent with runtime.
 ///
-/// LDAP hostnames are freshly resolved and screened immediately before every
-/// connection/reconnection. Other clients outside `DnsCache` retain their
-/// documented hostname limitations; JWKS hostname resolution keeps the shared
-/// client's runtime policy backstop.
+/// LDAP and `ws_logging` hostnames are freshly resolved and screened
+/// immediately before every connection/reconnection, and only screened
+/// addresses are dialed. `kafka_logging` cannot reach that bar with the pinned
+/// librdkafka client and is therefore refused outright under any policy that
+/// can deny an address (see `kafka_logging::screen_kafka_broker_list_egress`).
+/// JWKS hostname resolution keeps the shared client's runtime policy backstop.
 pub(crate) fn screen_direct_client_endpoint_egress(
     name: &str,
     config: &Value,
@@ -8432,25 +8545,14 @@ pub(crate) fn screen_direct_client_endpoint_egress(
                 ));
             }
         }
-        // broker_list is a comma-separated list of `host:port` (or `[v6]:port`,
-        // or a bare host/IP) entries with no scheme.
+        // broker_list is parsed with the pinned librdkafka grammar
+        // (`[proto://]host[:port]`, comma separated) so protocol-prefixed
+        // literals are screened too, and kafka_logging is refused outright when
+        // the policy can deny addresses librdkafka would dial without Ferrum
+        // ever seeing them (bootstrap hostname resolution, metadata-advertised
+        // brokers). See `kafka_logging::screen_kafka_broker_list_egress`.
         "kafka_logging" => {
-            if let Some(brokers) = config.get("broker_list").and_then(|v| v.as_str()) {
-                for entry in brokers.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    let literal = entry
-                        .parse::<std::net::SocketAddr>()
-                        .map(|sa| sa.ip())
-                        .ok()
-                        .or_else(|| crate::config::types::egress_literal_ip(entry));
-                    if let Some(ip) = literal
-                        && let Some(reason) = backend_allow_ips.deny_reason(&ip)
-                    {
-                        return Err(format!(
-                            "broker_list IP {ip} denied by backend egress policy: {reason}"
-                        ));
-                    }
-                }
-            }
+            kafka_logging::screen_kafka_broker_list_egress(config, backend_allow_ips)?;
         }
         // endpoint_url is a single ws:// / wss:// URL; ws_logging dials it via
         // tokio_tungstenite outside the shared client + DnsCache.

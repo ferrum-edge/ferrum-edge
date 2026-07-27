@@ -280,7 +280,11 @@ fn locality_distribute_first_wave_buckets_are_not_lockstep() {
         upstreams: vec![up],
         ..GatewayConfig::default()
     });
-    let lb = cache.load().get_balancer("u1").expect("balancer").clone();
+    let lb = cache
+        .load()
+        .get_balancer("ferrum", "u1")
+        .expect("balancer")
+        .clone();
 
     // Weighted total is 100; all-zero phases would map every shard to the same
     // first bucket via golden_ratio_hash(0) % 100.
@@ -389,8 +393,14 @@ fn locality_distribute_weighted_bucket_pick_stays_proportional() {
     let mut west = 0u64;
     let mut east = 0u64;
     for i in 0..5_000 {
-        let sel = LoadBalancerCache::select_target_from(&snapshot, "u1", &format!("d-{i}"), None)
-            .expect("distribute selection");
+        let sel = LoadBalancerCache::select_target_from(
+            &snapshot,
+            "ferrum",
+            "u1",
+            &format!("d-{i}"),
+            None,
+        )
+        .expect("distribute selection");
         match sel.target.host.as_str() {
             "west-a" | "west-b" => west += 1,
             "east-a" => east += 1,
@@ -509,6 +519,7 @@ fn port_override_lane_round_robin_stays_even_under_concurrency() {
             for i in 0..per_thread {
                 let sel = LoadBalancerCache::select_target_for_port_from(
                     &snapshot,
+                    "ferrum",
                     "u1",
                     &format!("p-{i}"),
                     8080,

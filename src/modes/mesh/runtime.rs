@@ -18,6 +18,10 @@ use crate::identity::SpiffeId;
 use crate::modes::mesh::config::{MeshPolicy, Workload, policy_scope_applies_to_workload};
 use crate::modes::mesh::federation::FederationStore;
 use crate::modes::mesh::multicluster::RemoteEndpointStore;
+use crate::modes::mesh::revision::{
+    MeshConfigRevision, MeshRevisionApplyToken, MeshRevisionDiagnostics, MeshRevisionGate,
+    MeshRevisionPolicy, MeshRevisionRejection,
+};
 use crate::modes::mesh::slice::{MeshEgressScopeSnapshot, MeshSlice};
 use crate::plugins::mesh::outbound_registry::OutboundRegistry;
 
@@ -218,6 +222,38 @@ pub struct MeshRuntimeState {
     /// Latest xDS resource-warming convergence snapshot, published by the xDS
     /// client. `None` in native mode and before the first ADS response.
     xds_convergence: Arc<ArcSwap<Option<Arc<XdsConvergenceSnapshot>>>>,
+    /// Authoritative config-revision freshness gate (issue #2473). Every slice
+    /// install runs through it BEFORE the `ArcSwap` replacement, so a lagging
+    /// fallback CP cannot roll this data plane back to an older generation.
+    /// Cold path only — nothing on the proxy request path reads it.
+    revision_gate: Arc<MeshRevisionGate>,
+}
+
+/// Outcome of [`MeshRuntimeState::install_slice`].
+///
+/// Deliberately NOT `#[must_use]`: local, inherently ordered installers (the
+/// file source, tests) legitimately ignore it, while the two control-plane-fed
+/// consumers (native `MeshSubscribe`, xDS ADS) match on it. The gate itself is
+/// unconditional — the enum only reports what it decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeshSliceInstall {
+    /// The slice replaced live state.
+    Installed,
+    /// The slice was quarantined; the previously installed slice keeps serving.
+    Quarantined(MeshRevisionRejection),
+}
+
+impl MeshSliceInstall {
+    pub const fn installed(&self) -> bool {
+        matches!(self, Self::Installed)
+    }
+
+    pub fn rejection(&self) -> Option<&MeshRevisionRejection> {
+        match self {
+            Self::Installed => None,
+            Self::Quarantined(rejection) => Some(rejection),
+        }
+    }
 }
 
 impl MeshRuntimeState {
@@ -237,7 +273,48 @@ impl MeshRuntimeState {
             federation_store: FederationStore::new(),
             remote_endpoint_store: RemoteEndpointStore::new(),
             xds_convergence: Arc::new(ArcSwap::new(Arc::new(None))),
+            revision_gate: Arc::new(MeshRevisionGate::new()),
         }
+    }
+
+    /// Install the operator's revision-gate policy
+    /// (`FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`). Called once during mesh
+    /// startup, before any consumer is spawned.
+    pub fn set_revision_policy(&self, policy: MeshRevisionPolicy) {
+        self.revision_gate.set_policy(policy);
+    }
+
+    /// Revision currently admitted into the RECEIVED slot by the freshness
+    /// gate, or `None` when no revisioned slice has been admitted. Raw
+    /// CP-supplied value — for ordering, not for logging; use
+    /// [`Self::revision_diagnostics`] for anything operator-facing.
+    pub fn accepted_revision(&self) -> Option<MeshConfigRevision> {
+        self.revision_gate.accepted()
+    }
+
+    /// Revision of the slice the proxy runtime last accepted — the last-good
+    /// generation, and the rollback target for a runtime-refused candidate.
+    /// Raw CP-supplied value, same handling rule as [`Self::accepted_revision`].
+    pub fn applied_revision(&self) -> Option<MeshConfigRevision> {
+        self.revision_gate.applied()
+    }
+
+    /// Operator diagnostics for `GET /mesh/config-drift`'s `revision` block.
+    pub fn revision_diagnostics(&self) -> MeshRevisionDiagnostics {
+        self.revision_gate.diagnostics()
+    }
+
+    /// Clear the accepted revision (operator escape hatch behind
+    /// `POST /mesh/config-revision/reset`). Returns the cleared revision with
+    /// its CP-supplied authority already sanitized for the audit log and the
+    /// admin response.
+    ///
+    /// This is the documented recovery for a sequence rewind INSIDE one
+    /// authority — a config store restored from backup without bumping
+    /// `FERRUM_MESH_CONFIG_AUTHORITY_ID`. It never installs anything itself: it
+    /// only makes the next slice from any authority eligible again.
+    pub fn reset_accepted_revision(&self) -> Option<MeshConfigRevision> {
+        self.revision_gate.reset()
     }
 
     /// Publish the latest xDS resource-warming convergence snapshot. Called by
@@ -318,7 +395,29 @@ impl MeshRuntimeState {
     }
 
     /// Hot-swap the live mesh slice and notify waiters on the first install.
-    pub fn install_slice(&self, slice: MeshSlice) {
+    ///
+    /// Fail-closed on config-revision ordering (issue #2473): the candidate's
+    /// [`MeshSlice::revision`] is admitted by the freshness gate BEFORE the
+    /// `ArcSwap` replacement, so a slice that is older than — or from a
+    /// different ordering domain than — the accepted revision never becomes
+    /// live. A quarantined candidate mutates nothing: the previously installed
+    /// slice keeps serving, no receive metric is recorded, no `last_install_at`
+    /// stamp advances, and no revision watcher is woken. The gate is
+    /// unconditional and lives here rather than in any one consumer, so the
+    /// native `MeshSubscribe` client, the xDS ADS client, and any future
+    /// installer share exactly one ordering decision.
+    ///
+    /// Admission is PROVISIONAL: it only makes the candidate the received
+    /// slice. The watermark is finalized by [`Self::record_applied_slice`] when
+    /// the proxy runtime accepts it, or returned to the last applied generation
+    /// by [`Self::record_rejected_slice`] when the runtime refuses it.
+    pub fn install_slice(&self, slice: MeshSlice) -> MeshSliceInstall {
+        if let Err(rejection) = self
+            .revision_gate
+            .admit(slice.revision.as_ref(), Utc::now())
+        {
+            return MeshSliceInstall::Quarantined(rejection);
+        }
         crate::plugins::mesh::prometheus_helpers::record_mesh_config_received(&slice.namespace);
         self.current.store(Arc::new(Some(slice)));
         // Stamp the receive timestamp before publishing the revision bump so
@@ -330,10 +429,40 @@ impl MeshRuntimeState {
         if !was_first {
             self.first_ready.notify_waiters();
         }
+        MeshSliceInstall::Installed
     }
 
     /// Publish a slice after the mesh proxy runtime accepts it.
+    ///
+    /// This is the COMMIT half of the config-revision lifecycle (issue #2473):
+    /// the freshness gate's authoritative last-good watermark advances here,
+    /// when the generation actually became live, not when it was received.
+    /// Committing first means any observer woken by the applied-slice watcher
+    /// already sees a watermark consistent with the slice it is about to read.
     pub fn record_applied_slice(&self, slice: &MeshSlice) {
+        let token = self.revision_gate.begin_apply(slice.revision.as_ref());
+        self.record_applied_slice_with_token(slice, token);
+    }
+
+    /// Capture the config-revision apply capability before asynchronous proxy
+    /// preparation begins. A concurrent operator reset invalidates the token,
+    /// so completion of pre-reset work cannot restore the cleared watermark.
+    pub(crate) fn begin_revision_apply(&self, slice: &MeshSlice) -> Option<MeshRevisionApplyToken> {
+        self.revision_gate.begin_apply(slice.revision.as_ref())
+    }
+
+    /// Commit a runtime-accepted slice with the capability captured before its
+    /// asynchronous apply began.
+    pub(crate) fn record_applied_slice_with_token(
+        &self,
+        slice: &MeshSlice,
+        token: Option<MeshRevisionApplyToken>,
+    ) {
+        if let Some(token) = token {
+            let _ = self
+                .revision_gate
+                .commit_applied(slice.revision.as_ref(), token);
+        }
         // GAP-3E: refresh RTDS-driven consumers only after proxy config
         // acceptance. Rejected slices must not mutate live log/transformer
         // state while the proxy keeps serving the previous accepted config.
@@ -347,6 +476,42 @@ impl MeshRuntimeState {
         self.last_applied_at.store(Arc::new(Some(Utc::now())));
         self.applied_revision_tx
             .send_modify(|revision| *revision += 1);
+    }
+
+    /// Finalize a received candidate the mesh proxy runtime REFUSED.
+    ///
+    /// The ROLLBACK half of the config-revision lifecycle (issue #2473).
+    /// `install_slice` advances the accepted watermark when a candidate enters
+    /// the received slot, but the proxy runtime is a second, independent gate:
+    /// slice→config preparation or `ProxyState::update_config` can still refuse
+    /// it, leaving the previous generation serving. Without this call the
+    /// watermark would keep the refused revision, so one runtime-invalid slice
+    /// published at a far-future sequence would lock out every valid revision
+    /// beneath it — a hostile or buggy control plane could poison the ordering
+    /// domain and block recovery with a slice that never served a request.
+    ///
+    /// `received` must be the exact `Arc` the apply path pulled from
+    /// [`Self::snapshot`]. Two independent identity checks make a late
+    /// rejection safe against a concurrent newer install:
+    ///
+    /// 1. Pointer identity against the live received slot — each install
+    ///    publishes a fresh `Arc`, and the caller holding this one keeps the
+    ///    address from being reused, so a mismatch proves a newer candidate has
+    ///    superseded it.
+    /// 2. Exact `(authority, sequence)` equality inside the gate lock, which
+    ///    closes the window between the pointer check and the rollback.
+    ///
+    /// Returns whether the watermark was rolled back. Cold path; nothing on the
+    /// proxy request path calls it.
+    pub fn record_rejected_slice(&self, received: &Arc<Option<MeshSlice>>) -> bool {
+        let Some(slice) = received.as_ref().as_ref() else {
+            return false;
+        };
+        if !Arc::ptr_eq(&self.current.load_full(), received) {
+            return false;
+        }
+        self.revision_gate
+            .rollback_rejected(slice.revision.as_ref())
     }
 
     /// Resolve once the initial mesh slice is available.
@@ -379,6 +544,43 @@ mod tests {
 
     fn install_slice_for_test(state: &MeshRuntimeState, slice: MeshSlice) {
         state.install_slice(slice);
+    }
+
+    #[test]
+    fn reset_invalidates_an_in_flight_revision_apply_token() {
+        let state = MeshRuntimeState::new();
+        let candidate = MeshSlice {
+            revision: Some(MeshConfigRevision::new("db", 10)),
+            ..MeshSlice::default()
+        };
+        assert!(state.install_slice(candidate.clone()).installed());
+        let token = state
+            .begin_revision_apply(&candidate)
+            .expect("the admitted candidate mints an apply token");
+
+        assert_eq!(
+            state.reset_accepted_revision(),
+            Some(MeshConfigRevision::new("db", 10))
+        );
+        state.record_applied_slice_with_token(&candidate, Some(token));
+
+        assert!(
+            state.accepted_revision().is_none(),
+            "a pre-reset apply completion must not resurrect accepted"
+        );
+        assert!(
+            state.applied_revision().is_none(),
+            "a pre-reset apply completion must not recreate the rollback target"
+        );
+        assert_eq!(
+            state
+                .applied_snapshot()
+                .as_ref()
+                .as_ref()
+                .and_then(|slice| slice.revision.as_ref()),
+            Some(&MeshConfigRevision::new("db", 10)),
+            "the proxy-accepted content remains observable even though reset keeps the ordering baseline clear"
+        );
     }
 
     #[test]

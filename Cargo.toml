@@ -68,6 +68,10 @@ tokio-stream = { version = "0.1", features = ["full"] }
 # HTTP
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
+# ACME wraps hyper-rustls around Ferrum's policy-aware connector so the
+# original hostname remains the SNI/certificate identity while only screened
+# resolved addresses are dialed.
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "ring", "rustls-platform-verifier"], optional = true }
 h2 = "0.4"
 http-body = "1"
 http-body-util = "0.1"
@@ -264,7 +268,7 @@ aya-log = { version = "0.2", optional = true }
 # builds that never use external secret providers.
 [features]
 default = []
-acme = ["dep:instant-acme"]
+acme = ["dep:instant-acme", "dep:hyper-rustls"]
 pkcs11 = ["dep:cryptoki"]
 cloud-secrets = ["secrets-vault", "secrets-aws", "secrets-gcp", "secrets-azure"]
 secrets-vault = ["dep:vaultrs"]
@@ -396,8 +400,15 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # directories, bump dependency versions/lockfile normally, and keep the gateway
 # call site using the same upstream API. See
 # `docs/upstream-tungstenite-patches/README.md`.
+#
+# We also carry a narrowly scoped copy of dimpl 0.6.1 that transmits complete
+# leaf-first certificate chains and owns every retained private-key byte copy
+# in zeroizing storage. No compatible upstream release currently provides
+# either security property. See
+# `docs/upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md`.
 [patch.crates-io]
 reqwest = { path = "vendor/reqwest-0.13.3-ferrum-patched" }
 h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }
 tungstenite = { path = "vendor/tungstenite-0.29.0-ferrum-patched" }
 tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }
+dimpl = { path = "vendor/dimpl-0.6.1-ferrum-patched" }

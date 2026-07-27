@@ -425,17 +425,15 @@ fn test_upload_gate_forwards_on_clean_completion() {
 }
 
 #[test]
-fn test_upload_gate_forwards_on_error_and_abandon() {
-    // Neither outcome can coexist with an overflow: `poll_frame` takes the
-    // completion sender when it stores `exceeded`, so an exceeded upload always
-    // reports `Exceeded`. Failing closed here would turn a backend that answers
-    // early and resets the unread upload — or a client that disconnects
-    // mid-body — into a 502 without enforcing anything extra.
+fn test_upload_gate_fails_closed_on_error_and_abandon() {
+    // Neither outcome proves that the complete upload was within the limit:
+    // unread frames can remain after a backend reset, and a transport error can
+    // interrupt polling before an over-limit frame is observed.
     for outcome in [RequestBodyOutcome::Errored, RequestBodyOutcome::Abandoned] {
         assert_eq!(
             direct_h2_upload_gate_for_test(Some(outcome)),
-            DirectH2UploadGateForTest::Forward,
-            "outcome {outcome:?} must forward the backend response"
+            DirectH2UploadGateForTest::FailClosed,
+            "outcome {outcome:?} must fail closed"
         );
     }
 }

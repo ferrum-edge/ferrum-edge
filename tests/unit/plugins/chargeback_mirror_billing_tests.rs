@@ -92,12 +92,12 @@ fn chargeback_key(
 ) -> String {
     let scope = InstanceScope::new("USD", "ferrum");
     format!(
-        "{}|{}|{}|http|{}|{}|{:016x}|{:016x}|{:016x}",
+        "{}|{}|{}|{}|http|{}|{:016x}|{:016x}|{:016x}",
         consumer,
+        scope.namespace,
         proxy_id,
         status_code,
         scope.currency,
-        scope.namespace_label,
         call_price.to_bits(),
         bw_price_sent.to_bits(),
         bw_price_received.to_bits()

@@ -464,6 +464,28 @@ fn test_grpc_backend_request_classifies_as_post_wire() {
 }
 
 #[test]
+fn test_grpc_dispatch_canceled_classifies_as_pre_wire_pool_error() {
+    // hyper `is_canceled` on a buffered body proves the request never left
+    // the client. Map to ConnectionPoolError so request_reached_wire is
+    // false and retry_on_connect_failure can redial after pool invalidation.
+    let err = GrpcProxyError::backend_unavailable(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::DispatchCanceled,
+        "Backend error: canceled".into(),
+    );
+    let class = classify_grpc_proxy_error(&err);
+    assert_eq!(class, ErrorClass::ConnectionPoolError);
+    assert!(
+        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::DispatchCanceled
+            .is_connect_class()
+    );
+    assert!(
+        !ferrum_edge::retry::request_reached_wire(class),
+        "DispatchCanceled must be pre-wire so buffered unary RPCs retry on \
+         pooled-sender GOAWAY races"
+    );
+}
+
+#[test]
 fn test_grpc_kind_is_connect_class_partitions_correctly() {
     use ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind as K;
     // Pre-wire (safe to replay regardless of method idempotency): retry loops
@@ -475,6 +497,7 @@ fn test_grpc_kind_is_connect_class_partitions_correctly() {
         K::H2Handshake,
         K::H2cHandshake,
         K::InvalidServerName,
+        K::DispatchCanceled,
     ] {
         assert!(
             kind.is_connect_class(),
@@ -512,6 +535,7 @@ fn test_every_connect_class_kind_classifies_as_pre_wire() {
         K::H2cHandshake,
         K::InvalidServerName,
         K::BackendRequest,
+        K::DispatchCanceled,
     ];
     // Compile-time exhaustiveness: if a new variant is added, this match
     // forces an update before tests can compile.
@@ -523,7 +547,8 @@ fn test_every_connect_class_kind_classifies_as_pre_wire() {
             | K::H2Handshake
             | K::H2cHandshake
             | K::InvalidServerName
-            | K::BackendRequest => (),
+            | K::BackendRequest
+            | K::DispatchCanceled => (),
         };
         let err = GrpcProxyError::backend_unavailable(kind, format!("{kind:?} test"));
         let class = classify_grpc_proxy_error(&err);
@@ -1328,6 +1353,236 @@ fn test_substring_fallback_anchored_tls_handshake() {
     let err: Box<dyn std::error::Error + Send + Sync> =
         "outbound request failed: tls handshake aborted by peer".into();
     assert_eq!(classify_boxed_error(&*err), ErrorClass::TlsError);
+}
+
+#[test]
+fn test_direct_h2_send_request_error_response_maintains_wire_boundary() {
+    // connection_error must equal !request_reached_wire(error_class) for every
+    // class the direct-H2 send_request mapper can emit. Flattening everything
+    // to ProtocolError with connection_error=true previously violated this.
+    use ferrum_edge::_test_support::direct_h2_send_request_error_response_for_class_for_test;
+    for class in [
+        ErrorClass::ConnectionPoolError,
+        ErrorClass::ConnectionRefused,
+        ErrorClass::ConnectionTimeout,
+        ErrorClass::ConnectionReset,
+        ErrorClass::ConnectionClosed,
+        ErrorClass::ProtocolError,
+        ErrorClass::ReadWriteTimeout,
+        ErrorClass::TlsError,
+        ErrorClass::DnsLookupError,
+        ErrorClass::RequestError,
+    ] {
+        let resp = direct_h2_send_request_error_response_for_class_for_test(
+            class,
+            Some("127.0.0.1".into()),
+        );
+        assert_eq!(resp.error_class, Some(class));
+        assert_eq!(
+            resp.connection_error,
+            !ferrum_edge::retry::request_reached_wire(class),
+            "{class:?}: connection_error must equal !request_reached_wire"
+        );
+    }
+}
+
+#[test]
+fn test_pooled_h2_send_request_classifier_is_public_for_dispatch_sites() {
+    // Guard the public surface used by `direct_h2_send_request_error_response`
+    // so a future refactor cannot re-privatize the canonical classifier.
+    let src = include_str!("../../../src/proxy/http2_pool.rs");
+    assert!(
+        src.contains("pub fn classify_pooled_h2_send_request_error("),
+        "direct-H2 send_request errors must classify through a public helper"
+    );
+    assert!(
+        src.contains("if hyper_err.is_canceled()"),
+        "pooled send_request classifier must treat hyper is_canceled as pre-wire"
+    );
+    assert!(
+        src.contains("return normalize_pooled_h2_send_post_wire_class(cls);"),
+        "typed source-chain errors must pass through the conservative post-wire boundary"
+    );
+    let mod_src = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        mod_src.contains("classify_pooled_h2_send_request_error"),
+        "map_h2_err must use the canonical pooled-send classifier"
+    );
+    assert!(
+        !mod_src.contains(
+            "connection_error: true,\n                backend_resolved_ip: resolved_ip,\n                error_class: Some(retry::ErrorClass::ProtocolError)"
+        ),
+        "must not hard-code connection_error=true with ProtocolError"
+    );
+}
+
+#[test]
+fn test_pooled_h2_send_source_classes_fail_closed_as_post_wire() {
+    use ferrum_edge::_test_support::normalize_pooled_h2_send_post_wire_class_for_test as normalize;
+    use ferrum_edge::retry::request_reached_wire;
+
+    for class in [
+        ErrorClass::ConnectionRefused,
+        ErrorClass::ConnectionTimeout,
+        ErrorClass::DnsLookupError,
+        ErrorClass::TlsError,
+        ErrorClass::PortExhaustion,
+        ErrorClass::ConnectionPoolError,
+    ] {
+        let mapped = normalize(class);
+        assert_eq!(mapped, ErrorClass::ProtocolError, "{class:?}");
+        assert!(request_reached_wire(mapped), "{class:?} -> {mapped:?}");
+    }
+
+    for class in [
+        ErrorClass::ReadWriteTimeout,
+        ErrorClass::ConnectionReset,
+        ErrorClass::ConnectionClosed,
+        ErrorClass::ProtocolError,
+        ErrorClass::RequestError,
+    ] {
+        assert_eq!(normalize(class), class, "{class:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_remaining_grpc_timeout_header_decrements_across_attempts() {
+    use ferrum_edge::_test_support::apply_remaining_grpc_timeout_header_for_test;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert(
+        "grpc-timeout",
+        hyper::header::HeaderValue::from_static("500m"),
+    );
+
+    apply_remaining_grpc_timeout_header_for_test(&mut headers, deadline);
+    let first = headers
+        .get("grpc-timeout")
+        .and_then(|v| v.to_str().ok())
+        .expect("first remaining timeout")
+        .to_string();
+    assert!(
+        first.ends_with('m'),
+        "remaining budget should prefer millisecond units: {first}"
+    );
+    let first_ms: u64 = first.trim_end_matches('m').parse().expect("parse ms");
+    assert!(
+        (1..=500).contains(&first_ms),
+        "first remaining must be within the original budget, got {first_ms}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    apply_remaining_grpc_timeout_header_for_test(&mut headers, deadline);
+    let second = headers
+        .get("grpc-timeout")
+        .and_then(|v| v.to_str().ok())
+        .expect("second remaining timeout")
+        .to_string();
+    let second_ms: u64 = second.trim_end_matches('m').parse().expect("parse ms");
+    assert!(
+        second_ms < first_ms,
+        "second attempt must forward a strictly smaller remaining timeout \
+         (first={first_ms}m second={second_ms}m) — never re-arm the original"
+    );
+}
+
+#[test]
+fn test_reqwest_grpc_timeout_forwarding_uses_remaining_deadline_on_every_attempt() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+    assert_eq!(
+        src.matches(".map(grpc_proxy::remaining_grpc_timeout_header_value)")
+            .count(),
+        2,
+        "initial and retry reqwest dispatch must derive the outbound header from the absolute deadline"
+    );
+    assert_eq!(
+        src.matches("\"grpc-timeout\" if remaining_grpc_timeout_header.is_some() => continue")
+            .count(),
+        2,
+        "initial and retry reqwest dispatch must suppress the stale relative header"
+    );
+    assert_eq!(
+        src.matches("req_builder = req_builder.header(\"grpc-timeout\", value);")
+            .count(),
+        2,
+        "initial and retry reqwest dispatch must install one remaining-budget header"
+    );
+}
+
+#[test]
+fn test_eager_buffer_body_read_timeout_maps_to_504_read_write_timeout() {
+    // #2953: the per-request `backend_read_timeout_ms` covers through body
+    // completion in reqwest, so a read timeout during eager buffering lands in
+    // `buffered_backend_response_from_body_read`. It must classify as
+    // `read_write_timeout`/504 — the pair the direct-H2 arm already emits via
+    // `HyperBodyCollectError::ReadTimeout` — instead of the hardcoded
+    // `connection_reset`/502 that made one backend fault report two different
+    // ways depending on which transport served the request.
+    use ferrum_edge::_test_support::eager_buffer_body_read_status_and_class_for_test as classify;
+
+    let (status, class) = classify(ErrorClass::ReadWriteTimeout);
+    assert_eq!(status, 504);
+    assert_eq!(class, ErrorClass::ReadWriteTimeout);
+}
+
+#[test]
+fn test_eager_buffer_body_read_preserves_post_wire_classes_with_502() {
+    // Every other post-wire class keeps the 502 and its own label, so the
+    // reqwest arm no longer flattens reset / closed / protocol faults into one
+    // bucket.
+    use ferrum_edge::_test_support::eager_buffer_body_read_status_and_class_for_test as classify;
+
+    for class in [
+        ErrorClass::ConnectionReset,
+        ErrorClass::ConnectionClosed,
+        ErrorClass::ProtocolError,
+        ErrorClass::GracefulRemoteClose,
+        ErrorClass::ClientDisconnect,
+        ErrorClass::RequestError,
+    ] {
+        let (status, mapped) = classify(class);
+        assert_eq!(status, 502, "{class:?} keeps 502");
+        assert_eq!(mapped, class, "{class:?} keeps its class");
+    }
+}
+
+#[test]
+fn test_eager_buffer_body_read_never_reports_a_pre_wire_class() {
+    // Response headers have already arrived at every call site, so the caller
+    // pins `connection_error: false`. A pre-wire class would then violate
+    // `connection_error == !request_reached_wire(error_class)` and could let
+    // `retry_on_connect_failure` replay a non-idempotent request whose body the
+    // backend already processed. Pre-wire verdicts are coerced to the post-wire
+    // `ConnectionReset`, and every emitted class must be post-wire.
+    use ferrum_edge::_test_support::eager_buffer_body_read_status_and_class_for_test as classify;
+    use ferrum_edge::retry::request_reached_wire;
+
+    let coerced = ErrorClass::ConnectionReset;
+    for class in [
+        ErrorClass::ConnectionRefused,
+        ErrorClass::ConnectionTimeout,
+        ErrorClass::DnsLookupError,
+        ErrorClass::TlsError,
+        ErrorClass::PortExhaustion,
+        ErrorClass::ConnectionPoolError,
+    ] {
+        let (status, mapped) = classify(class);
+        assert_eq!(status, 502, "{class:?} must stay 502");
+        assert_eq!(mapped, coerced, "{class:?} must be coerced");
+    }
+    for class in [
+        ErrorClass::ReadWriteTimeout,
+        ErrorClass::ConnectionReset,
+        ErrorClass::ConnectionClosed,
+        ErrorClass::ProtocolError,
+        ErrorClass::RequestError,
+        ErrorClass::ConnectionRefused,
+        ErrorClass::ConnectionPoolError,
+    ] {
+        let (_, mapped) = classify(class);
+        assert!(request_reached_wire(mapped), "{class:?} -> {mapped:?}");
+    }
 }
 
 /// Issue #2949 — the retry loop's response-streaming decision must not be

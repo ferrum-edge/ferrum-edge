@@ -1202,8 +1202,11 @@ async fn run_udp_egress_session(
         // Engage the per-port lane only on a non-zero override port: the relay
         // proxy's `backend_port` is a placeholder, so the HTTP path's fallback
         // must not pin a mixed-port upstream (see tcp_proxy::resolve_backend_target).
-        let override_port =
-            LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id);
+        let override_port = LoadBalancerCache::initial_dispatch_port_override_from(
+            lb,
+            &proxy.namespace,
+            &entry.upstream_id,
+        );
         let health_port_scope = backend_dispatch::stream_health_port_scope(
             proxy,
             lb,
@@ -1228,6 +1231,7 @@ async fn run_udp_egress_session(
         if let Some(port) = port_lane {
             let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
                 lb,
+                &proxy.namespace,
                 &entry.upstream_id,
                 Some(port),
                 None,
@@ -1253,6 +1257,7 @@ async fn run_udp_egress_session(
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb,
+                &proxy.namespace,
                 &entry.upstream_id,
                 &lb_hash_key,
                 port,
@@ -1261,6 +1266,7 @@ async fn run_udp_egress_session(
         } else {
             LoadBalancerCache::select_target_from(
                 lb,
+                &proxy.namespace,
                 &entry.upstream_id,
                 &lb_hash_key,
                 Some(&health_ctx),
@@ -1274,7 +1280,7 @@ async fn run_udp_egress_session(
             );
             return;
         };
-        let balancer = lb.balancers().get(&entry.upstream_id).cloned();
+        let balancer = lb.balancer(&proxy.namespace, &entry.upstream_id).cloned();
         (selection.target, balancer)
     };
 

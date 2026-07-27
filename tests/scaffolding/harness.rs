@@ -838,6 +838,21 @@ impl GatewayHarness {
         }
     }
 
+    /// Poll the proxy listener with a raw TCP connect until it accepts.
+    ///
+    /// `/health` proves only that the admin listener is ready. Tests using a
+    /// prior-knowledge H2 client must also wait for the independently spawned
+    /// proxy listener or their one-shot connect can race startup on loaded CI.
+    pub async fn wait_for_proxy_port(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match &self.backend {
+            Backend::Binary { gateway } => gateway.wait_for_proxy_port(timeout).await,
+            Backend::InProcess(b) => wait_for_in_process_proxy_port(b.proxy_port, timeout).await,
+        }
+    }
+
     /// Read captured gateway stdout/stderr. **Binary mode only** —
     /// in-process mode shares the test process's tracing subscriber and
     /// returns an io::Error here. Tests that depend on log assertions
@@ -1039,6 +1054,29 @@ async fn wait_for_in_process_health(
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!("in-process gateway not healthy within {timeout:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_in_process_proxy_port(
+    proxy_port: u16,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let error = match tokio::net::TcpStream::connect(("127.0.0.1", proxy_port)).await {
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "in-process gateway proxy port {proxy_port} not ready within {timeout:?}: {error}"
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

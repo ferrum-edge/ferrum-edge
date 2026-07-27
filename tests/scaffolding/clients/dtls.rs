@@ -74,7 +74,7 @@ impl DtlsClient {
 
         let params = BackendDtlsParams {
             config: Arc::new(DimplConfig::default()),
-            certificate,
+            certificate: certificate.into(),
             server_name,
             server_cert_verifier: None,
             connect_timeout_ms: 15_000,

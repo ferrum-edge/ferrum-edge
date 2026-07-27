@@ -42,7 +42,9 @@ Retry logic applies to the following proxy protocols:
 
 HTTP-family protocols (HTTP/1.1, HTTP/2, HTTP/3) share the same retry loop in the proxy core and support both connection failure and HTTP status code retries.
 
-gRPC retries handle connection-level failures (connect refused, timeout, DNS, TLS) by buffering the request body and replaying it against alternative upstream targets. Read timeouts and gRPC application-level errors (e.g., UNAVAILABLE status in trailers) are not retried because the request was already sent to the backend.
+gRPC retries handle connection-level failures (connect refused, timeout, DNS, TLS, and pooled-sender dispatch cancellations where hyper proves the request never left the client) by buffering the request body and replaying it against alternative upstream targets. Read timeouts and gRPC application-level errors (e.g., UNAVAILABLE status in trailers) are not retried because the request was already sent to the backend.
+
+A client `grpc-timeout` is anchored once at request receipt into an absolute monotonic deadline (independent of whether the `grpc_deadline` plugin is installed). Plugins, request-body collection, pool/client acquisition, backoff, response headers, and body reads all consume that same Instant. Native gRPC and pass-through gRPC-Web dispatch each forward a decremented remaining `grpc-timeout` on every attempt rather than re-arming the original relative header. Retry attempts also reuse the real collected `HeaderMap` so duplicate metadata lines and opaque field values stay byte-identical to attempt 1.
 
 WebSocket retries handle connection-level failures during the initial backend connection attempt (before the upgrade response — 101 Switching Protocols for HTTP/1.1, 200 OK for HTTP/2 Extended CONNECT). Once the WebSocket connection is established, retries no longer apply — the bidirectional stream is managed by the application layer.
 
@@ -86,6 +88,7 @@ Connection failures are TCP/transport-level problems where the request **never r
 - TCP connect timeout (SYN sent, no response)
 - DNS resolution failure (hostname unresolvable)
 - TLS handshake failure (certificate error, protocol mismatch)
+- Pooled HTTP/2 sender cancellation before dispatch (hyper `is_canceled` on a buffered/replayable body — typical backend GOAWAY / connection-age race)
 
 These are retried when `retry_on_connect_failure: true` (the default). Because the request never reached the backend, **all HTTP methods are retried** — idempotency is not a concern since nothing was processed.
 
