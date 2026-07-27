@@ -205,6 +205,11 @@ jobs:
           Invoke-WebRequest `
             -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$protocVersion/protoc-$protocVersion-win64.zip" `
             -OutFile $protocZip
+          $expectedProtocSha256 = "5d3ff218d7d91eea95f7569bcb5a98f3030f8996d44151279d9772edcff76082"
+          $actualProtocSha256 = (Get-FileHash -Algorithm SHA256 $protocZip).Hash.ToLowerInvariant()
+          if ($actualProtocSha256 -ne $expectedProtocSha256) {
+            throw "protoc archive SHA-256 mismatch: expected $expectedProtocSha256, got $actualProtocSha256"
+          }
           Expand-Archive -Path $protocZip -DestinationPath $protocRoot -Force
           $protocBin = Join-Path $protocRoot "bin"
           $protocExe = Join-Path $protocBin "protoc.exe"

@@ -191,6 +191,8 @@ def validate_release_workflow(workflow: str) -> list[str]:
     if PIPE_TO_SHELL.search(workflow):
         errors.append("release.yml contains a pipe-to-shell download")
     for checksum_token in (
+        '$expectedProtocSha256 = "5d3ff218d7d91eea95f7569bcb5a98f3030f8996d44151279d9772edcff76082"',
+        "$actualProtocSha256 = (Get-FileHash -Algorithm SHA256 $protocZip)",
         '$expectedNasmSha256 = "161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7"',
         "$actualNasmSha256 = (Get-FileHash -Algorithm SHA256 $nasmZip)",
     ):
@@ -209,6 +211,14 @@ def run_self_test(workflow: str) -> list[str]:
         return failures
 
     mutations = (
+        (
+            "protoc archive checksum",
+            workflow.replace(
+                "$actualProtocSha256 = (Get-FileHash -Algorithm SHA256 $protocZip)",
+                "$actualProtocSha256 = $expectedProtocSha256",
+                1,
+            ),
+        ),
         (
             "id-token scope",
             workflow.replace("      id-token: write", "      id-token: read", 1),
