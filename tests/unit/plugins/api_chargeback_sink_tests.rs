@@ -3630,29 +3630,14 @@ async fn saturated_spool_delivery_does_not_count_failed_high_water_diversion() {
     config["spool"]["delivery_queue_capacity"] = json!(1);
     config["spool"]["replay_interval_secs"] = json!(3600);
 
-    let entered = Arc::new((Mutex::new(false), Condvar::new()));
-    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate = SpoolBeforeWriteGate::new();
     let _clear_hook = ClearSpoolWriteHookOnDrop {
-        release: Arc::clone(&release),
+        gate: Arc::clone(&gate),
     };
-    let entered_for_hook = Arc::clone(&entered);
-    let release_for_hook = Arc::clone(&release);
-    set_spool_write_hook_for_tests(Some(Arc::new(move |point| {
-        if matches!(point, SpoolWriteHookPoint::BeforeWrite) {
-            let (lock, cv) = &*release_for_hook;
-            let mut guard = lock.lock().expect("release gate lock");
-            {
-                let (entered_lock, entered_cv) = &*entered_for_hook;
-                let mut entered_guard = entered_lock.lock().expect("entered gate lock");
-                if !*entered_guard {
-                    *entered_guard = true;
-                    entered_cv.notify_all();
-                }
-            }
-            while !*guard {
-                guard = cv.wait(guard).expect("release gate wait");
-            }
-        }
+    let hook_gate = Arc::clone(&gate);
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
+        SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
+        SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
     })));
 
     let (_, _, spool_lost_baseline) = spool_delivery_totals();
@@ -3672,7 +3657,14 @@ async fn saturated_spool_delivery_does_not_count_failed_high_water_diversion() {
 
     // First high-water diversion is accepted and parks the delivery worker.
     plugin.log(&billable_summary("divert-accepted")).await;
-    wait_condvar_flag(Arc::clone(&entered)).await;
+    let wait_gate = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || {
+        wait_gate
+            .wait_until_parked(1, Duration::from_secs(5))
+            .expect("accepted diversion must park in BeforeWrite")
+    })
+    .await
+    .expect("parked gate wait task");
 
     let (_, _, _, diversions_after_accept, drops_after_accept) = queue_status_counters();
     assert_eq!(
@@ -3721,6 +3713,12 @@ async fn saturated_spool_delivery_does_not_count_failed_high_water_diversion() {
         enqueued_before_reject > enqueued_baseline,
         "accepted channel/diversion admissions must still increment events_enqueued_total"
     );
+
+    gate.release_all();
+    let finished_gate = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || finished_gate.wait_until_finished())
+        .await
+        .expect("finished gate wait task");
 
     held_export.release_held_connections();
     drop(plugin);
