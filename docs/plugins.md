@@ -2352,8 +2352,10 @@ config:
     # there is no cache_ttl_seconds key. Under `shared` that is the TTL of every
     # Redis claim key, so the acceptance window can be widened later with no gap.
     replay_scope: shared
-sync_mode: redis
-redis_url: "redis://redis.internal:6379"
+  # The shared Redis fields live inside `config`, exactly as they do for
+  # `rate_limiting` / `request_deduplication`.
+  sync_mode: redis
+  redis_url: "redis://redis.internal:6379"
 ```
 
 #### UsernameToken — PasswordText
