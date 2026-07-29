@@ -13,7 +13,7 @@ Docker/kind install report.
 
 | Mode | Entry | Workflow / job |
 |---|---|---|
-| Live datapath (SPIRE-federated two kind clusters, bidirectional traffic + negatives + Stage-3 failure injection; GA-contract artifact gate) | `tests/k8s/multicluster-federation/run.sh` | `.github/workflows/multicluster-federation-live.yml` — path-filtered on PRs, force-run on every `main` push / `workflow_dispatch` (requires `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`) |
+| Live datapath (SPIRE-federated two kind clusters, bidirectional traffic + negatives + Stage-3 failure injection; fail-closed required-assertion gate) | `tests/k8s/multicluster-federation/run.sh` | `.github/workflows/multicluster-federation-live.yml` — path-filtered on PRs, force-run on every `main` push / `workflow_dispatch` (requires `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`) |
 | Deploy-only smoke (rollouts, no traffic) | same script with `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` | Legacy path-filtered `Mesh Multicluster Federation` CI job; a packaging/rollout check, not the authoritative datapath/release gate |
 
 In-process federation/discovery unit and integration coverage remains necessary
@@ -122,8 +122,27 @@ It runs in two modes:
   against disposable kind clusters and requires
   `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`. That workflow is the
   authoritative PR/main/release gate (issue #2459): relevant PRs and every
-  `main` push run the full datapath, validate `live-assertions.json` against
-  `ga_contract.yaml`, and feed exact-SHA release validation.
+  `main` push run the full datapath, and `release.yml` requires a successful
+  push run for the exact tag SHA.
+
+  The GA-contract enforcement is split, and the live workflow deliberately runs
+  **no** cargo/artifact-validation job (the trusted Cross build policy freezes
+  that workflow's Cross-sensitive surfaces, so neither adding a new build job
+  nor editing the existing one is permitted in an ordinary PR):
+
+  - **In the fixture.** `run.sh` ends in `ferrum_live_assertions_require_all_passed`
+    over its `REQUIRED_LIVE_ASSERTIONS` array, so a required `multicluster.*`
+    assertion that is missing, failed, or *skipped* fails the live job — and with
+    it the `Multicluster Federation Live` aggregate gate.
+  - **In the hosted Rust conformance suite.** `tests/conformance/live_contract.rs`
+    (`live_contract_real_contract_declares_the_multicluster_suite_rows`) and
+    `tests/conformance/mesh_multicluster_federation.rs` pin that required set to
+    the enforced, non-`live_deferred` `multicluster-federation` rows of
+    `ga_contract.yaml` on the `kind-spire-multicluster-federation` platform
+    profile. These run in the ordinary `Tests` aggregate.
+
+  `live_contract_artifact_gate` itself is only invoked by
+  `.github/workflows/mesh-e2e-sidecar-live.yml`; it self-skips everywhere else.
 - **Deploy-only smoke (`FERRUM_MULTICLUSTER_DEPLOY_ONLY=1`):** stops after the
   SPIRE/workload deploy and rollouts, before driving traffic. The legacy
   path-filtered `Mesh Multicluster Federation` CI job keeps this narrower

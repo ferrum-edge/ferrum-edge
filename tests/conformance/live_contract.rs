@@ -711,3 +711,77 @@ fn live_contract_real_contract_declares_the_multicluster_suite_rows() {
         );
     }
 }
+
+/// The `multicluster-federation` live workflow runs no in-workflow artifact
+/// validator — the trusted ARM64 Cross build policy freezes that workflow's
+/// Cross-sensitive surfaces, so neither a new cargo job nor an edit to the
+/// existing build job is permitted there. Its fail-closed required-assertion
+/// gate is therefore the fixture's own
+/// `ferrum_live_assertions_require_all_passed` call over the run.sh-local
+/// `REQUIRED_LIVE_ASSERTIONS` array.
+///
+/// That only gates the GA contract if the array and the contract stay the same
+/// set, so this hosted test is the binding between them: drop an id from the
+/// array (weakening the live gate) or add an enforced contract row the fixture
+/// never requires, and this test fails in the ordinary `Tests` aggregate.
+#[test]
+fn live_contract_multicluster_fixture_requires_exactly_the_enforced_rows() {
+    const RUN_SH: &str = include_str!("../k8s/multicluster-federation/run.sh");
+
+    let mut lines = RUN_SH.lines();
+    assert!(
+        lines.any(|line| line.trim_end() == "REQUIRED_LIVE_ASSERTIONS=("),
+        "tests/k8s/multicluster-federation/run.sh must declare REQUIRED_LIVE_ASSERTIONS=( \
+         on its own line — the fixture's fail-closed gate is what this test binds \
+         to the GA contract"
+    );
+    let mut fixture_required: BTreeSet<&str> = BTreeSet::new();
+    let mut closed = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == ")" {
+            closed = true;
+            break;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        assert!(
+            fixture_required.insert(trimmed),
+            "run.sh REQUIRED_LIVE_ASSERTIONS lists `{trimmed}` more than once"
+        );
+    }
+    assert!(
+        closed,
+        "run.sh REQUIRED_LIVE_ASSERTIONS array is unterminated — refusing to \
+         validate a partially parsed required set"
+    );
+
+    let contract = load_contract().expect("real contract loads");
+    let contract_required: BTreeSet<&str> = contract
+        .ga_capabilities()
+        .into_iter()
+        .filter(|capability| {
+            capability.live_suite == "multicluster-federation" && capability.live_deferred.is_none()
+        })
+        .flat_map(|capability| capability.live_assertions.iter().map(String::as_str))
+        .collect();
+    assert!(
+        !contract_required.is_empty(),
+        "the multicluster-federation suite must have enforced GA contract rows"
+    );
+
+    let missing_in_fixture: Vec<&&str> = contract_required.difference(&fixture_required).collect();
+    assert!(
+        missing_in_fixture.is_empty(),
+        "GA-contract assertions the live fixture does not REQUIRE (they could be \
+         skipped or absent without failing the live job): {missing_in_fixture:?}"
+    );
+    let missing_in_contract: Vec<&&str> = fixture_required.difference(&contract_required).collect();
+    assert!(
+        missing_in_contract.is_empty(),
+        "live fixture requires assertions with no enforced GA-contract row \
+         (add the row, or drop the id from REQUIRED_LIVE_ASSERTIONS): \
+         {missing_in_contract:?}"
+    );
+}

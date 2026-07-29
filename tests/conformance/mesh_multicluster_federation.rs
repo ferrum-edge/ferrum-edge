@@ -14,8 +14,15 @@
 //!    the live suite's revoke → fail-closed path.
 //!
 //! The *runtime* half is live-gated by the `multicluster.*` assertions in
-//! `tests/k8s/multicluster-federation/run.sh` and validated against
-//! `ga_contract.yaml` by `live_contract_artifact_gate`. Cross-cluster
+//! `tests/k8s/multicluster-federation/run.sh`, whose own
+//! `ferrum_live_assertions_require_all_passed` call fails the live job on any
+//! required assertion that is missing, failed, or skipped. That workflow runs
+//! no in-workflow artifact validator (the trusted Cross build policy freezes
+//! its Cross-sensitive surfaces); the binding between the fixture's required
+//! ids and the enforced `multicluster-federation` rows of `ga_contract.yaml`
+//! is instead pinned by
+//! `live_contract::live_contract_real_contract_declares_the_multicluster_suite_rows`
+//! in this hosted conformance suite. Cross-cluster
 //! endpoint *discovery* (poller-driven) remains Experimental and is excluded
 //! from these rows.
 

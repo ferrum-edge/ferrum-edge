@@ -139,6 +139,24 @@ Markdown link checker through its CI contract verifier
 (`.github/scripts/check_markdown_links.py`), including in light mode, so
 docs-only PRs still validate relative file targets and GitHub heading slugs.
 
+The two live-datapath suites enforce their GA contract differently, because the
+trusted ARM64 Cross build policy freezes each workflow's Cross-sensitive
+executable/configuration surfaces. `mesh-e2e-sidecar-live.yml` validates its
+emitted `live-assertions.json` in-workflow via
+`conformance::live_contract::live_contract_artifact_gate`.
+`multicluster-federation-live.yml` runs **no** artifact-validation job: adding
+one (or editing its existing build job) would change that workflow's frozen
+Cross surface set and is rejected by `Trusted Cross Build Policy`. Its
+fail-closed required-assertion gate is instead the fixture's own
+`ferrum_live_assertions_require_all_passed` call over the run.sh-local
+`REQUIRED_LIVE_ASSERTIONS` array — a required `multicluster.*` assertion that is
+missing, failed, or skipped fails the live job and therefore the
+`Multicluster Federation Live` aggregate — and the hosted `Tests` aggregate
+pins that array to the enforced, non-`live_deferred` `multicluster-federation`
+rows of `tests/conformance/ga_contract.yaml`
+(`tests/conformance/live_contract.rs`,
+`tests/conformance/mesh_multicluster_federation.rs`).
+
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
 shards, lint, dependency audit, vendored patch regressions,
 planner-gated mesh/Helm gates, eBPF/netns gates, performance, and the

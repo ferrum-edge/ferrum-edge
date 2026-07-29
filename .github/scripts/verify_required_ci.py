@@ -131,17 +131,20 @@ DEDICATED_REQUIRED_CHECKS = {
     ".github/workflows/multicluster-federation-live.yml": {
         "job": "gate",
         "name": "Multicluster Federation Live",
+        # No artifact-validation job: the trusted Cross build policy freezes the
+        # Cross-sensitive surfaces of this workflow, so the GA-contract halves
+        # live in the fixture (fail-closed required-assertion gate) and in the
+        # hosted Rust conformance suite. See the header comment in
+        # .github/workflows/multicluster-federation-live.yml.
         "needs": {
             "changes",
             "multicluster-federation-live",
-            "validate-live-contract",
         },
         "contract": {
             '${{ needs.changes.result }}" != "success"',
             '${{ needs.changes.outputs.relevant }}" = "false"',
             '${{ needs.changes.outputs.relevant }}" != "true"',
             '${{ needs.multicluster-federation-live.result }}" != "success"',
-            '${{ needs.validate-live-contract.result }}" != "success"',
         },
     },
 }

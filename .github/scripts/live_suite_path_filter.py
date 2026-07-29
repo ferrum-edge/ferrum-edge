@@ -73,12 +73,12 @@ SUITE_PATTERNS: dict[str, list[str]] = {
         r"^\.github/actions/setup-kubernetes-tools/",
         r"^tests/k8s/multicluster-federation/",
         r"^tests/k8s/lib/(live_assertions|spire)\.sh$",
-        # mod.rs wires `mod live_contract;` into the conformance tree and
-        # tests/conformance_tests.rs is the harness that declares
-        # `mod conformance;` — unwiring either would let the GA artifact gate
-        # vanish (the workflow's exact-path guard only runs when this filter
-        # marks the PR relevant). Multicluster GA rows live in ga_contract.yaml
-        # and mesh_multicluster_federation.rs.
+        # The GA-contract half of this suite is the enforced, non-deferred
+        # `multicluster-federation` rows of ga_contract.yaml, pinned by the
+        # hosted conformance suite (live_contract.rs,
+        # mesh_multicluster_federation.rs, wired through mod.rs /
+        # conformance_tests.rs). Editing any of them changes what the live
+        # fixture is required to prove, so the live datapath must re-run.
         r"^tests/conformance/(ga_contract\.yaml|contract\.rs|live_contract\.rs|mesh_multicluster_federation\.rs|mod\.rs)$",
         r"^tests/conformance_tests\.rs$",
         r"^Cargo\.(toml|lock)$",

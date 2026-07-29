@@ -132,9 +132,11 @@ jobs:
           # artifact against ga_contract.yaml on every main push, so a release
           # SHA without a green, contract-validated live run cannot ship.
           wait_for_success "mesh-e2e-sidecar-live.yml" "Mesh E2E Sidecar Live Datapath"
-          # The multicluster federation GA contract is likewise release-blocking
-          # (issue #2459): every main SHA must carry a successful, contract-
-          # validated push run of the dedicated two-cluster live workflow.
+          # The multicluster federation datapath is likewise release-blocking
+          # (issue #2459): every main SHA must carry a successful push run of
+          # the dedicated two-cluster live workflow, whose fixture fails closed
+          # on any required `multicluster.*` live assertion that is missing,
+          # failed, or skipped.
           wait_for_success "multicluster-federation-live.yml" "Multicluster Federation Live Datapath"
 
   build-release-binaries:
