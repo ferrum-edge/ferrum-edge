@@ -128,39 +128,6 @@ jobs:
           FERRUM_IMAGE_TAG: ${{ env.FERRUM_IMAGE_TAG }}
         run: tests/k8s/multicluster-federation/run.sh
 
-      # Stage-4 contract validator: the emitted artifact must satisfy every
-      # enforced (non-`live_deferred`) GA-contract live assertion for this
-      # suite, for this exact commit/profile, with no duplicate or stale
-      # artifacts. Reuses the pr-build cache from the binary build above.
-      # The gate test is invoked by EXACT path and the step then asserts it
-      # actually ran: a filtered-out test exits 0 with "0 passed", so a PR
-      # that unwires `mod live_contract;` (or renames the test) must fail
-      # here rather than silently skipping the artifact gate.
-      - name: Validate GA-contract live assertions artifact
-        env:
-          FERRUM_LIVE_ASSERTIONS_FILE: target/multicluster-federation/live-assertions.json
-          FERRUM_LIVE_SUITE: multicluster-federation
-          FERRUM_LIVE_MAX_AGE_HOURS: "6"
-        run: |
-          set -euo pipefail
-          # Capture with an explicit status so a FAILING gate still prints the
-          # validator's full error list before the step exits (a bare
-          # command-substitution assignment would abort under `set -e` with
-          # the output swallowed).
-          status=0
-          output="$(FERRUM_LIVE_EXPECTED_COMMIT="$(git rev-parse HEAD)" \
-            cargo test --profile pr-build --test conformance_tests -- \
-            --exact conformance::live_contract::live_contract_artifact_gate --nocapture 2>&1)" || status=$?
-          printf '%s\n' "$output"
-          if [ "$status" -ne 0 ]; then
-            echo "::error::GA-contract live-assertion validation failed (see validator output above)" >&2
-            exit "$status"
-          fi
-          if ! printf '%s\n' "$output" | grep -q '^test result: ok\. 1 passed'; then
-            echo "::error::live_contract_artifact_gate did not run (module unwired or test renamed) — the GA artifact gate must not be skippable" >&2
-            exit 1
-          fi
-
       - name: Collect diagnostics
         if: always()
         run: |
@@ -205,11 +172,54 @@ jobs:
           kind delete cluster --name "$CLUSTER_A" || true
           kind delete cluster --name "$CLUSTER_B" || true
 
+  validate-live-contract:
+    name: Validate multicluster federation GA contract
+    needs:
+      - changes
+      - multicluster-federation-live
+    if: needs.changes.outputs.relevant == 'true' && needs.multicluster-federation-live.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-multicluster-federation-contract"
+
+      - name: Download live assertions artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: multicluster-federation-results
+          path: target/multicluster-federation
+
+      - name: Validate GA-contract live assertions artifact
+        env:
+          FERRUM_LIVE_ASSERTIONS_FILE: target/multicluster-federation/live-assertions.json
+          FERRUM_LIVE_SUITE: multicluster-federation
+          FERRUM_LIVE_MAX_AGE_HOURS: "6"
+        run: |
+          set -euo pipefail
+          status=0
+          output="$(FERRUM_LIVE_EXPECTED_COMMIT="$(git rev-parse HEAD)" \
+            cargo test --profile pr-build --test conformance_tests -- \
+            --exact conformance::live_contract::live_contract_artifact_gate --nocapture 2>&1)" || status=$?
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::GA-contract live-assertion validation failed (see validator output above)" >&2
+            exit "$status"
+          fi
+          if ! printf '%s\n' "$output" | grep -q '^test result: ok\. 1 passed'; then
+            echo "::error::live_contract_artifact_gate did not run (module unwired or test renamed)" >&2
+            exit 1
+          fi
+
   gate:
     name: Multicluster Federation Live
     needs:
       - changes
       - multicluster-federation-live
+      - validate-live-contract
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -237,6 +247,11 @@ jobs:
 
           if [ "${{ needs.multicluster-federation-live.result }}" != "success" ]; then
             echo "Live datapath validation failed or did not complete: ${{ needs.multicluster-federation-live.result }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ "${{ needs.validate-live-contract.result }}" != "success" ]; then
+            echo "GA-contract validation failed or did not complete: ${{ needs.validate-live-contract.result }}." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 

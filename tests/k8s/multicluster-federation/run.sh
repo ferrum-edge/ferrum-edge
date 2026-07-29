@@ -91,12 +91,11 @@ REQUIRED_LIVE_ASSERTIONS=(
   multicluster.eastwest.endpoint_recovers_when_dest_returns
 )
 # NOTE: these required IDs are the live-gate for cross-cluster east-west, gated
-# below by `ferrum_live_assertions_require_all_passed` and additionally enrolled
-# in `tests/conformance/ga_contract.yaml` (suite `multicluster-federation`,
-# platform `kind-spire-multicluster-federation`) so the dedicated live workflow's
-# `live_contract_artifact_gate` step can fail closed on missing/stale artifacts
-# (issue #2459). Cross-cluster endpoint *discovery* (poller-driven) remains
-# Experimental and is excluded from those GA rows.
+# below by `ferrum_live_assertions_require_all_passed` exactly as the
+# node-waypoint eBPF live suite gates its `node_waypoint.*` IDs (run.sh-local
+# REQUIRED array). Cross-cluster east-west is Beta/Experimental per docs/mesh.md,
+# so there is intentionally NO ga_contract.yaml row yet (a GA promotion would add
+# a `maturity: ga` capability with a backing conformance semantic assertion).
 
 mkdir -p "$ARTIFACT_DIR" "$RESULTS_DIR"
 

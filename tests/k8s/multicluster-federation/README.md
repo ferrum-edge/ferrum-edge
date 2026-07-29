@@ -129,11 +129,9 @@ live suite gates its `node_waypoint.*` IDs in its own run.sh REQUIRED array):
 | `multicluster.eastwest.endpoint_blackhole_when_dest_down` | (Stage 3) with B's `svc` scaled to 0, A→B returns a real upstream error (a 5xx from the client sidecar — not a `000` curl-timeout hang, not 200) |
 | `multicluster.eastwest.endpoint_recovers_when_dest_returns` | (Stage 3) scaling `svc` back up + re-rendering the gateway for the new pod IP restores A→B (200, body `svc-b`) |
 
-Cross-cluster east-west SNI passthrough + trust federation is GA in
-`docs/mesh.md` / `ga_contract.yaml` (issue #2459). The dedicated live workflow
-validates this artifact against the contract after the fixture. Poller-driven
-cross-cluster endpoint discovery remains Experimental and is excluded from those
-rows.
+Cross-cluster east-west is Beta/Experimental in `docs/mesh.md`, so there is
+intentionally no `ga_contract.yaml` row yet — a GA promotion would add a
+`maturity: ga` capability with a backing conformance semantic assertion.
 
 ## Run manually
 

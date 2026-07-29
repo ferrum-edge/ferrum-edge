@@ -192,10 +192,7 @@ fn local_cluster_identity_rejects_blank_and_whitespace() {
             ..MeshConfig::default()
         };
         let errors = mesh.validate();
-        assert!(
-            !errors.is_empty(),
-            "local_cluster {bad:?} must be rejected"
-        );
+        assert!(!errors.is_empty(), "local_cluster {bad:?} must be rejected");
     }
 
     let ok = MeshConfig {
@@ -243,8 +240,7 @@ fn remote_cluster_names_unique_by_canonical_identity() {
     let errors = mesh.validate();
     assert!(
         errors.iter().any(|err| {
-            err.contains("duplicate name")
-                || err.contains("leading/trailing whitespace")
+            err.contains("duplicate name") || err.contains("leading/trailing whitespace")
         }),
         "duplicate/aliased remote names must be rejected, got: {errors:?}"
     );
@@ -338,7 +334,9 @@ fn east_west_gateway_requires_host_and_nonzero_port() {
     };
     let errors = mesh.validate();
     assert!(
-        errors.iter().any(|err| err.contains("host must not be empty"))
+        errors
+            .iter()
+            .any(|err| err.contains("host must not be empty"))
             && errors.iter().any(|err| err.contains("port")),
         "blank host / zero port must be rejected, got: {errors:?}"
     );
