@@ -139,23 +139,45 @@ Markdown link checker through its CI contract verifier
 (`.github/scripts/check_markdown_links.py`), including in light mode, so
 docs-only PRs still validate relative file targets and GitHub heading slugs.
 
-The two live-datapath suites enforce their GA contract differently, because the
-trusted ARM64 Cross build policy freezes each workflow's Cross-sensitive
-executable/configuration surfaces. `mesh-e2e-sidecar-live.yml` validates its
-emitted `live-assertions.json` in-workflow via
-`conformance::live_contract::live_contract_artifact_gate`.
-`multicluster-federation-live.yml` runs **no** artifact-validation job: adding
-one (or editing its existing build job) would change that workflow's frozen
-Cross surface set and is rejected by `Trusted Cross Build Policy`. Its
-fail-closed required-assertion gate is instead the fixture's own
-`ferrum_live_assertions_require_all_passed` call over the run.sh-local
-`REQUIRED_LIVE_ASSERTIONS` array — a required `multicluster.*` assertion that is
-missing, failed, or skipped fails the live job and therefore the
-`Multicluster Federation Live` aggregate — and the hosted `Tests` aggregate
-pins that array to the enforced, non-`live_deferred` `multicluster-federation`
-rows of `tests/conformance/ga_contract.yaml`
-(`tests/conformance/live_contract.rs`,
-`tests/conformance/mesh_multicluster_federation.rs`).
+Both live-datapath suites validate their emitted `live-assertions.json`, but by
+different mechanisms, because the trusted ARM64 Cross build policy freezes each
+workflow's existing Cross-sensitive executable/configuration surfaces.
+
+`mesh-e2e-sidecar-live.yml` validates in-workflow inside its live job via
+`conformance::live_contract::live_contract_artifact_gate` (a cargo test).
+
+`multicluster-federation-live.yml` cannot do that: adding a cargo step to its
+live job, or editing that job at all, changes the per-job digest the trusted
+policy compares and is rejected by `Trusted Cross Build Policy`. Its live job is
+therefore byte-identical to `main`, and validation happens in the separate
+`gate` job — the same job that publishes the required
+`Multicluster Federation Live` check. That job carries no toolchain and no
+build: it downloads the pinned `multicluster-federation-results` artifact with a
+full-SHA-pinned `actions/download-artifact` and runs
+`.github/scripts/validate_live_assertions.py` (standard library only), which
+fails closed on a missing or non-regular artifact, malformed JSON, a wrong
+schema version, suite, `github.sha` commit, or
+`kind-spire-multicluster-federation` platform profile, an invalid, future, or
+more-than-six-hour-old timestamp, duplicate assertion ids, a missing or extra
+required `multicluster.*` id, or any required assertion whose status is not
+`pass`. An irrelevant pull request skips the download entirely — the artifact
+steps run only after the aggregate step positively establishes that a relevant
+live run succeeded.
+
+Three layers therefore have to agree, and hosted CI fails if they drift:
+
+1. The fixture's own fail-closed
+   `ferrum_live_assertions_require_all_passed` call over the run.sh-local
+   `REQUIRED_LIVE_ASSERTIONS` array.
+2. The `gate` job's explicit `--require` id list.
+3. The enforced, non-`live_deferred` `multicluster-federation` rows of
+   `tests/conformance/ga_contract.yaml`.
+
+`tests/conformance/live_contract.rs` asserts set equality between (1) and (3)
+and between (2) and (3); `.github/scripts/verify_required_ci.py` independently
+pins the gate's download action, its exactness flags, its `validate`-gated
+steps, and the same id set, and runs the validator's own self-tests (which
+prove each rejection dimension) in the `Tests` aggregate.
 
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
 shards, lint, dependency audit, vendored patch regressions,

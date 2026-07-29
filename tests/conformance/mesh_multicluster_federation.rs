@@ -16,12 +16,18 @@
 //! The *runtime* half is live-gated by the `multicluster.*` assertions in
 //! `tests/k8s/multicluster-federation/run.sh`, whose own
 //! `ferrum_live_assertions_require_all_passed` call fails the live job on any
-//! required assertion that is missing, failed, or skipped. That workflow runs
-//! no in-workflow artifact validator (the trusted Cross build policy freezes
-//! its Cross-sensitive surfaces); the binding between the fixture's required
-//! ids and the enforced `multicluster-federation` rows of `ga_contract.yaml`
-//! is instead pinned by
-//! `live_contract::live_contract_real_contract_declares_the_multicluster_suite_rows`
+//! required assertion that is missing, failed, or skipped. The workflow's
+//! `gate` job then re-validates the artifact the run actually published
+//! (`.github/scripts/validate_live_assertions.py`: exact schema, suite,
+//! commit, and platform profile, freshness, no duplicates, exactly the
+//! required id set, every required id `pass`) — the live job itself carries no
+//! validator because the trusted Cross build policy freezes its per-job
+//! digest. The binding between those required id sets and the enforced
+//! `multicluster-federation` rows of `ga_contract.yaml` is pinned by
+//! `live_contract::live_contract_real_contract_declares_the_multicluster_suite_rows`,
+//! `live_contract::live_contract_multicluster_fixture_requires_exactly_the_enforced_rows`,
+//! and
+//! `live_contract::live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows`
 //! in this hosted conformance suite. Cross-cluster
 //! endpoint *discovery* (poller-driven) remains Experimental and is excluded
 //! from these rows.

@@ -68,7 +68,10 @@ SUITE_PATTERNS: dict[str, list[str]] = {
     ],
     "mesh-federation": [
         r"^\.github/workflows/(ci|multicluster-federation-live)\.yml$",
-        r"^\.github/scripts/live_suite_path_filter\.py$",
+        # `validate_live_assertions.py` is the emitted-artifact release gate in
+        # the workflow's `gate` job, so editing it changes what a live run must
+        # prove about the artifact it published.
+        r"^\.github/scripts/(live_suite_path_filter|validate_live_assertions)\.py$",
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
         r"^tests/k8s/multicluster-federation/",

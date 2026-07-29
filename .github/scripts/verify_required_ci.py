@@ -15,6 +15,9 @@ from live_suite_path_filter import (
     exact_path_patterns,
 )
 from pr_ci_plan import FULL_CI_DOCUMENTATION_PATHS, self_test as planner_self_test
+from validate_live_assertions import (
+    run_self_test as live_assertion_validator_self_test,
+)
 from verify_release_image_attestations import (
     run_self_test as release_attestation_self_test,
 )
@@ -131,11 +134,12 @@ DEDICATED_REQUIRED_CHECKS = {
     ".github/workflows/multicluster-federation-live.yml": {
         "job": "gate",
         "name": "Multicluster Federation Live",
-        # No artifact-validation job: the trusted Cross build policy freezes the
-        # Cross-sensitive surfaces of this workflow, so the GA-contract halves
-        # live in the fixture (fail-closed required-assertion gate) and in the
-        # hosted Rust conformance suite. See the header comment in
-        # .github/workflows/multicluster-federation-live.yml.
+        # The aggregate is also the emitted-artifact release gate: it downloads
+        # the published `multicluster-federation-results` artifact and validates
+        # live-assertions.json against the GA/release contract. The artifact
+        # steps are pinned below so a later pull request cannot keep the check
+        # name while dropping the validation, and `validate=true` is emitted
+        # only after the relevant-and-successful path is positively established.
         "needs": {
             "changes",
             "multicluster-federation-live",
@@ -145,8 +149,48 @@ DEDICATED_REQUIRED_CHECKS = {
             '${{ needs.changes.outputs.relevant }}" = "false"',
             '${{ needs.changes.outputs.relevant }}" != "true"',
             '${{ needs.multicluster-federation-live.result }}" != "success"',
+            'echo "validate=false" >> "$GITHUB_OUTPUT"',
+            'echo "validate=true" >> "$GITHUB_OUTPUT"',
+            "if: steps.summarize.outputs.validate == 'true'",
+            "name: multicluster-federation-results",
+            "python3 .github/scripts/validate_live_assertions.py --self-test",
+            "--artifact multicluster-federation-artifact/live-assertions.json",
+            "--suite multicluster-federation",
+            "--platform-profile kind-spire-multicluster-federation",
+            '--commit "$EXPECTED_COMMIT"',
+            "EXPECTED_COMMIT: ${{ github.sha }}",
+            "--max-age-seconds 21600",
+            "--required-namespace multicluster.",
         },
     },
+}
+
+# The artifact validator is only a gate if it is reached with a SHA-pinned
+# download and no toolchain step. Pin those properties structurally rather than
+# by substring alone.
+ARTIFACT_GATE_WORKFLOW = ".github/workflows/multicluster-federation-live.yml"
+ARTIFACT_GATE_DOWNLOAD_ACTION = (
+    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+)
+# The release-blocking `multicluster.*` ids, mirrored from the enforced,
+# non-deferred `multicluster-federation` rows of tests/conformance/ga_contract.yaml.
+# `tests/conformance/live_contract.rs` asserts set equality between this
+# workflow's `--require` list, run.sh's REQUIRED_LIVE_ASSERTIONS, and the
+# contract, so a drift in any one of the three fails the hosted suite.
+ARTIFACT_GATE_REQUIRED_IDS = {
+    "multicluster.spire.federation_ready_a",
+    "multicluster.spire.federation_ready_b",
+    "multicluster.federation.trust_bundle_exchange",
+    "multicluster.spire.workload_entries",
+    "multicluster.eastwest.gateway_reachable",
+    "multicluster.eastwest.a_to_b_authenticated",
+    "multicluster.eastwest.b_to_a_authenticated",
+    "multicluster.eastwest.bidirectional_authenticated_traffic",
+    "multicluster.eastwest.untrusted_peer_rejected",
+    "multicluster.federation.bundle_revoked_rejected",
+    "multicluster.federation.trust_restored_recovers",
+    "multicluster.eastwest.endpoint_blackhole_when_dest_down",
+    "multicluster.eastwest.endpoint_recovers_when_dest_returns",
 }
 
 MAIN_PUBLISH_WORKFLOWS = {
@@ -323,6 +367,79 @@ def extract_documentation_paths(workflow_yml: str) -> set[str]:
     return paths
 
 
+def extract_required_assertion_ids(gate_body: str) -> set[str]:
+    """Return the `--require <id>` arguments the artifact gate passes."""
+
+    return set(re.findall(r"--require\s+(\S+)", gate_body))
+
+
+def validate_artifact_gate_wiring() -> list[str]:
+    """Prove the emitted-artifact gate is wired, pinned, and fail-closed.
+
+    A `Multicluster Federation Live` check that merely reports the live job's
+    conclusion cannot see what the run published. These checks fail the hosted
+    `Verify required CI aggregate wiring` step if a later change keeps the
+    required check name while removing the download, the validator, the exact
+    commit binding, or an id from the release contract.
+    """
+
+    errors: list[str] = []
+    workflow_yml = Path(ARTIFACT_GATE_WORKFLOW).read_text(encoding="utf-8")
+    gate_body = extract_job_body(workflow_yml, "gate")
+
+    if ARTIFACT_GATE_DOWNLOAD_ACTION not in gate_body:
+        errors.append(
+            f"{ARTIFACT_GATE_WORKFLOW} jobs.gate must download the published live "
+            f"artifact with the pinned `{ARTIFACT_GATE_DOWNLOAD_ACTION}`"
+        )
+
+    # The gate must stay free of any build/toolchain step so the trusted build
+    # policy keeps reading it as a non-build job.
+    for forbidden in ("cargo ", "setup-rust", "rustup", "docker build", "kind "):
+        if forbidden in gate_body:
+            errors.append(
+                f"{ARTIFACT_GATE_WORKFLOW} jobs.gate must not run `{forbidden.strip()}`; "
+                "the aggregate gate carries no build or toolchain surface"
+            )
+
+    validator = Path(".github/scripts/validate_live_assertions.py")
+    if not validator.is_file():
+        errors.append(f"{validator} must exist; it is the emitted-artifact gate")
+
+    required_ids = extract_required_assertion_ids(gate_body)
+    if required_ids != ARTIFACT_GATE_REQUIRED_IDS:
+        missing = sorted(ARTIFACT_GATE_REQUIRED_IDS - required_ids)
+        unexpected = sorted(required_ids - ARTIFACT_GATE_REQUIRED_IDS)
+        errors.append(
+            f"{ARTIFACT_GATE_WORKFLOW} jobs.gate must require exactly the "
+            f"release-contract assertion ids (missing: {missing}, "
+            f"unexpected: {unexpected})"
+        )
+
+    # Every artifact step must be reached only through the positively
+    # established relevant-and-successful path, so an irrelevant pull request
+    # never tries to download an artifact that was never produced.
+    for step_marker in (
+        "name: Checkout Ferrum Edge",
+        "name: Download live assertion artifact",
+        "name: Validate emitted live assertion artifact",
+    ):
+        index = gate_body.find(step_marker)
+        if index < 0:
+            errors.append(
+                f"{ARTIFACT_GATE_WORKFLOW} jobs.gate is missing step `{step_marker}`"
+            )
+            continue
+        following = gate_body[index : index + 400]
+        if "if: steps.summarize.outputs.validate == 'true'" not in following:
+            errors.append(
+                f"{ARTIFACT_GATE_WORKFLOW} jobs.gate step `{step_marker}` must be "
+                "gated on the summarize step's `validate` output"
+            )
+
+    return errors
+
+
 def main() -> int:
     ci_path = Path(".github/workflows/ci.yml")
     ci_yml = ci_path.read_text(encoding="utf-8")
@@ -482,6 +599,13 @@ def main() -> int:
         run_self_test()
     except AssertionError as error:
         planner_errors.append(f"Markdown link-check self-test failed: {error}")
+    try:
+        live_assertion_validator_self_test()
+    except AssertionError as error:
+        planner_errors.append(
+            f"live-assertion artifact validator self-test failed: {error}"
+        )
+    planner_errors.extend(validate_artifact_gate_wiring())
     planner_errors.extend(error.format() for error in check_repository())
     release_yml = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
     planner_errors.extend(validate_release_workflow(release_yml))

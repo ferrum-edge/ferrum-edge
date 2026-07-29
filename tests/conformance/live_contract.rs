@@ -712,18 +712,21 @@ fn live_contract_real_contract_declares_the_multicluster_suite_rows() {
     }
 }
 
-/// The `multicluster-federation` live workflow runs no in-workflow artifact
-/// validator — the trusted ARM64 Cross build policy freezes that workflow's
-/// Cross-sensitive surfaces, so neither a new cargo job nor an edit to the
-/// existing build job is permitted there. Its fail-closed required-assertion
-/// gate is therefore the fixture's own
+/// The `multicluster-federation` live suite has two fail-closed required-
+/// assertion gates. The first is the fixture's own
 /// `ferrum_live_assertions_require_all_passed` call over the run.sh-local
-/// `REQUIRED_LIVE_ASSERTIONS` array.
+/// `REQUIRED_LIVE_ASSERTIONS` array, which proves what the fixture process
+/// observed. The second is the `gate` job of
+/// `.github/workflows/multicluster-federation-live.yml`, which downloads the
+/// published artifact and validates the emitted `live-assertions.json` against
+/// the same id set (see
+/// `live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows`).
 ///
-/// That only gates the GA contract if the array and the contract stay the same
-/// set, so this hosted test is the binding between them: drop an id from the
-/// array (weakening the live gate) or add an enforced contract row the fixture
-/// never requires, and this test fails in the ordinary `Tests` aggregate.
+/// Either only gates the GA contract if its id set and the contract stay the
+/// same set, so this hosted test is the binding for the fixture half: drop an
+/// id from the array (weakening the live gate) or add an enforced contract row
+/// the fixture never requires, and this test fails in the ordinary `Tests`
+/// aggregate.
 #[test]
 fn live_contract_multicluster_fixture_requires_exactly_the_enforced_rows() {
     const RUN_SH: &str = include_str!("../k8s/multicluster-federation/run.sh");
@@ -783,5 +786,92 @@ fn live_contract_multicluster_fixture_requires_exactly_the_enforced_rows() {
         "live fixture requires assertions with no enforced GA-contract row \
          (add the row, or drop the id from REQUIRED_LIVE_ASSERTIONS): \
          {missing_in_contract:?}"
+    );
+}
+
+/// The second fail-closed gate: the `gate` job of
+/// `.github/workflows/multicluster-federation-live.yml` downloads the artifact
+/// the live run PUBLISHED and validates it with
+/// `.github/scripts/validate_live_assertions.py`. The fixture-side check cannot
+/// prove the published artifact belongs to this commit, this platform profile,
+/// or this run at all; the workflow gate can, and does.
+///
+/// The workflow spells its required ids explicitly, which is only a contract if
+/// the spelling and `ga_contract.yaml` stay the same set. This test is that
+/// binding, in both directions, so neither dropping an id from the workflow nor
+/// adding an enforced contract row the workflow never checks can pass hosted
+/// CI. It also pins the exactness flags, so the gate cannot be relaxed into a
+/// shape that accepts a stale or foreign artifact.
+#[test]
+fn live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows() {
+    const WORKFLOW: &str =
+        include_str!("../../.github/workflows/multicluster-federation-live.yml");
+
+    let gate_start = WORKFLOW
+        .find("\n  gate:\n")
+        .expect("multicluster-federation-live.yml must declare a `gate` job");
+    let gate_body = &WORKFLOW[gate_start..];
+
+    for pinned in [
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        "name: multicluster-federation-results",
+        "python3 .github/scripts/validate_live_assertions.py --self-test",
+        "--artifact multicluster-federation-artifact/live-assertions.json",
+        "--schema-version 1",
+        "--suite multicluster-federation",
+        "--platform-profile kind-spire-multicluster-federation",
+        "--commit \"$EXPECTED_COMMIT\"",
+        "EXPECTED_COMMIT: ${{ github.sha }}",
+        "--max-age-seconds 21600",
+        "--required-namespace multicluster.",
+        "if: steps.summarize.outputs.validate == 'true'",
+    ] {
+        assert!(
+            gate_body.contains(pinned),
+            "the multicluster live release gate must keep `{pinned}` — without it the \
+             emitted artifact is no longer bound to this commit, this profile, this \
+             freshness window, or this contract"
+        );
+    }
+    assert!(
+        !gate_body.contains("cargo "),
+        "the aggregate gate must carry no build or toolchain surface"
+    );
+
+    let workflow_required: BTreeSet<&str> = gate_body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("--require "))
+        .map(|rest| rest.trim().trim_end_matches('\\').trim())
+        .collect();
+    assert!(
+        !workflow_required.is_empty(),
+        "the multicluster live release gate must pass an explicit --require id set"
+    );
+
+    let contract = load_contract().expect("real contract loads");
+    let contract_required: BTreeSet<&str> = contract
+        .ga_capabilities()
+        .into_iter()
+        .filter(|capability| {
+            capability.live_suite == "multicluster-federation" && capability.live_deferred.is_none()
+        })
+        .flat_map(|capability| capability.live_assertions.iter().map(String::as_str))
+        .collect();
+    assert!(
+        !contract_required.is_empty(),
+        "the multicluster-federation suite must have enforced GA contract rows"
+    );
+
+    let missing_in_workflow: Vec<&&str> = contract_required.difference(&workflow_required).collect();
+    assert!(
+        missing_in_workflow.is_empty(),
+        "GA-contract assertions the release gate does not validate in the emitted \
+         artifact: {missing_in_workflow:?}"
+    );
+    let missing_in_contract: Vec<&&str> = workflow_required.difference(&contract_required).collect();
+    assert!(
+        missing_in_contract.is_empty(),
+        "release gate requires assertion ids with no enforced GA-contract row \
+         (add the row, or drop the --require): {missing_in_contract:?}"
     );
 }

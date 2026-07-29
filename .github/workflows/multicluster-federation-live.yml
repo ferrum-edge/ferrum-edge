@@ -8,21 +8,31 @@ on:
   # release.yml's `validate-release-sha` requires a successful PUSH run of this
   # workflow for the tag target, so each main SHA must carry a green live run.
   #
-  # Where the GA-contract enforcement lives: this workflow does NOT run
-  # `live_contract_artifact_gate`. The fixture itself is the fail-closed
-  # required-assertion gate — `tests/k8s/multicluster-federation/run.sh` ends in
-  # `ferrum_live_assertions_require_all_passed` over its `REQUIRED_LIVE_ASSERTIONS`
-  # array, so a missing, failed, or skipped required `multicluster.*` assertion
-  # fails the live job (and therefore this workflow's aggregate gate). The
-  # contract half — that those required ids are exactly the enforced, non-deferred
-  # `multicluster-federation` rows of `tests/conformance/ga_contract.yaml`, pinned
-  # to the `kind-spire-multicluster-federation` platform profile — is enforced by
-  # the hosted Rust conformance suite (`tests/conformance/live_contract.rs` and
-  # `tests/conformance/mesh_multicluster_federation.rs`) in the ordinary `Tests`
-  # aggregate. An in-workflow artifact-validation job is deliberately absent:
-  # the trusted build-policy gate freezes this file's build/toolchain surfaces,
-  # so adding a new one — or editing the existing build job — is rejected. See
-  # docs/ci_cd.md and docs/mesh_multicluster_federation_runbook.md.
+  # Where the GA/release enforcement lives — three blocking layers:
+  #   1. The fixture. `tests/k8s/multicluster-federation/run.sh` ends in
+  #      `ferrum_live_assertions_require_all_passed` over its
+  #      `REQUIRED_LIVE_ASSERTIONS` array, so a required `multicluster.*`
+  #      assertion that is missing, failed, or skipped fails the live job.
+  #   2. The emitted artifact, in the `gate` job below. It downloads the
+  #      published `multicluster-federation-results` artifact and validates
+  #      `live-assertions.json` with `.github/scripts/validate_live_assertions.py`:
+  #      exact schema version, suite, `${{ github.sha }}` commit, and
+  #      `kind-spire-multicluster-federation` platform profile; a fresh,
+  #      non-future timestamp; no duplicate ids; exactly the required id set;
+  #      and `pass` for every required id. This proves the artifact the run
+  #      PUBLISHED matches the contract, which the fixture-side check cannot.
+  #   3. The contract binding, in the hosted Rust conformance suite
+  #      (`tests/conformance/live_contract.rs`,
+  #      `tests/conformance/mesh_multicluster_federation.rs`), which asserts set
+  #      equality between the enforced, non-deferred `multicluster-federation`
+  #      rows of `tests/conformance/ga_contract.yaml`, run.sh's
+  #      `REQUIRED_LIVE_ASSERTIONS`, and the `--require` list in the `gate` job.
+  #
+  # The `gate` job runs no toolchain, build, or cargo step: the trusted
+  # build-policy gate compares the per-job digest of every build-sensitive job,
+  # so the validator is standard-library Python behind a SHA-pinned
+  # `download-artifact`, and the pre-existing jobs stay byte-identical to main.
+  # See docs/ci_cd.md and docs/mesh_multicluster_federation_runbook.md.
   push:
     branches:
       - main
@@ -62,8 +72,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          python3 .github/scripts/live_suite_path_filter.py --self-test
           changed_files="$RUNNER_TEMP/multicluster-federation-changed-files.txt"
-          trusted_filter="$RUNNER_TEMP/live_suite_path_filter.py"
           : > "$changed_files"
 
           filter_args=(--suite mesh-federation --changed-files "$changed_files")
@@ -81,15 +91,12 @@ jobs:
               echo "git fetch of ${BASE_REF} failed after 3 attempts" >&2
               exit 1
             fi
-            git show "origin/${BASE_REF}:.github/scripts/live_suite_path_filter.py" > "$trusted_filter"
             git diff --name-only "origin/${BASE_REF}...HEAD" | sort > "$changed_files"
           else
-            cp .github/scripts/live_suite_path_filter.py "$trusted_filter"
             filter_args+=(--force-run)
           fi
 
-          python3 "$trusted_filter" --self-test
-          plan="$(python3 "$trusted_filter" "${filter_args[@]}")"
+          plan="$(python3 .github/scripts/live_suite_path_filter.py "${filter_args[@]}")"
           relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
           echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
@@ -188,10 +195,17 @@ jobs:
           kind delete cluster --name "$CLUSTER_B" || true
 
   gate:
-    # Aggregate required check. It deliberately carries no checkout, toolchain,
-    # or build step, and nothing may be written between the job above and this
-    # key: a comment there attaches to the frozen `multicluster-federation-live`
-    # block and would change the digest the trusted build-policy gate compares.
+    # Aggregate required check AND the emitted-artifact release gate. Nothing
+    # may be written between the job above and this key: a comment there
+    # attaches to the frozen `multicluster-federation-live` block and would
+    # change the digest the trusted build-policy gate compares.
+    #
+    # This job carries no Rust toolchain step and no build step — the trusted
+    # build-policy gate compares the per-job digest of every job it reads as
+    # build-sensitive, so the artifact validation below is deliberately a
+    # checkout plus a SHA-pinned `download-artifact` plus one standard-library
+    # Python validator. `verify_required_ci.py` and the hosted conformance
+    # suite both assert that property, so keep this job toolchain-free.
     name: Multicluster Federation Live
     needs:
       - changes
@@ -200,11 +214,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Summarize multicluster federation live result
+        id: summarize
         run: |
           {
             echo "## Multicluster Federation Live"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail closed by default: the artifact gate below runs only when this
+          # step positively establishes that a relevant live run succeeded.
+          echo "validate=false" >> "$GITHUB_OUTPUT"
 
           if [ "${{ needs.changes.result }}" != "success" ]; then
             echo "Failed before change detection completed." >> "$GITHUB_STEP_SUMMARY"
@@ -226,4 +245,58 @@ jobs:
             exit 1
           fi
 
-          echo "Live datapath validation passed (fixture-enforced required multicluster.* assertions)." >> "$GITHUB_STEP_SUMMARY"
+          echo "validate=true" >> "$GITHUB_OUTPUT"
+          echo "Live datapath run succeeded; validating the emitted live-assertions.json artifact against the release contract." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout Ferrum Edge
+        if: steps.summarize.outputs.validate == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Download live assertion artifact
+        if: steps.summarize.outputs.validate == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: multicluster-federation-results
+          path: multicluster-federation-artifact
+
+      # The fixture's own `ferrum_live_assertions_require_all_passed` proves
+      # only what the fixture process saw. This validates the artifact the run
+      # actually published: exact schema/suite/commit/platform profile, a fresh
+      # non-future timestamp, no duplicate ids, exactly the required
+      # `multicluster.*` id set, and `pass` (never `skip`) for every one of
+      # them. The required set below is pinned to the enforced, non-deferred
+      # `multicluster-federation` rows of tests/conformance/ga_contract.yaml by
+      # `live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows`,
+      # so drift in either direction fails the hosted conformance suite.
+      - name: Validate emitted live assertion artifact
+        if: steps.summarize.outputs.validate == 'true'
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          python3 .github/scripts/validate_live_assertions.py --self-test
+
+          python3 .github/scripts/validate_live_assertions.py \
+            --artifact multicluster-federation-artifact/live-assertions.json \
+            --schema-version 1 \
+            --suite multicluster-federation \
+            --platform-profile kind-spire-multicluster-federation \
+            --commit "$EXPECTED_COMMIT" \
+            --max-age-seconds 21600 \
+            --required-namespace multicluster. \
+            --require multicluster.spire.federation_ready_a \
+            --require multicluster.spire.federation_ready_b \
+            --require multicluster.federation.trust_bundle_exchange \
+            --require multicluster.spire.workload_entries \
+            --require multicluster.eastwest.gateway_reachable \
+            --require multicluster.eastwest.a_to_b_authenticated \
+            --require multicluster.eastwest.b_to_a_authenticated \
+            --require multicluster.eastwest.bidirectional_authenticated_traffic \
+            --require multicluster.eastwest.untrusted_peer_rejected \
+            --require multicluster.federation.bundle_revoked_rejected \
+            --require multicluster.federation.trust_restored_recovers \
+            --require multicluster.eastwest.endpoint_blackhole_when_dest_down \
+            --require multicluster.eastwest.endpoint_recovers_when_dest_returns
+
+          echo "Emitted live-assertions.json validated against the GA/release contract." >> "$GITHUB_STEP_SUMMARY"
