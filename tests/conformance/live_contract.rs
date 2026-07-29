@@ -804,8 +804,7 @@ fn live_contract_multicluster_fixture_requires_exactly_the_enforced_rows() {
 /// shape that accepts a stale or foreign artifact.
 #[test]
 fn live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows() {
-    const WORKFLOW: &str =
-        include_str!("../../.github/workflows/multicluster-federation-live.yml");
+    const WORKFLOW: &str = include_str!("../../.github/workflows/multicluster-federation-live.yml");
 
     let gate_start = WORKFLOW
         .find("\n  gate:\n")
@@ -862,13 +861,15 @@ fn live_contract_multicluster_release_gate_requires_exactly_the_enforced_rows() 
         "the multicluster-federation suite must have enforced GA contract rows"
     );
 
-    let missing_in_workflow: Vec<&&str> = contract_required.difference(&workflow_required).collect();
+    let missing_in_workflow: Vec<&&str> =
+        contract_required.difference(&workflow_required).collect();
     assert!(
         missing_in_workflow.is_empty(),
         "GA-contract assertions the release gate does not validate in the emitted \
          artifact: {missing_in_workflow:?}"
     );
-    let missing_in_contract: Vec<&&str> = workflow_required.difference(&contract_required).collect();
+    let missing_in_contract: Vec<&&str> =
+        workflow_required.difference(&contract_required).collect();
     assert!(
         missing_in_contract.is_empty(),
         "release gate requires assertion ids with no enforced GA-contract row \
