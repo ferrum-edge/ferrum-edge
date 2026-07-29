@@ -149,6 +149,10 @@ MAIN_PUBLISH_WORKFLOWS = {
     ".github/workflows/mesh-e2e-sidecar-live.yml": (
         "Mesh E2E Sidecar Live Datapath"
     ),
+}
+
+DEDICATED_WORKFLOW_NAMES = {
+    **MAIN_PUBLISH_WORKFLOWS,
     ".github/workflows/multicluster-federation-live.yml": (
         "Multicluster Federation Live Datapath"
     ),
@@ -161,7 +165,7 @@ MAIN_PUBLISH_WORKFLOWS = {
 # Cross verifier independently freezes this complete job, so changing either
 # the implementation or this diagnostic digest requires a trusted-base update.
 MAIN_PUBLISH_GATE_SHA256 = (
-    "667373e486e22bdecda446a81eeed602b50c06f9ddfc845b52828782f60d26b1"
+    "51d93dead7e8337df4cd85a8c034d11436ee8d1935d8e6b2e58509c5e7da8fb4"
 )
 
 
@@ -404,7 +408,7 @@ def main() -> int:
 
     for workflow_path, required_check in DEDICATED_REQUIRED_CHECKS.items():
         workflow_yml = Path(workflow_path).read_text(encoding="utf-8")
-        expected_workflow_name = MAIN_PUBLISH_WORKFLOWS.get(workflow_path)
+        expected_workflow_name = DEDICATED_WORKFLOW_NAMES.get(workflow_path)
         if expected_workflow_name is not None:
             if not workflow_has_exact_name(workflow_yml, expected_workflow_name):
                 planner_errors.append(
