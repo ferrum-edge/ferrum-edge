@@ -988,3 +988,189 @@ async fn decoded_sse_json_preludes_are_inspected_over_h1_h2_and_h3() {
     drop(reject_harness);
     backend.abort();
 }
+
+// ============================================================================
+// streaming.max_hold_ms — live slow-backend hold deadline (issue #3303)
+// ============================================================================
+
+/// An embeddings endpoint that accepts the TCP connection, reads the request,
+/// and then never answers. This is the "deliberately slow semantic backend" the
+/// hold deadline exists for: `provider.request_timeout_ms` is set far higher
+/// than `streaming.max_hold_ms` in these tests, so only the hold deadline can
+/// resolve the window.
+async fn start_stalled_embeddings_backend_on(listener: TcpListener) {
+    loop {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16384];
+                let _n = stream.read(&mut buf).await.unwrap_or(0);
+                // Hold the connection open without replying. The gateway must
+                // stop waiting on its own.
+                sleep(Duration::from_secs(120)).await;
+                drop(stream);
+            });
+        }
+    }
+}
+
+/// `streaming_response: inspect` with a short absolute hold deadline against a
+/// stalled embeddings provider. `on_hold_timeout` selects fail-closed/fail-open.
+fn hold_timeout_config(backend_port: u16, embeddings_port: u16, on_hold_timeout: &str) -> String {
+    format!(
+        r#"
+version: "1"
+proxies:
+  - id: "asf-proxy"
+    listen_path: "/ai"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    plugins:
+      - plugin_config_id: "asf-1"
+
+consumers: []
+
+plugin_configs:
+  - id: "asf-1"
+    proxy_id: "asf-proxy"
+    plugin_name: "ai_semantic_firewall"
+    scope: "proxy"
+    enabled: true
+    config:
+      inspect:
+        request: false
+        response: true
+      streaming_response: "inspect"
+      on_error: "reject"
+      streaming:
+        max_hold_ms: 300
+        on_hold_timeout: "{on_hold_timeout}"
+      provider:
+        type: "openai_compatible_embeddings"
+        endpoint: "http://127.0.0.1:{embeddings_port}/v1/embeddings"
+        model: "test-embedding-model"
+        request_timeout_ms: 15000
+      builtins:
+        prompt_injection: false
+        jailbreak: false
+        system_prompt_exfiltration: false
+        data_exfiltration: false
+        indirect_prompt_injection: false
+        tool_abuse: false
+        response_leakage: true
+"#
+    )
+}
+
+#[ignore]
+#[tokio::test]
+async fn inspect_mode_cuts_stream_when_hold_deadline_expires() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let embeddings_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let embeddings_port = embeddings_listener.local_addr().unwrap().port();
+    let config_path = write_config(
+        &temp_dir,
+        &hold_timeout_config(backend_port, embeddings_port, "cut"),
+    );
+
+    // CLEAN_SSE never matches lexically, so the firewall must consult the
+    // (stalled) semantic provider — the window is genuinely held awaiting a
+    // verdict that never arrives.
+    let backend = tokio::spawn(start_sse_backend_on(backend_listener, CLEAN_SSE));
+    let embeddings = tokio::spawn(start_stalled_embeddings_backend_on(embeddings_listener));
+    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+
+    let client = reqwest::Client::new();
+    let started = std::time::Instant::now();
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/ai/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
+        .send()
+        .await
+        .expect("request failed");
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    let elapsed = started.elapsed();
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend.abort();
+    embeddings.abort();
+
+    assert_eq!(
+        status, 200,
+        "headers are committed before the body streams (body: {body})"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "hold deadline must bind before provider.request_timeout_ms (15s), took {elapsed:?}"
+    );
+    assert!(
+        body.contains("ai_semantic_firewall_response_blocked"),
+        "an expired hold under on_hold_timeout=cut emits the terminal error event, got: {body}"
+    );
+    assert!(
+        !body.contains("sunny today"),
+        "the un-inspected held window must never reach the client, got: {body}"
+    );
+}
+
+#[ignore]
+#[tokio::test]
+async fn inspect_mode_forwards_held_window_when_configured_to_fail_open() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    let embeddings_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let embeddings_port = embeddings_listener.local_addr().unwrap().port();
+    let config_path = write_config(
+        &temp_dir,
+        &hold_timeout_config(backend_port, embeddings_port, "forward"),
+    );
+
+    let backend = tokio::spawn(start_sse_backend_on(backend_listener, CLEAN_SSE));
+    let embeddings = tokio::spawn(start_stalled_embeddings_backend_on(embeddings_listener));
+    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+
+    let client = reqwest::Client::new();
+    let started = std::time::Instant::now();
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/ai/v1/chat/completions",
+            proxy_port
+        ))
+        .header("content-type", "application/json")
+        .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
+        .send()
+        .await
+        .expect("request failed");
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    let elapsed = started.elapsed();
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    backend.abort();
+    embeddings.abort();
+
+    assert_eq!(status, 200);
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "hold deadline must bind before provider.request_timeout_ms (15s), took {elapsed:?}"
+    );
+    assert!(
+        body.contains("sunny today"),
+        "an explicit fail-open policy releases the held window, got: {body}"
+    );
+    assert!(
+        !body.contains("ai_semantic_firewall_response_blocked"),
+        "fail-open must not cut, got: {body}"
+    );
+}

@@ -382,7 +382,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ai_semantic_firewall",
         classification: BuiltinPluginClassification::Public,
         priority: 2968,
-        active_phases: "before_proxy, on_final_request_body, on_response_body, on_final_response_body, response_stream_inspector",
+        active_phases: "before_proxy, on_final_request_body, on_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP-only semantic inspection for LLM JSON request and response bodies",
     },

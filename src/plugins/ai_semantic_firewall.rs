@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::OnceCell;
 use url::{Host, Url};
@@ -525,6 +525,11 @@ pub struct AiSemanticFirewall {
     /// Windowed-inspection config, `Some` only when `streaming_response: inspect`.
     /// Drives the per-response [`StreamInspector`].
     streaming_config: Option<StreamingInspectConfig>,
+    /// Per-instance key for this plugin's typed response-stream handoff, used to
+    /// carry [`StreamHoldStats`] from the inspector to
+    /// `on_response_stream_terminated`. Allocated once at construction so two
+    /// scoped instances on one proxy never collide.
+    stream_hold_handoff_key: u64,
     engine: Arc<FirewallEngine>,
 }
 
@@ -665,6 +670,7 @@ impl AiSemanticFirewall {
                 has_request_rules: false,
                 has_response_rules: false,
                 streaming_config,
+                stream_hold_handoff_key: super::allocate_response_stream_handoff_id(),
                 engine: Arc::new(FirewallEngine {
                     enabled,
                     mode,
@@ -773,6 +779,7 @@ impl AiSemanticFirewall {
             has_request_rules,
             has_response_rules,
             streaming_config,
+            stream_hold_handoff_key: super::allocate_response_stream_handoff_id(),
             engine: Arc::new(FirewallEngine {
                 enabled,
                 mode,
@@ -2266,11 +2273,78 @@ impl Plugin for AiSemanticFirewall {
         if !content_type.is_some_and(is_event_stream_content_type) {
             return None;
         }
+        // Fixed-cardinality hold counters live on the request-owned stream
+        // handoff, so a detached detect evaluation can still increment them
+        // after the inspector is gone and terminal logging can drain them
+        // without a process-global registry.
+        let hold_stats = Arc::new(StreamHoldStats::default());
+        if config.max_hold.is_some()
+            && let Some(handoff) = ctx.response_stream_handoff()
+        {
+            handoff.publish(self.stream_hold_handoff_key, Arc::clone(&hold_stats));
+        }
         Some(Box::new(StreamInspector::new(
             Arc::clone(&self.engine),
             config,
             Arc::clone(&ctx.plugin_http_call_ns),
+            hold_stats,
         )))
+    }
+
+    /// Fold this response's hold-deadline counters into transaction metadata.
+    ///
+    /// Both keys are fixed and the action value comes from a closed vocabulary
+    /// (`cut` / `forward` / `detect_abandoned`), so streamed traffic cannot
+    /// inflate log or metric cardinality. Multiple active instances on one
+    /// response saturating-sum their timeout counts into the same key and merge
+    /// the action with client-visible precedence `cut` > `forward` >
+    /// `detect_abandoned`, so hook order cannot change the audit record. An
+    /// instance with zero expiries neither synthesizes nor erases those keys.
+    /// A `detect` evaluation that outlives terminal logging keeps its
+    /// structured warning as the durable audit record, matching the plugin's
+    /// existing detect contract.
+    async fn on_response_stream_terminated(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _outcome: &crate::proxy::deferred_log::BodyOutcome,
+    ) {
+        let Some(handoff) = ctx.response_stream_handoff() else {
+            return;
+        };
+        let Some(stats) = handoff.take::<StreamHoldStats>(self.stream_hold_handoff_key) else {
+            return;
+        };
+        let timeouts = stats.timeouts.load(Ordering::Relaxed);
+        // Zero-expiry instances must leave any sibling-written keys intact.
+        if timeouts == 0 {
+            return;
+        }
+        const TIMEOUTS_KEY: &str = "ai_semantic_firewall.stream_hold_timeouts";
+        const ACTION_KEY: &str = "ai_semantic_firewall.stream_hold_timeout_action";
+        let merged_timeouts = match ctx.metadata.get(TIMEOUTS_KEY) {
+            Some(existing) => existing
+                .parse::<u64>()
+                .unwrap_or(0)
+                .saturating_add(timeouts),
+            None => timeouts,
+        };
+        ctx.metadata
+            .insert(TIMEOUTS_KEY.to_string(), merged_timeouts.to_string());
+        let last_action = stats.last_action.load(Ordering::Relaxed);
+        let Some(action) = HoldTimeoutAction::from_code(last_action) else {
+            return;
+        };
+        let merged_action = match ctx
+            .metadata
+            .get(ACTION_KEY)
+            .and_then(|value| HoldTimeoutAction::parse(value))
+        {
+            Some(existing) => existing.most_restrictive(action),
+            None => action,
+        };
+        ctx.metadata
+            .insert(ACTION_KEY.to_string(), merged_action.as_str().to_string());
     }
 
     async fn on_response_body(
@@ -3143,6 +3217,191 @@ struct StreamingInspectConfig {
     /// Emit an OpenAI-compatible terminal error event on a cut (vs. a silent
     /// end). `block` mode only — `detect` never cuts.
     cut_with_error_event: bool,
+    /// Absolute deadline on how long content may be held awaiting a semantic
+    /// verdict, independent of `max_window_bytes`, the provider request timeout,
+    /// and any transport timeout. `None` leaves the hold unbounded (the historic
+    /// behavior). See [`HoldState`] for the anchoring rules.
+    max_hold: Option<Duration>,
+    /// What an expired hold does. Only meaningful when `max_hold` is `Some`.
+    hold_timeout: HoldTimeoutPolicy,
+}
+
+/// Ceiling for `streaming.max_hold_ms` (5 minutes). A hold longer than this is
+/// indistinguishable from "unbounded" for an operator bounding client-visible
+/// latency and gateway-retained bytes, so it is rejected rather than accepted as
+/// a bound that never fires.
+const MAX_STREAM_HOLD_MS: u64 = 300_000;
+
+/// Configured policy for a hold deadline that expires before the semantic
+/// verdict arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldTimeoutPolicy {
+    /// Inherit the plugin's `on_error` policy: `reject` fails closed (cut),
+    /// `warn`/`allow` fail open (forward the held window uninspected).
+    FollowOnError,
+    /// Always fail closed: discard the held window and cut the stream.
+    Cut,
+    /// Always fail open: release the held window uninspected and keep streaming.
+    Forward,
+}
+
+/// The resolved (post-`on_error`) action for an expired hold, and the fixed
+/// vocabulary reported through transaction metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldTimeoutAction {
+    Cut,
+    Forward,
+    /// `detect` mode: the window's bytes were forwarded before the evaluation
+    /// even started, so an expired hold can only abandon the detached
+    /// evaluation and release its admission permit.
+    DetectAbandoned,
+}
+
+impl HoldTimeoutAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cut => "cut",
+            Self::Forward => "forward",
+            Self::DetectAbandoned => "detect_abandoned",
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Cut => 1,
+            Self::Forward => 2,
+            Self::DetectAbandoned => 3,
+        }
+    }
+
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Cut),
+            2 => Some(Self::Forward),
+            3 => Some(Self::DetectAbandoned),
+            _ => None,
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "cut" => Some(Self::Cut),
+            "forward" => Some(Self::Forward),
+            "detect_abandoned" => Some(Self::DetectAbandoned),
+            _ => None,
+        }
+    }
+
+    /// Client-visible restrictiveness for multi-instance metadata merge.
+    ///
+    /// Higher wins so later terminal hooks cannot soften an earlier, more
+    /// restrictive sibling action: `cut` > `forward` > `detect_abandoned`.
+    fn restrictiveness(self) -> u8 {
+        match self {
+            Self::Cut => 3,
+            Self::Forward => 2,
+            Self::DetectAbandoned => 1,
+        }
+    }
+
+    fn most_restrictive(self, other: Self) -> Self {
+        if self.restrictiveness() >= other.restrictiveness() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+/// Fixed-cardinality per-response hold-deadline counters.
+///
+/// Published to the request-owned response-stream handoff by the inspector and
+/// drained into transaction metadata by
+/// [`Plugin::on_response_stream_terminated`]. Both metadata keys stay fixed with
+/// a fixed value vocabulary — no rule id, no window content, and no operator-
+/// or attacker-controlled label ever enters this surface. Per-instance counters
+/// are saturating-summed across active instances; actions merge by
+/// [`HoldTimeoutAction::most_restrictive`].
+#[derive(Debug, Default)]
+struct StreamHoldStats {
+    /// Number of expired holds on this instance's inspector for this response.
+    timeouts: AtomicU64,
+    /// [`HoldTimeoutAction::code`] of the most recent expiry on this instance,
+    /// `0` when none.
+    last_action: AtomicU8,
+}
+
+impl StreamHoldStats {
+    fn record(&self, action: HoldTimeoutAction) {
+        self.timeouts.fetch_add(1, Ordering::Relaxed);
+        self.last_action.store(action.code(), Ordering::Relaxed);
+    }
+}
+
+/// Live hold-deadline state for one streamed response.
+///
+/// The clock is anchored to the moment un-released content first entered the
+/// gateway's hold and is **never** refreshed by the arrival of more chunks or
+/// by a partial release that leaves older bytes behind. It clears only when the
+/// current hold is fully drained, or after an expiry applies its policy. A
+/// backend that drip-feeds bytes therefore cannot extend the hold indefinitely.
+struct HoldState {
+    budget: Duration,
+    action: HoldTimeoutAction,
+    /// When the current hold began; `None` while nothing is held.
+    started: Option<std::time::Instant>,
+    stats: Arc<StreamHoldStats>,
+}
+
+/// Remaining hold budget at a decision point.
+enum HoldBudget {
+    /// The hold is unbounded, or nothing is currently held.
+    Unbounded,
+    Remaining(Duration),
+    Expired,
+}
+
+impl HoldState {
+    fn new(budget: Duration, action: HoldTimeoutAction, stats: Arc<StreamHoldStats>) -> Self {
+        Self {
+            budget,
+            action,
+            started: None,
+            stats,
+        }
+    }
+
+    /// Start the clock if content is held and it is not already running; stop it
+    /// when nothing is held any more. When provided, preserve the arrival time
+    /// of the transport chunk that supplied newly-held bytes. A coalesced chunk
+    /// may contain several ready SSE events which are inspected incrementally;
+    /// releasing an earlier event must not give a later event from that
+    /// already-arrived chunk a fresh hold budget.
+    fn sync_from(&mut self, held_bytes: usize, first_held_at: Option<std::time::Instant>) {
+        if held_bytes == 0 {
+            self.started = None;
+        } else if self.started.is_none() {
+            self.started = Some(first_held_at.unwrap_or_else(std::time::Instant::now));
+        }
+    }
+
+    /// Clear the clock after an expiry has applied a terminal policy and drained
+    /// or discarded the whole hold. Clean releases synchronize the remaining
+    /// held bytes, so a partial release cannot refresh older bytes that remain
+    /// held.
+    fn restart(&mut self) {
+        self.started = None;
+    }
+
+    fn budget(&self) -> HoldBudget {
+        let Some(started) = self.started else {
+            return HoldBudget::Unbounded;
+        };
+        match self.budget.checked_sub(started.elapsed()) {
+            Some(remaining) if !remaining.is_zero() => HoldBudget::Remaining(remaining),
+            _ => HoldBudget::Expired,
+        }
+    }
 }
 
 /// A complete SSE event held pending release: its raw bytes (empty in `detect`
@@ -3182,7 +3441,9 @@ struct IngestStep {
 /// text to inspect when a sentence/paragraph boundary (or the byte cap) is
 /// crossed — with a rolling overlap so a violation split across a boundary is
 /// caught. After a clean verdict the caller takes the released raw bytes via
-/// [`release`](Self::release); on a violation it calls [`discard_pending`](Self::discard_pending).
+/// [`release`](Self::release); on a violation or cut it calls
+/// [`discard_held`](Self::discard_held) (which clears the pending window via
+/// [`discard_pending`](Self::discard_pending) and frees held raw bytes + carry).
 ///
 /// Block-mode contract: raw bytes are held until the text they produced has been
 /// inspected and cleared, so no un-inspected bytes reach the client. Async
@@ -3208,6 +3469,15 @@ struct StreamWindowEngine {
     cleared_len: usize,
     /// Content offset the emitted-but-unverified window will clear to.
     pending_clears_to: Option<usize>,
+    /// After a fail-open hold timeout forwarded an un-terminated partial event,
+    /// remaining bytes of that same SSE event are forwarded uninspected until
+    /// the next event boundary. Later complete events resume normal inspection.
+    passthrough_to_event_end: bool,
+    /// At most two already-forwarded bytes retained solely to detect an SSE
+    /// blank-line boundary that spans chunk edges during
+    /// [`passthrough_to_event_end`]. Never re-emitted, never held awaiting a
+    /// semantic verdict, and never counted by the hold clock.
+    passthrough_tail: Vec<u8>,
 }
 
 impl StreamWindowEngine {
@@ -3223,7 +3493,50 @@ impl StreamWindowEngine {
             held: Vec::new(),
             cleared_len: 0,
             pending_clears_to: None,
+            passthrough_to_event_end: false,
+            passthrough_tail: Vec::new(),
         }
+    }
+
+    fn in_passthrough(&self) -> bool {
+        self.passthrough_to_event_end
+    }
+
+    /// Forward bytes of a fail-open mid-event remainder until the next SSE event
+    /// boundary. Returns `(forwarded, bytes_consumed_from_chunk)`. When the
+    /// boundary is reached, [`passthrough_to_event_end`] clears and any
+    /// unconsumed suffix of `chunk` is left for normal ingest.
+    ///
+    /// [`passthrough_tail`] is a copy of already-forwarded bytes used only to
+    /// detect a blank line that spans chunk edges — it is never re-emitted and
+    /// never held awaiting a semantic verdict.
+    fn ingest_passthrough(&mut self, chunk: &[u8]) -> (Vec<u8>, usize) {
+        debug_assert!(self.passthrough_to_event_end);
+        let mut scan = self.passthrough_tail.clone();
+        let prefix_len = scan.len();
+        scan.extend_from_slice(chunk);
+        if let Some(end) = next_event_end(&scan) {
+            self.passthrough_to_event_end = false;
+            self.passthrough_tail.clear();
+            // Forward only bytes from this chunk; the lookback was already sent.
+            let consumed = end.saturating_sub(prefix_len).min(chunk.len());
+            (chunk[..consumed].to_vec(), consumed)
+        } else {
+            // Keep a 2-byte lookback so `\n` + `\n` / `\n` + `\r\n` spanning a
+            // chunk edge is still recognized. Forward the entire chunk now so
+            // pass-through cannot re-accumulate an unbounded hold.
+            let keep = scan.len().min(2);
+            self.passthrough_tail = scan[scan.len() - keep..].to_vec();
+            (chunk.to_vec(), chunk.len())
+        }
+    }
+
+    /// Clear fail-open mid-event pass-through at end of stream. Lookback bytes
+    /// were already forwarded, so this returns nothing.
+    fn finish_passthrough(&mut self) -> Vec<u8> {
+        self.passthrough_to_event_end = false;
+        self.passthrough_tail.clear();
+        Vec::new()
     }
 
     /// Reassemble one complete SSE event into a held entry, recording whether it
@@ -3548,6 +3861,50 @@ impl StreamWindowEngine {
     fn discard_pending(&mut self) {
         self.pending_clears_to = None;
     }
+
+    /// Release every byte that caused the current hold without inspecting it:
+    /// complete held events and any un-terminated `carry`. When `carry` was
+    /// non-empty, enter [`passthrough_to_event_end`] so the remainder of that
+    /// same SSE event is never absorbed as a fresh inspectable event (its
+    /// prefix already left the gateway uninspected). Used only by the fail-open
+    /// hold-timeout path; returns the raw bytes to forward immediately.
+    fn force_release_held(&mut self) -> Vec<u8> {
+        let mut out = if let Some(last) = self.held.last() {
+            // Reuse `release()` so the cleared-offset rebase and overlap draining
+            // stay in exactly one place.
+            self.pending_clears_to = Some(last.content_len_after);
+            self.release()
+        } else {
+            self.discard_pending();
+            Vec::new()
+        };
+        if !self.carry.is_empty() {
+            out.extend_from_slice(&self.carry);
+            // The first bytes of the next chunk may complete a blank-line
+            // boundary that started in this already-forwarded prefix. Retain
+            // only a detection copy of the final two bytes before clearing the
+            // held carry; they must never be emitted a second time.
+            let keep = self.carry.len().min(2);
+            self.passthrough_tail = self.carry[self.carry.len() - keep..].to_vec();
+            self.carry.clear();
+            self.passthrough_to_event_end = true;
+        }
+        out
+    }
+
+    /// Drop every held byte and the pending window. Called when the stream is
+    /// cut so un-inspected content is freed at the cut, not at inspector drop —
+    /// no held window survives the cancellation that ended the response.
+    fn discard_held(&mut self) {
+        self.discard_pending();
+        self.held.clear();
+        self.held.shrink_to_fit();
+        self.carry.clear();
+        self.carry.shrink_to_fit();
+        self.passthrough_to_event_end = false;
+        self.passthrough_tail.clear();
+        self.passthrough_tail.shrink_to_fit();
+    }
 }
 
 /// Byte index just past the end of the first complete SSE event in `buf` (the
@@ -3641,9 +3998,54 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
         }
     };
 
-    if streaming.is_some_and(|obj| obj.contains_key("max_hold_ms")) {
+    // Absolute per-window hold deadline. Bounded admission: the value must be a
+    // representable, non-zero, non-excessive millisecond count, and every
+    // rejection is field-specific so a misconfigured security bound never
+    // resolves to "no bound".
+    let max_hold = match streaming_u64(streaming, "max_hold_ms")? {
+        None => None,
+        Some(0) => {
+            return Err(
+                "ai_semantic_firewall: streaming.max_hold_ms must be greater than 0; omit the field to leave the hold unbounded"
+                    .to_string(),
+            );
+        }
+        Some(millis) if millis > MAX_STREAM_HOLD_MS => {
+            return Err(format!(
+                "ai_semantic_firewall: streaming.max_hold_ms must be less than or equal to {MAX_STREAM_HOLD_MS}, got {millis}"
+            ));
+        }
+        Some(millis) => Some(Duration::from_millis(millis)),
+    };
+
+    // Explicit fail-open / fail-closed selection for an expired hold. The
+    // default defers to the plugin's existing error policy so a `reject`
+    // firewall fails closed and a `warn`/`allow` firewall fails open, exactly
+    // like a provider error or an exhausted inspection budget.
+    let hold_timeout = match streaming_str(streaming, "on_hold_timeout")?.unwrap_or("on_error") {
+        "on_error" => HoldTimeoutPolicy::FollowOnError,
+        "cut" => HoldTimeoutPolicy::Cut,
+        "forward" => HoldTimeoutPolicy::Forward,
+        other => {
+            return Err(format!(
+                "ai_semantic_firewall: streaming.on_hold_timeout must be 'on_error', 'cut', or 'forward', got {other:?}"
+            ));
+        }
+    };
+    if max_hold.is_none() && streaming.is_some_and(|obj| obj.contains_key("on_hold_timeout")) {
         return Err(
-            "ai_semantic_firewall: streaming.max_hold_ms is not yet supported; windows are bounded by streaming.max_window_bytes"
+            "ai_semantic_firewall: streaming.on_hold_timeout requires streaming.max_hold_ms to be set"
+                .to_string(),
+        );
+    }
+    // `detect` already forwarded every byte before the evaluation starts, so it
+    // can never cut. Accepting an explicit `cut` there would silently install an
+    // inert fail-closed setting; reject it with a field-specific error instead.
+    // The `on_error`-derived default still degrades to abandon-and-log, so an
+    // ordinary `on_error: reject` + `enforcement: detect` config stays valid.
+    if hold_timeout == HoldTimeoutPolicy::Cut && enforcement == StreamEnforcement::Detect {
+        return Err(
+            "ai_semantic_firewall: streaming.on_hold_timeout 'cut' is invalid with streaming.enforcement 'detect'; detect has already forwarded the window and cannot cut"
                 .to_string(),
         );
     }
@@ -3675,6 +4077,8 @@ fn parse_streaming_inspect_config(config: &Value) -> Result<StreamingInspectConf
         overlap_bytes: overlap_bytes as usize,
         max_inspections: u32::try_from(max_inspections).unwrap_or(u32::MAX),
         cut_with_error_event,
+        max_hold,
+        hold_timeout,
     })
 }
 
@@ -3712,6 +4116,11 @@ struct StreamInspector {
     /// Shared by every detached detect evaluation for this response so provider
     /// outages emit one sanitized warning rather than one per window.
     detect_provider_error_logged: Arc<AtomicBool>,
+    /// Absolute hold-deadline state. `Some` only when `streaming.max_hold_ms`
+    /// is configured, so the unbounded path pays nothing per chunk.
+    hold: Option<HoldState>,
+    /// Whether the one-time hold-timeout warning has fired for this response.
+    hold_timeout_logged: Arc<AtomicBool>,
 }
 
 impl StreamInspector {
@@ -3719,6 +4128,7 @@ impl StreamInspector {
         engine: Arc<FirewallEngine>,
         config: StreamingInspectConfig,
         plugin_http_call_ns: Arc<AtomicU64>,
+        hold_stats: Arc<StreamHoldStats>,
     ) -> Self {
         // Pre-split the configured response paths: delta paths are covered by the
         // reassembler; non-delta paths need per-frame extraction (matching the
@@ -3738,6 +4148,23 @@ impl StreamInspector {
         // extraction); the delta-only case stores no per-event `Value`s.
         let mut window = StreamWindowEngine::new(config);
         window.store_frames = non_delta_extraction.is_some();
+        // Resolve the configured hold policy against the plugin's error policy
+        // ONCE, at attach time, so the per-window decision is a plain field read.
+        let hold = config.max_hold.map(|budget| {
+            let action = match (config.enforcement, config.hold_timeout) {
+                (StreamEnforcement::Detect, _) => HoldTimeoutAction::DetectAbandoned,
+                (_, HoldTimeoutPolicy::Cut) => HoldTimeoutAction::Cut,
+                (_, HoldTimeoutPolicy::Forward) => HoldTimeoutAction::Forward,
+                (_, HoldTimeoutPolicy::FollowOnError) => {
+                    if engine.on_error == OnErrorAction::Reject {
+                        HoldTimeoutAction::Cut
+                    } else {
+                        HoldTimeoutAction::Forward
+                    }
+                }
+            };
+            HoldState::new(budget, action, hold_stats)
+        });
         Self {
             engine,
             config,
@@ -3753,7 +4180,104 @@ impl StreamInspector {
                 ))
             }),
             detect_provider_error_logged: Arc::new(AtomicBool::new(false)),
+            hold,
+            hold_timeout_logged: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Keep the hold clock in step with what is actually being held. Called
+    /// after every ingest step and every release.
+    fn sync_hold(&mut self) {
+        self.sync_hold_from(None);
+    }
+
+    /// As [`Self::sync_hold`], with an optional arrival-time anchor for bytes
+    /// taken from the current transport chunk.
+    fn sync_hold_from(&mut self, first_held_at: Option<std::time::Instant>) {
+        // `detect` holds nothing: its bytes were forwarded in `on_chunk`, so the
+        // deadline there bounds only the detached evaluation (and its admission
+        // permit), never a client-visible hold.
+        if self.config.enforcement == StreamEnforcement::Detect {
+            return;
+        }
+        // The historic unbounded path pays only this Option check; do not walk
+        // the held-event vector unless a deadline is configured.
+        let Some(hold) = self.hold.as_mut() else {
+            return;
+        };
+        // Un-released wire bytes: complete held events plus the un-terminated
+        // `carry`. Zero exactly when nothing is awaiting a verdict.
+        let held = self.window.input_window_bytes();
+        hold.sync_from(held, first_held_at);
+    }
+
+    /// Emit the one-time sanitized hold-timeout warning. Fixed fields only — no
+    /// rule id, no matched text, no window content, and no provider detail, so
+    /// an expired hold can never become a disclosure channel.
+    fn log_hold_timeout_once(&self, phase: &'static str, action: HoldTimeoutAction) {
+        if self.hold_timeout_logged.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let enforcement = match self.config.enforcement {
+            StreamEnforcement::Block => "block",
+            StreamEnforcement::Detect => "detect",
+        };
+        tracing::warn!(
+            target: "ai_semantic_firewall",
+            direction = "response",
+            enforcement,
+            phase,
+            action = action.as_str(),
+            max_hold_ms = self.config.max_hold.map(|d| d.as_millis() as u64),
+            "streaming inspect: response window hold deadline expired before a semantic verdict"
+        );
+    }
+
+    /// Apply the configured policy for an expired hold in `block` mode. Records
+    /// the fixed-cardinality counter, logs once, and either cuts (fail closed —
+    /// every held/partial byte is discarded and never reaches the client) or
+    /// releases every byte that caused the hold uninspected (fail open),
+    /// including any un-terminated carry, then pass-through until the next SSE
+    /// event boundary.
+    fn on_hold_expired(&mut self, phase: &'static str) -> ResponseStreamAction {
+        let Some(hold) = self.hold.as_mut() else {
+            return ResponseStreamAction::Forward(Bytes::new());
+        };
+        let action = hold.action;
+        hold.stats.record(action);
+        // Restart the clock either way: on a cut nothing more is held, and on a
+        // fail-open release every byte that caused this hold left the gateway
+        // (complete events and any partial carry), so the next hold is a new
+        // hold rather than an immediately-expired one. This is the ONLY reset
+        // path besides a clean release — arriving chunks never reset it.
+        hold.restart();
+        self.log_hold_timeout_once(phase, action);
+        match action {
+            HoldTimeoutAction::Cut => self.terminate(),
+            HoldTimeoutAction::Forward | HoldTimeoutAction::DetectAbandoned => {
+                self.log_forward_uninspected_once("hold_timeout");
+                let released = self.window.force_release_held();
+                self.sync_hold();
+                ResponseStreamAction::Forward(Bytes::from(released))
+            }
+        }
+    }
+
+    /// Release the pending window's held bytes downstream and synchronize the
+    /// clock. If older bytes remain in `held`/`carry`, they keep the original
+    /// deadline; only a fully drained hold lets the next bytes start a new one.
+    fn release_clean(&mut self) -> ResponseStreamAction {
+        let released = self.window.release();
+        self.sync_hold();
+        ResponseStreamAction::Forward(Bytes::from(released))
+    }
+
+    /// Whether the hold deadline has already expired with nothing left to wait
+    /// for. Cheap field read on the unbounded path.
+    fn hold_expired(&self) -> bool {
+        self.hold
+            .as_ref()
+            .is_some_and(|hold| matches!(hold.budget(), HoldBudget::Expired))
     }
 
     /// Emit a one-time warning that block mode forwarded a window WITHOUT
@@ -3818,7 +4342,7 @@ impl StreamInspector {
         let segments = self.window_segments();
         // Nothing inspectable (role-only events flushed): release without a call.
         if segments.is_empty() {
-            return ResponseStreamAction::Forward(Bytes::from(self.window.release()));
+            return self.release_clean();
         }
         // Per-response inspection cap reached but content is still arriving: honor
         // on_error instead of silently forwarding un-inspected windows — reject
@@ -3829,15 +4353,47 @@ impl StreamInspector {
                 self.terminate()
             } else {
                 self.log_forward_uninspected_once("max_inspections_reached");
-                ResponseStreamAction::Forward(Bytes::from(self.window.release()))
+                self.release_clean()
             };
         }
+        // The hold budget covers ALL time this window's bytes have been held —
+        // the time already spent accumulating them plus the semantic
+        // round-trip — so it is a true absolute deadline, not a second provider
+        // timeout. An already-expired budget skips the call entirely.
+        // Owned pair (elapsed-adjusted budget, full budget) so the `&self`
+        // borrow ends before the fail-closed/fail-open branch takes `&mut self`.
+        let budget = self.hold.as_ref().map(|hold| (hold.budget(), hold.budget));
+        let remaining = match budget {
+            None => None,
+            Some((HoldBudget::Expired, _)) => return self.on_hold_expired("await_verdict"),
+            Some((HoldBudget::Remaining(remaining), _)) => Some(remaining),
+            // Nothing is held right now (an overlap-only re-inspection at end of
+            // stream): still bound the semantic wait by a full budget, so a
+            // configured deadline never leaves an unbounded await behind.
+            Some((HoldBudget::Unbounded, full)) => Some(full),
+        };
+
         self.inspections_used += 1;
 
-        let outcome = self
-            .engine
-            .evaluate(Direction::Response, &segments, &self.plugin_http_call_ns)
-            .await;
+        // `tokio::time::timeout` resolves exactly once and polls the inner
+        // future first, so a verdict that lands in the same wakeup as the
+        // deadline WINS the race — the stream is never cut on work that actually
+        // completed. Losing the race drops the evaluation future, which cancels
+        // the in-flight embedding request and releases every resource it held.
+        // The inner scope ends the evaluation's borrow of `self` before the
+        // expiry branch below takes `&mut self`.
+        let evaluated = {
+            let evaluation =
+                self.engine
+                    .evaluate(Direction::Response, &segments, &self.plugin_http_call_ns);
+            match remaining {
+                Some(remaining) => tokio::time::timeout(remaining, evaluation).await.ok(),
+                None => Some(evaluation.await),
+            }
+        };
+        let Some(outcome) = evaluated else {
+            return self.on_hold_expired("await_verdict");
+        };
 
         // Provider error mid-stream honors on_error: reject fails closed, others
         // forward best-effort.
@@ -3849,7 +4405,7 @@ impl StreamInspector {
                 self.terminate()
             } else {
                 self.log_forward_uninspected_once("provider_error");
-                ResponseStreamAction::Forward(Bytes::from(self.window.release()))
+                self.release_clean()
             };
         }
 
@@ -3868,7 +4424,7 @@ impl StreamInspector {
             {
                 self.engine.log_stream_detection(&outcome.decision, false);
             }
-            ResponseStreamAction::Forward(Bytes::from(self.window.release()))
+            self.release_clean()
         }
     }
 
@@ -3890,22 +4446,61 @@ impl StreamInspector {
         let plugin_http_call_ns = Arc::clone(&self.plugin_http_call_ns);
         let concurrency = self.detect_concurrency.clone();
         let provider_error_logged = Arc::clone(&self.detect_provider_error_logged);
+        let max_hold = self.config.max_hold;
+        let hold_stats = self.hold.as_ref().map(|hold| Arc::clone(&hold.stats));
+        let hold_timeout_logged = Arc::clone(&self.hold_timeout_logged);
         // Capture the current dispatcher so detached tasks preserve the
         // request's structured-log destination (and tests can observe them
         // deterministically even if Tokio schedules the task on another thread).
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         tokio::spawn(async move {
-            // Cap concurrent provider round-trips per response: the permit is held
-            // until the evaluation finishes, so excess windows queue rather than
-            // firing a burst of embedding calls. The stream itself is never blocked
-            // (the bytes were already forwarded in `on_chunk`).
-            let _permit = match concurrency {
-                Some(sem) => sem.acquire_owned().await.ok(),
-                None => None,
+            let evaluation = async {
+                // Cap concurrent provider round-trips per response: the permit is
+                // held until the evaluation finishes, so excess windows queue
+                // rather than firing a burst of embedding calls. The stream
+                // itself is never blocked (the bytes were already forwarded in
+                // `on_chunk`). Admission is INSIDE the deadline: queueing for a
+                // permit is time spent awaiting semantic work, so a starved
+                // window abandons instead of holding a slot indefinitely, and
+                // cancelling this future drops the permit with it.
+                let _permit = match concurrency {
+                    Some(sem) => sem.acquire_owned().await.ok(),
+                    None => None,
+                };
+                engine
+                    .evaluate(Direction::Response, &segments, &plugin_http_call_ns)
+                    .await
             };
-            let outcome = engine
-                .evaluate(Direction::Response, &segments, &plugin_http_call_ns)
-                .await;
+            // `detect` never cuts (the bytes are already on the wire), so an
+            // expired deadline abandons the evaluation, releases its admission
+            // permit, and records the fixed-cardinality counter plus one
+            // sanitized warning.
+            let outcome = match max_hold {
+                Some(budget) => match tokio::time::timeout(budget, evaluation).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        if let Some(stats) = hold_stats {
+                            stats.record(HoldTimeoutAction::DetectAbandoned);
+                        }
+                        if !hold_timeout_logged.swap(true, Ordering::Relaxed) {
+                            let max_hold_ms = budget.as_millis() as u64;
+                            tracing::dispatcher::with_default(&dispatch, || {
+                                tracing::warn!(
+                                    target: "ai_semantic_firewall",
+                                    direction = "response",
+                                    enforcement = "detect",
+                                    phase = "await_verdict",
+                                    action = HoldTimeoutAction::DetectAbandoned.as_str(),
+                                    max_hold_ms,
+                                    "streaming inspect: response window hold deadline expired before a semantic verdict"
+                                );
+                            });
+                        }
+                        return;
+                    }
+                },
+                None => evaluation.await,
+            };
             let provider_error = engine
                 .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref());
             if provider_error {
@@ -3931,7 +4526,13 @@ impl StreamInspector {
 
     fn terminate(&mut self) -> ResponseStreamAction {
         self.terminated = true;
-        self.window.discard_pending();
+        // Free every held byte at the cut. `terminated` already guarantees they
+        // can never be forwarded; discarding here additionally guarantees no
+        // un-inspected window is retained after the stream is cancelled.
+        self.window.discard_held();
+        if let Some(hold) = self.hold.as_mut() {
+            hold.restart();
+        }
         let final_bytes = self.config.cut_with_error_event.then(|| {
             encode_sse_error_event(
                 "ai_semantic_firewall_response_blocked",
@@ -3952,11 +4553,47 @@ impl ResponseStreamInspector for StreamInspector {
             // Hold: process a coalesced transport chunk incrementally, inspect
             // each bounded ready window, and aggregate only clean releases.
             StreamEnforcement::Block => {
+                // Every byte in this slice reached the gateway together. Later
+                // events are ingested only after earlier windows resolve, but
+                // that incremental bounded-memory processing must not turn one
+                // transport arrival into a series of fresh hold budgets.
+                let chunk_arrived_at = std::time::Instant::now();
                 let mut consumed = 0usize;
                 let mut released = Vec::new();
+                // Fail-open mid-event remainder: forward until the next SSE
+                // boundary without re-entering the hold / semantic path.
+                if self.window.in_passthrough() {
+                    let (fwd, took) = self.window.ingest_passthrough(&chunk[consumed..]);
+                    released.extend_from_slice(&fwd);
+                    consumed = consumed.saturating_add(took);
+                    if self.window.in_passthrough() {
+                        return ResponseStreamAction::Forward(Bytes::from(released));
+                    }
+                }
+                // A hold that already expired while the backend was silent is
+                // resolved BEFORE absorbing more attacker-controlled bytes, so
+                // arriving chunks can neither extend the hold nor grow the
+                // window that a fail-closed policy is about to discard.
+                if self.hold_expired() {
+                    match self.on_hold_expired("accumulate") {
+                        ResponseStreamAction::Forward(bytes) => released.extend_from_slice(&bytes),
+                        terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                    }
+                    // Expiry may have entered pass-through for a partial event;
+                    // drain any remainder already present in this same chunk.
+                    if self.window.in_passthrough() && consumed < chunk.len() {
+                        let (fwd, took) = self.window.ingest_passthrough(&chunk[consumed..]);
+                        released.extend_from_slice(&fwd);
+                        consumed = consumed.saturating_add(took);
+                        if self.window.in_passthrough() {
+                            return ResponseStreamAction::Forward(Bytes::from(released));
+                        }
+                    }
+                }
                 loop {
                     let step = self.window.ingest_step(&chunk[consumed..]);
                     consumed = consumed.saturating_add(step.consumed);
+                    self.sync_hold_from(Some(chunk_arrived_at));
                     if step.window_ready {
                         match self.act_on_window().await {
                             ResponseStreamAction::Forward(bytes) => {
@@ -3964,12 +4601,34 @@ impl ResponseStreamInspector for StreamInspector {
                             }
                             terminate @ ResponseStreamAction::Terminate(_) => return terminate,
                         }
+                        // `act_on_window` can itself expire the hold while
+                        // awaiting a verdict. A fail-open expiry may have
+                        // forwarded a partial SSE event and entered
+                        // pass-through; consume the remainder from THIS same
+                        // transport chunk before normal ingest can reinterpret
+                        // it as a fresh event.
+                        if self.window.in_passthrough() && consumed < chunk.len() {
+                            let (fwd, took) = self.window.ingest_passthrough(&chunk[consumed..]);
+                            released.extend_from_slice(&fwd);
+                            consumed = consumed.saturating_add(took);
+                            if self.window.in_passthrough() {
+                                return ResponseStreamAction::Forward(Bytes::from(released));
+                            }
+                        }
                     }
                     if consumed >= chunk.len() && !step.progressed {
                         break;
                     }
                     if step.consumed == 0 && !step.progressed && !step.window_ready {
                         break;
+                    }
+                }
+                // A slow drip that never completes a window still has a bounded
+                // hold: nothing here waits for a window boundary.
+                if self.hold_expired() {
+                    match self.on_hold_expired("accumulate") {
+                        ResponseStreamAction::Forward(bytes) => released.extend_from_slice(&bytes),
+                        terminate @ ResponseStreamAction::Terminate(_) => return terminate,
                     }
                 }
                 ResponseStreamAction::Forward(Bytes::from(released))
@@ -4004,14 +4663,36 @@ impl ResponseStreamInspector for StreamInspector {
         match self.config.enforcement {
             StreamEnforcement::Block => {
                 let mut released = Vec::new();
+                // Match `on_chunk`: an already-expired hold is resolved BEFORE
+                // finalizing or releasing any held carry / event. Otherwise a
+                // silent backend that closes after the deadline can flush a
+                // partial or role-only window through `act_on_window`'s
+                // empty-segments `release_clean()` path without consulting the
+                // budget — including when `on_hold_timeout: cut`.
+                if self.hold_expired() {
+                    match self.on_hold_expired("accumulate") {
+                        ResponseStreamAction::Forward(bytes) => released.extend_from_slice(&bytes),
+                        terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                    }
+                }
+                if self.window.in_passthrough() {
+                    released.extend_from_slice(&self.window.finish_passthrough());
+                }
                 loop {
                     let step = self.window.finish_step();
+                    self.sync_hold();
                     if step.window_ready {
                         match self.act_on_window().await {
                             ResponseStreamAction::Forward(bytes) => {
                                 released.extend_from_slice(&bytes);
                             }
                             terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                        }
+                        // A verdict timeout can enter fail-open pass-through
+                        // after the pre-loop check. End-of-stream has no later
+                        // chunk that could clear that state, so finish it now.
+                        if self.window.in_passthrough() {
+                            released.extend_from_slice(&self.window.finish_passthrough());
                         }
                     }
                     if !step.progressed && !step.window_ready {
@@ -4032,6 +4713,14 @@ impl ResponseStreamInspector for StreamInspector {
                 }
                 ResponseStreamAction::Forward(Bytes::new())
             }
+        }
+    }
+
+    fn on_downstream_terminated(&mut self) {
+        self.terminated = true;
+        self.window.discard_held();
+        if let Some(hold) = self.hold.as_mut() {
+            hold.restart();
         }
     }
 }
@@ -5322,8 +6011,6 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
         reject_unknown_keys(object, "config.inspect", &["request", "response"])?;
     }
     if let Some(object) = config.get("streaming").and_then(Value::as_object) {
-        // `max_hold_ms` remains recognized solely to return its existing,
-        // explicit not-yet-supported validation error.
         reject_unknown_keys(
             object,
             "config.streaming",
@@ -5335,6 +6022,7 @@ fn validate_config_keys(config: &serde_json::Map<String, Value>) -> Result<(), S
                 "max_inspections",
                 "on_violation",
                 "max_hold_ms",
+                "on_hold_timeout",
             ],
         )?;
     }
@@ -5660,6 +6348,8 @@ mod stream_window_tests {
             overlap_bytes,
             max_inspections: 64,
             cut_with_error_event: true,
+            max_hold: None,
+            hold_timeout: HoldTimeoutPolicy::FollowOnError,
         }
     }
 

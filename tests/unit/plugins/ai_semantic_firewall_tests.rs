@@ -3083,7 +3083,6 @@ fn invalid_streaming_inspect_configs_are_rejected() {
     let configs = [
         with_streaming(json!({"enforcement": "explode"})), // unknown enum
         with_streaming(json!({"window": "tokens"})),       // not yet supported
-        with_streaming(json!({"max_hold_ms": 500})),       // not yet supported
         with_streaming(json!({"max_window_bytes": 0})),    // must be > 0
         with_streaming(json!({"max_inspections": 0})),     // must be > 0
         with_streaming(json!({"on_violation": "explode"})), // unknown enum
@@ -5007,4 +5006,1119 @@ async fn detect_mode_sanitizes_malformed_provider_response() {
     let logs = writer.contents();
     assert!(logs.contains("provider_error=\"embedding response parse failed\""));
     assert!(!logs.contains("provider raw secret payload"));
+}
+
+// ============================================================================
+// streaming.max_hold_ms — absolute per-window hold deadline (issue #3303)
+// ============================================================================
+
+/// An embeddings endpoint that accepts the call and then never answers within
+/// any test's hold budget. Makes the hold deadline — not the provider timeout,
+/// not the window byte cap — the binding constraint.
+async fn stalled_embedding_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": [{"index": 0, "embedding": [1.0, 0.0]}]}))
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+/// `streaming_response: inspect` with an explicit `streaming` block. The
+/// provider's own `request_timeout_ms` stays at its 5s default so a short
+/// `max_hold_ms` is provably the binding bound.
+fn hold_config(endpoint: &str, on_error: &str, streaming: Value) -> Value {
+    json!({
+        "inspect": {"request": false, "response": true},
+        "streaming_response": "inspect",
+        "on_error": on_error,
+        "streaming": streaming,
+        "provider": provider(endpoint),
+        "builtins": disabled_builtins_with("response_leakage")
+    })
+}
+
+/// A complete, benign SSE content event. Benign matters: the lexical fast path
+/// must MISS so the semantic round-trip actually happens and the hold deadline
+/// is what resolves the window.
+const CLEAN_SENTENCE_EVENT: &[u8] =
+    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The weather is sunny today.\"}}]}\n\n";
+
+/// A complete SSE event that never closes a sentence, so no window ever becomes
+/// ready and no provider call happens: only the hold deadline can resolve it.
+const DRIP_EVENT: &[u8] =
+    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"held prose no terminator \"}}]}\n\n";
+
+/// A complete SSE content event whose text `nonmatching_embedding_server`
+/// deliberately embeds orthogonally to the rules, so a TIMELY verdict is
+/// unambiguously clean and any cut must have come from the hold deadline.
+const GOVERNED_CLEAN_EVENT: &[u8] =
+    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A harmless governed sentence.\"}}]}\n\n";
+
+#[test]
+fn max_hold_ms_bounded_admission_is_field_specific() {
+    let with_streaming =
+        |streaming: Value| hold_config("http://127.0.0.1:9/v1/embeddings", "reject", streaming);
+    let cases: Vec<(Value, &str)> = vec![
+        (
+            json!({"max_hold_ms": 0}),
+            "streaming.max_hold_ms must be greater than 0",
+        ),
+        (
+            json!({"max_hold_ms": 300_001u64}),
+            "streaming.max_hold_ms must be less than or equal to 300000",
+        ),
+        (
+            json!({"max_hold_ms": -1}),
+            "streaming.max_hold_ms must be a non-negative integer",
+        ),
+        (
+            json!({"max_hold_ms": 1.5}),
+            "streaming.max_hold_ms must be a non-negative integer",
+        ),
+        (
+            json!({"max_hold_ms": "500"}),
+            "streaming.max_hold_ms must be a non-negative integer",
+        ),
+        (
+            json!({"max_hold_ms": 1e30}),
+            "streaming.max_hold_ms must be a non-negative integer",
+        ),
+        (
+            json!({"on_hold_timeout": "forward"}),
+            "streaming.on_hold_timeout requires streaming.max_hold_ms",
+        ),
+        (
+            json!({"max_hold_ms": 100, "on_hold_timeout": "explode"}),
+            "streaming.on_hold_timeout must be 'on_error', 'cut', or 'forward'",
+        ),
+        (
+            json!({"max_hold_ms": 100, "on_hold_timeout": "cut", "enforcement": "detect"}),
+            "streaming.on_hold_timeout 'cut' is invalid with streaming.enforcement 'detect'",
+        ),
+        (
+            json!({"max_hold_seconds": 5}),
+            "unknown property config.streaming.max_hold_seconds",
+        ),
+    ];
+
+    for (streaming, expected) in cases {
+        let config = with_streaming(streaming.clone());
+        let error = AiSemanticFirewall::new(&config, PluginHttpClient::default())
+            .err()
+            .unwrap_or_else(|| panic!("config should fail closed: {streaming}"));
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} for {streaming}, got {error:?}"
+        );
+        // The admin/reload validation entry point must reject identically, so a
+        // running gateway can never be updated into an unbounded hold that the
+        // operator believes is bounded.
+        let admin = ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", &config)
+            .expect_err("admin validation should reject the same config");
+        assert!(
+            admin.contains(expected),
+            "admin validation expected {expected:?}, got {admin:?}"
+        );
+    }
+}
+
+#[test]
+fn max_hold_ms_accepts_bounded_values() {
+    for streaming in [
+        json!({"max_hold_ms": 1}),
+        json!({"max_hold_ms": 300_000u64}),
+        json!({"max_hold_ms": 250, "on_hold_timeout": "cut"}),
+        json!({"max_hold_ms": 250, "on_hold_timeout": "forward"}),
+        json!({"max_hold_ms": 250, "on_hold_timeout": "on_error"}),
+        json!({"max_hold_ms": 250, "on_hold_timeout": "forward", "enforcement": "detect"}),
+        json!({"max_hold_ms": 250, "enforcement": "detect"}),
+    ] {
+        let config = hold_config(
+            "http://127.0.0.1:9/v1/embeddings",
+            "reject",
+            streaming.clone(),
+        );
+        assert!(
+            AiSemanticFirewall::new(&config, PluginHttpClient::default()).is_ok(),
+            "config should be accepted: {streaming}"
+        );
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config("ai_semantic_firewall", &config).is_ok(),
+            "admin validation should accept: {streaming}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hold_deadline_cuts_and_never_delivers_the_held_window() {
+    let server = stalled_embedding_server().await;
+    let config = hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 120}),
+    );
+    let firewall = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let started = std::time::Instant::now();
+    let action = inspector.on_chunk(CLEAN_SENTENCE_EVENT).await;
+    let elapsed = started.elapsed();
+
+    let ResponseStreamAction::Terminate(final_bytes) = action else {
+        panic!("an expired hold under on_error=reject must cut the stream");
+    };
+    // The hold deadline — not provider.request_timeout_ms (5s default) — bound
+    // the wait.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "hold deadline must bind before the provider timeout, waited {elapsed:?}"
+    );
+    let terminal = String::from_utf8(final_bytes.unwrap_or_default().to_vec()).unwrap_or_default();
+    assert!(
+        terminal.contains("ai_semantic_firewall_response_blocked"),
+        "a cut emits the terminal error event, got {terminal:?}"
+    );
+    // The held window is discarded, never delivered, and a timeout is not
+    // distinguishable from a policy violation on the wire.
+    assert!(
+        !terminal.contains("sunny"),
+        "the un-inspected held window must never reach the client: {terminal:?}"
+    );
+
+    // After the cut nothing further is forwarded and no window is retained.
+    let ResponseStreamAction::Forward(post_cut) = inspector.on_chunk(CLEAN_SENTENCE_EVENT).await
+    else {
+        panic!("post-cut chunks forward nothing");
+    };
+    assert!(post_cut.is_empty());
+    let ResponseStreamAction::Forward(post_end) = inspector.on_end().await else {
+        panic!("post-cut end forwards nothing");
+    };
+    assert!(post_end.is_empty());
+}
+
+#[tokio::test]
+async fn hold_deadline_fails_open_when_configured_to_forward() {
+    let server = stalled_embedding_server().await;
+    let config = hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        // `reject` would otherwise fail closed; the explicit policy wins.
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    );
+    let firewall = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let ResponseStreamAction::Forward(released) = inspector.on_chunk(CLEAN_SENTENCE_EVENT).await
+    else {
+        panic!("on_hold_timeout=forward must not cut");
+    };
+    assert_eq!(
+        released.as_ref(),
+        CLEAN_SENTENCE_EVENT,
+        "fail-open releases the complete held events verbatim, preserving SSE framing"
+    );
+}
+
+#[tokio::test]
+async fn fail_open_verdict_timeout_drains_same_chunk_remainder_in_passthrough() {
+    let server = stalled_embedding_server().await;
+    let config = hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        // Keep the ordinary error posture strict so reinterpreting the partial
+        // second event would expose the regression as an incorrect cut.
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    );
+    let firewall = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    // One bounded ingest includes both events. The first inspectable window's
+    // semantic wait expires inside `act_on_window`; fail-open must release that
+    // event plus the same-chunk carry without reinterpreting any bytes as a
+    // fresh event.
+    let mut coalesced = CLEAN_SENTENCE_EVENT.to_vec();
+    coalesced.extend_from_slice(CLEAN_SENTENCE_EVENT);
+    let ResponseStreamAction::Forward(released) = inspector.on_chunk(&coalesced).await else {
+        panic!("explicit fail-open timeout must not cut a coalesced SSE chunk");
+    };
+    assert_eq!(
+        released.as_ref(),
+        coalesced.as_slice(),
+        "the timed-out event prefix and same-chunk remainder must preserve exact wire order"
+    );
+}
+
+#[tokio::test]
+async fn partial_clean_release_does_not_refresh_older_held_bytes() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_responder = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(move |request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).expect("embedding request");
+            let inputs = body["input"].as_array().expect("embedding input array");
+            let data: Vec<Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    let text = input.as_str().unwrap_or("").to_ascii_lowercase();
+                    let embedding = if text.contains("harmless governed") {
+                        vec![0.0, 1.0]
+                    } else {
+                        vec![1.0, 0.0]
+                    };
+                    json!({"index": index, "embedding": embedding})
+                })
+                .collect();
+            let response = ResponseTemplate::new(200).set_body_json(json!({"data": data}));
+            if calls_for_responder.fetch_add(1, Ordering::Relaxed) < 2 {
+                // The rule-index and first-window embedding calls both finish
+                // cleanly, leaving ample room inside the original hold.
+                response.set_delay(Duration::from_millis(150))
+            } else {
+                response.set_delay(Duration::from_secs(30))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let config = hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 800, "on_hold_timeout": "forward"}),
+    );
+    let firewall = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let mut coalesced = GOVERNED_CLEAN_EVENT.to_vec();
+    coalesced.extend_from_slice(GOVERNED_CLEAN_EVENT);
+
+    let started = std::time::Instant::now();
+    let ResponseStreamAction::Forward(released) = inspector.on_chunk(&coalesced).await else {
+        panic!("the configured fail-open deadline must not cut");
+    };
+    let elapsed = started.elapsed();
+
+    assert_eq!(released.as_ref(), coalesced.as_slice());
+    assert!(
+        calls.load(Ordering::Relaxed) >= 3,
+        "the first window must complete cleanly before the second stalls"
+    );
+    assert!(
+        elapsed < Duration::from_millis(950),
+        "bytes from one coalesced chunk must keep the original 800ms deadline after a partial clean release, waited {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn hold_deadline_default_policy_follows_on_error() {
+    let server = stalled_embedding_server().await;
+    let endpoint = format!("{}/v1/embeddings", server.uri());
+
+    // on_error=warn is fail-open, so the default (`on_error`) policy forwards.
+    let lenient = plugin(&hold_config(&endpoint, "warn", json!({"max_hold_ms": 120})));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = lenient
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let ResponseStreamAction::Forward(released) = inspector.on_chunk(CLEAN_SENTENCE_EVENT).await
+    else {
+        panic!("on_error=warn must fail open on an expired hold");
+    };
+    assert_eq!(released.as_ref(), CLEAN_SENTENCE_EVENT);
+
+    // on_error=reject is fail-closed, so the same default policy cuts.
+    let strict = plugin(&hold_config(
+        &endpoint,
+        "reject",
+        json!({"max_hold_ms": 120}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = strict
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    assert!(
+        matches!(
+            inspector.on_chunk(CLEAN_SENTENCE_EVENT).await,
+            ResponseStreamAction::Terminate(_)
+        ),
+        "on_error=reject must fail closed on an expired hold"
+    );
+}
+
+#[tokio::test]
+async fn completion_wins_the_hold_race_with_a_generous_budget() {
+    // A provider that answers immediately with a non-matching vector: the
+    // verdict lands far inside the budget, so the deadline must never fire and
+    // the window is released on its own merits.
+    let server = nonmatching_embedding_server().await;
+    let config = hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 30_000}),
+    );
+    let firewall = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let ResponseStreamAction::Forward(released) = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await
+    else {
+        panic!("a timely clean verdict must forward the window");
+    };
+    assert_eq!(released.as_ref(), GOVERNED_CLEAN_EVENT);
+}
+
+#[tokio::test]
+async fn hold_deadline_is_not_reset_by_more_chunks() {
+    // Complete SSE events that never close a sentence: no window ever becomes
+    // ready, so nothing is inspected and no provider call happens. The hold is
+    // bounded anyway, and the arrival of further attacker-controlled chunks
+    // must not push the deadline out.
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 150}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let mut cut = false;
+    for _ in 0..6 {
+        if matches!(
+            inspector.on_chunk(DRIP_EVENT).await,
+            ResponseStreamAction::Terminate(_)
+        ) {
+            cut = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    assert!(
+        cut,
+        "a drip-feeding backend must not be able to extend the hold indefinitely"
+    );
+}
+
+/// Un-terminated SSE prefix used by the fail-open partial-hold regressions.
+/// No blank line, so it stays in `carry` and never becomes a ready window.
+const PARTIAL_EVENT_PREFIX: &[u8] =
+    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"held partial";
+
+const PARTIAL_EVENT_SUFFIX: &[u8] = b" prose continues\"}}]}\n\n";
+
+#[tokio::test]
+async fn fail_open_hold_timeout_forwards_partial_event_bytes_exactly() {
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let ResponseStreamAction::Forward(first) = inspector.on_chunk(PARTIAL_EVENT_PREFIX).await
+    else {
+        panic!("absorbing a partial event must not cut under fail-open");
+    };
+    assert!(
+        first.is_empty(),
+        "partial bytes stay held until the deadline, got {:?}",
+        String::from_utf8_lossy(&first)
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ResponseStreamAction::Forward(released) = inspector.on_chunk(&[]).await else {
+        panic!("fail-open expiry must forward, not cut");
+    };
+    assert_eq!(
+        released.as_ref(),
+        PARTIAL_EVENT_PREFIX,
+        "fail-open expiry must forward the partial event's exact held bytes"
+    );
+}
+
+#[tokio::test]
+async fn fail_open_partial_event_remainder_is_passthrough_preserving_wire_order() {
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    assert!(matches!(
+        inspector.on_chunk(PARTIAL_EVENT_PREFIX).await,
+        ResponseStreamAction::Forward(b) if b.is_empty()
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ResponseStreamAction::Forward(prefix_out) = inspector.on_chunk(&[]).await else {
+        panic!("fail-open expiry must forward the prefix");
+    };
+    assert_eq!(prefix_out.as_ref(), PARTIAL_EVENT_PREFIX);
+
+    // Remainder of the SAME event must not be held for semantic inspection —
+    // the already-forwarded prefix is no longer protected content.
+    let started = std::time::Instant::now();
+    let ResponseStreamAction::Forward(suffix_out) = inspector.on_chunk(PARTIAL_EVENT_SUFFIX).await
+    else {
+        panic!("partial-event remainder must not cut");
+    };
+    assert!(
+        started.elapsed() < Duration::from_millis(50),
+        "remainder of an already-expired partial event must pass through immediately, waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        suffix_out.as_ref(),
+        PARTIAL_EVENT_SUFFIX,
+        "wire order preserves the exact suffix bytes"
+    );
+
+    // A later complete event resumes normal windowed inspection (timely clean).
+    let ResponseStreamAction::Forward(next) = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await else {
+        panic!("subsequent events resume normal inspection");
+    };
+    assert_eq!(next.as_ref(), GOVERNED_CLEAN_EVENT);
+}
+
+#[tokio::test]
+async fn downstream_cut_discards_held_state_and_stops_the_inspector() {
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 30_000}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    assert!(matches!(
+        inspector.on_chunk(PARTIAL_EVENT_PREFIX).await,
+        ResponseStreamAction::Forward(bytes) if bytes.is_empty()
+    ));
+    inspector.on_downstream_terminated();
+
+    assert!(matches!(
+        inspector.on_chunk(PARTIAL_EVENT_SUFFIX).await,
+        ResponseStreamAction::Forward(bytes) if bytes.is_empty()
+    ));
+    assert!(matches!(
+        inspector.on_end().await,
+        ResponseStreamAction::Forward(bytes) if bytes.is_empty()
+    ));
+}
+
+#[tokio::test]
+async fn fail_open_partial_event_detects_boundary_split_across_timeout_release() {
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let mut prefix = PARTIAL_EVENT_PREFIX.to_vec();
+    prefix.extend_from_slice(b"\"}}]}\n");
+    assert!(matches!(
+        inspector.on_chunk(&prefix).await,
+        ResponseStreamAction::Forward(b) if b.is_empty()
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ResponseStreamAction::Forward(prefix_out) = inspector.on_chunk(&[]).await else {
+        panic!("fail-open expiry must forward the prefix");
+    };
+    assert_eq!(prefix_out.as_ref(), prefix);
+
+    // This leading LF completes the blank line whose first LF was in the
+    // already-forwarded timeout prefix. The following event must leave
+    // pass-through and resume ordinary governed inspection.
+    let mut boundary_and_next = b"\n".to_vec();
+    boundary_and_next.extend_from_slice(GOVERNED_CLEAN_EVENT);
+    let ResponseStreamAction::Forward(out) = inspector.on_chunk(&boundary_and_next).await else {
+        panic!("split boundary plus clean event must forward");
+    };
+    assert_eq!(out.as_ref(), boundary_and_next);
+}
+
+#[tokio::test]
+async fn fail_open_drip_cannot_retain_original_bytes_across_timer_resets() {
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 100, "on_hold_timeout": "forward"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let mut forwarded = Vec::new();
+    let ResponseStreamAction::Forward(b) = inspector.on_chunk(PARTIAL_EVENT_PREFIX).await else {
+        panic!("initial partial absorb must not cut");
+    };
+    forwarded.extend_from_slice(&b);
+
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    let ResponseStreamAction::Forward(b) = inspector.on_chunk(&[]).await else {
+        panic!("first expiry must fail open");
+    };
+    forwarded.extend_from_slice(&b);
+    assert_eq!(
+        &forwarded, PARTIAL_EVENT_PREFIX,
+        "first expiry must flush the original held bytes exactly once"
+    );
+
+    // Further drips of the same unterminated event are pass-through; sleeping
+    // past another deadline must not re-emit or re-retain the original prefix.
+    for piece in [b" more" as &[u8], b" drip", b" bytes"] {
+        let ResponseStreamAction::Forward(b) = inspector.on_chunk(piece).await else {
+            panic!("pass-through drip must not cut");
+        };
+        forwarded.extend_from_slice(&b);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let ResponseStreamAction::Forward(idle) = inspector.on_chunk(&[]).await else {
+            panic!("idle poke after pass-through must not cut");
+        };
+        assert!(
+            idle.is_empty(),
+            "already-forwarded prefix must not be retained across timer resets: {:?}",
+            String::from_utf8_lossy(&idle)
+        );
+    }
+
+    let mut expected = PARTIAL_EVENT_PREFIX.to_vec();
+    expected.extend_from_slice(b" more drip bytes");
+    assert_eq!(
+        forwarded, expected,
+        "wire order is the concatenation of the original prefix and later drips"
+    );
+    assert_eq!(
+        forwarded
+            .windows(PARTIAL_EVENT_PREFIX.len())
+            .filter(|w| *w == PARTIAL_EVENT_PREFIX)
+            .count(),
+        1,
+        "original bytes must appear exactly once on the wire"
+    );
+}
+
+#[tokio::test]
+async fn fail_closed_hold_timeout_discards_partial_event_bytes() {
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "cut"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    assert!(matches!(
+        inspector.on_chunk(PARTIAL_EVENT_PREFIX).await,
+        ResponseStreamAction::Forward(b) if b.is_empty()
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ResponseStreamAction::Terminate(final_bytes) = inspector.on_chunk(&[]).await else {
+        panic!("fail-closed expiry must cut");
+    };
+    let terminal = String::from_utf8(final_bytes.unwrap_or_default().to_vec()).unwrap_or_default();
+    assert!(
+        terminal.contains("ai_semantic_firewall_response_blocked"),
+        "cut emits the terminal error event, got {terminal:?}"
+    );
+    assert!(
+        !terminal.contains("held partial"),
+        "fail-closed must leak no partial bytes: {terminal:?}"
+    );
+    assert!(
+        !terminal.contains("choices"),
+        "fail-closed must leak no partial SSE payload: {terminal:?}"
+    );
+
+    let ResponseStreamAction::Forward(post) = inspector.on_chunk(PARTIAL_EVENT_SUFFIX).await else {
+        panic!("post-cut chunks forward nothing");
+    };
+    assert!(post.is_empty());
+}
+
+/// A backend that holds a non-window-ready role-only SSE event past `max_hold_ms`
+/// and then closes must still honor fail-closed at `on_end`. Without consulting
+/// the budget first, `finish_step` + empty-segments `release_clean()` would
+/// forward the held bytes even when `on_hold_timeout: cut`.
+const ROLE_ONLY_EVENT: &[u8] =
+    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n";
+
+#[tokio::test]
+async fn fail_closed_on_end_does_not_release_expired_role_only_hold() {
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "cut"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    assert!(matches!(
+        inspector.on_chunk(ROLE_ONLY_EVENT).await,
+        ResponseStreamAction::Forward(b) if b.is_empty()
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let ResponseStreamAction::Terminate(final_bytes) = inspector.on_end().await else {
+        panic!("fail-closed expiry at end-of-stream must cut, not release held bytes");
+    };
+    let terminal = String::from_utf8(final_bytes.unwrap_or_default().to_vec()).unwrap_or_default();
+    assert!(
+        terminal.contains("ai_semantic_firewall_response_blocked"),
+        "cut emits the terminal error event, got {terminal:?}"
+    );
+    assert!(
+        !terminal.contains("assistant"),
+        "fail-closed on_end must never release the held payload: {terminal:?}"
+    );
+    assert!(
+        !terminal.contains("choices"),
+        "fail-closed on_end must leak no held SSE payload: {terminal:?}"
+    );
+
+    let ResponseStreamAction::Forward(post) = inspector.on_end().await else {
+        panic!("post-cut end forwards nothing");
+    };
+    assert!(
+        post.is_empty(),
+        "terminated stream must not emit held bytes on a later end: {:?}",
+        String::from_utf8_lossy(&post)
+    );
+}
+
+/// Fail-open at end-of-stream must release the exact held wire bytes once and
+/// leave nothing for a subsequent end to re-emit. A partial (non-window-ready)
+/// event is required: without the pre-`finish_step` expiry check, end-of-stream
+/// absorption can treat the carry as uninspectable and cut under `on_error:
+/// reject` instead of honoring `on_hold_timeout: forward`.
+#[tokio::test]
+async fn fail_open_on_end_forwards_expired_partial_hold_exactly_once() {
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    assert!(matches!(
+        inspector.on_chunk(PARTIAL_EVENT_PREFIX).await,
+        ResponseStreamAction::Forward(b) if b.is_empty()
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let ResponseStreamAction::Forward(released) = inspector.on_end().await else {
+        panic!("fail-open expiry at end-of-stream must forward, not cut");
+    };
+    assert_eq!(
+        released.as_ref(),
+        PARTIAL_EVENT_PREFIX,
+        "fail-open on_end must forward the held wire bytes exactly"
+    );
+
+    let ResponseStreamAction::Forward(again) = inspector.on_end().await else {
+        panic!("second end after fail-open release must not cut");
+    };
+    assert!(
+        again.is_empty(),
+        "held bytes must not be duplicated on a later end: {:?}",
+        String::from_utf8_lossy(&again)
+    );
+
+    let mut wire = released.to_vec();
+    wire.extend_from_slice(&again);
+    assert_eq!(
+        wire.windows(PARTIAL_EVENT_PREFIX.len())
+            .filter(|w| *w == PARTIAL_EVENT_PREFIX)
+            .count(),
+        1,
+        "original held payload must appear exactly once across end-of-stream actions"
+    );
+}
+
+#[tokio::test]
+async fn hold_timeout_publishes_fixed_cardinality_metadata() {
+    use ferrum_edge::plugins::create_response_stream_inspector;
+    use ferrum_edge::proxy::deferred_log::BodyOutcome;
+
+    let server = stalled_embedding_server().await;
+    let firewall: Arc<dyn Plugin> = Arc::new(plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 120}),
+    )));
+    let plugins = vec![Arc::clone(&firewall)];
+    let mut ctx = inspect_marked_ctx();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("inspector for event stream");
+
+    assert!(matches!(
+        inspector.on_chunk(CLEAN_SENTENCE_EVENT).await,
+        ResponseStreamAction::Terminate(_)
+    ));
+    drop(inspector);
+
+    firewall
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.stream_hold_timeouts")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.stream_hold_timeout_action")
+            .map(String::as_str),
+        Some("cut"),
+        "the action value comes from a closed vocabulary"
+    );
+    // No window content, rule id, or provider detail rides along.
+    assert_firewall_metadata_omits(&ctx, "sunny");
+    assert_firewall_metadata_omits(&ctx, &server.uri());
+}
+
+/// Drive two active firewall instances so both expire on one response, then fold
+/// terminal metadata in `hook_order`. The fail-open instance must run first in
+/// the inspector chain so its released bytes reach the fail-closed sibling;
+/// hook order is independent of that chain order.
+async fn multi_instance_hold_timeout_metadata(hook_order: [usize; 2]) -> (RequestContext, String) {
+    use ferrum_edge::plugins::create_response_stream_inspector;
+    use ferrum_edge::proxy::deferred_log::BodyOutcome;
+
+    let server = stalled_embedding_server().await;
+    let endpoint = format!("{}/v1/embeddings", server.uri());
+    // Fail-open first so the chain can deliver bytes to the fail-closed sibling.
+    let forward: Arc<dyn Plugin> = Arc::new(plugin(&hold_config(
+        &endpoint,
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    )));
+    let cut: Arc<dyn Plugin> = Arc::new(plugin(&hold_config(
+        &endpoint,
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "cut"}),
+    )));
+    let instances = [forward, cut];
+    let plugins = vec![Arc::clone(&instances[0]), Arc::clone(&instances[1])];
+    let mut ctx = inspect_marked_ctx();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("chained inspectors for both instances");
+
+    assert!(matches!(
+        inspector.on_chunk(CLEAN_SENTENCE_EVENT).await,
+        ResponseStreamAction::Terminate(_)
+    ));
+    drop(inspector);
+
+    for index in hook_order {
+        instances[index]
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
+            .await;
+    }
+    (ctx, server.uri())
+}
+
+#[tokio::test]
+async fn multi_instance_hold_timeouts_aggregate_counts_and_most_restrictive_action() {
+    for hook_order in [[0, 1], [1, 0]] {
+        let (ctx, server_uri) = multi_instance_hold_timeout_metadata(hook_order).await;
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.stream_hold_timeouts")
+                .map(String::as_str),
+            Some("2"),
+            "both instances' expiries must saturating-sum; hook order {hook_order:?}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.stream_hold_timeout_action")
+                .map(String::as_str),
+            Some("cut"),
+            "cut outranks forward regardless of hook order {hook_order:?}"
+        );
+        assert_firewall_metadata_omits(&ctx, "sunny");
+        assert_firewall_metadata_omits(&ctx, &server_uri);
+        assert!(
+            !ctx.metadata.keys().any(|key| key.contains("rule")
+                || key.contains("endpoint")
+                || key.contains("window")),
+            "metadata keys must stay fixed-cardinality: {:?}",
+            ctx.metadata.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
+#[tokio::test]
+async fn zero_expiry_sibling_does_not_erase_hold_timeout_metadata() {
+    use ferrum_edge::plugins::create_response_stream_inspector;
+    use ferrum_edge::proxy::deferred_log::BodyOutcome;
+
+    let stalled = stalled_embedding_server().await;
+    let clean = nonmatching_embedding_server().await;
+    // Fail-open timeout first so bytes reach the long-hold sibling, which then
+    // receives a timely clean verdict and records zero expiries.
+    let timing_out: Arc<dyn Plugin> = Arc::new(plugin(&hold_config(
+        &format!("{}/v1/embeddings", stalled.uri()),
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    )));
+    let no_expiry: Arc<dyn Plugin> = Arc::new(plugin(&hold_config(
+        &format!("{}/v1/embeddings", clean.uri()),
+        "reject",
+        json!({"max_hold_ms": 30_000}),
+    )));
+    let plugins = vec![Arc::clone(&timing_out), Arc::clone(&no_expiry)];
+    let mut ctx = inspect_marked_ctx();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("chained inspectors");
+
+    let ResponseStreamAction::Forward(released) = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await
+    else {
+        panic!("fail-open timeout then clean sibling must forward, not cut");
+    };
+    assert_eq!(released.as_ref(), GOVERNED_CLEAN_EVENT);
+    let _ = inspector.on_end().await;
+    drop(inspector);
+
+    // Expiring instance writes first; zero-expiry sibling must not erase it.
+    timing_out
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.stream_hold_timeouts")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.stream_hold_timeout_action")
+            .map(String::as_str),
+        Some("forward")
+    );
+
+    no_expiry
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.stream_hold_timeouts")
+            .map(String::as_str),
+        Some("1"),
+        "zero-expiry sibling must not erase a sibling timeout count"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.stream_hold_timeout_action")
+            .map(String::as_str),
+        Some("forward"),
+        "zero-expiry sibling must not erase a sibling timeout action"
+    );
+}
+
+#[tokio::test]
+async fn no_hold_timeout_metadata_without_an_expiry() {
+    use ferrum_edge::plugins::create_response_stream_inspector;
+    use ferrum_edge::proxy::deferred_log::BodyOutcome;
+
+    let server = nonmatching_embedding_server().await;
+    let firewall: Arc<dyn Plugin> = Arc::new(plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 30_000}),
+    )));
+    let plugins = vec![Arc::clone(&firewall)];
+    let mut ctx = inspect_marked_ctx();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("inspector for event stream");
+    let _ = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await;
+    let _ = inspector.on_end().await;
+    drop(inspector);
+
+    firewall
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
+        .await;
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_semantic_firewall.stream_hold_timeouts")
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_semantic_firewall.stream_hold_timeout_action")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn detect_mode_hold_timeout_abandons_without_cutting() {
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let server = stalled_embedding_server().await;
+    let config = hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 120, "enforcement": "detect"}),
+    );
+    let firewall = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("detect inspector");
+
+    // detect is release-then-detect: the chunk is forwarded immediately and the
+    // deadline only bounds the detached evaluation.
+    let started = std::time::Instant::now();
+    let ResponseStreamAction::Forward(out) = inspector.on_chunk(CLEAN_SENTENCE_EVENT).await else {
+        panic!("detect must never cut");
+    };
+    assert_eq!(out.as_ref(), CLEAN_SENTENCE_EVENT);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "detect must not block the stream on the stalled provider"
+    );
+    let _ = inspector.on_end().await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !writer.contents().contains("hold deadline expired")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(guard);
+
+    let logs = writer.contents();
+    assert_eq!(
+        logs.matches("hold deadline expired").count(),
+        1,
+        "one sanitized warning per response: {logs}"
+    );
+    assert!(logs.contains("action=\"detect_abandoned\""));
+    assert!(logs.contains("enforcement=\"detect\""));
+    assert!(
+        !logs.contains("sunny"),
+        "no window content in the log: {logs}"
+    );
+    assert!(
+        !logs.contains(&server.uri()),
+        "no provider endpoint in the log: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn hold_policy_is_rebuilt_on_reload_update_and_delete() {
+    let server = stalled_embedding_server().await;
+    let endpoint = format!("{}/v1/embeddings", server.uri());
+    let ctx = inspect_marked_ctx();
+
+    // Generation 1: fail closed on an expired hold.
+    let generation_1 = create_plugin_with_http_client(
+        "ai_semantic_firewall",
+        &hold_config(&endpoint, "reject", json!({"max_hold_ms": 120})),
+        PluginHttpClient::default(),
+    )
+    .expect("generation 1 constructs")
+    .expect("generation 1 is enabled");
+    let mut inspector = generation_1
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("generation 1 inspector");
+    assert!(matches!(
+        inspector.on_chunk(CLEAN_SENTENCE_EVENT).await,
+        ResponseStreamAction::Terminate(_)
+    ));
+
+    // Generation 2 (update): the same proxy reloaded onto an explicit
+    // fail-open policy must take effect immediately, with no state carried
+    // over from generation 1.
+    let generation_2 = create_plugin_with_http_client(
+        "ai_semantic_firewall",
+        &hold_config(
+            &endpoint,
+            "reject",
+            json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+        ),
+        PluginHttpClient::default(),
+    )
+    .expect("generation 2 constructs")
+    .expect("generation 2 is enabled");
+    let mut inspector = generation_2
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("generation 2 inspector");
+    let ResponseStreamAction::Forward(released) = inspector.on_chunk(CLEAN_SENTENCE_EVENT).await
+    else {
+        panic!("the updated generation must fail open");
+    };
+    assert_eq!(released.as_ref(), CLEAN_SENTENCE_EVENT);
+
+    // Generation 3 (delete/disable): no inspector attaches and no hold state
+    // survives the removal.
+    let mut disabled = hold_config(&endpoint, "reject", json!({"max_hold_ms": 120}));
+    disabled["enabled"] = json!(false);
+    let generation_3 = create_plugin_with_http_client(
+        "ai_semantic_firewall",
+        &disabled,
+        PluginHttpClient::default(),
+    )
+    .expect("generation 3 constructs")
+    .expect("generation 3 instantiates");
+    assert!(!generation_3.requires_response_stream_hooks());
+    assert!(
+        generation_3
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_none()
+    );
 }
