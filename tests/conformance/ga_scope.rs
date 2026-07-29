@@ -36,7 +36,7 @@
 //! Removing one is a deliberate scope change. A feature earns its place here once its
 //! translation/semantics are stable and pinned by a conformance test; the
 //! *runtime* GA bar (live mTLS/authz/routing on real pods) is gated separately
-//! by the `mesh-e2e-sidecar` live-datapath suite.
+//! by the `mesh-e2e-sidecar` and `multicluster-federation` live-datapath suites.
 
 use super::contract::load_contract;
 use super::registry::{Maturity, Status, snapshot};

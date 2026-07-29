@@ -36,7 +36,6 @@ REQUIRED_JOBS = {
     "test-vendor-patches",
     "test-functional",
     "plugin-hardening-redis-regression",
-    "mesh-multicluster-federation",
     "mesh-e2e-sidecar",
     "helm-chart",
     "lint",
@@ -69,7 +68,6 @@ DIRECT_FULL_CI_JOBS = {
 }
 
 PATH_GATED_JOBS = {
-    "mesh-multicluster-federation": "run_mesh_federation",
     "mesh-e2e-sidecar": "run_mesh_sidecar_smoke",
     "helm-chart": "run_helm",
     "build-ebpf": "run_ebpf_build",
@@ -86,6 +84,10 @@ REMOVED_JOBS = {
     "build-gateway-binary",
     "build-functional-tests-archive",
     "detect-ebpf-live-changes",
+    # Deploy-only multicluster smoke consolidated into the dedicated live
+    # workflow once that suite became the authoritative main/release gate
+    # (issue #2459).
+    "mesh-multicluster-federation",
 }
 
 REMOVED_MIRROR_JOBS = {
@@ -128,6 +130,17 @@ DEDICATED_REQUIRED_CHECKS = {
             '${{ needs.mesh-e2e-sidecar-live.result }}" != "success"',
         },
     },
+    ".github/workflows/multicluster-federation-live.yml": {
+        "job": "gate",
+        "name": "Multicluster Federation Live",
+        "needs": {"changes", "multicluster-federation-live"},
+        "contract": {
+            '${{ needs.changes.result }}" != "success"',
+            '${{ needs.changes.outputs.relevant }}" = "false"',
+            '${{ needs.changes.outputs.relevant }}" != "true"',
+            '${{ needs.multicluster-federation-live.result }}" != "success"',
+        },
+    },
 }
 
 MAIN_PUBLISH_WORKFLOWS = {
@@ -135,6 +148,9 @@ MAIN_PUBLISH_WORKFLOWS = {
     ".github/workflows/gateway-api-conformance.yml": "Gateway API Conformance",
     ".github/workflows/mesh-e2e-sidecar-live.yml": (
         "Mesh E2E Sidecar Live Datapath"
+    ),
+    ".github/workflows/multicluster-federation-live.yml": (
+        "Multicluster Federation Live Datapath"
     ),
 }
 
@@ -145,7 +161,7 @@ MAIN_PUBLISH_WORKFLOWS = {
 # Cross verifier independently freezes this complete job, so changing either
 # the implementation or this diagnostic digest requires a trusted-base update.
 MAIN_PUBLISH_GATE_SHA256 = (
-    "51d93dead7e8337df4cd85a8c034d11436ee8d1935d8e6b2e58509c5e7da8fb4"
+    "667373e486e22bdecda446a81eeed602b50c06f9ddfc845b52828782f60d26b1"
 )
 
 

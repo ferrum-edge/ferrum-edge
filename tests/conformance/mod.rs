@@ -19,6 +19,7 @@ mod istio_service_entry_egress;
 mod istio_virtual_service;
 mod live_contract;
 mod mesh_config_transport;
+mod mesh_multicluster_federation;
 mod mesh_spiffe_identity;
 mod mesh_topology_matrix;
 mod xds_type_urls;

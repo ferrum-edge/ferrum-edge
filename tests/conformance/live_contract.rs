@@ -649,3 +649,65 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         "ga_capabilities must return GA rows"
     );
 }
+
+#[test]
+fn live_contract_real_contract_declares_the_multicluster_suite_rows() {
+    // Pin the real ga_contract.yaml against this validator for the
+    // multicluster-federation suite (issue #2459): SPIRE trust federation,
+    // bidirectional authenticated east-west traffic, untrusted-peer rejection,
+    // trust revocation/recovery, and destination blackhole/recovery are all
+    // ENFORCED and emitted by tests/k8s/multicluster-federation/run.sh.
+    let contract = load_contract().expect("real contract loads");
+    let multicluster_rows: Vec<_> = contract
+        .ga_capabilities()
+        .into_iter()
+        .filter(|capability| capability.live_suite == "multicluster-federation")
+        .collect();
+    assert!(
+        !multicluster_rows.is_empty(),
+        "the multicluster-federation suite must have GA contract rows"
+    );
+    let enforced_ids: Vec<&str> = multicluster_rows
+        .iter()
+        .filter(|capability| capability.live_deferred.is_none())
+        .flat_map(|capability| capability.live_assertions.iter().map(String::as_str))
+        .collect();
+    for required in [
+        "multicluster.spire.federation_ready_a",
+        "multicluster.spire.federation_ready_b",
+        "multicluster.federation.trust_bundle_exchange",
+        "multicluster.spire.workload_entries",
+        "multicluster.eastwest.gateway_reachable",
+        "multicluster.eastwest.a_to_b_authenticated",
+        "multicluster.eastwest.b_to_a_authenticated",
+        "multicluster.eastwest.bidirectional_authenticated_traffic",
+        "multicluster.eastwest.untrusted_peer_rejected",
+        "multicluster.federation.bundle_revoked_rejected",
+        "multicluster.federation.trust_restored_recovers",
+        "multicluster.eastwest.endpoint_blackhole_when_dest_down",
+        "multicluster.eastwest.endpoint_recovers_when_dest_returns",
+    ] {
+        assert!(
+            enforced_ids.contains(&required),
+            "`{required}` must be an enforced GA live assertion"
+        );
+    }
+    let deferred: Vec<&str> = multicluster_rows
+        .iter()
+        .filter(|capability| capability.live_deferred.is_some())
+        .map(|capability| capability.id.as_str())
+        .collect();
+    assert!(
+        deferred.is_empty(),
+        "no multicluster row should remain live-deferred (found: {deferred:?})"
+    );
+    for capability in multicluster_rows
+        .iter()
+        .filter(|capability| capability.live_deferred.is_none())
+    {
+        assert_eq!(
+            capability.platform_profile, "kind-spire-multicluster-federation",
+            "enforced multicluster rows must pin the fixture's platform profile"
+        );
+    }
+}

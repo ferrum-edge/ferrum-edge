@@ -1203,6 +1203,7 @@ CI_MAIN_PUBLISH_GATE_JOB = r"""  main-publish-gate:
             "coverage.yml|.github/workflows/coverage.yml|Coverage"
             "gateway-api-conformance.yml|.github/workflows/gateway-api-conformance.yml|Gateway API Conformance"
             "mesh-e2e-sidecar-live.yml|.github/workflows/mesh-e2e-sidecar-live.yml|Mesh E2E Sidecar Live Datapath"
+            "multicluster-federation-live.yml|.github/workflows/multicluster-federation-live.yml|Multicluster Federation Live Datapath"
           )
 
           # Bound the wait inside `timeout-minutes` so the runner is never held

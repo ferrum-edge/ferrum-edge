@@ -13,8 +13,8 @@ Docker/kind install report.
 
 | Mode | Entry | Workflow / job |
 |---|---|---|
-| Live datapath (SPIRE-federated two kind clusters, bidirectional traffic + negatives) | `tests/k8s/multicluster-federation/run.sh` | `.github/workflows/multicluster-federation-live.yml` (requires `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`) |
-| Deploy-only smoke (rollouts, no traffic) | same script with `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` | PR `Mesh Multicluster Federation` job in `.github/workflows/ci.yml` (path-filtered; `workflow_dispatch` forces) |
+| Live datapath (SPIRE-federated two kind clusters, bidirectional traffic + negatives + Stage-3 failure injection; GA-contract artifact gate) | `tests/k8s/multicluster-federation/run.sh` | `.github/workflows/multicluster-federation-live.yml` — path-filtered on PRs, force-run on every `main` push / `workflow_dispatch` (requires `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`) |
+| Local deploy-only smoke (rollouts, no traffic; optional operator shortcut) | same script with `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` | Not a CI/release gate — the dedicated live workflow is authoritative |
 
 In-process federation/discovery unit and integration coverage remains necessary
 but is not a substitute for the two-cluster harness. Preflight requires
@@ -120,15 +120,17 @@ It runs in two modes:
   verifier sources federated trust from the slice, not the SVID). This mode runs
   in the dedicated `.github/workflows/multicluster-federation-live.yml` workflow
   against disposable kind clusters and requires
-  `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`.
+  `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`. That workflow is the
+  authoritative PR/main/release gate (issue #2459): relevant PRs and every
+  `main` push run the full datapath, validate `live-assertions.json` against
+  `ga_contract.yaml`, and feed exact-SHA release validation.
 - **Deploy-only smoke (`FERRUM_MULTICLUSTER_DEPLOY_ONLY=1`):** stops after the
-  SPIRE/workload deploy and rollouts, before driving traffic. The PR
-  `Mesh Multicluster Federation` job in `.github/workflows/ci.yml` runs this on
-  mesh federation/discovery/identity/proxy/image/proto/docs/config/CI changes
-  (`workflow_dispatch` forces it regardless of paths). The Helm chart is NOT a
-  trigger and is NOT deployed — this fixture uses hand-crafted NodePort manifests
-  because the chart's east-west Service is ClusterIP-only and not cross-cluster
-  reachable; the chart is covered by the dedicated `Helm Chart` CI job.
+  SPIRE/workload deploy and rollouts, before driving traffic. This is an
+  optional local/operator shortcut only — CI no longer runs a deploy-only
+  multicluster job. The Helm chart is NOT a trigger and is NOT deployed — this
+  fixture uses hand-crafted NodePort manifests because the chart's east-west
+  Service is ClusterIP-only and not cross-cluster reachable; the chart is
+  covered by the dedicated `Helm Chart` CI job.
 
 Diagnostics are recorded under `${ARTIFACT_DIR:-.context/multicluster-federation}`.
 Preflight requires `docker`, `kind`, `kubectl`, `curl`, and `python3` and

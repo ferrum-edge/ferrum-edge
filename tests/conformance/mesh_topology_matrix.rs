@@ -140,7 +140,9 @@ fn topology_east_west_gateway() {
         category = CATEGORY,
         feature = "EastWestGateway topology",
         status = Status::Supported,
-        notes = "SNI-passthrough TCP proxies on 15443 from multi-cluster RemoteCluster entries.",
+        maturity = Maturity::Ga,
+        notes = "SNI-passthrough TCP proxies on 15443 from multi-cluster RemoteCluster entries. \
+                 Live-gated by multicluster.eastwest.* in multicluster-federation (issue #2459).",
     );
     assert_topology_apply_succeeds(MeshTopology::EastWestGateway);
 }

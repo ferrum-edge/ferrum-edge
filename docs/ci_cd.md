@@ -41,7 +41,7 @@ adding, removing, or materially changing a workflow.
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface; `Trusted Cross Build Policy` must be directly required after the bootstrap workflow merges. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
-| `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | Path-filtered PRs, manual | Live multicluster federation datapath validation. |
+| `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
 | `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. |
 | `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
@@ -74,7 +74,8 @@ Pull Request
     └─► Dedicated required checks (internally skip unrelated changes)
             ├─► Merge Coverage
             ├─► Gateway API Conformance
-            └─► Mesh E2E Sidecar Live
+            ├─► Mesh E2E Sidecar Live
+            └─► Multicluster Federation Live
 
 Push to main
     ├─► Full required validation gate
@@ -124,16 +125,18 @@ edit cannot classify itself as light; edits to the planner therefore receive
 the full matrix. The required-CI verifier also checks that documentation paths
 used by live-suite filters remain in the planner's full-CI set.
 
-The same trusted planner emits fail-closed job outputs for Helm, mesh federation,
-the sidecar deployment smoke, eBPF program builds, and eBPF/netns live suites.
-PRs outside those curated path sets skip the downstream job before GitHub
-allocates a runner. Pushes to `main` and manual runs force all of these gates on.
-Rust formatting and the integration-shard coverage contract also run as named
-steps in `CI Plan`, avoiding two additional runner allocations. The required
-`Tests` aggregate runs the first-party Markdown link checker through its CI
-contract verifier (`.github/scripts/check_markdown_links.py`), including in
-light mode, so docs-only PRs still validate relative file targets and GitHub
-heading slugs.
+The same trusted planner emits fail-closed job outputs for Helm, the sidecar
+deployment smoke, eBPF program builds, and eBPF/netns live suites. Multicluster
+federation datapath coverage rides the dedicated
+`multicluster-federation-live.yml` workflow (path-filtered on PRs, force-run on
+every `main` push) rather than a deploy-only CI smoke. PRs outside those curated
+path sets skip the downstream job before GitHub allocates a runner. Pushes to
+`main` and manual runs force all of these gates on. Rust formatting and the
+integration-shard coverage contract also run as named steps in `CI Plan`,
+avoiding two additional runner allocations. The required `Tests` aggregate runs
+the first-party Markdown link checker through its CI contract verifier
+(`.github/scripts/check_markdown_links.py`), including in light mode, so
+docs-only PRs still validate relative file targets and GitHub heading slugs.
 
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
 shards, lint, dependency audit, vendored patch regressions,
@@ -143,10 +146,11 @@ and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
 
-Branch protection must require five independent PR checks: the unchanged `Tests`
+Branch protection must require six independent PR checks: the unchanged `Tests`
 aggregate from `ci.yml`, `Merge Coverage` from `coverage.yml`, `Gateway API
 Conformance` from `gateway-api-conformance.yml`, `Mesh E2E Sidecar Live` from
-`mesh-e2e-sidecar-live.yml`, and `Trusted Cross Build Policy` from
+`mesh-e2e-sidecar-live.yml`, `Multicluster Federation Live` from
+`multicluster-federation-live.yml`, and `Trusted Cross Build Policy` from
 `cross-build-policy.yml`. Each dedicated workflow triggers on every pull
 request and fails closed on planning or validation failures. They are required
 directly rather than mirrored by runner-holding polling jobs in `ci.yml`.
@@ -1041,16 +1045,18 @@ dependency.
 
 **Runs**: `ubuntu-latest`
 
-On pushes to `main`, the `main-publish-gate` job runs after the native build matrix and the `Tests` aggregate, then waits for successful same-commit push runs of the dedicated Coverage, Gateway API Conformance, and Mesh E2E Sidecar Live Datapath workflows. Each requirement is queried through its canonical workflow-file endpoint and accepted only when the server-reported workflow path, display name, commit SHA, `push` event, and `main` branch all match. A different workflow that reuses the display name therefore cannot satisfy a missing canonical run, and every matching canonical run must conclude `success`, so one passing duplicate cannot mask a failed run of the same workflow for the same commit. A missing, still-running, failed, cancelled, stale, malformed, identity-mismatched, or timed-out dedicated run fails the gate closed. Each Actions API query receives up to three bounded attempts with short backoff; exhausting those attempts also fails closed. The gate polls for at most 60 minutes inside a 75-minute job timeout, runs only on `main` pushes so it never holds a runner on a pull request, and grants only `actions: read` because it checks out no code. The protected Cross verifier freezes the complete gate job and rejects workflow-wide run defaults that could alter a protected publishing shell's failure semantics, while the required-CI verifier independently pins the gate's exact digest, checks the three workflow file/name bindings and their unconditional `main` push triggers, and validates the publisher dependencies. Comments cannot stand in for executable gate fields, and changing the gate or either publishing dependency requires a trusted-base update. The `latest-release` job and the per-architecture Linux Docker publishing job keep their direct dependencies on the `Tests` aggregate, the native build matrix, and the protected `build-arm64-cross` job, and additionally require a successful `main-publish-gate`; they can run in parallel only once all four succeed. The `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease, but neither publish path can start until every release check passes. Version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-<sha>` tags (where `<sha>` is the full commit SHA from `github.sha`).
+On pushes to `main`, the `main-publish-gate` job runs after the native build matrix and the `Tests` aggregate, then waits for successful same-commit push runs of the dedicated Coverage, Gateway API Conformance, Mesh E2E Sidecar Live Datapath, and Multicluster Federation Live Datapath workflows. Each requirement is queried through its canonical workflow-file endpoint and accepted only when the server-reported workflow path, display name, commit SHA, `push` event, and `main` branch all match. A different workflow that reuses the display name therefore cannot satisfy a missing canonical run, and every matching canonical run must conclude `success`, so one passing duplicate cannot mask a failed run of the same workflow for the same commit. A missing, still-running, failed, cancelled, stale, malformed, identity-mismatched, or timed-out dedicated run fails the gate closed. Each Actions API query receives up to three bounded attempts with short backoff; exhausting those attempts also fails closed. The gate polls for at most 60 minutes inside a 75-minute job timeout, runs only on `main` pushes so it never holds a runner on a pull request, and grants only `actions: read` because it checks out no code. The protected Cross verifier freezes the complete gate job and rejects workflow-wide run defaults that could alter a protected publishing shell's failure semantics, while the required-CI verifier independently pins the gate's exact digest, checks the four workflow file/name bindings and their unconditional `main` push triggers, and validates the publisher dependencies. Comments cannot stand in for executable gate fields, and changing the gate or either publishing dependency requires a trusted-base update. The `latest-release` job and the per-architecture Linux Docker publishing job keep their direct dependencies on the `Tests` aggregate, the native build matrix, and the protected `build-arm64-cross` job, and additionally require a successful `main-publish-gate`; they can run in parallel only once all four succeed. The `docker-manifest` job runs after the Docker digests are pushed. A Docker failure on `main` does not block replacing the `latest` prerelease, but neither publish path can start until every release check passes. Version-tag releases are stricter and gate GitHub Release creation on `docker-manifest`. Docker Hub publishing requires the `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets. GHCR publishing uses `GITHUB_TOKEN` and the job-level `packages: write` permission. The Docker manifests publish both `latest` and `main-<sha>` tags (where `<sha>` is the full commit SHA from `github.sha`).
 
 ## Release Pipeline (release.yml)
 
 The Release pipeline creates official releases when a version tag is pushed. It
 first verifies that the tag is exactly `v` followed by the `[package]` version
 from `Cargo.toml`. It then resolves the tag to its target commit and waits for
-successful `CI` and `Coverage` workflow runs for that exact SHA before any
-release binary or image job starts. A version mismatch fails immediately, and
-every build and publishing job depends transitively on this guard.
+successful `CI`, `Coverage`, `Mesh E2E Sidecar Live Datapath`, and
+`Multicluster Federation Live Datapath` workflow push runs for that exact SHA
+before any release binary or image job starts. A version mismatch fails
+immediately, and every build and publishing job depends transitively on this
+guard.
 
 Release runs use `concurrency.group: release-${{ github.ref }}` with `cancel-in-progress: false`, so a versioned release is never canceled by a later tag push.
 

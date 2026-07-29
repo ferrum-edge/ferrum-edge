@@ -198,3 +198,108 @@ capabilities:
       - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
       - The xDS ADS transport is a separate surface and is not covered by this row.
       - The live fixture exercises the transport over in-cluster plaintext h2c with JWT auth (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true); CP-DP gRPC TLS is an orthogonal, documented deployment knob not exercised by this row.
+
+  # ── Multicluster federation (issue #2459) ────────────────────────────────
+  # Live-proven two-cluster SPIRE federation + east-west SNI datapath. Poller-
+  # driven cross-cluster endpoint discovery remains Experimental and is
+  # excluded from every row below.
+
+  - id: mesh.multicluster.spire_trust_federation
+    display_name: Multicluster SPIRE trust federation
+    maturity: ga
+    topology: sidecar
+    config_protocol: spiffe_workload_api
+    semantic_assertions:
+      - category: mesh_multicluster_federation
+        feature: remote cluster requires federated trust bundle
+      - category: mesh_multicluster_federation
+        feature: federated trust domain uniqueness
+    live_suite: multicluster-federation
+    live_assertions:
+      - multicluster.spire.federation_ready_a
+      - multicluster.spire.federation_ready_b
+      - multicluster.federation.trust_bundle_exchange
+      - multicluster.spire.workload_entries
+    platform_profile: kind-spire-multicluster-federation
+    docs_anchor: docs/mesh.md#trust-federation
+    owner: mesh
+    exclusions:
+      - Cross-cluster endpoint discovery (poller-driven) remains Experimental.
+      - Network-partition / last-good retention live coverage remains deferred (#3331).
+
+  - id: mesh.multicluster.eastwest_authenticated_datapath
+    display_name: Multicluster east-west authenticated datapath
+    maturity: ga
+    topology: east_west_gateway
+    config_protocol: file
+    semantic_assertions:
+      - category: mesh_topology_matrix
+        feature: EastWestGateway topology
+      - category: mesh_multicluster_federation
+        feature: local_cluster identity reject blank/whitespace
+    live_suite: multicluster-federation
+    live_assertions:
+      - multicluster.eastwest.gateway_reachable
+      - multicluster.eastwest.a_to_b_authenticated
+      - multicluster.eastwest.b_to_a_authenticated
+      - multicluster.eastwest.bidirectional_authenticated_traffic
+    platform_profile: kind-spire-multicluster-federation
+    docs_anchor: docs/mesh.md#east-west-gateways
+    owner: mesh
+    exclusions:
+      - Cross-cluster endpoint discovery (poller-driven) remains Experimental.
+      - Ambient cross-cluster gRPC remains fail-closed; this row covers Sidecar HTTP east-west.
+
+  - id: mesh.multicluster.untrusted_peer_rejected
+    display_name: Multicluster untrusted peer rejection
+    maturity: ga
+    topology: sidecar
+    config_protocol: file
+    semantic_assertions:
+      - category: mesh_multicluster_federation
+        feature: remote_clusters uniqueness by canonical name
+    live_suite: multicluster-federation
+    live_assertions:
+      - multicluster.eastwest.untrusted_peer_rejected
+    platform_profile: kind-spire-multicluster-federation
+    docs_anchor: docs/mesh.md#authorization
+    owner: mesh
+    exclusions:
+      - Cross-cluster endpoint discovery (poller-driven) remains Experimental.
+
+  - id: mesh.multicluster.trust_revocation_recovery
+    display_name: Multicluster trust revocation and recovery
+    maturity: ga
+    topology: sidecar
+    config_protocol: file
+    semantic_assertions:
+      - category: mesh_multicluster_federation
+        feature: federated bundle withdrawal fails closed while remotes declared
+    live_suite: multicluster-federation
+    live_assertions:
+      - multicluster.federation.bundle_revoked_rejected
+      - multicluster.federation.trust_restored_recovers
+    platform_profile: kind-spire-multicluster-federation
+    docs_anchor: docs/mesh.md#trust-federation
+    owner: mesh
+    exclusions:
+      - Cross-cluster endpoint discovery (poller-driven) remains Experimental.
+      - Network-partition / last-good retention live coverage remains deferred (#3331).
+
+  - id: mesh.multicluster.endpoint_failure_recovery
+    display_name: Multicluster destination endpoint failure and recovery
+    maturity: ga
+    topology: sidecar
+    config_protocol: file
+    semantic_assertions:
+      - category: mesh_multicluster_federation
+        feature: east-west gateway requires host and non-zero port
+    live_suite: multicluster-federation
+    live_assertions:
+      - multicluster.eastwest.endpoint_blackhole_when_dest_down
+      - multicluster.eastwest.endpoint_recovers_when_dest_returns
+    platform_profile: kind-spire-multicluster-federation
+    docs_anchor: docs/mesh.md#multi-cluster
+    owner: mesh
+    exclusions:
+      - Cross-cluster endpoint discovery (poller-driven) remains Experimental.
