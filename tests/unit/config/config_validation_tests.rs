@@ -628,14 +628,16 @@ fn runtime_plugin_file_dependency_validation_runs_off_async_workers() {
     let plugin_cache = include_str!("../../../src/plugin_cache.rs");
     assert!(proxy.contains("country_mmdb_preload_required("));
     assert!(proxy.contains("body_validator_descriptor_preload_required("));
+    assert!(proxy.contains("ai_response_guard_descriptor_preload_required("));
     assert!(proxy.contains("validate_plugin_file_dependencies_off_thread("));
     assert!(plugin_cache.contains("pub(crate) fn country_mmdb_preload_required("));
     assert!(plugin_cache.contains("pub(crate) fn body_validator_descriptor_preload_required("));
+    assert!(plugin_cache.contains("pub(crate) fn ai_response_guard_descriptor_preload_required("));
     assert_eq!(
         plugin_cache
             .matches("self.expanded_file_dependency_rebuild_scope(")
             .count(),
-        2,
+        3,
         "MMDB and protobuf descriptor preloads must use the exact expanded delta-build scope"
     );
 

@@ -93,7 +93,45 @@ with configured plugin order preserved within each stage. Do not hard-code
 plugin names or change request-side priorities to obtain response representation
 ordering.
 
-Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
+Plugin rejects for `application/grpc` must become trailers-only gRPC errors. The single
+exception is the `serverless_function` terminate contract: a validated function response
+stamps request-scoped provenance (`RequestContext.serverless_grpc_terminate_frame`) that
+authorizes exactly that byte-identical frame to be emitted as HEADERS + one uncompressed
+unary DATA frame + plugin-authored terminal trailers. Reject body shape and reject
+`content-type`/`grpc-status` headers are never provenance, and the terminate contract is
+entered only for the request-scoped native-gRPC flavor the frontend stamps at intake —
+never for a mutable effective `content-type`. Authorization binds the authored HTTP status
+as well as the frame bytes, and that authorized representation — and only it — runs the
+shared synthetic response-body policy lifecycle so configured gRPC response validators are
+not bypassed. Invalidated authorization (rewritten frame, replaced response, changed
+status) FAILS CLOSED: the body is dropped and a residual `grpc-status: 0` is replaced by
+the rejection's own status, or `INTERNAL` — never emitted as an empty Trailers-Only
+success. The status-only shape stamps the same provenance with an EMPTY frame: it can
+never authorize DATA, but while the reply is unchanged (authored status, still-empty body)
+it stays trailers-only and its COMPLETE terminal metadata (`grpc-status`, optional
+`grpc-message`, `grpc-status-details-bin`, validated custom trailers) is restored from the
+authored provenance instead of the decorated reject header map; an omitted `grpc_message`
+stays omitted rather than becoming a synthesized reason. A changed status or an unauthored
+body fails closed identically AND discards every terminal key the contract authored, so a
+replacement error never ships beside the original contract's `grpc-status-details-bin` or
+custom trailers. `grpc_message` is authored as text and emitted percent-encoded per the
+gRPC HTTP mapping, with the 8 KiB wire ceiling measured on the encoded value.
+That per-field ceiling bounds one value; the COMPLETE terminal block
+(`grpc-status`, `grpc-message`, `grpc-status-details-bin`, every custom trailer,
+and `content-type`) carries a separate 16 KiB aggregate budget charged as
+name + value + 32 bytes per field — the HTTP/2 `SETTINGS_MAX_HEADER_LIST_SIZE` /
+HTTP/3 `SETTINGS_MAX_FIELD_SECTION_SIZE` accounting — so 32 individually valid
+8 KiB trailers cannot authorize ~256 KiB of terminal metadata.
+The raw function output is screened with the shared bounded
+`crate::util::json_dup_keys` scanner BEFORE `serde_json::from_slice`: a duplicate
+object member name (byte-identical, escaped-equivalent, or nested inside
+`trailers`) makes the authored terminal metadata parser-dependent, so it fails
+closed under the fixed `invalid_grpc_terminate_response` class with a
+fixed-cardinality reason that never echoes body bytes. Do not add a second
+ad hoc duplicate-key parser here.
+`request_deduplication` is not in this picture at all — it is `HTTP_ONLY_PROTOCOLS` while
+`HttpFlavor::Grpc` selects the `ProxyProtocol::Grpc` plugin view, so it is never effective
+on a native-gRPC request.
 
 ## Request Context And Body Rules
 
@@ -107,7 +145,7 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 - gRPC uses `GrpcBody::Streaming(Incoming)` when there are no body plugins and no retries; otherwise `Buffered(Full<Bytes>)`.
 - In `before_proxy(ctx, headers)`, read headers from the `headers` parameter, never `ctx.headers`. The handler may have moved headers out of `ctx.headers` when no plugin modifies request headers.
 - `ctx.authenticated_identity` is first-class for rate-limit/cache keys, log summaries, and backend identity header injection.
-- `response_mock` strips a proxy prefix `listen_path` before rule matching, except for root, regex, exact (`=`), and host-only scopes. It supports HTTP and WebSocket upgrade handshakes only (not native gRPC): a match short-circuits the HTTP handshake response and does not mock upgraded frame streams. Native gRPC is excluded because `Reject` normalizes to trailers-only errors that discard configured bodies.
+- `response_mock` strips a proxy prefix `listen_path` before rule matching, except for root, regex, exact (`=`), and host-only scopes. It supports HTTP and WebSocket upgrade handshakes only (not native gRPC): a match short-circuits the HTTP handshake response and does not mock upgraded frame streams. Native gRPC is excluded because `response_mock` has no provenance-authorized framed unary `Reject` contract; only `serverless_function` terminate does.
 
 ## Mesh Authz Plugin
 

@@ -3465,3 +3465,1592 @@ async fn test_sse_escaped_tool_arguments_are_decoded_after_reassembly() {
         }
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════
+//  Native gRPC inspection (issue #3305)
+// ══════════════════════════════════════════════════════════════════════
+
+/// Path to the checked-in descriptor compiled from `test_validator.proto`
+/// (`test.HelloRequest`, `test.HelloResponse`, `test.Greeter/SayHello`).
+fn grpc_descriptor_path() -> String {
+    format!(
+        "{}/tests/fixtures/test_validator.bin",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn hello_response_bytes(message: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let bytes = std::fs::read(grpc_descriptor_path()).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("test.HelloResponse").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("message", Value::String(message.to_string()));
+    msg.set_field_by_name("success", Value::Bool(true));
+    msg.encode_to_vec()
+}
+
+fn hello_response_text(frame_payload: &[u8]) -> String {
+    use prost_reflect::{DescriptorPool, DynamicMessage};
+
+    let bytes = std::fs::read(grpc_descriptor_path()).unwrap();
+    let pool = DescriptorPool::decode(bytes.as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("test.HelloResponse").unwrap();
+    let msg = DynamicMessage::decode(descriptor, frame_payload).unwrap();
+    msg.get_field_by_name("message")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn grpc_frame(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(0);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn gzip_grpc_frame(payload: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut frame = Vec::with_capacity(5 + compressed.len());
+    frame.push(1);
+    frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&compressed);
+    frame
+}
+
+/// Split a buffered gRPC body back into its frame payloads (identity only).
+fn grpc_frame_payloads(body: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    while offset < body.len() {
+        let length = u32::from_be_bytes([
+            body[offset + 1],
+            body[offset + 2],
+            body[offset + 3],
+            body[offset + 4],
+        ]) as usize;
+        offset += 5;
+        out.push(body[offset..offset + length].to_vec());
+        offset += length;
+    }
+    out
+}
+
+fn grpc_ctx(method: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        method.to_string(),
+    );
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::HttpFlavor::Grpc,
+    );
+    ctx
+}
+
+fn grpc_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers
+}
+
+fn grpc_guard(action: &str) -> AiResponseGuard {
+    make_plugin(json!({
+        "action": action,
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    }))
+}
+
+#[test]
+fn grpc_block_extends_supported_protocols_and_admission() {
+    let plugin = grpc_guard("reject");
+    let protocols = plugin.supported_protocols();
+    assert!(protocols.contains(&ProxyProtocol::Http));
+    assert!(protocols.contains(&ProxyProtocol::Grpc));
+
+    // Without a `grpc` block the plugin stays HTTP-only.
+    let http_only = make_plugin(json!({"pii_patterns": ["email"]}));
+    assert_eq!(http_only.supported_protocols(), &[ProxyProtocol::Http]);
+}
+
+#[test]
+fn grpc_buffering_vote_is_limited_to_enrolled_methods() {
+    let plugin = grpc_guard("reject");
+    assert!(plugin.requires_response_body_buffering());
+    assert!(plugin.should_buffer_response_body(&grpc_ctx("/test.Greeter/SayHello")));
+    assert!(!plugin.should_buffer_response_body(&grpc_ctx("/test.Greeter/Other")));
+    // Plain HTTP traffic on the same instance keeps its ordinary vote.
+    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "application/json")));
+}
+
+#[tokio::test]
+async fn grpc_enrolled_method_never_releases_on_sse_content_type() {
+    let plugin = grpc_guard("reject");
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+
+    assert!(
+        !plugin.may_release_response_body_under_retries(&ctx),
+        "native gRPC enrollment must remain buffered while retries are active"
+    );
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &headers));
+    assert!(!plugin.should_release_response_body_before_content_type_rewrite(&ctx, 200, &headers));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &headers,
+    ));
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let body = grpc_frame(&hello_response_bytes("contact mislabeled@example.com"));
+    assert!(
+        matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
+                .await,
+            PluginResult::Reject { .. }
+        ),
+        "the descriptor guard must inspect framed bytes regardless of a misleading SSE label"
+    );
+}
+
+#[test]
+fn grpc_config_requires_descriptor_and_methods() {
+    for invalid in [
+        json!({"pii_patterns": ["email"], "grpc": {}}),
+        json!({"pii_patterns": ["email"], "grpc": {"methods": {}}}),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {"descriptor_path": "/tmp/x.bin", "methods": {}}
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {"descriptor_path": "/tmp/x.bin", "unknown": 1, "methods": {
+                "/a.B/C": {"response_type": "x"}
+            }}
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {"descriptor_path": "/tmp/x.bin", "methods": {
+                "/a.B/C": {"response_type": "x", "unknown": 1}
+            }}
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {"descriptor_path": "/tmp/x.bin", "methods": {"not-a-path": {
+                "response_type": "x"
+            }}}
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {"descriptor_path": "/tmp/x.bin", "methods": {"/a.B/C": {}}}
+        }),
+        // JSON-only structural rules cannot be satisfied by protobuf.
+        json!({
+            "require_json": true,
+            "grpc": {"descriptor_path": "/tmp/x.bin", "methods": {
+                "/a.B/C": {"response_type": "x"}
+            }}
+        }),
+        json!({
+            "required_fields": ["choices"],
+            "grpc": {"descriptor_path": "/tmp/x.bin", "methods": {
+                "/a.B/C": {"response_type": "x"}
+            }}
+        }),
+    ] {
+        assert!(
+            AiResponseGuard::new(&invalid).is_err(),
+            "config must be rejected: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn grpc_config_rejects_unresolvable_descriptor_targets() {
+    let unknown_type = json!({
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {"/test.Greeter/SayHello": {"response_type": "test.NoSuchType"}}
+        }
+    });
+    assert!(AiResponseGuard::new(&unknown_type).is_err());
+
+    let non_string_field = json!({
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {"/test.Greeter/SayHello": {
+                "response_type": "test.HelloResponse",
+                "text_fields": ["success"]
+            }}
+        }
+    });
+    assert!(AiResponseGuard::new(&non_string_field).is_err());
+
+    let unknown_field = json!({
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {"/test.Greeter/SayHello": {
+                "response_type": "test.HelloResponse",
+                "text_fields": ["nope"]
+            }}
+        }
+    });
+    assert!(AiResponseGuard::new(&unknown_field).is_err());
+
+    let duplicate_text_fields = json!({
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {"/test.Greeter/SayHello": {
+                "response_type": "test.HelloResponse",
+                "text_fields": ["message", " message "]
+            }}
+        }
+    });
+    let duplicate_err = AiResponseGuard::new(&duplicate_text_fields)
+        .err()
+        .expect("duplicate normalized text_fields paths must fail closed");
+    assert!(
+        duplicate_err.contains("text_fields") && duplicate_err.contains("more than once"),
+        "diagnostic must name the field without echoing the path value: {duplicate_err}"
+    );
+    assert!(
+        !duplicate_err.contains("message"),
+        "diagnostic must stay value-redacted: {duplicate_err}"
+    );
+
+    // Shape-only admission must not need the node-local descriptor at all.
+    assert!(
+        AiResponseGuard::validate_config(&json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/nonexistent/descriptor.bin",
+                "methods": {"/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}}
+            }
+        }))
+        .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn grpc_unary_clean_response_passes_through() {
+    let plugin = grpc_guard("reject");
+    let body = grpc_frame(&hello_response_bytes("all clear"));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn grpc_unary_detection_rejects() {
+    let plugin = grpc_guard("reject");
+    let body = grpc_frame(&hello_response_bytes("write to agent@example.com"));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+        .await;
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert!(ctx.metadata.contains_key("ai_response_guard_rejected"));
+}
+
+#[tokio::test]
+async fn grpc_unknown_method_is_never_inspected() {
+    let plugin = grpc_guard("reject");
+    let body = grpc_frame(&hello_response_bytes("write to agent@example.com"));
+    let mut ctx = grpc_ctx("/test.Greeter/Unenrolled");
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "an un-enrolled method must never be decoded opportunistically"
+    );
+    assert!(!ctx.metadata.contains_key("ai_response_guard_rejected"));
+    assert!(!ctx.metadata.contains_key("ai_response_guard_detected"));
+}
+
+#[tokio::test]
+async fn grpc_streaming_frames_are_all_inspected() {
+    let plugin = grpc_guard("reject");
+    let mut body = grpc_frame(&hello_response_bytes("clean one"));
+    body.extend_from_slice(&grpc_frame(&hello_response_bytes("clean two")));
+    body.extend_from_slice(&grpc_frame(&hello_response_bytes("ops@example.com")));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "a match in a later stream frame must still be caught"
+    );
+}
+
+#[tokio::test]
+async fn grpc_compressed_frames_are_decoded_and_bounded() {
+    let plugin = grpc_guard("reject");
+    let body = gzip_grpc_frame(&hello_response_bytes("ops@example.com"));
+    let mut headers = grpc_headers();
+    headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    // An encoding the guard cannot inflate is uninspectable, not ignored.
+    let mut snappy = grpc_headers();
+    snappy.insert("grpc-encoding".to_string(), "snappy".to_string());
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut snappy, &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn grpc_malformed_and_oversized_framing_fails_closed() {
+    let plugin = grpc_guard("reject");
+    let payload = hello_response_bytes("clean");
+
+    // Truncated frame.
+    let mut truncated = grpc_frame(&payload);
+    truncated.pop();
+    // Trailing junk after a complete frame.
+    let mut trailing = grpc_frame(&payload);
+    trailing.extend_from_slice(&[0u8, 0, 0]);
+    // Unrecognized compressed-flag value.
+    let mut bad_flag = grpc_frame(&payload);
+    bad_flag[0] = 7;
+
+    for body in [truncated, trailing, bad_flag, vec![0u8, 0, 0]] {
+        let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+        assert!(
+            matches!(
+                plugin
+                    .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+                    .await,
+                PluginResult::Reject { .. }
+            ),
+            "malformed gRPC framing must fail closed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn grpc_message_and_stream_bounds_fail_closed() {
+    let bounded = make_plugin(json!({
+        "action": "reject",
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "max_message_bytes": 8,
+            "max_messages": 2,
+            "methods": {"/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}}
+        }
+    }));
+    let payload = hello_response_bytes("a message longer than eight bytes");
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        bounded
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &grpc_frame(&payload))
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    let small = hello_response_bytes("");
+    let mut many = grpc_frame(&small);
+    many.extend_from_slice(&grpc_frame(&small));
+    many.extend_from_slice(&grpc_frame(&small));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        bounded
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &many)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn grpc_undecodable_payload_fails_closed() {
+    let plugin = grpc_guard("reject");
+    // Field 1 declared as a length-delimited value whose length runs past the
+    // buffer: valid framing, invalid protobuf.
+    let body = grpc_frame(&[0x0a, 0x7f, 0x01]);
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn grpc_unknown_protobuf_fields_fail_closed() {
+    let plugin = grpc_guard("reject");
+    let mut payload = hello_response_bytes("clean");
+    // Field 9, varint — not present in test.HelloResponse.
+    payload.extend_from_slice(&[0x48, 0x01]);
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(
+        matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &grpc_frame(&payload))
+                .await,
+            PluginResult::Reject { .. }
+        ),
+        "fields outside the descriptor are undecodable evidence and must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn grpc_warn_action_records_and_passes_through() {
+    let plugin = grpc_guard("warn");
+    let body = grpc_frame(&hello_response_bytes("ops@example.com"));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(ctx.metadata.contains_key("ai_response_guard_detected"));
+}
+
+#[tokio::test]
+async fn grpc_redact_rewrites_and_reencodes_the_message() {
+    let plugin = grpc_guard("redact");
+    let body = grpc_frame(&hello_response_bytes("mail ops@example.com now"));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
+
+    let transformed = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &grpc_headers(),
+        )
+        .await
+        .expect("redaction must produce replacement bytes");
+    let payloads = grpc_frame_payloads(&transformed);
+    assert_eq!(payloads.len(), 1);
+    let text = hello_response_text(&payloads[0]);
+    assert!(!text.contains("ops@example.com"), "PII survived: {text}");
+    assert!(text.contains("[REDACTED:pii:email]"), "unexpected: {text}");
+}
+
+#[tokio::test]
+async fn grpc_redact_preserves_compressed_framing() {
+    let plugin = grpc_guard("redact");
+    let body = gzip_grpc_frame(&hello_response_bytes("mail ops@example.com now"));
+    let mut headers = grpc_headers();
+    headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let transformed = plugin
+        .transform_response_body_with_context(&mut ctx, &body, Some("application/grpc"), &headers)
+        .await
+        .expect("compressed redaction must produce replacement bytes");
+    assert_eq!(
+        transformed[0], 1,
+        "a frame that arrived compressed must stay compressed"
+    );
+}
+
+#[tokio::test]
+async fn grpc_text_fields_narrow_the_scanned_surface() {
+    let plugin = make_plugin(json!({
+        "action": "reject",
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {"/test.Greeter/SayHello": {
+                "response_type": "test.HelloResponse",
+                "text_fields": ["message"]
+            }}
+        }
+    }));
+    let body = grpc_frame(&hello_response_bytes("ops@example.com"));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn grpc_missing_descriptor_fails_closed_for_enrolled_methods() {
+    let plugin = AiResponseGuard::new(&json!({
+        "action": "reject",
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": "/nonexistent/ai-response-guard-descriptor.bin",
+            "methods": {"/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}}
+        }
+    }))
+    .expect("an absent node-local descriptor must still construct");
+    let body = grpc_frame(&hello_response_bytes("clean"));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    // Still no opportunistic inspection of anything else.
+    let mut other = grpc_ctx("/test.Greeter/Unenrolled");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut other, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn grpc_method_router_metadata_resolves_enrollment() {
+    let plugin = grpc_guard("reject");
+    let body = grpc_frame(&hello_response_bytes("ops@example.com"));
+    let mut ctx = grpc_ctx("/rewritten/path");
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn grpc_empty_and_non_success_bodies_are_not_governed() {
+    let plugin = grpc_guard("reject");
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), b"")
+            .await,
+        PluginResult::Continue
+    ));
+    let body = grpc_frame(&hello_response_bytes("ops@example.com"));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 500, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  PR #3398 repair regressions
+// ══════════════════════════════════════════════════════════════════════
+
+const EXT_PB_LABEL_OPTIONAL: u64 = 1;
+const EXT_PB_TYPE_STRING: u64 = 9;
+const EXT_PB_TYPE_MESSAGE: u64 = 11;
+
+fn ext_pb_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn ext_pb_tag(out: &mut Vec<u8>, field: u32, wire: u64) {
+    ext_pb_varint(out, (u64::from(field) << 3) | wire);
+}
+
+fn ext_pb_len_field(field: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    ext_pb_tag(&mut out, field, 2);
+    ext_pb_varint(&mut out, payload.len() as u64);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn ext_pb_str_field(field: u32, value: &str) -> Vec<u8> {
+    ext_pb_len_field(field, value.as_bytes())
+}
+
+fn ext_pb_varint_field(field: u32, value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    ext_pb_tag(&mut out, field, 0);
+    ext_pb_varint(&mut out, value);
+    out
+}
+
+fn ext_pb_field(name: &str, number: u32, label: u64, kind: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(ext_pb_str_field(1, name));
+    out.extend(ext_pb_varint_field(3, u64::from(number)));
+    out.extend(ext_pb_varint_field(4, label));
+    out.extend(ext_pb_varint_field(5, kind));
+    out
+}
+
+fn ext_pb_extension_field(
+    name: &str,
+    number: u32,
+    label: u64,
+    kind: u64,
+    extendee: &str,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(ext_pb_str_field(1, name));
+    out.extend(ext_pb_str_field(2, extendee));
+    out.extend(ext_pb_varint_field(3, u64::from(number)));
+    out.extend(ext_pb_varint_field(4, label));
+    out.extend(ext_pb_varint_field(5, kind));
+    out
+}
+
+fn ext_pb_extension_message_field(
+    name: &str,
+    number: u32,
+    label: u64,
+    ty: &str,
+    extendee: &str,
+) -> Vec<u8> {
+    let mut out = ext_pb_extension_field(name, number, label, EXT_PB_TYPE_MESSAGE, extendee);
+    out.extend(ext_pb_str_field(6, ty));
+    out
+}
+
+/// proto2 FileDescriptorSet:
+/// ```proto
+/// package ext;
+/// message Carrier { optional string base = 1; extensions 100 to 199; }
+/// message Nested  { optional string inner = 1; }
+/// extend Carrier {
+///   optional string note = 100;
+///   optional Nested nest = 101;
+/// }
+/// ```
+fn extension_descriptor_set() -> Vec<u8> {
+    let base = ext_pb_field("base", 1, EXT_PB_LABEL_OPTIONAL, EXT_PB_TYPE_STRING);
+    let mut carrier = ext_pb_str_field(1, "Carrier");
+    carrier.extend(ext_pb_len_field(2, &base));
+    let mut range = Vec::new();
+    range.extend(ext_pb_varint_field(1, 100));
+    range.extend(ext_pb_varint_field(2, 200));
+    carrier.extend(ext_pb_len_field(5, &range));
+
+    let inner = ext_pb_field("inner", 1, EXT_PB_LABEL_OPTIONAL, EXT_PB_TYPE_STRING);
+    let mut nested = ext_pb_str_field(1, "Nested");
+    nested.extend(ext_pb_len_field(2, &inner));
+
+    let note = ext_pb_extension_field(
+        "note",
+        100,
+        EXT_PB_LABEL_OPTIONAL,
+        EXT_PB_TYPE_STRING,
+        ".ext.Carrier",
+    );
+    let nest = ext_pb_extension_message_field(
+        "nest",
+        101,
+        EXT_PB_LABEL_OPTIONAL,
+        ".ext.Nested",
+        ".ext.Carrier",
+    );
+
+    let mut file = ext_pb_str_field(1, "ext.proto");
+    file.extend(ext_pb_str_field(2, "ext"));
+    file.extend(ext_pb_len_field(4, &carrier));
+    file.extend(ext_pb_len_field(4, &nested));
+    file.extend(ext_pb_len_field(7, &note));
+    file.extend(ext_pb_len_field(7, &nest));
+    ext_pb_len_field(1, &file)
+}
+
+fn extension_descriptor_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("ext.bin"), extension_descriptor_set()).expect("write");
+    dir
+}
+
+fn extension_guard(dir: &tempfile::TempDir, action: &str) -> AiResponseGuard {
+    make_plugin(json!({
+        "action": action,
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": dir.path().join("ext.bin").to_string_lossy(),
+            "methods": {
+                "/ext.Svc/Run": {"response_type": "ext.Carrier"}
+            }
+        }
+    }))
+}
+
+fn carrier_with_note(note: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let pool = DescriptorPool::decode(extension_descriptor_set().as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("ext.Carrier").unwrap();
+    let extension = pool.get_extension_by_name("ext.note").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("base", Value::String("clean".into()));
+    msg.set_extension(&extension, Value::String(note.to_string()));
+    msg.encode_to_vec()
+}
+
+fn carrier_with_nested_unknown() -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let pool = DescriptorPool::decode(extension_descriptor_set().as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("ext.Carrier").unwrap();
+    let nested_desc = pool.get_message_by_name("ext.Nested").unwrap();
+    let extension = pool.get_extension_by_name("ext.nest").unwrap();
+    let mut nested = DynamicMessage::new(nested_desc.clone());
+    nested.set_field_by_name("inner", Value::String("clean".into()));
+    let mut nested_bytes = nested.encode_to_vec();
+    // Append unknown field 99 (varint 1) outside Nested's descriptor so the
+    // extension walk must recurse into the nested message to prove absence.
+    ext_pb_tag(&mut nested_bytes, 99, 0);
+    ext_pb_varint(&mut nested_bytes, 1);
+    let nested = DynamicMessage::decode(nested_desc, nested_bytes.as_slice()).unwrap();
+    assert!(
+        nested.unknown_fields().next().is_some(),
+        "fixture must carry a nested unknown field"
+    );
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_extension(&extension, Value::Message(nested));
+    msg.encode_to_vec()
+}
+
+#[tokio::test]
+async fn grpc_string_extension_is_scanned_for_reject_and_redact() {
+    let dir = extension_descriptor_dir();
+    let reject = extension_guard(&dir, "reject");
+    let body = grpc_frame(&carrier_with_note("mail ops@example.com"));
+    let mut ctx = grpc_ctx("/ext.Svc/Run");
+    assert!(matches!(
+        reject
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    let redact = extension_guard(&dir, "redact");
+    let mut ctx = grpc_ctx("/ext.Svc/Run");
+    assert!(matches!(
+        redact
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let transformed = redact
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &grpc_headers(),
+        )
+        .await
+        .expect("extension redaction must rewrite");
+    use prost_reflect::{DescriptorPool, DynamicMessage};
+    let pool = DescriptorPool::decode(extension_descriptor_set().as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("ext.Carrier").unwrap();
+    let extension = pool.get_extension_by_name("ext.note").unwrap();
+    let payloads = grpc_frame_payloads(&transformed);
+    let msg = DynamicMessage::decode(descriptor, payloads[0].as_slice()).unwrap();
+    let note = msg.get_extension(&extension);
+    let note = note.as_str().unwrap();
+    assert!(!note.contains("ops@example.com"), "PII survived: {note}");
+    assert!(note.contains("[REDACTED:pii:email]"), "unexpected: {note}");
+}
+
+#[tokio::test]
+async fn grpc_unknown_fields_nested_under_extension_fail_closed() {
+    let dir = extension_descriptor_dir();
+    let plugin = extension_guard(&dir, "reject");
+    let body = grpc_frame(&carrier_with_nested_unknown());
+    let mut ctx = grpc_ctx("/ext.Svc/Run");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn grpc_split_frame_pii_is_detected_and_redact_fails_closed() {
+    let plugin = grpc_guard("reject");
+    let mut body = grpc_frame(&hello_response_bytes("ops@"));
+    body.extend_from_slice(&grpc_frame(&hello_response_bytes("example.com")));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(
+        matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+                .await,
+            PluginResult::Reject { .. }
+        ),
+        "email split across frames must still reject"
+    );
+
+    let redact = grpc_guard("redact");
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(
+        matches!(
+            redact
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+                .await,
+            PluginResult::Reject { .. }
+        ),
+        "cross-frame-only match must fail closed in redact mode"
+    );
+    assert!(
+        redact
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &grpc_headers(),
+            )
+            .await
+            .is_none(),
+        "cross-frame-only match cannot be rewritten in any one scalar"
+    );
+}
+
+#[tokio::test]
+async fn grpc_aggregate_completion_length_covers_selected_stream() {
+    let plugin = make_plugin(json!({
+        "action": "reject",
+        "max_completion_length": 10,
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {"/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}}
+        }
+    }));
+    // Each fragment is under the limit; the ordered aggregate is not.
+    let mut body = grpc_frame(&hello_response_bytes("hello "));
+    body.extend_from_slice(&grpc_frame(&hello_response_bytes("world!!!")));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn grpc_redact_transform_ignores_mislabeled_response_content_type() {
+    let plugin = grpc_guard("redact");
+    let body = grpc_frame(&hello_response_bytes("mail ops@example.com now"));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
+
+    // Absent or relabeled response Content-Type must not skip the rewrite after
+    // a successful framed inspection on an enrolled native-gRPC request.
+    for content_type in [None, Some("application/json"), Some("text/plain")] {
+        let transformed = plugin
+            .transform_response_body_with_context(&mut ctx, &body, content_type, &grpc_headers())
+            .await
+            .expect("transform gate must follow enrollment, not response Content-Type");
+        let text = hello_response_text(&grpc_frame_payloads(&transformed)[0]);
+        assert!(
+            !text.contains("ops@example.com"),
+            "PII leaked under content-type {content_type:?}: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn grpc_web_translated_response_is_never_rewritten_as_text() {
+    // A gRPC-Web translated response is excluded from the protobuf rewrite
+    // (`grpc_web` re-frames the body first), but its bytes are still gRPC
+    // framing, so the plain `transform_response_body` must decline them. With
+    // `scan_fields: all` the frame bytes of an ASCII payload are valid UTF-8,
+    // so a text redaction would rewrite them and change a payload's length
+    // without its 5-byte prefix, corrupting the wire while reporting success.
+    //
+    // This ctx is the native-flavor half of the hazard. The production
+    // gRPC-Web shape — `HttpFlavor::Plain` — is covered by
+    // `grpc_web_framed_response_fails_closed_instead_of_being_text_redacted`.
+    let plugin = make_plugin(json!({
+        "action": "redact",
+        "scan_fields": "all",
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    }));
+    let body = grpc_frame(&hello_response_bytes("mail ops@example.com now"));
+    assert!(
+        std::str::from_utf8(&body).is_ok(),
+        "the regression only bites when the framed body is valid UTF-8"
+    );
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    ctx.metadata
+        .insert("grpc_web_mode".to_string(), "text".to_string());
+
+    // Detection still fires; redaction cannot reach the delivered bytes, so the
+    // enforcing action fails closed rather than claiming a redaction.
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_response_guard_rejected")
+            .map(|s| s.as_str()),
+        Some("grpc_web_translation_blocks_redaction")
+    );
+
+    // The transform must decline these bytes for every response label a
+    // translated response can carry, including the gRPC-Web media types that
+    // the native-gRPC content-type guard does not recognize.
+    for content_type in [
+        None,
+        Some("application/grpc-web+proto"),
+        Some("application/grpc-web-text"),
+        Some("application/json"),
+        Some("text/plain"),
+    ] {
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &body,
+                    content_type,
+                    &grpc_headers()
+                )
+                .await
+                .is_none(),
+            "gRPC framing must never be rewritten as text under content-type {content_type:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn grpc_gzip_rejects_trailing_garbage_and_concatenated_members() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = grpc_guard("reject");
+    let payload = hello_response_bytes("clean");
+
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&payload).unwrap();
+    let mut with_trailer = encoder.finish().unwrap();
+    with_trailer.extend_from_slice(b"trailing-garbage");
+    let mut frame = Vec::with_capacity(5 + with_trailer.len());
+    frame.push(1);
+    frame.extend_from_slice(&(with_trailer.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&with_trailer);
+    let mut headers = grpc_headers();
+    headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &frame)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    let mut first = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    first.write_all(&payload).unwrap();
+    let mut concatenated = first.finish().unwrap();
+    let mut second = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    second.write_all(&payload).unwrap();
+    concatenated.extend_from_slice(&second.finish().unwrap());
+    let mut frame = Vec::with_capacity(5 + concatenated.len());
+    frame.push(1);
+    frame.extend_from_slice(&(concatenated.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&concatenated);
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &frame)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn grpc_aggregate_decoded_budget_bounds_compressed_amplification() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    // Small wire body, but decompressed aggregate exceeds max_scan_bytes.
+    let plugin = make_plugin(json!({
+        "action": "reject",
+        "pii_patterns": ["email"],
+        "max_scan_bytes": 64,
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "max_message_bytes": 4096,
+            "methods": {"/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}}
+        }
+    }));
+    let large = hello_response_bytes(&"x".repeat(1024));
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(&large).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut frame = Vec::with_capacity(5 + compressed.len());
+    frame.push(1);
+    frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&compressed);
+    assert!(
+        frame.len() <= 64,
+        "fixture must amplify under the wire budget: frame {} vs limit 64",
+        frame.len()
+    );
+    assert!(
+        large.len() > 64,
+        "decompressed payload must exceed max_scan_bytes"
+    );
+    let mut headers = grpc_headers();
+    headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &frame)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[test]
+fn grpc_method_path_requires_protobuf_identifier_grammar() {
+    for invalid in [
+        "/a.B/C?x=1",
+        "/a.B/C%2F",
+        "/a. B/C",
+        "/a..B/C",
+        "/.B/C",
+        "/a.B/",
+        "//a.B/C",
+        "/a.B/C/extra",
+        "/1Service/Method",
+        "/a.B/9bad",
+        "/a-B/C",
+        "not-a-path",
+        "",
+    ] {
+        let mut methods = serde_json::Map::new();
+        methods.insert(invalid.to_string(), json!({"response_type": "x"}));
+        let config = json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/tmp/x.bin",
+                "methods": methods
+            }
+        });
+        assert!(
+            AiResponseGuard::new(&config).is_err(),
+            "must reject method path {invalid:?}"
+        );
+    }
+
+    // Optional leading slash still normalizes.
+    let config = json!({
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    });
+    assert!(AiResponseGuard::new(&config).is_ok());
+
+    // Duplicate after normalization is rejected.
+    let dup = json!({
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "test.Greeter/SayHello": {"response_type": "test.HelloResponse"},
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    });
+    assert!(AiResponseGuard::new(&dup).is_err());
+}
+
+/// A gRPC-framed response on a request that is NOT native gRPC has no
+/// descriptor contract, and `transform_response_body` declines those bytes.
+/// `scan_fields: all` must therefore not report a redaction the transform can
+/// never apply — it fails closed exactly as content mode already does.
+#[tokio::test]
+async fn scan_all_grpc_framed_response_on_http_request_fails_closed() {
+    let plugin = make_plugin(json!({
+        "action": "redact",
+        "pii_patterns": ["email"],
+        "scan_fields": "all"
+    }));
+    // Valid UTF-8 framed bytes: without the guard this is scanned as raw text.
+    let body = grpc_frame(b"contact ops@example.com now");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "gRPC-framed response must not be redacted as a text document"
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_response_guard_rejected"),
+        Some(&"grpc_framed_response_requires_grpc_contract".to_string())
+    );
+    assert!(!ctx.metadata.contains_key("ai_response_guard_redacted"));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &grpc_headers(),
+            )
+            .await
+            .is_none(),
+        "the text transform must never rewrite gRPC framing"
+    );
+}
+
+/// Warn-only guards keep their documented pass-through posture for the same
+/// uninspectable response, recording the reason instead of rejecting.
+#[tokio::test]
+async fn scan_all_grpc_framed_response_on_http_request_warns_in_warn_mode() {
+    let plugin = make_plugin(json!({
+        "action": "warn",
+        "pii_patterns": ["email"],
+        "scan_fields": "all"
+    }));
+    let body = grpc_frame(b"contact ops@example.com now");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("ai_response_guard_warning"),
+        Some(&"grpc_framed_response_requires_grpc_contract".to_string())
+    );
+}
+
+/// A highly compressible gzip frame is bounded by the aggregate
+/// `max_scan_bytes` budget, not just by the (independently configurable)
+/// per-message ceiling, so a small compressed frame cannot inflate to the much
+/// larger per-message limit before being refused.
+#[tokio::test]
+async fn grpc_gzip_bomb_is_bounded_by_max_scan_bytes() {
+    let plugin = make_plugin(json!({
+        "action": "reject",
+        "pii_patterns": ["email"],
+        "max_scan_bytes": 4096,
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "max_message_bytes": 1048576,
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    }));
+    let payload = vec![b'a'; 512_000];
+    let body = gzip_grpc_frame(&payload);
+    assert!(
+        body.len() <= 4096,
+        "the compressed frame itself must fit under max_scan_bytes"
+    );
+    let mut headers = grpc_headers();
+    headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        ctx.metadata.get("ai_response_guard_rejected"),
+        Some(&"grpc_decoded_exceeds_max_scan_bytes".to_string())
+    );
+}
+
+const SCOPE_PB_LABEL_REPEATED: u64 = 3;
+
+fn scope_pb_message_field(name: &str, number: u32, label: u64, ty: &str) -> Vec<u8> {
+    let mut out = ext_pb_field(name, number, label, EXT_PB_TYPE_MESSAGE);
+    out.extend(ext_pb_str_field(6, ty));
+    out
+}
+
+fn scope_pb_as_map_entry(mut message: Vec<u8>) -> Vec<u8> {
+    // MessageOptions.map_entry = true (options field 7; map_entry field 7).
+    let options = ext_pb_varint_field(7, 1);
+    message.extend(ext_pb_len_field(7, &options));
+    message
+}
+
+/// proto2 FileDescriptorSet:
+/// ```proto
+/// package scope;
+/// message Reply {
+///   optional string body = 1;
+///   optional string meta = 2;
+///   map<string, string> labels = 3;
+/// }
+/// ```
+fn scoped_reply_descriptor_set() -> Vec<u8> {
+    let body = ext_pb_field("body", 1, EXT_PB_LABEL_OPTIONAL, EXT_PB_TYPE_STRING);
+    let meta = ext_pb_field("meta", 2, EXT_PB_LABEL_OPTIONAL, EXT_PB_TYPE_STRING);
+
+    let key = ext_pb_field("key", 1, EXT_PB_LABEL_OPTIONAL, EXT_PB_TYPE_STRING);
+    let value = ext_pb_field("value", 2, EXT_PB_LABEL_OPTIONAL, EXT_PB_TYPE_STRING);
+    let mut entry = ext_pb_str_field(1, "LabelsEntry");
+    entry.extend(ext_pb_len_field(2, &key));
+    entry.extend(ext_pb_len_field(2, &value));
+    let entry = scope_pb_as_map_entry(entry);
+
+    let labels = scope_pb_message_field(
+        "labels",
+        3,
+        SCOPE_PB_LABEL_REPEATED,
+        ".scope.Reply.LabelsEntry",
+    );
+    let mut reply = ext_pb_str_field(1, "Reply");
+    reply.extend(ext_pb_len_field(2, &body));
+    reply.extend(ext_pb_len_field(2, &meta));
+    reply.extend(ext_pb_len_field(2, &labels));
+    reply.extend(ext_pb_len_field(3, &entry));
+
+    let mut file = ext_pb_str_field(1, "scope.proto");
+    file.extend(ext_pb_str_field(2, "scope"));
+    file.extend(ext_pb_len_field(4, &reply));
+    ext_pb_len_field(1, &file)
+}
+
+fn scoped_reply_descriptor_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("scope.bin"), scoped_reply_descriptor_set()).expect("write");
+    dir
+}
+
+fn scoped_reply_bytes(body: &str, meta: &str, map_key: &str, map_value: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, MapKey, Value};
+    use std::collections::HashMap;
+
+    let pool = DescriptorPool::decode(scoped_reply_descriptor_set().as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("scope.Reply").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("body", Value::String(body.to_string()));
+    msg.set_field_by_name("meta", Value::String(meta.to_string()));
+    let mut labels = HashMap::new();
+    labels.insert(
+        MapKey::String(map_key.to_string()),
+        Value::String(map_value.to_string()),
+    );
+    msg.set_field_by_name("labels", Value::Map(labels));
+    msg.encode_to_vec()
+}
+
+fn scoped_text_fields_guard(dir: &tempfile::TempDir) -> AiResponseGuard {
+    make_plugin(json!({
+        "action": "reject",
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": dir.path().join("scope.bin").to_string_lossy(),
+            "methods": {
+                "/scope.Svc/Run": {
+                    "response_type": "scope.Reply",
+                    "text_fields": ["body"]
+                }
+            }
+        }
+    }))
+}
+
+/// `text_fields` is the enrollment contract: out-of-scope strings and map keys
+/// must not trigger detection, while an in-scope match still fails closed.
+#[tokio::test]
+async fn grpc_text_fields_ignore_out_of_scope_strings_and_map_keys() {
+    let dir = scoped_reply_descriptor_dir();
+    let plugin = scoped_text_fields_guard(&dir);
+
+    // Out-of-scope scalar + map key carry PII; selected `body` is clean.
+    let out_of_scope = grpc_frame(&scoped_reply_bytes(
+        "clean",
+        "mail ops@example.com",
+        "ops@example.com",
+        "also ops@example.com",
+    ));
+    let mut ctx = grpc_ctx("/scope.Svc/Run");
+    assert!(
+        matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &out_of_scope)
+                .await,
+            PluginResult::Continue
+        ),
+        "out-of-scope string/map-key matches must not reject under text_fields"
+    );
+
+    // Same out-of-scope PII, but the selected field also matches.
+    let in_scope = grpc_frame(&scoped_reply_bytes(
+        "mail ops@example.com",
+        "mail ops@example.com",
+        "ops@example.com",
+        "also ops@example.com",
+    ));
+    let mut ctx = grpc_ctx("/scope.Svc/Run");
+    assert!(
+        matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &in_scope)
+                .await,
+            PluginResult::Reject { .. }
+        ),
+        "in-scope text_fields matches must still reject"
+    );
+}
+
+/// A browser gRPC-Web request as the proxy actually classifies it.
+///
+/// `detect_http_flavor` calls gRPC-Web `HttpFlavor::Plain` — only the request
+/// protocol view is gRPC — so a framing guard keyed on
+/// `is_native_grpc_request()` never fires for real gRPC-Web traffic.
+fn grpc_web_ctx(path: &str, translated: bool) -> RequestContext {
+    let ip = "127.0.0.1".to_string();
+    let mut ctx = RequestContext::new(ip, "POST".to_string(), path.to_string());
+    if translated {
+        // `grpc_web` claimed the translation, so the backend answered in native
+        // framing and this plugin's transform runs after that re-framing.
+        let mode = "binary".to_string();
+        ctx.metadata.insert("grpc_web_mode".to_string(), mode);
+    }
+    // Retained on both the translated and pass-through deployments.
+    let ct = "application/grpc-web+proto".to_string();
+    ctx.metadata.insert("grpc_web_original_ct".to_string(), ct);
+    ctx
+}
+
+fn grpc_web_guard(with_grpc_block: bool) -> AiResponseGuard {
+    let mut config = json!({
+        "action": "redact",
+        "scan_fields": "all",
+        "pii_patterns": ["email"]
+    });
+    if with_grpc_block {
+        config["grpc"] = json!({
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        });
+    }
+    make_plugin(config)
+}
+
+fn content_type_headers(value: Option<&str>) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    if let Some(ct) = value {
+        headers.insert("content-type".to_string(), ct.to_string());
+    }
+    headers
+}
+
+async fn guard_inspect(
+    plugin: &AiResponseGuard,
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    body: &[u8],
+) -> PluginResult {
+    plugin.on_response_body(ctx, 200, headers, body).await
+}
+
+async fn guard_transform(
+    plugin: &AiResponseGuard,
+    ctx: &mut RequestContext,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) -> Option<Vec<u8>> {
+    let content_type = headers.get("content-type").map(String::as_str);
+    plugin
+        .transform_response_body_with_context(ctx, body, content_type, headers)
+        .await
+}
+
+fn rejected_reason(ctx: &RequestContext) -> Option<&str> {
+    ctx.metadata
+        .get("ai_response_guard_rejected")
+        .map(String::as_str)
+}
+
+fn assert_framing_reject(verdict: PluginResult, ctx: &RequestContext, label: &str) {
+    assert!(matches!(verdict, PluginResult::Reject { .. }), "{label}");
+    let expected = Some("grpc_framed_response_requires_grpc_contract");
+    assert_eq!(rejected_reason(ctx), expected, "{label}");
+    let redacted = ctx.metadata.contains_key("ai_response_guard_redacted");
+    assert!(!redacted, "a redaction that cannot reach the wire: {label}");
+}
+
+#[tokio::test]
+async fn grpc_web_framed_response_fails_closed_instead_of_being_text_redacted() {
+    // Regression: the framing guard must not key on the request's HTTP flavor
+    // or on `application/grpc` alone. A browser gRPC-Web request is
+    // `HttpFlavor::Plain`, so it never reaches the descriptor contract, and
+    // `grpc_web`'s `after_proxy` has already relabeled the response to
+    // `application/grpc-web*` by the time `on_response_body` runs. Under
+    // `scan_fields: all` those frame bytes are valid UTF-8, so the JSON/text
+    // model would detect the PII, report `redacted`, and then regex-rewrite the
+    // payload without its 5-byte length prefix — corrupting the delivered wire.
+    let body = grpc_frame(&hello_response_bytes("mail ops@example.com now"));
+    assert!(
+        std::str::from_utf8(&body).is_ok(),
+        "the regression only bites when the framed body is valid UTF-8"
+    );
+
+    for with_grpc_block in [false, true] {
+        let plugin = grpc_web_guard(with_grpc_block);
+        for translated in [true, false] {
+            let label = format!("grpc_block={with_grpc_block} translated={translated}");
+            let mut ctx = grpc_web_ctx("/test.Greeter/SayHello", translated);
+            let ct = Some("application/grpc-web+proto");
+            let mut headers = content_type_headers(ct);
+
+            let verdict = guard_inspect(&plugin, &mut ctx, &mut headers, &body).await;
+            assert_framing_reject(verdict, &ctx, &label);
+
+            let rewritten = guard_transform(&plugin, &mut ctx, &body, &headers).await;
+            assert!(
+                rewritten.is_none(),
+                "a gRPC-Web framed body must never be rewritten as text ({label})"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn grpc_web_framing_is_resolved_without_a_trustworthy_content_type() {
+    // A header rule can strip or relabel the response `Content-Type` after the
+    // backend answered, so the live label alone cannot decide framing. The
+    // pristine backend label stamped before any response hook ran, and failing
+    // that a total frame parse under the client's representation, must still
+    // recognize these bytes as gRPC-Web framing and fail closed.
+    let plugin = grpc_web_guard(true);
+    let body = grpc_frame(&hello_response_bytes("mail ops@example.com now"));
+
+    // (a) Live type relabeled to JSON; the pristine backend type proves framing.
+    let mut ctx = grpc_web_ctx("/test.Greeter/SayHello", true);
+    let key = "ferrum:original_response_content_type".to_string();
+    let pristine = "application/grpc+proto".to_string();
+    ctx.metadata.insert(key, pristine);
+    let mut headers = content_type_headers(Some("application/json"));
+    let verdict = guard_inspect(&plugin, &mut ctx, &mut headers, &body).await;
+    assert_framing_reject(verdict, &ctx, "relabeled content-type");
+
+    // (b) No live type and no pristine type: the bytes themselves total-parse
+    // as complete frames under the retained gRPC-Web binary grammar.
+    let mut ctx = grpc_web_ctx("/test.Greeter/SayHello", false);
+    let mut headers = content_type_headers(None);
+    let verdict = guard_inspect(&plugin, &mut ctx, &mut headers, &body).await;
+    assert_framing_reject(verdict, &ctx, "stripped content-type");
+}
+
+#[tokio::test]
+async fn grpc_web_request_with_a_bare_json_document_is_still_inspected() {
+    // The framing resolution is one-directional: it must not turn every
+    // response on a gRPC-Web request into a 502. A genuine bare JSON document
+    // is not a frame sequence under any gRPC grammar (a frame's first octet is
+    // a flag byte, and `{` is not one), so it stays claimed and redactable.
+    let plugin = grpc_web_guard(true);
+    let body = br#"{"choices":[{"message":{"content":"mail ops@example.com"}}]}"#;
+
+    let mut ctx = grpc_web_ctx("/test.Greeter/SayHello", false);
+    let mut headers = content_type_headers(Some("application/json"));
+    let verdict = guard_inspect(&plugin, &mut ctx, &mut headers, body).await;
+    assert!(matches!(verdict, PluginResult::Continue));
+    assert!(
+        ctx.metadata.contains_key("ai_response_guard_redacted"),
+        "a bare JSON document on a gRPC-Web request must still be redacted"
+    );
+
+    let rewritten = guard_transform(&plugin, &mut ctx, body, &headers).await;
+    let rewritten = rewritten.expect("bare JSON is still rewritten");
+    let rewritten = String::from_utf8(rewritten).unwrap();
+    assert!(!rewritten.contains("ops@example.com"));
+    assert!(rewritten.contains("[REDACTED:pii:email]"));
+}

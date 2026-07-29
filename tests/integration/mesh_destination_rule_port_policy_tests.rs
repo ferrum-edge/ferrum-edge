@@ -1021,7 +1021,7 @@ virtual_service_cors_policies:
     assert!(plugin.enabled);
     assert_eq!(
         plugin.config["allowed_origins"],
-        serde_json::json!(["https://fixture.example"])
+        serde_json::json!([{ "exact": "https://fixture.example" }])
     );
     assert_eq!(
         plugin.config["allowed_methods"],
@@ -1183,18 +1183,209 @@ fn virtual_service_cors_unmatched_modes_survive_gateway_and_mesh_projection() {
     }
 }
 
+/// Issue #3254: an Istio exact that is wildcard-shaped or not the canonical
+/// browser serialization is projected LITERALLY on BOTH paths — it must reach
+/// the plugin as `{"exact": <source string>}`, never as the plugin's
+/// plain-string form (which canonicalizes and reads a leading `*` as native
+/// wildcard-subdomain syntax, widening the source matcher).
 #[test]
-fn virtual_service_cors_noncanonical_exact_origin_is_deferred_across_both_projections() {
+fn virtual_service_cors_literal_exact_origin_survives_both_projections_unwidened() {
+    for source_origin in [
+        "https://example.com:443",
+        "HTTPS://EXAMPLE.COM",
+        "https://bücher.example",
+        "*.example.com",
+    ] {
+        for cors_policy in [
+            serde_json::json!({"allowOrigins": [{"exact": source_origin}]}),
+            serde_json::json!({"allowOrigin": [source_origin]}),
+        ] {
+            let translated = translate_k8s_objects(
+                &[k8s_object(
+                    "VirtualService",
+                    "vs-literal-cors",
+                    serde_json::json!({
+                        "hosts": ["svc.default.svc.cluster.local"],
+                        "http": [{
+                            "route": [{"destination": {
+                                "host": "svc.default.svc.cluster.local",
+                                "port": {"number": 8080}
+                            }}],
+                            "corsPolicy": cors_policy
+                        }]
+                    }),
+                )],
+                k8s_options(),
+            )
+            .expect("literal exact translates");
+
+            let gateway = translated
+                .config
+                .plugin_configs
+                .iter()
+                .find(|plugin| plugin.plugin_name == "cors")
+                .expect("literal Istio exact must project a gateway CORS plugin");
+            assert_eq!(
+                gateway.config["allowed_origins"],
+                serde_json::json!([{ "exact": source_origin }]),
+                "the source string must be preserved byte-for-byte as a literal matcher"
+            );
+            ferrum_edge::plugins::validate_plugin_config("cors", &gateway.config)
+                .expect("projected literal CORS config constructs");
+
+            let mesh = translated
+                .config
+                .mesh
+                .as_ref()
+                .expect("mesh block")
+                .virtual_service_cors_policies
+                .first()
+                .expect("literal Istio exact must ride the mesh slice");
+            assert_eq!(
+                cors_plugin_config_from_mesh_policy(&mesh.cors),
+                gateway.config,
+                "slice-carried and gateway-projected CORS configs must be identical"
+            );
+        }
+    }
+}
+
+/// Reload / update / delete: a route-local CORS policy must follow its source
+/// through re-translation, and rule ordering must be preserved. Each pass is a
+/// full re-translate — the same path a config reload or a K8s watch event takes
+/// — so a stale or leaked route-local plugin would show up here.
+#[test]
+fn virtual_service_cors_policy_follows_updates_and_deletes_preserving_rule_order() {
+    let translate = |first_cors: Option<serde_json::Value>| {
+        let mut api_rule = serde_json::json!({
+            "match": [{"uri": {"prefix": "/api"}}],
+            "route": [{"destination": {
+                "host": "svc.default.svc.cluster.local",
+                "port": {"number": 8080}
+            }}]
+        });
+        if let Some(cors) = first_cors {
+            api_rule["corsPolicy"] = cors;
+        }
+        translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-cors-lifecycle",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [
+                        api_rule,
+                        {
+                            "match": [{"uri": {"prefix": "/"}}],
+                            "route": [{"destination": {
+                                "host": "svc.default.svc.cluster.local",
+                                "port": {"number": 8080}
+                            }}]
+                        }
+                    ]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("VirtualService translates")
+    };
+
+    let cors_plugins = |translated: &ferrum_edge::config_sources::k8s::K8sTranslation| {
+        translated
+            .config
+            .plugin_configs
+            .iter()
+            .filter(|plugin| plugin.plugin_name == "cors")
+            .map(|plugin| {
+                (
+                    plugin.proxy_id.clone(),
+                    plugin.config["allowed_origins"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let listen_paths = |translated: &ferrum_edge::config_sources::k8s::K8sTranslation| {
+        translated
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.listen_path.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // ADD: the policy lands on the `/api` route's own proxy only.
+    let added = translate(Some(
+        serde_json::json!({"allowOrigins": [{"exact": "https://one.example"}]}),
+    ));
+    let added_plugins = cors_plugins(&added);
+    assert_eq!(added_plugins.len(), 1, "{added_plugins:?}");
+    let scoped_proxy = added_plugins[0].0.clone().expect("cors is proxy-scoped");
+    assert_eq!(
+        added_plugins[0].1,
+        serde_json::json!([{ "exact": "https://one.example" }])
+    );
+    let order = listen_paths(&added);
+
+    // UPDATE: re-translating with a changed matcher replaces the projection in
+    // place — same route scope, new origins, no second instance.
+    let updated = translate(Some(serde_json::json!({
+        "allowOrigins": [
+            {"exact": "*.two.example"},
+            {"regex": "https://[a-z]+\\.two\\.example"}
+        ]
+    })));
+    let updated_plugins = cors_plugins(&updated);
+    assert_eq!(updated_plugins.len(), 1, "{updated_plugins:?}");
+    assert_eq!(updated_plugins[0].0.as_deref(), Some(scoped_proxy.as_str()));
+    assert_eq!(
+        updated_plugins[0].1,
+        serde_json::json!([
+            { "exact": "*.two.example" },
+            { "regex": "https://[a-z]+\\.two\\.example" }
+        ])
+    );
+    assert_eq!(
+        listen_paths(&updated),
+        order,
+        "rule ordering must survive a CORS-only update"
+    );
+
+    // DELETE: removing the corsPolicy leaves no residual route-local plugin.
+    let deleted = translate(None);
+    assert!(
+        cors_plugins(&deleted).is_empty(),
+        "a removed corsPolicy must leave no route-local plugin behind"
+    );
+    let deleted_paths = listen_paths(&deleted);
+    for path in &order {
+        assert!(
+            deleted_paths.contains(path),
+            "rule `{path:?}` must survive a CORS delete: {deleted_paths:?}"
+        );
+    }
+}
+
+/// Issue #3253: matcher shapes outside the explicit byte / complexity / count
+/// bounds stay fail-closed on BOTH projections — unprojected and uncarried,
+/// never truncated, approximated, or widened.
+#[test]
+fn virtual_service_cors_out_of_bounds_matchers_are_deferred_across_both_projections() {
+    let oversized = "a".repeat(600);
+    let too_many: Vec<serde_json::Value> = (0..65)
+        .map(|i| serde_json::json!({"exact": format!("https://app{i}.example.com")}))
+        .collect();
     for cors_policy in [
-        serde_json::json!({"allowOrigins": [{"exact": "https://example.com:443"}]}),
-        serde_json::json!({"allowOrigins": [{"exact": "HTTPS://EXAMPLE.COM"}]}),
-        serde_json::json!({"allowOrigins": [{"exact": "https://bücher.example"}]}),
-        serde_json::json!({"allowOrigin": ["https://example.com:443"]}),
+        serde_json::json!({"allowOrigins": [{"exact": &oversized}]}),
+        serde_json::json!({"allowOrigins": [{"prefix": &oversized}]}),
+        serde_json::json!({"allowOrigins": [{"regex": &oversized}]}),
+        serde_json::json!({"allowOrigins": [{"regex": "((((((((((((((((((((((((((((a))))))))))))))))))))))))))))"}]}),
+        serde_json::json!({"allowOrigins": too_many}),
+        serde_json::json!({"allowOrigins": [{"exact": "   "}]}),
     ] {
         let translated = translate_k8s_objects(
             &[k8s_object(
                 "VirtualService",
-                "vs-noncanonical-cors",
+                "vs-out-of-bounds-cors",
                 serde_json::json!({
                     "hosts": ["svc.default.svc.cluster.local"],
                     "http": [{
@@ -1208,7 +1399,7 @@ fn virtual_service_cors_noncanonical_exact_origin_is_deferred_across_both_projec
             )],
             k8s_options(),
         )
-        .expect("noncanonical exact leaves routing translated");
+        .expect("an unrepresentable corsPolicy still leaves routing translated");
         assert!(
             translated
                 .config
@@ -1216,7 +1407,7 @@ fn virtual_service_cors_noncanonical_exact_origin_is_deferred_across_both_projec
                 .as_ref()
                 .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
                 .unwrap_or(true),
-            "noncanonical Istio exact must not ride the mesh slice"
+            "an out-of-bounds Istio CORS matcher must not ride the mesh slice"
         );
         assert!(
             !translated
@@ -1224,7 +1415,7 @@ fn virtual_service_cors_noncanonical_exact_origin_is_deferred_across_both_projec
                 .plugin_configs
                 .iter()
                 .any(|plugin| plugin.plugin_name == "cors"),
-            "noncanonical Istio exact must not project a widened gateway CORS plugin"
+            "an out-of-bounds Istio CORS matcher must not project a gateway CORS plugin"
         );
     }
 }
@@ -1459,10 +1650,11 @@ fn virtual_service_cors_policy_match_level_mesh_gateway_overrides_ingress_only_v
 
 #[test]
 fn virtual_service_cors_policy_legacy_allow_origin_shares_the_exact_gate() {
-    // The deprecated `allowOrigin` string list projects into the SAME plugin
-    // plain-string form as `allowOrigins[].exact` — padded and non-origin
-    // values must defer identically (trim-widening / construction failure).
-    for invalid in [" https://app.example", "https://app.example/"] {
+    // The deprecated `allowOrigin` string list projects through the SAME
+    // literal `{exact}` matcher as `allowOrigins[].exact`, so it shares that
+    // gate exactly: only values the plugin itself refuses (empty /
+    // whitespace-only / over-budget) defer.
+    for invalid in ["", "   "] {
         let translated = translate_k8s_objects(
             &[k8s_object(
                 "VirtualService",
@@ -1537,7 +1729,45 @@ fn virtual_service_cors_policy_legacy_allow_origin_shares_the_exact_gate() {
         .iter()
         .find(|plugin| plugin.plugin_name == "cors")
         .expect("legacy wildcard projects a CORS plugin");
-    assert_eq!(plugin.config["allowed_origins"], serde_json::json!(["*"]));
+    assert_eq!(
+        plugin.config["allowed_origins"],
+        serde_json::json!([{ "exact": "*" }])
+    );
+
+    // A padded / non-origin legacy entry is a valid LITERAL matcher now: it is
+    // carried verbatim and matches only that exact string, never trimmed or
+    // canonicalized into a wider matcher.
+    for literal in [" https://app.example", "https://app.example/"] {
+        let translated = translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-legacy-literal",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/"}}],
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {"allowOrigin": [literal]}
+                    }]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("VirtualService translates");
+        let plugin = translated
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "cors")
+            .unwrap_or_else(|| panic!("legacy literal `{literal}` must project"));
+        assert_eq!(
+            plugin.config["allowed_origins"],
+            serde_json::json!([{ "exact": literal }])
+        );
+    }
 }
 
 #[test]
@@ -1667,7 +1897,7 @@ virtual_service_cors_policies:
 }
 
 #[test]
-fn virtual_service_cors_policy_exact_star_projects_but_other_wildcards_defer() {
+fn virtual_service_cors_policy_exact_star_projects_and_other_wildcards_stay_literal() {
     let translated_star = translate_k8s_objects(
         &[k8s_object(
             "VirtualService",
@@ -1705,7 +1935,7 @@ fn virtual_service_cors_policy_exact_star_projects_but_other_wildcards_defer() {
         .expect("exact star projects a gateway CORS plugin");
     assert_eq!(
         star_plugin.config["allowed_origins"],
-        serde_json::json!(["*"])
+        serde_json::json!([{ "exact": "*" }])
     );
     assert_eq!(
         star_plugin.config["unmatched_preflights"],
@@ -1764,6 +1994,10 @@ fn virtual_service_cors_policy_exact_star_projects_but_other_wildcards_defer() {
         );
     }
 
+    // Issue #3254: every OTHER wildcard-shaped exact is a LITERAL matcher. It
+    // projects (it is not deferred) and must reach the plugin as
+    // `{"exact": <source>}` — never allow-all, and never the plain-string form
+    // that would read it as native wildcard-subdomain syntax.
     for wildcard in ["*.example.com", "**"] {
         let translated = translate_k8s_objects(
             &[k8s_object(
@@ -1784,22 +2018,28 @@ fn virtual_service_cors_policy_exact_star_projects_but_other_wildcards_defer() {
             k8s_options(),
         )
         .expect("VirtualService translates");
-        assert!(
-            translated
-                .config
-                .mesh
-                .as_ref()
-                .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
-                .unwrap_or(true),
-            "non-Istio wildcard exact `{wildcard}` must not ride the mesh slice"
+        let plugin = translated
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "cors")
+            .unwrap_or_else(|| panic!("literal wildcard exact `{wildcard}` must project"));
+        assert_eq!(
+            plugin.config["allowed_origins"],
+            serde_json::json!([{ "exact": wildcard }]),
+            "wildcard-shaped exact `{wildcard}` must stay a literal matcher"
         );
-        assert!(
-            !translated
-                .config
-                .plugin_configs
-                .iter()
-                .any(|plugin| plugin.plugin_name == "cors"),
-            "non-Istio wildcard exact `{wildcard}` must not project a gateway cors plugin either"
+        let carried = translated
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh block")
+            .virtual_service_cors_policies
+            .first()
+            .unwrap_or_else(|| panic!("literal wildcard exact `{wildcard}` must ride the slice"));
+        assert_eq!(
+            cors_plugin_config_from_mesh_policy(&carried.cors),
+            plugin.config
         );
     }
 }
@@ -1843,7 +2083,7 @@ fn virtual_service_cors_policy_skips_gateway_scoped_matches() {
     assert_eq!(mesh.virtual_service_cors_policies.len(), 1);
     assert_eq!(
         cors_plugin_config_from_mesh_policy(&mesh.virtual_service_cors_policies[0].cors)["allowed_origins"],
-        serde_json::json!(["https://mesh.example"]),
+        serde_json::json!([{ "exact": "https://mesh.example" }]),
         "the mesh-bound entry's policy must be carried, not the ingress-scoped first entry's"
     );
 }
@@ -1914,9 +2154,11 @@ virtual_service_cors_policies:
 
 #[test]
 fn virtual_service_cors_policy_wildcard_padding_and_predicate_scoping() {
-    // Whitespace-padded wildcard exacts must defer like their unpadded forms:
-    // the cors plugin TRIMS plain-string origins before interpreting wildcard
-    // syntax, so " *" would otherwise become allow-all.
+    // A whitespace-padded exact is a LITERAL matcher carried byte-for-byte
+    // (issue #3254). The security property is that padding can never be
+    // trimmed into something WIDER: " *" must stay the literal string " *",
+    // never Istio's allow-all `*`, and a padded wildcard shape must never
+    // become the plugin's native wildcard-subdomain syntax.
     for padded in [" *", " *.example.com", "*.example.com "] {
         let translated = translate_k8s_objects(
             &[k8s_object(
@@ -1937,31 +2179,37 @@ fn virtual_service_cors_policy_wildcard_padding_and_predicate_scoping() {
             k8s_options(),
         )
         .expect("VirtualService translates");
-        assert!(
-            translated
-                .config
-                .mesh
-                .as_ref()
-                .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
-                .unwrap_or(true),
-            "padded wildcard exact `{padded}` must not ride the mesh slice"
+        let plugin = translated
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "cors")
+            .unwrap_or_else(|| panic!("padded literal exact `{padded}` must project"));
+        assert_eq!(
+            plugin.config["allowed_origins"],
+            serde_json::json!([{ "exact": padded }]),
+            "padded exact `{padded}` must be carried verbatim, never trimmed into a wider matcher"
         );
-        assert!(
-            !translated
-                .config
-                .plugin_configs
-                .iter()
-                .any(|plugin| plugin.plugin_name == "cors"),
-            "padded wildcard exact `{padded}` must not project a gateway cors plugin"
+        let carried = translated
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh block")
+            .virtual_service_cors_policies
+            .first()
+            .unwrap_or_else(|| panic!("padded literal exact `{padded}` must ride the slice"));
+        assert_eq!(
+            cors_plugin_config_from_mesh_policy(&carried.cors),
+            plugin.config
         );
     }
 
-    // Padded PLAIN exacts and non-origin exacts are equally non-translatable:
-    // the plugin trims plain-string origins (a padded literal, which Istio
-    // matches against no real Origin, would widen to its trimmed form) and
-    // rejects non-`scheme://host[:port]` values at construction (a
-    // translate-then-fail on the data plane instead of a deferral here).
-    for invalid in [
+    // Values that are not `scheme://host[:port]` origins are still valid
+    // LITERAL matchers: they are carried verbatim and can only ever match an
+    // Origin header equal to that exact string. The origin grammar belongs to
+    // the plugin's NATIVE plain-string form, which this path no longer uses,
+    // so nothing here can be canonicalized into a wider matcher.
+    for literal in [
         " https://app.example",
         "https://app.example ",
         "https://app.example/",
@@ -1984,30 +2232,25 @@ fn virtual_service_cors_policy_wildcard_padding_and_predicate_scoping() {
                             "host": "svc.default.svc.cluster.local",
                             "port": {"number": 8080}
                         }}],
-                        "corsPolicy": {"allowOrigins": [{"exact": invalid}]}
+                        "corsPolicy": {"allowOrigins": [{"exact": literal}]}
                     }]
                 }),
             )],
             k8s_options(),
         )
         .expect("VirtualService translates");
-        assert!(
-            translated
-                .config
-                .mesh
-                .as_ref()
-                .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
-                .unwrap_or(true),
-            "non-plugin-valid exact `{invalid}` must not ride the mesh slice"
+        let plugin = translated
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "cors")
+            .unwrap_or_else(|| panic!("literal exact `{literal}` must project"));
+        assert_eq!(
+            plugin.config["allowed_origins"],
+            serde_json::json!([{ "exact": literal }])
         );
-        assert!(
-            !translated
-                .config
-                .plugin_configs
-                .iter()
-                .any(|plugin| plugin.plugin_name == "cors"),
-            "non-plugin-valid exact `{invalid}` must not project a gateway cors plugin"
-        );
+        ferrum_edge::plugins::validate_plugin_config("cors", &plugin.config)
+            .expect("projected literal CORS config constructs");
     }
 
     // An EARLIER sidecar-applicable predicate-scoped entry SUPPRESSES the
@@ -2090,7 +2333,7 @@ fn virtual_service_cors_policy_wildcard_padding_and_predicate_scoping() {
     assert_eq!(mesh.virtual_service_cors_policies.len(), 1);
     assert_eq!(
         cors_plugin_config_from_mesh_policy(&mesh.virtual_service_cors_policies[0].cors)["allowed_origins"],
-        serde_json::json!(["https://host-wide.example"]),
+        serde_json::json!([{ "exact": "https://host-wide.example" }]),
         "a first host-wide entry's policy carries; later scoped entries are unreachable"
     );
 

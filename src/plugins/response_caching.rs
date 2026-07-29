@@ -79,6 +79,14 @@ pub const RESPONSE_CACHING_CONFIG_KEYS: &[&str] = &[
     "vary_by_headers",
 ];
 
+/// The single response field `after_proxy` writes, in the bounded form
+/// `Plugin::response_trailer_policy` hands to the plugin cache. Built once per
+/// process; never allocated per request. (`age` is written only onto a
+/// gateway-synthesized cache HIT, which carries no backend trailer section, so
+/// it is deliberately not declared here.)
+static CACHE_STATUS_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| vec!["x-cache-status".to_string()]);
+
 /// Maximum cache entries before triggering eviction of expired entries.
 const DEFAULT_MAX_ENTRIES: usize = 10_000;
 
@@ -2359,6 +2367,20 @@ impl Plugin for ResponseCaching {
         self.config.add_cache_status_header
             && self.cache_status(ctx).is_some()
             && name.eq_ignore_ascii_case("x-cache-status")
+    }
+
+    /// Config-time form of the same ownership: a backend echoing the guessable
+    /// `MISS` value hides the gateway write from observed-mutation
+    /// reconciliation, so only this declaration stops a backend `x-cache-status`
+    /// TRAILER from overwriting the gateway's cache telemetry after
+    /// `after_proxy` set it. Empty — and therefore no trailer governance — when
+    /// the header is not configured to be written at all.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        if self.config.add_cache_status_header {
+            super::ResponseTrailerPolicy::Names(&CACHE_STATUS_POLICY_NAMES)
+        } else {
+            super::ResponseTrailerPolicy::None
+        }
     }
 
     async fn on_final_response_body(

@@ -2336,8 +2336,12 @@ impl<'de> Deserialize<'de> for MeshCorsOriginMatch {
 }
 
 /// Project the typed policy onto the `cors` plugin's config schema
-/// (`src/plugins/cors.rs`): exact origins are plain strings, prefix/regex are
-/// single-key matcher objects — byte-for-byte the shape the K8s translator's
+/// (`src/plugins/cors.rs`): every matcher is a single-key object, including
+/// `exact`, which selects the plugin's LITERAL matcher (issue #3254). Emitting
+/// an exact as a plain string would select the plugin's NATIVE syntax instead,
+/// canonicalizing the value and reading a leading `*` as wildcard-subdomain
+/// syntax — silently widening a carried `*.example.com` to every subdomain.
+/// The emitted shape is byte-for-byte the shape the K8s translator's
 /// gateway-side `route_cors_plugin` emits, pinned by a unit test so the two
 /// projections can never drift. The synthesized config always carries
 /// `unmatched_preflights`, which selects Istio semantics without changing the
@@ -2347,7 +2351,7 @@ pub fn cors_plugin_config_from_mesh_policy(policy: &MeshCorsPolicy) -> serde_jso
         .allowed_origins
         .iter()
         .map(|origin| match origin {
-            MeshCorsOriginMatch::Exact(value) => serde_json::Value::String(value.clone()),
+            MeshCorsOriginMatch::Exact(value) => serde_json::json!({ "exact": value }),
             MeshCorsOriginMatch::Prefix(value) => serde_json::json!({ "prefix": value }),
             MeshCorsOriginMatch::Regex(value) => serde_json::json!({ "regex": value }),
         })
@@ -2729,9 +2733,12 @@ pub fn validate_mesh_config(
 }
 
 /// Validate VirtualService-derived CORS policies at the config boundary:
-/// unusable policies (no origins, empty host, un-compilable regex) reject the
-/// slice fail-closed instead of surfacing later as a plugin-construction
-/// failure on the data plane.
+/// unusable policies (no origins, empty host, empty/over-budget matcher, a
+/// regex that does not compile within the shared byte/complexity bounds, or too
+/// many matchers) reject the slice fail-closed with a field-specific diagnostic
+/// instead of surfacing later as a plugin-construction failure on the data
+/// plane. Every origin predicate is the SHARED `plugins::cors` admission gate —
+/// do not fork it.
 fn validate_virtual_service_cors_policies(
     policies: &[MeshVirtualServiceCorsPolicy],
     errors: &mut Vec<String>,
@@ -2749,6 +2756,11 @@ fn validate_virtual_service_cors_policies(
                 "{context}: cors.allowed_origins must declare at least one origin matcher"
             ));
         }
+        if let Err(err) =
+            crate::plugins::cors::validate_origin_matcher_count(policy.cors.allowed_origins.len())
+        {
+            errors.push(format!("{context}: {err}"));
+        }
         if policy.cors.allow_credentials == Some(true)
             && policy
                 .cors
@@ -2763,70 +2775,33 @@ fn validate_virtual_service_cors_policies(
         for (index, origin) in policy.cors.allowed_origins.iter().enumerate() {
             match origin {
                 MeshCorsOriginMatch::Exact(value) => {
-                    let trimmed = value.trim();
-                    if trimmed.is_empty() {
-                        errors.push(format!(
-                            "{context}: cors.allowed_origins[{index}] must not be empty"
-                        ));
-                    } else if trimmed.starts_with('*') && trimmed != "*" {
-                        // Istio explicitly defines exact `*` as allow-all.
-                        // Other wildcard-shaped exacts (for example
-                        // `*.example.com`) remain literal StringMatch values
-                        // upstream and must not be reinterpreted as Ferrum's
-                        // native wildcard-subdomain syntax.
-                        errors.push(format!(
-                            "{context}: cors.allowed_origins[{index}] exact matcher must not use wildcard syntax other than Istio's exact `*` allow-all value"
-                        ));
-                    } else if trimmed.len() != value.len() {
-                        // The cors plugin TRIMS plain-string origins, so a
-                        // whitespace-padded exact would silently widen from
-                        // Istio's literal semantics (the padded value matches
-                        // no real Origin) to the trimmed origin.
-                        errors.push(format!(
-                            "{context}: cors.allowed_origins[{index}] exact matcher must not have leading/trailing whitespace — Istio exact semantics match the literal string only"
-                        ));
-                    } else if trimmed != "*" {
-                        match crate::plugins::cors::canonicalize_exact_origin(value) {
-                            Err(err) => {
-                                // Synthesis projects exacts into the cors
-                                // plugin's plain `allowed_origins` form, whose
-                                // construction rejects non-origin values.
-                                errors.push(format!(
-                                    "{context}: cors.allowed_origins[{index}] exact matcher is not a valid origin: {err}"
-                                ));
-                            }
-                            Ok(canonical) if canonical != value.as_str() => {
-                                // Istio exacts are literal, but the native
-                                // plugin canonicalizes this form. Reject the
-                                // carrier value instead of authorizing the
-                                // canonical browser Origin that the source did
-                                // not literally match.
-                                errors.push(format!(
-                                    "{context}: cors.allowed_origins[{index}] exact matcher must use its canonical serialization `{canonical}` to preserve literal Istio matching"
-                                ));
-                            }
-                            Ok(_) => {}
-                        }
+                    // Synthesis projects exacts onto the cors plugin's LITERAL
+                    // `{"exact": ...}` matcher (issue #3254), so a
+                    // wildcard-shaped (`*.example.com`) or non-canonical
+                    // (`https://Example.com:443`) value is carried faithfully
+                    // rather than rejected or reinterpreted as native
+                    // wildcard-subdomain syntax. Only values the plugin itself
+                    // refuses are errors here — Istio's allow-all `*` is
+                    // exempt because the plugin maps that one value to its
+                    // wildcard policy.
+                    if value != "*"
+                        && let Err(err) = crate::plugins::cors::validate_literal_exact_origin(value)
+                    {
+                        errors.push(format!("{context}: cors.allowed_origins[{index}] {err}"));
                     }
                 }
                 MeshCorsOriginMatch::Prefix(value) => {
-                    if value.trim().is_empty() {
-                        errors.push(format!(
-                            "{context}: cors.allowed_origins[{index}] must not be empty"
-                        ));
+                    if let Err(err) = crate::plugins::cors::validate_origin_prefix(value) {
+                        errors.push(format!("{context}: cors.allowed_origins[{index}] {err}"));
                     }
                 }
                 MeshCorsOriginMatch::Regex(pattern) => {
-                    if pattern.trim().is_empty() {
-                        errors.push(format!(
-                            "{context}: cors.allowed_origins[{index}] must not be empty"
-                        ));
-                    } else if let Err(err) =
-                        regex::Regex::new(&crate::config::types::anchor_regex_pattern(pattern))
-                    {
-                        errors.push(format!(
-                            "{context}: cors.allowed_origins[{index}] regex does not compile: {err}"
-                        ));
+                    // Compile under the plugin's explicit byte/complexity
+                    // bounds (issue #3253) — the shared gate, not a fork, so a
+                    // pattern that passes here can never fail plugin
+                    // construction on the data plane.
+                    if let Err(err) = crate::plugins::cors::compile_origin_regex(pattern) {
+                        errors.push(format!("{context}: cors.allowed_origins[{index}] {err}"));
                     }
                 }
             }

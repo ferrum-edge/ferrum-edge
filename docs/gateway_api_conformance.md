@@ -78,10 +78,214 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | Selectorless/headless Services | Yes | With pod discovery enabled, backends resolve ready EndpointSlice addresses directly; a named Service `targetPort` resolves against EndpointSlice port names, but the `backendRef.port` itself is numeric-only — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Backend failure | Yes | Traffic to unavailable generated backends must return an error response rather than falling through |
 | Route update and deletion | Yes | Reconciliation regenerates live proxy/upstream/plugin config; deletion removes the route from live config |
-| `GRPCRoute` | Not claimed by the `GATEWAY-HTTP` gate | Watched and partially translated through HTTP/gRPC routing, but not advertised as a passing upstream `GATEWAY-GRPC` profile until request traffic conformance is added |
+| `GRPCRoute` | Not claimed by the `GATEWAY-HTTP` gate | Watched and translated — see [GRPCRoute predicate translation](#grpcroute-predicate-translation) — but not advertised as a passing upstream `GATEWAY-GRPC` profile until request traffic conformance is added |
 | `TCPRoute` | Yes, via Ferrum black-box live checks (not upstream `GATEWAY-TCP`) | Lab installs the pinned `v1.5.1` experimental-channel CRD bundle (one coherent channel that includes `TCPRoute`). Live kind traffic proves parent/listener attachment, same-namespace and ReferenceGrant cross-namespace backend resolution, tagged TCP echo forwarding, empty/missing/unpermitted backend fail-closed behavior, parent status (`Accepted`/`ResolvedRefs`/`Programmed`), live backendRef updates, and deletion withdrawal. Upstream profile/features remain `GATEWAY-HTTP` / `Gateway,ReferenceGrant,HTTPRoute`; `GATEWAY-TCP` is **not** claimed on this pin (the profile/tests land in later Gateway API releases). |
 | `TLSRoute` | Not claimed | Watched/translated for L4 experiments, but not advertised as a supported Gateway API conformance profile |
 | `UDPRoute`, `BackendTLSPolicy`, `ListenerSet`, `BackendLBPolicy` | No | Not claimed as effective Gateway API conformance features |
+
+## GRPCRoute predicate translation
+
+`GRPCRoute.spec.rules[].matches[]` is translated on its own terms; a gRPC
+predicate is never rewritten into an invented HTTP catch-all path, and it is
+never dropped for being pathless.
+
+| `matches[]` shape | Materialized as |
+|---|---|
+| `method.type: Exact` with `service` **and** `method` | Exact listen path `=/{service}/{method}` — the method predicate itself is fully represented by that listen path; the mandatory gRPC `content-type` gate still runs at request time |
+| `method.type: Exact` with `service` only | Listen path prefix `/{service}/` — a gRPC `:path` always carries a trailing method segment, so this selects exactly that service |
+| `service` written in fully-qualified `.pkg.Svc` form | The optional leading `.` is normalized away — a gRPC `:path` never carries it, so `.pkg.Svc` and `pkg.Svc` denote the same service and collapse onto the same route |
+| `method.type: Exact` with `method` only | `/` listener plus a `mesh_route_dispatch` URI regex `/[^/]+/{method}` (the method literal is regex-escaped) |
+| `method.type: RegularExpression` | **Not supported** — dropped fail closed (see below) |
+| Header-only match (no `method`) | `/` listener plus the "any gRPC call" URI regex `/[^/]+/[^/]+` and the exact header predicates |
+| Rule with `matches` omitted or empty | `/` listener plus the "any gRPC call" URI regex — the Gateway API defines this as every **gRPC** call on the route's hostnames, not every HTTP request |
+
+`method.type: RegularExpression` is an implementation-specific Gateway API
+extension that Ferrum does not implement. A gRPC `:path` is
+`/{service}/{method}`, and an operator-supplied pattern can consume the `/`
+delimiter through `.*`, a character class, or an encoded escape (`\x2F`,
+`\u{2F}`) — wrapping the operand in a non-capturing group does not constrain it
+to one path segment. Rather than emit a matcher that could silently widen a
+route across service and method boundaries, the predicate is refused and the
+match is dropped with a field-specific warning. Use `Exact` `service` /
+`method` matches (including the service-only and method-only forms) instead.
+
+**Every** emitted GRPCRoute match — including one whose predicate is carried
+entirely by an exact `=/{service}/{method}` listen path or a `/{service}/`
+prefix — additionally carries a `content-type` predicate. That gate is the
+regex transcription of Ferrum's canonical **native**-gRPC content-type contract
+(`proxy::backend_dispatch::is_native_grpc_content_type`): the
+`application/grpc` essence followed by end-of-value, a `+` suffix, a `;`
+parameter list, or optional whitespace leading to either, compared
+case-insensitively. A GRPCRoute therefore only ever selects gRPC calls: neither
+a pathless rule nor an exact gRPC path can capture ordinary HTTP traffic
+sharing the same hostname and path.
+
+`application/grpc-web` and `application/grpc-web-text` are **not** native gRPC
+and are refused by the gate, exactly as the proxy's own dispatcher refuses
+them — as are lookalikes such as `application/grpcfoo` and
+`application/grpc-website`. gRPC-Web is served by configuring the trusted
+`grpc_web` plugin, which verifies the request and rewrites it to native
+`application/grpc` before backend dispatch; the route gate must not
+independently bless the raw wire form.
+
+A route-authored `content-type` header match replaces that gate (it is the more
+specific operator intent), but it is validated against the same native contract,
+so an operator header can only narrow the protocol boundary and never widen it;
+a `content-type` predicate such as `text/plain`, `application/grpc-web`, or
+`application/grpcfoo` drops the match fail closed. The generated
+`mesh_route_dispatch` instance sets `reject_unmatched: true` unless another
+**GRPCRoute** on the same listener contributes an unconditional match for the
+same `(hostname, listen path)`.
+
+Rule and match ordering is preserved: gRPC predicates sharing a listen path
+collapse into one ordered dispatch-rule list (method-bearing before
+header-count before route `creationTimestamp`, then namespace/name, rule
+index, and match index), so fall-through between a specific rule and a later
+broader rule behaves as written. Two GRPCRoutes only conflict when they claim
+the *same* predicate on the same parent, hostname, and listen path; distinct
+methods on the shared `/` listener are distinct routes, not a collision.
+
+### HTTPRoute and GRPCRoute never merge
+
+Gateway API v1.5.1 `GRPCRouteRule` states that "Merging MUST not be done between
+GRPCRoutes and HTTPRoutes", and `GRPCRouteSpec` requires that when an HTTPRoute
+and a GRPCRoute attach to the same listener with **any** intersecting hostname,
+implementations accept exactly one of them.
+
+Ferrum resolves that as a **whole-route** decision, before either object
+materializes anything:
+
+- The two routes are compared by oldest `metadata.creationTimestamp`, then
+  `{namespace}/{name}` — the same deterministic tiebreaker as the same-kind
+  path — and finally by `kind`, independent of the order objects are observed
+  in. The `kind` tiebreak matters only here: `{namespace}/{name}` is unique
+  within one kind, but an HTTPRoute and a GRPCRoute may share a name, and
+  `metadata.creationTimestamp` has second granularity, so one `kubectl apply`
+  of both ties on every Gateway API ordering field.
+- Rule paths and match predicates are **not** consulted. An HTTPRoute catch-all
+  and a GRPCRoute method predicate on the same host are a conflict even though
+  their predicates are disjoint.
+- The losing Route produces no proxy, no upstream, no plugin, and no
+  materialized-parent record for the rejected `(parentRef, hostname)` claim, so
+  it cannot route traffic. It is reported `Accepted=False` with
+  `reason: Conflicted` and a message naming the winner, and the translator emits
+  a matching warning.
+- Resolution is per listener and per hostname intersection. The same GRPCRoute
+  can still win on a hostname the HTTPRoute does not claim, or on a *separate*
+  parentRef claim (for example a second `sectionName`-pinned reference) that
+  reaches only a listener it wins. What it cannot do is keep one shared claim on
+  a subset of the listeners that claim reaches — see the wildcard rule below.
+- Rejection does not cascade: a route is only rejected when it overlaps an
+  **accepted** route of the other kind, so a second HTTPRoute is unaffected by a
+  GRPCRoute that already lost.
+
+"The same listener" means the **resolved** listener, not the literal
+`parentRefs[]` entry. A parentRef is a selector, so the two are not
+interchangeable:
+
+- A wildcard reference (no `sectionName`, no `port`) and a reference pinning that
+  listener by `sectionName` or `port` attach to the same listener and therefore
+  contend, even though their selector shapes differ.
+- Two wildcard references on one Gateway that `allowedRoutes.kinds` sends to
+  *different* listeners never share one, so neither is rejected.
+- A wildcard reference that reaches several listeners is arbitrated on each of
+  them independently, but it emits one shared conflict claim, which cannot
+  express a partial withdrawal — and Ferrum's route representation is
+  port-agnostic (see the known limitation below), so a claim kept for the
+  listener it won would still route on the listener it lost. Such a claim is
+  therefore **conservatively withdrawn whole on a loss on any listener it
+  reaches**, and the reported winner is the accepted opposite-kind Route on the
+  lowest-ordered listener it lost on. Availability on the non-conflicting
+  listener does not take priority over not serving cross-kind traffic on the
+  conflicting one.
+
+Route status is still reported against the parentRef the operator wrote —
+listener resolution is an internal arbitration detail and never rewrites the
+`parentRef` echoed in `status.parents[]`.
+
+Same-kind behavior is unchanged: two HTTPRoutes (or two GRPCRoutes) sharing a
+`(hostname, listen path)` still collapse into one ordered dispatch-rule list,
+and only claim-for-claim collisions are resolved as conflicts.
+
+The prohibition is enforced where it applies — coexistence on one resolved
+listener — and not as a blanket ban on the route-proxy collapse. Two Routes that
+Gateway API requires be accepted *together* because they resolve to different
+listeners share Ferrum's single port-agnostic `(hosts, listen path)` slot, so
+they collapse into one ordered dispatch-rule list even across kinds. That is a
+representation detail, not spec-forbidden rule merging: the two kinds'
+predicates stay intact and disjoint inside that list, because every emitted
+GRPCRoute rule carries the native-gRPC `content-type` gate and can therefore
+only select gRPC calls, while everything else falls through to the HTTPRoute's
+own rules and default backend. The alternative — one proxy each — is not a
+choice the route table can express; it fails
+`validate_unique_listen_paths` and aborts the whole config reload. This matters
+in the ordinary "HTTP listener plus gRPC listener on one Gateway" topology,
+where a pathless GRPCRoute predicate always lands on `/` and so does an
+HTTPRoute `PathPrefix: /` rule.
+
+**Known limitation.** Ferrum materializes Gateway API HTTP-family routes as
+port-agnostic `(hosts, listen path)` proxies, so listeners of one Gateway are
+not distinguishable in the route table. Two consequences follow:
+
+- Two routes that legitimately survive on different listeners but claim the same
+  `(hostname, listen path)` share one route-table slot rather than being served
+  per listener port: their rules collapse into one ordered dispatch list, and a
+  request that matches the other listener's route is answered on both listener
+  ports. Give such routes distinct listen paths, distinct hostnames, or distinct
+  Gateways when per-listener isolation is required.
+- A single `(parentRef, hostname)` claim spanning several listeners cannot be
+  restricted to the listeners it won, so a cross-kind loss on any one of them
+  withdraws the claim from all of them (above). A GRPCRoute that must keep
+  serving a listener an HTTPRoute also claims elsewhere needs a parentRef that
+  reaches only that listener (`sectionName` or `port`), a non-intersecting
+  hostname, or a separate Gateway.
+
+### Fail-closed match shapes
+
+Shapes Ferrum cannot represent exactly are **dropped fail closed** with a
+field-specific translator warning (`GRPCRoute {ns}/{name}
+rules[i].matches[j] dropped fail-closed: …`) rather than widened. The
+`Exact` operand grammars are exactly the ones the v1.5.1 CRD enforces, so a
+predicate the API server would have admitted is never rejected and a
+hand-authored one that it would have rejected never reaches routing state:
+
+- `method.type: RegularExpression`, and any `method.type` other than `Exact`.
+- A `method` block with neither `service` nor `method`.
+- An `Exact` `service` that is empty, longer than 1024 bytes (the CRD's
+  `MaxLength=1024`; both grammars are ASCII-only, so bytes and characters
+  coincide for any operand the API server could have admitted), or does not
+  match `^\.?[a-z_][a-z_0-9]*(\.[a-z_][a-z_0-9]*)*$` (applied
+  case-insensitively) — so a leading digit or hyphen, an empty dotted segment,
+  a path separator, a percent escape, or whitespace is refused.
+- An `Exact` `method` that is empty, longer than 1024 bytes, or does not
+  match `^[A-Za-z_][A-Za-z_0-9]*$` — a single protobuf identifier, so a dot or
+  hyphen is refused here even though `service` allows the dot.
+- A `content-type` header match whose value is not a native gRPC media type — it
+  would replace the protocol gate and widen the route onto non-gRPC traffic.
+- `headers[].type: RegularExpression`, or a header match missing `name` or
+  `value` — only `Exact` header matches are translated, matching the HTTPRoute
+  translator.
+- An **explicit** `method: null` or `headers: null`. An explicit null is
+  malformed input, not an omission: reading it as absent would widen `method`
+  into the any-gRPC-call predicate and `headers` into the headerless match.
+  *Omitting* either field keeps its documented meaning — an omitted `method`
+  matches any gRPC call on the route's hostnames, and omitted `headers` adds no
+  header predicate.
+- A **present but non-string** `method.service` or `method.method` (including an
+  explicit null). Reading it as an omission would silently degrade an exact
+  `=/{service}/{method}` listener into the far broader method-only or
+  service-only shape.
+- A match entry carrying **both** `method` and Ferrum's hand-authored
+  `matches[].path` extension. `path` is not a GRPCRoute CRD field (the API
+  server prunes it), and Ferrum's plan is a single listen path *or* a single URI
+  predicate, so honoring either half alone would discard the other and widen the
+  match. Use one or the other.
+
+Refusal warnings never echo the operator-supplied operand or header value back,
+since both are unbounded, attacker-influenceable input.
+
+A rule whose every match is dropped materializes no route, so its parent status
+is not reported as programmed.
 
 ## backendRef port and zero-weight semantics
 

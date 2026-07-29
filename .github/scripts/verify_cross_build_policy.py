@@ -1429,6 +1429,451 @@ PUBLISH_CONTROL_CONTRACTS = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Trusted-base relevance contract for the required live-datapath gates
+# ---------------------------------------------------------------------------
+# `mesh-e2e-sidecar-live.yml` and `multicluster-federation-live.yml` publish
+# REQUIRED status checks that may skip their expensive live job when a pull
+# request touches nothing relevant. That skip is a security boundary: if the
+# relevance verdict is computed by a script the PULL REQUEST supplies, the pull
+# request can widen its own suite patterns, declare itself irrelevant, skip the
+# live job, and still turn the required gate green.
+#
+# The block below is therefore the ONLY accepted shape for that decision, and
+# it is frozen byte-for-byte so a later pull request cannot weaken, redirect,
+# or replace it with an equivalent-looking one. Its load-bearing properties:
+#
+#   * The relevance script is read from the base-branch tip of the BASE
+#     repository, never from the pull-request checkout. This holds for fork
+#     pull requests, because `github.base_ref` always names a branch in the
+#     base repository and `origin` is the base repository.
+#   * That tip is pinned once to a full 40-hex commit id, and every later read
+#     goes through that id and then through the blob's own object id, so a push
+#     to the base branch between validation and execution cannot swap the file.
+#   * `github.base_ref` is untrusted text and is charset- and shape-validated
+#     before it can reach a refspec, so no option, pathspec, or revision-syntax
+#     metacharacter can be smuggled into a git invocation.
+#   * The tree entry must be a regular blob (100644/100755) at the pinned path:
+#     a symlink (120000), gitlink (160000), tree, missing entry, multi-entry
+#     match, or oversized blob fails closed.
+#   * Every failure path exits non-zero, so a trusted-base acquisition or
+#     execution failure fails the gate instead of defaulting to "irrelevant",
+#     and the emitted verdict must literally be `true` or `false`.
+#   * The filter runs under `python3 -I`, so nothing the pull request committed
+#     can be imported into the trusted interpreter.
+#
+# The template is substituted only at three sentinels — display name, temp-file
+# slug, and suite selector — so every governed workflow runs identical logic.
+LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
+    name: @@DISPLAY@@
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+
+      # Relevance decides whether a REQUIRED live gate runs at all, so it must
+      # never be computed by code the pull request supplies: a PR that widens
+      # its own suite patterns could declare itself irrelevant, skip the live
+      # job, and still turn the required check green.
+      #
+      # Everything below reads ONE immutable trusted commit. The base-branch
+      # tip is fetched from the base repository, pinned once to a full object
+      # id, checked to hold the filter as a regular blob, and then read BY
+      # OBJECT ID rather than by path. A fork head, a rewritten head, or a push
+      # to the base branch mid-run therefore cannot swap the script between
+      # validation and execution, and every failure exits non-zero so the gate
+      # fails closed instead of quietly declaring itself irrelevant.
+      #
+      # This block is frozen by .github/scripts/verify_cross_build_policy.py
+      # (see live_suite_relevance_errors); it is byte-identical across every
+      # live-suite workflow apart from the suite, slug, and display name.
+      - name: Check for @@SLUG@@ changes
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          filter_path=.github/scripts/live_suite_path_filter.py
+          changed_files="$RUNNER_TEMP/@@SLUG@@-changed-files.txt"
+          trusted_filter="$RUNNER_TEMP/@@SLUG@@-trusted-filter.py"
+          rm -f -- "$changed_files" "$trusted_filter"
+          : > "$changed_files"
+
+          filter_args=(--suite @@SUITE@@ --changed-files "$changed_files")
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # `github.base_ref` names a branch in the BASE repository, so a fork
+            # cannot control its contents -- but it is still untrusted text.
+            # Reject anything outside a conservative branch charset before it
+            # reaches a refspec so no option, pathspec, or revision-syntax
+            # metacharacter can be smuggled into a git invocation.
+            if ! printf '%s' "$BASE_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$'; then
+              echo "::error::refusing to resolve an unsafe base ref" >&2
+              exit 1
+            fi
+            case "$BASE_REF" in
+              *..*|*//*|*/|*.lock|*/.*)
+                echo "::error::refusing to resolve an unsafe base ref" >&2
+                exit 1
+                ;;
+            esac
+            fetched=false
+            for attempt in 1 2 3; do
+              if git fetch --no-tags --no-recurse-submodules origin \
+                "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base"; then
+                fetched=true
+                break
+              fi
+              echo "git fetch of ${BASE_REF} failed (attempt ${attempt}/3); retrying" >&2
+              sleep $(( attempt * 10 ))
+            done
+            if [ "$fetched" != true ]; then
+              echo "::error::git fetch of ${BASE_REF} failed after 3 attempts" >&2
+              exit 1
+            fi
+            # Pin the moving tip exactly once; nothing below re-resolves a ref.
+            trusted_sha="$(git rev-parse --verify --quiet refs/ferrum/trusted-base^{commit} || true)"
+          else
+            # A push to the default branch and a manual dispatch already run
+            # trusted code, so the checked-out commit IS the trusted base.
+            trusted_sha="$(git rev-parse --verify --quiet 'HEAD^{commit}' || true)"
+            filter_args+=(--force-run)
+          fi
+
+          if ! printf '%s' "$trusted_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::trusted base did not resolve to a full commit id" >&2
+            exit 1
+          fi
+
+          # Reject anything that is not a regular blob at that exact commit: a
+          # symlink (mode 120000) would make a content read emit its target
+          # path, a gitlink (160000) or tree (040000) carries no script at all,
+          # and a missing entry must fail closed rather than fall back to the
+          # pull request's own copy.
+          entry="$(git ls-tree --full-tree "$trusted_sha" -- "$filter_path")"
+          if [ "$(printf '%s\n' "$entry" | grep -c . || true)" != "1" ]; then
+            echo "::error::${filter_path} is not a single tree entry at ${trusted_sha}" >&2
+            exit 1
+          fi
+          entry_mode="$(printf '%s\n' "$entry" | awk '{print $1}')"
+          entry_type="$(printf '%s\n' "$entry" | awk '{print $2}')"
+          entry_object="$(printf '%s\n' "$entry" | awk '{print $3}')"
+          entry_path="$(printf '%s\n' "$entry" | awk -F'\t' '{print $2}')"
+          if [ "$entry_type" != "blob" ] || [ "$entry_path" != "$filter_path" ]; then
+            echo "::error::${filter_path} is not a blob at ${trusted_sha}" >&2
+            exit 1
+          fi
+          case "$entry_mode" in
+            100644|100755) ;;
+            *)
+              echo "::error::${filter_path} has non-regular mode ${entry_mode}" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s' "$entry_object" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::${filter_path} did not resolve to an object id" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -s "$entry_object")" -gt 262144 ]; then
+            echo "::error::${filter_path} exceeds the 256 KiB trusted-filter ceiling" >&2
+            exit 1
+          fi
+          git cat-file blob "$entry_object" > "$trusted_filter"
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git diff --name-only --no-renames "${trusted_sha}...HEAD" \
+              | sort > "$changed_files"
+          fi
+
+          # Isolated interpreter: no user site directory, no PYTHON* overrides,
+          # and no implicit path entry, so nothing the pull request committed
+          # can be imported by the trusted filter.
+          python3 -I "$trusted_filter" --self-test
+          plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
+          relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
+          case "$relevant" in
+            true|false) ;;
+            *)
+              echo "::error::trusted relevance filter produced no usable verdict" >&2
+              exit 1
+              ;;
+          esac
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "Relevance decided by trusted base ${trusted_sha}." >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$plan" | sed -n '/^## /,$p' >> "$GITHUB_STEP_SUMMARY"
+"""
+
+# workflow file -> (relevance job, live job, display name, temp slug, suite).
+LIVE_SUITE_RELEVANCE_CONTRACTS = {
+    "mesh-e2e-sidecar-live.yml": (
+        "changes",
+        "mesh-e2e-sidecar-live",
+        "Mesh e2e sidecar trigger",
+        "mesh-e2e-sidecar",
+        "mesh-e2e-sidecar",
+    ),
+    "multicluster-federation-live.yml": (
+        "changes",
+        "multicluster-federation-live",
+        "Multicluster federation trigger",
+        "multicluster-federation",
+        "mesh-federation",
+    ),
+}
+
+# Freezing the relevance job alone is not sufficient. A pull request that left
+# the frozen block untouched but rewrote the live job's `needs`/`if` would skip
+# the expensive job just as effectively, so the binding from the trusted
+# relevance output to the live job is part of the same contract.
+LIVE_SUITE_JOB_BINDING = {
+    "needs": "    needs: changes\n",
+    "if": "    if: needs.changes.outputs.relevant == 'true'\n",
+}
+
+# ---------------------------------------------------------------------------
+# Admitted fuzz/property lane (issue #2461)
+# ---------------------------------------------------------------------------
+# The trusted policy rejects any new Cross-readable executable surface in
+# `ci.yml` outside the protected ARM64 job, which is why the fuzz lane could
+# not be wired in. Rather than relaxing that rule — which would reopen
+# arbitrary pull-request-authored executable workflow injection — exactly one
+# additional `ci.yml` job is admitted, and only when its text is byte-identical
+# to the contract below. Its surfaces (and only its surfaces) are then withheld
+# from the `ci.yml` surface comparison.
+#
+# Consequences of freezing the whole job rather than a predicate about it:
+#   * every command, action pin, toolchain pin, tool version, target list, and
+#     libFuzzer bound is part of the contract;
+#   * the command surface cannot be redirected at a repository-supplied
+#     automation script; the explicit purpose of the read-only job is still to
+#     compile and execute pull-request-authored Rust tests and fuzz targets;
+#   * a repository that has not adopted the job may omit it, but once the
+#     trusted base carries it a pull request cannot remove it.
+CI_FUZZ_SMOKE_JOB_NAME = "fuzz-smoke"
+CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
+    # Byte-frozen by the trusted Cross build policy
+    # (.github/scripts/verify_cross_build_policy.py, CI_FUZZ_SMOKE_JOB). Issue
+    # #2461 requires a short deterministic property/fuzz smoke in ordinary CI;
+    # this is its entire permitted shape. Every command, action pin, toolchain
+    # pin, tool version, target name, and libFuzzer bound below is part of the
+    # contract, so a pull request cannot widen the budget, change the target
+    # list, add a step, or redirect this job at a repository-supplied script.
+    name: Fuzz Smoke
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-smoke
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run deterministic property smoke tests
+        working-directory: fuzz
+        run: cargo test --locked
+
+      - name: Run bounded libFuzzer smoke budget
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+
+          for fuzz_target in traceparent config_decode proxy_protocol mesh_udp_frame k8s_crd plugin_config; do
+            echo "Fuzz smoke target: ${fuzz_target}"
+            cargo fuzz run "$fuzz_target" -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=4096 \
+              -timeout=2 \
+              -rss_limit_mb=512
+          done
+"""
+
+# The scheduled sanitizer lane is a whole-file contract rather than a job
+# contract: the file's triggers, permissions, and concurrency are as
+# security-relevant as its steps, and freezing the file is the only comparison
+# that cannot be sidestepped by moving a command between them.
+FUZZ_WORKFLOW_FILENAME = "fuzz.yml"
+FUZZ_WORKFLOW = r"""name: Fuzz
+
+# Scheduled/manual sanitizer-backed fuzz lane for issue #2461. This file is
+# byte-frozen by the trusted Cross build policy
+# (.github/scripts/verify_cross_build_policy.py, FUZZ_WORKFLOW): the filename,
+# triggers, permissions, action pins, toolchain and cargo-fuzz versions, target
+# matrix, libFuzzer budgets, and artifact bounds below are the whole contract.
+# A repository that has not adopted this file may omit it. Once the trusted
+# base carries it, a pull request may neither remove it nor change one byte.
+#
+# Deliberate constraints:
+#   * read-only `contents: read` permissions at both workflow and job level,
+#     and no reference to any repository secret anywhere;
+#   * no `pull_request` or `push` trigger, so an untrusted head can never
+#     schedule this lane;
+#   * `workflow_dispatch` takes NO inputs, so there is no caller-chosen target,
+#     tool, command, or time budget;
+#   * the matrix target reaches the shell only through an environment variable
+#     that is re-checked against the literal target list, so no untrusted text
+#     is interpolated into a command;
+#   * every libFuzzer run is bounded in wall time, input length, per-input
+#     timeout, and resident set size;
+#   * crash artifacts are rejected if any path is a symlink or other
+#     non-regular object, then size- and count-bounded BEFORE upload, uploaded
+#     from one fixed path, and expired quickly;
+#   * no Cross toolchain, aarch64 target, unpinned tool install, or release
+#     publication path is reachable from this file.
+
+on:
+  schedule:
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz-sanitized:
+    name: Fuzz sanitizer lane
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        fuzz_target:
+          - traceparent
+          - config_decode
+          - proxy_protocol
+          - mesh_udp_frame
+          - k8s_crd
+          - plugin_config
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-sanitized
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run sanitizer-backed fuzz target
+        working-directory: fuzz
+        env:
+          FUZZ_TARGET: ${{ matrix.fuzz_target }}
+          ASAN_OPTIONS: detect_odr_violation=0:allocator_may_return_null=1
+        run: |
+          set -euo pipefail
+
+          # The matrix is frozen above, so this can only fire if the workflow
+          # itself was tampered with; it costs nothing and keeps the command
+          # line free of any value this shell has not literally approved.
+          case "$FUZZ_TARGET" in
+            traceparent|config_decode|proxy_protocol|mesh_udp_frame|k8s_crd|plugin_config) ;;
+            *)
+              echo "::error::unknown fuzz target" >&2
+              exit 1
+              ;;
+          esac
+
+          mkdir -p "artifacts/$FUZZ_TARGET"
+          cargo fuzz run -s address "$FUZZ_TARGET" -- \
+            -max_total_time=300 \
+            -max_len=65536 \
+            -timeout=5 \
+            -rss_limit_mb=2048 \
+            -artifact_prefix="artifacts/$FUZZ_TARGET/"
+
+      # Bound the crash corpus BEFORE it can be published: an unbounded
+      # artifact path is an exfiltration surface, and a crash input large
+      # enough to carry unrelated process state must be triaged locally.
+      - name: Bound crash artifacts
+        id: bound
+        if: failure()
+        working-directory: fuzz
+        env:
+          FUZZ_TARGET: ${{ matrix.fuzz_target }}
+        run: |
+          set -euo pipefail
+
+          directory="artifacts/$FUZZ_TARGET"
+          if [ ! -d "$directory" ]; then
+            exit 0
+          fi
+          # upload-artifact follows symbolic links by default. Reject the root
+          # path and every descendant unless it is a directory or regular file,
+          # so the fixed upload path cannot escape into unrelated runner state.
+          if [ -L "$directory" ]; then
+            echo "::error::the crash artifact directory must not be a symbolic link" >&2
+            exit 1
+          fi
+          if find "$directory" \( -type l -o \( ! -type d ! -type f \) \) -print -quit | grep -q .; then
+            echo "::error::crash artifacts must contain only directories and regular files" >&2
+            exit 1
+          fi
+          if find "$directory" -type f -size +64k -print -quit | grep -q .; then
+            echo "::error::a crash artifact exceeds 64 KiB; triage and redact it locally" >&2
+            exit 1
+          fi
+          if [ "$(find "$directory" -type f | wc -l | tr -d ' ')" -gt 16 ]; then
+            echo "::error::more than 16 crash artifacts; triage locally before publishing" >&2
+            exit 1
+          fi
+
+      # Publication is gated on the bounding step having SUCCEEDED, not merely
+      # on job failure: a skipped or failed bound must never publish.
+      - name: Upload bounded crash artifacts
+        if: always() && steps.bound.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fuzz-crash-${{ matrix.fuzz_target }}
+          path: fuzz/artifacts/${{ matrix.fuzz_target }}
+          if-no-files-found: ignore
+          retention-days: 7
+"""
+
+# Only the repository-root Cargo configuration is validated by this policy
+# (`validate_cargo_tool_configuration`). A nested `.cargo/config.toml` would be
+# an unreviewed place to set a target linker, runner, or rustflags for any
+# cargo invocation started from that directory — including the admitted fuzz
+# lane, which runs with `working-directory: fuzz`.
+NESTED_CARGO_CONFIG_NAMES = frozenset({"config", "config.toml"})
+
 ATTACK_PAYLOADS = {
     "whitespace": "arm64 amd64",
     "leading option": "--help",
@@ -8485,15 +8930,231 @@ def flow_normalized_workflow_surfaces(
     ]
 
 
+def live_suite_relevance_job(display: str, slug: str, suite: str) -> str:
+    """Render the frozen trusted-base relevance job for one live suite.
+
+    Substitution is by sentinel rather than by `str.format`, because the block
+    is GitHub Actions YAML and is full of `${{ ... }}` expressions that a format
+    string would misread as replacement fields.
+    """
+
+    return (
+        LIVE_SUITE_RELEVANCE_JOB_TEMPLATE.replace("@@DISPLAY@@", display)
+        .replace("@@SLUG@@", slug)
+        .replace("@@SUITE@@", suite)
+    )
+
+
+def live_suite_relevance_errors(
+    workflows: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Hold every required live gate to the trusted-base relevance contract.
+
+    This is an ABSOLUTE check in both exact and pull-request mode, not a
+    comparison against the trusted base. A comparison would accept any shape
+    the base already carried, which is exactly the property a bootstrap of this
+    contract has to remove: the accepted shape is the one written here and
+    nothing else. Deleting a governed workflow is rejected too, because a
+    required check that never runs is indistinguishable from a passing one.
+    """
+
+    errors: list[str] = []
+    for name, (
+        relevance_job,
+        live_job,
+        display,
+        slug,
+        suite,
+    ) in sorted(LIVE_SUITE_RELEVANCE_CONTRACTS.items()):
+        contents = workflows.get(name)
+        if contents is None:
+            errors.append(
+                f"{source} is missing {name}; its required live gate must keep "
+                "deciding relevance from the trusted base"
+            )
+            continue
+        located = f"{source}/{name}"
+        block, failures = extract_job_block(
+            contents,
+            located,
+            relevance_job,
+            required=True,
+        )
+        errors.extend(failures)
+        if not failures:
+            assert block is not None
+            if block != live_suite_relevance_job(display, slug, suite):
+                errors.append(
+                    f"{located} job {relevance_job!r} must be exactly the trusted-base "
+                    "relevance contract; a required live gate may not decide its own "
+                    "relevance with pull-request-supplied code"
+                )
+        for field, expected_field in sorted(LIVE_SUITE_JOB_BINDING.items()):
+            actual, field_failures = extract_job_field_block(
+                contents,
+                located,
+                live_job,
+                field,
+                required=True,
+            )
+            errors.extend(field_failures)
+            if field_failures:
+                continue
+            if actual != expected_field:
+                errors.append(
+                    f"{located} job {live_job!r} must keep {field!r} bound to the "
+                    "trusted relevance output; rewriting it skips the live job just "
+                    "as effectively as tampering with the relevance decision"
+                )
+    return errors
+
+
+def admitted_fuzz_smoke_errors(contents: str, source: str) -> list[str]:
+    """Reject any `fuzz-smoke` job that is not the byte-frozen contract.
+
+    Absence is allowed: the fuzz lane is opt-in, and a repository that has not
+    adopted it must still validate. Presence is allowed only at exactly the
+    admitted text, so the admission can never be widened into a general licence
+    to add executable jobs to `ci.yml`.
+    """
+
+    block, failures = extract_job_block(
+        contents,
+        source,
+        CI_FUZZ_SMOKE_JOB_NAME,
+        required=False,
+    )
+    if failures:
+        return failures
+    if block is None or block == CI_FUZZ_SMOKE_JOB:
+        return []
+    return [
+        f"{source} job {CI_FUZZ_SMOKE_JOB_NAME!r} must be byte-identical to the "
+        "admitted fuzz-smoke contract in the trusted policy, or be absent"
+    ]
+
+
+def admitted_ci_job_names(contents: str, source: str) -> frozenset[str]:
+    """Return the admitted jobs this workflow carries verbatim.
+
+    Only a job whose text equals its contract is admitted, so a tampered job
+    keeps every surface it produced and is rejected by the surface comparison
+    in addition to `admitted_fuzz_smoke_errors`.
+    """
+
+    block, failures = extract_job_block(
+        contents,
+        source,
+        CI_FUZZ_SMOKE_JOB_NAME,
+        required=False,
+    )
+    if failures or block is None or block != CI_FUZZ_SMOKE_JOB:
+        return frozenset()
+    return frozenset({CI_FUZZ_SMOKE_JOB_NAME})
+
+
+def admitted_fuzz_smoke_removal_errors(
+    merge_base_contents: str,
+    proposed_contents: str,
+    source: str,
+) -> list[str]:
+    """Keep the admitted smoke gate once the trusted base has adopted it."""
+
+    baseline = admitted_ci_job_names(merge_base_contents, f"merge-base {source}")
+    proposed = admitted_ci_job_names(proposed_contents, f"proposed {source}")
+    if CI_FUZZ_SMOKE_JOB_NAME in baseline and CI_FUZZ_SMOKE_JOB_NAME not in proposed:
+        return [
+            f"{source} cannot remove or alter the admitted "
+            f"{CI_FUZZ_SMOKE_JOB_NAME!r} job after the trusted base adopts it"
+        ]
+    return []
+
+
+def without_admitted_job_surfaces(
+    surfaces: tuple[str, ...],
+    admitted: frozenset[str],
+) -> tuple[str, ...]:
+    """Drop the `job:<name>:<digest>` surfaces of admitted verbatim jobs.
+
+    Only per-job surfaces are withheld. A top-level surface, a remote-action
+    surface attributed outside a job, and every other job's surfaces are
+    untouched, so the admission cannot launder a Cross input that lives
+    anywhere but inside the frozen text.
+    """
+
+    if not admitted:
+        return surfaces
+    prefixes = tuple(f"job:{name}:" for name in sorted(admitted))
+    return tuple(
+        surface
+        for surface in surfaces
+        if not surface.startswith(prefixes)
+    )
+
+
+def frozen_fuzz_workflow_errors(contents: str, source: str) -> list[str]:
+    """Require `fuzz.yml`, when present, to be the frozen scheduled lane.
+
+    Whole-file equality is the contract: the triggers, permissions, and
+    concurrency of a scheduled sanitizer lane are as security-relevant as its
+    steps, and a per-job comparison could be sidestepped by moving a command
+    between them.
+    """
+
+    if contents == FUZZ_WORKFLOW:
+        return []
+    return [
+        f"{source} must be byte-identical to the admitted scheduled fuzz-lane "
+        "contract in the trusted policy, or be absent"
+    ]
+
+
+def validate_nested_cargo_configuration_tree(
+    tree_paths: tuple[str, ...],
+    label: str,
+) -> list[str]:
+    """Reject a committed `.cargo/config[.toml]` below the repository root.
+
+    `validate_cargo_tool_configuration` reviews exactly one Cargo configuration
+    file. A nested one is loaded by any cargo invocation started from its
+    directory — including the admitted fuzz lane, which runs with
+    `working-directory: fuzz` — and could set a target linker, runner, or
+    rustflags that nothing in this policy reads.
+    """
+
+    offenders = sorted(
+        path
+        for path in tree_paths
+        if (parts := PurePosixPath(path).parts)
+        and len(parts) > 2
+        and parts[-2] == ".cargo"
+        and parts[-1] in NESTED_CARGO_CONFIG_NAMES
+    )
+    return [
+        f"{label} commits {path!r}; only the repository-root Cargo "
+        "configuration is validated, so a nested one could set an unreviewed "
+        "target linker, runner, or rustflags"
+        for path in offenders
+    ]
+
+
 def validate_workflow_collection(
     workflows: dict[str, str],
     source: str,
 ) -> list[str]:
     """Reject Cross inputs in every workflow except the two hashed contracts."""
 
-    errors: list[str] = []
+    errors: list[str] = live_suite_relevance_errors(workflows, source)
     for name, contents in sorted(workflows.items()):
         if name in PROTECTED_WORKFLOW_FILENAMES:
+            continue
+        if name == FUZZ_WORKFLOW_FILENAME:
+            # Byte equality with a contract embedded in the trusted verifier is
+            # a stronger statement than the heuristic scan, so the frozen file
+            # is accepted on that basis alone and any other content is refused
+            # outright rather than scanned.
+            errors.extend(frozen_fuzz_workflow_errors(contents, f"{source}/{name}"))
             continue
         surface_reasons: dict[str, str] = {}
         # Exact validation runs with opaque *executable* checks off, but an
@@ -8549,7 +9210,13 @@ def compare_pr_workflow_collection(
 ) -> list[str]:
     """Permit safe workflow edits while rejecting new or changed Cross inputs."""
 
-    errors: list[str] = []
+    # Absolute, not comparative: the trusted-base relevance contract is what a
+    # required live gate must look like after the pull request, regardless of
+    # what the base happened to carry.
+    errors: list[str] = live_suite_relevance_errors(
+        proposed_workflows,
+        f"proposed {source}",
+    )
     names = sorted(
         (set(merge_base_workflows) | set(proposed_workflows))
         - PROTECTED_WORKFLOW_FILENAMES
@@ -8557,6 +9224,32 @@ def compare_pr_workflow_collection(
     for name in names:
         baseline_contents = merge_base_workflows.get(name, "")
         proposed_contents = proposed_workflows.get(name, "")
+        if name == FUZZ_WORKFLOW_FILENAME:
+            # Adding the frozen file is allowed before adoption. Once the
+            # trusted base carries it, deletion is refused; anything other than
+            # the frozen content is always refused. A non-conforming file
+            # already present on the trusted base is reported too, so the
+            # contract cannot be inherited around.
+            if name in proposed_workflows:
+                errors.extend(
+                    frozen_fuzz_workflow_errors(
+                        proposed_contents,
+                        f"proposed {source}/{name}",
+                    )
+                )
+            if name in merge_base_workflows:
+                errors.extend(
+                    frozen_fuzz_workflow_errors(
+                        baseline_contents,
+                        f"merge-base {source}/{name}",
+                    )
+                )
+                if name not in proposed_workflows:
+                    errors.append(
+                        f"proposed {source}/{name} cannot remove the scheduled "
+                        "fuzz lane after the trusted base adopts it"
+                    )
+            continue
         baseline_surfaces, baseline_failures = generic_workflow_cross_surfaces(
             baseline_contents,
             f"merge-base {source}/{name}",
@@ -12660,6 +13353,12 @@ def validate_workflow_contract(
         )
         surface_reasons.update(flow_reasons)
         surfaces = tuple(dict.fromkeys([*surfaces, *flow_surfaces]))
+    if source == "CI workflow":
+        errors.extend(admitted_fuzz_smoke_errors(contents, source))
+        surfaces = without_admitted_job_surfaces(
+            surfaces,
+            admitted_ci_job_names(contents, source),
+        )
     if surfaces:
         # Name what was matched: a bare rejection leaves the author to
         # rediscover which job and which line the scan read.
@@ -12810,6 +13509,29 @@ def compare_pr_workflow_job(
     )
     errors.extend(baseline_surface_failures)
     errors.extend(proposed_surface_failures)
+    if source == "CI workflow":
+        # The admitted fuzz-smoke job is the ONE executable surface a pull
+        # request may add to `ci.yml` outside the protected ARM64 job, and only
+        # by reproducing the frozen contract byte for byte. Its surfaces are
+        # withheld from both sides of the comparison; every other job's are not.
+        errors.extend(
+            admitted_fuzz_smoke_errors(proposed_contents, f"proposed {source}")
+        )
+        errors.extend(
+            admitted_fuzz_smoke_removal_errors(
+                merge_base_contents,
+                proposed_contents,
+                source,
+            )
+        )
+        baseline_surfaces = without_admitted_job_surfaces(
+            baseline_surfaces,
+            admitted_ci_job_names(merge_base_contents, f"merge-base {source}"),
+        )
+        proposed_surfaces = without_admitted_job_surfaces(
+            proposed_surfaces,
+            admitted_ci_job_names(proposed_contents, f"proposed {source}"),
+        )
     if not baseline_surface_failures and not proposed_surface_failures:
         if baseline_surfaces != proposed_surfaces:
             errors.append(
@@ -21100,6 +21822,366 @@ pre_build = []
     ):
         failures.append("a flow expression value was cut short by normalization")
 
+    # ------------------------------------------------------------------
+    # Trusted-base relevance contract for the required live-datapath gates
+    # ------------------------------------------------------------------
+    rendered_relevance = live_suite_relevance_job("Display", "slug", "suite")
+    for sentinel in ("@@DISPLAY@@", "@@SLUG@@", "@@SUITE@@"):
+        if sentinel in rendered_relevance:
+            failures.append(
+                f"{sentinel} survived trusted-base relevance contract rendering"
+            )
+    if live_suite_relevance_job("Display", "slug", "suite") == (
+        live_suite_relevance_job("Display", "slug", "other")
+    ):
+        failures.append("the trusted-base relevance contract ignores its suite")
+    if live_suite_relevance_job("Display", "slug", "suite") == (
+        live_suite_relevance_job("Display", "other", "suite")
+    ):
+        failures.append("the trusted-base relevance contract ignores its slug")
+    # Two governed suites sharing a temp-file slug would race on one runner.
+    relevance_slugs = [
+        contract[3] for contract in LIVE_SUITE_RELEVANCE_CONTRACTS.values()
+    ]
+    if len(relevance_slugs) != len(set(relevance_slugs)):
+        failures.append("two governed live suites share a trusted-filter slug")
+    # Each of these is a distinct fail-closed property of the contract. Losing
+    # any one of them silently restores the fail-open relevance decision.
+    for required_token in (
+        'git ls-tree --full-tree "$trusted_sha" -- "$filter_path"',
+        'git cat-file blob "$entry_object" > "$trusted_filter"',
+        "^[0-9a-f]{40}$",
+        "100644|100755",
+        'python3 -I "$trusted_filter" --self-test',
+        "+refs/heads/${BASE_REF}:refs/ferrum/trusted-base",
+        "^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$",
+        "            true|false) ;;",
+    ):
+        if required_token not in rendered_relevance:
+            failures.append(
+                "the trusted-base relevance contract no longer contains "
+                f"{required_token!r}"
+            )
+    if ".github/scripts/live_suite_path_filter.py --self-test" in rendered_relevance:
+        failures.append(
+            "the trusted-base relevance contract executes the pull request's own filter"
+        )
+
+    def relevance_workflow(display: str, live_job: str, body: str) -> str:
+        return (
+            "name: Self-test live suite\n"
+            "on:\n"
+            "  pull_request:\n"
+            "permissions:\n"
+            "  contents: read\n"
+            "jobs:\n"
+            + body
+            + "\n"
+            + f"  {live_job}:\n"
+            + f"    name: {display} live\n"
+            + "    needs: changes\n"
+            + "    if: needs.changes.outputs.relevant == 'true'\n"
+            + "    runs-on: ubuntu-latest\n"
+            + "    steps:\n"
+            + "      - run: echo live\n"
+        )
+
+    relevance_workflows = {
+        contract_name: relevance_workflow(
+            contract[2],
+            contract[1],
+            live_suite_relevance_job(contract[2], contract[3], contract[4]),
+        )
+        for contract_name, contract in LIVE_SUITE_RELEVANCE_CONTRACTS.items()
+    }
+    if live_suite_relevance_errors(relevance_workflows, "self-test workflows"):
+        failures.append("the trusted-base relevance contract was rejected")
+
+    relevance_mutations: dict[str, tuple[str, str]] = {
+        "pull-request-supplied filter": (
+            'python3 -I "$trusted_filter" --self-test',
+            "python3 .github/scripts/live_suite_path_filter.py --self-test",
+        ),
+        "re-resolved base ref": (
+            'git cat-file blob "$entry_object" > "$trusted_filter"',
+            'git show "origin/${BASE_REF}:$filter_path" > "$trusted_filter"',
+        ),
+        "dropped blob mode check": (
+            "            100644|100755) ;;\n",
+            "            *) ;;\n",
+        ),
+        "unvalidated base ref": (
+            "^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$",
+            ".*",
+        ),
+        "fail-open relevance verdict": (
+            "            true|false) ;;\n",
+            "            *) ;;\n",
+        ),
+        "unpinned trusted checkout": (
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+            "actions/checkout@v6",
+        ),
+        "widened relevance-job permissions": (
+            "    permissions:\n      contents: read\n",
+            "    permissions:\n      contents: write\n",
+        ),
+    }
+    for mutation_name, (original, replacement) in relevance_mutations.items():
+        mutated = {
+            key: value.replace(original, replacement)
+            for key, value in relevance_workflows.items()
+        }
+        if mutated == relevance_workflows:
+            failures.append(
+                f"the {mutation_name} relevance self-test mutation is stale"
+            )
+            continue
+        if not live_suite_relevance_errors(mutated, "self-test workflows"):
+            failures.append(f"a {mutation_name} relevance job was not rejected")
+
+    severed_binding = {
+        key: value.replace(
+            "    if: needs.changes.outputs.relevant == 'true'\n",
+            "    if: false\n",
+        )
+        for key, value in relevance_workflows.items()
+    }
+    if not live_suite_relevance_errors(severed_binding, "self-test workflows"):
+        failures.append("a severed live-job relevance binding was not rejected")
+    unbound_needs = {
+        key: value.replace("    needs: changes\n", "    needs: []\n")
+        for key, value in relevance_workflows.items()
+    }
+    if not live_suite_relevance_errors(unbound_needs, "self-test workflows"):
+        failures.append("an unbound live job was not rejected")
+    if not live_suite_relevance_errors({}, "self-test workflows"):
+        failures.append("a deleted required live-gate workflow was not rejected")
+    renamed_relevance = {
+        key: value.replace("  changes:\n", "  relevance:\n", 1)
+        for key, value in relevance_workflows.items()
+    }
+    if not live_suite_relevance_errors(renamed_relevance, "self-test workflows"):
+        failures.append("a renamed relevance job was not rejected")
+
+    # ------------------------------------------------------------------
+    # Admitted fuzz/property lane
+    # ------------------------------------------------------------------
+    for admitted_label, admitted_text in (
+        ("fuzz-smoke job", CI_FUZZ_SMOKE_JOB),
+        ("scheduled fuzz lane", FUZZ_WORKFLOW),
+    ):
+        if TARGET in admitted_text:
+            failures.append(
+                f"the admitted {admitted_label} names the protected ARM64 target"
+            )
+        if STANDALONE_CROSS.search(admitted_text):
+            failures.append(
+                f"the admitted {admitted_label} names the Cross executable"
+            )
+        if "secrets." in admitted_text:
+            failures.append(f"the admitted {admitted_label} references a secret")
+        if "contents: write" in admitted_text:
+            failures.append(
+                f"the admitted {admitted_label} requests write permission"
+            )
+    if (
+        "\non:\n  schedule:\n    - cron: '30 6 * * 1'\n  workflow_dispatch:\n"
+        "\npermissions:\n  contents: read\n"
+    ) not in FUZZ_WORKFLOW:
+        failures.append(
+            "the scheduled fuzz lane no longer carries exactly the "
+            "schedule/dispatch trigger and read-only permissions"
+        )
+
+    fuzz_ci_workflow = (
+        "name: Self-test CI\non:\n  pull_request:\njobs:\n" + CI_FUZZ_SMOKE_JOB
+    )
+    if admitted_fuzz_smoke_errors(fuzz_ci_workflow, "CI workflow"):
+        failures.append("the admitted fuzz-smoke contract was rejected")
+    if admitted_ci_job_names(fuzz_ci_workflow, "CI workflow") != frozenset(
+        {CI_FUZZ_SMOKE_JOB_NAME}
+    ):
+        failures.append("the admitted fuzz-smoke job was not recognized")
+    fuzz_absent_workflow = (
+        "name: Self-test CI\non:\n  pull_request:\njobs:\n"
+        "  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n"
+    )
+    if admitted_fuzz_smoke_errors(fuzz_absent_workflow, "CI workflow"):
+        failures.append("an absent fuzz-smoke job was rejected")
+    if admitted_ci_job_names(fuzz_absent_workflow, "CI workflow"):
+        failures.append("an absent fuzz-smoke job was reported as admitted")
+    if not admitted_fuzz_smoke_removal_errors(
+        fuzz_ci_workflow,
+        fuzz_absent_workflow,
+        "CI workflow",
+    ):
+        failures.append("removal of an adopted fuzz-smoke job was not rejected")
+    if admitted_fuzz_smoke_removal_errors(
+        fuzz_absent_workflow,
+        fuzz_ci_workflow,
+        "CI workflow",
+    ):
+        failures.append("initial adoption of the fuzz-smoke job was rejected")
+
+    fuzz_smoke_tampering: dict[str, tuple[str, str]] = {
+        "widened libFuzzer budget": ("-max_total_time=8", "-max_total_time=800"),
+        "unbounded input length": ("-max_len=4096", "-max_len=1048576"),
+        "unpinned cargo-fuzz": (
+            "cargo install cargo-fuzz --locked --version 0.13.1",
+            "cargo install cargo-fuzz",
+        ),
+        "mutable toolchain pin": ("nightly-2025-07-01", "nightly"),
+        "repository-supplied script": (
+            'cargo fuzz run "$fuzz_target" -- \\',
+            'bash scripts/fuzz_smoke.sh "$fuzz_target" -- \\',
+        ),
+        "mutable action ref": (
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+            "actions/checkout@v6",
+        ),
+        "local action substitution": (
+            "uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2",
+            "uses: ./.github/actions/fuzz-cache",
+        ),
+        "widened permissions": (
+            "      contents: read\n",
+            "      contents: write\n",
+        ),
+        "untrusted interpolation": (
+            "for fuzz_target in traceparent",
+            "for fuzz_target in ${{ github.event.pull_request.title }} traceparent",
+        ),
+        "failure-tolerant job": (
+            "    needs: ci-plan\n",
+            "    needs: ci-plan\n    continue-on-error: true\n",
+        ),
+    }
+    for tamper_name, (original, replacement) in fuzz_smoke_tampering.items():
+        tampered = fuzz_ci_workflow.replace(original, replacement)
+        if tampered == fuzz_ci_workflow:
+            failures.append(
+                f"the {tamper_name} fuzz-smoke self-test mutation is stale"
+            )
+            continue
+        if not admitted_fuzz_smoke_errors(tampered, "CI workflow"):
+            failures.append(f"a {tamper_name} fuzz-smoke job was not rejected")
+        if admitted_ci_job_names(tampered, "CI workflow"):
+            failures.append(f"a {tamper_name} fuzz-smoke job was still admitted")
+
+    # Withholding is scoped to the admitted job alone: a top-level surface and
+    # every other job's surface survive the admission untouched.
+    mixed_surfaces = (
+        "executable:cross build --target " + TARGET,
+        "job:other:0123456789abcdef",
+        f"job:{CI_FUZZ_SMOKE_JOB_NAME}:fedcba9876543210",
+    )
+    if without_admitted_job_surfaces(
+        mixed_surfaces,
+        frozenset({CI_FUZZ_SMOKE_JOB_NAME}),
+    ) != mixed_surfaces[:2]:
+        failures.append("admitted-job surface withholding is not scoped to that job")
+    if without_admitted_job_surfaces(mixed_surfaces, frozenset()) != mixed_surfaces:
+        failures.append("surfaces were withheld with no admitted job")
+
+    if frozen_fuzz_workflow_errors(FUZZ_WORKFLOW, "self-test/fuzz.yml"):
+        failures.append("the admitted scheduled fuzz-lane contract was rejected")
+    scheduled_removal = compare_pr_workflow_collection(
+        {"fuzz.yml": FUZZ_WORKFLOW, **relevance_workflows},
+        relevance_workflows,
+        "self-test workflows",
+    )
+    if not any("cannot remove the scheduled fuzz lane" in error for error in scheduled_removal):
+        failures.append("removal of an adopted scheduled fuzz lane was not rejected")
+    scheduled_adoption = compare_pr_workflow_collection(
+        relevance_workflows,
+        {"fuzz.yml": FUZZ_WORKFLOW, **relevance_workflows},
+        "self-test workflows",
+    )
+    if any("scheduled fuzz lane" in error for error in scheduled_adoption):
+        failures.append("initial adoption of the scheduled fuzz lane was rejected")
+    fuzz_workflow_tampering: dict[str, tuple[str, str]] = {
+        "untrusted trigger": (
+            "  workflow_dispatch:\n",
+            "  workflow_dispatch:\n  pull_request:\n",
+        ),
+        "caller-chosen budget": (
+            "  workflow_dispatch:\n",
+            "  workflow_dispatch:\n    inputs:\n      budget:\n        default: '1'\n",
+        ),
+        "write permission": (
+            "permissions:\n  contents: read\n",
+            "permissions:\n  contents: write\n",
+        ),
+        "secret exposure": (
+            "          ASAN_OPTIONS:",
+            "          TOKEN: ${{ secrets.GITHUB_TOKEN }}\n          ASAN_OPTIONS:",
+        ),
+        "unbounded run": ("-max_total_time=300", "-max_total_time=86400"),
+        "unbounded rss": ("-rss_limit_mb=2048", "-rss_limit_mb=0"),
+        "widened artifact path": (
+            "          path: fuzz/artifacts/${{ matrix.fuzz_target }}\n",
+            "          path: .\n",
+        ),
+        "ungated artifact publication": (
+            "        if: always() && steps.bound.outcome == 'success'\n",
+            "        if: always()\n",
+        ),
+        "symlink-following artifact publication": (
+            '          if [ -L "$directory" ]; then\n',
+            '          if false; then\n',
+        ),
+        "local action substitution": (
+            "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7",
+            "uses: ./.github/actions/publish",
+        ),
+        "mutable action ref": (
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6",
+            "actions/checkout@v6",
+        ),
+        "shell indirection": (
+            'cargo fuzz run -s address "$FUZZ_TARGET" -- \\',
+            'bash -c "$FUZZ_TARGET" -- \\',
+        ),
+        "arbitrary target selection": (
+            "            traceparent|config_decode|proxy_protocol|mesh_udp_frame"
+            "|k8s_crd|plugin_config) ;;\n",
+            "            *) ;;\n",
+        ),
+    }
+    for tamper_name, (original, replacement) in fuzz_workflow_tampering.items():
+        tampered = FUZZ_WORKFLOW.replace(original, replacement)
+        if tampered == FUZZ_WORKFLOW:
+            failures.append(
+                f"the {tamper_name} fuzz-workflow self-test mutation is stale"
+            )
+            continue
+        if not frozen_fuzz_workflow_errors(tampered, "self-test/fuzz.yml"):
+            failures.append(
+                f"a {tamper_name} scheduled fuzz workflow was not rejected"
+            )
+
+    # ------------------------------------------------------------------
+    # Nested Cargo configuration
+    # ------------------------------------------------------------------
+    if validate_nested_cargo_configuration_tree(
+        (".cargo/config.toml", ".cargo/config", "Cargo.toml", "fuzz/Cargo.toml"),
+        "self-test tree",
+    ):
+        failures.append("the repository-root Cargo configuration was rejected")
+    for nested_config in (
+        "fuzz/.cargo/config.toml",
+        "fuzz/.cargo/config",
+        "tests/performance/multi_protocol/.cargo/config.toml",
+    ):
+        if not validate_nested_cargo_configuration_tree(
+            (nested_config,),
+            "self-test tree",
+        ):
+            failures.append(
+                f"nested Cargo configuration {nested_config!r} was not rejected"
+            )
+
     return failures
 
 
@@ -21510,6 +22592,12 @@ def main() -> int:
             if not listing_failures:
                 failures.extend(
                     validate_generated_command_tree(tree_paths, "proposed tree")
+                )
+                failures.extend(
+                    validate_nested_cargo_configuration_tree(
+                        tree_paths,
+                        "proposed tree",
+                    )
                 )
 
         comparisons = (

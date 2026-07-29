@@ -389,6 +389,20 @@ async fn protocol_matrix_matches_parity_meta_and_runtime_protocols() {
                     "waf minimal config must remain HTTP-family"
                 );
             }
+            _ if row.name == "ai_response_guard" => {
+                // Documented capability envelope includes descriptor-based
+                // native gRPC inspection, which is opt-in through the `grpc`
+                // block; the minimal config attaches HTTP only.
+                assert!(
+                    live.is_subset(&row.protocols),
+                    "ai_response_guard live protocols {live:?} must be a subset of documented capability {:?}",
+                    row.protocols
+                );
+                assert!(
+                    live.contains(&ProxyProtocol::Http),
+                    "ai_response_guard minimal config must remain HTTP-capable"
+                );
+            }
             _ => {
                 assert_eq!(
                     live, row.protocols,

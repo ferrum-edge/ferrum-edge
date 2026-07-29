@@ -2161,6 +2161,11 @@ struct H3ReadProgress {
     /// terminal stream FIN arrives. If the caller's trailer-phase timeout fires
     /// before that FIN, the outer timeout wrapper can still forward these
     /// trailers before ending the downstream body.
+    ///
+    /// Stored ALREADY hop-by-hop stripped and ALREADY governed by the source's
+    /// `trailer_governor`: the outer wrapper forwards this map verbatim as the
+    /// response's trailer section and applies no policy of its own, so this slot
+    /// only ever holds a map that is safe to put on the wire.
     pending_trailers: std::sync::Mutex<Option<http::HeaderMap>>,
 }
 
@@ -2218,6 +2223,25 @@ pub(crate) struct H3FrameSource<S = crate::http3::client::H3RequestStream> {
     /// optional trailers remain. `None` when no read timeout is configured (the
     /// outer wrapper is absent).
     progress: Option<Arc<H3ReadProgress>>,
+    /// Response-trailer policy boundary for the H1/H2 frontend → native-H3
+    /// backend STREAMING relay (`ResponseBody::StreamingH3`).
+    ///
+    /// This source sends nothing itself, but the response it feeds committed
+    /// its initial header block long before the backend's TRAILERS frame is
+    /// read, so the trailer section crosses the response-header policy boundary
+    /// exactly as the direct-H2 relay's does (GHSA-r78v-rc86-6r86). Owned
+    /// rather than borrowed because the body outlives
+    /// `handle_proxy_request_inner`. `None` on every path with nothing to
+    /// enforce (and in tests), which keeps this a pure hop-by-hop filter.
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    /// Set once a trailer-phase `peek_recv_trailers_map()` has handed the
+    /// buffered map to [`H3ReadProgress::store_pending_trailers`]. The peek
+    /// CLONES a `HeaderMap` and the governor pass over it is not free, while
+    /// `store_pending_trailers` keeps only the first map — so without this flag
+    /// every subsequent trailer-phase `Pending` poll would re-clone, re-strip,
+    /// and re-govern a snapshot that is then thrown away, double-counting the
+    /// removal telemetry on the way.
+    peeked_pending_trailers: bool,
 }
 
 impl<S> H3FrameSource<S> {
@@ -2236,11 +2260,50 @@ impl<S> H3FrameSource<S> {
             content_length,
             received: 0,
             progress,
+            trailer_governor: None,
+            peeked_pending_trailers: false,
         }
+    }
+
+    /// Attach the streaming response-trailer policy boundary. Chained from the
+    /// public constructors so every existing `new` call site (and the source
+    /// tests) keeps the ungoverned pass-through shape.
+    fn with_trailer_governor(
+        mut self,
+        governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    ) -> Self {
+        self.trailer_governor = governor;
+        self
     }
 
     fn is_done(&self) -> bool {
         matches!(self.state, H3FrameSourceState::Done)
+    }
+
+    /// Bind the trailer section to the response-header policy boundary.
+    ///
+    /// Both trailer-delivery routes out of this source funnel through here so
+    /// the boundary cannot be closed on one and left open on the other: the
+    /// ordinary `Ready` frame yielded after the terminal FIN, and the buffered
+    /// map peeked before that FIN which the outer [`IdleReadTimeoutBody`]
+    /// forwards when its trailer-phase deadline collapses the stream. Call it
+    /// AFTER hop-by-hop stripping.
+    ///
+    /// `route` is a two-value static label (`"fin"` / `"timeout_peek"`), not
+    /// request-derived data, so it adds no log cardinality — it only keeps the
+    /// two lines from reading as one response's trailers being governed twice.
+    /// A `None` governor (every path with nothing to enforce, and the source
+    /// tests) skips the work entirely and leaves this a pure hop-by-hop filter.
+    fn govern_trailers(&self, trailers: &mut http::HeaderMap, route: &'static str) {
+        if let Some(governor) = self.trailer_governor.as_ref() {
+            let removed = governor.reconcile(trailers);
+            if removed > 0 {
+                debug!(
+                    removed,
+                    route, "H3 backend stream: dropped governed trailer fields"
+                );
+            }
+        }
     }
 
     /// Mark the DATA body complete (a clean FIN that satisfied any declared
@@ -2369,9 +2432,37 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                     match Pin::new(&mut this.recv_stream).poll_recv_trailers_map(cx) {
                         Poll::Ready(Ok(Some(mut trailers))) => {
                             this.state = H3FrameSourceState::Done;
-                            crate::proxy::headers::strip_response_hop_by_hop_trailers(
-                                &mut trailers,
-                            );
+                            // A preceding delayed-FIN peek already stripped and
+                            // governed the exact buffered trailer block. Reuse
+                            // that safe snapshot when FIN arrives before the
+                            // outer timeout instead of governing and logging the
+                            // same backend metadata twice. If the progress slot
+                            // was unavailable (for example, a poisoned mutex),
+                            // fall back to the authoritative map returned here.
+                            let governed_peek = if this.peeked_pending_trailers {
+                                this.progress
+                                    .as_ref()
+                                    .and_then(|progress| progress.take_pending_trailers())
+                            } else {
+                                None
+                            };
+                            if let Some(governed_peek) = governed_peek {
+                                trailers = governed_peek;
+                            } else {
+                                crate::proxy::headers::strip_response_hop_by_hop_trailers(
+                                    &mut trailers,
+                                );
+                                // Last point on this relay where the
+                                // response-header policy boundary can still bind
+                                // the trailer section: the initial header block
+                                // went to the client before the first DATA frame,
+                                // so `after_proxy`, sticky-cookie injection, and
+                                // the gateway's own builder writes are all
+                                // already committed. Runs once per response, on
+                                // the trailer frame only, and is skipped entirely
+                                // (`None`) whenever no signal could drop a field.
+                                this.govern_trailers(&mut trailers, "fin");
+                            }
                             return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
                         }
                         Poll::Ready(Ok(None)) => {
@@ -2397,13 +2488,29 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                             return Poll::Ready(Some(Err(err)));
                         }
                         Poll::Pending => {
-                            if let Some(p) = &this.progress {
+                            // h3 can hold a fully-received TRAILERS frame back
+                            // until the terminal stream FIN arrives. If the outer
+                            // trailer-phase deadline fires during that wait, the
+                            // outer wrapper forwards THIS snapshot as the
+                            // response's trailer section — and it carries no
+                            // governor of its own — so the policy boundary has to
+                            // be applied here too, or a governed field reaches the
+                            // client on exactly the delayed-FIN/timeout-collapse
+                            // path. Peeked at most once per response; see
+                            // `peeked_pending_trailers`.
+                            if let Some(p) = &this.progress
+                                && !this.peeked_pending_trailers
+                            {
                                 match this.recv_stream.peek_recv_trailers_map() {
                                     Ok(Some(mut trailers)) => {
                                         crate::proxy::headers::strip_response_hop_by_hop_trailers(
                                             &mut trailers,
                                         );
+                                        this.govern_trailers(&mut trailers, "timeout_peek");
                                         p.store_pending_trailers(trailers);
+                                        // Set after the store so `p`'s borrow of
+                                        // `this.progress` has ended.
+                                        this.peeked_pending_trailers = true;
                                     }
                                     Ok(None) => {}
                                     Err(err) => {
@@ -3459,6 +3566,7 @@ pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
     coalesce_target: usize,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
     // Bound the backend read so a backend that sends headers then stalls cannot
     // pin the streaming relay indefinitely. Two mutually-exclusive regimes
@@ -3470,7 +3578,7 @@ pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
     // no buffered frame left to flush AND the backend is pending, so a per-frame
     // idle deadline measures genuine backend-read waits and never fires while a
     // sub-target frame is buffered waiting on a slow downstream client.
-    let stripped = StripHopByHopTrailers::new(body);
+    let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
     let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
     if let Some(deadline) = total_deadline {
         let timed = TotalDeadlineBody::new(coalescing, Some(deadline));
@@ -3497,12 +3605,13 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
     coalesce_target: usize,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
     // See `coalescing_h2_body_strip_hop_by_hop_trailers` for the two
     // mutually-exclusive deadline regimes (issue #1649). Either wraps the
     // coalescer OUTERMOST so a per-frame idle deadline never fires while a
     // buffered sub-target frame is waiting on a slow downstream client.
-    let stripped = StripHopByHopTrailers::new(body);
+    let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
     let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
     let coalescing = Coalescing::new(limited, coalesce_target, content_length);
     if let Some(deadline) = total_deadline {
@@ -3529,6 +3638,7 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
     content_length: Option<u64>,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
     use http_body_util::BodyExt;
 
@@ -3544,14 +3654,14 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
     if let Some(deadline) = total_deadline {
         let timed = TotalDeadlineBody::new(direct, Some(deadline));
         let fired = timed.deadline_fired_handle();
-        let stripped = StripHopByHopTrailers::new(timed);
+        let stripped = StripHopByHopTrailers::with_trailer_governor(timed, trailer_governor);
         ProxyBody::streaming(Box::pin(stripped)).with_client_grpc_deadline_fired_flag(fired)
     } else if read_timeout_ms > 0 {
         let timed = IdleReadTimeoutBody::new(direct, read_timeout_ms);
-        let stripped = StripHopByHopTrailers::new(timed);
+        let stripped = StripHopByHopTrailers::with_trailer_governor(timed, trailer_governor);
         ProxyBody::streaming(Box::pin(stripped))
     } else {
-        let stripped = StripHopByHopTrailers::new(direct);
+        let stripped = StripHopByHopTrailers::with_trailer_governor(direct, trailer_governor);
         ProxyBody::streaming(Box::pin(stripped.map_err(|e| Box::new(e) as BoxError)))
     }
 }
@@ -3576,11 +3686,25 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
 /// natively, so this is safe.
 pub(crate) struct StripHopByHopTrailers<B> {
     inner: B,
+    /// Response-trailer policy boundary for a streaming HTTP/2 response.
+    ///
+    /// Plain HTTP uses `TrailerSectionKind::PlainResponse`; native gRPC and
+    /// translated gRPC-Web install a governor with
+    /// `TrailerSectionKind::NativeGrpcTerminal`, which always preserves the
+    /// three protocol-reserved status fields and governs the remaining metadata
+    /// before the outer gRPC-Web adapter can encode it. `None` keeps paths with
+    /// no actionable policy as a pure hop-by-hop filter.
+    governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 }
 
 impl<B> StripHopByHopTrailers<B> {
-    pub(crate) fn new(inner: B) -> Self {
-        Self { inner }
+    /// Same filter, plus the streaming HTTP/2 response-trailer policy
+    /// boundary. See [`crate::proxy::headers::StreamingResponseTrailerGovernor`].
+    pub(crate) fn with_trailer_governor(
+        inner: B,
+        governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    ) -> Self {
+        Self { inner, governor }
     }
 }
 
@@ -3606,6 +3730,24 @@ where
                         Err(other) => return Poll::Ready(Some(Ok(other))),
                     };
                     crate::proxy::headers::strip_response_hop_by_hop_trailers(&mut trailers);
+                    // Last point on a streaming HTTP/2 relay where the
+                    // response-header policy boundary can still bind the
+                    // trailer section: the initial HEADERS frame went on the
+                    // wire before the first body frame, so `after_proxy`,
+                    // sticky-cookie injection, and the gateway's own builder
+                    // writes are all already committed. Runs once per response,
+                    // on the trailer frame only — DATA frames never reach this
+                    // branch — and is skipped entirely (`None`) for every path
+                    // that is not a plain streaming HTTP/2 response.
+                    if let Some(governor) = this.governor.as_ref() {
+                        let removed = governor.reconcile(&mut trailers);
+                        if removed > 0 {
+                            debug!(
+                                removed,
+                                "streaming H2: dropped backend trailer fields governed by response header policy"
+                            );
+                        }
+                    }
                     Poll::Ready(Some(Ok(Frame::trailers(trailers))))
                 } else {
                     Poll::Ready(Some(Ok(frame)))
@@ -3693,6 +3835,7 @@ pub(crate) fn coalescing_h3_body(
     coalesce_max_bytes: usize,
     flush_interval: Duration,
     read_timeout_ms: u64,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
     let progress = h3_read_progress(read_timeout_ms);
     let source = H3FrameSource::new(
@@ -3701,7 +3844,8 @@ pub(crate) fn coalescing_h3_body(
         status,
         content_length,
         progress.clone(),
-    );
+    )
+    .with_trailer_governor(trailer_governor);
     let buffer_capacity = coalesce_max_bytes.clamp(
         crate::http3::config::H3_COALESCE_MIN_FLOOR,
         crate::http3::config::H3_COALESCE_MAX_CAP,
@@ -3736,6 +3880,7 @@ pub(crate) fn size_limited_streaming_h3_body(
     coalesce_max_bytes: usize,
     flush_interval: Duration,
     read_timeout_ms: u64,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
     let progress = h3_read_progress(read_timeout_ms);
     let source = H3FrameSource::new(
@@ -3744,7 +3889,8 @@ pub(crate) fn size_limited_streaming_h3_body(
         status,
         content_length,
         progress.clone(),
-    );
+    )
+    .with_trailer_governor(trailer_governor);
     let limited = SizeLimitedFrameSource::new(source, max_bytes);
     let buffer_capacity = coalesce_max_bytes.clamp(
         crate::http3::config::H3_COALESCE_MIN_FLOOR,
@@ -3775,16 +3921,19 @@ pub(crate) fn direct_streaming_h3_body(
     status: u16,
     content_length: Option<u64>,
     read_timeout_ms: u64,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
     let progress = h3_read_progress(read_timeout_ms);
+    let source = H3FrameSource::new(
+        recv_stream,
+        method,
+        status,
+        content_length,
+        progress.clone(),
+    )
+    .with_trailer_governor(trailer_governor);
     let body = DirectH3Body {
-        source: H3FrameSource::new(
-            recv_stream,
-            method,
-            status,
-            content_length,
-            progress.clone(),
-        ),
+        source,
         content_length,
     };
     match progress {
@@ -4528,6 +4677,58 @@ mod tests {
     }
 
     #[test]
+    fn h3_frame_source_reuses_governed_peek_when_delayed_fin_arrives() {
+        let progress = Arc::new(H3ReadProgress::default());
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-trace", "abc".parse().unwrap());
+        trailers.insert("transfer-encoding", "chunked".parse().unwrap());
+        let authoritative = trailers.clone();
+        let mut source = H3FrameSource::new(
+            MockH3RecvStream::new(
+                vec![MockH3DataStep::End],
+                vec![
+                    MockH3TrailerStep::PendingWithBuffered(trailers),
+                    MockH3TrailerStep::Trailers(authoritative),
+                ],
+            ),
+            Arc::from("GET"),
+            200,
+            None,
+            Some(Arc::clone(&progress)),
+        );
+
+        // The first trailer poll peeks the fully decoded map while h3 is still
+        // withholding it for the delayed stream FIN. The stored snapshot is
+        // already stripped and governed.
+        assert!(matches!(poll_source(&mut source), Poll::Pending));
+        {
+            let slot = progress
+                .pending_trailers
+                .lock()
+                .expect("pending trailer slot");
+            let peeked = slot.as_ref().expect("peeked trailer snapshot");
+            assert_eq!(peeked.get("x-trace").unwrap(), "abc");
+            assert!(peeked.get("transfer-encoding").is_none());
+        }
+
+        // FIN makes the authoritative map available. The source must consume
+        // the already-safe snapshot instead of governing the same block again.
+        match poll_source(&mut source) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let emitted = frame.trailers_ref().expect("trailer frame");
+                assert_eq!(emitted.get("x-trace").unwrap(), "abc");
+                assert!(emitted.get("transfer-encoding").is_none());
+            }
+            other => panic!("expected delayed-FIN trailer frame, got {other:?}"),
+        }
+        assert!(
+            progress.take_pending_trailers().is_none(),
+            "the governed peek must be consumed when the authoritative frame arrives",
+        );
+        assert!(source.is_done());
+    }
+
+    #[test]
     fn h3_frame_source_truncated_fin_surfaces_error() {
         // A backend that declares Content-Length but FINs early (fewer bytes) is a
         // framing violation: the FIN must surface a backend error (not enter the
@@ -4830,7 +5031,7 @@ mod tests {
             inner: MockSource::new(steps),
             _marker: PhantomData,
         };
-        StripHopByHopTrailers::new(body)
+        StripHopByHopTrailers::with_trailer_governor(body, None)
     }
 
     /// Drive a `Body` to `Ready(None)`, returning the collected frames.

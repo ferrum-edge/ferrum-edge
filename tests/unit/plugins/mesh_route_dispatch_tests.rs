@@ -1228,3 +1228,617 @@ fn screen_mesh_route_dispatch_egress_rejects_metadata_destination() {
     });
     assert!(screen_mesh_route_dispatch_egress(&allowed, &default_policy).is_ok());
 }
+
+// ── GRPCRoute pathless-predicate live data path (issue #3271) ─────────────
+//
+// These drive the *translator-emitted* `mesh_route_dispatch` config, so the
+// CRD → dispatch-rule → request-time-decision chain is covered end to end
+// rather than only asserting the translated JSON shape.
+
+mod grpc_route_predicate_dispatch {
+    use std::collections::HashMap;
+
+    use ferrum_edge::config_sources::k8s::{
+        K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
+    };
+    use ferrum_edge::identity::spiffe::TrustDomain;
+    use ferrum_edge::plugins::mesh_route_dispatch::MeshRouteDispatch;
+    use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+    use serde_json::{Value, json};
+
+    fn options() -> K8sTranslationOptions {
+        K8sTranslationOptions::new(
+            "default".to_string(),
+            TrustDomain::new("cluster.local").expect("test trust domain"),
+        )
+    }
+
+    fn grpc_route(name: &str, rules: Value) -> K8sObject {
+        K8sObject {
+            api_version: "gateway.networking.k8s.io/v1".to_string(),
+            kind: "GRPCRoute".to_string(),
+            metadata: K8sMetadata {
+                name: name.to_string(),
+                uid: String::new(),
+                namespace: "default".to_string(),
+                generation: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                creation_timestamp: None,
+                deletion_timestamp: None,
+            },
+            spec: json!({"hostnames": ["grpc.example.com"], "rules": rules}),
+            status: Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    fn http_catch_all_route(name: &str) -> K8sObject {
+        let mut route = grpc_route(name, json!([]));
+        route.kind = "HTTPRoute".to_string();
+        route.spec = json!({
+            "hostnames": ["grpc.example.com"],
+            "rules": [{"backendRefs": [{"name": "web", "port": 8080}]}]
+        });
+        route
+    }
+
+    /// Build the live plugin from the dispatch config the translator emitted
+    /// for `listen_path`, failing loudly if no such listener exists.
+    fn dispatch_plugin_for_path(objects: &[K8sObject], listen_path: &str) -> MeshRouteDispatch {
+        let translation =
+            translate_k8s_objects(objects, options()).expect("translation should succeed");
+        let proxy = translation
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.listen_path.as_deref() == Some(listen_path))
+            .unwrap_or_else(|| panic!("expected a `{listen_path}` listener"));
+        let plugin = translation
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.plugin_name == "mesh_route_dispatch"
+                    && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .unwrap_or_else(|| {
+                panic!("the `{listen_path}` listener carries a mesh_route_dispatch instance")
+            });
+        MeshRouteDispatch::new(&plugin.config).expect("translated dispatch config is valid")
+    }
+
+    /// Build the live plugin from the dispatch config the translator emitted
+    /// for the `/` listener, failing loudly if no such listener exists.
+    fn dispatch_plugin_for_catch_all(objects: &[K8sObject]) -> MeshRouteDispatch {
+        dispatch_plugin_for_path(objects, "/")
+    }
+
+    fn grpc_headers() -> HashMap<String, String> {
+        HashMap::from([(
+            "content-type".to_string(),
+            "application/grpc+proto".to_string(),
+        )])
+    }
+
+    async fn resolved_backend(
+        plugin: &MeshRouteDispatch,
+        path: &str,
+        headers: &mut HashMap<String, String>,
+    ) -> (Option<String>, Option<u16>, bool) {
+        let mut request = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            path.to_string(),
+        );
+        let rejected = !matches!(
+            plugin.before_proxy(&mut request, headers).await,
+            PluginResult::Continue
+        );
+        (
+            request.route_override_backend_host.clone(),
+            request.route_override_backend_port,
+            rejected,
+        )
+    }
+
+    #[tokio::test]
+    async fn method_only_predicate_routes_matching_rpc_and_rejects_everything_else() {
+        let plugin = dispatch_plugin_for_catch_all(&[grpc_route(
+            "hello",
+            json!([{
+                "matches": [{"method": {"method": "SayHello"}}],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]),
+        )]);
+
+        // Positive: any service, the named method, over gRPC.
+        let (host, port, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut grpc_headers()).await;
+        assert!(!rejected);
+        assert_eq!(port, Some(50051));
+        assert!(
+            host.as_deref()
+                .is_some_and(|host| host.contains("grpc-api")),
+            "expected the GRPCRoute backend, got {host:?}"
+        );
+
+        // Negative: a different method on the same service.
+        let (_, _, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayBye", &mut grpc_headers()).await;
+        assert!(
+            rejected,
+            "an unrelated gRPC method must not reach the backend"
+        );
+
+        // Negative: a plain HTTP request whose path happens to share the
+        // two-segment gRPC shape must not be captured by a pathless gRPC rule.
+        let mut html = HashMap::from([("content-type".to_string(), "text/html".to_string())]);
+        let (_, _, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut html).await;
+        assert!(
+            rejected,
+            "a non-gRPC request must not match a pathless GRPCRoute predicate"
+        );
+
+        // Negative: a gRPC call whose path is not the two-segment shape.
+        let (_, _, rejected) = resolved_backend(&plugin, "/SayHello", &mut grpc_headers()).await;
+        assert!(rejected);
+    }
+
+    #[tokio::test]
+    async fn exact_service_and_method_route_rejects_plain_http_on_the_same_path() {
+        // The predicate is carried by the proxy's exact listen path, but a
+        // GRPCRoute still selects gRPC calls only — a plain HTTP request to
+        // `/helloworld.Greeter/SayHello` must not reach the gRPC backend.
+        let objects = [grpc_route(
+            "hello",
+            json!([{
+                "matches": [{
+                    "method": {"service": "helloworld.Greeter", "method": "SayHello"}
+                }],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]),
+        )];
+        let plugin = dispatch_plugin_for_path(&objects, "=/helloworld.Greeter/SayHello");
+
+        for content_type in [
+            "application/grpc",
+            "application/grpc+proto",
+            "application/grpc; charset=utf-8",
+            "application/grpc ; charset=utf-8",
+            // HTTP media types are case-insensitive; a gRPC client that
+            // capitalizes must still be routed.
+            "Application/GRPC",
+        ] {
+            let mut headers =
+                HashMap::from([("content-type".to_string(), content_type.to_string())]);
+            let (_, port, rejected) =
+                resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut headers).await;
+            assert!(!rejected, "{content_type} is a gRPC call");
+            assert_eq!(port, Some(50051), "{content_type} must reach the backend");
+        }
+
+        // The emitted gate is the regex transcription of Ferrum's canonical
+        // native-gRPC dispatcher contract, so raw lookalikes are refused. A
+        // real gRPC-Web request reaches a native `application/grpc` only via a
+        // trusted, explicitly configured `grpc_web` plugin.
+        for content_type in [
+            "application/grpcfoo",
+            "application/grpc-web",
+            "application/grpc-website",
+            "application/grpc-web-text",
+            "text/plain",
+            "application/json",
+            "text/html",
+        ] {
+            let mut headers =
+                HashMap::from([("content-type".to_string(), content_type.to_string())]);
+            let (_, _, rejected) =
+                resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut headers).await;
+            assert!(
+                rejected,
+                "plain HTTP ({content_type}) must not match an exact GRPCRoute path"
+            );
+        }
+
+        // No content-type at all is not a gRPC call either.
+        let (_, _, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut HashMap::new()).await;
+        assert!(rejected, "a request without a content-type is not gRPC");
+    }
+
+    #[tokio::test]
+    async fn service_only_route_rejects_plain_http_under_the_service_prefix() {
+        let objects = [grpc_route(
+            "greeter",
+            json!([{
+                "matches": [{"method": {"service": "helloworld.Greeter"}}],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]),
+        )];
+        let plugin = dispatch_plugin_for_path(&objects, "/helloworld.Greeter/");
+
+        let (_, port, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut grpc_headers()).await;
+        assert!(!rejected);
+        assert_eq!(port, Some(50051));
+
+        let mut html = HashMap::from([("content-type".to_string(), "text/html".to_string())]);
+        let (_, _, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut html).await;
+        assert!(
+            rejected,
+            "plain HTTP under the service prefix must not reach the gRPC backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn authored_content_type_narrows_the_gate_and_text_plain_is_refused() {
+        // A gRPC media type authored on the route replaces the canonical gate
+        // and only narrows it: `+proto` matches, bare `application/grpc` does
+        // not.
+        let objects = [grpc_route(
+            "hello",
+            json!([{
+                "matches": [{
+                    "method": {"method": "SayHello"},
+                    "headers": [{"name": "content-type", "value": "application/grpc+proto"}]
+                }],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]),
+        )];
+        let plugin = dispatch_plugin_for_catch_all(&objects);
+        let (_, port, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut grpc_headers()).await;
+        assert!(!rejected);
+        assert_eq!(port, Some(50051));
+
+        let mut bare =
+            HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+        let (_, _, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut bare).await;
+        assert!(rejected, "the authored predicate narrows the gate");
+
+        // A non-gRPC authored content-type would widen the route onto plain
+        // HTTP, so the match is refused during translation and nothing
+        // materializes at all.
+        let widening = translate_k8s_objects(
+            &[grpc_route(
+                "widen",
+                json!([{
+                    "matches": [{
+                        "method": {"service": "helloworld.Greeter", "method": "SayHello"},
+                        "headers": [{"name": "content-type", "value": "text/plain"}]
+                    }],
+                    "backendRefs": [{"name": "grpc-api", "port": 50051}]
+                }]),
+            )],
+            options(),
+        )
+        .expect("translation should succeed");
+        assert!(
+            widening.config.proxies.is_empty(),
+            "a text/plain content-type predicate must not materialize a GRPCRoute"
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_expression_method_matches_never_materialize() {
+        // Ferrum cannot constrain a regex operand to one gRPC path segment,
+        // so `RegularExpression` predicates are refused rather than compiled
+        // into a matcher that could widen across service/method boundaries.
+        for operand in [".*", "a\\x2Fb", "a[/]b", "helloworld\\..*"] {
+            let translation = translate_k8s_objects(
+                &[grpc_route(
+                    "regex",
+                    json!([{
+                        "matches": [{"method": {
+                            "type": "RegularExpression",
+                            "service": operand,
+                            "method": operand
+                        }}],
+                        "backendRefs": [{"name": "grpc-api", "port": 50051}]
+                    }]),
+                )],
+                options(),
+            )
+            .expect("translation should succeed");
+            assert!(
+                translation.config.proxies.is_empty(),
+                "`{operand}` must not materialize a route"
+            );
+            assert!(
+                !translation
+                    .config
+                    .plugin_configs
+                    .iter()
+                    .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
+                "`{operand}` must not leave a dispatch rule behind"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn header_predicate_wins_over_the_broader_later_rule() {
+        let plugin = dispatch_plugin_for_catch_all(&[grpc_route(
+            "tenants",
+            json!([
+                {
+                    "matches": [{
+                        "method": {"method": "SayHello"},
+                        "headers": [{"name": "x-tenant", "value": "a"}]
+                    }],
+                    "backendRefs": [{"name": "tenant-a", "port": 50051}]
+                },
+                {
+                    "matches": [{"method": {"method": "SayHello"}}],
+                    "backendRefs": [{"name": "shared", "port": 50052}]
+                }
+            ]),
+        )]);
+
+        let mut tenant = grpc_headers();
+        tenant.insert("x-tenant".to_string(), "a".to_string());
+        let (_, port, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut tenant).await;
+        assert!(!rejected);
+        assert_eq!(port, Some(50051), "the tenant rule is more specific");
+
+        let (_, port, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut grpc_headers()).await;
+        assert!(!rejected);
+        assert_eq!(
+            port,
+            Some(50052),
+            "untagged calls fall through to the broader rule"
+        );
+    }
+
+    /// Gateway API v1.5.1 `GRPCRouteSpec` / `GRPCRouteRule`: an HTTPRoute and a
+    /// GRPCRoute attached to the same listener with intersecting hostnames must
+    /// resolve to exactly one accepted Route (oldest `creationTimestamp`, then
+    /// `{namespace}/{name}`), and rules must never be merged between the two
+    /// kinds. The loser must materialize no traffic state at all.
+    ///
+    /// `grpc-api:50051` is only ever the GRPCRoute's backend and `web:8080` is
+    /// only ever the HTTPRoute's, so "did the losing route materialize
+    /// anything?" is answered behaviorally rather than by parsing proxy ids.
+    fn backend_ports(objects: &[K8sObject]) -> Vec<u16> {
+        let translation =
+            translate_k8s_objects(objects, options()).expect("translation should succeed");
+        let mut ports: Vec<u16> = translation
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.backend_port)
+            .collect();
+        for upstream in &translation.config.upstreams {
+            ports.extend(upstream.targets.iter().map(|target| target.port));
+        }
+        for plugin in &translation.config.plugin_configs {
+            for rule in plugin
+                .config
+                .get("rules")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(port) = rule
+                    .get("destination")
+                    .and_then(|destination| destination.get("backend_port"))
+                    .and_then(Value::as_u64)
+                {
+                    ports.push(u16::try_from(port).expect("a translated backend port fits u16"));
+                }
+            }
+        }
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
+    fn dated(mut route: K8sObject, timestamp: &str) -> K8sObject {
+        route.metadata.creation_timestamp = Some(timestamp.to_string());
+        route
+    }
+
+    fn grpc_hello(name: &str) -> K8sObject {
+        grpc_route(
+            name,
+            json!([{
+                "matches": [{"method": {"method": "SayHello"}}],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]),
+        )
+    }
+
+    #[test]
+    fn cross_kind_listener_overlap_accepts_exactly_one_route_by_creation_timestamp() {
+        let http = dated(http_catch_all_route("web"), "2024-01-01T00:00:00Z");
+        let grpc = dated(grpc_hello("grpc"), "2024-02-01T00:00:00Z");
+
+        // The older HTTPRoute wins the listener outright; the GRPCRoute
+        // contributes no proxy, no upstream, and no dispatch destination.
+        for objects in [
+            vec![http.clone(), grpc.clone()],
+            vec![grpc.clone(), http.clone()],
+        ] {
+            assert_eq!(
+                backend_ports(&objects),
+                vec![8080],
+                "the older HTTPRoute wins regardless of input order"
+            );
+        }
+
+        // Flip the timestamps and the GRPCRoute wins instead — the rule is the
+        // creation order, not the kind.
+        let http_newer = dated(http_catch_all_route("web"), "2024-03-01T00:00:00Z");
+        for objects in [
+            vec![http_newer.clone(), grpc.clone()],
+            vec![grpc.clone(), http_newer.clone()],
+        ] {
+            assert_eq!(
+                backend_ports(&objects),
+                vec![50051],
+                "the older GRPCRoute wins regardless of input order"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_kind_tie_on_timestamp_breaks_on_namespace_and_name() {
+        // Same creationTimestamp: `{namespace}/{name}` decides. Both routes are
+        // in `default`, so `aaa-http` sorts before `zzz-grpc`.
+        let http = dated(http_catch_all_route("aaa-http"), "2024-01-01T00:00:00Z");
+        let grpc = dated(grpc_hello("zzz-grpc"), "2024-01-01T00:00:00Z");
+        for objects in [
+            vec![http.clone(), grpc.clone()],
+            vec![grpc.clone(), http.clone()],
+        ] {
+            assert_eq!(backend_ports(&objects), vec![8080]);
+        }
+
+        let http = dated(http_catch_all_route("zzz-http"), "2024-01-01T00:00:00Z");
+        let grpc = dated(grpc_hello("aaa-grpc"), "2024-01-01T00:00:00Z");
+        for objects in [
+            vec![http.clone(), grpc.clone()],
+            vec![grpc.clone(), http.clone()],
+        ] {
+            assert_eq!(backend_ports(&objects), vec![50051]);
+        }
+    }
+
+    /// `{namespace}/{name}` is unique *within* a kind but not across kinds, and
+    /// `metadata.creationTimestamp` has second granularity — so one
+    /// `kubectl apply` of an HTTPRoute and a GRPCRoute that share a name ties
+    /// on every Gateway API ordering field. The accepted Route must still be
+    /// the same one regardless of the order the objects are observed in.
+    #[test]
+    fn cross_kind_tie_on_timestamp_and_name_is_still_order_independent() {
+        let http = dated(http_catch_all_route("echo"), "2024-01-01T00:00:00Z");
+        let grpc = dated(grpc_hello("echo"), "2024-01-01T00:00:00Z");
+
+        let forward = backend_ports(&[http.clone(), grpc.clone()]);
+        let reverse = backend_ports(&[grpc, http]);
+        assert_eq!(
+            forward, reverse,
+            "a total tie must not resolve by watch arrival order"
+        );
+        assert_eq!(
+            forward.len(),
+            1,
+            "exactly one Route may be accepted on the listener, got {forward:?}"
+        );
+    }
+
+    #[test]
+    fn cross_kind_routes_on_disjoint_hostnames_both_materialize() {
+        // The rejection is hostname-scoped: no intersection, no conflict.
+        let http = dated(http_catch_all_route("web"), "2024-01-01T00:00:00Z");
+        let mut grpc = dated(grpc_hello("grpc"), "2024-02-01T00:00:00Z");
+        grpc.spec["hostnames"] = json!(["rpc.example.com"]);
+
+        assert_eq!(
+            backend_ports(&[http, grpc]),
+            vec![8080, 50051],
+            "disjoint hostnames are different listeners' worth of traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cross_kind_losing_grpc_route_cannot_route_traffic() {
+        let objects = [
+            dated(http_catch_all_route("web"), "2024-01-01T00:00:00Z"),
+            dated(grpc_hello("grpc"), "2024-02-01T00:00:00Z"),
+        ];
+        let translation =
+            translate_k8s_objects(&objects, options()).expect("translation should succeed");
+
+        // No rule anywhere can send `/helloworld.Greeter/SayHello` to the gRPC
+        // backend, because the GRPCRoute never materialized.
+        for plugin in translation
+            .config
+            .plugin_configs
+            .iter()
+            .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        {
+            let dispatch = MeshRouteDispatch::new(&plugin.config)
+                .expect("translated dispatch config is valid");
+            let (_, port, _) = resolved_backend(
+                &dispatch,
+                "/helloworld.Greeter/SayHello",
+                &mut grpc_headers(),
+            )
+            .await;
+            assert_ne!(
+                port,
+                Some(50051),
+                "the rejected GRPCRoute must not route any traffic"
+            );
+        }
+
+        assert!(
+            translation.warnings.iter().any(|warning| {
+                warning.contains("GRPCRoute default/grpc")
+                    && warning.contains("Gateway API forbids merging")
+            }),
+            "the rejection must be reported: {:?}",
+            translation.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_and_deleting_the_route_republishes_the_dispatch_generation() {
+        let initial = [grpc_route(
+            "hello",
+            json!([{
+                "matches": [{"method": {"method": "SayHello"}}],
+                "backendRefs": [{"name": "grpc-v1", "port": 50051}]
+            }]),
+        )];
+        let (_, port, _) = resolved_backend(
+            &dispatch_plugin_for_catch_all(&initial),
+            "/helloworld.Greeter/SayHello",
+            &mut grpc_headers(),
+        )
+        .await;
+        assert_eq!(port, Some(50051));
+
+        // Update: the same route now names a different method and backend.
+        // The regenerated plugin must serve the new predicate and reject the
+        // old one — no stale rule survives the reload.
+        let updated = [grpc_route(
+            "hello",
+            json!([{
+                "matches": [{"method": {"method": "SayGoodbye"}}],
+                "backendRefs": [{"name": "grpc-v2", "port": 50052}]
+            }]),
+        )];
+        let plugin = dispatch_plugin_for_catch_all(&updated);
+        let (_, port, rejected) = resolved_backend(
+            &plugin,
+            "/helloworld.Greeter/SayGoodbye",
+            &mut grpc_headers(),
+        )
+        .await;
+        assert!(!rejected);
+        assert_eq!(port, Some(50052));
+        let (_, _, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut grpc_headers()).await;
+        assert!(rejected, "the replaced predicate must no longer match");
+
+        // Delete: with the route gone the `/` listener and its dispatch
+        // instance disappear entirely.
+        let empty: [K8sObject; 0] = [];
+        let translation =
+            translate_k8s_objects(&empty, options()).expect("translation should succeed");
+        assert!(translation.config.proxies.is_empty());
+        assert!(
+            !translation
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        );
+    }
+}

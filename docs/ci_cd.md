@@ -1082,6 +1082,94 @@ example consumes the exact `origin/${BASE_REF}` fetched by the immediately
 preceding policy step, so those adjacent steps have an intentional ordering
 dependency.
 
+##### Trusted-base relevance for required live gates
+
+`mesh-e2e-sidecar-live.yml` and `multicluster-federation-live.yml` publish
+required status checks that may legitimately skip their expensive live job when
+a pull request touches nothing relevant. That skip is a security boundary: if
+the relevance verdict were computed by the pull request's own copy of
+`.github/scripts/live_suite_path_filter.py`, a pull request could widen
+`SUITE_PATTERNS`, declare itself irrelevant, skip the live job, and still turn
+the required gate green.
+
+Both workflows therefore share one byte-identical relevance job, frozen in the
+trusted verifier as `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE` and enforced absolutely
+by `live_suite_relevance_errors` in exact validation *and* in pull-request
+comparison. Only the display name, temp-file slug, and `--suite` selector
+differ. Its load-bearing properties:
+
+- The relevance script comes from the base-branch tip of the **base**
+  repository, never from the pull-request checkout. This holds for fork pull
+  requests too, because `github.base_ref` always names a branch in the base
+  repository and `origin` is the base repository.
+- That tip is resolved **once** to a full 40-hex commit id, and every later read
+  goes through that id and then through the blob's own object id, so a push to
+  `main` between validation and execution cannot swap the script (TOCTOU).
+- `github.base_ref` is untrusted text: it is charset- and shape-validated before
+  it can reach a refspec, so no option, pathspec, or revision-syntax
+  metacharacter (`-`, `..`, `:`, `^`, `~`, `@{`, glob characters) can be
+  smuggled into a git invocation.
+- The tree entry must be a single regular blob (`100644`/`100755`) at the pinned
+  path and at most 256 KiB. A symlink (`120000`), gitlink (`160000`), tree,
+  missing entry, multi-entry match, or oversized blob fails closed.
+- Every failure path exits non-zero, and the emitted verdict must literally be
+  `true` or `false`, so acquisition or execution failure fails the gate instead
+  of defaulting to "irrelevant".
+- The filter runs under `python3 -I`, so nothing the pull request committed can
+  be imported into the trusted interpreter.
+
+Freezing the relevance job alone would not be enough — a pull request could
+leave it untouched and instead rewrite the live job's `needs`/`if`. The binding
+`needs: changes` plus `if: needs.changes.outputs.relevant == 'true'` is
+therefore part of the same contract, and deleting a governed workflow outright
+is rejected as well.
+
+##### Admitted fuzz/property lane
+
+Issue #2461 requires a short deterministic property/fuzz smoke in ordinary CI
+and a longer sanitizer-backed scheduled lane. The trusted policy rejects any new
+Cross-readable executable surface in `ci.yml` outside the protected ARM64 job,
+so rather than relaxing that rule the policy admits **exactly two** byte-frozen
+shapes and nothing else:
+
+- `CI_FUZZ_SMOKE_JOB` — the entire `fuzz-smoke` job in `ci.yml`. A repository
+  that has not adopted it may omit it; once the trusted base carries it, a pull
+  request may neither remove nor alter it. Its surfaces, and only its surfaces,
+  are then withheld from the `ci.yml` surface comparison; a top-level surface
+  and every other job's surfaces are unaffected. Every command, action pin,
+  toolchain pin (`nightly-2025-07-01`), tool version (`cargo-fuzz 0.13.1`),
+  target name, and libFuzzer bound (`-runs`, `-max_total_time`, `-max_len`,
+  `-timeout`, `-rss_limit_mb`) is part of the contract. All automation commands
+  are inline and cannot be redirected through a repository-supplied script;
+  the read-only job necessarily compiles and executes pull-request-authored Rust
+  tests and fuzz targets.
+- `FUZZ_WORKFLOW` — the whole of `.github/workflows/fuzz.yml`. A repository
+  that has not adopted it may omit it; once the trusted base carries it, a pull
+  request may neither remove nor alter it. Whole-file
+  equality is the contract because a scheduled lane's triggers, permissions, and
+  concurrency are as security-relevant as its steps. It is `schedule` +
+  input-less `workflow_dispatch` only (no untrusted head can schedule it),
+  read-only at workflow and job level, references no secret, pins every action
+  to a full commit SHA, bounds every libFuzzer run in wall time / input length /
+  per-input timeout / RSS, re-checks the matrix target against a literal
+  allowlist before it reaches a command line, rejects symlinks and other
+  non-regular crash-artifact objects, and bounds regular artifacts by size and
+  count **before** publication — with the upload gated on that bounding step
+  having succeeded, from one fixed path, at short retention.
+
+Neither admitted shape names the protected ARM64 target or the Cross executable,
+requests write permission, or references a secret; the verifier self-tests
+assert each of those directly, plus rejection of budget widening, unpinned or
+mutable action/tool pins, local-action substitution, shell indirection,
+untrusted interpolation, broadened triggers or permissions, arbitrary target
+selection, ungated publication, and widened artifact paths.
+
+Because only the repository-root Cargo configuration is validated, a committed
+`.cargo/config[.toml]` anywhere below the root is now rejected outright
+(`validate_nested_cargo_configuration_tree`): the fuzz lane runs with
+`working-directory: fuzz`, and a nested Cargo configuration there would be an
+unreviewed place to set a target linker, runner, or rustflags.
+
 #### 8. Latest Release and Docker Jobs
 
 **Runs**: `ubuntu-latest`

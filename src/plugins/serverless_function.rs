@@ -102,6 +102,69 @@ const ALLOWED_CONFIG_FIELDS: &[&str] = &[
 
 const DEFAULT_INSTANCE_ID: &str = "standalone";
 
+/// Maximum custom trailer entries accepted from a gRPC terminate function
+/// response. Protocol-owned `grpc-status` / `grpc-message` /
+/// `grpc-status-details-bin` are counted separately via dedicated fields.
+const MAX_GRPC_TERMINATE_CUSTOM_TRAILERS: usize = 32;
+/// Per-trailer **wire** value byte cap. Bounds one field only; the size of the
+/// block a peer must accept is bounded separately by
+/// [`MAX_GRPC_TERMINATE_TERMINAL_BLOCK_BYTES`].
+///
+/// This bound is applied to the bytes that actually reach the trailer block,
+/// after sanitization and after any re-encoding — not to some pre-image of
+/// them. `grpc_message` is therefore bounded here rather than only by
+/// `max_response_body_bytes` (which can be many MiB), and
+/// `status_details_base64` is bounded by its re-encoded base64 length rather
+/// than by the decoded byte count that base64 expands 4/3 beyond.
+const MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES: usize = 8 * 1024;
+/// Largest decoded `grpc-status-details-bin` payload whose standard-base64
+/// re-encoding still fits [`MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES`]. Base64
+/// emits four characters per three input bytes, so the decoded ceiling is
+/// three quarters of the wire ceiling.
+const MAX_GRPC_TERMINATE_STATUS_DETAILS_DECODED_BYTES: usize =
+    MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES / 4 * 3;
+/// Per-field accounting overhead an HTTP/2 peer adds when charging a header
+/// list against `SETTINGS_MAX_HEADER_LIST_SIZE` (RFC 9113 §6.5.2: name length +
+/// value length + 32). HTTP/3 charges the same shape for a field section
+/// against `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2), so one constant
+/// covers both wire protocols this contract can terminate on.
+const GRPC_TERMINATE_HEADER_FIELD_OVERHEAD_BYTES: usize = 32;
+/// Aggregate ceiling for the COMPLETE terminal metadata block the contract
+/// authors — every emitted field, not one value at a time.
+///
+/// [`MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES`] alone bounds only a single field.
+/// With [`MAX_GRPC_TERMINATE_CUSTOM_TRAILERS`] custom entries plus the
+/// protocol-owned `grpc-message` / `grpc-status-details-bin`, a contract could
+/// authorize ~256 KiB of trailer values and still pass every per-entry check —
+/// far beyond any header-list size a peer is obliged to accept, and retained in
+/// memory until emission. The block is therefore charged as a whole.
+///
+/// 16 KiB is the established repository floor for this resource: proxy H2
+/// listeners never advertise a `SETTINGS_MAX_HEADER_LIST_SIZE` below
+/// `MIN_H2_HEADER_LIST_SIZE` (16 KiB, `src/proxy/mod.rs`), while the configured
+/// header budget defaults to 32 KiB (`FERRUM_MAX_HEADER_SIZE_BYTES`) and the
+/// admin listener advertises 64 KiB. Staying at the smallest of those keeps an
+/// accepted terminal block deliverable on every H2/H3 client Ferrum expects,
+/// rather than accepted here and reset by the peer.
+const MAX_GRPC_TERMINATE_TERMINAL_BLOCK_BYTES: usize = 16 * 1024;
+/// Allowed top-level keys in the terminate-mode native-gRPC JSON contract.
+const GRPC_TERMINATE_RESPONSE_FIELDS: &[&str] = &[
+    "grpc_status",
+    "grpc_message",
+    "message_base64",
+    "status_details_base64",
+    "trailers",
+];
+/// Max characters of one function-controlled field-name fragment rendered into
+/// an operator diagnostic. A hostile key must not dominate the log line.
+const MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS: usize = 64;
+/// Max characters of a complete terminate-contract operator diagnostic. Caps
+/// the log record even when several field fragments are present.
+const MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS: usize = 256;
+/// How many unknown top-level member names may appear in the diagnostic sample.
+/// The full inventory is never collected or joined solely for logging.
+const MAX_GRPC_TERMINATE_UNKNOWN_FIELD_SAMPLE: usize = 3;
+
 #[derive(Debug)]
 struct InvocationFailure {
     code: &'static str,
@@ -1900,11 +1963,624 @@ fn has_non_empty_authority(url: &str) -> bool {
     authority_end > 0
 }
 
-fn starts_with_grpc_content_type(value: &str) -> bool {
-    value
-        .as_bytes()
-        .get(..b"application/grpc".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"application/grpc"))
+fn request_content_type<'a>(
+    headers: &'a HashMap<String, String>,
+    ctx: &'a RequestContext,
+) -> Option<&'a str> {
+    headers
+        .get("content-type")
+        .map(String::as_str)
+        .or_else(|| ctx.headers.get("content-type").map(String::as_str))
+}
+
+/// True when the frontend classified this request as native gRPC.
+///
+/// The request-scoped flavor is the ONLY classification used here. Production
+/// frontends stamp `RequestContext::request_http_flavor` once at intake, and
+/// every downstream consumer of the framed terminate contract — the reject
+/// finalizer's `is_grpc_request`, the H1/H2 body builder, and the H3 writers —
+/// keys off that same intake decision. The live effective `content-type` is
+/// mutable: `request_transformer` runs before this plugin and can rewrite a
+/// Plain request's `content-type` to `application/grpc`. Honouring that would
+/// make `serverless_function` author a framed unary response for a request the
+/// frontend and finalizer still treat as ordinary HTTP, so the header is not
+/// consulted.
+///
+/// gRPC-Web is a separate question with the opposite problem — see
+/// [`is_grpc_web_terminate_request`], where the live header is *insufficient*
+/// rather than untrustworthy.
+fn is_native_grpc_terminate_request(ctx: &RequestContext) -> bool {
+    ctx.is_native_grpc_request()
+}
+
+/// True when the client spoke gRPC-Web, including after translation.
+///
+/// The live `content-type` alone cannot answer this: `grpc_web` (priority 260)
+/// runs its `on_request_received` / `before_proxy` well ahead of this plugin
+/// (3025) and rewrites both `ctx.headers` and the effective header view to
+/// `application/grpc`, so a translated browser request is indistinguishable
+/// from native gRPC by header inspection at this point. The request-scoped
+/// markers are the authoritative signal — the translation claim
+/// (`request_is_grpc_web_translated`) and the retained client representation
+/// used by pass-through deployments that omit the plugin
+/// (`client_uses_grpc_web`) — and neither is derivable from client input.
+fn is_grpc_web_terminate_request(headers: &HashMap<String, String>, ctx: &RequestContext) -> bool {
+    if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
+        || crate::plugins::grpc_web::client_uses_grpc_web(ctx)
+    {
+        return true;
+    }
+    request_content_type(headers, ctx)
+        .is_some_and(crate::plugins::grpc_web::is_grpc_web_content_type)
+}
+
+fn sanitize_grpc_terminate_message(message: &str) -> String {
+    message
+        .chars()
+        .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Render a function-controlled field name for an operator diagnostic: control
+/// characters, Unicode line separators, and the surrounding quote delimiter
+/// become single-line escapes, and the displayed fragment is capped at
+/// [`MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS`].
+fn render_grpc_terminate_diagnostic_field_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut displayed = 0usize;
+    for ch in name.chars() {
+        let segment = match ch {
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            '\t' => "\\t".to_string(),
+            '\'' => "\\'".to_string(),
+            '\\' => "\\\\".to_string(),
+            '\u{2028}' => "\\u{2028}".to_string(),
+            '\u{2029}' => "\\u{2029}".to_string(),
+            c if c.is_control() => format!("\\u{{{:04x}}}", c as u32),
+            c => c.to_string(),
+        };
+        let segment_chars = segment.chars().count();
+        if displayed.saturating_add(segment_chars) > MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS
+        {
+            if displayed < MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS {
+                out.push('…');
+            }
+            break;
+        }
+        displayed = displayed.saturating_add(segment_chars);
+        out.push_str(&segment);
+    }
+    out
+}
+
+/// Bound a terminate-contract operator detail to a single line of at most
+/// [`MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS`] characters.
+fn bound_grpc_terminate_operator_detail(detail: String) -> String {
+    let single_line: String = detail
+        .chars()
+        .map(|c| {
+            if matches!(c, '\r' | '\n' | '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let char_count = single_line.chars().count();
+    if char_count <= MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS {
+        return single_line;
+    }
+    let keep = MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS.saturating_sub(1);
+    let truncated: String = single_line.chars().take(keep).collect();
+    format!("{truncated}…")
+}
+
+/// Fail-closed terminate-contract refusal under the fixed client-visible class.
+/// The operator detail is bounded and single-line; the client only sees `code`.
+fn invalid_grpc_terminate_response(operator_detail: impl Into<String>) -> InvocationFailure {
+    InvocationFailure::new(
+        "invalid_grpc_terminate_response",
+        bound_grpc_terminate_operator_detail(operator_detail.into()),
+    )
+}
+
+/// Diagnostic for unknown top-level contract members: a deterministic bounded
+/// sample plus a count, never an unbounded joined inventory of names.
+/// Returns `None` when every member is recognized.
+fn unknown_grpc_terminate_fields_detail<'a>(
+    unknown_keys: impl Iterator<Item = &'a str>,
+) -> Option<String> {
+    let mut unknown_count = 0usize;
+    let mut sample: Vec<&'a str> = Vec::with_capacity(MAX_GRPC_TERMINATE_UNKNOWN_FIELD_SAMPLE);
+    for key in unknown_keys {
+        unknown_count += 1;
+        if sample.len() < MAX_GRPC_TERMINATE_UNKNOWN_FIELD_SAMPLE {
+            sample.push(key);
+        }
+    }
+    if unknown_count == 0 {
+        return None;
+    }
+    let mut rendered = String::from("unknown gRPC terminate response field(s) (");
+    rendered.push_str(&unknown_count.to_string());
+    rendered.push_str("): ");
+    for (index, key) in sample.iter().enumerate() {
+        if index > 0 {
+            rendered.push_str(", ");
+        }
+        rendered.push('\'');
+        rendered.push_str(&render_grpc_terminate_diagnostic_field_name(key));
+        rendered.push('\'');
+    }
+    if unknown_count > sample.len() {
+        rendered.push_str(", …");
+    }
+    Some(rendered)
+}
+
+/// Encode a sanitized status message into the canonical `grpc-message` wire
+/// form required by the gRPC HTTP/2 mapping:
+///
+/// ```text
+/// Status-Message         = Percent-Encoded
+/// Percent-Encoded        = 1*(Percent-Byte-Unescaped / Percent-Encoded-Byte)
+/// Percent-Byte-Unescaped = %x20-%x24 / %x26-%x7E
+/// Percent-Encoded-Byte   = "%" 2HEXDIG
+/// ```
+///
+/// Bytes the grammar allows unescaped stay literal. `%` (0x25) is escaped so an
+/// author's literal percent sign cannot be decoded by the client as an escape,
+/// and every byte outside `0x20..=0x7E` — ASCII controls the CR/LF sanitizer
+/// does not cover, `DEL`, and each UTF-8 continuation byte of a non-ASCII
+/// character — is escaped as `%XX`. Hex digits are uppercase, matching the
+/// canonical form other gRPC implementations emit.
+///
+/// The result is pure printable ASCII, so it is a valid HTTP field value by
+/// construction, contains no CR/LF, and is a fixed point of the gateway's
+/// downstream `sanitize_grpc_message` (the input was already trimmed, so no
+/// leading/trailing space survives to be trimmed again). That is what keeps the
+/// emitted value byte-stable across the H1/H2 normalizer and both H3 writers.
+fn percent_encode_grpc_message(message: &str) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(message.len());
+    for &byte in message.as_bytes() {
+        if matches!(byte, 0x20..=0x24 | 0x26..=0x7e) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX_DIGITS[usize::from(byte >> 4)] as char);
+            encoded.push(HEX_DIGITS[usize::from(byte & 0x0f)] as char);
+        }
+    }
+    encoded
+}
+
+/// Frame one uncompressed unary gRPC DATA message: flag(0) + BE length + bytes.
+fn frame_uncompressed_unary_grpc_message(message: &[u8]) -> Result<Bytes, String> {
+    let len = u32::try_from(message.len()).map_err(|_| {
+        "serverless_function: gRPC terminate message exceeds u32 length".to_string()
+    })?;
+    let mut framed = Vec::with_capacity(5 + message.len());
+    framed.push(0);
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(message);
+    Ok(Bytes::from(framed))
+}
+
+/// Decode a standard-base64 contract field under a decoded-byte ceiling.
+///
+/// `limit_label` names the ceiling that was violated so an operator can tell a
+/// `max_response_body_bytes` overrun apart from a trailer-value overrun without
+/// reading the source.
+fn decode_bounded_base64_field(
+    value: &str,
+    field: &str,
+    max_decoded_bytes: usize,
+    limit_label: &str,
+) -> Result<Vec<u8>, String> {
+    // Reject standard/base64url alphabet waste that would decode far beyond the
+    // ceiling before allocating the decoded buffer.
+    let approx_decoded = value.len().saturating_mul(3) / 4;
+    if approx_decoded > max_decoded_bytes.saturating_add(3) {
+        return Err(format!(
+            "serverless_function: gRPC terminate '{field}' exceeds {limit_label}"
+        ));
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value.as_bytes())
+        .map_err(|_| {
+            format!("serverless_function: gRPC terminate '{field}' must be standard base64")
+        })?;
+    if decoded.len() > max_decoded_bytes {
+        return Err(format!(
+            "serverless_function: gRPC terminate '{field}' exceeds {limit_label}"
+        ));
+    }
+    Ok(decoded)
+}
+
+fn is_reserved_grpc_terminate_trailer_name(name: &str) -> bool {
+    crate::proxy::grpc_proxy::is_reserved_grpc_terminal_metadata(name)
+        || name.eq_ignore_ascii_case("content-type")
+        || name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("grpc-encoding")
+        || name.eq_ignore_ascii_case("grpc-accept-encoding")
+}
+
+/// Charge a built terminate field map the way an H2/H3 peer charges a header
+/// list: name bytes + value bytes + per-field overhead, over every field.
+///
+/// Returns `None` on arithmetic overflow so the caller fails closed rather than
+/// wrapping into an apparently small total.
+fn grpc_terminate_terminal_block_bytes(fields: &HashMap<String, String>) -> Option<usize> {
+    let mut total: usize = 0;
+    for (name, value) in fields {
+        total = total
+            .checked_add(name.len())?
+            .checked_add(value.len())?
+            .checked_add(GRPC_TERMINATE_HEADER_FIELD_OVERHEAD_BYTES)?;
+    }
+    Some(total)
+}
+
+/// Parse the terminate-mode native-gRPC JSON contract and build the client
+/// RejectBinary parts (HTTP 200 + `application/grpc` + framed unary body /
+/// trailers-only signalling).
+///
+/// Contract (fail-closed, unknown fields rejected):
+/// ```json
+/// {
+///   "grpc_status": 0,
+///   "grpc_message": "optional",
+///   "message_base64": "optional raw protobuf bytes",
+///   "status_details_base64": "optional grpc-status-details-bin",
+///   "trailers": { "x-custom": "value" }
+/// }
+/// ```
+///
+/// The gateway owns framing and reserved terminal metadata. Compression and
+/// streaming forms are rejected explicitly.
+///
+/// The raw bytes are screened with the shared bounded duplicate-member scanner
+/// ([`crate::util::json_dup_keys`], advisory `GHSA-c78j-5w9p-cpq6`) BEFORE
+/// `serde_json` collapses them. `serde_json` keeps the LAST of duplicate object
+/// members, so without this screen a function response carrying
+/// `"grpc_status": 0` twice — or spelling one of them with a `\u` escape, or
+/// duplicating a member of the nested `trailers` object — would have the
+/// gateway author a terminal status/trailer set that a first-wins parser reading
+/// the same bytes never agrees with. That authored representation is exactly
+/// what `FramedGrpcUnaryProvenance` then binds and emits as trailers, so the
+/// ambiguity must be refused rather than resolved.
+fn build_native_grpc_terminate_response(
+    function_http_status: u16,
+    body: &[u8],
+    max_response_body_bytes: usize,
+) -> Result<(u16, Bytes, HashMap<String, String>), InvocationFailure> {
+    if !(200..=299).contains(&function_http_status) {
+        return Err(InvocationFailure::new(
+            "invalid_grpc_terminate_status",
+            format!(
+                "gRPC terminate requires a 2xx function HTTP status, got {function_http_status}"
+            ),
+        ));
+    }
+
+    // Screen the RAW bytes before `serde_json` collapses duplicate members. The
+    // scanner walks nested objects under explicit budgets and compares DECODED
+    // member names, so an escaped-equivalent spelling and a duplicate inside
+    // `trailers` are both caught; budget exhaustion fails closed as well.
+    // Ordinary malformed bytes report nothing here and keep the existing
+    // malformed-body diagnostic below.
+    //
+    // `reason` is one of a fixed set of `&'static str` values and never contains
+    // any byte of the inspected document, so this stays operator-safe even
+    // though the function response is attacker-influencable through the request.
+    if let Some(reason) = crate::util::json_dup_keys::slice_ambiguity(body) {
+        return Err(invalid_grpc_terminate_response(format!(
+            "gRPC terminate function response is ambiguous: {reason}"
+        )));
+    }
+
+    let parsed: Value = serde_json::from_slice(body).map_err(|_| {
+        invalid_grpc_terminate_response("gRPC terminate function response must be a JSON object")
+    })?;
+    let object = parsed.as_object().ok_or_else(|| {
+        invalid_grpc_terminate_response("gRPC terminate function response must be a JSON object")
+    })?;
+
+    // Reject unsupported streaming / compression contract shapes explicitly
+    // before the generic unknown-field diagnostic so operators get a precise
+    // reason rather than a field-list error.
+    if object.contains_key("streaming")
+        || object.contains_key("messages")
+        || object.contains_key("grpc_encoding")
+        || object.contains_key("message_compressed")
+        || object.contains_key("compression")
+    {
+        return Err(InvocationFailure::new(
+            "unsupported_grpc_terminate_encoding",
+            "gRPC terminate supports only uncompressed unary responses",
+        ));
+    }
+
+    // Never collect/sort/join an unbounded inventory of unknown names solely for
+    // logging. serde_json::Map iterates in sorted key order, so the first
+    // sample slots are deterministic; only a bounded sample plus a count is
+    // rendered, and each name fragment is escaped/capped.
+    if let Some(detail) = unknown_grpc_terminate_fields_detail(
+        object
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !GRPC_TERMINATE_RESPONSE_FIELDS.contains(key)),
+    ) {
+        return Err(invalid_grpc_terminate_response(detail));
+    }
+
+    let grpc_status = object
+        .get("grpc_status")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            invalid_grpc_terminate_response(
+                "gRPC terminate response requires integer 'grpc_status'",
+            )
+        })?;
+    if grpc_status > u64::from(u32::MAX) {
+        return Err(invalid_grpc_terminate_response(
+            "gRPC terminate 'grpc_status' is out of range",
+        ));
+    }
+    let grpc_status = grpc_status as u32;
+
+    let grpc_message = match object.get("grpc_message") {
+        None => None,
+        Some(Value::String(message)) => {
+            // The contract documents `grpc_message` as human-readable text, but
+            // the wire field is `Percent-Encoded` per the gRPC HTTP mapping.
+            // Normalize CR/LF deterministically first, then encode; emitting the
+            // raw text would put a bare `%` (which clients decode as an escape)
+            // and raw non-ASCII bytes into a field whose grammar forbids both.
+            let sanitized = sanitize_grpc_terminate_message(message);
+            if sanitized.is_empty() {
+                None
+            } else {
+                let encoded = percent_encode_grpc_message(&sanitized);
+                // `grpc_message` becomes a terminal trailer value, so it is
+                // bound by the same advertised wire ceiling every other trailer
+                // value is. Without this it inherits only
+                // `max_response_body_bytes` — many MiB on a default deployment —
+                // and a single status message could dominate the TRAILERS block.
+                // The check is on the ENCODED bytes because those are what reach
+                // the wire: percent-encoding expands a byte threefold, so
+                // bounding the pre-encoding string would admit a ~24 KiB field.
+                if encoded.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
+                    return Err(invalid_grpc_terminate_response(format!(
+                        "gRPC terminate 'grpc_message' exceeds {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes once percent-encoded"
+                    )));
+                }
+                // Custom trailers are field-value validated below; hold the
+                // protocol-owned message to the same bar. Percent-encoding
+                // already guarantees printable ASCII, so this cannot fire today
+                // — it is retained so a future change to the encoder fails
+                // closed here rather than silently dropping `grpc-message` at
+                // trailer construction, where `HeaderValue::from_str` errors are
+                // discarded.
+                if HeaderValue::from_str(&encoded).is_err() {
+                    return Err(invalid_grpc_terminate_response(
+                        "gRPC terminate 'grpc_message' is not a valid HTTP field value",
+                    ));
+                }
+                Some(encoded)
+            }
+        }
+        Some(_) => {
+            return Err(invalid_grpc_terminate_response(
+                "gRPC terminate 'grpc_message' must be a string",
+            ));
+        }
+    };
+
+    // Message bytes are raw protobuf (not length-prefixed). Frame overhead is 5
+    // bytes; keep the framed unary payload within max_response_body_bytes.
+    let max_message_bytes = max_response_body_bytes.saturating_sub(5);
+    let message_bytes = match object.get("message_base64") {
+        None => None,
+        Some(Value::String(encoded)) => {
+            if encoded.is_empty() {
+                Some(Vec::new())
+            } else {
+                Some(
+                    decode_bounded_base64_field(
+                        encoded,
+                        "message_base64",
+                        max_message_bytes,
+                        "max_response_body_bytes",
+                    )
+                    .map_err(invalid_grpc_terminate_response)?,
+                )
+            }
+        }
+        Some(_) => {
+            return Err(invalid_grpc_terminate_response(
+                "gRPC terminate 'message_base64' must be a string",
+            ));
+        }
+    };
+
+    let status_details = match object.get("status_details_base64") {
+        None => None,
+        Some(Value::String(encoded)) => {
+            if encoded.is_empty() {
+                None
+            } else {
+                // The ceiling is on the re-encoded wire value, so the decoded
+                // ceiling is scaled down by base64's 4/3 expansion. Bounding the
+                // decoded bytes at the wire cap instead would admit a ~10.9 KiB
+                // trailer value.
+                let details_limit_label = format!(
+                    "the {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES}-byte \
+                     grpc-status-details-bin trailer value ceiling"
+                );
+                let decoded = decode_bounded_base64_field(
+                    encoded,
+                    "status_details_base64",
+                    MAX_GRPC_TERMINATE_STATUS_DETAILS_DECODED_BYTES,
+                    &details_limit_label,
+                )
+                .map_err(invalid_grpc_terminate_response)?;
+                // grpc-status-details-bin is a binary trailer; re-encode the
+                // validated bytes so only well-formed base64 reaches the wire.
+                let reencoded = base64::engine::general_purpose::STANDARD.encode(decoded);
+                // Belt-and-braces on the value that is actually emitted: the
+                // decoded ceiling above is derived from this one, so a future
+                // change to either constant cannot silently widen the wire cap.
+                if reencoded.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
+                    return Err(invalid_grpc_terminate_response(format!(
+                        "gRPC terminate 'status_details_base64' re-encodes to more than \
+                         {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes"
+                    )));
+                }
+                Some(reencoded)
+            }
+        }
+        Some(_) => {
+            return Err(invalid_grpc_terminate_response(
+                "gRPC terminate 'status_details_base64' must be a string",
+            ));
+        }
+    };
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    response_headers.insert("grpc-status".to_string(), grpc_status.to_string());
+    if let Some(message) = grpc_message {
+        response_headers.insert("grpc-message".to_string(), message);
+    }
+    if let Some(details) = status_details {
+        response_headers.insert("grpc-status-details-bin".to_string(), details);
+    }
+
+    if let Some(trailers_value) = object.get("trailers") {
+        let trailers = trailers_value.as_object().ok_or_else(|| {
+            invalid_grpc_terminate_response(
+                "gRPC terminate 'trailers' must be an object of string values",
+            )
+        })?;
+        if trailers.len() > MAX_GRPC_TERMINATE_CUSTOM_TRAILERS {
+            return Err(invalid_grpc_terminate_response(format!(
+                "gRPC terminate 'trailers' exceeds {MAX_GRPC_TERMINATE_CUSTOM_TRAILERS} entries"
+            )));
+        }
+        // HTTP/gRPC metadata names are case-insensitive, so `X-Foo` and `x-foo`
+        // are the SAME trailer. JSON object members are not: both survive
+        // parsing as distinct keys and would collapse on insertion, silently
+        // emitting whichever the map iterated last. That is nondeterministic
+        // (map order) and loses an authored value, so reject it with a
+        // field-specific diagnostic instead.
+        //
+        // Deliberately scoped to case folding: the shared `json_dup_keys` screen
+        // at the top of this function already refused every JSON-level duplicate
+        // member name (including this nested `trailers` object), so what remains
+        // here is the HTTP-specific collision that JSON considers two distinct
+        // members.
+        let mut seen_trailer_names: HashSet<String> = HashSet::with_capacity(trailers.len());
+        for (name, value) in trailers {
+            let displayed_name = render_grpc_terminate_diagnostic_field_name(name);
+            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                invalid_grpc_terminate_response(format!(
+                    "gRPC terminate trailer name '{displayed_name}' is not a valid HTTP field name"
+                ))
+            })?;
+            let lower = header_name.as_str();
+            let displayed_lower = render_grpc_terminate_diagnostic_field_name(lower);
+            if !crate::plugins::grpc_web::is_grpc_metadata_name(lower) {
+                return Err(invalid_grpc_terminate_response(format!(
+                    "gRPC terminate trailer name '{displayed_name}' is outside the gRPC metadata name alphabet"
+                )));
+            }
+            if !seen_trailer_names.insert(lower.to_string()) {
+                return Err(invalid_grpc_terminate_response(format!(
+                    "gRPC terminate 'trailers' declares '{displayed_lower}' more than once; \
+                     trailer names are case-insensitive"
+                )));
+            }
+            if is_reserved_grpc_terminate_trailer_name(lower) {
+                return Err(invalid_grpc_terminate_response(format!(
+                    "gRPC terminate trailer '{displayed_lower}' is protocol-owned; use the dedicated contract fields"
+                )));
+            }
+            let value = value.as_str().ok_or_else(|| {
+                invalid_grpc_terminate_response(format!(
+                    "gRPC terminate trailer '{displayed_lower}' must be a string"
+                ))
+            })?;
+            if value.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
+                return Err(invalid_grpc_terminate_response(format!(
+                    "gRPC terminate trailer '{displayed_lower}' exceeds {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes"
+                )));
+            }
+            if !crate::plugins::grpc_web::is_valid_trailer_value(value)
+                || HeaderValue::from_str(value).is_err()
+            {
+                return Err(invalid_grpc_terminate_response(format!(
+                    "gRPC terminate trailer '{displayed_lower}' is not a valid gRPC ASCII value"
+                )));
+            }
+            if lower.ends_with("-bin") && !crate::plugins::grpc_web::is_base64_metadata_value(value)
+            {
+                return Err(invalid_grpc_terminate_response(format!(
+                    "gRPC terminate binary trailer '{displayed_lower}' must contain standard base64, with or without padding"
+                )));
+            }
+            // Values are validated above and never interpolated into diagnostics.
+            response_headers.insert(lower.to_string(), value.to_string());
+        }
+    }
+
+    // Aggregate bound on the COMPLETE terminal metadata block. Per-entry and
+    // per-count limits above bound one field and the field count; neither bounds
+    // the block a peer actually has to accept. `response_headers` is exactly what
+    // both authored shapes emit — the framed shape sends it as trailers, the
+    // status-only shape as a Trailers-Only HEADERS block — so charging the map
+    // here covers both. The gateway's own `content-type` is charged too: it
+    // shares that single block in the trailers-only shape, and counting it is
+    // the conservative direction.
+    //
+    // The diagnostic is fixed text: it names no trailer, echoes no value, and so
+    // cannot leak attacker- or function-supplied material into operator logs.
+    let block_bytes = grpc_terminate_terminal_block_bytes(&response_headers).ok_or_else(|| {
+        invalid_grpc_terminate_response(
+            "gRPC terminate terminal metadata block size is not representable",
+        )
+    })?;
+    if block_bytes > MAX_GRPC_TERMINATE_TERMINAL_BLOCK_BYTES {
+        return Err(invalid_grpc_terminate_response(format!(
+            "gRPC terminate terminal metadata exceeds the {MAX_GRPC_TERMINATE_TERMINAL_BLOCK_BYTES}-byte \
+             aggregate header-list budget (names + values + 32 bytes per field)"
+        )));
+    }
+
+    let framed_body = match message_bytes {
+        Some(message) => frame_uncompressed_unary_grpc_message(&message)
+            .map_err(invalid_grpc_terminate_response)?,
+        None => Bytes::new(),
+    };
+    if framed_body.len() > max_response_body_bytes {
+        return Err(invalid_grpc_terminate_response(
+            "framed gRPC terminate response exceeds max_response_body_bytes",
+        ));
+    }
+
+    Ok((200, framed_body, response_headers))
 }
 
 // ---------------------------------------------------------------------------
@@ -1979,6 +2655,52 @@ pub mod test_helpers {
             now,
         )
     }
+
+    pub fn frame_uncompressed_unary_grpc_message_test(message: &[u8]) -> Result<Bytes, String> {
+        frame_uncompressed_unary_grpc_message(message)
+    }
+
+    /// The canonical `grpc-message` percent encoder, so the wire form asserted
+    /// by tests is the one the plugin actually emits.
+    pub fn percent_encode_grpc_message_test(message: &str) -> String {
+        percent_encode_grpc_message(message)
+    }
+
+    pub fn build_native_grpc_terminate_response_test(
+        function_http_status: u16,
+        body: &[u8],
+        max_response_body_bytes: usize,
+    ) -> Result<(u16, Bytes, HashMap<String, String>), String> {
+        build_native_grpc_terminate_response(function_http_status, body, max_response_body_bytes)
+            .map_err(|failure| failure.operator_detail)
+    }
+
+    /// The failure CODE for a refused terminate contract. That code — not the
+    /// operator detail — is the only thing `failure_result` puts in the
+    /// client-visible reject body, so a test that pins the fail-closed class
+    /// must assert on it rather than on the log-only diagnostic.
+    pub fn build_native_grpc_terminate_response_error_code_test(
+        function_http_status: u16,
+        body: &[u8],
+        max_response_body_bytes: usize,
+    ) -> Result<(), &'static str> {
+        build_native_grpc_terminate_response(function_http_status, body, max_response_body_bytes)
+            .map(|_| ())
+            .map_err(|failure| failure.code)
+    }
+
+    /// Complete operator-diagnostic character ceiling for terminate-contract
+    /// refusals. Pinned by hostile-input diagnostic tests.
+    pub const MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS_TEST: usize =
+        MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS;
+
+    /// Per field-name fragment character ceiling inside those diagnostics.
+    pub const MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS_TEST: usize =
+        MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS;
+
+    /// Maximum unknown top-level names sampled into the diagnostic.
+    pub const MAX_GRPC_TERMINATE_UNKNOWN_FIELD_SAMPLE_TEST: usize =
+        MAX_GRPC_TERMINATE_UNKNOWN_FIELD_SAMPLE;
 }
 
 #[async_trait]
@@ -2052,27 +2774,26 @@ impl Plugin for ServerlessFunction {
             return PluginResult::Continue;
         }
 
-        // Terminate mode is incompatible with gRPC: the gateway normalizes
-        // RejectBinary into trailers-only gRPC errors, dropping the body.
-        // Fail clearly rather than silently losing the function response.
-        if self.mode == InvocationMode::Terminate {
-            let is_grpc = headers
-                .get("content-type")
-                .is_some_and(|ct| starts_with_grpc_content_type(ct));
-            if is_grpc {
-                warn!(
-                    "serverless_function: terminate mode is not supported for gRPC requests — \
-                     the gateway normalizes plugin rejects into trailers-only gRPC errors"
-                );
-                ctx.serverless_pre_invocation_rejection_owners
-                    .extend(ctx.request_deduplication_states.keys().copied());
-                return PluginResult::Reject {
-                    status_code: 500,
-                    body: r#"{"error":"serverless_function terminate mode is not supported for gRPC"}"#.to_string(),
-                    headers: HashMap::new(),
-                };
-            }
+        // Terminate + gRPC-Web is unsupported: gRPC-Web framing/trailer encoding
+        // is owned by the grpc_web plugin, and RejectBinary normalization cannot
+        // synthesize a correct browser-facing response from the unary contract.
+        if self.mode == InvocationMode::Terminate && is_grpc_web_terminate_request(headers, ctx) {
+            warn!(
+                "serverless_function: terminate mode does not support gRPC-Web requests — \
+                 use native application/grpc or HTTP terminate"
+            );
+            ctx.serverless_pre_invocation_rejection_owners
+                .extend(ctx.request_deduplication_states.keys().copied());
+            return PluginResult::Reject {
+                status_code: 500,
+                body: r#"{"error":"serverless_function terminate mode does not support gRPC-Web"}"#
+                    .to_string(),
+                headers: HashMap::new(),
+            };
         }
+
+        let native_grpc_terminate =
+            self.mode == InvocationMode::Terminate && is_native_grpc_terminate_request(ctx);
 
         let payload = match self.build_invocation_payload(ctx, headers) {
             Ok(payload) => payload,
@@ -2109,6 +2830,63 @@ impl Plugin for ServerlessFunction {
 
         match self.mode {
             InvocationMode::Terminate => {
+                if native_grpc_terminate {
+                    match build_native_grpc_terminate_response(
+                        status,
+                        &body,
+                        self.max_response_body_bytes,
+                    ) {
+                        Ok((status_code, framed_body, grpc_headers)) => {
+                            debug!(
+                                "serverless_function: terminate mode — returning framed unary gRPC response"
+                            );
+                            ctx.serverless_terminate_response = true;
+                            // Byte-exact provenance for the ONE rejection that
+                            // may keep a body on a native gRPC stream, together
+                            // with the terminal metadata that is allowed to
+                            // reach the client as trailers.
+                            //
+                            // An empty `framed_body` is the status-only contract
+                            // shape: it authors NO frame, so this provenance can
+                            // never authorize DATA (`authorized_trailers`
+                            // refuses an empty frame). It is still recorded,
+                            // because the authored status + terminal metadata
+                            // are what let the normalizer tell an *unchanged*
+                            // status-only reply (legitimately trailers-only)
+                            // apart from one a response-body policy rewrote or
+                            // re-statused. Without it, an invalidated
+                            // status-only contract falls back to the mutable
+                            // reject header map and can ship the contract's
+                            // `grpc-status: 0` as an empty Trailers-Only
+                            // success.
+                            let trailers = grpc_headers
+                                .iter()
+                                .filter(|(name, _)| !name.eq_ignore_ascii_case("content-type"))
+                                .map(|(name, value)| (name.clone(), value.clone()))
+                                .collect();
+                            let authored = crate::plugins::ServerlessGrpcTerminateFrame {
+                                http_status: status_code,
+                                frame: framed_body.clone(),
+                                trailers,
+                            };
+                            ctx.serverless_grpc_terminate_frame =
+                                Some(std::sync::Arc::new(authored));
+                            return PluginResult::RejectBinary {
+                                status_code,
+                                body: framed_body,
+                                headers: grpc_headers,
+                            };
+                        }
+                        Err(mut failure) => {
+                            // Malformed/oversized/unsupported function output is
+                            // not a faithful client representation; never continue
+                            // to the backend with on_error=continue.
+                            failure.must_reject = true;
+                            return self.failure_result(ctx, failure);
+                        }
+                    }
+                }
+
                 if !(200..=599).contains(&status) {
                     return self.failure_result(
                         ctx,

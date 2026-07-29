@@ -728,16 +728,10 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     );
     let Some(new_config) = published else {
         debug!("No config changes detected, skipping swap");
-        // Owned `Vec<...>` parameters keep the patch futures Send across
-        // `tokio::spawn`'s HRTB analysis — `&[T]` parameters previously
-        // tripped the same "Send not general enough" error as the
-        // `&Mutex<...>` borrow above. But the helpers immediately return
-        // when their writer is `None`, so gate the calls on the writer
-        // existing before paying for the deep-clone of `objects`
-        // (`K8sObject` carries serde-cloned `spec`/`status` JSON) or for
-        // `options` / `route_conflicts`. Deployments that don't watch
-        // Gateway API / Istio CRDs (the default) get zero per-reconcile
-        // clone cost.
+        // Status writers share one immutable `Arc<[K8sObject]>` generation
+        // (see [`shared_status_objects_snapshot`]). Deployments that don't
+        // watch Gateway API / Istio CRDs (the default) pay zero per-
+        // reconcile clone cost.
         run_status_patchers(
             ctx.gateway_status_writer,
             ctx.istio_status_writer,
@@ -755,8 +749,7 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         return;
     };
 
-    // Same clone-elision contract as the no-change branch above; see the
-    // comment over `run_status_patchers` there.
+    // Same shared-snapshot contract as the no-change branch above.
     run_status_patchers(
         ctx.gateway_status_writer,
         ctx.istio_status_writer,
@@ -782,15 +775,36 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     );
 }
 
-/// Dispatch to whichever status patchers are configured, paying the
-/// `objects` / `options` / `route_conflicts` clone cost only for the writers
-/// that actually exist. Callers in `do_reconcile` previously always cloned —
-/// a regression in deployments that don't watch Gateway API or Istio CRDs
-/// (the default), since `K8sObject` carries serde-cloned `spec`/`status`
-/// JSON and the clone is O(snapshot size) per reconcile. Both writers are
-/// taken by value so they can be moved into the helper futures (required
-/// for `tokio::spawn`'s HRTB Send check — see the `Send is not general
-/// enough` history in `spawn_reconcile_loop`).
+/// Build the immutable object generation shared by Gateway API and Istio
+/// status writers for one reconcile.
+///
+/// Returns `None` when neither writer will run so the default deployment
+/// (no Gateway API / Istio status watching) pays zero snapshot clone cost.
+/// When at least one writer is present, objects are deep-cloned exactly once
+/// into an `Arc<[K8sObject]>`; a second writer only bumps the refcount.
+///
+/// The Arc keeps planner futures `Send + 'static` across the reconciler's
+/// `tokio::spawn` HRTB boundary without aliasing the store's mutable
+/// reflector state — each reconcile owns a distinct generation.
+pub(crate) fn shared_status_objects_snapshot(
+    objects: &[K8sObject],
+    gateway_writer_present: bool,
+    istio_writer_present: bool,
+) -> Option<Arc<[K8sObject]>> {
+    if !gateway_writer_present && !istio_writer_present {
+        return None;
+    }
+    Some(Arc::from(objects))
+}
+
+/// Dispatch to whichever status patchers are configured.
+///
+/// Both writers observe the same immutable object generation
+/// ([`shared_status_objects_snapshot`]) while retaining independent bounded
+/// update plans, patch concurrency, route-conflict inputs, and failure
+/// handling. Writers are taken by value so they can be moved into the helper
+/// futures (required for `tokio::spawn`'s HRTB Send check — see the
+/// `Send is not general enough` history in `spawn_reconcile_loop`).
 async fn run_status_patchers(
     gateway_writer: Option<GatewayApiStatusWriter>,
     istio_writer: Option<IstioStatusWriter>,
@@ -799,10 +813,16 @@ async fn run_status_patchers(
     route_conflicts: Option<&[crate::config_sources::k8s::GatewayApiRouteConflict]>,
     gateway_api_status_context: GatewayApiStatusContext,
 ) {
+    let Some(snapshot) =
+        shared_status_objects_snapshot(objects, gateway_writer.is_some(), istio_writer.is_some())
+    else {
+        return;
+    };
+
     if let Some(writer) = gateway_writer {
         patch_gateway_api_statuses(
             writer,
-            objects.to_vec(),
+            Arc::clone(&snapshot),
             options.clone(),
             route_conflicts.map(<[_]>::to_vec).unwrap_or_default(),
             gateway_api_status_context,
@@ -810,13 +830,13 @@ async fn run_status_patchers(
         .await;
     }
     if let Some(writer) = istio_writer {
-        patch_istio_statuses(writer, objects.to_vec(), options.clone()).await;
+        patch_istio_statuses(writer, snapshot, options.clone()).await;
     }
 }
 
 async fn patch_gateway_api_statuses(
     writer: GatewayApiStatusWriter,
-    objects: Vec<K8sObject>,
+    objects: Arc<[K8sObject]>,
     options: K8sTranslationOptions,
     route_conflicts: Vec<crate::config_sources::k8s::GatewayApiRouteConflict>,
     status_context: GatewayApiStatusContext,
@@ -871,10 +891,11 @@ fn gateway_api_status_context(
 /// by [`plan_istio_status_updates`]. No-op when the writer wasn't built
 /// (Istio CRD watching is off, or kube client unavailable) or when the
 /// plan is empty (no supported Istio CRDs in the snapshot). Failures
-/// are logged and never abort reconcile.
+/// are logged and never abort reconcile. Shares the same immutable
+/// object generation as the Gateway API writer when both are enabled.
 async fn patch_istio_statuses(
     writer: IstioStatusWriter,
-    objects: Vec<K8sObject>,
+    objects: Arc<[K8sObject]>,
     options: K8sTranslationOptions,
 ) {
     let updates = plan_istio_status_updates(&objects, options);
@@ -1237,6 +1258,228 @@ mod tests {
                 ..MeshConfig::default()
             })),
             ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn shared_status_snapshot_skipped_when_no_writers() {
+        let objects = vec![status_snapshot_object("ConfigMap", "cm")];
+        assert!(shared_status_objects_snapshot(&objects, false, false).is_none());
+    }
+
+    #[test]
+    fn shared_status_snapshot_built_once_for_single_writer() {
+        let objects = vec![status_snapshot_object("HTTPRoute", "api")];
+        let gateway_only = shared_status_objects_snapshot(&objects, true, false)
+            .expect("gateway writer requires a snapshot");
+        let istio_only = shared_status_objects_snapshot(&objects, false, true)
+            .expect("istio writer requires a snapshot");
+        assert_eq!(gateway_only.as_ref(), objects.as_slice());
+        assert_eq!(istio_only.as_ref(), objects.as_slice());
+        assert_eq!(Arc::strong_count(&gateway_only), 1);
+        assert_eq!(Arc::strong_count(&istio_only), 1);
+    }
+
+    #[test]
+    fn shared_status_snapshot_is_one_arc_generation_for_both_writers() {
+        let mut large_spec = serde_json::Map::new();
+        large_spec.insert("payload".to_string(), Value::String("x".repeat(64 * 1024)));
+        let objects = vec![K8sObject {
+            api_version: "gateway.networking.k8s.io/v1".to_string(),
+            kind: "HTTPRoute".to_string(),
+            metadata: K8sMetadata {
+                name: "large".to_string(),
+                uid: "uid-large".to_string(),
+                namespace: "default".to_string(),
+                generation: Some(1),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                creation_timestamp: None,
+                deletion_timestamp: None,
+            },
+            spec: Value::Object(large_spec),
+            status: json!({"observedGeneration": 1}),
+        }];
+
+        let snapshot = shared_status_objects_snapshot(&objects, true, true)
+            .expect("both writers share one snapshot");
+        assert_eq!(Arc::strong_count(&snapshot), 1);
+
+        // Simulate the reconciler handoff: each writer receives an Arc clone,
+        // not a second deep copy of the large JSON payloads.
+        let gateway_view = Arc::clone(&snapshot);
+        let istio_view = Arc::clone(&snapshot);
+        assert!(Arc::ptr_eq(&gateway_view, &istio_view));
+        assert_eq!(Arc::strong_count(&snapshot), 3);
+        assert_eq!(
+            gateway_view[0].spec["payload"].as_str().map(str::len),
+            Some(64 * 1024)
+        );
+        // Dropping one writer view must not invalidate the other.
+        drop(gateway_view);
+        assert_eq!(Arc::strong_count(&snapshot), 2);
+        assert_eq!(istio_view.len(), 1);
+    }
+
+    #[test]
+    fn shared_status_snapshot_reload_replaces_generation_without_aliasing() {
+        let first_objects = vec![
+            status_snapshot_object("HTTPRoute", "keep"),
+            status_snapshot_object("VirtualService", "gone"),
+        ];
+        let first =
+            shared_status_objects_snapshot(&first_objects, true, true).expect("initial generation");
+
+        let reloaded_objects = vec![status_snapshot_object("HTTPRoute", "keep")];
+        let reloaded = shared_status_objects_snapshot(&reloaded_objects, true, true)
+            .expect("reload generation");
+
+        assert!(!Arc::ptr_eq(&first, &reloaded));
+        assert_eq!(first.len(), 2);
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].metadata.name, "keep");
+        assert!(
+            !reloaded.iter().any(|object| object.metadata.name == "gone"),
+            "deleted objects must not appear in the reload generation"
+        );
+        // Prior generation remains independently readable after reload.
+        assert!(first.iter().any(|object| object.metadata.name == "gone"));
+    }
+
+    #[test]
+    fn shared_status_snapshot_planning_parity_matches_slice_inputs() {
+        let objects = vec![
+            status_snapshot_object("HTTPRoute", "api"),
+            status_snapshot_object("VirtualService", "vs"),
+            status_snapshot_object("ConfigMap", "noise"),
+        ];
+        let snapshot =
+            shared_status_objects_snapshot(&objects, true, true).expect("both writers present");
+        let options = K8sTranslationOptions::new(
+            "default".to_string(),
+            TrustDomain::new("cluster.local").expect("test trust domain"),
+        );
+
+        let gateway_from_slice = plan_gateway_api_status_updates_with_context(
+            &objects,
+            options.clone(),
+            &[],
+            Default::default(),
+        );
+        let gateway_from_arc = plan_gateway_api_status_updates_with_context(
+            &snapshot,
+            options.clone(),
+            &[],
+            Default::default(),
+        );
+        assert_status_update_identity_parity(&gateway_from_slice, &gateway_from_arc);
+
+        let istio_from_slice = plan_istio_status_updates(&objects, options.clone());
+        let istio_from_arc = plan_istio_status_updates(&snapshot, options);
+        assert_eq!(istio_from_slice.len(), istio_from_arc.len());
+        for (left, right) in istio_from_slice.iter().zip(istio_from_arc.iter()) {
+            assert_eq!(left.kind, right.kind);
+            assert_eq!(left.namespace, right.namespace);
+            assert_eq!(left.name, right.name);
+            assert_eq!(left.ferrum_detail, right.ferrum_detail);
+        }
+    }
+
+    #[test]
+    fn status_writer_plans_stay_independent_on_shared_snapshot() {
+        let objects = vec![
+            status_snapshot_object("HTTPRoute", "api"),
+            status_snapshot_object("VirtualService", "vs"),
+        ];
+        let snapshot =
+            shared_status_objects_snapshot(&objects, true, true).expect("both writers present");
+        let options = K8sTranslationOptions::new(
+            "default".to_string(),
+            TrustDomain::new("cluster.local").expect("test trust domain"),
+        );
+
+        let gateway = plan_gateway_api_status_updates_with_context(
+            &snapshot,
+            options.clone(),
+            &[],
+            Default::default(),
+        );
+        let istio = plan_istio_status_updates(&snapshot, options);
+
+        assert!(
+            gateway.iter().all(|update| {
+                matches!(
+                    update.kind.as_str(),
+                    "HTTPRoute"
+                        | "Gateway"
+                        | "GatewayClass"
+                        | "GRPCRoute"
+                        | "TCPRoute"
+                        | "TLSRoute"
+                )
+            }),
+            "gateway planner must not emit Istio kinds"
+        );
+        assert!(
+            istio.iter().all(|update| update.kind != "HTTPRoute"),
+            "istio planner must not emit Gateway API kinds"
+        );
+        // Independent planners: an empty Gateway plan must not suppress Istio
+        // updates (and vice versa) when both kinds are present.
+        assert!(
+            !istio.is_empty(),
+            "VirtualService on the shared snapshot must still plan Istio status"
+        );
+    }
+
+    fn status_snapshot_object(kind: &str, name: &str) -> K8sObject {
+        let (api_version, spec) = match kind {
+            "HTTPRoute" => (
+                "gateway.networking.k8s.io/v1",
+                json!({
+                    "parentRefs": [{"name": "edge"}],
+                    "rules": [{"backendRefs": [{"name": "svc", "port": 80}]}]
+                }),
+            ),
+            "VirtualService" => (
+                "networking.istio.io/v1beta1",
+                json!({
+                    "hosts": ["example.com"],
+                    "http": [{"route": [{"destination": {"host": "svc"}}]}]
+                }),
+            ),
+            _ => ("v1", json!({})),
+        };
+        K8sObject {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            metadata: K8sMetadata {
+                name: name.to_string(),
+                uid: format!("uid-{name}"),
+                namespace: "default".to_string(),
+                generation: Some(1),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                creation_timestamp: None,
+                deletion_timestamp: None,
+            },
+            spec,
+            status: Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    fn assert_status_update_identity_parity(
+        left: &[crate::k8s_controller::status::GatewayApiStatusUpdate],
+        right: &[crate::k8s_controller::status::GatewayApiStatusUpdate],
+    ) {
+        assert_eq!(left.len(), right.len());
+        for (a, b) in left.iter().zip(right.iter()) {
+            assert_eq!(a.api_version, b.api_version);
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.namespace, b.namespace);
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.patch_gateway_addresses, b.patch_gateway_addresses);
+            assert_eq!(a.patch_gateway_listeners, b.patch_gateway_listeners);
         }
     }
 

@@ -13,6 +13,10 @@ use tokio::task::JoinHandle;
 
 const ORIGIN: &str = "https://app.example";
 const CANONICAL_ORIGIN: &str = "https://xn--bcher-kva.example";
+/// Istio `StringMatch.exact` value that LOOKS like the plugin's native
+/// wildcard-subdomain syntax. On the literal matcher it must authorize only
+/// itself (issue #3254).
+const LITERAL_WILDCARD_ORIGIN: &str = "*.example.com";
 const BACKEND_ACCESS_CONTROL_HEADERS: [&str; 7] = [
     "access-control-allow-origin",
     "access-control-allow-credentials",
@@ -521,6 +525,156 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
     harness.shutdown();
 }
 
+/// Live data path for the Istio-shaped literal `exact` and bounded `regex`
+/// origin matchers (issues #3254 / #3253).
+///
+/// The plugin config carries `{"exact": "*.example.com"}`. On the native
+/// plain-string form that value is wildcard-subdomain syntax; as a LITERAL
+/// matcher it must authorize only the byte-identical `Origin` and must NOT
+/// authorize any subdomain — that difference is the security property, so it is
+/// asserted from outside the process, over real H1/H2/H3 frontends.
+#[ignore]
+#[tokio::test]
+async fn functional_cors_literal_exact_and_regex_origins_are_not_widened() {
+    let mut harness = CorsProtocolHarness::spawn().await;
+    const PATH: &str = "/literal-matchers";
+
+    // 1. The literal `*.example.com` matcher authorizes exactly its own string
+    //    and reflects it (credentialed, so never `*`).
+    for response in [
+        send_h1_path(
+            &harness,
+            PATH,
+            Method::GET,
+            None,
+            None,
+            LITERAL_WILDCARD_ORIGIN,
+        )
+        .await,
+        send_h2_path(
+            &harness,
+            PATH,
+            Method::GET,
+            None,
+            None,
+            LITERAL_WILDCARD_ORIGIN,
+        )
+        .await,
+        send_h3_path(
+            &harness,
+            PATH,
+            Method::GET,
+            None,
+            None,
+            LITERAL_WILDCARD_ORIGIN,
+        )
+        .await,
+    ] {
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            header(&response, "access-control-allow-origin"),
+            LITERAL_WILDCARD_ORIGIN,
+            "a literal exact matcher reflects the request origin verbatim"
+        );
+        assert_eq!(
+            header(&response, "access-control-allow-credentials"),
+            "true",
+            "a concrete literal origin keeps credentialed CORS usable"
+        );
+        assert_vary(&response, "Origin");
+    }
+
+    // 2. The security property: a real subdomain is NOT authorized. If the
+    //    literal were reinterpreted as native wildcard syntax, this would be a
+    //    200 with the subdomain reflected.
+    for origin in [
+        "https://app.example.com",
+        "https://deep.sub.example.com",
+        "https://example.com",
+    ] {
+        for response in [
+            send_h1_path(&harness, PATH, Method::GET, None, None, origin).await,
+            send_h2_path(&harness, PATH, Method::GET, None, None, origin).await,
+            send_h3_path(&harness, PATH, Method::GET, None, None, origin).await,
+        ] {
+            assert_eq!(
+                response.status,
+                StatusCode::FORBIDDEN,
+                "`{origin}` must not be widened into the literal `*.example.com` matcher"
+            );
+            assert_no_access_control_headers(&response);
+        }
+    }
+
+    // 3. The bounded regex matcher full-matches, with no implicit `.*`.
+    let allowed = send_h1_path(
+        &harness,
+        PATH,
+        Method::GET,
+        None,
+        None,
+        "https://v2.api.example.com",
+    )
+    .await;
+    assert_eq!(allowed.status, StatusCode::OK);
+    assert_eq!(
+        header(&allowed, "access-control-allow-origin"),
+        "https://v2.api.example.com"
+    );
+
+    let suffixed = send_h1_path(
+        &harness,
+        PATH,
+        Method::GET,
+        None,
+        None,
+        "https://v2.api.example.com.evil.com",
+    )
+    .await;
+    assert_eq!(
+        suffixed.status,
+        StatusCode::FORBIDDEN,
+        "the regex is a FULL match, so a suffixed origin must not be authorized"
+    );
+
+    // 4. A credentialed preflight from the literal origin is answered locally
+    //    with the exact origin reflected and the configured method/header lists.
+    let preflight = send_h1_path(
+        &harness,
+        PATH,
+        Method::OPTIONS,
+        Some("PUT"),
+        Some("X-Custom"),
+        LITERAL_WILDCARD_ORIGIN,
+    )
+    .await;
+    assert_eq!(preflight.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        header(&preflight, "access-control-allow-origin"),
+        LITERAL_WILDCARD_ORIGIN
+    );
+    assert_eq!(
+        header(&preflight, "access-control-allow-credentials"),
+        "true"
+    );
+
+    // An uncredentialed, unmatched preflight stays fail-closed on the native
+    // (non-Istio) policy shape.
+    let denied_preflight = send_h1_path(
+        &harness,
+        PATH,
+        Method::OPTIONS,
+        Some("PUT"),
+        None,
+        "https://app.example.com",
+    )
+    .await;
+    assert_eq!(denied_preflight.status, StatusCode::FORBIDDEN);
+    assert_no_access_control_headers(&denied_preflight);
+
+    harness.shutdown();
+}
+
 struct CorsProtocolHarness {
     gateway: TestGateway,
     echo: PermissiveCorsBackend,
@@ -614,6 +768,12 @@ fn cors_config(backend_port: u16) -> String {
         ),
         cors_proxy("istio-star", "/istio-star", backend_port, &["istio-star"]),
         cors_proxy("canonical", "/canonical", backend_port, &["canonical"]),
+        cors_proxy(
+            "literal-matchers",
+            "/literal-matchers",
+            backend_port,
+            &["literal-matchers"],
+        ),
         cors_proxy("no-cors", "/no-cors", backend_port, &[]),
     ];
     let config = serde_json::json!({
@@ -730,6 +890,24 @@ fn cors_config(backend_port: u16) -> String {
                 "enabled": true,
                 "config": {
                     "allowed_origins": ["HTTPS://BÜCHER.EXAMPLE:443"]
+                }
+            },
+            {
+                // Istio-shaped literal exact + bounded regex origin matchers
+                // (issues #3254 / #3253) on the live data path.
+                "id": "literal-matchers",
+                "plugin_name": "cors",
+                "scope": "proxy",
+                "proxy_id": "literal-matchers",
+                "enabled": true,
+                "config": {
+                    "allowed_origins": [
+                        {"exact": LITERAL_WILDCARD_ORIGIN},
+                        {"regex": "https://[a-z0-9-]+\\.api\\.example\\.com"}
+                    ],
+                    "allowed_methods": ["GET", "PUT"],
+                    "allowed_headers": ["X-Custom"],
+                    "allow_credentials": true
                 }
             }
         ]

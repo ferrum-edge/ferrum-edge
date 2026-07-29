@@ -29,6 +29,19 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - The trusted-base `pr_ci_plan.py --self-test` rejects mutable or dynamic
   action refs, pipe-to-shell installers, and unverified tool downloads. The
   pull request's proposed policy is tested separately but never controls gates.
+- A required live gate must decide its own relevance from a pinned trusted-base
+  copy of `live_suite_path_filter.py`, never from the pull request's checkout.
+  `verify_cross_build_policy.py` freezes that block byte-for-byte
+  (`LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`) for `mesh-e2e-sidecar-live.yml` and
+  `multicluster-federation-live.yml`, together with the live job's
+  `needs`/`if` binding. See `docs/ci_cd.md` → "Trusted-base relevance for
+  required live gates".
+- The fuzz/property lane is admitted only as two byte-frozen shapes:
+  `CI_FUZZ_SMOKE_JOB` (the whole `fuzz-smoke` job in `ci.yml`) and
+  `FUZZ_WORKFLOW` (the whole of `.github/workflows/fuzz.yml`). Either may be
+  absent before initial adoption; once present on the trusted base, pull
+  requests may neither remove nor alter it. A committed
+  `.cargo/config[.toml]` below the repository root is rejected outright.
 
 ## Drift Guard
 

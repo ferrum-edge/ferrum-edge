@@ -829,7 +829,8 @@ fn test_supported_protocols() {
         !plugin
             .supported_protocols()
             .contains(&ferrum_edge::plugins::ProxyProtocol::Grpc),
-        "native gRPC must be excluded (#2442): Reject cannot carry framed unary payloads"
+        "native gRPC must be excluded (#2442): response_mock has no provenance-authorized \
+         framed unary Reject contract — only serverless_function terminate does"
     );
 }
 

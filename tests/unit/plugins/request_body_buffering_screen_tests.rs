@@ -499,7 +499,7 @@ fn screen_special_cases_stay_minimal() {
         "transaction_log_schema",
         "udp_logging",
     ];
-    let shape_only = ["body_validator"];
+    let shape_only = ["ai_response_guard", "body_validator"];
     let actual = REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT;
     assert_eq!(actual, no_construct.as_slice());
     let actual = REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY;

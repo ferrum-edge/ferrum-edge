@@ -6397,6 +6397,40 @@ fn validate_mmdb_file_for_generation(
     }
 }
 
+/// Shared FileDescriptorSet load used by mode-aware plugin file-dependency
+/// validation. Distinguishes absent/unreadable from present-but-invalid so
+/// each plugin family can emit its own redacted diagnostic while the bytes
+/// are still read and decoded only once per path.
+#[derive(Clone, Copy)]
+enum SharedProtobufDescriptorLoadError {
+    Unavailable,
+    Invalid,
+}
+
+impl SharedProtobufDescriptorLoadError {
+    fn body_validator_message(self) -> &'static str {
+        match self {
+            Self::Unavailable => "body_validator: failed to read protobuf descriptor file",
+            Self::Invalid => "body_validator: failed to parse protobuf descriptor",
+        }
+    }
+
+    fn ai_response_guard_message(self) -> &'static str {
+        match self {
+            Self::Unavailable => "ai_response_guard: failed to read protobuf descriptor file",
+            Self::Invalid => "ai_response_guard: failed to parse protobuf descriptor",
+        }
+    }
+}
+
+fn load_shared_protobuf_descriptor_pool(
+    path: &str,
+) -> Result<prost_reflect::DescriptorPool, SharedProtobufDescriptorLoadError> {
+    let bytes = std::fs::read(path).map_err(|_| SharedProtobufDescriptorLoadError::Unavailable)?;
+    prost_reflect::DescriptorPool::decode(bytes.as_slice())
+        .map_err(|_| SharedProtobufDescriptorLoadError::Invalid)
+}
+
 // Testing-policy exception: peak-budget, digest-identity, and poisoned-lock
 // bookkeeping is private by design and cannot be exercised externally without
 // widening the runtime API. Public MMDB behavior remains covered externally.
@@ -9289,21 +9323,28 @@ impl GatewayConfig {
     }
 
     /// Validate file dependencies for plugins that reference external files
-    /// (e.g., geo_restriction `.mmdb` databases, body_validator protobuf
-    /// descriptors, and `udp_logging` DTLS sources).
+    /// (e.g., geo_restriction `.mmdb` databases, `body_validator` and
+    /// `ai_response_guard` protobuf descriptors, and `udp_logging` DTLS
+    /// sources).
     ///
     /// This is separate from `validate_all_fields_with_ip_policy()` so that
     /// each mode can handle missing files independently:
     /// - **File mode**: fatal (bail)
     /// - **DB mode**: warn (data already in DB)
     /// - **DP mode**: validate full snapshots and affected incremental rebuilds
-    ///   off the runtime worker; reject invalid updates and retain the live
-    ///   generation
+    ///   off the runtime worker. Readable-invalid descriptor dependencies
+    ///   reject construction and retain the live generation; absent/unreadable
+    ///   descriptors keep enrollment and fail closed at request time for
+    ///   enforcing actions rather than rejecting the DP update solely for
+    ///   absence.
     ///
     /// Deduplicates paths so each file is read at most once. Enabled
     /// `udp_logging` DTLS validation caches by the full validation-input tuple
     /// (host / no_verify / source paths) so identical rows share one
     /// materialization while still attaching errors per PluginConfig id.
+    /// `body_validator` and `ai_response_guard` share one descriptor-pool cache
+    /// keyed by path so a descriptor used by both families is decoded once;
+    /// diagnostics remain plugin-prefixed and never include path or body bytes.
     pub fn validate_plugin_file_dependencies(&self) -> Vec<String> {
         self.validate_plugin_file_dependencies_inner(None)
     }
@@ -9337,11 +9378,14 @@ impl GatewayConfig {
     ) -> Vec<String> {
         let mut errors = Vec::new();
         let mut validated_paths = std::collections::HashSet::new();
+        // Shared across body_validator and ai_response_guard so a path used by
+        // both families is read and decoded at most once per pass.
         let mut protobuf_descriptor_cache = std::collections::HashMap::<
             String,
-            Result<prost_reflect::DescriptorPool, String>,
+            Result<prost_reflect::DescriptorPool, SharedProtobufDescriptorLoadError>,
         >::new();
-        let mut reported_protobuf_path_errors = std::collections::HashSet::new();
+        let mut reported_body_validator_path_errors = std::collections::HashSet::new();
+        let mut reported_guard_path_errors = std::collections::HashSet::new();
         // Identical enabled UDP DTLS validation inputs share one materialization
         // (provider/file read) per pass; cached errors are still attached to
         // each affected PluginConfig id.
@@ -9371,9 +9415,7 @@ impl GatewayConfig {
                     Ok(Some(path)) => {
                         let cached = protobuf_descriptor_cache
                             .entry(path.to_string())
-                            .or_insert_with(|| {
-                                crate::plugins::body_validator::load_protobuf_descriptor_pool(path)
-                            });
+                            .or_insert_with(|| load_shared_protobuf_descriptor_pool(path));
                         match cached {
                             Ok(pool) => {
                                 if let Err(error) =
@@ -9386,9 +9428,44 @@ impl GatewayConfig {
                                 }
                             }
                             Err(error)
-                                if reported_protobuf_path_errors.insert(path.to_string()) =>
+                                if reported_body_validator_path_errors.insert(path.to_string()) =>
                             {
-                                errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                                errors.push(format!(
+                                    "PluginConfig '{}': {}",
+                                    pc.id,
+                                    error.body_validator_message()
+                                ));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                    }
+                }
+            }
+            if pc.plugin_name == "ai_response_guard" {
+                use crate::plugins::ai_response_guard as guard;
+                match guard::grpc_descriptor_path(&pc.config) {
+                    Ok(Some(path)) => {
+                        let cached = protobuf_descriptor_cache
+                            .entry(path.clone())
+                            .or_insert_with(|| load_shared_protobuf_descriptor_pool(&path));
+                        match cached {
+                            Ok(pool) => {
+                                if let Err(error) =
+                                    guard::validate_grpc_descriptor_config(&pc.config, pool)
+                                {
+                                    errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                                }
+                            }
+                            Err(error) if reported_guard_path_errors.insert(path.clone()) => {
+                                errors.push(format!(
+                                    "PluginConfig '{}': {}",
+                                    pc.id,
+                                    error.ai_response_guard_message()
+                                ));
                             }
                             Err(_) => {}
                         }

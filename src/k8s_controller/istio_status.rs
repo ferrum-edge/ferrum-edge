@@ -786,7 +786,11 @@ fn accepted_status(
 /// `spec.tls` L4 route blocks (translated to stream proxies: port / SNI
 /// passthrough). Unsupported L4 match predicates / weighted splitting and any
 /// other `K8sTranslateError` (bad backend, etc.) surface through the `Invalid`
-/// arm. `corsPolicy` with prefix/regex origins is the remaining deferred field.
+/// arm. `corsPolicy` is deferred only for a policy combination Ferrum cannot
+/// represent faithfully (a malformed/unknown origin matcher, an over-budget
+/// matcher list or value, an un-compilable/over-complex regex, an unparseable
+/// `maxAge`, or credentialed exact `*`); exact/prefix/regex origin matchers are
+/// otherwise translated.
 fn virtual_service_status(
     object: &K8sObject,
     result: Result<&K8sTranslation, &K8sTranslateError>,
@@ -863,13 +867,16 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     // `mirrorPercentage` / `redirect` / `rewrite` are translated, and
     // `corsPolicy` is translated to a proxy-scoped `cors` plugin when its
     // origins are representable — `allowOrigins[]` `exact`/`prefix`/`regex`
-    // `StringMatch` (regex must compile) or the legacy `allowOrigin` exact
-    // list, plus a parseable maxAge. It remains a deferred field when an origin
-    // matcher is malformed/unknown, a `regex` does not compile, maxAge is
-    // unparseable, or credentials are combined with exact `*` (the native
-    // wildcard representation cannot preserve that source behavior). The
-    // shared `cors_policy_translatable` predicate keeps the translator and this
-    // report in lockstep.
+    // `StringMatch` (exact projected LITERALLY, so a wildcard-shaped or
+    // non-canonical exact is representable rather than deferred — issue #3254;
+    // regex must compile within the shared byte/complexity bounds — issue
+    // #3253) or the legacy `allowOrigin` exact list, plus a parseable maxAge. It
+    // remains a deferred field when an origin matcher is malformed/unknown, a
+    // matcher list or value exceeds its bound, a `regex` does not compile or is
+    // too complex, maxAge is unparseable, or credentials are combined with
+    // exact `*` (the native wildcard representation cannot preserve that source
+    // behavior). The shared `cors_policy_translatable` predicate keeps the
+    // translator and this report in lockstep.
     let http_routes = spec.get("http").and_then(Value::as_array);
     if http_routes.is_some_and(|routes| {
         routes.iter().any(|route| {
@@ -2871,6 +2878,77 @@ mod tests {
             deferred.iter().any(|f| f.contains("corsPolicy")),
             "credentialed wildcard http[].corsPolicy must remain deferred, got {deferred:?}"
         );
+    }
+
+    /// Helper: the `corsPolicy`-related `deferred_fields` entries for one VS.
+    fn cors_deferred_fields(spec: Value) -> Vec<String> {
+        let obj = object("networking.istio.io/v1", "VirtualService", "cors-vs", spec);
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        updates[0].ferrum_detail.as_ref().unwrap()["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|field| field.contains("corsPolicy"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn cors_vs_spec(cors: Value) -> Value {
+        json!({
+            "hosts": ["reviews.default.svc.cluster.local"],
+            "http": [
+                {
+                    "route": [ { "destination": { "host": "reviews.default.svc.cluster.local" } } ],
+                    "corsPolicy": cors
+                }
+            ]
+        })
+    }
+
+    /// Issue #3254: an exact origin that merely LOOKS like native wildcard
+    /// syntax, and a non-canonical exact, are projected literally now — the
+    /// status report must stop calling them deferred.
+    #[test]
+    fn virtual_service_cors_policy_literal_exact_origins_not_deferred() {
+        for cors in [
+            json!({ "allowOrigins": [ { "exact": "*.example.com" } ] }),
+            json!({ "allowOrigins": [ { "exact": "https://Example.com:443" } ] }),
+            json!({ "allowOrigin": ["*.example.com"] }),
+        ] {
+            let deferred = cors_deferred_fields(cors_vs_spec(cors.clone()));
+            assert!(
+                deferred.is_empty(),
+                "literal exact corsPolicy {cors} must be translated, got {deferred:?}"
+            );
+        }
+    }
+
+    /// Issue #3253: matchers outside the explicit bounds stay fail-closed
+    /// (deferred + unprojected), never silently truncated or approximated.
+    #[test]
+    fn virtual_service_cors_policy_out_of_bounds_matchers_stay_deferred() {
+        let oversized = "a".repeat(crate::plugins::cors::MAX_ORIGIN_MATCHER_BYTES + 1);
+        let too_many: Vec<Value> = (0..=crate::plugins::cors::MAX_ALLOWED_ORIGIN_ENTRIES)
+            .map(|i| json!({ "exact": format!("https://app{i}.example.com") }))
+            .collect();
+        for cors in [
+            json!({ "allowOrigins": [ { "exact": oversized } ] }),
+            json!({ "allowOrigins": [ { "regex": format!("https://{}", "a".repeat(crate::plugins::cors::MAX_ORIGIN_MATCHER_BYTES)) } ] }),
+            json!({ "allowOrigins": [ { "regex": "((((((((((((((((((((((((((((a))))))))))))))))))))))))))))" } ] }),
+            json!({ "allowOrigins": too_many }),
+        ] {
+            let deferred = cors_deferred_fields(cors_vs_spec(cors.clone()));
+            assert!(
+                !deferred.is_empty(),
+                "out-of-bounds corsPolicy {cors} must remain deferred, got {deferred:?}"
+            );
+        }
     }
 
     // ── ServiceEntry ───────────────────────────────────────────────────────

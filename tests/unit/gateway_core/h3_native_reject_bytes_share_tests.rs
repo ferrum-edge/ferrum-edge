@@ -332,6 +332,26 @@ fn gateway_literal_error_family_is_documented_as_out_of_scope() {
     );
 }
 
+/// Ordinary H3 gRPC rejects must not pay for a full provenance normalization
+/// when no `serverless_function` terminate authorization is present.
+#[test]
+fn native_h3_grpc_reject_skips_normalization_without_authorizing_provenance() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let writer = bounded_fn(
+        server,
+        "async fn send_h3_reject_flavor_aware_with_header_state(",
+        "pub(crate) fn h3_framed_unary_initial_response(",
+    );
+    assert!(
+        writer.contains("framed_unary_provenance.is_authorizing()"),
+        "direct-H3 gRPC reject normalization must be gated on authorizing provenance"
+    );
+    assert!(
+        writer.contains("normalize_reject_response_with_provenance("),
+        "authorizing terminate rejects must still normalize for framed emission"
+    );
+}
+
 /// The shared mesh dispatch-required literal must reach QUIC as a static, not
 /// as a per-reject copy.
 #[test]

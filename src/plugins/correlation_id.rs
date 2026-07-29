@@ -63,6 +63,10 @@ pub struct CorrelationId {
     header_name: String,
     instance_metadata_key: String,
     echo_downstream: bool,
+    /// `[header_name]` when `echo_downstream` is on, empty otherwise.
+    /// Precomputed so `Plugin::response_trailer_policy` can hand out a bounded
+    /// slice without allocating per request.
+    echoed_header_names: Vec<String>,
 }
 
 impl CorrelationId {
@@ -141,10 +145,16 @@ impl CorrelationId {
         };
 
         let instance_metadata_key = format!("{INSTANCE_METADATA_PREFIX}{header_name}");
+        let echoed_header_names = if echo_downstream {
+            vec![header_name.clone()]
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             header_name,
             instance_metadata_key,
             echo_downstream,
+            echoed_header_names,
         })
     }
 
@@ -300,5 +310,15 @@ impl Plugin for CorrelationId {
         self.echo_downstream
             && self.request_id(ctx).is_some()
             && name.eq_ignore_ascii_case(&self.header_name)
+    }
+
+    /// The echoed correlation ID is the gateway's own value, and a client that
+    /// reads a different one from a backend trailer loses the ability to
+    /// correlate at all. A backend that echoes the identical request ID (the
+    /// common case — it was sent upstream in `before_proxy`) makes the
+    /// `after_proxy` write invisible to observed-mutation reconciliation, so the
+    /// declaration is the only signal that binds the trailer channel here.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::Names(&self.echoed_header_names)
     }
 }

@@ -167,6 +167,26 @@ pub(crate) const HEADER_GRPC_WEB_TRAILER_NAMES: &str = "x-ferrum-grpc-web-traile
 /// header syntax while it crosses the sidecar mesh-mTLS dispatch boundary.
 pub(crate) const HEADER_GRPC_WEB_SHADOWED_TRAILERS: &str = "x-ferrum-grpc-web-shadowed-trailers";
 
+/// Response fields `after_proxy` owns, in the bounded form
+/// `Plugin::response_trailer_policy` hands to the plugin cache. Built once per
+/// process; never allocated per request.
+///
+/// The two internal bridge names lead: `after_proxy` REMOVES them from the
+/// initial map precisely so gateway trailer provenance never reaches a client,
+/// and that removal is a no-op — invisible to observed-mutation reconciliation —
+/// when a backend supplies the same name as a TRAILER instead.
+static GRPC_WEB_RESPONSE_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| {
+        vec![
+            HEADER_GRPC_WEB_TRAILER_NAMES.to_string(),
+            HEADER_GRPC_WEB_SHADOWED_TRAILERS.to_string(),
+            "content-type".to_string(),
+            "x-grpc-web".to_string(),
+            "vary".to_string(),
+            "access-control-expose-headers".to_string(),
+        ]
+    });
+
 /// Ferrum-owned gRPC-Web bridge headers that must never reach a client.
 #[inline]
 pub(crate) fn is_internal_grpc_web_bridge_header(name: &str) -> bool {
@@ -752,7 +772,7 @@ fn is_forbidden_grpc_web_request_trailer_name(name: &str) -> bool {
 /// The gRPC wire spec permits producers to omit padding on binary metadata, so
 /// both dialects are accepted; anything else is refused rather than forwarded
 /// as an unreadable binary field.
-fn is_base64_metadata_value(value: &str) -> bool {
+pub(crate) fn is_base64_metadata_value(value: &str) -> bool {
     !value.is_empty()
         && (BASE64.decode(value).is_ok()
             || base64::engine::general_purpose::STANDARD_NO_PAD
@@ -1976,7 +1996,7 @@ fn is_forbidden_grpc_web_trailer_name(name: &str) -> bool {
 /// `_` / `-` / `.`. Stricter than the HTTP token set so hostile names that
 /// survive `HeaderName` parsing still cannot enter the trailer frame.
 #[inline]
-fn is_grpc_metadata_name(name: &str) -> bool {
+pub(crate) fn is_grpc_metadata_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -1996,7 +2016,7 @@ fn is_valid_trailer_header(key: &str) -> Option<HeaderName> {
 /// gRPC ASCII-Value (PROTOCOL-HTTP2): space and printable ASCII only. Also
 /// rejects embedded CR/LF so a hostile trailer cannot smuggle header lines
 /// into the gRPC-Web trailer block.
-fn is_valid_trailer_value(value: &str) -> bool {
+pub(crate) fn is_valid_trailer_value(value: &str) -> bool {
     value.bytes().all(|b| (0x20..=0x7E).contains(&b))
 }
 
@@ -3146,6 +3166,17 @@ impl Plugin for GrpcWebPlugin {
         // representation instead of trusting the backend's
         // `application/grpc` header for the content-type refinement decision.
         retained_response_content_type(ctx).is_some()
+    }
+
+    /// An untranslated gRPC-Web request keeps the Plain wire flavor and can
+    /// therefore reach a trailer-forwarding HTTP/3 relay while this
+    /// `after_proxy` still runs its unconditional bridge-header strip. Declaring
+    /// the bounded owned set keeps that strip — and the negotiated
+    /// `content-type` / `x-grpc-web` / `vary` /
+    /// `access-control-expose-headers` writes — binding on the trailer section
+    /// instead of only the initial header map.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::Names(&GRPC_WEB_RESPONSE_POLICY_NAMES)
     }
 
     async fn after_proxy(

@@ -983,6 +983,15 @@ impl Plugin for OtelTracing {
             && ctx.metadata.contains_key(TRACEPARENT_HEADER)
     }
 
+    /// `after_proxy` echoes the gateway-authored `traceparent`. A backend that
+    /// echoes the identical value back (the normal W3C propagation case) makes
+    /// that write invisible to observed-mutation reconciliation, so without this
+    /// declaration a backend `traceparent` TRAILER would land after the write
+    /// and hand the client a trace context the gateway did not author.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::Names(&super::TRACEPARENT_RESPONSE_POLICY_NAMES)
+    }
+
     async fn log(&self, summary: &TransactionSummary) {
         let Some(trace_id) = summary.metadata.get("trace_id") else {
             return;

@@ -2149,28 +2149,35 @@ mod virtual_service_cors {
         ] {
             let errors = validate(vec![policy(vec![matcher.clone()])]);
             assert!(
-                errors
-                    .iter()
-                    .any(|error| error.contains("must not be empty")),
+                errors.iter().any(|error| error.contains("non-empty")),
                 "matcher {matcher:?} must be rejected: {errors:?}"
             );
         }
     }
 
+    /// Issue #3254: exact `*` keeps Istio's allow-all meaning, and every OTHER
+    /// exact — including one shaped like the plugin's native wildcard-subdomain
+    /// syntax — is carried as a LITERAL matcher instead of being rejected.
+    /// The synthesized plugin config must select the object matcher, because
+    /// the plain-string form would read `*.example.com` as native wildcard
+    /// syntax and authorize every subdomain the source never matched.
     #[test]
-    fn exact_star_is_istio_allow_all_but_other_wildcard_exacts_are_rejected() {
+    fn exact_star_is_istio_allow_all_and_other_wildcard_exacts_stay_literal() {
         let exact_star = validate(vec![policy(vec![MeshCorsOriginMatch::Exact("*".into())])]);
         assert!(exact_star.is_empty(), "{exact_star:?}");
 
-        let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
-            "*.example.com".into(),
-        )])]);
+        let wildcard_shaped = policy(vec![MeshCorsOriginMatch::Exact("*.example.com".into())]);
+        let errors = validate(vec![wildcard_shaped.clone()]);
         assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("wildcard syntax other than Istio's exact `*`")),
-            "non-Istio wildcard exact must be rejected: {errors:?}"
+            errors.is_empty(),
+            "a wildcard-shaped exact is literal, not invalid: {errors:?}"
         );
+        assert_eq!(
+            cors_plugin_config_from_mesh_policy(&wildcard_shaped.cors)["allowed_origins"],
+            serde_json::json!([{ "exact": "*.example.com" }]),
+            "a wildcard-shaped exact must project as a literal matcher object"
+        );
+
         // Wildcard-looking PREFIX matchers are fine — prefix is a literal
         // byte-prefix in both Istio and the plugin object form.
         let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Prefix(
@@ -2196,20 +2203,21 @@ mod virtual_service_cors {
         assert!(errors.is_empty(), "{errors:?}");
     }
 
+    /// A padded literal is preserved verbatim under literal-exact semantics
+    /// (issue #3254). It matches no real `Origin` header, which is exactly what
+    /// Istio's literal `StringMatch.exact` does — the previous rejection existed
+    /// only because the plain-string plugin form TRIMMED it and thereby widened
+    /// the matcher to the trimmed origin.
     #[test]
-    fn padded_exact_origin_rejected() {
-        // The cors plugin TRIMS plain-string origins, so a padded literal —
-        // which Istio's exact semantics match against no real Origin — would
-        // silently widen to its trimmed form on the sidecar.
+    fn padded_exact_origin_is_carried_verbatim_without_trimming() {
         for padded in [" https://a.example", "https://a.example "] {
-            let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
-                padded.into(),
-            )])]);
-            assert!(
-                errors
-                    .iter()
-                    .any(|error| error.contains("leading/trailing whitespace")),
-                "exact `{padded}` must be rejected: {errors:?}"
+            let carried = policy(vec![MeshCorsOriginMatch::Exact(padded.into())]);
+            let errors = validate(vec![carried.clone()]);
+            assert!(errors.is_empty(), "exact `{padded}`: {errors:?}");
+            assert_eq!(
+                cors_plugin_config_from_mesh_policy(&carried.cors)["allowed_origins"],
+                serde_json::json!([{ "exact": padded }]),
+                "a padded exact must not be trimmed into a wider matcher"
             );
         }
     }
@@ -2300,46 +2308,31 @@ mod virtual_service_cors {
         );
     }
 
+    /// Issue #3254: an exact that is not a canonical `scheme://host[:port]`
+    /// origin, or not the canonical browser serialization, is still a valid
+    /// LITERAL matcher. It is carried verbatim and matches only that exact
+    /// `Origin` string — never widened to the canonical origin, and never
+    /// rejected as "not an origin" (that predicate belongs to the plugin's
+    /// NATIVE plain-string form, which this path no longer uses).
     #[test]
-    fn plugin_incompatible_exact_origin_rejected() {
-        // Synthesis projects exacts into the cors plugin's plain-string
-        // `allowed_origins` form; values the plugin rejects at construction
-        // must fail slice validation at the config boundary instead of
-        // plugin-cache construction on the data plane.
-        for invalid in [
+    fn noncanonical_and_non_origin_exacts_are_carried_literally() {
+        for literal in [
             "https://a.example/",
             "https://a.example/path",
             "https://user:pw@a.example",
             "ftp://a.example",
             "not a url",
-        ] {
-            let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
-                invalid.into(),
-            )])]);
-            assert!(
-                errors
-                    .iter()
-                    .any(|error| error.contains("not a valid origin")),
-                "exact `{invalid}` must be rejected: {errors:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn noncanonical_exact_origin_is_rejected_to_preserve_literal_matching() {
-        for noncanonical in [
             "https://example.com:443",
             "HTTPS://EXAMPLE.COM",
             "https://bücher.example",
         ] {
-            let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
-                noncanonical.into(),
-            )])]);
-            assert!(
-                errors
-                    .iter()
-                    .any(|error| error.contains("must use its canonical serialization")),
-                "exact `{noncanonical}` must be rejected: {errors:?}"
+            let carried = policy(vec![MeshCorsOriginMatch::Exact(literal.into())]);
+            let errors = validate(vec![carried.clone()]);
+            assert!(errors.is_empty(), "exact `{literal}`: {errors:?}");
+            assert_eq!(
+                cors_plugin_config_from_mesh_policy(&carried.cors)["allowed_origins"],
+                serde_json::json!([{ "exact": literal }]),
+                "exact `{literal}` must be carried byte-for-byte"
             );
         }
     }
@@ -2348,9 +2341,54 @@ mod virtual_service_cors {
     fn uncompilable_regex_rejected() {
         let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Regex("(".into())])]);
         assert!(
+            errors.iter().any(|error| error.contains("is invalid")),
+            "{errors:?}"
+        );
+    }
+
+    /// Issue #3253: matchers outside the explicit byte / complexity / count
+    /// bounds reject the slice at the config boundary with a field-specific
+    /// diagnostic — they are never silently dropped or truncated.
+    #[test]
+    fn out_of_bounds_origin_matchers_rejected_with_field_specific_diagnostics() {
+        let oversized = "a".repeat(600);
+        for (matcher, needle) in [
+            (
+                MeshCorsOriginMatch::Exact(oversized.clone()),
+                "byte matcher limit",
+            ),
+            (
+                MeshCorsOriginMatch::Prefix(oversized.clone()),
+                "byte matcher limit",
+            ),
+            (
+                MeshCorsOriginMatch::Regex(oversized.clone()),
+                "byte matcher limit",
+            ),
+            (
+                MeshCorsOriginMatch::Regex(
+                    "((((((((((((((((((((((((((((a))))))))))))))))))))))))))))".into(),
+                ),
+                "complexity bounds",
+            ),
+        ] {
+            let errors = validate(vec![policy(vec![matcher.clone()])]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains(needle) && error.contains("allowed_origins[0]")),
+                "matcher {matcher:?} must be rejected with `{needle}`: {errors:?}"
+            );
+        }
+
+        let too_many: Vec<MeshCorsOriginMatch> = (0..65)
+            .map(|i| MeshCorsOriginMatch::Exact(format!("https://app{i}.example")))
+            .collect();
+        let errors = validate(vec![policy(too_many)]);
+        assert!(
             errors
                 .iter()
-                .any(|error| error.contains("regex does not compile")),
+                .any(|error| error.contains("at most 64 entries")),
             "{errors:?}"
         );
     }
@@ -2432,7 +2470,7 @@ mod virtual_service_cors {
         assert_eq!(
             config["allowed_origins"],
             serde_json::json!([
-                "https://a.example",
+                {"exact": "https://a.example"},
                 {"prefix": "https://app."},
                 {"regex": "https://.*"}
             ])

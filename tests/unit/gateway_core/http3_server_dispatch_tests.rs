@@ -1520,8 +1520,36 @@ fn plain_h3_streaming_body_and_trailer_faults_downgrade_capability() {
 }
 
 #[test]
-fn buffered_h3_trailers_drop_only_when_a_response_body_plugin_ran() {
+fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
     let src = include_str!("../../../src/http3/server.rs");
+
+    // The witness must be captured BEFORE the first response-header phase,
+    // otherwise the "did the chain change this field?" comparison is against a
+    // map the chain already rewrote and every mutation reads as a no-op.
+    let buffered_response_region = src
+        .split("        // buffered native-H3 path. Unlike the streamed paths")
+        .nth(1)
+        .expect("buffered native-H3 response region")
+        .split("// Build and send buffered response")
+        .next()
+        .expect("bounded buffered native-H3 response region");
+    let (before_capture, after_capture) = buffered_response_region
+        .split_once("        // after_proxy hooks")
+        .expect("buffered after_proxy phase");
+    let capture = after_capture
+        .split("// Sticky session cookie injection.")
+        .next()
+        .expect("bounded after_proxy trailer region");
+    assert!(
+        before_capture.contains("ResponseTrailerPolicyWitness::capture(")
+            && before_capture.contains("ResponseTrailerPolicyWitness::Unproven"),
+        "buffered H3 must witness the backend's pre-policy header values before after_proxy runs"
+    );
+    assert!(
+        !capture.contains("if !plugins.is_empty()"),
+        "buffered H3 must not wipe trailers merely because the plugin chain is nonempty"
+    );
+
     let gate = src
         .split("        let mut response_body_rejected = false;")
         .nth(1)
@@ -1540,6 +1568,50 @@ fn buffered_h3_trailers_drop_only_when_a_response_body_plugin_ran() {
         "buffered H3 must not wipe trailers merely because the plugin chain is nonempty"
     );
 
+    // Reconciliation runs after the LAST header phase and before the response
+    // is built, so sticky-cookie injection and committed hooks are covered too.
+    let reconcile = src
+        .split("        // Final hop-by-hop strip after after_proxy / committed hooks")
+        .nth(1)
+        .expect("buffered final header strip")
+        .split("// Build and send buffered response")
+        .next()
+        .expect("bounded reconciliation region");
+    assert!(
+        reconcile.contains("reconcile_backend_trailers_with_response_policy(")
+            && reconcile.contains("plugin_cache_view.response_trailer_policy_names()")
+            && reconcile.contains("plugin_cache_view.response_trailer_policy_prefixes()")
+            && reconcile.contains("UNBOUNDED_RESPONSE_TRAILER_POLICY"),
+        "buffered H3 must reconcile surviving trailers against the precomputed \
+         response-header policy names/prefixes and the fail-closed unbounded capability"
+    );
+
+    // Hop-by-hop trailer names are stripped BEFORE the reconciliation, matching
+    // `finish_h3_response_with_backend_trailers`. Either order drops the same
+    // fields from the wire, but reconciling first counts them as policy-governed
+    // removals and inflates the `removed` telemetry.
+    let strip_at = reconcile
+        .find("strip_response_hop_by_hop_trailers(trailers);")
+        .expect("buffered H3 hop-by-hop trailer strip");
+    let reconcile_at = reconcile
+        .find("reconcile_backend_trailers_with_response_policy(")
+        .expect("buffered H3 reconciliation");
+    assert!(
+        strip_at < reconcile_at,
+        "buffered H3 must strip hop-by-hop trailer names before reconciling"
+    );
+    let forward_region = src
+        .split("// Forward backend response trailers, if any (issue #1630).")
+        .nth(1)
+        .expect("buffered trailer forward region")
+        .split("stream.send_trailers(")
+        .next()
+        .expect("bounded buffered trailer forward region");
+    assert!(
+        !forward_region.contains("strip_response_hop_by_hop_trailers("),
+        "buffered H3 must not strip hop-by-hop trailer names a second time"
+    );
+
     let send = src
         .split("// Backend trailers survive to here only when no response-body plugin")
         .nth(1)
@@ -1550,6 +1622,380 @@ fn buffered_h3_trailers_drop_only_when_a_response_body_plugin_ran() {
     assert!(
         send.contains("Auth/logging-only plugins must not"),
         "retention rationale for auth/logging-only plugins must remain documented"
+    );
+}
+
+/// The binding produced by the three PLAIN native/refined H3 streaming relays'
+/// pre-policy capture. The native gRPC relay's capture binds
+/// `grpc_pre_policy_response_headers` instead, so anchoring on this exact
+/// `let` keeps the two families countable apart while the bare
+/// `capture_for_streaming(` count still pins the file-wide total.
+const PLAIN_STREAMING_CAPTURE: &str = "let pre_policy_response_headers = \
+                                       PrePolicyResponseHeaders::capture_for_streaming(";
+
+/// The native gRPC H3 relay's counterpart binding.
+const GRPC_STREAMING_CAPTURE: &str = "let grpc_pre_policy_response_headers =";
+
+#[test]
+fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
+    let src = include_str!("../../../src/http3/server.rs");
+
+    // The shared trailer-finish helper must reconcile BEFORE `send_trailers`:
+    // a streaming relay's initial HEADERS frame is already on the wire, so this
+    // is the last point at which the response-header policy can bind the
+    // trailer section.
+    let helper = src
+        .split("async fn finish_h3_response_with_backend_trailers<S>")
+        .nth(1)
+        .expect("trailer finish helper")
+        .split("/// Start the HTTP/3 listener")
+        .next()
+        .expect("bounded trailer finish helper");
+    let reconcile_at = helper
+        .find("reconcile_streaming_backend_trailers(")
+        .expect("streaming trailer reconciliation");
+    let send_at = helper.find(".send_trailers(").expect("trailer send");
+    assert!(
+        reconcile_at < send_at,
+        "streaming H3 must reconcile backend trailers before they reach the wire"
+    );
+    assert!(
+        helper.contains("strip_response_hop_by_hop_trailers(&mut trailers);"),
+        "streaming H3 must keep the hop-by-hop trailer strip"
+    );
+
+    // This file holds FOUR streaming relays that cross the response-header
+    // policy boundary, and every one of them must capture pre-policy evidence:
+    // the three plain native/refined relays (the inline stream, the refined
+    // stream, and the buffered-request streaming helper) plus the native gRPC
+    // relay, which inlines its own trailer finish and is pinned separately
+    // below. Counting the total — not just the plain subset — is what makes a
+    // silently added fifth relay fail here instead of shipping ungoverned.
+    assert_eq!(
+        src.matches("PrePolicyResponseHeaders::capture_for_streaming(")
+            .count(),
+        4,
+        "every H3 streaming relay must capture its pre-policy response headers: \
+         three plain native/refined relays plus the native gRPC relay"
+    );
+    // The two families are told apart by the binding they produce, never by
+    // position, so adding a relay of either kind moves exactly one count.
+    assert_eq!(
+        src.matches(GRPC_STREAMING_CAPTURE).count(),
+        1,
+        "the native gRPC H3 relay must own exactly one pre-policy capture"
+    );
+    assert_eq!(
+        src.matches("H3StreamingTrailerPolicy {").count(),
+        3,
+        "every plain native/refined H3 streaming relay must bind the response \
+         trailer policy at its trailer frame"
+    );
+    let captures: Vec<&str> = src.split(PLAIN_STREAMING_CAPTURE).skip(1).collect();
+    assert_eq!(
+        captures.len(),
+        3,
+        "every plain native/refined H3 streaming relay must capture its \
+         pre-policy response headers"
+    );
+    for region in captures {
+        let hooks = region.find("run_h3_streaming_after_proxy_hooks(");
+        let finish = region.find("finish_h3_response_with_backend_trailers(");
+        assert!(
+            hooks.is_some() && finish.is_some() && hooks < finish,
+            "the pre-policy capture must precede the response-header phases, \
+             which must precede the trailer frame"
+        );
+    }
+
+    // Governance is read once from the precomputed plugin-cache view, not
+    // rebuilt per response, and keeps the fail-closed unbounded arm.
+    let governance = src
+        .split("let response_trailer_governance = ResponseTrailerGovernance {")
+        .nth(1)
+        .expect("streaming trailer governance")
+        .split("};")
+        .next()
+        .expect("bounded streaming trailer governance");
+    assert!(
+        governance.contains("policy_names: plugin_cache_view.response_trailer_policy_names(),"),
+        "streaming governance names must come from the per-reload plugin cache view"
+    );
+    assert!(
+        governance
+            .contains("policy_prefixes: plugin_cache_view.response_trailer_policy_prefixes(),"),
+        "streaming governance prefixes must come from the per-reload plugin cache view"
+    );
+    assert!(
+        governance.contains("UNBOUNDED_RESPONSE_TRAILER_POLICY"),
+        "streaming governance must keep the fail-closed unbounded arm"
+    );
+
+    // GHSA-r78v-rc86-6r86: native gRPC over H3 inlines its own trailer finish,
+    // but that trailer section crosses the SAME response-header policy boundary
+    // — its application metadata was the advisory's reproduction. It must
+    // reconcile, and it must do so as a NATIVE GRPC TERMINAL section so the
+    // reserved status fields survive.
+    let grpc = src
+        .split("async fn dispatch_grpc_native_h3(")
+        .nth(1)
+        .expect("native gRPC H3 dispatch")
+        .split("async fn log_h3_grpc_transaction(")
+        .next()
+        .expect("bounded native gRPC H3 dispatch");
+    assert!(
+        grpc.contains("reconcile_streaming_backend_trailers("),
+        "native gRPC H3 application metadata must be reconciled against the \
+         response-header policy"
+    );
+    assert!(
+        grpc.contains("TrailerSectionKind::NativeGrpcTerminal"),
+        "native gRPC H3 must reconcile as a gRPC terminal section so grpc-status \
+         survives"
+    );
+    assert!(
+        !grpc.contains("TrailerSectionKind::PlainResponse"),
+        "native gRPC H3 must not reconcile any trailer section as plain"
+    );
+    // Evidence must predate every response-header phase, and the reconciliation
+    // must run before the trailers reach the client.
+    let capture_at = grpc
+        .find("let grpc_pre_policy_response_headers =")
+        .expect("native gRPC H3 pre-policy capture");
+    let after_proxy_at = grpc
+        .find("run_h3_streaming_after_proxy_hooks(")
+        .expect("native gRPC H3 after_proxy phase");
+    let reconcile_at = grpc
+        .find("reconcile_streaming_backend_trailers(")
+        .expect("native gRPC H3 reconciliation");
+    let send_at = grpc
+        .find("send_h3_grpc_trailers_and_finish_before_deadline(")
+        .expect("native gRPC H3 trailer send");
+    assert!(
+        capture_at < after_proxy_at,
+        "the pre-policy capture must precede the first response-header phase"
+    );
+    assert!(
+        reconcile_at < send_at,
+        "native gRPC H3 trailers must be reconciled before they are sent"
+    );
+}
+
+#[test]
+fn the_h3_to_h2_grpc_streaming_bridge_governs_its_terminal_metadata() {
+    // The advisory's second reproduction: an H3 client against an H2 gRPC
+    // backend. The bridge commits its initial HEADERS frame, runs `after_proxy`
+    // on headers only, then forwards the backend trailer section verbatim.
+    let src = include_str!("../../../src/http3/cross_protocol.rs");
+    let relay = src
+        .split("async fn handle_h3_grpc_streaming_response<S>(")
+        .nth(1)
+        .expect("cross-protocol H3 gRPC streaming relay")
+        .split("\nasync fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol H3 gRPC streaming relay");
+    assert!(
+        relay.contains("reconcile_streaming_backend_trailers("),
+        "the H3->H2 gRPC bridge must reconcile its trailer section"
+    );
+    assert!(
+        relay.contains("TrailerSectionKind::NativeGrpcTerminal"),
+        "the H3->H2 gRPC bridge must reconcile as a gRPC terminal section"
+    );
+    let capture_at = relay
+        .find("let grpc_pre_policy_response_headers =")
+        .expect("bridge pre-policy capture");
+    let after_proxy_at = relay
+        .find("crate::proxy::run_after_proxy_hooks(")
+        .expect("bridge after_proxy phase");
+    let reconcile_at = relay
+        .find("reconcile_streaming_backend_trailers(")
+        .expect("bridge reconciliation");
+    let send_at = relay
+        .find("stream.send_trailers(trailers)")
+        .expect("bridge trailer send");
+    assert!(
+        capture_at < after_proxy_at,
+        "the bridge capture must precede the first response-header phase"
+    );
+    assert!(
+        reconcile_at < send_at,
+        "the bridge must reconcile before sending trailers"
+    );
+}
+
+#[test]
+fn streaming_h3_relays_put_the_default_content_type_on_the_final_header_map() {
+    let src = include_str!("../../../src/http3/server.rs");
+
+    // The default `content-type` must reach the response-header MAP, not just
+    // the response builder. `H3StreamingTrailerPolicy.final_headers` points at
+    // that map, so a builder-only default would leave the trailer boundary
+    // reconciling a field set the client never actually received: a backend
+    // `content-type` trailer would prove absent -> absent and land on the wire
+    // contradicting the media type the gateway itself synthesized.
+    assert!(
+        !src.contains(r#"resp_builder = resp_builder.header("content-type", "application/json");"#),
+        "no streaming relay may add the default content-type to the builder alone"
+    );
+    // Per relay: the pre-policy capture comes first, then the default lands in
+    // the header map, then the response is built from that same map, and only
+    // then does the trailer frame bind the policy. Bounded to each relay's own
+    // region rather than counted across the file.
+    //
+    // Scoped to the PLAIN relays by their binding. The fourth streaming capture
+    // in this file belongs to the native gRPC relay
+    // (`grpc_pre_policy_response_headers`), which never synthesizes a default
+    // `content-type` — a gRPC response carries `application/grpc` from the
+    // backend — so it has no map write for this contract to order. That
+    // exclusion is checked below rather than assumed.
+    let relays: Vec<&str> = src
+        .split(PLAIN_STREAMING_CAPTURE)
+        .skip(1)
+        .map(|tail| {
+            tail.split("H3StreamingTrailerPolicy {")
+                .next()
+                .expect("bounded streaming relay region")
+        })
+        .collect();
+    assert_eq!(
+        relays.len(),
+        3,
+        "three plain native/refined streaming relays"
+    );
+    for relay in &relays {
+        let map_write = relay
+            .find(r#".entry("content-type".to_string())"#)
+            .expect("streaming relay must default content-type onto the header map");
+        let build = relay
+            .find("apply_response_headers(Response::builder().status(")
+            .expect("streaming relay must build its response");
+        assert!(
+            map_write < build,
+            "the default content-type must be in the header map BEFORE the \
+             response is built, so the map and the wire agree"
+        );
+        assert!(
+            relay[map_write..build].contains(r#""application/json".to_string()"#),
+            "the map write must carry the same default the builder used to add"
+        );
+    }
+
+    // Synthesizing that field is a gateway-authored wire mutation, so it counts
+    // as a response-header phase for the pre-policy capture decision. Without
+    // that, an auth/logging-only chain would take the no-clone #2941
+    // pass-through and forward a conflicting backend `content-type` trailer.
+    for tail in src.split(PLAIN_STREAMING_CAPTURE).skip(1) {
+        let args = tail.split(");").next().expect("capture argument list");
+        assert!(
+            args.contains("gateway_synthesizes_content_type"),
+            "the capture predicate must fold in the synthesized default \
+             content-type: {args}"
+        );
+    }
+    // The native gRPC relay is exempt only because it authors no default
+    // media type. If one is ever added there, this fails and the predicate
+    // above has to grow a fourth site rather than silently under-capturing.
+    let grpc_relay = src
+        .split("async fn dispatch_grpc_native_h3(")
+        .nth(1)
+        .expect("native gRPC H3 dispatch")
+        .split("async fn log_h3_grpc_transaction(")
+        .next()
+        .expect("bounded native gRPC H3 dispatch");
+    assert!(
+        !grpc_relay.contains(r#".entry("content-type".to_string())"#),
+        "the native gRPC H3 relay must not synthesize a default content-type; \
+         if it does, its pre-policy capture predicate must fold that in"
+    );
+    let flags: Vec<&str> = src
+        .split("let gateway_synthesizes_content_type = ")
+        .skip(1)
+        .collect();
+    assert_eq!(
+        flags.len(),
+        3,
+        "each streaming relay decides the synthesis for itself"
+    );
+    for tail in flags {
+        assert!(
+            tail.starts_with("!response_headers.contains_key(\"content-type\");"),
+            "the synthesis flag must come from this relay's own backend headers"
+        );
+    }
+}
+
+#[test]
+fn the_trailer_reconciliation_exempts_no_field_name() {
+    let src = include_str!("../../../src/proxy/headers.rs");
+    let body = src
+        .split("pub(crate) fn reconcile_backend_trailers_with_response_policy(")
+        .nth(1)
+        .expect("reconciliation function")
+        .split("\n/// ")
+        .next()
+        .expect("bounded reconciliation function");
+
+    // A NAME-based exemption here is a bypass, not a protocol accommodation: a
+    // non-gRPC backend could smuggle a governed field past an observed or
+    // unbounded policy just by naming its trailer `grpc-status`. Reserved-field
+    // handling must therefore be reached STRUCTURALLY, through the `section`
+    // the call site chose from the dispatch it committed to — never from a
+    // literal field name in this function.
+    assert!(
+        !body.contains("grpc-status")
+            && !body.contains("grpc-message")
+            && !body.contains("GRPC_CONTROL_TRAILER_NAMES"),
+        "the reconciliation must not name any exempt field: {body}"
+    );
+    // Exactly one early-out, and it must be the structural section check.
+    assert_eq!(
+        body.matches("continue;").count(),
+        1,
+        "the reconciliation must have exactly one early-out: {body}"
+    );
+    let early_out = body
+        .split("continue;")
+        .next()
+        .expect("region above the early-out");
+    let guard = early_out
+        .rsplit("if ")
+        .next()
+        .expect("early-out guard")
+        .lines()
+        .next()
+        .expect("early-out guard line");
+    assert!(
+        guard.contains("section.field_is_reserved("),
+        "the only early-out must be the structural section check, not a name \
+         comparison: {guard}"
+    );
+    // Governance stays the union of every independent signal. Asserted term by
+    // term rather than as one formatted line so `cargo fmt` rewrapping the
+    // expression cannot silently retire the contract.
+    let union = body
+        .split("let governed = ")
+        .nth(1)
+        .expect("governance union")
+        .split(';')
+        .next()
+        .expect("bounded governance union");
+    for term in [
+        "explicitly_named",
+        "prefix_owned",
+        "gateway_owned",
+        "unbounded_policy",
+        "witness.was_mutated(",
+    ] {
+        assert!(
+            union.contains(term),
+            "governance must keep the {term} signal in its union: {union}"
+        );
+    }
+    assert!(
+        !union.contains("&&"),
+        "the governance signals must be OR-ed; ANDing any pair would let one \
+         signal veto another: {union}"
     );
 }
 

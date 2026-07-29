@@ -16859,8 +16859,25 @@ components:
         - $ref: '#/components/schemas/CorsExactOrigin'
         - type: string
           minLength: 3
+          maxLength: 512
           pattern: '^\*\.[^*/:\s]+$'
           description: Native wildcard-subdomain matcher such as `*.example.com`.
+
+    CorsLiteralExactOrigin:
+      type: string
+      minLength: 1
+      maxLength: 512
+      # At least one non-whitespace character: a whitespace-only literal can
+      # never equal a real Origin header, so the runtime rejects it too.
+      pattern: '\S'
+      description: >-
+        Istio `StringMatch.exact` origin matcher. LITERAL semantics: compared
+        byte-for-byte and case-sensitively against the request `Origin` header
+        with NO canonicalization and NO wildcard interpretation, so a value such
+        as `*.example.com` stays the exact string upstream assigns it instead of
+        becoming the native wildcard-subdomain matcher. The single exception is
+        `*`, which Istio itself defines as allow-all. Whitespace-only values are
+        rejected; the value is bounded at 512 bytes.
 
     CorsConfig:
       type: object
@@ -16891,6 +16908,7 @@ components:
         allowed_origins:
           type: array
           minItems: 1
+          maxItems: 64
           items:
             oneOf:
               - $ref: '#/components/schemas/CorsAllowedOriginString'
@@ -16904,32 +16922,37 @@ components:
                   multi-key objects are rejected at config time.
                 properties:
                   exact:
-                    $ref: '#/components/schemas/CorsExactOrigin'
-                    description: >-
-                      Exact origin, canonicalized at config time (scheme/host
-                      case, IDNA, IP serialization, and default ports). The
-                      exact value `*` has Istio's documented allow-all meaning.
+                    $ref: '#/components/schemas/CorsLiteralExactOrigin'
                   prefix:
                     type: string
                     minLength: 1
+                    maxLength: 512
                     description: >-
                       Literal byte-prefix of the request Origin header
                       (case-sensitive), e.g. "https://app.".
                   regex:
                     type: string
                     minLength: 1
+                    maxLength: 512
                     description: >-
                       RE2 pattern that must FULLY match the request Origin
-                      header. Compiled (and size-bounded) at config time; an
-                      invalid pattern is rejected.
+                      header. Compiled once at config construction/reload (never
+                      per request) under explicit bounds — 512 pattern bytes, a
+                      64 KiB compiled-program limit, a 64 KiB lazy-DFA limit,
+                      and an AST nesting limit of 24. An invalid or over-budget
+                      pattern is rejected with a field-specific error.
           description: >-
-            Required permitted-origin policy. Each entry is either a string
-            (`"*"` for intentional allow-all, an exact `scheme://host[:port]`
-            origin canonicalized on the cold config path, or a
-            `*.suffix.com` wildcard-subdomain pattern)
-            or an Istio `StringMatch`-shaped object carrying exactly one of
-            `exact` / `prefix` / `regex`. Prefix and regex retain literal Istio
-            matcher semantics and are not broadened by exact canonicalization.
+            Required permitted-origin policy, bounded at 64 entries. Each entry
+            is either a string — NATIVE syntax: `"*"` for intentional allow-all,
+            an exact `scheme://host[:port]` origin canonicalized on the cold
+            config path, or a `*.suffix.com` wildcard-subdomain pattern — or an
+            Istio `StringMatch`-shaped object carrying exactly one of `exact` /
+            `prefix` / `regex`. The two families are SEPARATE matcher semantics:
+            object `exact`, `prefix`, and `regex` all retain literal Istio
+            semantics and are never broadened by the native form's
+            canonicalization or wildcard interpretation, so
+            `{"exact": "*.example.com"}` matches only that literal string while
+            the plain string `"*.example.com"` matches every subdomain.
         allowed_methods:
           type: array
           items:
@@ -20005,9 +20028,50 @@ components:
         Google Cloud Functions as middleware in the proxy pipeline. In
         `pre_proxy` mode the function response can inject request headers and
         metadata before the backend call. In `terminate` mode the function
-        response is returned directly to the client (HTTP only — gRPC
-        rejection normalization would drop the body, so terminate mode on
-        gRPC requests is rejected with 500). Cloud credential fields fall
+        response is returned directly to the client. Native gRPC terminate
+        requires a JSON contract with `grpc_status` plus optional
+        `message_base64` (raw protobuf bytes), `grpc_message`,
+        `status_details_base64`, and custom `trailers`; the gateway frames an
+        uncompressed unary DATA message and owns reserved terminal metadata.
+        The request is classified as native gRPC by the HTTP flavor the
+        frontend stamps at intake, not by a mutable effective content-type.
+        Every terminal trailer value is bounded by an 8 KiB wire-value
+        ceiling, measured after sanitization and after base64 or
+        percent-encoding, and the complete terminal metadata block —
+        `grpc-status`, `grpc-message`, `grpc-status-details-bin`, every
+        custom trailer, and `content-type` — is bounded by a separate 16 KiB
+        aggregate budget charged as name + value + 32 bytes per field, the
+        way HTTP/2 charges `SETTINGS_MAX_HEADER_LIST_SIZE` and HTTP/3 charges
+        `SETTINGS_MAX_FIELD_SECTION_SIZE`. Custom trailers are additionally
+        capped at 32 entries. `grpc_message` is authored as human-readable text
+        and emitted in the canonical percent-encoded `grpc-message` wire form
+        (uppercase hex for `%` and every byte outside the grammar's
+        unescaped range). Custom trailers use the gRPC Custom-Metadata name
+        alphabet and printable-ASCII value grammar; `-bin` values must be
+        standard base64 with or without padding. Names are case-insensitive,
+        so two `trailers` members differing only in case are rejected rather
+        than one silently overwriting the other. The raw function output is
+        also screened for duplicate JSON object member names before parsing —
+        byte-identical, escaped-equivalent, or nested inside `trailers` — so a
+        document whose terminal outcome depends on which parser reads it is
+        refused instead of resolved.
+        gRPC-Web terminate is rejected with 500. Streaming and compression
+        contract shapes fail closed. Malformed or oversized function output
+        fails closed without reflecting untrusted bodies. The validated
+        framed response enters the shared response-body policy lifecycle, so
+        configured gRPC response validators and limits still apply; if a body
+        policy or transform invalidates that authorized representation, the
+        response fails closed to a nonzero gRPC error rather than degrading to
+        an empty successful trailers-only reply. The status-only shape carries
+        the same provenance: unchanged, it stays trailers-only and restores its
+        complete terminal metadata (grpc-status, optional grpc-message,
+        grpc-status-details-bin, and validated custom trailers) from the
+        validated contract rather than the reject header map, with an omitted
+        grpc-message emitted as omission rather than a synthesized reason; a
+        changed status or an unauthored body fails closed the same way and
+        discards every authored terminal key with it, and it can never
+        authorize DATA. Cloud credential
+        fields fall
         back to well-known environment variables. Terminate mode forwards
         applicable end-to-end response headers, preserving repeated Set-Cookie
         and list-valued Link while requiring Location, Content-Location, and
@@ -20057,7 +20121,8 @@ components:
         and enforcing
         redaction-dependent plugins reject governed content when those bytes
         cannot be safely rewritten.
-        Proven pre-invocation payload-validation, unsupported-gRPC, DNS-policy,
+        Proven pre-invocation payload-validation, unsupported-gRPC-Web,
+        DNS-policy,
         and literal-IP-policy rejections release every acquired deduplication
         owner after commit. Real remote 502 responses remain application
         responses; uncertain post-invocation failures retain their protection.
@@ -20093,7 +20158,8 @@ components:
           default: pre_proxy
           description: |
             pre_proxy: invoke and inject headers/metadata, then continue.
-            terminate: invoke and return response to client (HTTP only).
+            terminate: invoke and return response to client (HTTP body
+            passthrough, or native-gRPC JSON unary contract).
         function_url:
           type: string
           format: uri
@@ -21911,7 +21977,7 @@ components:
     AiResponseGuardConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_response_guard — HTTP-only validation and filtering for AI/LLM API responses. Enforcing actions fail closed when a governed buffered response is oversized or uninspectable. Native gRPC protobuf messages are not supported."
+      description: "Plugin: ai_response_guard — validation and filtering for AI/LLM API responses. Enforcing actions fail closed when a governed buffered response is oversized or uninspectable. Native gRPC protobuf responses are inspected only for methods enrolled in the descriptor-based grpc block; unenrolled methods are never decoded and never buffered. require_json and required_fields are JSON-only and are rejected when combined with grpc."
       anyOf:
         - required: [pii_patterns]
           properties:
@@ -22008,7 +22074,11 @@ components:
           type: integer
           minimum: 1
           default: 1048576
-          description: Maximum governed buffered response size. Reject/redact and structural rules fail closed above this limit; warn-only content rules record a bounded warning and pass through.
+          description: >-
+            Maximum governed buffered response size, including the aggregate
+            decoded/decompressed native-gRPC payload across frames.
+            Reject/redact and structural rules fail closed above this limit;
+            warn-only content rules record a bounded warning and pass through.
         require_json:
           type: boolean
           default: false
@@ -22025,6 +22095,85 @@ components:
           minimum: 0
           default: 0
           description: "Maximum allowed length of completion content, measured in characters (Unicode scalar values, not UTF-8 bytes). 0 = no limit"
+        grpc:
+          type: object
+          additionalProperties: false
+          required: [descriptor_path, methods]
+          description: >-
+            Native-gRPC response inspection contract. Present means the plugin
+            also applies to native gRPC, but only for the enrolled methods:
+            every other gRPC method is left undecoded, uninspected, and
+            unbuffered. Enrolled methods fail closed for reject/redact actions
+            when the descriptor is unavailable, the payload does not decode as
+            the configured type, the message carries fields outside the
+            descriptor, the framing is malformed or truncated, the message
+            encoding is not gzip/identity, or a bound is exceeded. Requires at
+            least one detection pattern, blocked phrase, or
+            max_completion_length, and may not be combined with require_json or
+            required_fields.
+          properties:
+            descriptor_path:
+              type: string
+              minLength: 1
+              pattern: '\S'
+              description: >-
+                Node-local path to a compiled protobuf FileDescriptorSet.
+                Validated shape-only at Admin/CP admission and against the real
+                descriptor by mode-aware file-dependency validation. A readable
+                but invalid descriptor rejects the candidate configuration; an
+                absent or unreadable descriptor retains enrollment and fails
+                closed for enforcing actions at request time.
+            methods:
+              type: object
+              minProperties: 1
+              description: >-
+                Map of "/package.Service/Method" to that method's response
+                inspection contract. Only these methods are inspected.
+                Leading/trailing whitespace and one optional leading slash are
+                normalized by the runtime; every dotted service segment and the
+                method identifier must be a protobuf/gRPC identifier. Duplicate
+                normalized forms are rejected at runtime.
+              propertyNames:
+                pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
+              additionalProperties:
+                type: object
+                additionalProperties: false
+                required: [response_type]
+                properties:
+                  response_type:
+                    type: string
+                    minLength: 1
+                    pattern: '\S'
+                    description: Fully-qualified protobuf response message type.
+                  text_fields:
+                    type: array
+                    minItems: 1
+                    items:
+                      type: string
+                      minLength: 1
+                      pattern: '\S'
+                    description: >-
+                      Dotted field paths restricting what is scanned and
+                      rewritten. Each path must end at a string field and may
+                      not traverse a map field. Omit to cover every string
+                      field and known extension value recursively.
+            max_message_bytes:
+              type: integer
+              minimum: 1
+              default: 1048576
+              description: >-
+                Per-message ceiling, applied to the declared frame length and
+                enforced while inflating a gzip-compressed frame; inflation
+                stops at the tighter of this ceiling and the remaining
+                max_scan_bytes budget. Aggregate decoded payload across frames
+                is additionally capped by max_scan_bytes.
+            max_messages:
+              type: integer
+              minimum: 1
+              default: 64
+              description: >-
+                Maximum number of length-prefixed frames one buffered gRPC
+                response may carry.
 
     AiToolGovernorConfig:
       type: object

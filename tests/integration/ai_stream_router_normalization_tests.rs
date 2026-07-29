@@ -111,6 +111,73 @@ async fn claim_requests_identity_encoding_and_preserves_tool_history() {
 }
 
 #[tokio::test]
+async fn claim_preserves_legacy_function_call_history() {
+    let plugin = plugin();
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "function_call": {
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"ok\"}"
+                }
+            },
+            {"role": "function", "name": "lookup", "content": "ok"}
+        ]
+    });
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".into(),
+        "POST".into(),
+        "/v1/chat/completions".into(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&body).unwrap(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("accept-encoding".to_string(), "gzip, br".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let translated = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("legacy function history must translate");
+    let parsed: serde_json::Value = serde_json::from_slice(&translated).unwrap();
+    assert_eq!(
+        parsed["messages"][1]["content"][0]["type"],
+        json!("tool_use")
+    );
+    assert_eq!(
+        parsed["messages"][1]["content"][0]["id"],
+        json!("call_legacy_1")
+    );
+    assert_eq!(parsed["messages"][1]["content"][0]["name"], json!("lookup"));
+    assert_eq!(
+        parsed["messages"][2]["content"][0]["type"],
+        json!("tool_result")
+    );
+    assert_eq!(
+        parsed["messages"][2]["content"][0]["tool_use_id"],
+        json!("call_legacy_1")
+    );
+}
+
+#[tokio::test]
 async fn gzip_residual_encoding_repairs_headers_and_normalizes_stream() {
     let plugin = plugin();
     let (mut ctx, _) = claim(&plugin).await;

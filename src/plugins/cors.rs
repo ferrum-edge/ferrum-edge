@@ -11,24 +11,62 @@
 //!
 //! In addition to the plain-string forms, `allowed_origins` entries may be
 //! Istio `StringMatch`-shaped objects — `{"exact": ...}`, `{"prefix": ...}`, or
-//! `{"regex": ...}` — so a VirtualService `corsPolicy` that uses `prefix` /
-//! `regex` origin matchers can be projected onto this plugin. `prefix` is a
-//! literal byte-prefix of the request `Origin` header; `regex` is an RE2
-//! full match of the entire `Origin` (same semantics Ferrum already applies to
-//! Istio `StringMatch` elsewhere). A matching origin is reflected verbatim into
-//! `Access-Control-Allow-Origin`.
+//! `{"regex": ...}` — so a VirtualService `corsPolicy` that uses `exact` /
+//! `prefix` / `regex` origin matchers can be projected onto this plugin.
+//!
+//! The two families are deliberately SEPARATE matcher semantics and must not be
+//! conflated (issue #3254):
+//!
+//! - a plain STRING entry is NATIVE syntax: `"*"` is allow-all,
+//!   `"*.company.com"` is the wildcard-subdomain pattern, and anything else is
+//!   an exact origin canonicalized once at config time and compared
+//!   case-insensitively;
+//! - an OBJECT `{"exact": ...}` entry is Istio `StringMatch.exact`: a LITERAL,
+//!   byte-for-byte, case-sensitive comparison against the request `Origin`
+//!   header with no canonicalization and no wildcard interpretation. That is
+//!   what makes `{"exact": "*.example.com"}` representable: it stays the
+//!   literal string upstream assigns it and is NEVER reinterpreted as the
+//!   native wildcard-subdomain syntax (which would widen the policy to every
+//!   subdomain). The single documented exception is `{"exact": "*"}`, which
+//!   Istio itself defines as allow-all.
+//!
+//! `prefix` is a literal byte-prefix of the request `Origin` header; `regex` is
+//! an RE2 full match of the entire `Origin` (same semantics Ferrum already
+//! applies to Istio `StringMatch` elsewhere), compiled once at config
+//! construction/reload under the explicit byte/complexity/count bounds below
+//! (issue #3253) — never per request. A matching origin is reflected verbatim
+//! into `Access-Control-Allow-Origin`.
 
 use async_trait::async_trait;
 use http::Method;
 use http::header::HeaderName;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tracing::{debug, warn};
 use url::Url;
 
 use super::{Plugin, PluginResult, RequestContext};
+
+/// Discrete response fields `finalize_cors_response` can write that sit
+/// outside the open-ended `access-control-` family. Built once per process and
+/// shared by both the per-instance plugin and the cache-internal finalizer.
+///
+/// `vary` is the only such field today: `cors_headers` merges a token list into
+/// it, and a backend trailer could otherwise overwrite that merge. Every
+/// `access-control-*` name — including trailer-only extensions the finite write
+/// list never enumerates — is covered by [`CORS_RESPONSE_POLICY_PREFIXES`].
+static CORS_RESPONSE_POLICY_NAMES: LazyLock<Vec<String>> =
+    LazyLock::new(|| vec!["vary".to_string()]);
+
+/// Open-ended CORS response-header family. Mirrors the case-insensitive
+/// `access-control-` prefix `remove_access_control_headers` strips on every
+/// CORS-owned response, so a trailer-only extension name
+/// (`access-control-allow-private-network`, …) cannot bypass sanitization
+/// merely by being absent from the finite write list and the initial map.
+static CORS_RESPONSE_POLICY_PREFIXES: LazyLock<Vec<String>> =
+    LazyLock::new(|| vec!["access-control-".to_string()]);
 
 const DEFAULT_ALLOWED_METHODS: &[&str] =
     &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
@@ -42,6 +80,40 @@ const DEFAULT_ALLOWED_HEADERS: &[&str] = &[
 const ACCESS_CONTROL_HEADER_PREFIX: &[u8] = b"access-control-";
 
 pub(crate) const CORS_FINALIZER_NAME: &str = "__cors_finalizer";
+
+// ── Origin-matcher bounds (issue #3253) ───────────────────────────────────
+//
+// Every bound below is EXPLICIT and shared. The `cors` plugin, the Istio
+// VirtualService translator (`config_sources::k8s::istio`), and the
+// native/file mesh validator (`modes::mesh::config`) all admit origin matchers
+// through these same predicates, so a matcher that passes a config boundary can
+// never fail `CorsPlugin` construction later, and an over-budget matcher is
+// refused with a field-specific diagnostic rather than dropped, approximated,
+// or widened.
+
+/// Maximum number of `allowed_origins` entries in ONE policy. A CORS policy is
+/// evaluated linearly per cross-origin request, so an unbounded matcher list is
+/// a per-request cost multiplier; 64 covers every realistic origin allow-list.
+pub(crate) const MAX_ALLOWED_ORIGIN_ENTRIES: usize = 64;
+
+/// Maximum byte length of a single origin matcher value (exact literal, native
+/// string, prefix, or regex pattern). Real origins are well under 512 bytes;
+/// the bound keeps a hostile source resource from shipping a megabyte pattern
+/// into every proxy's plugin cache.
+pub(crate) const MAX_ORIGIN_MATCHER_BYTES: usize = 512;
+
+/// Compiled-program byte ceiling for one origin regex. The regex crate is
+/// finite-automaton based (no catastrophic backtracking), but an adversarial
+/// pattern can still compile to a very large program; bound it explicitly
+/// instead of inheriting the crate default (10 MiB).
+const ORIGIN_REGEX_SIZE_LIMIT: usize = 64 * 1024;
+
+/// Lazy-DFA cache ceiling for one origin regex, bounding per-match memory.
+const ORIGIN_REGEX_DFA_SIZE_LIMIT: usize = 64 * 1024;
+
+/// Maximum AST nesting depth for one origin regex — the explicit complexity
+/// bound (the crate default is 250).
+const ORIGIN_REGEX_NEST_LIMIT: u32 = 24;
 
 const CORS_CONFIG_KEYS: &[&str] = &[
     "allowed_origins",
@@ -171,8 +243,21 @@ fn intersect_values(
 /// A single origin pattern entry.
 #[derive(Debug, Clone)]
 enum OriginPattern {
-    /// Exact origin match (case-insensitive), e.g. `"https://app.company.com"`.
+    /// NATIVE exact origin match (case-insensitive) against the canonicalized
+    /// origin, e.g. `"https://app.company.com"`. Produced by the plain-string
+    /// config form only.
     Exact(String),
+    /// Istio `StringMatch.exact` on the request `Origin` header: a LITERAL,
+    /// byte-for-byte, case-sensitive comparison with NO canonicalization and NO
+    /// wildcard interpretation (issue #3254).
+    ///
+    /// This variant exists so a source `exact` that merely LOOKS like native
+    /// wildcard syntax (`*.example.com`) keeps its upstream literal meaning
+    /// instead of being reinterpreted as [`OriginPattern::WildcardSubdomain`],
+    /// which would authorize every subdomain the source never matched. It is
+    /// also why a non-canonical literal (`https://Example.com:443`) is
+    /// preserved verbatim rather than widened to the browser serialization.
+    LiteralExact(String),
     /// Wildcard subdomain match, e.g. `"*.company.com"`.
     ///
     /// Stores the suffix to match against (e.g. `".company.com"`).
@@ -187,9 +272,10 @@ enum OriginPattern {
     Prefix(String),
     /// Istio `StringMatch.regex` on the request `Origin` header: the compiled
     /// RE2 pattern must FULLY match the entire origin. Compiled once at config
-    /// time with the regex crate's default size limit (no catastrophic
-    /// backtracking — the engine is finite-automaton based); an invalid pattern
-    /// is rejected at config validation, never panicked on.
+    /// time under the explicit program, DFA, and nesting limits below (no
+    /// catastrophic backtracking — the engine is finite-automaton based); an
+    /// invalid or over-budget pattern is rejected at config validation, never
+    /// panicked on.
     Regex(Regex),
 }
 
@@ -320,15 +406,21 @@ impl CorsPlugin {
     /// - `["*.company.com"]` → wildcard subdomain (matches any `*.company.com`)
     ///
     /// and Istio `StringMatch`-shaped object forms (so a VirtualService
-    /// `corsPolicy` with `prefix` / `regex` origin matchers can project here):
-    /// - `[{"exact": "https://example.com"}]` → exact match (same as the string
-    ///   form)
+    /// `corsPolicy` with `exact` / `prefix` / `regex` origin matchers can
+    /// project here):
+    /// - `[{"exact": "https://example.com"}]` → LITERAL byte-exact match of the
+    ///   `Origin` header — NOT the canonicalizing, case-insensitive plain-string
+    ///   form, so `{"exact": "*.example.com"}` stays the literal string it is
+    ///   upstream instead of becoming native wildcard-subdomain syntax
     /// - `[{"prefix": "https://app."}]` → literal byte-prefix of the `Origin`
     /// - `[{"regex": "https://.*\\.example\\.com"}]` → RE2 full match of the
     ///   `Origin`
     ///
     /// String and object entries can be mixed. An object entry must carry
-    /// exactly one of `exact` / `prefix` / `regex`.
+    /// exactly one of `exact` / `prefix` / `regex`. The list length and every
+    /// entry's byte length are bounded ([`MAX_ALLOWED_ORIGIN_ENTRIES`] /
+    /// [`MAX_ORIGIN_MATCHER_BYTES`]) with a field-specific error — never a
+    /// silent truncation.
     fn parse_origins(config: &Value) -> Result<AllowedOrigins, String> {
         match config.get("allowed_origins") {
             None => Err(
@@ -342,6 +434,7 @@ impl CorsPlugin {
                             .to_string(),
                     );
                 }
+                validate_origin_matcher_count(arr.len())?;
 
                 let mut patterns = Vec::with_capacity(arr.len());
                 let mut wildcard = false;
@@ -367,6 +460,7 @@ impl CorsPlugin {
                                 wildcard = true;
                                 continue;
                             }
+                            validate_origin_matcher_len("'allowed_origins' string entry", origin)?;
                             if origin.starts_with('*') {
                                 patterns.push(OriginPattern::WildcardSubdomain(
                                     validate_wildcard_origin(origin)?,
@@ -405,8 +499,16 @@ impl CorsPlugin {
     /// Parse a single Istio `StringMatch`-shaped origin matcher object
     /// (`{"exact": ...}` / `{"prefix": ...}` / `{"regex": ...}`). Exactly one of
     /// the three keys must be present and a non-empty string. The `regex`
-    /// pattern is compiled here (config time) so an invalid pattern is a config
-    /// error, never a request-path panic.
+    /// pattern is compiled here (config time) under explicit bounds so an
+    /// invalid or over-budget pattern is a config error, never a request-path
+    /// panic or per-request cost.
+    ///
+    /// `exact` is LITERAL here (issue #3254) — see
+    /// [`OriginPattern::LiteralExact`]. Do not route it through
+    /// [`canonicalize_exact_origin`]: that predicate belongs to the native
+    /// plain-string form, and applying it to an Istio matcher would both reject
+    /// representable literals (`*.example.com`) and widen non-canonical ones to
+    /// the browser serialization the source never matched.
     fn parse_origin_matcher(value: &Value) -> Result<Option<OriginPattern>, String> {
         // Istio `StringMatch` contract: EXACTLY ONE recognized key, and nothing
         // else. Reject unknown keys, extra keys, or a non-string value rather
@@ -434,24 +536,14 @@ impl CorsPlugin {
 
         match (exact, prefix, regex) {
             (Some(exact), None, None) => {
-                let trimmed = exact.trim();
-                if trimmed.is_empty() {
-                    return Err(
-                        "cors: 'allowed_origins' exact matcher must be a non-empty string"
-                            .to_string(),
-                    );
-                }
-                if trimmed.len() != exact.len() {
-                    return Err(
-                        "cors: 'allowed_origins' exact matcher must not have leading or trailing whitespace"
-                            .to_string(),
-                    );
-                }
+                // Istio explicitly assigns exact `*` allow-all semantics; every
+                // OTHER value stays a literal, including one that looks like
+                // native wildcard syntax.
                 if exact == "*" {
                     return Ok(None);
                 }
-                let canonical = canonicalize_exact_origin(exact)?;
-                Ok(Some(OriginPattern::Exact(canonical)))
+                validate_literal_exact_origin(exact)?;
+                Ok(Some(OriginPattern::LiteralExact(exact.to_string())))
             }
             (None, Some(prefix), None) => {
                 // Istio prefix is a literal string prefix of the Origin header;
@@ -459,38 +551,11 @@ impl CorsPlugin {
                 // beyond rejecting an all-empty value. An empty prefix would
                 // match every origin (an open CORS policy by accident), so it
                 // is rejected rather than silently allow-all.
-                if prefix.is_empty() {
-                    return Err(
-                        "cors: 'allowed_origins' prefix matcher must be a non-empty string \
-                         (an empty prefix would match every origin)"
-                            .to_string(),
-                    );
-                }
+                validate_origin_prefix(prefix)?;
                 Ok(Some(OriginPattern::Prefix(prefix.to_string())))
             }
             (None, None, Some(regex)) => {
-                if regex.is_empty() {
-                    return Err(
-                        "cors: 'allowed_origins' regex matcher must be a non-empty string"
-                            .to_string(),
-                    );
-                }
-                // Istio `StringMatch.regex` is a FULL match. Anchor at compile
-                // time (the shared Ferrum convention for Istio-style regex, also
-                // strips a redundant leading `^`/trailing `$`) so matching can
-                // use `is_match`: checking only the first unanchored `find`
-                // would reject an Origin that a LATER alternation branch fully
-                // matches (e.g. `https://app|https://app\.example\.com` vs
-                // `https://app.example.com`, where `find` returns the shorter
-                // `https://app`). Compile with the regex crate's default size
-                // limit; the engine is finite-automaton based, so a hostile
-                // pattern cannot trigger catastrophic backtracking. A pattern
-                // that fails to compile is rejected here, not at request time.
-                let anchored = crate::config::types::anchor_regex_pattern(regex);
-                let compiled = Regex::new(&anchored).map_err(|e| {
-                    format!("cors: 'allowed_origins' regex matcher '{regex}' is invalid: {e}")
-                })?;
-                Ok(Some(OriginPattern::Regex(compiled)))
+                Ok(Some(OriginPattern::Regex(compile_origin_regex(regex)?)))
             }
             (None, None, None) => Err(
                 "cors: 'allowed_origins' object matcher must specify one of \
@@ -552,7 +617,10 @@ impl CorsPlugin {
 
     /// Check whether a request origin is allowed.
     ///
-    /// For `Exact` patterns: case-insensitive full-string match.
+    /// For `Exact` patterns (native plain strings): case-insensitive
+    /// full-string match against the canonicalized origin.
+    /// For `LiteralExact` patterns (Istio `StringMatch.exact`): byte-for-byte
+    /// case-sensitive equality with the raw `Origin` header.
     /// For `WildcardSubdomain` patterns: the origin's host portion must end
     /// with the stored suffix (e.g. `.company.com`). This means
     /// `*.company.com` matches `https://app.company.com` but NOT
@@ -570,6 +638,9 @@ impl CorsPlugin {
             AllowedOrigins::Wildcard => true,
             AllowedOrigins::List(patterns) => patterns.iter().any(|p| match p {
                 OriginPattern::Exact(expected) => expected.eq_ignore_ascii_case(origin),
+                // Istio `StringMatch.exact`: literal, case-sensitive, no
+                // canonicalization. Allocation-free on the hot path.
+                OriginPattern::LiteralExact(expected) => expected == origin,
                 OriginPattern::WildcardSubdomain(suffix) => origin_host(origin)
                     .is_some_and(|host| ascii_ends_with_ignore_case(host, suffix.as_str())),
                 OriginPattern::Prefix(prefix) => origin.starts_with(prefix.as_str()),
@@ -754,6 +825,20 @@ impl Plugin for CorsPlugin {
                 .get(.."access-control-".len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("access-control-"))
     }
+
+    /// The CORS response headers are the browser's entire cross-origin
+    /// authorization decision. A backend trailer repeating one of them lands
+    /// after `after_proxy` and could hand the client a second, contradictory
+    /// `Access-Control-Allow-Origin` — and a backend that echoes the identical
+    /// value is invisible to observed-mutation reconciliation. Ownership is the
+    /// open-ended `access-control-` prefix `remove_access_control_headers`
+    /// already strips, plus `vary` for the merge outside that family.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::NamesAndPrefixes {
+            names: &CORS_RESPONSE_POLICY_NAMES,
+            prefixes: &CORS_RESPONSE_POLICY_PREFIXES,
+        }
+    }
 }
 
 /// Cache-internal boundary after a contiguous set of CORS instances.
@@ -805,6 +890,16 @@ impl Plugin for CorsFinalizer {
             && name
                 .get(.."access-control-".len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("access-control-"))
+    }
+
+    /// Same ownership contract as the per-instance plugin: this finalizer is
+    /// the phase that actually writes the deferred CORS response headers, so it
+    /// declares the same prefix family plus `vary`.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::NamesAndPrefixes {
+            names: &CORS_RESPONSE_POLICY_NAMES,
+            prefixes: &CORS_RESPONSE_POLICY_PREFIXES,
+        }
     }
 }
 
@@ -1037,6 +1132,111 @@ pub(crate) fn validate_method(key: &str, value: &str) -> Result<(), String> {
         .map_err(|_| format!("cors: '{key}' contains an invalid HTTP method: {value}"))
 }
 
+/// Shared bound on how many `allowed_origins` entries one policy may carry.
+/// `pub(crate)` for the same reason as [`validate_method`]: the Istio
+/// translator and the native/file mesh validator admit against this exact
+/// predicate, so an over-budget list is refused with a field-specific
+/// diagnostic at the source boundary instead of failing plugin construction
+/// later. Do not fork.
+pub(crate) fn validate_origin_matcher_count(count: usize) -> Result<(), String> {
+    if count > MAX_ALLOWED_ORIGIN_ENTRIES {
+        return Err(format!(
+            "cors: 'allowed_origins' must contain at most {MAX_ALLOWED_ORIGIN_ENTRIES} entries, got: {count}"
+        ));
+    }
+    Ok(())
+}
+
+/// Shared byte bound for one origin matcher value — see
+/// [`validate_origin_matcher_count`]. `label` names the offending field so the
+/// diagnostic points at the matcher kind that failed.
+pub(crate) fn validate_origin_matcher_len(label: &str, value: &str) -> Result<(), String> {
+    if value.len() > MAX_ORIGIN_MATCHER_BYTES {
+        return Err(format!(
+            "cors: {label} exceeds the {MAX_ORIGIN_MATCHER_BYTES}-byte matcher limit (got {} bytes)",
+            value.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Admission for an Istio `StringMatch.exact` origin matcher (issue #3254).
+///
+/// LITERAL semantics: the value is preserved byte-for-byte and compared
+/// case-sensitively against the raw `Origin` header, so no canonicalization,
+/// whitespace trimming, or wildcard interpretation is applied — that is exactly
+/// what keeps `*.example.com` from being widened into the native
+/// wildcard-subdomain matcher. Only genuinely unusable values are refused: an
+/// empty or whitespace-only matcher (it can never equal a real `Origin`, so it
+/// is a config mistake, not a policy) and an over-budget one.
+///
+/// Callers handle Istio's documented allow-all `*` BEFORE this gate.
+pub(crate) fn validate_literal_exact_origin(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(
+            "cors: 'allowed_origins' exact matcher must be a non-empty, non-whitespace string"
+                .to_string(),
+        );
+    }
+    validate_origin_matcher_len("'allowed_origins' exact matcher", value)
+}
+
+/// Admission for an Istio `StringMatch.prefix` origin matcher — see
+/// [`validate_literal_exact_origin`]. An EMPTY prefix would match every origin
+/// (an accidental open CORS policy), so it is refused rather than allowed.
+pub(crate) fn validate_origin_prefix(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(
+            "cors: 'allowed_origins' prefix matcher must be a non-empty string \
+             (an empty prefix would match every origin)"
+                .to_string(),
+        );
+    }
+    validate_origin_matcher_len("'allowed_origins' prefix matcher", value)
+}
+
+/// Compile one Istio `StringMatch.regex` origin matcher under the explicit
+/// bounds of issue #3253. Shared admission gate — see
+/// [`validate_origin_matcher_count`].
+///
+/// Istio `StringMatch.regex` is a FULL match. The pattern is anchored at
+/// compile time (the shared Ferrum convention for Istio-style regex, which also
+/// strips a redundant leading `^` / trailing `$`) so matching is exactly
+/// `is_match` — checking only the first unanchored `find` would reject an
+/// Origin that a LATER alternation branch fully matches (e.g.
+/// `https://app|https://app\.example\.com` against `https://app.example.com`,
+/// where `find` returns the shorter `https://app`).
+///
+/// Compilation happens ONCE on the config construction/reload path, never per
+/// request. The regex crate is finite-automaton based, so a hostile pattern
+/// cannot trigger catastrophic backtracking, but size/complexity are still
+/// bounded EXPLICITLY rather than inherited: pattern bytes
+/// ([`MAX_ORIGIN_MATCHER_BYTES`]), compiled program size
+/// ([`ORIGIN_REGEX_SIZE_LIMIT`]), lazy-DFA cache
+/// ([`ORIGIN_REGEX_DFA_SIZE_LIMIT`]), and AST nesting
+/// ([`ORIGIN_REGEX_NEST_LIMIT`]). Anything that fails is a config error with a
+/// field-specific message — never a dropped or approximated matcher.
+pub(crate) fn compile_origin_regex(pattern: &str) -> Result<Regex, String> {
+    if pattern.is_empty() {
+        return Err("cors: 'allowed_origins' regex matcher must be a non-empty string".to_string());
+    }
+    validate_origin_matcher_len("'allowed_origins' regex matcher", pattern)?;
+    let anchored = crate::config::types::anchor_regex_pattern(pattern);
+    RegexBuilder::new(&anchored)
+        .size_limit(ORIGIN_REGEX_SIZE_LIMIT)
+        .dfa_size_limit(ORIGIN_REGEX_DFA_SIZE_LIMIT)
+        .nest_limit(ORIGIN_REGEX_NEST_LIMIT)
+        .build()
+        .map_err(|e| {
+            format!(
+                "cors: 'allowed_origins' regex matcher '{pattern}' is invalid or exceeds the \
+                 configured complexity bounds (size limit {ORIGIN_REGEX_SIZE_LIMIT} bytes, \
+                 DFA limit {ORIGIN_REGEX_DFA_SIZE_LIMIT} bytes, nest limit \
+                 {ORIGIN_REGEX_NEST_LIMIT}): {e}"
+            )
+        })
+}
+
 /// Shared admission gate — see [`validate_method`].
 pub(crate) fn validate_header_name(key: &str, value: &str) -> Result<(), String> {
     HeaderName::from_bytes(value.as_bytes())
@@ -1068,9 +1268,11 @@ fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
 /// browser-serialized form; no request-time URL parse is introduced.
 /// `pub(crate)` because this is the shared admission gate for the K8s Istio
 /// translator and native/file mesh validation as well as direct plugin
-/// configuration. Callers that preserve literal Istio `StringMatch.exact`
-/// semantics additionally require the returned serialization to equal the
-/// source value. Do not fork this predicate.
+/// configuration. It governs the NATIVE plain-string form ONLY: Istio
+/// `StringMatch.exact` matchers are literal and go through
+/// [`validate_literal_exact_origin`] instead, because canonicalizing them would
+/// widen the source matcher to the browser serialization it never matched. Do
+/// not fork this predicate and do not re-apply it to literal matchers.
 pub(crate) fn canonicalize_exact_origin(origin: &str) -> Result<String, String> {
     if origin.contains(char::is_whitespace) {
         return Err(format!(

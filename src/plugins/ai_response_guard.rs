@@ -9,14 +9,30 @@
 //! IPv4 addresses, and IBAN (shared with ai_prompt_shield).
 //!
 //! Actions: reject (return error to client), redact (replace matches with placeholders),
-//! or warn (add metadata/headers but pass through). Native gRPC protobuf
-//! messages are intentionally outside this JSON/SSE/text plugin's scope.
+//! or warn (add metadata/headers but pass through).
+//!
+//! Native gRPC responses are inspected only for methods an operator explicitly
+//! enrolled under the `grpc` config block. Enrolled methods are decoded against
+//! a compiled `FileDescriptorSet`, scanned, and — for `redact` — re-encoded and
+//! re-verified before delivery. Everything the contract cannot cover safely
+//! (unknown compression, malformed or oversized framing, unknown protobuf
+//! fields, an unresolvable descriptor, a residual match after redaction) fails
+//! closed for enforcing actions. Methods that were never enrolled are never
+//! inspected opportunistically and never forced onto the buffered path.
 
 use async_trait::async_trait;
+use flate2::bufread::GzDecoder;
+use flate2::write::GzEncoder;
+use prost::Message as _;
+use prost_reflect::{
+    DescriptorPool, DynamicMessage, Kind, MapKey, MessageDescriptor, ReflectMessage,
+    Value as ProtobufValue,
+};
 use regex::{NoExpand, Regex, RegexSet};
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read as _, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
@@ -66,7 +82,33 @@ const CONFIG_KEYS: &[&str] = &[
     "require_json",
     "required_fields",
     "max_completion_length",
+    "grpc",
 ];
+
+/// Closed key set for the `grpc` config block.
+pub const AI_RESPONSE_GUARD_GRPC_CONFIG_KEYS: &[&str] = &[
+    "descriptor_path",
+    "methods",
+    "max_message_bytes",
+    "max_messages",
+];
+
+/// Closed key set for one `grpc.methods` entry.
+pub const AI_RESPONSE_GUARD_GRPC_METHOD_KEYS: &[&str] = &["response_type", "text_fields"];
+
+/// Default per-message decoded/decompressed ceiling for one gRPC frame.
+const DEFAULT_GRPC_MAX_MESSAGE_BYTES: usize = 1_048_576;
+
+/// Default ceiling on the number of length-prefixed frames one buffered gRPC
+/// response may carry. Server-streaming responses above this are uninspectable
+/// rather than silently partially inspected.
+const DEFAULT_GRPC_MAX_MESSAGES: usize = 64;
+
+/// Recursion depth ceiling for the protobuf message walk.
+const GRPC_MAX_MESSAGE_DEPTH: usize = 32;
+
+/// Total value-node ceiling for one protobuf message walk.
+const GRPC_MAX_MESSAGE_NODES: usize = 50_000;
 
 const RESPONSE_VALIDATORS: &[&str] = &[
     "etag",
@@ -131,6 +173,66 @@ pub struct AiResponseGuard {
     required_fields: Vec<String>,
     /// Maximum allowed completion length in characters (0 = unlimited).
     max_completion_length: usize,
+    /// Native-gRPC inspection contract. `None` when the operator did not
+    /// configure a `grpc` block, which keeps every gRPC response outside this
+    /// plugin's scope (no buffering vote, no inspection, no transform).
+    grpc: Option<GrpcInspection>,
+}
+
+/// One enrolled gRPC method's response inspection contract, after the
+/// descriptor pool resolved it.
+struct GrpcMethodInspection {
+    descriptor: MessageDescriptor,
+    /// Pre-split dotted field paths. `None` means "every string field,
+    /// recursively" (bounded by the walk budgets).
+    text_fields: Option<Vec<Vec<String>>>,
+}
+
+/// Runtime view of the `grpc` config block.
+struct GrpcInspection {
+    /// Resolved per-method contracts. Empty when the descriptor dependency is
+    /// unavailable on this node.
+    methods: HashMap<String, GrpcMethodInspection>,
+    /// Every method path the operator enrolled, independent of whether the
+    /// descriptor file could be read. Enrollment is what makes a response
+    /// governed, so a missing descriptor fails closed instead of silently
+    /// un-enrolling the method.
+    enrolled_methods: HashSet<String>,
+    max_message_bytes: usize,
+    max_messages: usize,
+    dependency_unavailable: bool,
+}
+
+impl GrpcInspection {
+    fn enrolls(&self, method_path: &str) -> bool {
+        self.enrolled_methods.contains(method_path)
+    }
+
+    fn method(&self, method_path: &str) -> Option<&GrpcMethodInspection> {
+        self.methods.get(method_path)
+    }
+}
+
+/// Config-shape view of the `grpc` block, before descriptor resolution.
+struct GrpcMethodShape {
+    response_type: String,
+    text_fields: Option<Vec<Vec<String>>>,
+}
+
+struct GrpcShape {
+    descriptor_path: String,
+    methods: HashMap<String, GrpcMethodShape>,
+    max_message_bytes: usize,
+    max_messages: usize,
+}
+
+/// Whether a constructor may open node-local descriptor files.
+#[derive(Clone, Copy)]
+enum DescriptorLoadMode {
+    /// Runtime construction on a data-plane node: read the descriptor.
+    Runtime,
+    /// Admin / CP admission: validate the config shape only.
+    ShapeOnly,
 }
 
 /// Built-in PII pattern definitions (shared with ai_prompt_shield and
@@ -141,6 +243,24 @@ fn builtin_pii_pattern(name: &str) -> Option<&'static str> {
 
 impl AiResponseGuard {
     pub fn new(config: &Value) -> Result<Self, String> {
+        Self::new_inner(config, DescriptorLoadMode::Runtime)
+    }
+
+    /// Validate configuration shape without opening node-local descriptor
+    /// files. Mode-aware file dependency validation is performed separately by
+    /// `GatewayConfig::validate_plugin_file_dependencies`.
+    pub fn validate_config(config: &Value) -> Result<(), String> {
+        Self::new_shape_only(config).map(|_| ())
+    }
+
+    /// Build an instance from configuration shape alone. The gRPC enrollment
+    /// set — which is what drives buffering and fail-closed behavior — comes
+    /// from the config shape, not from the descriptor file.
+    pub fn new_shape_only(config: &Value) -> Result<Self, String> {
+        Self::new_inner(config, DescriptorLoadMode::ShapeOnly)
+    }
+
+    fn new_inner(config: &Value, descriptor_mode: DescriptorLoadMode) -> Result<Self, String> {
         if !config.is_object() {
             return Err("ai_response_guard: config must be an object".to_string());
         }
@@ -330,6 +450,32 @@ impl AiResponseGuard {
 
         let max_completion_length = optional_usize(config, "max_completion_length")?.unwrap_or(0);
 
+        let grpc = load_grpc_inspection(config, descriptor_mode)?;
+        if grpc.is_some() {
+            // `require_json` / `required_fields` describe a JSON document
+            // model that a protobuf message can never satisfy. Accepting the
+            // combination would leave one of the two response families
+            // unenforced without the operator ever being told.
+            if require_json {
+                return Err(
+                    "ai_response_guard: 'require_json' is JSON-only and cannot be combined with 'grpc'"
+                        .to_string(),
+                );
+            }
+            if !required_fields.is_empty() {
+                return Err(
+                    "ai_response_guard: 'required_fields' is JSON-only and cannot be combined with 'grpc'"
+                        .to_string(),
+                );
+            }
+            if pii_patterns.is_empty() && blocked_phrases.is_empty() && max_completion_length == 0 {
+                return Err(
+                    "ai_response_guard: 'grpc' requires at least one detection pattern, blocked phrase, or 'max_completion_length'"
+                        .to_string(),
+                );
+            }
+        }
+
         let has_validation_rules = !pii_patterns.is_empty()
             || !blocked_phrases.is_empty()
             || require_json
@@ -378,6 +524,7 @@ impl AiResponseGuard {
             require_json,
             required_fields,
             max_completion_length,
+            grpc,
         })
     }
 
@@ -1375,6 +1522,1322 @@ impl AiResponseGuard {
             None
         }
     }
+
+    // ───────────────────────── native gRPC inspection ─────────────────────────
+
+    /// Resolve the gRPC method path used for enrollment lookup.
+    ///
+    /// Prefers the finalized `grpc_full_method` published by
+    /// `grpc_method_router` (which reflects a method rewrite applied before
+    /// dispatch) and falls back to the canonical request path. Backends never
+    /// echo `:path` in a response, so the request is the only correct source.
+    fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
+        match ctx.metadata.get("grpc_full_method") {
+            Some(method) if method.starts_with('/') => Cow::Borrowed(method.as_str()),
+            Some(method) => {
+                let mut path = String::with_capacity(method.len() + 1);
+                path.push('/');
+                path.push_str(method);
+                Cow::Owned(path)
+            }
+            None => Cow::Borrowed(ctx.path.as_str()),
+        }
+    }
+
+    /// Whether a configured gRPC contract governs this request's response.
+    ///
+    /// This is the single gate for the buffering vote, the inspection hook, and
+    /// the redaction transform, so a method the operator never enrolled is
+    /// never pulled onto the buffered path and never inspected opportunistically.
+    fn grpc_inspection_applies(&self, ctx: &RequestContext) -> bool {
+        let Some(grpc) = self.grpc.as_ref() else {
+            return false;
+        };
+        ctx.is_native_grpc_request() && grpc.enrolls(&Self::grpc_method_path(ctx))
+    }
+
+    /// Whether this plugin's redaction transform owns this response's bytes.
+    ///
+    /// Matches the inspection/enrollment gate rather than the response
+    /// `Content-Type`: a successfully inspected framed response whose response
+    /// type is absent or relabeled must still be rewritten. gRPC-Web
+    /// translated responses remain excluded because `grpc_web` re-frames the
+    /// body before this transform could run.
+    fn grpc_transform_applies(&self, ctx: &RequestContext, _content_type: Option<&str>) -> bool {
+        self.needs_body_transform
+            && self.grpc_inspection_applies(ctx)
+            && !crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
+    }
+
+    /// Inspect a buffered native-gRPC response body for an enrolled method.
+    fn inspect_grpc_response(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let Some(grpc) = self.grpc.as_ref() else {
+            return PluginResult::Continue;
+        };
+        let method_path = Self::grpc_method_path(ctx).into_owned();
+        if !grpc.enrolls(&method_path) {
+            // Never inspect a method the operator did not enroll: its message
+            // type is unknown, so any decode would be a guess.
+            return PluginResult::Continue;
+        }
+
+        // An enrolled method whose descriptor this node could not load has a
+        // policy but no way to apply it, which is exactly the fail-closed case.
+        if grpc.dependency_unavailable {
+            return self.respond_to_uninspectable(
+                ctx,
+                "grpc_descriptor_unavailable",
+                "configured protobuf descriptor dependency is unavailable",
+            );
+        }
+        let Some(method) = grpc.method(&method_path) else {
+            return self.respond_to_uninspectable(
+                ctx,
+                "grpc_descriptor_unavailable",
+                "configured protobuf descriptor dependency is unavailable",
+            );
+        };
+
+        if body.len() > self.max_scan_bytes {
+            return self.respond_to_uninspectable(
+                ctx,
+                "body_exceeds_max_scan_bytes",
+                "response body exceeds max_scan_bytes",
+            );
+        }
+        // Content governance stays scoped to successful responses; a gRPC
+        // error is carried by trailers, not by a governed message.
+        if !(200..300).contains(&response_status) {
+            return PluginResult::Continue;
+        }
+        // A trailers-only response carries no message to inspect.
+        if body.is_empty() {
+            return PluginResult::Continue;
+        }
+
+        let encoding = grpc_message_encoding(response_headers);
+        let scan = match scan_grpc_body(body, method, grpc, encoding, self.max_scan_bytes) {
+            Ok(scan) => scan,
+            Err(error) => {
+                let (reason, detail) = error.describe();
+                return self.respond_to_uninspectable(ctx, reason, detail);
+            }
+        };
+
+        // Length policy covers the ordered aggregate of governed selected
+        // strings as well as each fragment, so a limit cannot be split across
+        // server-streaming frames.
+        let mut length_texts: Vec<&str> = scan.scanned.iter().map(String::as_str).collect();
+        if !scan.aggregate.is_empty() {
+            length_texts.push(scan.aggregate.as_str());
+        }
+        if let Some(reason) = self.check_completion_length(&length_texts) {
+            match self.action {
+                GuardAction::Reject | GuardAction::Redact => {
+                    Self::mark_rejected(ctx, reason.clone());
+                    return PluginResult::Reject {
+                        status_code: 502,
+                        body: format!(
+                            r#"{{"error":"AI response guard: {}"}}"#,
+                            escape_json_string(&reason)
+                        ),
+                        headers: HashMap::new(),
+                    };
+                }
+                GuardAction::Warn => {
+                    ctx.metadata
+                        .insert("ai_response_guard_warning".to_string(), reason);
+                }
+            }
+        }
+
+        let detected = self.detect_grpc_matches(&scan);
+        if detected.is_empty() {
+            return PluginResult::Continue;
+        }
+
+        if self.action == GuardAction::Redact {
+            if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) {
+                // The gRPC-Web transform re-frames the body before this
+                // plugin's transform would run, so a protobuf redaction can
+                // never reach the bytes the client receives.
+                return self.respond_to_uninspectable(
+                    ctx,
+                    "grpc_web_translation_blocks_redaction",
+                    "gRPC-Web translated responses cannot be redacted in protobuf form",
+                );
+            }
+            // Map keys and matches that exist only across string/frame
+            // boundaries are matchable but not rewritable in any one scalar.
+            let key_match = !self.detect_matches(&scan.map_keys).is_empty();
+            let cross_boundary_only = self.grpc_match_only_across_boundaries(&scan);
+            let rewritten = self.redacted_grpc_body(ctx, response_headers, body);
+            if key_match || cross_boundary_only || rewritten.is_none() {
+                debug!(
+                    "ai_response_guard: gRPC redaction leaves residual content \
+                     (types: {:?}), rejecting response",
+                    detected
+                );
+                let types_json: Vec<String> = detected
+                    .iter()
+                    .map(|t| format!("\"{}\"", escape_json_string(t)))
+                    .collect();
+                Self::mark_rejected(ctx, detected.join(","));
+                return PluginResult::Reject {
+                    status_code: 502,
+                    body: format!(
+                        r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                        types_json.join(","),
+                    ),
+                    headers: HashMap::new(),
+                };
+            }
+        }
+
+        self.respond_to_detection(ctx, response_status, &detected)
+    }
+
+    /// Detect matches against each governed string and the ordered aggregate of
+    /// selected strings (plus matchable-but-unrewritable map keys).
+    fn detect_grpc_matches(&self, scan: &GrpcScan) -> Vec<String> {
+        let mut candidates: Vec<&str> = scan.scanned.iter().map(String::as_str).collect();
+        if !scan.aggregate.is_empty() {
+            candidates.push(scan.aggregate.as_str());
+        }
+        candidates.extend(scan.map_keys.iter().map(String::as_str));
+        self.detect_matches(&candidates)
+    }
+
+    /// True when detection fires only on the ordered aggregate of selected
+    /// strings — a match that cannot be rewritten inside any one scalar.
+    fn grpc_match_only_across_boundaries(&self, scan: &GrpcScan) -> bool {
+        if scan.aggregate.is_empty() {
+            return false;
+        }
+        let aggregate_hits = self.detect_matches(&[scan.aggregate.as_str()]);
+        if aggregate_hits.is_empty() {
+            return false;
+        }
+        self.detect_matches(&scan.scanned).is_empty()
+    }
+
+    /// Produce the redacted gRPC wire body, or `None` when the redaction could
+    /// not be applied and *verified* end to end.
+    ///
+    /// Verification is deliberately a full round trip: rewrite, re-encode
+    /// (re-compressing frames that arrived compressed), re-parse the produced
+    /// wire bytes, re-decode, and re-scan with the same selected-field and
+    /// aggregate semantics used at inspection time. Only a body that comes
+    /// back clean is returned, so a partial rewrite can never be reported as
+    /// redacted.
+    fn redacted_grpc_body(
+        &self,
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<Vec<u8>> {
+        let grpc = self.grpc.as_ref()?;
+        let method = grpc.method(&Self::grpc_method_path(ctx))?;
+        if body.is_empty() || body.len() > self.max_scan_bytes {
+            return None;
+        }
+        let encoding = grpc_message_encoding(response_headers);
+        let max_bytes = grpc.max_message_bytes;
+        let frames = parse_grpc_frames(
+            body,
+            encoding,
+            max_bytes,
+            grpc.max_messages,
+            self.max_scan_bytes,
+        )
+        .ok()?;
+
+        let mut rewritten = Vec::with_capacity(body.len());
+        let mut changed = false;
+        for frame in &frames {
+            let payload = frame.payload.as_ref();
+            let mut message = DynamicMessage::decode(method.descriptor.clone(), payload).ok()?;
+            let mut budget = GrpcWalkBudget::default();
+            let mut redact = |text: &str| -> String { self.redact_text(text) };
+            let mutated = match method.text_fields.as_deref() {
+                None => redact_strings(&mut message, &mut budget, &mut redact),
+                Some(paths) => redact_paths(&mut message, paths, &mut budget, &mut redact),
+            };
+            changed |= mutated.ok()?;
+            let encoded = message.encode_to_vec();
+            if encoded.len() > max_bytes {
+                return None;
+            }
+            rewritten.extend_from_slice(&encode_grpc_frame(&encoded, frame.compressed)?);
+        }
+        if !changed {
+            return None;
+        }
+
+        // Re-verify against the exact bytes the client would receive, using the
+        // same selected-field surface and aggregate matching as inspection.
+        let verify_scan =
+            scan_grpc_body(&rewritten, method, grpc, encoding, self.max_scan_bytes).ok()?;
+        self.detect_grpc_matches(&verify_scan)
+            .is_empty()
+            .then_some(rewritten)
+    }
+}
+
+/// True when a response `Content-Type` is native gRPC or gRPC-Web framing.
+///
+/// Delegates to the shared classifier every sibling AI plugin uses, so this
+/// stays aligned with the H1/H2/H3 paths. Allocation-free.
+///
+/// Native gRPC alone is not enough here: a gRPC-Web response body is the same
+/// length-prefixed frame grammar (optionally base64-armored), and it is the
+/// representation an `ai_response_guard` on a mixed route actually meets —
+/// `grpc_web`'s `after_proxy` relabels every translated response to
+/// `application/grpc-web*` before `on_response_body` runs.
+fn is_framed_grpc_content_type(content_type: &str) -> bool {
+    crate::plugins::utils::body_transform::is_framed_grpc_content_type(content_type)
+}
+
+/// Whether these buffered response bytes are gRPC framing rather than the
+/// JSON/SSE/text document model this plugin's non-gRPC paths assume.
+///
+/// The live `content-type` cannot answer this alone. `grpc_web`'s `after_proxy`
+/// rewrites it, and an ordinary header rule may relabel or strip it outright, so
+/// the resolution mirrors
+/// [`crate::plugins::response_representation::effective_response_media_type`]:
+/// the live label, then the pristine backend label stamped before any response
+/// hook ran, then a total frame parse under the one grammar the client's
+/// representation admits. The parse is structural, never a sniff, so a genuine
+/// bare JSON document on a gRPC-Web request stays claimed and inspectable.
+fn response_is_grpc_framed(ctx: &RequestContext, content_type: Option<&str>, body: &[u8]) -> bool {
+    if content_type.is_some_and(is_framed_grpc_content_type) {
+        return true;
+    }
+    if ctx
+        .metadata
+        .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY)
+        .map(String::as_str)
+        .is_some_and(is_framed_grpc_content_type)
+    {
+        return true;
+    }
+    let Some(representation) = crate::plugins::grpc_web::client_grpc_framing_representation(ctx)
+    else {
+        return false;
+    };
+    crate::plugins::grpc_web::bytes_are_complete_grpc_frames(body, representation)
+}
+
+/// Bounded walk accounting shared by every protobuf traversal.
+struct GrpcWalkBudget {
+    depth: usize,
+    nodes: usize,
+}
+
+impl Default for GrpcWalkBudget {
+    fn default() -> Self {
+        Self {
+            depth: 0,
+            nodes: GRPC_MAX_MESSAGE_NODES,
+        }
+    }
+}
+
+impl GrpcWalkBudget {
+    fn enter(&mut self) -> Result<(), ()> {
+        if self.depth >= GRPC_MAX_MESSAGE_DEPTH {
+            return Err(());
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn charge(&mut self) -> Result<(), ()> {
+        if self.nodes == 0 {
+            return Err(());
+        }
+        self.nodes -= 1;
+        Ok(())
+    }
+}
+
+/// Strings harvested from one decoded protobuf message tree when the method
+/// does not restrict the scan with `text_fields`.
+#[derive(Default)]
+struct GrpcStrings {
+    /// Every string *value* in the tree.
+    texts: Vec<String>,
+    /// Every protobuf map key of string type. Matchable, never rewritable —
+    /// the same limitation JSON object member names have.
+    map_keys: Vec<String>,
+}
+
+/// Everything one buffered gRPC response contributed to the scan.
+struct GrpcScan {
+    /// Strings the configured contract actually scans and may rewrite, in
+    /// encounter order across frames.
+    scanned: Vec<String>,
+    /// Ordered concatenation of [`Self::scanned`]. Detection and length policy
+    /// treat this as a second surface so a match or limit split across frames
+    /// cannot hide between scalars.
+    aggregate: String,
+    /// Protobuf map keys governed by this scan. Present only when `text_fields`
+    /// is omitted (whole-message governance); detection covers them but
+    /// redaction cannot rewrite them. Empty when `text_fields` scopes the scan.
+    map_keys: Vec<String>,
+}
+
+/// Why a governed gRPC response could not be inspected.
+#[derive(Clone, Copy)]
+enum GrpcScanError {
+    Framing(GrpcFramingError),
+    DecodeFailed,
+    WalkBudget,
+    UnknownFields,
+}
+
+impl GrpcScanError {
+    fn describe(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Framing(error) => error.describe(),
+            Self::DecodeFailed => (
+                "grpc_message_decode_failed",
+                "response protobuf message does not match the configured type",
+            ),
+            Self::WalkBudget => (
+                "grpc_message_exceeds_walk_budget",
+                "response protobuf message exceeds the inspection walk budget",
+            ),
+            Self::UnknownFields => (
+                "grpc_message_has_unknown_fields",
+                "response protobuf message carries fields outside the configured descriptor",
+            ),
+        }
+    }
+}
+
+/// Decode every frame of a governed gRPC response and harvest its strings.
+///
+/// The structural walk always covers the whole message tree — bounding it and
+/// proving there are no undecodable unknown fields — even when `text_fields`
+/// narrows what is scanned and rewritten. Known extension values are walked
+/// exactly like ordinary known fields. When `text_fields` is set, only those
+/// selected string scalars are collected; out-of-scope strings and map keys
+/// are neither cloned nor fed to detection.
+fn scan_grpc_body(
+    body: &[u8],
+    method: &GrpcMethodInspection,
+    grpc: &GrpcInspection,
+    encoding: GrpcMessageEncoding,
+    max_scan_bytes: usize,
+) -> Result<GrpcScan, GrpcScanError> {
+    let max_bytes = grpc.max_message_bytes;
+    let frames = parse_grpc_frames(body, encoding, max_bytes, grpc.max_messages, max_scan_bytes)
+        .map_err(GrpcScanError::Framing)?;
+
+    let mut scanned: Vec<String> = Vec::new();
+    let mut map_keys: Vec<String> = Vec::new();
+    for frame in &frames {
+        let payload = frame.payload.as_ref();
+        let message = DynamicMessage::decode(method.descriptor.clone(), payload)
+            .map_err(|_| GrpcScanError::DecodeFailed)?;
+        match method.text_fields.as_deref() {
+            None => {
+                let mut strings = GrpcStrings::default();
+                let mut budget = GrpcWalkBudget::default();
+                collect_strings(&message, &mut strings, &mut budget)
+                    .map_err(|_| GrpcScanError::WalkBudget)?;
+                let mut unknown_budget = GrpcWalkBudget::default();
+                if has_unknown_fields(&message, &mut unknown_budget) {
+                    // Unknown fields carry bytes this contract cannot decode, so a
+                    // clean scan of the known fields would not be evidence.
+                    return Err(GrpcScanError::UnknownFields);
+                }
+                scanned.extend(strings.texts);
+                map_keys.extend(strings.map_keys);
+            }
+            Some(paths) => {
+                // Bound the complete tree without harvesting out-of-scope
+                // strings. `text_fields` cannot select map keys, so map-key
+                // matches stay out of detection for a scoped enrollment.
+                let mut budget = GrpcWalkBudget::default();
+                charge_message_tree(&message, &mut budget)
+                    .map_err(|_| GrpcScanError::WalkBudget)?;
+                let mut unknown_budget = GrpcWalkBudget::default();
+                if has_unknown_fields(&message, &mut unknown_budget) {
+                    return Err(GrpcScanError::UnknownFields);
+                }
+                let mut budget = GrpcWalkBudget::default();
+                collect_paths(&message, paths, &mut scanned, &mut budget)
+                    .map_err(|_| GrpcScanError::WalkBudget)?;
+            }
+        }
+    }
+
+    let aggregate = scanned.concat();
+    Ok(GrpcScan {
+        scanned,
+        aggregate,
+        map_keys,
+    })
+}
+
+/// One parsed gRPC length-prefixed frame with its payload in identity form.
+struct GrpcFrame<'a> {
+    /// Whether the frame arrived compressed. Preserved so a redacted rewrite
+    /// keeps the wire shape the negotiated `grpc-encoding` promises.
+    compressed: bool,
+    payload: Cow<'a, [u8]>,
+}
+
+/// Message encoding negotiated for this response, from `grpc-encoding`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrpcMessageEncoding {
+    Identity,
+    Gzip,
+    /// An encoding this plugin cannot decode. Only reachable when a frame
+    /// actually sets its compressed flag.
+    Unsupported,
+}
+
+/// Why a gRPC body could not be framed within the configured bounds.
+#[derive(Clone, Copy)]
+enum GrpcFramingError {
+    Malformed,
+    MessageTooLarge,
+    DecodedTooLarge,
+    TooManyMessages,
+    UnsupportedEncoding,
+}
+
+impl GrpcFramingError {
+    fn describe(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Malformed => (
+                "grpc_framing_malformed",
+                "response gRPC framing is malformed or truncated",
+            ),
+            Self::MessageTooLarge => (
+                "grpc_message_too_large",
+                "a gRPC message exceeds the configured max_message_bytes",
+            ),
+            Self::DecodedTooLarge => (
+                "grpc_decoded_exceeds_max_scan_bytes",
+                "aggregate decoded gRPC payload exceeds max_scan_bytes",
+            ),
+            Self::TooManyMessages => (
+                "grpc_too_many_messages",
+                "the gRPC response exceeds the configured max_messages",
+            ),
+            Self::UnsupportedEncoding => (
+                "grpc_unsupported_message_encoding",
+                "the gRPC message encoding is not supported",
+            ),
+        }
+    }
+}
+
+fn grpc_message_encoding(response_headers: &HashMap<String, String>) -> GrpcMessageEncoding {
+    let Some(value) = response_headers.get("grpc-encoding") else {
+        return GrpcMessageEncoding::Identity;
+    };
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("identity") {
+        GrpcMessageEncoding::Identity
+    } else if value.eq_ignore_ascii_case("gzip") {
+        GrpcMessageEncoding::Gzip
+    } else {
+        GrpcMessageEncoding::Unsupported
+    }
+}
+
+/// Parse a buffered gRPC body into its complete length-prefixed frames.
+///
+/// Every frame must be complete: a truncated trailing frame, a stray trailing
+/// byte, or an unrecognized compressed-flag value is malformed rather than
+/// "inspect what we have". The per-message ceiling, the frame-count cap, and
+/// an aggregate decoded/decompressed payload ceiling (`max_scan_bytes`) are
+/// all enforced before any further inspection work.
+fn parse_grpc_frames(
+    body: &[u8],
+    encoding: GrpcMessageEncoding,
+    max_message_bytes: usize,
+    max_messages: usize,
+    max_scan_bytes: usize,
+) -> Result<Vec<GrpcFrame<'_>>, GrpcFramingError> {
+    let mut frames = Vec::new();
+    let mut offset = 0usize;
+    let mut decoded_total = 0usize;
+    while offset < body.len() {
+        if body.len() - offset < 5 {
+            return Err(GrpcFramingError::Malformed);
+        }
+        let flag = body[offset];
+        if flag > 1 {
+            return Err(GrpcFramingError::Malformed);
+        }
+        let length = u32::from_be_bytes([
+            body[offset + 1],
+            body[offset + 2],
+            body[offset + 3],
+            body[offset + 4],
+        ]) as usize;
+        offset += 5;
+        if length > max_message_bytes {
+            return Err(GrpcFramingError::MessageTooLarge);
+        }
+        if body.len() - offset < length {
+            return Err(GrpcFramingError::Malformed);
+        }
+        let raw = &body[offset..offset + length];
+        offset += length;
+        if frames.len() >= max_messages {
+            return Err(GrpcFramingError::TooManyMessages);
+        }
+        let payload = if flag == 1 {
+            match encoding {
+                GrpcMessageEncoding::Gzip => {
+                    // Never inflate past what the aggregate `max_scan_bytes`
+                    // budget could still admit. Bytes above it are rejected
+                    // below no matter what they decompress to, so inflating to
+                    // the (independently configurable, potentially much larger)
+                    // per-message ceiling first is pure amplification: a small
+                    // compressed frame would materialize `max_message_bytes` of
+                    // heap only to be discarded.
+                    let remaining = max_scan_bytes.saturating_sub(decoded_total);
+                    let scan_budget_binds = remaining < max_message_bytes;
+                    let inflate_limit = max_message_bytes.min(remaining);
+                    match decompress_grpc_gzip(raw, inflate_limit) {
+                        Ok(payload) => Cow::Owned(payload),
+                        // Attribute the refusal to whichever ceiling actually
+                        // bound this frame, so the fail-closed reason stays
+                        // truthful.
+                        Err(GrpcFramingError::MessageTooLarge) if scan_budget_binds => {
+                            return Err(GrpcFramingError::DecodedTooLarge);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                GrpcMessageEncoding::Identity | GrpcMessageEncoding::Unsupported => {
+                    return Err(GrpcFramingError::UnsupportedEncoding);
+                }
+            }
+        } else {
+            Cow::Borrowed(raw)
+        };
+        decoded_total = decoded_total.saturating_add(payload.len());
+        if decoded_total > max_scan_bytes {
+            return Err(GrpcFramingError::DecodedTooLarge);
+        }
+        frames.push(GrpcFrame {
+            compressed: flag == 1,
+            payload,
+        });
+    }
+    Ok(frames)
+}
+
+/// Bounded gzip inflate for one gRPC message. The ceiling is enforced while
+/// reading so a compression bomb cannot allocate past it; the caller passes the
+/// tighter of the per-message ceiling and the remaining aggregate scan budget,
+/// then re-labels the refusal to whichever bound applied. The compressed
+/// payload must be exactly one fully consumed gzip member: trailing garbage
+/// and concatenated additional members are rejected.
+fn decompress_grpc_gzip(
+    payload: &[u8],
+    max_decompressed_bytes: usize,
+) -> Result<Vec<u8>, GrpcFramingError> {
+    // Use `bufread::GzDecoder` (not `read::GzDecoder`): the read variant wraps
+    // a `BufReader` and may pull past the first member's trailer into its
+    // internal buffer, which would make a leftover-slice check miss trailing
+    // garbage or a second concatenated member.
+    let mut decoder = GzDecoder::new(payload);
+    let mut decompressed = Vec::with_capacity(payload.len().min(max_decompressed_bytes));
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = decoder
+            .read(&mut buffer)
+            .map_err(|_| GrpcFramingError::Malformed)?;
+        if read == 0 {
+            break;
+        }
+        if decompressed.len().saturating_add(read) > max_decompressed_bytes {
+            return Err(GrpcFramingError::MessageTooLarge);
+        }
+        decompressed.extend_from_slice(&buffer[..read]);
+    }
+    // First member (header + deflate + trailer/CRC) was fully validated.
+    // Recover the exact unconsumed input; any remainder is trailing garbage
+    // or another concatenated member and must not be silently ignored.
+    if !decoder.into_inner().is_empty() {
+        return Err(GrpcFramingError::Malformed);
+    }
+    Ok(decompressed)
+}
+
+/// Re-frame one protobuf payload, re-compressing when the source frame was
+/// compressed so the response stays consistent with its `grpc-encoding`.
+fn encode_grpc_frame(payload: &[u8], compress: bool) -> Option<Vec<u8>> {
+    let body: Cow<'_, [u8]> = if compress {
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).ok()?;
+        Cow::Owned(encoder.finish().ok()?)
+    } else {
+        Cow::Borrowed(payload)
+    };
+    let length = u32::try_from(body.len()).ok()?;
+    let mut frame = Vec::with_capacity(5 + body.len());
+    frame.push(u8::from(compress));
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(body.as_ref());
+    Some(frame)
+}
+
+/// Collect every string value and string map key reachable from `message`,
+/// including known extension values.
+fn collect_strings(
+    message: &DynamicMessage,
+    strings: &mut GrpcStrings,
+    budget: &mut GrpcWalkBudget,
+) -> Result<(), ()> {
+    budget.enter()?;
+    for (_, value) in message.fields() {
+        collect_value(value, strings, budget)?;
+    }
+    for (_, value) in message.extensions() {
+        collect_value(value, strings, budget)?;
+    }
+    budget.leave();
+    Ok(())
+}
+
+fn collect_value(
+    value: &ProtobufValue,
+    strings: &mut GrpcStrings,
+    budget: &mut GrpcWalkBudget,
+) -> Result<(), ()> {
+    budget.charge()?;
+    match value {
+        ProtobufValue::String(text) => strings.texts.push(text.clone()),
+        ProtobufValue::Message(message) => collect_strings(message, strings, budget)?,
+        ProtobufValue::List(items) => {
+            for item in items {
+                collect_value(item, strings, budget)?;
+            }
+        }
+        ProtobufValue::Map(entries) => {
+            for (key, entry) in entries {
+                if let MapKey::String(key) = key {
+                    strings.map_keys.push(key.clone());
+                }
+                collect_value(entry, strings, budget)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Charge the walk budget across the whole message tree without collecting
+/// string values. Used when `text_fields` already scopes which scalars are
+/// harvested, so out-of-scope clones are not paid for just to discard them.
+fn charge_message_tree(message: &DynamicMessage, budget: &mut GrpcWalkBudget) -> Result<(), ()> {
+    budget.enter()?;
+    for (_, value) in message.fields() {
+        charge_value(value, budget)?;
+    }
+    for (_, value) in message.extensions() {
+        charge_value(value, budget)?;
+    }
+    budget.leave();
+    Ok(())
+}
+
+fn charge_value(value: &ProtobufValue, budget: &mut GrpcWalkBudget) -> Result<(), ()> {
+    budget.charge()?;
+    match value {
+        ProtobufValue::Message(message) => charge_message_tree(message, budget)?,
+        ProtobufValue::List(items) => {
+            for item in items {
+                charge_value(item, budget)?;
+            }
+        }
+        ProtobufValue::Map(entries) => {
+            for entry in entries.values() {
+                charge_value(entry, budget)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Whether any message in the tree carries fields outside the descriptor.
+///
+/// Budget exhaustion answers "cannot prove absence", which keeps the caller
+/// fail-closed rather than optimistic. Known extension values are recursed
+/// exactly like ordinary fields so an unknown nested under an extension cannot
+/// hide.
+fn has_unknown_fields(message: &DynamicMessage, budget: &mut GrpcWalkBudget) -> bool {
+    if budget.enter().is_err() {
+        return true;
+    }
+    if message.unknown_fields().next().is_some() {
+        return true;
+    }
+    for (_, value) in message.fields() {
+        if value_has_unknown_fields(value, budget) {
+            return true;
+        }
+    }
+    for (_, value) in message.extensions() {
+        if value_has_unknown_fields(value, budget) {
+            return true;
+        }
+    }
+    budget.leave();
+    false
+}
+
+fn value_has_unknown_fields(value: &ProtobufValue, budget: &mut GrpcWalkBudget) -> bool {
+    if budget.charge().is_err() {
+        return true;
+    }
+    match value {
+        ProtobufValue::Message(message) => has_unknown_fields(message, budget),
+        ProtobufValue::List(items) => items
+            .iter()
+            .any(|item| value_has_unknown_fields(item, budget)),
+        ProtobufValue::Map(entries) => entries
+            .values()
+            .any(|entry| value_has_unknown_fields(entry, budget)),
+        _ => false,
+    }
+}
+
+/// Collect only the string values addressed by the configured dotted paths.
+fn collect_paths(
+    message: &DynamicMessage,
+    paths: &[Vec<String>],
+    texts: &mut Vec<String>,
+    budget: &mut GrpcWalkBudget,
+) -> Result<(), ()> {
+    for path in paths {
+        collect_path(message, path, texts, budget)?;
+    }
+    Ok(())
+}
+
+fn collect_path(
+    message: &DynamicMessage,
+    path: &[String],
+    texts: &mut Vec<String>,
+    budget: &mut GrpcWalkBudget,
+) -> Result<(), ()> {
+    budget.enter()?;
+    let Some((segment, rest)) = path.split_first() else {
+        budget.leave();
+        return Ok(());
+    };
+    let Some(field) = message.descriptor().get_field_by_name(segment) else {
+        budget.leave();
+        return Ok(());
+    };
+    if !message.has_field(&field) {
+        budget.leave();
+        return Ok(());
+    }
+    collect_path_value(message.get_field(&field).as_ref(), rest, texts, budget)?;
+    budget.leave();
+    Ok(())
+}
+
+fn collect_path_value(
+    value: &ProtobufValue,
+    rest: &[String],
+    texts: &mut Vec<String>,
+    budget: &mut GrpcWalkBudget,
+) -> Result<(), ()> {
+    budget.charge()?;
+    match value {
+        ProtobufValue::List(items) => {
+            for item in items {
+                collect_path_value(item, rest, texts, budget)?;
+            }
+        }
+        ProtobufValue::String(text) if rest.is_empty() => texts.push(text.clone()),
+        ProtobufValue::Message(message) if !rest.is_empty() => {
+            collect_path(message, rest, texts, budget)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Rewrite every string value in the tree, including known extensions.
+/// Returns whether anything changed.
+fn redact_strings(
+    message: &mut DynamicMessage,
+    budget: &mut GrpcWalkBudget,
+    redact: &mut impl FnMut(&str) -> String,
+) -> Result<bool, ()> {
+    budget.enter()?;
+    let mut changed = false;
+    for (_, value) in message.fields_mut() {
+        changed |= redact_value(value, budget, redact)?;
+    }
+    for (_, value) in message.extensions_mut() {
+        changed |= redact_value(value, budget, redact)?;
+    }
+    budget.leave();
+    Ok(changed)
+}
+
+fn redact_value(
+    value: &mut ProtobufValue,
+    budget: &mut GrpcWalkBudget,
+    redact: &mut impl FnMut(&str) -> String,
+) -> Result<bool, ()> {
+    budget.charge()?;
+    let mut changed = false;
+    match value {
+        ProtobufValue::String(text) => {
+            let replacement = redact(text.as_str());
+            if &replacement != text {
+                *text = replacement;
+                changed = true;
+            }
+        }
+        ProtobufValue::Message(message) => {
+            changed |= redact_strings(message, budget, redact)?;
+        }
+        ProtobufValue::List(items) => {
+            for item in items {
+                changed |= redact_value(item, budget, redact)?;
+            }
+        }
+        ProtobufValue::Map(entries) => {
+            for entry in entries.values_mut() {
+                changed |= redact_value(entry, budget, redact)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(changed)
+}
+
+/// Rewrite only the string values addressed by the configured dotted paths.
+fn redact_paths(
+    message: &mut DynamicMessage,
+    paths: &[Vec<String>],
+    budget: &mut GrpcWalkBudget,
+    redact: &mut impl FnMut(&str) -> String,
+) -> Result<bool, ()> {
+    let mut changed = false;
+    for path in paths {
+        changed |= redact_path(message, path, budget, redact)?;
+    }
+    Ok(changed)
+}
+
+fn redact_path(
+    message: &mut DynamicMessage,
+    path: &[String],
+    budget: &mut GrpcWalkBudget,
+    redact: &mut impl FnMut(&str) -> String,
+) -> Result<bool, ()> {
+    budget.enter()?;
+    let Some((segment, rest)) = path.split_first() else {
+        budget.leave();
+        return Ok(false);
+    };
+    let Some(field) = message.descriptor().get_field_by_name(segment) else {
+        budget.leave();
+        return Ok(false);
+    };
+    if !message.has_field(&field) {
+        budget.leave();
+        return Ok(false);
+    }
+    let changed = redact_path_value(message.get_field_mut(&field), rest, budget, redact)?;
+    budget.leave();
+    Ok(changed)
+}
+
+fn redact_path_value(
+    value: &mut ProtobufValue,
+    rest: &[String],
+    budget: &mut GrpcWalkBudget,
+    redact: &mut impl FnMut(&str) -> String,
+) -> Result<bool, ()> {
+    budget.charge()?;
+    let mut changed = false;
+    match value {
+        ProtobufValue::List(items) => {
+            for item in items {
+                changed |= redact_path_value(item, rest, budget, redact)?;
+            }
+        }
+        ProtobufValue::String(text) if rest.is_empty() => {
+            let replacement = redact(text.as_str());
+            if &replacement != text {
+                *text = replacement;
+                changed = true;
+            }
+        }
+        ProtobufValue::Message(message) if !rest.is_empty() => {
+            changed |= redact_path(message, rest, budget, redact)?;
+        }
+        _ => {}
+    }
+    Ok(changed)
+}
+
+/// Parse the `grpc` config block. `Ok(None)` means no gRPC inspection at all.
+fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
+    let Some(grpc) = config.get("grpc") else {
+        return Ok(None);
+    };
+    if !grpc.is_object() {
+        return Err("ai_response_guard: 'grpc' must be an object".to_string());
+    }
+    reject_unknown_keys(grpc, AI_RESPONSE_GUARD_GRPC_CONFIG_KEYS, "grpc")?;
+
+    let descriptor_path = optional_string(grpc, "descriptor_path")?
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            "ai_response_guard: 'grpc.descriptor_path' is required and must be a \
+             non-empty string"
+                .to_string()
+        })?
+        .to_string();
+
+    let max_message_bytes = optional_positive_usize(grpc, "max_message_bytes")?
+        .unwrap_or(DEFAULT_GRPC_MAX_MESSAGE_BYTES);
+    let max_messages =
+        optional_positive_usize(grpc, "max_messages")?.unwrap_or(DEFAULT_GRPC_MAX_MESSAGES);
+
+    let Some(method_configs) = grpc.get("methods").and_then(Value::as_object) else {
+        return Err(
+            "ai_response_guard: 'grpc.methods' is required and must be an object".to_string(),
+        );
+    };
+    if method_configs.is_empty() {
+        return Err(
+            "ai_response_guard: 'grpc.methods' must configure at least one method".to_string(),
+        );
+    }
+
+    let mut methods: HashMap<String, GrpcMethodShape> = HashMap::new();
+    for (method_path, method_config) in method_configs {
+        let normalized = normalize_grpc_method_path(method_path)?;
+        if !method_config.is_object() {
+            return Err("ai_response_guard: a 'grpc.methods' entry must be an object".to_string());
+        }
+        reject_unknown_keys(
+            method_config,
+            AI_RESPONSE_GUARD_GRPC_METHOD_KEYS,
+            "grpc.methods",
+        )?;
+        let response_type = optional_string(method_config, "response_type")?
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "ai_response_guard: a 'grpc.methods' entry requires a non-empty \
+                 'response_type'"
+                    .to_string()
+            })?
+            .to_string();
+        let text_fields = parse_grpc_text_fields(method_config)?;
+        let shape = GrpcMethodShape {
+            response_type,
+            text_fields,
+        };
+        if methods.insert(normalized, shape).is_some() {
+            return Err(
+                "ai_response_guard: a 'grpc.methods' method path is configured more than once"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(Some(GrpcShape {
+        descriptor_path,
+        methods,
+        max_message_bytes,
+        max_messages,
+    }))
+}
+
+/// Normalize a configured method key to the `/package.Service/Method` form the
+/// request path and `grpc_full_method` metadata both resolve to.
+///
+/// Every dotted service segment and the method identifier must be a real
+/// protobuf/gRPC identifier (`[A-Za-z_][A-Za-z0-9_]*`). Whitespace,
+/// percent/query syntax, empty segments, invalid leading characters, and
+/// extra slashes are rejected. An optional leading slash is normalized; a
+/// duplicate after normalization is rejected by the caller.
+fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
+    let trimmed = method_path.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "ai_response_guard: a 'grpc.methods' key must be a non-empty method path".to_string(),
+        );
+    }
+    // Reject whitespace interior to the path (trim only clears the edges) and
+    // any percent/query/fragment syntax that is not part of a gRPC method path.
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '%' | '?' | '#' | '&' | '=' | '+' | ';'))
+    {
+        return Err(
+            "ai_response_guard: a 'grpc.methods' key must be a '/package.Service/Method' path"
+                .to_string(),
+        );
+    }
+    let normalized = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    let rest = &normalized[1..];
+    let Some((service, method_name)) = rest.split_once('/') else {
+        return Err(
+            "ai_response_guard: a 'grpc.methods' key must be a '/package.Service/Method' path"
+                .to_string(),
+        );
+    };
+    if service.is_empty()
+        || method_name.is_empty()
+        || method_name.contains('/')
+        || !is_valid_grpc_service(service)
+        || !is_valid_grpc_identifier(method_name)
+    {
+        return Err(
+            "ai_response_guard: a 'grpc.methods' key must be a '/package.Service/Method' path"
+                .to_string(),
+        );
+    }
+    Ok(normalized)
+}
+
+fn is_valid_grpc_service(service: &str) -> bool {
+    service
+        .split('.')
+        .all(|segment| !segment.is_empty() && is_valid_grpc_identifier(segment))
+}
+
+fn is_valid_grpc_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// Parse and pre-split the optional `text_fields` dotted paths.
+fn parse_grpc_text_fields(method_config: &Value) -> Result<Option<Vec<Vec<String>>>, String> {
+    let Some(fields) = optional_string_vec(method_config, "text_fields")? else {
+        return Ok(None);
+    };
+    if fields.is_empty() {
+        return Err(
+            "ai_response_guard: 'grpc.methods' 'text_fields' must not be empty".to_string(),
+        );
+    }
+    let mut parsed = Vec::with_capacity(fields.len());
+    let mut seen = HashSet::with_capacity(fields.len());
+    for field in &fields {
+        let segments: Vec<String> = field
+            .split('.')
+            .map(|part| part.trim().to_string())
+            .collect();
+        if segments.iter().any(String::is_empty) {
+            return Err(
+                "ai_response_guard: a 'grpc.methods' 'text_fields' entry must be a dotted \
+                 field path with non-empty segments"
+                    .to_string(),
+            );
+        }
+        if segments.len() > GRPC_MAX_MESSAGE_DEPTH {
+            return Err(
+                "ai_response_guard: a 'grpc.methods' 'text_fields' path exceeds the maximum \
+                 nesting depth"
+                    .to_string(),
+            );
+        }
+        // Compare the normalized dotted form so `"a.b"` and `" a.b "` collide
+        // without echoing the configured path value into the diagnostic.
+        let normalized = segments.join(".");
+        if !seen.insert(normalized) {
+            return Err(
+                "ai_response_guard: a 'grpc.methods' 'text_fields' path is configured more \
+                 than once"
+                    .to_string(),
+            );
+        }
+        parsed.push(segments);
+    }
+    Ok(Some(parsed))
+}
+
+/// The configured descriptor path, for mode-aware file dependency validation.
+pub(crate) fn grpc_descriptor_path(config: &Value) -> Result<Option<String>, String> {
+    Ok(parse_grpc_shape(config)?.map(|shape| shape.descriptor_path))
+}
+
+/// Load a `FileDescriptorSet` from disk. The boolean distinguishes
+/// "absent/unreadable" (true) from "present but not a descriptor set" (false).
+fn load_grpc_descriptor_pool_inner(path: &str) -> Result<DescriptorPool, (bool, String)> {
+    let bytes = std::fs::read(path).map_err(|_| {
+        (
+            true,
+            "ai_response_guard: failed to read protobuf descriptor file".to_string(),
+        )
+    })?;
+    DescriptorPool::decode(bytes.as_slice()).map_err(|_| {
+        (
+            false,
+            "ai_response_guard: failed to parse protobuf descriptor".to_string(),
+        )
+    })
+}
+
+/// Resolve every enrolled method against the pool, rejecting an unknown
+/// response message type or a `text_fields` path that is not a string field.
+fn resolve_grpc_shape(
+    shape: &GrpcShape,
+    pool: &DescriptorPool,
+) -> Result<HashMap<String, GrpcMethodInspection>, String> {
+    let mut resolved = HashMap::with_capacity(shape.methods.len());
+    for (method_path, method) in &shape.methods {
+        let descriptor = pool
+            .get_message_by_name(&method.response_type)
+            .ok_or_else(|| {
+                "ai_response_guard: a 'grpc.methods' 'response_type' was not found in the \
+                 descriptor"
+                    .to_string()
+            })?;
+        if let Some(paths) = method.text_fields.as_ref() {
+            for path in paths {
+                resolve_text_field_path(&descriptor, path)?;
+            }
+        }
+        let inspection = GrpcMethodInspection {
+            descriptor,
+            text_fields: method.text_fields.clone(),
+        };
+        resolved.insert(method_path.clone(), inspection);
+    }
+    Ok(resolved)
+}
+
+/// Verify a dotted path addresses a string field, walking singular/repeated
+/// message fields on the way. Map fields are not addressable: their keys are
+/// not rewritable, so an operator must not be able to claim coverage of one.
+fn resolve_text_field_path(root: &MessageDescriptor, path: &[String]) -> Result<(), String> {
+    let mut current = root.clone();
+    for (index, segment) in path.iter().enumerate() {
+        let Some(field) = current.get_field_by_name(segment) else {
+            return Err(
+                "ai_response_guard: a 'grpc.methods' 'text_fields' path names a field that \
+                 is not in the descriptor"
+                    .to_string(),
+            );
+        };
+        if field.is_map() {
+            return Err(
+                "ai_response_guard: a 'grpc.methods' 'text_fields' path may not traverse a \
+                 map field"
+                    .to_string(),
+            );
+        }
+        let last = index + 1 == path.len();
+        match field.kind() {
+            Kind::String if last => return Ok(()),
+            Kind::Message(next) if !last => current = next,
+            _ => {
+                return Err(
+                    "ai_response_guard: a 'grpc.methods' 'text_fields' path must end at a \
+                     string field"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Err("ai_response_guard: a 'grpc.methods' 'text_fields' path must not be empty".to_string())
+}
+
+/// Validate the `grpc` block against an already-loaded descriptor pool.
+pub(crate) fn validate_grpc_descriptor_config(
+    config: &Value,
+    pool: &DescriptorPool,
+) -> Result<(), String> {
+    match parse_grpc_shape(config)? {
+        Some(shape) => resolve_grpc_shape(&shape, pool).map(|_| ()),
+        None => Ok(()),
+    }
+}
+
+/// Build the runtime gRPC inspection contract.
+///
+/// A readable-but-invalid descriptor rejects the candidate configuration, so
+/// the last known-good plugin generation stays in place. A descriptor that is
+/// simply not present on this node keeps the enrollment set — governed methods
+/// then fail closed at request time — instead of silently un-enrolling them.
+fn load_grpc_inspection(
+    config: &Value,
+    mode: DescriptorLoadMode,
+) -> Result<Option<GrpcInspection>, String> {
+    let Some(shape) = parse_grpc_shape(config)? else {
+        return Ok(None);
+    };
+    let enrolled_methods: HashSet<String> = shape.methods.keys().cloned().collect();
+    let unresolved = GrpcInspection {
+        methods: HashMap::new(),
+        enrolled_methods: enrolled_methods.clone(),
+        max_message_bytes: shape.max_message_bytes,
+        max_messages: shape.max_messages,
+        dependency_unavailable: true,
+    };
+
+    if matches!(mode, DescriptorLoadMode::ShapeOnly) {
+        return Ok(Some(unresolved));
+    }
+
+    let pool = match load_grpc_descriptor_pool_inner(&shape.descriptor_path) {
+        Ok(pool) => pool,
+        Err((true, _)) => {
+            warn!(
+                plugin = "ai_response_guard",
+                "Protobuf descriptor dependency is unavailable; enrolled gRPC methods fail closed"
+            );
+            return Ok(Some(unresolved));
+        }
+        Err((false, message)) => return Err(message),
+    };
+
+    Ok(Some(GrpcInspection {
+        methods: resolve_grpc_shape(&shape, &pool)?,
+        enrolled_methods,
+        max_message_bytes: shape.max_message_bytes,
+        max_messages: shape.max_messages,
+        dependency_unavailable: false,
+    }))
 }
 
 #[async_trait]
@@ -1388,24 +2851,36 @@ impl Plugin for AiResponseGuard {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        // Native gRPC bodies are length-prefixed protobuf frames and cannot be
-        // inspected by this JSON/SSE/text guard. Do not advertise inert gRPC
-        // enforcement or force gRPC responses through full-body buffering.
-        super::HTTP_ONLY_PROTOCOLS
+        // Native gRPC is in scope only through the explicit `grpc` enrollment
+        // block. Without it the plugin stays HTTP-only rather than advertising
+        // inert gRPC enforcement or forcing protobuf responses to buffer.
+        if self.grpc.is_some() {
+            super::HTTP_GRPC_PROTOCOLS
+        } else {
+            super::HTTP_ONLY_PROTOCOLS
+        }
     }
 
     fn requires_response_body_buffering(&self) -> bool {
         self.has_validation_rules
     }
 
-    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // A native-gRPC response is buffered only for a method the operator
+        // enrolled: an un-enrolled method has no decodable contract, so pinning
+        // it to the buffered path would cost streaming for no enforcement.
+        if ctx.is_native_grpc_request() {
+            return self.has_validation_rules && self.grpc_inspection_applies(ctx);
+        }
         // Client-controlled streaming intent is not response evidence. Buffer
         // conservatively until the pristine backend Content-Type is known.
         self.has_validation_rules
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
-        self.should_buffer_response_body(ctx)
+        // An enrolled native-gRPC method is governed by framing and descriptor,
+        // never by a backend-controlled response media-type label.
+        self.should_buffer_response_body(ctx) && !ctx.is_native_grpc_request()
     }
 
     fn should_release_response_body_under_retries(
@@ -1415,6 +2890,7 @@ impl Plugin for AiResponseGuard {
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
+            && !ctx.is_native_grpc_request()
             && original_response_is_event_stream(ctx, response_headers)
     }
 
@@ -1425,6 +2901,7 @@ impl Plugin for AiResponseGuard {
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
+            && !ctx.is_native_grpc_request()
             && original_response_is_event_stream(ctx, response_headers)
     }
 
@@ -1436,7 +2913,8 @@ impl Plugin for AiResponseGuard {
         _response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && !content_type.is_some_and(is_text_event_stream_media_type)
+            && (ctx.is_native_grpc_request()
+                || !content_type.is_some_and(is_text_event_stream_media_type))
     }
 
     async fn after_proxy(
@@ -1445,7 +2923,8 @@ impl Plugin for AiResponseGuard {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if self.should_buffer_response_body(ctx)
+        if !ctx.is_native_grpc_request()
+            && self.should_buffer_response_body(ctx)
             && original_response_is_event_stream(ctx, response_headers)
         {
             // This plugin's buffered SSE parser cannot safely decide an
@@ -1468,6 +2947,12 @@ impl Plugin for AiResponseGuard {
         response_headers: &mut HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
+        // Native gRPC framing has its own descriptor-based contract; the
+        // JSON/SSE/text document model below never applies to it.
+        if ctx.is_native_grpc_request() {
+            return self.inspect_grpc_response(ctx, response_status, response_headers, body);
+        }
+
         // Enforce the aggregate scan/work bound before the successful-response
         // content gate. Buffered non-2xx error bodies still reach the transform
         // phase, so returning before this check would let a large raw body evade
@@ -1510,6 +2995,28 @@ impl Plugin for AiResponseGuard {
                 );
             }
             return PluginResult::Continue;
+        }
+
+        // A gRPC-framed response reaching the JSON/SSE/text model belongs to a
+        // request that is not native gRPC (a native one returned above), so the
+        // descriptor contract cannot name a message type for it and
+        // `transform_response_body` declines these bytes. Scanning length-
+        // prefixed frames as a raw text document would let `scan_mode: all`
+        // report a redaction the transform can never apply; fail closed for
+        // enforcing actions instead, exactly as content mode already does.
+        //
+        // gRPC-Web is the same grammar and the same hazard, and it is what a
+        // browser client on a mixed route actually sends: its request flavor is
+        // `Plain`, so it never reaches `inspect_grpc_response` above, and
+        // `grpc_web`'s `after_proxy` has already relabeled the response to
+        // `application/grpc-web*` — a native-gRPC media-type test alone would
+        // let those frames through to the text redactor.
+        if response_is_grpc_framed(ctx, Some(content_type), body) {
+            return self.respond_to_uninspectable(
+                ctx,
+                "grpc_framed_response_requires_grpc_contract",
+                "gRPC-framed responses are only inspectable through the grpc enrollment contract",
+            );
         }
 
         // --- SSE path: parse frames, extract accumulated texts, detect ---
@@ -1748,6 +3255,40 @@ impl Plugin for AiResponseGuard {
         self.respond_to_detection(ctx, response_status, &detected)
     }
 
+    async fn transform_response_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        // Protobuf redaction needs the request's gRPC method to select the
+        // message descriptor, which only the context carries.
+        if self.grpc_transform_applies(ctx, content_type) {
+            return self.redacted_grpc_body(ctx, response_headers, body);
+        }
+        // A gRPC or gRPC-Web response body is length-prefixed protobuf framing
+        // — or the base64 armoring of it — whatever the response `Content-Type`
+        // claims. The JSON/SSE/text rewriter below cannot address that
+        // representation, and its `scan_fields: all` branch would regex-rewrite
+        // raw frame bytes whenever they happen to be valid UTF-8, changing a
+        // payload's length without its 5-byte prefix and corrupting the wire.
+        //
+        // The request flavor alone cannot gate this: a gRPC-Web request is
+        // `HttpFlavor::Plain`, so keying on `is_native_grpc_request()` would
+        // leave every browser gRPC client — translated by `grpc_web` (which
+        // re-frames at priority 260, before this transform) or passed through
+        // to a gRPC-Web backend — exposed to the text redactor. Only the
+        // descriptor contract above may rewrite these bytes; when it does not
+        // apply, `on_response_body` has already failed closed under the same
+        // predicate for anything it detected, so deliver them unchanged.
+        if ctx.is_native_grpc_request() || response_is_grpc_framed(ctx, content_type, body) {
+            return None;
+        }
+        self.transform_response_body(body, content_type, response_headers)
+            .await
+    }
+
     async fn transform_response_body(
         &self,
         body: &[u8],
@@ -1755,6 +3296,12 @@ impl Plugin for AiResponseGuard {
         _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         if !self.needs_body_transform {
+            return None;
+        }
+
+        // Native gRPC and gRPC-Web bodies are only ever rewritten through the
+        // context-carrying entry point above, which knows the method contract.
+        if content_type.is_some_and(is_framed_grpc_content_type) {
             return None;
         }
 

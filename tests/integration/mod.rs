@@ -55,6 +55,7 @@ mod injector_admission_tests;
 mod k8s_controller_gateway_status_tests;
 mod k8s_controller_istio_status_tests;
 mod k8s_controller_shutdown_tests;
+mod k8s_controller_status_snapshot_tests;
 mod kafka_logging_broker_tests;
 mod log_schema_integration_tests;
 mod log_schema_registry_tests;

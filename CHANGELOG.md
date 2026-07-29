@@ -159,6 +159,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Kubernetes controller Gateway API and Istio status writers now share one
+  immutable `Arc<[K8sObject]>` generation per reconcile instead of each
+  deep-cloning the full unstructured object snapshot. Status semantics,
+  bounded update plans, route-conflict handling, and per-writer failure
+  isolation are unchanged; deployments with neither writer still pay no
+  snapshot clone cost (#3281).
+
+- Gateway API `GRPCRoute` predicates are now translated instead of dropped.
+  A pathless `matches[]` entry (method-only, header-only, or a rule with no
+  `matches` at all) previously disappeared during translation, so valid gRPC
+  rules never routed and their traffic fell through or 404'd. gRPC predicates
+  are now represented independently of HTTP paths: an `Exact` `method` with
+  both `service` and `method` becomes an exact `=/{service}/{method}` listen
+  path, a service-only match becomes a `/{service}/` prefix, and every
+  remaining shape materializes on the `/` listener behind a
+  `mesh_route_dispatch` URI regex. Every emitted GRPCRoute match — exact-path
+  matches included — additionally carries a case-insensitive gRPC
+  `content-type` predicate, so a GRPCRoute only ever selects gRPC calls and
+  can never capture ordinary HTTP traffic sharing the same hostname and path.
+  That gate is the regex transcription of Ferrum's canonical native-gRPC
+  content-type contract (`proxy::backend_dispatch::is_native_grpc_content_type`),
+  so `application/grpc-web`, `application/grpc-web-text`, and lookalikes such as
+  `application/grpcfoo` are refused exactly as the proxy's own dispatcher
+  refuses them — gRPC-Web is served by configuring the trusted `grpc_web`
+  plugin, which rewrites a verified request to native `application/grpc` before
+  backend dispatch. A route-authored `content-type` match still replaces the
+  gate, but it is validated against the same native contract first, so an
+  operator header can only narrow the protocol boundary. GRPCRoutes share
+  HTTPRoute's same-`(hostname, listen path)` collapse, so rule/match ordering
+  and fall-through are preserved. Gateway API v1.5.1
+  forbids merging rules between GRPCRoutes and HTTPRoutes: an HTTPRoute and a
+  GRPCRoute attached to the same resolved listener with any intersecting
+  hostname now resolve to exactly one accepted Route on that listener and
+  hostname — oldest `metadata.creationTimestamp`,
+  then `{namespace}/{name}`, then `kind` (the last only breaks a total tie: the
+  two kinds may share a name and `creationTimestamp` has second granularity),
+  independent of rule paths and of the order objects are observed in — and the losing Route materializes no proxy, upstream,
+  plugin, or materialized-parent record and is reported `Accepted=False` with
+  `reason: Conflicted`. "The same listener" is the *resolved* Gateway listener,
+  not the literal `parentRefs[]` selector: a wildcard reference and a reference
+  pinning that listener by `sectionName` or `port` contend with each other,
+  while two wildcard references that `allowedRoutes.kinds` sends to different
+  listeners do not. A wildcard reference spanning several listeners emits one
+  shared conflict claim, and Ferrum's HTTP-family route representation is
+  port-agnostic, so a claim kept for the listener it won would still route on
+  the listener it lost: such a claim is conservatively withdrawn whole as soon
+  as it loses on **any** listener it reaches. Route status always echoes the
+  parentRef the operator wrote. Two Routes of different kinds that Gateway API
+  requires be accepted *together* — because `allowedRoutes.kinds`, a
+  `sectionName`/`port` pin, or separate Gateways send them to different
+  listeners — still share Ferrum's single port-agnostic `(hosts, listen path)`
+  slot and collapse into one ordered dispatch-rule list. Their predicates stay
+  intact and disjoint there (the gRPC rules are content-type gated), and the
+  alternative would emit two proxies with an identical `(hosts, listen path)`,
+  which `validate_unique_listen_paths` rejects — aborting the entire config
+  reload for the common "HTTP listener plus gRPC listener on one Gateway"
+  topology, where a pathless GRPCRoute and an HTTPRoute `PathPrefix: /` rule
+  both land on `/`. gRPC shapes Ferrum cannot represent exactly
+  — `method.type: RegularExpression` (Ferrum cannot constrain a regex operand
+  to a single gRPC path segment, so the predicate is refused rather than
+  compiled into a matcher that could widen across service/method boundaries)
+  or any other non-`Exact` `method.type`, a `method` block with neither
+  `service` nor `method`, an `Exact` operand that is empty, over 1024 bytes
+  (the CRD `MaxLength=1024`), present but not a string, or outside the v1.5.1
+  CRD grammars, a non-native-gRPC `content-type` predicate, a non-`Exact`
+  header match, a match entry carrying both `method` and Ferrum's hand-authored
+  `path` extension (Ferrum cannot represent their conjunction, so honoring
+  either half alone would widen the match), or an explicit
+  `method: null` / `headers: null` (an explicit null is malformed input, not an
+  omission, and must not widen into the any-gRPC-call or headerless match —
+  omitting either field keeps its documented meaning) — are dropped fail
+  closed with a field-specific translator warning that never echoes the
+  operand.
+  See
+  [GRPCRoute predicate translation](docs/gateway_api_conformance.md#grpcroute-predicate-translation).
+
 - **Breaking:** `kafka_logging` now fails closed under any restrictive backend
   egress policy, including the default posture. librdkafka resolves bootstrap
   hostnames itself and dials brokers advertised by cluster metadata, and the

@@ -1047,8 +1047,8 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP Agent Cards, applies method policy, and emits `a2a.*` metadata |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
 | `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
-| `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions) |
-| `response_mock` | ✓ | | ✓ | | | Short-circuits HTTP and WebSocket upgrade handshakes; native gRPC unsupported (Reject cannot carry framed unary payloads) |
+| `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions); terminate supports HTTP and native unary gRPC |
+| `response_mock` | ✓ | | ✓ | | | Short-circuits HTTP and WebSocket upgrade handshakes; native gRPC unsupported by design — only the validated serverless_function terminate contract carries provenance-authorized framed unary Reject semantics |
 | `grpc_deadline` | | ✓ | | | | gRPC timeout enforcement and propagation |
 | `load_testing` | ✓ | | | | | On-demand load testing via header trigger with multi-node fan-out |
 | `request_mirror` | ✓ | ✓ | | | | Duplicates traffic to a shadow destination for validation |
@@ -1058,7 +1058,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli) |
 | `ai_prompt_compressor` | ✓ | | | | | HTTP-only JSON prompt compression; native gRPC wire frames are not rewritten |
 | `ai_federation` | ✓ | | | | | HTTP-only; routes final OpenAI JSON bodies to providers and normalizes bounded responses |
-| `ai_response_guard` | ✓ | | | | | HTTP-only JSON/SSE/text response inspection; native gRPC protobuf framing is unsupported |
+| `ai_response_guard` | ✓ | ✓ | | | | HTTP JSON/SSE/text response inspection; native gRPC only for methods enrolled in the descriptor-based `grpc` block |
 | `security_headers` | ✓ | ✓ | ✓ | | | HTTP-family response security headers and fingerprint stripping |
 | `ai_token_metrics` | ✓ | | | | | HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract |
 | `ai_rate_limiter` | ✓ | | | | | HTTP JSON/SSE token accounting only; native gRPC protobuf frames have no supported usage schema, so gRPC attachment would never charge |

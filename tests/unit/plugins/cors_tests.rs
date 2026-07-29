@@ -214,22 +214,47 @@ fn test_constructor_rejects_exact_origin_with_empty_authority() {
     assert!(err.contains("hostname"), "got: {err}");
 }
 
-#[test]
-fn test_constructor_rejects_exact_origin_with_raw_post_authority() {
+#[tokio::test]
+async fn test_constructor_rejects_exact_origin_with_raw_post_authority() {
     for origin in [
         "https://example.com/api",
         "https://example.com/foo/..",
         "https://example.com/%2e%2e",
         "https://example.com\\foo\\..",
     ] {
-        for allowed_origins in [json!([origin]), json!([{"exact": origin}])] {
-            let err = CorsPlugin::new(&json!({"allowed_origins": allowed_origins}))
-                .err()
-                .expect("origins with a raw post-authority component must be rejected");
+        // NATIVE plain-string form only: it canonicalizes, so a raw
+        // post-authority component could collapse to `/` and be serialized as
+        // permission for the whole origin.
+        let err = CorsPlugin::new(&json!({"allowed_origins": [origin]}))
+            .err()
+            .expect("origins with a raw post-authority component must be rejected");
+        assert!(err.contains("without path"), "got: {err}");
 
-            assert!(err.contains("without path"), "got: {err}");
-        }
+        // The Istio `{exact}` matcher is LITERAL (issue #3254): nothing is
+        // canonicalized, so there is nothing to collapse. It is accepted and
+        // matches ONLY that literal string — strictly narrower than the
+        // canonicalizing form, never wider.
+        let plugin = CorsPlugin::new(&json!({"allowed_origins": [{"exact": origin}]}))
+            .expect("a literal exact matcher is accepted verbatim");
+        assert!(
+            !plugin_allows_origin(&plugin, "https://example.com").await,
+            "literal exact `{origin}` must not authorize the bare origin"
+        );
+        assert!(
+            plugin_allows_origin(&plugin, origin).await,
+            "literal exact `{origin}` must authorize exactly its own string"
+        );
     }
+}
+
+/// Drive one actual cross-origin request and report whether the policy allowed
+/// it (the 403 rejection is the plugin's disallowed-origin signal).
+async fn plugin_allows_origin(plugin: &CorsPlugin, origin: &str) -> bool {
+    let mut ctx = make_cors_ctx("GET", origin);
+    matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    )
 }
 
 #[test]
@@ -1167,7 +1192,7 @@ async fn test_case_sensitivity_of_origins() {
 }
 
 #[tokio::test]
-async fn test_plain_and_object_exact_origins_are_canonicalized_on_the_config_path() {
+async fn test_plain_string_exact_origins_are_canonicalized_on_the_config_path() {
     for (configured, request) in [
         ("HTTPS://EXAMPLE.COM:443", "https://example.com"),
         ("http://example.com:80", "http://example.com"),
@@ -1179,32 +1204,75 @@ async fn test_plain_and_object_exact_origins_are_canonicalized_on_the_config_pat
         ),
         ("https://example.com:8443", "https://example.com:8443"),
     ] {
-        for allowed_origins in [json!([configured]), json!([{"exact": configured}])] {
-            let plugin = CorsPlugin::new(&json!({"allowed_origins": allowed_origins})).unwrap();
-            let mut ctx = make_cors_ctx("GET", request);
-            assert!(
-                matches!(
-                    plugin.on_request_received(&mut ctx).await,
-                    PluginResult::Continue
-                ),
-                "configured {configured} should match browser origin {request}"
-            );
-        }
+        // NATIVE plain-string form only. The Istio `{exact}` object matcher is
+        // deliberately NOT canonicalized (issue #3254) — see
+        // `test_object_exact_origin_is_literal_and_never_widened`.
+        let plugin = CorsPlugin::new(&json!({"allowed_origins": [configured]})).unwrap();
+        let mut ctx = make_cors_ctx("GET", request);
+        assert!(
+            matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Continue
+            ),
+            "configured {configured} should match browser origin {request}"
+        );
     }
 }
 
+/// Issue #3254: the Istio `{exact}` matcher is a LITERAL, case-sensitive,
+/// byte-for-byte comparison. It must never be canonicalized into the browser
+/// serialization (which would authorize an origin the source never matched),
+/// and a wildcard-shaped literal must never become native wildcard-subdomain
+/// syntax (which would authorize every subdomain).
 #[tokio::test]
-async fn test_object_exact_origin_is_canonicalized_and_non_default_port_stays_distinct() {
-    let plugin = CorsPlugin::new(&json!({
-        "allowed_origins": [{"exact": "http://[2001:0db8:0:0:0:0:0:1]:80"}]
-    }))
-    .unwrap();
-    let mut canonical = make_cors_ctx("GET", "http://[2001:db8::1]");
-    assert!(matches!(
-        plugin.on_request_received(&mut canonical).await,
-        PluginResult::Continue
-    ));
+async fn test_object_exact_origin_is_literal_and_never_widened() {
+    for (configured, canonical) in [
+        ("HTTPS://EXAMPLE.COM:443", "https://example.com"),
+        ("http://example.com:80", "http://example.com"),
+        ("https://bücher.example", "https://xn--bcher-kva.example"),
+        ("http://127.1:80", "http://127.0.0.1"),
+    ] {
+        let plugin = CorsPlugin::new(&json!({"allowed_origins": [{"exact": configured}]}))
+            .expect("a literal exact matcher is accepted verbatim");
+        assert!(
+            plugin_allows_origin(&plugin, configured).await,
+            "literal `{configured}` must match its own string"
+        );
+        assert!(
+            !plugin_allows_origin(&plugin, canonical).await,
+            "literal `{configured}` must NOT be widened to canonical `{canonical}`"
+        );
+    }
 
+    // The headline case: a wildcard-SHAPED literal authorizes only itself.
+    let plugin = CorsPlugin::new(&json!({"allowed_origins": [{"exact": "*.example.com"}]}))
+        .expect("a wildcard-shaped literal exact is representable");
+    for subdomain in [
+        "https://app.example.com",
+        "https://deep.sub.example.com",
+        "https://example.com",
+    ] {
+        assert!(
+            !plugin_allows_origin(&plugin, subdomain).await,
+            "a literal `*.example.com` must not authorize `{subdomain}` as native wildcard syntax would"
+        );
+    }
+    assert!(
+        plugin_allows_origin(&plugin, "*.example.com").await,
+        "the literal matcher still matches its own exact string"
+    );
+
+    // Contrast: the NATIVE plain-string form keeps wildcard-subdomain meaning.
+    let native = CorsPlugin::new(&json!({"allowed_origins": ["*.example.com"]}))
+        .expect("native wildcard syntax is unchanged");
+    assert!(
+        plugin_allows_origin(&native, "https://app.example.com").await,
+        "the native plain-string form must keep wildcard-subdomain semantics"
+    );
+}
+
+#[tokio::test]
+async fn test_non_default_port_origin_stays_distinct_in_both_matcher_forms() {
     for allowed_origins in [
         json!(["https://example.com:8443"]),
         json!([{"exact": "https://example.com:8443"}]),
@@ -1970,4 +2038,141 @@ fn test_constructor_rejects_empty_object_origin_matcher() {
         err.contains("exact") && err.contains("prefix") && err.contains("regex"),
         "got: {err}"
     );
+}
+
+// ── Bounded origin matchers (issue #3253) ─────────────────────────────────
+//
+// Regex origins are compiled ONCE at config construction/reload under explicit
+// byte, complexity, and count bounds. An over-budget matcher is a config error
+// with a field-specific diagnostic — never a silently dropped, truncated, or
+// approximated matcher, and never a per-request compile.
+
+#[test]
+fn test_constructor_rejects_oversized_origin_matchers() {
+    let oversized = "a".repeat(600);
+    for allowed_origins in [
+        json!([oversized.clone()]),
+        json!([{"exact": &oversized}]),
+        json!([{"prefix": &oversized}]),
+        json!([{"regex": &oversized}]),
+    ] {
+        let err = CorsPlugin::new(&json!({"allowed_origins": allowed_origins.clone()}))
+            .err()
+            .unwrap_or_else(|| panic!("an oversized matcher must be rejected: {allowed_origins}"));
+        assert!(
+            err.contains("byte matcher limit") && err.contains("allowed_origins"),
+            "got: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_constructor_rejects_too_many_origin_matchers() {
+    let too_many: Vec<serde_json::Value> = (0..65)
+        .map(|i| json!({"exact": format!("https://app{i}.example.com")}))
+        .collect();
+    let err = CorsPlugin::new(&json!({"allowed_origins": too_many}))
+        .err()
+        .expect("an over-budget matcher list must be rejected");
+    assert!(err.contains("at most 64 entries"), "got: {err}");
+
+    // Exactly at the bound is accepted — the ceiling is inclusive.
+    let at_bound: Vec<serde_json::Value> = (0..64)
+        .map(|i| json!({"exact": format!("https://app{i}.example.com")}))
+        .collect();
+    CorsPlugin::new(&json!({"allowed_origins": at_bound}))
+        .expect("a matcher list exactly at the bound is accepted");
+}
+
+#[test]
+fn test_constructor_rejects_over_complex_origin_regex() {
+    // Deeply nested groups exceed the explicit AST nesting bound even though
+    // the pattern is short and syntactically valid.
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": [{"regex": "((((((((((((((((((((((((((((a))))))))))))))))))))))))))))"}]
+    }))
+    .err()
+    .expect("an over-complex regex origin must be rejected");
+    assert!(err.contains("complexity bounds"), "got: {err}");
+}
+
+#[test]
+fn test_constructor_rejects_whitespace_only_exact_matcher() {
+    let err = CorsPlugin::new(&json!({"allowed_origins": [{"exact": "   "}]}))
+        .err()
+        .expect("a whitespace-only exact matcher must be rejected");
+    assert!(err.contains("non-whitespace"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_safe_regex_origin_positives_and_negatives() {
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"regex": "https://[a-z0-9-]+\\.api\\.example\\.com"}]
+    }))
+    .expect("a bounded, safe regex origin compiles at config time");
+
+    for allowed in ["https://v2.api.example.com", "https://a-b.api.example.com"] {
+        assert!(
+            plugin_allows_origin(&plugin, allowed).await,
+            "`{allowed}` must full-match the configured regex"
+        );
+    }
+    for denied in [
+        // Full match, not a substring search: no implicit `.*` on either end.
+        "https://v2.api.example.com.evil.com",
+        "https://evil.com/https://v2.api.example.com",
+        "https://api.example.com",
+        "http://v2.api.example.com",
+    ] {
+        assert!(
+            !plugin_allows_origin(&plugin, denied).await,
+            "`{denied}` must not be authorized by the anchored regex"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_credentialed_literal_exact_preflight_reflects_the_source_origin() {
+    // Issue #3254 + credentialed CORS: a literal exact is a concrete origin, so
+    // credentials remain usable and the response reflects that exact string
+    // rather than `*`.
+    let plugin = CorsPlugin::new(&json!({
+        "allowed_origins": [{"exact": "https://app.example.com"}],
+        "allow_credentials": true
+    }))
+    .expect("credentialed literal exact policy constructs");
+
+    let mut ctx = make_preflight_ctx("https://app.example.com", "POST");
+    let result = plugin.on_request_received(&mut ctx).await;
+    let PluginResult::Reject {
+        status_code,
+        headers,
+        ..
+    } = result
+    else {
+        panic!("an allowed preflight is answered locally");
+    };
+    assert_eq!(status_code, 204);
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .map(String::as_str),
+        Some("https://app.example.com")
+    );
+    assert_eq!(
+        headers
+            .get("access-control-allow-credentials")
+            .map(String::as_str),
+        Some("true")
+    );
+
+    // An uncredentialed disallowed origin is still fail-closed.
+    let mut denied = make_preflight_ctx("https://evil.example.com", "POST");
+    assert!(matches!(
+        plugin.on_request_received(&mut denied).await,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
 }

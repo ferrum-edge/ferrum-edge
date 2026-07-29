@@ -456,7 +456,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         priority: 3025,
         active_phases: "before_proxy",
         matrix_protocols: HTTP_GRPC_PROTOCOLS,
-        protocol_rationale: "Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions)",
+        protocol_rationale: "Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions); terminate supports HTTP and native unary gRPC",
     },
     BuiltinPluginParityMeta {
         name: "response_mock",
@@ -464,7 +464,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         priority: 3030,
         active_phases: "before_proxy",
         matrix_protocols: &[ProxyProtocol::Http, ProxyProtocol::WebSocket],
-        protocol_rationale: "Short-circuits HTTP and WebSocket upgrade handshakes; native gRPC unsupported (Reject cannot carry framed unary payloads)",
+        protocol_rationale: "Short-circuits HTTP and WebSocket upgrade handshakes; native gRPC unsupported by design — only the validated serverless_function terminate contract carries provenance-authorized framed unary Reject semantics",
     },
     BuiltinPluginParityMeta {
         name: "grpc_deadline",
@@ -543,8 +543,8 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         classification: BuiltinPluginClassification::Public,
         priority: 4075,
         active_phases: "after_proxy, on_response_body, transform_response_body",
-        matrix_protocols: HTTP_ONLY_PROTOCOLS,
-        protocol_rationale: "HTTP-only JSON/SSE/text response inspection; native gRPC protobuf framing is unsupported",
+        matrix_protocols: HTTP_GRPC_PROTOCOLS,
+        protocol_rationale: "HTTP JSON/SSE/text response inspection; native gRPC only for methods enrolled in the descriptor-based `grpc` block",
     },
     BuiltinPluginParityMeta {
         name: "security_headers",

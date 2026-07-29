@@ -3345,8 +3345,21 @@ async fn test_anthropic_translation_rejects_each_malformed_tool_history_shape() 
             json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "user", "content": 42}]}),
         ),
         (
-            "legacy function call",
+            "legacy function call missing result",
             json!({"model": "claude-3-5-sonnet", "stream": true, "messages": [{"role": "assistant", "content": "calling", "function_call": {"name": "run", "arguments": "{}"}}]}),
+        ),
+        (
+            "legacy function call with modern tool_calls",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [{
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{}"}}],
+                    "function_call": {"name": "run", "arguments": "{}"}
+                }]
+            }),
         ),
         (
             "empty tool call list",
@@ -3455,6 +3468,416 @@ async fn test_anthropic_translation_rejects_each_malformed_tool_history_shape() 
             "{label} must fail closed"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #3300 — legacy OpenAI function_call / role:function history
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_anthropic_legacy_function_call_history_round_trip() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "weather in Paris?"},
+            {
+                "role": "assistant",
+                "content": "Let me check.",
+                "function_call": {
+                    "name": "get_weather",
+                    "arguments": "{\"location\":\"Paris\"}"
+                }
+            },
+            {"role": "function", "name": "get_weather", "content": "22C and sunny"},
+            {"role": "user", "content": "thanks"}
+        ]
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let raw = serde_json::to_vec(&body).unwrap();
+    let out = plugin
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await
+        .expect("legacy history must translate");
+    let parsed: Value = serde_json::from_slice(&out).unwrap();
+    let messages = parsed["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[1]["role"], json!("assistant"));
+    let assistant_blocks = messages[1]["content"].as_array().unwrap();
+    assert_eq!(assistant_blocks[0]["type"], json!("text"));
+    assert_eq!(assistant_blocks[0]["text"], json!("Let me check."));
+    assert_eq!(assistant_blocks[1]["type"], json!("tool_use"));
+    assert_eq!(assistant_blocks[1]["id"], json!("call_legacy_1"));
+    assert_eq!(assistant_blocks[1]["name"], json!("get_weather"));
+    assert_eq!(assistant_blocks[1]["input"]["location"], json!("Paris"));
+    assert_eq!(messages[2]["role"], json!("user"));
+    let tool_results = messages[2]["content"].as_array().unwrap();
+    assert_eq!(tool_results[0]["type"], json!("tool_result"));
+    assert_eq!(tool_results[0]["tool_use_id"], json!("call_legacy_1"));
+    assert_eq!(tool_results[0]["content"], json!("22C and sunny"));
+    assert_eq!(messages[3]["content"], json!("thanks"));
+}
+
+#[tokio::test]
+async fn test_anthropic_legacy_function_call_with_null_content_and_text_parts_result() {
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "lookup"},
+            {
+                "role": "assistant",
+                "content": null,
+                "function_call": {"name": "lookup", "arguments": "{}"}
+            },
+            {
+                "role": "function",
+                "name": "lookup",
+                "content": [{"type": "text", "text": "ok"}],
+                "is_error": true
+            }
+        ]
+    });
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("null content + text-parts function result");
+    let assistant = parsed["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(assistant.len(), 1);
+    assert_eq!(assistant[0]["type"], json!("tool_use"));
+    assert_eq!(assistant[0]["id"], json!("call_legacy_1"));
+    let results = parsed["messages"][2]["content"].as_array().unwrap();
+    assert_eq!(results[0]["content"], json!("ok"));
+    assert_eq!(results[0]["is_error"], json!(true));
+}
+
+#[tokio::test]
+async fn test_anthropic_legacy_function_history_rejects_malformed_and_mixed_shapes() {
+    let plugin = build(openai_and_anthropic_config());
+
+    let cases = vec![
+        (
+            "malformed legacy arguments",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "function_call": {
+                            "name": "get_weather",
+                            "arguments": "{\"api_key\":\"sk-live-secret\",not-json"
+                        }
+                    }
+                ]
+            }),
+            Some("function_call"),
+            vec!["sk-live-secret", "api_key"],
+        ),
+        (
+            "orphaned function result",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "function", "name": "get_weather", "content": "x"}
+                ]
+            }),
+            Some("function"),
+            vec![],
+        ),
+        (
+            "duplicate function result",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "function_call": {"name": "get_weather", "arguments": "{}"}
+                    },
+                    {"role": "function", "name": "get_weather", "content": "first"},
+                    {"role": "function", "name": "get_weather", "content": "duplicate"}
+                ]
+            }),
+            Some("function"),
+            vec![],
+        ),
+        (
+            "mismatched function result name",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "function_call": {"name": "get_weather", "arguments": "{}"}
+                    },
+                    {"role": "function", "name": "other_tool", "content": "x"}
+                ]
+            }),
+            Some("name"),
+            vec!["other_tool", "get_weather"],
+        ),
+        (
+            "missing function result after legacy call",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "function_call": {"name": "get_weather", "arguments": "{}"}
+                    },
+                    {"role": "user", "content": "continue"}
+                ]
+            }),
+            Some("function_call"),
+            vec![],
+        ),
+        (
+            "modern tool_calls then legacy function result",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": "{}"}
+                        }]
+                    },
+                    {"role": "function", "name": "get_weather", "content": "x"}
+                ]
+            }),
+            Some("mixes"),
+            vec![],
+        ),
+        (
+            "legacy function_call then modern tool result",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "function_call": {"name": "get_weather", "arguments": "{}"}
+                    },
+                    {"role": "tool", "tool_call_id": "call_legacy_1", "content": "x"}
+                ]
+            }),
+            Some("mixes"),
+            vec![],
+        ),
+        (
+            "oversized legacy arguments",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": null,
+                        "function_call": {
+                            "name": "get_weather",
+                            "arguments": format!("{{\"pad\":\"{}\"}}", "x".repeat(256 * 1024))
+                        }
+                    }
+                ]
+            }),
+            Some("maximum allowed size"),
+            vec![],
+        ),
+        (
+            "invalid legacy function name",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [{
+                    "role": "assistant",
+                    "content": null,
+                    "function_call": {"name": "not valid!", "arguments": "{}"}
+                }]
+            }),
+            Some("function_call"),
+            vec!["not valid!"],
+        ),
+        (
+            "non-object legacy arguments encoding",
+            json!({
+                "model": "claude-3-5-sonnet",
+                "stream": true,
+                "messages": [{
+                    "role": "assistant",
+                    "content": null,
+                    "function_call": {"name": "run", "arguments": "[1]"}
+                }]
+            }),
+            Some("JSON object"),
+            vec![],
+        ),
+    ];
+
+    for (label, body, needle, forbidden) in cases {
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            reject_status(&result),
+            Some(400),
+            "{label} must fail closed"
+        );
+        if let PluginResult::Reject { body: err_body, .. } = result {
+            if let Some(needle) = needle {
+                assert!(
+                    err_body.contains(needle),
+                    "{label}: expected field-specific diagnostic containing {needle:?}: {err_body}"
+                );
+            }
+            for secret in forbidden {
+                assert!(
+                    !err_body.contains(secret),
+                    "{label}: diagnostic must not leak {secret:?}: {err_body}"
+                );
+            }
+        } else {
+            panic!("{label}: expected Reject");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_modern_tool_history_unchanged_alongside_legacy_support() {
+    // Regression: modern parallel tool_calls still translate in order after #3300.
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "multi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "call_a", "type": "function", "function": {"name": "alpha", "arguments": "{}"}},
+                    {"id": "call_b", "type": "function", "function": {"name": "beta", "arguments": "{\"x\":1}"}}
+                ]
+            },
+            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B"}
+        ]
+    });
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("modern history must still translate");
+    let assistant = parsed["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(assistant[0]["id"], json!("call_a"));
+    assert_eq!(assistant[1]["id"], json!("call_b"));
+    let results = parsed["messages"][2]["content"].as_array().unwrap();
+    assert_eq!(results[0]["tool_use_id"], json!("call_a"));
+    assert_eq!(results[1]["tool_use_id"], json!("call_b"));
+}
+
+#[tokio::test]
+async fn test_anthropic_completed_modern_and_legacy_rounds_can_coexist() {
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_modern",
+                    "type": "function",
+                    "function": {"name": "alpha", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_modern", "content": "A"},
+            {
+                "role": "assistant",
+                "content": null,
+                "function_call": {"name": "beta", "arguments": "{\"x\":1}"}
+            },
+            {"role": "function", "name": "beta", "content": "B"}
+        ]
+    });
+
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("completed modern and legacy rounds are unambiguous");
+    assert_eq!(
+        parsed["messages"][1]["content"][0]["id"],
+        json!("call_modern")
+    );
+    assert_eq!(
+        parsed["messages"][2]["content"][0]["tool_use_id"],
+        json!("call_modern")
+    );
+    assert_eq!(
+        parsed["messages"][3]["content"][0]["id"],
+        json!("call_legacy_3")
+    );
+    assert_eq!(
+        parsed["messages"][4]["content"][0]["tool_use_id"],
+        json!("call_legacy_3")
+    );
+}
+
+#[tokio::test]
+async fn test_anthropic_modern_tool_id_and_arguments_keep_existing_bounds() {
+    let long_id = format!("call_{}", "x".repeat(256));
+    let large_arguments =
+        serde_json::to_string(&json!({"payload": "x".repeat(256 * 1024)})).unwrap();
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "large modern call"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": long_id,
+                    "type": "function",
+                    "function": {"name": "alpha", "arguments": large_arguments}
+                }]
+            },
+            {"role": "tool", "tool_call_id": long_id, "content": "ok"}
+        ]
+    });
+
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("legacy support must not tighten the existing modern path");
+    assert_eq!(parsed["messages"][1]["content"][0]["id"], json!(long_id));
+    assert_eq!(
+        parsed["messages"][1]["content"][0]["input"]["payload"]
+            .as_str()
+            .map(str::len),
+        Some(256 * 1024)
+    );
 }
 
 #[tokio::test]

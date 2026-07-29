@@ -645,6 +645,534 @@ pub(crate) fn strip_response_hop_by_hop_trailers(trailers: &mut http::HeaderMap)
     }
 }
 
+/// Which trailer-section semantics one reconciliation is applying.
+///
+/// This is the ONLY thing that can exempt a trailer field name, and it is chosen
+/// STRUCTURALLY by each call site from the dispatch it already committed to —
+/// never from the trailer's own name, and never from a request header a client
+/// controls. A plain response therefore cannot buy protection for a field by
+/// calling it `grpc-status`; that would hand any backend a one-word bypass of
+/// the response-header policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrailerSectionKind {
+    /// Plain HTTP/HTTP-3 response trailers. Every field is ordinary
+    /// backend-supplied response metadata and NO field name is exempt —
+    /// `grpc-status` included.
+    PlainResponse,
+    /// A native gRPC TERMINAL trailer section, on a dispatch the gateway itself
+    /// selected as native gRPC.
+    ///
+    /// Only the three reserved fields
+    /// (`grpc-status` / `grpc-message` / `grpc-status-details-bin`) carry
+    /// protocol-required RPC outcome; dropping or rewriting them would destroy
+    /// the client's view of the call, so they survive governance unconditionally.
+    /// EVERY other field in that section is gRPC application metadata — exactly
+    /// what GHSA-r78v-rc86-6r86 reports as bypassing `response_transformer` —
+    /// and is governed exactly like a plain trailer field, including the
+    /// fail-closed `Unbounded` arm.
+    NativeGrpcTerminal,
+}
+
+impl TrailerSectionKind {
+    /// Whether this field is protocol-required terminal status that generic
+    /// response-header governance must not touch.
+    ///
+    /// `http::HeaderName::as_str` is always lowercase, so the exact-match
+    /// inventory shared with the buffered gRPC paths
+    /// (`grpc_proxy::is_reserved_grpc_terminal_metadata`) is authoritative here.
+    /// It is an EXACT three-name set, not a `grpc-` prefix: `grpc-encoding`,
+    /// `grpc-accept-encoding`, and any other `grpc-`-named field are application
+    /// metadata and stay governed.
+    fn field_is_reserved(self, field: &str) -> bool {
+        match self {
+            Self::PlainResponse => false,
+            Self::NativeGrpcTerminal => {
+                crate::proxy::grpc_proxy::is_reserved_grpc_terminal_metadata(field)
+            }
+        }
+    }
+}
+
+/// Outcome of a case-insensitive lookup into a plugin-facing header map.
+///
+/// Plugins may synthesize several case variants of one field name (`x-name`
+/// alongside `X-Name`), and a `HashMap` yields them in arbitrary order.
+/// Collapsing that to "whichever variant iteration reached first" would let the
+/// trailer reconciliation compare against a copy the policy never touched and
+/// miss the changed or added duplicate, so ambiguity is a distinct outcome
+/// rather than a value — and every ambiguous transition is treated as governed.
+#[derive(Debug, PartialEq, Eq)]
+enum CaseInsensitiveHeader<'a> {
+    /// No key in the map matches the field name.
+    Absent,
+    /// Exactly one key matches; this is its value.
+    Unique(&'a str),
+    /// Two or more case variants match, so no single value represents the field.
+    Ambiguous,
+}
+
+/// Case-insensitive lookup into a plugin-facing header map. Plugins may
+/// synthesize mixed-case keys, so the trailer reconciliation cannot rely on the
+/// map being normalized — and must not silently pick one of several variants.
+fn find_header_value_ci<'a>(
+    headers: &'a std::collections::HashMap<String, String>,
+    name: &str,
+) -> CaseInsensitiveHeader<'a> {
+    let mut found: Option<&'a str> = None;
+    for (key, value) in headers {
+        if !key.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        if found.is_some() {
+            return CaseInsensitiveHeader::Ambiguous;
+        }
+        found = Some(value.as_str());
+    }
+    match found {
+        Some(value) => CaseInsensitiveHeader::Unique(value),
+        None => CaseInsensitiveHeader::Absent,
+    }
+}
+
+/// Owned pre-policy form of [`CaseInsensitiveHeader`]. Carried inside the
+/// `pub(crate)` witness, so it shares that visibility.
+#[derive(Debug)]
+pub(crate) enum PrePolicyHeaderValue {
+    Absent,
+    Unique(String),
+    Ambiguous,
+}
+
+impl PrePolicyHeaderValue {
+    fn capture(lookup: CaseInsensitiveHeader<'_>) -> Self {
+        match lookup {
+            CaseInsensitiveHeader::Absent => Self::Absent,
+            CaseInsensitiveHeader::Unique(value) => Self::Unique(value.to_string()),
+            CaseInsensitiveHeader::Ambiguous => Self::Ambiguous,
+        }
+    }
+
+    /// Whether the field is PROVABLY unchanged between capture and the client
+    /// boundary. Only two transitions qualify: absent stayed absent, and a
+    /// single value stayed the same single value. Anything else — an appearing
+    /// or disappearing field, a changed value, or duplicate case variants on
+    /// either side — is unproven and therefore governed.
+    fn is_unchanged(&self, now: &CaseInsensitiveHeader<'_>) -> bool {
+        match (self, now) {
+            (Self::Absent, CaseInsensitiveHeader::Absent) => true,
+            (Self::Unique(before), CaseInsensitiveHeader::Unique(after)) => before == after,
+            _ => false,
+        }
+    }
+}
+
+/// Backend values, captured before any response-header phase ran, for exactly
+/// the field names a backend trailer section also carries.
+///
+/// The captured form is bounded by the TRAILER count rather than the header
+/// count: the reconciliation only has to answer "did the response-header phases
+/// change THIS name?", so a response without trailers allocates nothing at all.
+pub(crate) enum ResponseTrailerPolicyWitness {
+    /// Nothing was captured, so the reconciliation cannot prove the
+    /// response-header phases left any field alone. Every trailer name is
+    /// treated as mutated: callers without a witness fail closed instead of
+    /// forwarding an unreconciled trailer section.
+    Unproven,
+    /// No response-header phase could run for this response, so no field can
+    /// have changed. Preserves the issue #2941 pass-through for chains that
+    /// cannot touch the response headers at all.
+    NoHeaderPolicyPhase,
+    /// `(trailer field name, pre-policy backend header value)`.
+    PrePolicyValues(Vec<(http::HeaderName, PrePolicyHeaderValue)>),
+}
+
+impl ResponseTrailerPolicyWitness {
+    /// Capture the pre-policy backend header value for every field name the
+    /// backend also sent as a trailer. Call this before the first response-header
+    /// phase (`after_proxy`) runs.
+    pub(crate) fn capture(
+        trailers: &http::HeaderMap,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> Self {
+        let mut observed = Vec::with_capacity(trailers.keys_len());
+        for name in trailers.keys() {
+            let lookup = find_header_value_ci(response_headers, name.as_str());
+            observed.push((name.clone(), PrePolicyHeaderValue::capture(lookup)));
+        }
+        Self::PrePolicyValues(observed)
+    }
+
+    /// Whether the response-header phases changed this field between capture
+    /// and the client boundary.
+    ///
+    /// A name absent from the witness fails closed: the only way that happens is
+    /// a trailer field the capture never saw, which means the reconciliation
+    /// cannot prove the chain left it alone.
+    fn was_mutated(
+        &self,
+        name: &http::HeaderName,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        match self {
+            Self::Unproven => true,
+            Self::NoHeaderPolicyPhase => false,
+            Self::PrePolicyValues(observed) => {
+                let Some((_, before)) = observed.iter().find(|(known, _)| known == name) else {
+                    // A trailer field the capture never saw. Unprovable, so
+                    // governed.
+                    return true;
+                };
+                let now = find_header_value_ci(response_headers, name.as_str());
+                !before.is_unchanged(&now)
+            }
+        }
+    }
+}
+
+/// Config-time response-trailer governance for one request, read once from the
+/// plugin cache and threaded down the HTTP/3 relay helpers.
+#[derive(Clone, Copy)]
+pub(crate) struct ResponseTrailerGovernance<'a> {
+    /// Union of `Plugin::response_trailer_policy()` exact names for this proxy
+    /// and protocol, precomputed per reload.
+    pub(crate) policy_names: &'a [String],
+    /// Union of `Plugin::response_trailer_policy()` case-insensitive ASCII
+    /// prefixes for this proxy and protocol, precomputed per reload.
+    pub(crate) policy_prefixes: &'a [String],
+    /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`.
+    pub(crate) unbounded: bool,
+}
+
+/// Allocation-free per-response ownership for the small, fixed set of
+/// end-to-end fields written directly onto the plain streaming-HTTP/2 response
+/// builder.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GatewayOwnedResponseHeaders(u8);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GatewayOwnedResponseHeader {
+    Via = 1 << 0,
+    AltSvc = 1 << 1,
+    GatewayError = 1 << 2,
+    GatewayUpstreamStatus = 1 << 3,
+}
+
+impl GatewayOwnedResponseHeaders {
+    pub(crate) fn insert(&mut self, header: GatewayOwnedResponseHeader) {
+        self.0 |= header as u8;
+    }
+
+    fn owns(self, field: &str) -> bool {
+        let bit = match field {
+            "via" => GatewayOwnedResponseHeader::Via as u8,
+            "alt-svc" => GatewayOwnedResponseHeader::AltSvc as u8,
+            "x-gateway-error" => GatewayOwnedResponseHeader::GatewayError as u8,
+            "x-gateway-upstream-status" => GatewayOwnedResponseHeader::GatewayUpstreamStatus as u8,
+            _ => return false,
+        };
+        self.0 & bit != 0
+    }
+
+    /// Build the bitset from field names. Production callers use
+    /// [`Self::insert`] at the point of each builder write; this name-driven
+    /// form exists so external tests can reach the real name-to-variant mapping
+    /// through [`crate::_test_support`] rather than restating it.
+    #[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
+    pub(crate) fn from_names(names: &[String]) -> Self {
+        let mut owned = Self::default();
+        for name in names {
+            let header = if name.eq_ignore_ascii_case("via") {
+                Some(GatewayOwnedResponseHeader::Via)
+            } else if name.eq_ignore_ascii_case("alt-svc") {
+                Some(GatewayOwnedResponseHeader::AltSvc)
+            } else if name.eq_ignore_ascii_case("x-gateway-error") {
+                Some(GatewayOwnedResponseHeader::GatewayError)
+            } else if name.eq_ignore_ascii_case("x-gateway-upstream-status") {
+                Some(GatewayOwnedResponseHeader::GatewayUpstreamStatus)
+            } else {
+                None
+            };
+            if let Some(header) = header {
+                owned.insert(header);
+            }
+        }
+        owned
+    }
+}
+
+/// The backend's response headers as a STREAMING relay saw them before its
+/// response-header phases ran.
+///
+/// A streaming relay cannot use the buffered capture: the initial HEADERS frame
+/// is on the wire long before the backend's trailer section exists, so the set
+/// of trailer field names is unknown at capture time. Retaining the pre-policy
+/// map instead keeps the evidence bounded by the response's own header count —
+/// one clone per streaming RESPONSE, never per frame — and defers the
+/// per-trailer-name comparison to the trailer boundary, where it is bounded by
+/// the trailer count exactly as on the buffered path.
+pub(crate) enum PrePolicyResponseHeaders {
+    /// No evidence retained; the witness fails closed.
+    Unproven,
+    /// No response-header phase can run for this response.
+    NoHeaderPolicyPhase,
+    /// Pre-policy backend header map.
+    Snapshot(std::collections::HashMap<String, String>),
+}
+
+impl PrePolicyResponseHeaders {
+    /// Decide what evidence a streaming relay needs, and capture only that.
+    ///
+    /// * An `Unbounded` chain drops the whole reconcilable trailer section no
+    ///   matter what the headers did, so no evidence could change the outcome
+    ///   and none is retained.
+    /// * A chain with no response-header phase (`header_phases_can_mutate` is
+    ///   false) cannot have changed anything, so the snapshot would be a clone
+    ///   compared against itself. Callers must fold their own CORE response-header
+    ///   mutations into that flag, not just the plugin chain — the HTTP/3 relays
+    ///   pass `true` when they will synthesize a default `content-type`, because
+    ///   that field goes on the wire exactly like a plugin write.
+    /// * Otherwise the snapshot is the only way to tell a policy mutation from
+    ///   an untouched backend field once the trailers arrive.
+    pub(crate) fn capture_for_streaming(
+        response_headers: &std::collections::HashMap<String, String>,
+        governance: ResponseTrailerGovernance<'_>,
+        header_phases_can_mutate: bool,
+    ) -> Self {
+        if governance.unbounded {
+            Self::Unproven
+        } else if header_phases_can_mutate {
+            Self::Snapshot(response_headers.clone())
+        } else {
+            Self::NoHeaderPolicyPhase
+        }
+    }
+
+    fn witness(&self, trailers: &http::HeaderMap) -> ResponseTrailerPolicyWitness {
+        match self {
+            Self::Unproven => ResponseTrailerPolicyWitness::Unproven,
+            Self::NoHeaderPolicyPhase => ResponseTrailerPolicyWitness::NoHeaderPolicyPhase,
+            Self::Snapshot(pre_policy) => {
+                ResponseTrailerPolicyWitness::capture(trailers, pre_policy)
+            }
+        }
+    }
+}
+
+/// Owned, self-contained form of the streaming trailer-policy boundary, for
+/// relays whose trailer frame is produced by a BODY that outlives the request
+/// handler.
+///
+/// The native-HTTP/3 relays reconcile inline, so they can borrow the handler's
+/// final header map and pre-policy snapshot ([`ResponseTrailerGovernance`] +
+/// [`PrePolicyResponseHeaders`]). A streaming HTTP/2 response instead hands its
+/// body to hyper and returns: the backend TRAILERS frame is read minutes later,
+/// on a different task, long after `handle_proxy_request_inner`'s locals are
+/// gone. This struct is what the body carries instead — the same three inputs,
+/// owned.
+///
+/// Construction is once per governed streaming RESPONSE (one header-map clone
+/// for `final_headers`, one for the pre-policy snapshot, one `Arc` bump each for
+/// the precomputed policy names and prefixes, plus an allocation-free bitset of
+/// builder fields this response actually wrote). Never per body frame: the body
+/// wrapper only touches this on the single TRAILERS frame, and the
+/// reconciliation itself is bounded by the trailer count exactly as on the
+/// buffered path.
+pub(crate) struct StreamingResponseTrailerGovernor {
+    /// The response headers exactly as they went on the wire, after every
+    /// response-header phase AND the gateway's own builder-only writes.
+    final_headers: std::collections::HashMap<String, String>,
+    /// Evidence captured before the first response-header phase ran.
+    pre_policy: PrePolicyResponseHeaders,
+    /// Config-time union of `Plugin::response_trailer_policy()` names, shared
+    /// from the plugin cache generation (no per-request allocation).
+    policy_names: std::sync::Arc<Vec<String>>,
+    /// Config-time union of `Plugin::response_trailer_policy()` prefixes,
+    /// shared from the plugin cache generation.
+    policy_prefixes: std::sync::Arc<Vec<String>>,
+    /// End-to-end gateway builder fields this response actually wrote
+    /// (`via`, `alt-svc`, `x-gateway-error`, `x-gateway-upstream-status`).
+    /// Owned and per-response so an exact-value pre-seeded backend header
+    /// cannot hide the write from the mutation witness, and so a field the
+    /// gateway did not write on this response stays ungoverned. Empty when
+    /// none of those builder writes fired. Never includes hop-by-hop
+    /// `connection`.
+    gateway_owned_headers: GatewayOwnedResponseHeaders,
+    /// Plain response trailers, or a native gRPC terminal section whose three
+    /// reserved status fields survive governance. Fixed at construction from the
+    /// dispatch the handler already chose — never from a trailer name.
+    section: TrailerSectionKind,
+    /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`.
+    unbounded: bool,
+}
+
+impl StreamingResponseTrailerGovernor {
+    pub(crate) fn new(
+        final_headers: std::collections::HashMap<String, String>,
+        pre_policy: PrePolicyResponseHeaders,
+        policy_names: std::sync::Arc<Vec<String>>,
+        policy_prefixes: std::sync::Arc<Vec<String>>,
+        gateway_owned_headers: GatewayOwnedResponseHeaders,
+        section: TrailerSectionKind,
+        unbounded: bool,
+    ) -> Self {
+        Self {
+            final_headers,
+            pre_policy,
+            policy_names,
+            policy_prefixes,
+            gateway_owned_headers,
+            section,
+            unbounded,
+        }
+    }
+
+    /// Reconcile one backend trailer block against the retained boundary and
+    /// report how many fields were dropped. Call AFTER hop-by-hop stripping so
+    /// removed-field telemetry counts only policy-governed drops.
+    pub(crate) fn reconcile(&self, trailers: &mut http::HeaderMap) -> usize {
+        reconcile_streaming_backend_trailers(
+            trailers,
+            &self.final_headers,
+            &self.pre_policy,
+            ResponseTrailerGovernance {
+                policy_names: self.policy_names.as_slice(),
+                policy_prefixes: self.policy_prefixes.as_slice(),
+                unbounded: self.unbounded,
+            },
+            self.gateway_owned_headers,
+            self.section,
+        )
+    }
+}
+
+/// Streaming-relay entry point for
+/// [`reconcile_backend_trailers_with_response_policy`].
+///
+/// Builds the per-trailer witness from the retained pre-policy snapshot and
+/// applies the same governance rules the buffered path applies. Call it after
+/// every response-header mutation for the path and immediately before
+/// `send_trailers`.
+///
+/// `gateway_owned_headers` is the plain streaming-HTTP/2 builder-ownership bitset
+/// (empty on the native-H3 relays, which fold gateway writes into the shared
+/// header map before reconciling).
+///
+/// `section` selects reserved-field handling structurally — see
+/// [`TrailerSectionKind`].
+pub(crate) fn reconcile_streaming_backend_trailers(
+    trailers: &mut http::HeaderMap,
+    response_headers: &std::collections::HashMap<String, String>,
+    pre_policy: &PrePolicyResponseHeaders,
+    governance: ResponseTrailerGovernance<'_>,
+    gateway_owned_headers: GatewayOwnedResponseHeaders,
+    section: TrailerSectionKind,
+) -> usize {
+    let witness = pre_policy.witness(trailers);
+    reconcile_backend_trailers_with_response_policy(
+        trailers,
+        response_headers,
+        &witness,
+        governance.policy_names,
+        governance.policy_prefixes,
+        gateway_owned_headers,
+        section,
+        governance.unbounded,
+    )
+}
+
+/// Drop backend trailer fields that would re-open the response-header policy a
+/// protocol path already applied, and report how many were dropped.
+///
+/// `after_proxy` and every later response-header phase see only the INITIAL
+/// header map. A backend trailer carrying a governed field name arrives after
+/// that boundary, so without this reconciliation it reintroduces exactly what
+/// the policy removed — or contradicts what the policy set — on the wire. The
+/// paths that cross it are the buffered native-HTTP/3 send path, the plain
+/// native/refined HTTP/3 STREAMING relays, the plain direct-HTTP/2 streaming
+/// relay, and — via [`TrailerSectionKind::NativeGrpcTerminal`] — every native
+/// STREAMING gRPC relay (the direct-H2 gRPC pool path, the mesh-mTLS
+/// `StreamingH2` relay, the H3-to-H2 cross-protocol gRPC bridge, and
+/// `dispatch_grpc_native_h3`). The streaming families reach this function
+/// through [`reconcile_streaming_backend_trailers`] — the H3 relays inline, the
+/// H2 relays through the owned [`StreamingResponseTrailerGovernor`] their
+/// response body carries.
+///
+/// Independent signals decide "governed", because none alone is sufficient:
+///
+/// * `policy_names` — the config-time union of `Plugin::response_trailer_policy()`
+///   exact-name declarations. This is the only signal that can catch a policy
+///   REMOVAL which was a NO-OP on the initial header map because the backend
+///   sent the field only as a trailer, and an idempotent plugin write the
+///   mutation witness cannot see.
+/// * `policy_prefixes` — the config-time union of open-ended ASCII prefixes
+///   (CORS `access-control-`). Catches trailer-only extension names a finite
+///   write list never enumerates.
+/// * `gateway_owned_headers` — per-response end-to-end fields the plain streaming
+///   HTTP/2 builder actually wrote. Same idempotent-write shape as a plugin
+///   declaration: folding the value into `final_headers` alone misses an
+///   exact-value pre-seed.
+/// * `witness` — the observed per-request mutation. This catches every realized
+///   header change, including plugins that declare nothing (custom plugins, and
+///   transforms published at request time).
+///
+/// `unbounded_policy` is the fail-closed arm for a chain containing a plugin
+/// whose governed field set is not enumerable at config time: every field is
+/// treated as governed.
+///
+/// The ONLY exemption is `section` — see [`TrailerSectionKind`]. On a
+/// [`TrailerSectionKind::PlainResponse`] section there is no field-name
+/// exemption of any kind, `grpc-*` names included: exempting a name there would
+/// hand any backend a one-word bypass of the response-header policy. On a
+/// [`TrailerSectionKind::NativeGrpcTerminal`] section — reachable only because
+/// the gateway itself dispatched native gRPC — the three reserved terminal
+/// fields survive so generic rules cannot corrupt protocol status, and
+/// everything else in that section stays fully governed.
+///
+/// Removal is loop-until-absent so a trailer name repeated across several field
+/// lines cannot leave a surviving duplicate behind.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconcile_backend_trailers_with_response_policy(
+    trailers: &mut http::HeaderMap,
+    response_headers: &std::collections::HashMap<String, String>,
+    witness: &ResponseTrailerPolicyWitness,
+    policy_names: &[String],
+    policy_prefixes: &[String],
+    gateway_owned_headers: GatewayOwnedResponseHeaders,
+    section: TrailerSectionKind,
+    unbounded_policy: bool,
+) -> usize {
+    let mut to_remove: Vec<http::HeaderName> = Vec::new();
+    for name in trailers.keys() {
+        let field = name.as_str();
+        if section.field_is_reserved(field) {
+            // Protocol-required native gRPC terminal status. Never governed:
+            // dropping it would ship a truncated RPC with no outcome, and
+            // rewriting it would report an outcome the backend never produced.
+            continue;
+        }
+        let explicitly_named = policy_names
+            .iter()
+            .any(|policy| policy.eq_ignore_ascii_case(field));
+        let prefix_owned = policy_prefixes.iter().any(|prefix| {
+            field.len() >= prefix.len()
+                && field.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        });
+        let gateway_owned = gateway_owned_headers.owns(field);
+        let governed = explicitly_named
+            || prefix_owned
+            || gateway_owned
+            || unbounded_policy
+            || witness.was_mutated(name, response_headers);
+        if governed {
+            to_remove.push(name.clone());
+        }
+    }
+    for name in &to_remove {
+        while trailers.remove(name).is_some() {}
+    }
+    to_remove.len()
+}
+
 /// Strip response-direction hop-by-hop names from a plugin header map.
 ///
 /// Used as a final sanitation pass on HTTP/3 client-facing responses after
@@ -697,7 +1225,7 @@ pub fn apply_response_headers(
     headers: &std::collections::HashMap<String, String>,
 ) -> http::response::Builder {
     for (k, v) in headers {
-        if k == "set-cookie" {
+        if k.eq_ignore_ascii_case("set-cookie") {
             for cookie_val in v.split('\n') {
                 if let Ok(val) = http::HeaderValue::from_str(cookie_val) {
                     builder = builder.header(http::header::SET_COOKIE, val);

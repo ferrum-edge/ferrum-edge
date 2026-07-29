@@ -22,7 +22,7 @@ The CORS plugin is configured via the `plugin_configs` section in your YAML conf
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `allowed_origins` | `(string \| object)[]` | required | Origins permitted to make cross-origin requests. Use `"*"` only for intentional allow-all. Exact `scheme://host[:port]` values are URL-parsed and canonicalized once at config load (scheme/host case, default ports, IDNA, IPv4, and IPv6); request matching remains a direct comparison with no per-request URL parse/allocation. Native `"*.company.com"` matches subdomains. Istio-shaped objects carry exactly one of `exact` / `prefix` / `regex`; exact `*` is Istio allow-all, while prefix and regex retain literal source semantics. |
+| `allowed_origins` | `(string \| object)[]` | required, max 64 entries | Origins permitted to make cross-origin requests. Use `"*"` only for intentional allow-all. **Plain strings are native syntax:** exact `scheme://host[:port]` values are URL-parsed and canonicalized once at config load (scheme/host case, default ports, IDNA, IPv4, and IPv6) and matched case-insensitively, and `"*.company.com"` matches subdomains; request matching remains a direct comparison with no per-request URL parse/allocation. **Istio-shaped objects carry exactly one of `exact` / `prefix` / `regex` and retain literal source semantics:** object `exact` is a byte-for-byte, case-sensitive comparison with no canonicalization and no wildcard interpretation (so `{exact: "*.example.com"}` matches only that literal string), except `{exact: "*"}` which is Istio allow-all. Each matcher value is bounded at 512 bytes; regexes are compiled once at config construction/reload under explicit complexity limits. |
 | `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only policy returned in `Access-Control-Allow-Methods`. Native preflights for unlisted methods are rejected with 403; the list is not evaluated against an actual request's method. |
 | `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only policy returned in `Access-Control-Allow-Headers`. It is not evaluated against headers on the actual request. |
 | `exposed_headers` | `string[]` | `[]` | Response headers the browser is allowed to access via JavaScript, returned in `Access-Control-Expose-Headers`. |
@@ -156,9 +156,15 @@ This allows:
 
 > **Note:** Wildcard subdomain patterns match the host portion of syntactically valid HTTP(S) origins only. `*.company.com` matches any origin whose host ends with `.company.com`, with an optional numeric port. The bare domain (`company.com` without a subdomain) does **not** match — add it as a separate exact entry if needed.
 
-### Example 5: Prefix / Regex Origin Matchers (Istio `StringMatch`)
+### Example 5: Exact / Prefix / Regex Origin Matchers (Istio `StringMatch`)
 
 For finer-grained control — and for parity with Istio `VirtualService` `corsPolicy.allowOrigins[]`, which the mesh translator projects onto this plugin — `allowed_origins` entries may be `StringMatch`-shaped objects. Each object carries exactly one of `exact`, `prefix`, or `regex`.
+
+> **The two entry families are different matcher semantics — this matters for security.** A plain STRING entry is *native* syntax: it is canonicalized at config load, compared case-insensitively, and a leading `*.` makes it a wildcard-subdomain pattern. An OBJECT `{ exact: … }` entry is *Istio* `StringMatch.exact`: a literal, byte-for-byte, case-sensitive comparison with no canonicalization and no wildcard interpretation.
+>
+> So `"*.example.com"` (string) allows every `*.example.com` subdomain, while `{ exact: "*.example.com" }` allows only an `Origin` header whose value is literally `*.example.com`. The literal form exists precisely so an Istio source matcher that *looks* like wildcard syntax is preserved rather than silently widened. The one exception is `{ exact: "*" }`, which Istio itself defines as allow-all.
+>
+> Likewise `{ exact: "https://Example.com:443" }` matches only that exact string; it is **not** normalized to `https://example.com`. Use the plain-string form when you want canonicalizing, case-insensitive origin matching.
 
 ```yaml
 plugin_configs:
@@ -180,7 +186,21 @@ This allows:
 - `https://preview.example.com` ❌ (does not start with `https://preview-`)
 - `https://app.example.com.evil.com` ❌ (regex is a **full** match, not a substring search)
 
-> **Semantics:** `prefix` is a literal, case-sensitive byte-prefix of the request `Origin` header. `regex` is an RE2 pattern (the `regex` crate) that must match the **entire** `Origin` — there is no implicit `.*` on either end — mirroring how Ferrum evaluates Istio `StringMatch` regex elsewhere. The pattern is compiled (and bounded by the regex engine's size limit, so a hostile pattern cannot cause catastrophic backtracking) at config-load time; an invalid pattern is rejected when the plugin is created. Use `(?i)` inside the pattern for case-insensitive regex matching.
+> **Semantics:** `exact` is a literal, case-sensitive, byte-for-byte comparison with the request `Origin` header (see the note above). `prefix` is a literal, case-sensitive byte-prefix of the `Origin`. `regex` is an RE2 pattern (the `regex` crate) that must match the **entire** `Origin` — there is no implicit `.*` on either end — mirroring how Ferrum evaluates Istio `StringMatch` regex elsewhere. Use `(?i)` inside the pattern for case-insensitive regex matching.
+
+#### Origin matcher limits
+
+Origin matchers are admitted against explicit bounds on the cold config path. Every regex is compiled **once at config construction and reload**, never per request, and a matcher that exceeds a bound is a config error with a field-specific message — it is never dropped, truncated, or approximated:
+
+| Bound | Value |
+| --- | --- |
+| `allowed_origins` entries | 64 |
+| Bytes per matcher value (native string, `exact`, `prefix`, `regex` pattern) | 512 |
+| Compiled regex program size | 64 KiB |
+| Regex lazy-DFA cache | 64 KiB |
+| Regex AST nesting depth | 24 |
+
+The `regex` crate is finite-automaton based, so a hostile pattern cannot cause catastrophic backtracking; the bounds above additionally cap compile-time memory and per-match cache growth. An empty or whitespace-only `exact`, an empty `prefix` (which would match every origin), and an invalid or over-complex pattern are all rejected when the plugin is created. The same predicates gate the Istio VirtualService translator and native/file mesh validation, so an unrepresentable source policy is reported as a deferred field instead of failing plugin construction later.
 
 ### Example 6: Backend Handles OPTIONS
 
@@ -221,7 +241,24 @@ authoritative over the browser-facing response fields:
   from widening the gateway policy;
 - omitted/empty method and header lists stay empty, and omitted `maxAge` stays
   absent; and
-- `StringMatch.exact: "*"` and legacy `allowOrigin: ["*"]` mean allow-all.
+- `StringMatch.exact: "*"` and legacy `allowOrigin: ["*"]` mean allow-all;
+- every OTHER `StringMatch.exact` value (and every legacy `allowOrigin` entry) is
+  projected onto this plugin's **literal** `{ exact: … }` matcher, byte-for-byte.
+  A wildcard-shaped value such as `*.example.com` therefore keeps its upstream
+  literal meaning and is never reinterpreted as this plugin's
+  wildcard-subdomain syntax, and a non-canonical value such as
+  `https://Example.com:443` is never widened to its browser serialization; and
+- `prefix` / `regex` matchers project onto the matching object entries, with the
+  regex compiled at config construction/reload under the limits above.
+
+A policy Ferrum cannot represent faithfully is left **unprojected** — no route
+CORS plugin is emitted, and the VirtualService's
+`status.ferrum.translation.deferred_fields` names `http[].corsPolicy`. That
+applies to a malformed or unknown origin matcher, a matcher value or list beyond
+its bound, an un-compilable or over-complex regex, an unparseable `maxAge`, an
+invalid method/header token, and credentialed exact `*` (which cannot emit the
+concrete request origin credentialed CORS requires). Ferrum never approximates
+or widens such a policy.
 
 These rules do not alter operator-authored native direct-plugin behavior.
 

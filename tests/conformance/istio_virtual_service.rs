@@ -89,9 +89,9 @@ fn cors_plugin_for(translation_input: &[K8sObject]) -> Option<PluginConfig> {
 /// when its origins are representable (`allowOrigins[]` `exact`/`prefix`/`regex`
 /// `StringMatch` / legacy `allowOrigin`). GA: this is the common-case CORS
 /// surface Istio operators set on a route. Malformed/unknown origin matchers,
-/// un-compilable regexes, noncanonical literal exacts, and credentialed exact
-/// `*` combinations are left unprojected (deferred), not silently
-/// approximated.
+/// un-compilable or over-complex regexes, over-budget matcher lists/values, and
+/// credentialed exact `*` combinations are left unprojected (deferred), not
+/// silently approximated.
 #[test]
 fn vs_cors_policy_translated() {
     register_feature!(
@@ -99,7 +99,7 @@ fn vs_cors_policy_translated() {
         feature = "http[].corsPolicy",
         status = Status::Supported,
         maturity = Maturity::Ga,
-        notes = "Translated to a proxy-scoped `cors` plugin (allowOrigins[] exact/prefix/regex StringMatch / legacy allowOrigin, allowMethods/allowHeaders/exposeHeaders/maxAge/allowCredentials/unmatchedPreflights). Literal exact origins must already use their canonical browser serialization; omitted unmatchedPreflights preserves Istio FORWARD; uncredentialed exact `*` preserves allow-all, while credentialed exact `*` stays deferred instead of losing credentials.",
+        notes = "Translated to a proxy-scoped `cors` plugin (allowOrigins[] exact/prefix/regex StringMatch / legacy allowOrigin, allowMethods/allowHeaders/exposeHeaders/maxAge/allowCredentials/unmatchedPreflights). Exact origins project onto the plugin's LITERAL {exact} matcher, so wildcard-shaped and noncanonical exacts keep their source semantics instead of being widened or deferred; omitted unmatchedPreflights preserves Istio FORWARD; uncredentialed exact `*` preserves allow-all, while credentialed exact `*` stays deferred instead of losing credentials.",
     );
     let cors = cors_plugin_for(&[virtual_service(json!({
         "hosts": ["api.example.com"],
@@ -127,7 +127,9 @@ fn vs_cors_policy_translated() {
     // Fields mapped from Istio CRD camelCase to the cors plugin's snake_case.
     assert_eq!(
         cors.config["allowed_origins"],
-        json!(["https://app.example.com"])
+        json!([{"exact": "https://app.example.com"}]),
+        "Istio exact origins project onto the plugin's LITERAL matcher, never \
+         its canonicalizing plain-string form"
     );
     assert_eq!(cors.config["allowed_methods"], json!(["GET", "POST"]));
     assert_eq!(cors.config["allowed_headers"], json!(["X-Request-Id"]));
@@ -151,7 +153,7 @@ fn vs_cors_policy_regex_and_prefix_origins_projected() {
         category = CATEGORY,
         feature = "http[].corsPolicy regex/prefix origins",
         status = Status::Supported,
-        notes = "regex/prefix origin matchers project onto the cors plugin's {prefix}/{regex} allowed_origins entries (literal prefix / RE2 full match). Only an un-compilable regex stays deferred.",
+        notes = "regex/prefix origin matchers project onto the cors plugin's {prefix}/{regex} allowed_origins entries (literal prefix / RE2 full match), compiled once at config construction/reload under explicit byte/complexity/count bounds. An un-compilable, over-complex, or over-budget matcher stays deferred.",
     );
     let cors = cors_plugin_for(&[virtual_service(json!({
         "hosts": ["api.example.com"],
@@ -207,7 +209,7 @@ fn vs_cors_policy_preserves_unmatched_modes_and_exact_wildcard() {
             }]
         }))])
         .expect("Istio wildcard and unmatched mode must translate");
-        assert_eq!(cors.config["allowed_origins"], json!(["*"]));
+        assert_eq!(cors.config["allowed_origins"], json!([{"exact": "*"}]));
         assert_eq!(cors.config["unmatched_preflights"], json!(projected));
         assert_eq!(cors.config["allowed_methods"], json!([]));
         assert_eq!(cors.config["allowed_headers"], json!([]));
@@ -216,20 +218,28 @@ fn vs_cors_policy_preserves_unmatched_modes_and_exact_wildcard() {
             .expect("projected CORS config is valid");
     }
 
-    assert!(
-        cors_plugin_for(&[virtual_service(json!({
-            "hosts": ["api.example.com"],
-            "http": [{
-                "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
-                "corsPolicy": {
-                    "allowOrigins": [{"exact": "*.example.com"}],
-                    "unmatchedPreflights": "FORWARD"
-                }
-            }]
-        }))])
-        .is_none(),
-        "unrelated wildcard-shaped exacts must remain deferred"
+    // Issue #3254: a wildcard-SHAPED exact is now projected LITERALLY. It must
+    // reach the plugin as `{"exact": "*.example.com"}` — the plain-string form
+    // would be read as native wildcard-subdomain syntax and authorize every
+    // subdomain the source never matched.
+    let wildcard_shaped = cors_plugin_for(&[virtual_service(json!({
+        "hosts": ["api.example.com"],
+        "http": [{
+            "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
+            "corsPolicy": {
+                "allowOrigins": [{"exact": "*.example.com"}],
+                "unmatchedPreflights": "FORWARD"
+            }
+        }]
+    }))])
+    .expect("wildcard-shaped exacts translate literally");
+    assert_eq!(
+        wildcard_shaped.config["allowed_origins"],
+        json!([{"exact": "*.example.com"}]),
+        "a wildcard-shaped exact must stay a literal matcher, never native wildcard syntax"
     );
+    ferrum_edge::plugins::validate_plugin_config("cors", &wildcard_shaped.config)
+        .expect("literal wildcard-shaped exact config is valid");
 
     assert!(
         cors_plugin_for(&[virtual_service(json!({
@@ -261,19 +271,25 @@ fn vs_cors_policy_preserves_unmatched_modes_and_exact_wildcard() {
         "a malformed allowCredentials value must remain deferred"
     );
 
-    assert!(
-        cors_plugin_for(&[virtual_service(json!({
-            "hosts": ["api.example.com"],
-            "http": [{
-                "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
-                "corsPolicy": {
-                    "allowOrigins": [{"exact": "https://app.example.com:443"}]
-                }
-            }]
-        }))])
-        .is_none(),
-        "a noncanonical literal exact must remain deferred rather than widen"
+    // A noncanonical exact is likewise preserved verbatim instead of being
+    // widened to the browser serialization (`https://app.example.com`).
+    let noncanonical = cors_plugin_for(&[virtual_service(json!({
+        "hosts": ["api.example.com"],
+        "http": [{
+            "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
+            "corsPolicy": {
+                "allowOrigins": [{"exact": "https://app.example.com:443"}]
+            }
+        }]
+    }))])
+    .expect("noncanonical exacts translate literally");
+    assert_eq!(
+        noncanonical.config["allowed_origins"],
+        json!([{"exact": "https://app.example.com:443"}]),
+        "a noncanonical exact must stay literal rather than widen to its canonical origin"
     );
+    ferrum_edge::plugins::validate_plugin_config("cors", &noncanonical.config)
+        .expect("literal noncanonical exact config is valid");
 }
 
 /// A `corsPolicy` `regex` origin matcher that does not compile cannot be
@@ -286,19 +302,36 @@ fn vs_cors_policy_uncompilable_regex_origin_not_projected() {
         category = CATEGORY,
         feature = "http[].corsPolicy uncompilable regex origin",
         status = Status::Deferred,
-        notes = "An un-compilable regex origin matcher is fail-closed: left unprojected (deferred) and reported in status.deferred_fields, never emitted as an invalid plugin config.",
+        notes = "An un-compilable, over-complex, or over-budget origin matcher is fail-closed: left unprojected (deferred) and reported in status.deferred_fields, never emitted as an invalid plugin config, truncated, or approximated.",
     );
-    assert!(
-        cors_plugin_for(&[virtual_service(json!({
-            "hosts": ["api.example.com"],
-            "http": [{
-                "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
-                "corsPolicy": {"allowOrigins": [{"regex": "https://(example"}]}
-            }]
-        }))])
-        .is_none(),
-        "uncompilable-regex-origin corsPolicy must not emit a cors plugin"
-    );
+    let oversized = "a".repeat(600);
+    let too_many: Vec<serde_json::Value> = (0..65)
+        .map(|i| json!({"exact": format!("https://app{i}.example.com")}))
+        .collect();
+    for origins in [
+        // Unbalanced group → invalid RE2.
+        json!([{"regex": "https://(example"}]),
+        // Beyond the explicit AST nesting bound.
+        json!([{"regex": "((((((((((((((((((((((((((((a))))))))))))))))))))))))))))"}]),
+        // Beyond the explicit per-matcher byte bound.
+        json!([{"regex": &oversized}]),
+        json!([{"exact": &oversized}]),
+        json!([{"prefix": &oversized}]),
+        // Beyond the explicit matcher-count bound.
+        json!(too_many),
+    ] {
+        assert!(
+            cors_plugin_for(&[virtual_service(json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
+                    "corsPolicy": {"allowOrigins": origins}
+                }]
+            }))])
+            .is_none(),
+            "an unrepresentable origin matcher must not emit a cors plugin: {origins}"
+        );
+    }
 }
 
 /// A `corsPolicy` `allowOrigins[]` entry that is not a single-key

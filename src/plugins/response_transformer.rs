@@ -1039,6 +1039,21 @@ impl Plugin for ResponseTransformer {
         !self.body_rules.is_empty() && self.rules_enabled()
     }
 
+    /// Fail closed: the governed field set is not enumerable at config time.
+    ///
+    /// Static `rules` are enumerable, but `after_proxy` ALSO applies
+    /// `ctx.route_override_response_transform` — per-rule header transforms
+    /// published at request time by `mesh_route_dispatch` — and the runtime
+    /// path consults that context slot unconditionally, independent of the
+    /// config-time `apply_route_overrides` flag. A route-level `remove` whose
+    /// field arrived only as a backend trailer is therefore both invisible to
+    /// this declaration and invisible to observed-mutation reconciliation, so a
+    /// buffered path that forwards backend trailers drops the whole trailer
+    /// section instead of guessing which names are governed.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::Unbounded
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,

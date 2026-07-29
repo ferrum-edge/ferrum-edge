@@ -89,6 +89,18 @@ pub const COMPRESSION_CONFIG_KEYS: &[&str] = &[
 /// capped by `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that wire limit is set.
 pub const HARD_MAX_DECOMPRESSED_REQUEST_SIZE: usize = 32 * 1024 * 1024;
 
+/// Response fields `after_proxy` owns, in the bounded form
+/// `Plugin::response_trailer_policy` hands to the plugin cache. Built once per
+/// process; never allocated per request.
+static COMPRESSION_RESPONSE_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| {
+        vec![
+            "content-encoding".to_string(),
+            "content-length".to_string(),
+            "vary".to_string(),
+        ]
+    });
+
 /// Default `max_decompressed_request_size` (10 MiB).
 const DEFAULT_MAX_DECOMPRESSED_REQUEST_SIZE: usize = 10 * 1024 * 1024;
 
@@ -1669,6 +1681,18 @@ impl Plugin for CompressionPlugin {
 
     fn applies_after_proxy_on_reject(&self) -> bool {
         true
+    }
+
+    /// Content-coding negotiation is representation metadata, and all three
+    /// fields can be governed without a visible initial-map mutation:
+    /// `content-length` is REMOVED after coding (a no-op when the backend sent
+    /// the field only as a trailer, yet forwarding that trailer gives the client
+    /// the uncompressed length for a compressed body), `vary` is an idempotent
+    /// token merge that no-ops whenever the backend already nominated
+    /// `Accept-Encoding`, and `content-encoding` is a gateway write a trailer
+    /// copy would contradict.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::Names(&COMPRESSION_RESPONSE_POLICY_NAMES)
     }
 
     fn may_replace_rejection_response(&self) -> bool {

@@ -632,6 +632,20 @@ impl Plugin for RateLimiting {
         }
         false
     }
+
+    /// Config-time form of the same ownership. The exposed rate-limit values are
+    /// the gateway's own accounting; a backend trailer repeating one would hand
+    /// the client a budget the gateway never computed, and a backend echoing an
+    /// identical value hides the `after_proxy` write from observed-mutation
+    /// reconciliation. Empty when `expose_headers` is off, so a limiter that
+    /// writes no response headers governs no trailers.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        if self.expose_headers {
+            super::ResponseTrailerPolicy::Names(&EXPOSED_RATELIMIT_POLICY_NAMES)
+        } else {
+            super::ResponseTrailerPolicy::None
+        }
+    }
 }
 
 fn parse_limit_by(object: &serde_json::Map<String, Value>) -> Result<LimitBy, String> {
@@ -955,6 +969,18 @@ static EXPOSED_RATELIMIT_HEADERS: &[(&str, &str)] = &[
     ("ratelimit_remaining", "x-ratelimit-remaining"),
     ("ratelimit_window", "x-ratelimit-window"),
 ];
+
+/// The same table in the bounded `&[String]` form
+/// `Plugin::response_trailer_policy` hands to the plugin cache. Derived from
+/// [`EXPOSED_RATELIMIT_HEADERS`] so the two cannot drift, built once per
+/// process, and never allocated per request.
+static EXPOSED_RATELIMIT_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| {
+        EXPOSED_RATELIMIT_HEADERS
+            .iter()
+            .map(|(_, header_name)| (*header_name).to_string())
+            .collect()
+    });
 
 fn inject_rate_limit_headers_from_metadata(
     metadata: &HashMap<String, String>,

@@ -1559,6 +1559,7 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
 
 /// gRPC status codes for gateway-generated errors.
 pub mod grpc_status {
+    pub const OK: u32 = 0;
     pub const UNKNOWN: u32 = 2;
     pub const INVALID_ARGUMENT: u32 = 3;
     pub const DEADLINE_EXCEEDED: u32 = 4;

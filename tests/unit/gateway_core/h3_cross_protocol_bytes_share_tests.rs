@@ -120,6 +120,90 @@ fn h3_cross_protocol_reject_boundaries_avoid_slice_copies_for_owned_bytes() {
 }
 
 #[test]
+fn h3_cross_protocol_normalize_reject_omits_framed_provenance() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let normalize = cross
+        .split("fn normalize_reject_for_client(")
+        .nth(1)
+        .expect("H3 cross-protocol reject normalizer")
+        .split("fn reject_committed_response_view<'a>(")
+        .next()
+        .expect("bounded H3 cross-protocol reject normalizer");
+    assert!(
+        normalize.contains("normalize_reject_response("),
+        "cross-protocol rejects must use the provenance-free normalizer"
+    );
+    assert!(
+        !normalize.contains("FramedGrpcUnaryProvenance::from_context"),
+        "cross-protocol rejects must not thread framed terminate provenance"
+    );
+}
+
+#[test]
+fn h3_cross_protocol_grpc_reject_writer_is_trailers_only() {
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let writer = cross
+        .split("async fn write_normalized_grpc_reject_send<S>(")
+        .nth(1)
+        .expect("H3 cross-protocol gRPC reject writer")
+        .split("async fn write_final_grpc_body_reject_send<S>(")
+        .next()
+        .expect("bounded H3 cross-protocol gRPC reject writer");
+    assert!(
+        writer.contains("debug_assert!(\n        reject.body.is_empty(),"),
+        "cross-protocol gRPC rejects must assert trailers-only"
+    );
+    assert!(
+        !writer.contains("framed_unary_reject_parts"),
+        "cross-protocol gRPC rejects must not branch on framed unary parts"
+    );
+    assert!(
+        !writer.contains("stream.send_data("),
+        "cross-protocol gRPC rejects must not emit DATA frames"
+    );
+    assert!(
+        writer.contains("apply_response_headers("),
+        "cross-protocol gRPC rejects must share the response-header emitter"
+    );
+}
+
+#[test]
+fn h3_cross_protocol_grpc_reject_headers_emit_each_cookie() {
+    use ferrum_edge::proxy::headers::apply_response_headers;
+    use http::StatusCode;
+    use http::header::SET_COOKIE;
+    use std::collections::HashMap;
+
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("grpc-status".to_string(), "7".to_string()),
+        (
+            "set-cookie".to_string(),
+            "a=1; Path=/\nb=2; Path=/".to_string(),
+        ),
+        ("x-custom".to_string(), "keep".to_string()),
+    ]);
+    let response = http::Response::builder().status(StatusCode::OK);
+    let response = apply_response_headers(response, &headers)
+        .body(())
+        .expect("cross-protocol gRPC reject header block");
+    let cookies = response
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().expect("ASCII cookie"))
+        .collect::<Vec<_>>();
+    assert_eq!(cookies, vec!["a=1; Path=/", "b=2; Path=/"]);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-custom")
+            .and_then(|v| v.to_str().ok()),
+        Some("keep")
+    );
+}
+
+#[test]
 fn committed_hook_deadline_boundary_accepts_bytes_without_copy() {
     let proxy = include_str!("../../../src/proxy/mod.rs");
     let hook = proxy

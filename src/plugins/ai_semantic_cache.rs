@@ -75,6 +75,12 @@ use crate::util::unknown_keys::reject_unknown_keys;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// The single response field this plugin writes, in the bounded form
+/// `Plugin::response_trailer_policy` hands to the plugin cache. Built once per
+/// process; never allocated per request.
+static AI_CACHE_STATUS_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| vec!["x-ai-cache-status".to_string()]);
+
 /// Request-metadata namespace prefix. Each plugin instance appends its
 /// process-unique [`AiSemanticCache::instance_id`] so multiple
 /// `ai_semantic_cache` configs on one proxy cannot overwrite one another's
@@ -4814,6 +4820,15 @@ impl Plugin for AiSemanticCache {
     /// status to write.
     fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
         name.eq_ignore_ascii_case("x-ai-cache-status") && self.cache_status(ctx).is_some()
+    }
+
+    /// Same ownership contract as `owns_deadline_response_header`, expressed at
+    /// config time: an identical backend echo hides the gateway write from
+    /// observed-mutation reconciliation, so a backend `x-ai-cache-status`
+    /// TRAILER would otherwise overwrite the gateway's cache telemetry after
+    /// `after_proxy` already set it.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::Names(&AI_CACHE_STATUS_POLICY_NAMES)
     }
 
     async fn on_final_response_body(

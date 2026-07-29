@@ -166,6 +166,17 @@ impl Plugin for SecurityHeaders {
         &self.policy_header_names
     }
 
+    /// A configured `remove` is a policy decision about the FIELD, not about
+    /// the header section that happened to carry it: a backend that sends the
+    /// same name as a trailer would otherwise reintroduce exactly what the
+    /// policy suppressed, and the removal is a no-op on the initial map in that
+    /// case, so no observed-mutation diff can catch it. `set` names are
+    /// declared for the same reason — a trailer copy would leave the client
+    /// holding two conflicting values for a header the gateway owns.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::Names(&self.policy_header_names)
+    }
+
     fn may_add_response_cache_control_no_transform(
         &self,
         _ctx: &RequestContext,

@@ -713,6 +713,14 @@ fn h3_grpc_web_accept_rejection_keeps_http_406_contract() {
         log.contains("reject_headers_mark_accept_not_acceptable("),
         "H3 reject logging must keep Accept negotiation failures as HTTP 406"
     );
+    assert!(
+        !log.contains("Bytes::copy_from_slice(http_body)"),
+        "H3 reject logging must not full-copy an authorized terminate body merely for metadata"
+    );
+    assert!(
+        log.contains("intact_framed_unary_terminate_signal("),
+        "H3 reject logging must share the borrowed framed-unary predicate with the normalizer"
+    );
 }
 
 #[test]

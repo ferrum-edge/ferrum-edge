@@ -972,6 +972,20 @@ impl Plugin for WorkloadMetrics {
             && ctx.metadata.contains_key(TRACEPARENT_HEADER)
     }
 
+    /// Same contract as `otel_tracing`: the echoed `traceparent` is the
+    /// gateway's, an identical backend echo hides the write from
+    /// observed-mutation reconciliation, and a backend `traceparent` TRAILER
+    /// must not replace it after the fact.
+    fn response_trailer_policy(&self) -> crate::plugins::ResponseTrailerPolicy<'_> {
+        if self.trace_context_enabled() {
+            crate::plugins::ResponseTrailerPolicy::Names(
+                &crate::plugins::TRACEPARENT_RESPONSE_POLICY_NAMES,
+            )
+        } else {
+            crate::plugins::ResponseTrailerPolicy::None
+        }
+    }
+
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let stamped_direction = ctx.mesh_direction;
         let peer_identity = ctx
@@ -2287,6 +2301,25 @@ mod tests {
                 .map(String::as_str),
             Some("literal,tenant")
         );
+    }
+
+    #[test]
+    fn response_trailer_policy_only_claims_traceparent_when_tracing_can_author_it() {
+        let metrics_only = WorkloadMetrics::new(&json!({})).expect("metrics-only config");
+        assert!(matches!(
+            metrics_only.response_trailer_policy(),
+            crate::plugins::ResponseTrailerPolicy::None
+        ));
+
+        let tracing = WorkloadMetrics::new(&json!({
+            "sampling_percentage": 100.0
+        }))
+        .expect("tracing config");
+        assert!(matches!(
+            tracing.response_trailer_policy(),
+            crate::plugins::ResponseTrailerPolicy::Names(names)
+                if names.len() == 1 && names[0] == "traceparent"
+        ));
     }
 
     #[test]

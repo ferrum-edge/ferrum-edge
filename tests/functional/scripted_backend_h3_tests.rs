@@ -2238,6 +2238,61 @@ fn file_mode_yaml_for_h3_with_compression(port: u16) -> String {
     file_mode_yaml_for_h3_with_compression_and_read_timeout(port, 5000)
 }
 
+/// A `security_headers` chain whose `remove` names a field the backend sends
+/// ONLY as a response TRAILER. The removal is a no-op on the initial header
+/// map, so nothing but the plugin's `response_trailer_policy()` declaration can
+/// bind the trailer section (advisory GHSA-r78v-rc86-6r86).
+fn file_mode_yaml_for_h3_streaming_trailer_policy(port: u16) -> String {
+    file_mode_yaml_for_h3_streaming_trailer_policy_with_read_timeout(port, 5000)
+}
+
+/// Same chain with a caller-chosen `backend_read_timeout_ms`, so a test can make
+/// the trailer-phase deadline fire while h3 still withholds an already-received
+/// TRAILERS frame behind a delayed FIN.
+fn file_mode_yaml_for_h3_streaming_trailer_policy_with_read_timeout(
+    port: u16,
+    backend_read_timeout_ms: u64,
+) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "scripted-h3",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": backend_read_timeout_ms,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "h3-trailer-policy-security",
+                "plugin_name": "security_headers",
+                "scope": "global",
+                "enabled": true,
+                "config": {
+                    "set": {"X-Security-Policy": "gateway-enforced"},
+                    "remove": ["X-Powered-By"],
+                },
+            },
+            {
+                "id": "h3-access-log",
+                "plugin_name": "stdout_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": {},
+            }
+        ],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
 fn file_mode_yaml_for_h3_with_compression_and_read_timeout(
     port: u16,
     backend_read_timeout_ms: u64,
@@ -2391,6 +2446,22 @@ async fn spawn_h3_streaming_downgrade_harness_with_read_timeout(
     extra_env: &[(&str, &str)],
     backend_read_timeout_ms: u64,
 ) -> (GatewayHarness, ScriptedH3Backend) {
+    spawn_h3_streaming_harness_with_config(ca_name, h3_steps, extra_env, &|port| {
+        file_mode_yaml_for_h3_with_compression_and_read_timeout(port, backend_read_timeout_ms)
+    })
+    .await
+}
+
+/// Same H3 streaming harness, with the file config chosen by the caller from
+/// the allocated backend port. Lets a test swap the plugin chain (for example
+/// `security_headers` instead of `compression`) without duplicating the
+/// capability-probe sidecar and `h3=supported` barrier.
+async fn spawn_h3_streaming_harness_with_config(
+    ca_name: &str,
+    h3_steps: Vec<H3Step>,
+    extra_env: &[(&str, &str)],
+    file_config: &dyn Fn(u16) -> String,
+) -> (GatewayHarness, ScriptedH3Backend) {
     let ca = TestCa::new(ca_name).expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
@@ -2422,10 +2493,7 @@ async fn spawn_h3_streaming_downgrade_harness_with_read_timeout(
         .expect("spawn h3 backend");
 
     let mut builder = GatewayHarness::builder()
-        .file_config(file_mode_yaml_for_h3_with_compression_and_read_timeout(
-            backend_port,
-            backend_read_timeout_ms,
-        ))
+        .file_config(file_config(backend_port))
         .log_level("info")
         .capture_output()
         // Avoid pool warmup issuing an extra H3 request before the test's GET.
@@ -2849,6 +2917,217 @@ async fn h2c_frontend_h3_backend_206_buffered_decision_streams_and_forwards_trai
     assert!(
         received.iter().any(|r| r.method == "GET"),
         "H3 backend must have received the GET; recorded: {received:#?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 14b — the H1/H2 frontend → native-H3 backend STREAMING relay
+// (`ResponseBody::StreamingH3`) enforces the response-header policy on the
+// backend's TRAILERS frame (advisory GHSA-r78v-rc86-6r86).
+//
+// `security_headers` is configured with `{"remove": ["X-Powered-By"]}` and the
+// backend sends `x-powered-by` ONLY as a trailer. The removal is a no-op on the
+// initial header map, so no observed-mutation diff can catch it — only the
+// plugin's declared `response_trailer_policy()` name binds the trailer section.
+// Pre-fix `H3FrameSource` stripped hop-by-hop names and forwarded everything
+// else verbatim, landing the suppressed field on the wire after the policy had
+// already run. An UNDECLARED backend trailer must still be forwarded (issue
+// #2941 pass-through).
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2c_frontend_h3_backend_streaming_trailers_obey_response_header_policy() {
+    let body_len = 512usize;
+    let body = bytes::Bytes::from(vec![b's'; body_len]);
+
+    let (harness, h3_backend) = spawn_h3_streaming_harness_with_config(
+        "phase-h3-trailer-policy",
+        vec![
+            H3Step::AcceptStream,
+            // Content-Length is load-bearing for the same reason as test 14:
+            // `H3FrameSource`'s graceful-close recovery only treats the
+            // end-of-script QUIC close as a clean EOS on a provably complete
+            // body. `x-powered-by` is deliberately ABSENT from the initial
+            // header block so the policy removal is a no-op there.
+            H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-length", body_len.to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]),
+            H3Step::RespondData(body.clone()),
+            H3Step::StallFor(Duration::from_millis(50)),
+            H3Step::RespondTrailers(vec![
+                // Governed: `security_headers` declared this name.
+                ("x-powered-by", "backend-trailer-bypass".to_string()),
+                // Ungoverned: nothing in the chain owns this field.
+                ("x-backend-checksum", "sha256-cafebabe".to_string()),
+            ]),
+            H3Step::StallFor(Duration::from_millis(100)),
+        ],
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
+        &file_mode_yaml_for_h3_streaming_trailer_policy,
+    )
+    .await;
+
+    let resp = raw_h2c_request(&harness.proxy_url("/api/stream"), "GET", &[])
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("raw h2c request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status, 200,
+        "expected the response to STREAM; headers={:?} body_error={:?}\n--- logs ---\n{logs}",
+        resp.headers, resp.body_error
+    );
+    assert!(
+        resp.body_error.is_none(),
+        "expected a clean stream end; body_error={:?}\n--- logs ---\n{logs}",
+        resp.body_error
+    );
+    assert_eq!(
+        resp.body.len(),
+        body_len,
+        "expected the full {body_len}-byte body; got {}",
+        resp.body.len()
+    );
+    assert!(
+        !resp.trailers.contains_key("x-powered-by"),
+        "a backend TRAILER carrying a name `security_headers` removes must not reach the client \
+         — the removal was a no-op on the initial header map, so the trailer section is the only \
+         place it could land (GHSA-r78v-rc86-6r86); trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.trailers.get("x-backend-checksum").map(String::as_str),
+        Some("sha256-cafebabe"),
+        "an UNGOVERNED backend trailer must still be forwarded (issue #2941); trailers={:?}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.headers.get("x-security-policy").map(String::as_str),
+        Some("gateway-enforced"),
+        "the security_headers chain must actually have run on this response; headers={:?}",
+        resp.headers
+    );
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received.iter().any(|r| r.method == "GET"),
+        "H3 backend must have received the GET; recorded: {received:#?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 14c — the SAME response-header policy binds the trailer section on the
+// delayed-FIN / trailer-timeout-collapse route, not just on the ordinary FIN
+// route covered by test 14b (advisory GHSA-r78v-rc86-6r86).
+//
+// `H3FrameSource` reaches the trailer phase, sees `Pending` from
+// `poll_recv_trailers`, and PEEKS the TRAILERS frame h3 has already received but
+// is withholding until the terminal stream FIN. That peeked map is handed to
+// `H3ReadProgress.pending_trailers`, and the outer `IdleReadTimeoutBody` — which
+// carries no governor of its own — forwards it verbatim when its trailer-phase
+// deadline fires. So a governed field that never reaches the `Ready` arm above
+// still lands on the wire unless the peek path applies the governor too.
+//
+// The script therefore NEVER sends FIN: the trailers can only reach the client
+// through the timeout collapse. A plain FIN-path test cannot exercise this.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2c_frontend_h3_backend_delayed_fin_trailers_obey_response_header_policy() {
+    let body_len = 512usize;
+    let body = bytes::Bytes::from(vec![b'p'; body_len]);
+
+    let (harness, h3_backend) = spawn_h3_streaming_harness_with_config(
+        "phase-h3-delayed-fin-trailer-policy",
+        vec![
+            H3Step::AcceptStream,
+            // Content-Length declared and satisfied so the DATA phase ends on a
+            // provably COMPLETE body — that is what lets the source enter the
+            // trailer phase (and the outer deadline collapse cleanly rather than
+            // erroring). `x-powered-by` is deliberately ABSENT here so the
+            // `security_headers` removal is a no-op on the initial header map and
+            // only the declared `response_trailer_policy()` name can bind it.
+            H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-length", body_len.to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]),
+            H3Step::RespondData(body.clone()),
+            H3Step::RespondTrailersWithoutFin(vec![
+                // Governed: `security_headers` declared this name.
+                ("x-powered-by", "backend-trailer-bypass".to_string()),
+                // Ungoverned: nothing in the chain owns this field.
+                ("x-backend-checksum", "sha256-delayed-policy".to_string()),
+                // Hop-by-hop: stripped on this route before the governor runs.
+                ("transfer-encoding", "chunked".to_string()),
+            ]),
+            // Hold the stream open well past the 25 ms backend read timeout so
+            // the trailer-phase deadline is the ONLY thing that can deliver the
+            // buffered trailer map downstream.
+            H3Step::StallFor(Duration::from_millis(300)),
+        ],
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
+        &|port| file_mode_yaml_for_h3_streaming_trailer_policy_with_read_timeout(port, 25),
+    )
+    .await;
+
+    let resp = raw_h2c_request(&harness.proxy_url("/api/delayed-fin-policy"), "GET", &[])
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("raw h2c request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status, 200,
+        "expected the response to STREAM; headers={:?} body_error={:?}\n--- logs ---\n{logs}",
+        resp.headers, resp.body_error
+    );
+    assert!(
+        resp.body_error.is_none(),
+        "expected the trailer-phase timeout to collapse cleanly; body_error={:?}\n--- logs ---\n{logs}",
+        resp.body_error
+    );
+    assert_eq!(resp.body.as_slice(), body.as_ref());
+    // The load-bearing pair: the collapse must have delivered a trailer section
+    // (so this really is the peek/timeout route, not a silent drop) AND that
+    // section must be governed.
+    assert_eq!(
+        resp.trailers.get("x-backend-checksum").map(String::as_str),
+        Some("sha256-delayed-policy"),
+        "the peeked trailer map must still reach the client through the timeout collapse — \
+         without this the `x-powered-by` assertion below would pass vacuously; \
+         trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert!(
+        !resp.trailers.contains_key("x-powered-by"),
+        "a governed trailer must not bypass the response-header policy on the delayed-FIN / \
+         trailer-timeout-collapse route either (GHSA-r78v-rc86-6r86); trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert!(
+        !resp.trailers.contains_key("transfer-encoding"),
+        "hop-by-hop trailer name must still be stripped on this route; trailers={:?}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.headers.get("x-security-policy").map(String::as_str),
+        Some("gateway-enforced"),
+        "the security_headers chain must actually have run on this response; headers={:?}",
+        resp.headers
+    );
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received.iter().any(|r| r.path == "/delayed-fin-policy"),
+        "H3 backend must have received the delayed-FIN request; recorded: {received:#?}"
     );
 }
 
@@ -3458,6 +3737,170 @@ async fn h3_native_grpc_server_streaming_preserves_frames_and_trailers() {
     );
 }
 
+/// Native-H3 gRPC config carrying a `response_transformer`, which declares
+/// `ResponseTrailerPolicy::Unbounded` — its `after_proxy` also applies
+/// `mesh_route_dispatch` route overrides whose field names do not exist until
+/// the request runs, so the governed set is not enumerable at config time.
+fn file_mode_yaml_for_h3_grpc_with_response_transformer(port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "scripted-h3",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [{"plugin_config_id": "h3-grpc-response-transformer"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "h3-grpc-response-transformer",
+            "plugin_name": "response_transformer",
+            "scope": "proxy",
+            "proxy_id": "scripted-h3",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "target": "header",
+                    "operation": "remove",
+                    "key": "x-internal-debug",
+                }],
+            },
+        }],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GHSA-r78v-rc86-6r86 — native H3 gRPC streaming.
+//
+// The advisory's reproduction: `response_transformer` removes
+// `x-internal-debug`, the backend sends that field ONLY in the terminal
+// metadata, and the streaming path runs `after_proxy` on the initial headers
+// alone. Before the fix the trailer sailed straight past the operator's rule.
+//
+// Both halves are asserted here, because a fix that simply dropped the whole
+// trailer section would be worse than the bug: the RESERVED terminal fields
+// (`grpc-status` / `grpc-message` / `grpc-status-details-bin`) must survive so
+// the client still learns the RPC outcome.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_grpc_streaming_governs_application_metadata_only() {
+    let ca = TestCa::new("phase-h3-grpc-trailer-policy").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let _tcp_backend =
+        spawn_grpc_probe_tcp_backend(tcp_res.into_listener(), cert.clone(), key.clone());
+
+    let frame = grpc_frame(b"stream-msg-1");
+
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-type", "application/grpc".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from(frame.clone())))
+        .step(H3Step::RespondTrailers(vec![
+            ("grpc-status", "9".to_string()),
+            ("grpc-message", "FAILED_PRECONDITION".to_string()),
+            ("grpc-status-details-bin", "AQID".to_string()),
+            // Trailer-ONLY application metadata: the removal rule is a no-op on
+            // the initial header map, so only the trailer boundary can bind it.
+            ("x-internal-debug", "backend-trace-9f2a".to_string()),
+            ("x-tenant-shard", "eu-3".to_string()),
+        ]))
+        .step(H3Step::StallFor(Duration::from_secs(1)))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let (harness, _ca_pem, _https_port) = spawn_h3_harness_with_explicit_https_port_and_config(
+        file_mode_yaml_for_h3_grpc_with_response_transformer(backend_port),
+        false,
+        Some(1),
+    )
+    .await;
+
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported for the native H3 gRPC trailer-policy case; entry: {entry:#?}"
+    );
+
+    let resp = match h3_grpc_post(&harness, "/api/echo.Echo/ServerStream", grpc_frame(b"go")).await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("native H3 gRPC trailer-policy request failed: {e}\n--- logs ---\n{logs}");
+        }
+    };
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    let backend_errors = h3_backend.step_errors().await;
+    assert_eq!(resp.status.as_u16(), 200, "status; --- logs ---\n{logs}");
+    assert_eq!(
+        resp.body_bytes.as_ref(),
+        frame.as_slice(),
+        "the streamed gRPC frame must still be relayed byte-for-byte"
+    );
+
+    // Reserved terminal metadata survives: generic header policy must never
+    // corrupt or suppress a valid RPC outcome.
+    assert_eq!(
+        resp.trailer("grpc-status"),
+        Some("9"),
+        "grpc-status must survive response-header governance; trailers: {:#?}\n\
+         backend errors: {backend_errors:#?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.trailer("grpc-message"),
+        Some("FAILED_PRECONDITION"),
+        "grpc-message must survive; trailers: {:#?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.trailer("grpc-status-details-bin"),
+        Some("AQID"),
+        "grpc-status-details-bin must survive; trailers: {:#?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+
+    // Application metadata does NOT: `response_transformer` is unbounded, so the
+    // non-reserved terminal fields fail closed.
+    assert_eq!(
+        resp.trailer("x-internal-debug"),
+        None,
+        "trailer-only gRPC application metadata must not bypass the \
+         response_transformer header policy; trailers: {:#?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.trailer("x-tenant-shard"),
+        None,
+        "every non-reserved gRPC trailer field must fail closed under an \
+         unbounded policy; trailers: {:#?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Issue #2939 — plain native-H3 streaming mid-body non-graceful abort
 // downgrades capability so the next request bridges to TCP instead of
@@ -3941,4 +4384,487 @@ async fn h3_buffered_auth_logging_plugins_preserve_backend_trailers() {
         resp.trailers
     );
     assert_eq!(resp.trailer("x-request-id"), Some("trail-auth-1"));
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// A response-header policy binds the TRAILER section too. `after_proxy` only
+// ever sees the initial header map, so a backend trailer repeating a governed
+// field name would otherwise reintroduce exactly what the policy removed —
+// while ungoverned trailer fields must still reach the client untouched.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_security_headers_policy_strips_only_governed_backend_trailers() {
+    let (harness, https_port, _keep) =
+        spawn_h3_trailer_policy_harness("h3-buffered-trailers-policy", |backend_port| {
+            json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "scripted-h3",
+                    "listen_path": "/api",
+                    "backend_scheme": "https",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": backend_port,
+                    "strip_listen_path": true,
+                    "backend_connect_timeout_ms": 2000,
+                    "backend_read_timeout_ms": 5000,
+                    "backend_write_timeout_ms": 5000,
+                    "backend_tls_verify_server_cert": false,
+                    "response_body_mode": "buffer",
+                    "plugins": [{"plugin_config_id": "trail-security-headers"}],
+                }],
+                "consumers": [],
+                "upstreams": [],
+                "plugin_configs": [{
+                    "id": "trail-security-headers",
+                    "plugin_name": "security_headers",
+                    "scope": "proxy",
+                    "proxy_id": "scripted-h3",
+                    "enabled": true,
+                    // The backend never sends `x-powered-by` as a HEADER, so
+                    // this removal is a no-op on the initial map. Only the
+                    // config-time policy declaration can bind the trailer copy.
+                    "config": {"remove": ["x-powered-by"]},
+                }],
+            })
+        })
+        .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/trailers");
+    let resp = client
+        .get_with_options(&url, GetOptions::default())
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 buffered trailer request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "buffered security_headers path must succeed; body={:?}\n--- logs ---\n{logs}",
+        resp.body_text()
+    );
+    assert_eq!(resp.body_text(), "trailer-body");
+    assert_eq!(
+        resp.trailer("x-powered-by"),
+        None,
+        "a backend trailer must not reintroduce a field the response header \
+         policy removes; trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.trailer("x-backend-finished"),
+        Some("true"),
+        "ungoverned backend trailers must survive a response header policy; \
+         trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+}
+
+// A plugin whose governed field set is not enumerable at config time fails
+// closed: `response_transformer` also applies per-request route overrides
+// published by `mesh_route_dispatch`, so the whole trailer section is dropped
+// rather than reconciled field by field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_unbounded_response_policy_drops_backend_trailers() {
+    let (harness, https_port, _keep) =
+        spawn_h3_trailer_policy_harness("h3-buffered-trailers-unbounded", |backend_port| {
+            json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "scripted-h3",
+                    "listen_path": "/api",
+                    "backend_scheme": "https",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": backend_port,
+                    "strip_listen_path": true,
+                    "backend_connect_timeout_ms": 2000,
+                    "backend_read_timeout_ms": 5000,
+                    "backend_write_timeout_ms": 5000,
+                    "backend_tls_verify_server_cert": false,
+                    "response_body_mode": "buffer",
+                    "plugins": [{"plugin_config_id": "trail-response-transformer"}],
+                }],
+                "consumers": [],
+                "upstreams": [],
+                "plugin_configs": [{
+                    "id": "trail-response-transformer",
+                    "plugin_name": "response_transformer",
+                    "scope": "proxy",
+                    "proxy_id": "scripted-h3",
+                    "enabled": true,
+                    "config": {
+                        "rules": [{
+                            "target": "header",
+                            "operation": "add",
+                            "key": "x-gateway-note",
+                            "value": "transformed",
+                        }],
+                    },
+                }],
+            })
+        })
+        .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/trailers");
+    let resp = client
+        .get_with_options(&url, GetOptions::default())
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 buffered trailer request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "buffered response_transformer path must succeed; body={:?}\n--- logs ---\n{logs}",
+        resp.body_text()
+    );
+    assert_eq!(resp.body_text(), "trailer-body");
+    assert_eq!(
+        resp.headers
+            .get("x-gateway-note")
+            .and_then(|value| value.to_str().ok()),
+        Some("transformed")
+    );
+    assert_eq!(
+        resp.trailer("x-backend-finished"),
+        None,
+        "a non-enumerable response header policy must fail closed on the trailer \
+         section; trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(resp.trailer("x-powered-by"), None);
+}
+
+/// Spawn an H3 harness whose scripted backend answers `/api/trailers` with a
+/// buffered body plus two trailer fields — one that a response-header policy
+/// may govern (`x-powered-by`) and one that no policy names
+/// (`x-backend-finished`).
+///
+/// Returned as a tuple so the scripted TLS/H3 backends stay alive for the whole
+/// test; dropping them would tear the listeners down mid-request.
+async fn spawn_h3_trailer_policy_harness(
+    ca_name: &str,
+    build_config: impl FnOnce(u16) -> serde_json::Value,
+) -> (GatewayHarness, u16, (ScriptedTlsBackend, ScriptedH3Backend)) {
+    spawn_h3_trailer_policy_harness_with_trailers(
+        ca_name,
+        &[
+            ("x-powered-by", "backend/1.2"),
+            ("x-backend-finished", "true"),
+        ],
+        build_config,
+    )
+    .await
+}
+
+/// [`spawn_h3_trailer_policy_harness`] with a caller-chosen backend trailer
+/// section, so a test can prove that a specific field NAME earns no special
+/// treatment from the reconciliation.
+async fn spawn_h3_trailer_policy_harness_with_trailers(
+    ca_name: &str,
+    backend_trailers: &[(&'static str, &'static str)],
+    build_config: impl FnOnce(u16) -> serde_json::Value,
+) -> (GatewayHarness, u16, (ScriptedTlsBackend, ScriptedH3Backend)) {
+    let ca = TestCa::new(ca_name).expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .repeat_each_connection()
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    let body = bytes::Bytes::from_static(b"trailer-body");
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", body.len().to_string()),
+            ("content-type", "text/plain".to_string()),
+        ]))
+        .step(H3Step::RespondData(body.clone()))
+        .step(H3Step::RespondTrailers(
+            backend_trailers
+                .iter()
+                .map(|(name, value)| (*name, (*value).to_string()))
+                .collect(),
+        ))
+        .step(H3Step::StallFor(Duration::from_millis(100)))
+        .spawn()
+        .expect("spawn h3");
+
+    let yaml = serde_yaml::to_string(&build_config(backend_port)).expect("yaml");
+    let (harness, _ca_pem, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
+
+    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("pre-entry")
+        .expect("registry populated");
+    assert_eq!(pre["plain_http"]["h3"].as_str(), Some("supported"));
+
+    (harness, https_port, (tcp_backend, h3_backend))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// The same boundary on the STREAMING relays. Here the initial HEADERS frame is
+// already on the wire when the backend's trailer section arrives, so the
+// reconciliation happens at the trailer frame instead of at response build.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streaming_security_headers_policy_strips_only_governed_backend_trailers() {
+    let (harness, https_port, _keep) =
+        spawn_h3_trailer_policy_harness("h3-streaming-trailers-policy", |backend_port| {
+            json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "scripted-h3",
+                    "listen_path": "/api",
+                    "backend_scheme": "https",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": backend_port,
+                    "strip_listen_path": true,
+                    "backend_connect_timeout_ms": 2000,
+                    "backend_read_timeout_ms": 5000,
+                    "backend_write_timeout_ms": 5000,
+                    "backend_tls_verify_server_cert": false,
+                    "response_body_mode": "stream",
+                    "plugins": [{"plugin_config_id": "trail-security-headers"}],
+                }],
+                "consumers": [],
+                "upstreams": [],
+                "plugin_configs": [{
+                    "id": "trail-security-headers",
+                    "plugin_name": "security_headers",
+                    "scope": "proxy",
+                    "proxy_id": "scripted-h3",
+                    "enabled": true,
+                    // Removal is a no-op on the initial header map; only the
+                    // config-time declaration can bind the trailer copy, which
+                    // arrives long after the HEADERS frame was committed.
+                    "config": {"remove": ["x-powered-by"]},
+                }],
+            })
+        })
+        .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/trailers");
+    let resp = client
+        .get_with_options(&url, GetOptions::default())
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 streaming trailer request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "streaming security_headers path must succeed; body={:?}\n--- logs ---\n{logs}",
+        resp.body_text()
+    );
+    assert_eq!(resp.body_text(), "trailer-body");
+    assert_eq!(
+        resp.trailer("x-powered-by"),
+        None,
+        "a streamed backend trailer must not reintroduce a field the response \
+         header policy removes; trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.trailer("x-backend-finished"),
+        Some("true"),
+        "ungoverned backend trailers must survive on the streaming relay; \
+         trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+}
+
+// The fail-closed arm applies to the streaming relay too: a chain whose
+// governed field set is not enumerable at config time drops the whole trailer
+// section rather than guessing which names the route overrides touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streaming_unbounded_response_policy_drops_backend_trailers() {
+    let (harness, https_port, _keep) =
+        spawn_h3_trailer_policy_harness("h3-streaming-trailers-unbounded", |backend_port| {
+            json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "scripted-h3",
+                    "listen_path": "/api",
+                    "backend_scheme": "https",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": backend_port,
+                    "strip_listen_path": true,
+                    "backend_connect_timeout_ms": 2000,
+                    "backend_read_timeout_ms": 5000,
+                    "backend_write_timeout_ms": 5000,
+                    "backend_tls_verify_server_cert": false,
+                    "response_body_mode": "stream",
+                    "plugins": [{"plugin_config_id": "trail-response-transformer"}],
+                }],
+                "consumers": [],
+                "upstreams": [],
+                "plugin_configs": [{
+                    "id": "trail-response-transformer",
+                    "plugin_name": "response_transformer",
+                    "scope": "proxy",
+                    "proxy_id": "scripted-h3",
+                    "enabled": true,
+                    "config": {
+                        "rules": [{
+                            "target": "header",
+                            "operation": "add",
+                            "key": "x-gateway-note",
+                            "value": "transformed",
+                        }],
+                    },
+                }],
+            })
+        })
+        .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/trailers");
+    let resp = client
+        .get_with_options(&url, GetOptions::default())
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 streaming trailer request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "streaming response_transformer path must succeed; body={:?}\n--- logs ---\n{logs}",
+        resp.body_text()
+    );
+    assert_eq!(resp.body_text(), "trailer-body");
+    assert_eq!(
+        resp.headers
+            .get("x-gateway-note")
+            .and_then(|value| value.to_str().ok()),
+        Some("transformed")
+    );
+    assert_eq!(
+        resp.trailer("x-backend-finished"),
+        None,
+        "a non-enumerable response header policy must fail closed on the \
+         streamed trailer section; trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(resp.trailer("x-powered-by"), None);
+}
+
+// A `grpc-*` trailer NAME earns no exemption on a PLAIN response. Reserved-field
+// handling is selected structurally from the dispatch the gateway committed to,
+// never from the trailer's own name, and this proxy is an ordinary HTTP backend
+// that merely happens to name its trailer `grpc-status`. Without that rule the
+// one word would carry it past a fail-closed response-header policy. The mirror
+// case — the SAME names surviving on a real native gRPC dispatch — is
+// `h3_native_grpc_streaming_governs_application_metadata_only` below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streaming_grpc_named_trailer_from_a_plain_backend_is_not_exempt() {
+    let (harness, https_port, _keep) = spawn_h3_trailer_policy_harness_with_trailers(
+        "h3-streaming-trailers-grpc-name",
+        &[
+            ("grpc-status", "0"),
+            ("grpc-message", "smuggled"),
+            ("x-backend-finished", "true"),
+        ],
+        |backend_port| {
+            json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "scripted-h3",
+                    "listen_path": "/api",
+                    "backend_scheme": "https",
+                    "backend_host": "127.0.0.1",
+                    "backend_port": backend_port,
+                    "strip_listen_path": true,
+                    "backend_connect_timeout_ms": 2000,
+                    "backend_read_timeout_ms": 5000,
+                    "backend_write_timeout_ms": 5000,
+                    "backend_tls_verify_server_cert": false,
+                    "response_body_mode": "stream",
+                    "plugins": [{"plugin_config_id": "trail-response-transformer"}],
+                }],
+                "consumers": [],
+                "upstreams": [],
+                "plugin_configs": [{
+                    "id": "trail-response-transformer",
+                    "plugin_name": "response_transformer",
+                    "scope": "proxy",
+                    "proxy_id": "scripted-h3",
+                    "enabled": true,
+                    "config": {
+                        "rules": [{
+                            "target": "header",
+                            "operation": "add",
+                            "key": "x-gateway-note",
+                            "value": "transformed",
+                        }],
+                    },
+                }],
+            })
+        },
+    )
+    .await;
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/trailers");
+    let resp = client
+        .get_with_options(&url, GetOptions::default())
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 streaming trailer request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "streaming path must still succeed; body={:?}\n--- logs ---\n{logs}",
+        resp.body_text()
+    );
+    assert_eq!(resp.body_text(), "trailer-body");
+    assert_eq!(
+        resp.trailer("grpc-status"),
+        None,
+        "a grpc-named trailer from a plain backend must not bypass the \
+         fail-closed response header policy; trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(resp.trailer("grpc-message"), None);
+    assert_eq!(resp.trailer("x-backend-finished"), None);
 }

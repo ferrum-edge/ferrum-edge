@@ -135,6 +135,12 @@ pub struct SsePlugin {
     /// an enumeration that could silently fall behind a new field. Only the
     /// digest is ever exposed; the source config is not retained.
     static_policy_digest: [u8; 32],
+
+    /// Canonical response-header field names this instance's `after_proxy`
+    /// policy owns, precomputed at construction for
+    /// `Plugin::response_trailer_policy`. Bounded by the four fields the
+    /// response-shaping block can touch and never rebuilt per request.
+    trailer_policy_names: Vec<String>,
 }
 
 /// Domain separator and schema version for [`SsePlugin`] replay provenance.
@@ -175,6 +181,29 @@ impl SsePlugin {
         let static_policy_digest =
             policy_digest::static_config_digest(STATIC_POLICY_DIGEST_DOMAIN, config);
 
+        // Response-header fields this instance's `after_proxy` owns. Declared so
+        // a protocol path that forwards backend TRAILERS cannot let the backend
+        // re-open the decision after the fact. `content-length` is the load-
+        // bearing case: `strip_content_length` removes it from the INITIAL map,
+        // which is a no-op — and therefore invisible to observed-mutation
+        // reconciliation — when the backend only ever sends the field as a
+        // trailer, yet forwarding that trailer hands the client exactly the
+        // indefinite-stream length this plugin exists to suppress.
+        // `cache-control` and `x-accel-buffering` are gateway writes a trailer
+        // copy would contradict; `content-type` is only owned when this instance
+        // can actually relabel it.
+        let mut trailer_policy_names = Vec::with_capacity(4);
+        if force_sse_content_type || wrap_non_sse_responses {
+            trailer_policy_names.push("content-type".to_string());
+        }
+        trailer_policy_names.push("cache-control".to_string());
+        if add_no_buffering_header {
+            trailer_policy_names.push("x-accel-buffering".to_string());
+        }
+        if strip_content_length {
+            trailer_policy_names.push("content-length".to_string());
+        }
+
         Ok(Self {
             require_accept_header,
             require_get_method,
@@ -186,6 +215,7 @@ impl SsePlugin {
             force_sse_content_type,
             wrap_non_sse_responses,
             static_policy_digest,
+            trailer_policy_names,
         })
     }
 
@@ -382,6 +412,20 @@ impl super::Plugin for SsePlugin {
 
     fn applies_after_proxy_on_reject(&self) -> bool {
         false
+    }
+
+    /// SSE response shaping binds the trailer section: `strip_content_length`
+    /// is a REMOVAL that is a no-op on the initial header map whenever the
+    /// backend sends `content-length` only as a trailer, so nothing in the
+    /// observed-mutation witness can see it, and forwarding that trailer would
+    /// hand the client the exact bounded length the plugin removed. The
+    /// gateway's `cache-control` / `x-accel-buffering` / relabeled
+    /// `content-type` writes are declared for the mirror-image reason: a trailer
+    /// copy would leave the client holding two conflicting values for a field
+    /// the gateway owns, and an idempotent write (backend already sent the same
+    /// value) is invisible to the witness too.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::Names(&self.trailer_policy_names)
     }
 
     // ── Phase 1: Validate inbound SSE client request ─────────────────────
