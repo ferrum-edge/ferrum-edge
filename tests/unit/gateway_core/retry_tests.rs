@@ -464,28 +464,6 @@ fn test_grpc_backend_request_classifies_as_post_wire() {
 }
 
 #[test]
-fn test_grpc_dispatch_canceled_classifies_as_pre_wire_pool_error() {
-    // hyper `is_canceled` on a buffered body proves the request never left
-    // the client. Map to ConnectionPoolError so request_reached_wire is
-    // false and retry_on_connect_failure can redial after pool invalidation.
-    let err = GrpcProxyError::backend_unavailable(
-        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::DispatchCanceled,
-        "Backend error: canceled".into(),
-    );
-    let class = classify_grpc_proxy_error(&err);
-    assert_eq!(class, ErrorClass::ConnectionPoolError);
-    assert!(
-        ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind::DispatchCanceled
-            .is_connect_class()
-    );
-    assert!(
-        !ferrum_edge::retry::request_reached_wire(class),
-        "DispatchCanceled must be pre-wire so buffered unary RPCs retry on \
-         pooled-sender GOAWAY races"
-    );
-}
-
-#[test]
 fn test_grpc_kind_is_connect_class_partitions_correctly() {
     use ferrum_edge::proxy::grpc_proxy::GrpcBackendUnavailableKind as K;
     // Pre-wire (safe to replay regardless of method idempotency): retry loops
@@ -497,7 +475,6 @@ fn test_grpc_kind_is_connect_class_partitions_correctly() {
         K::H2Handshake,
         K::H2cHandshake,
         K::InvalidServerName,
-        K::DispatchCanceled,
     ] {
         assert!(
             kind.is_connect_class(),
@@ -535,7 +512,6 @@ fn test_every_connect_class_kind_classifies_as_pre_wire() {
         K::H2cHandshake,
         K::InvalidServerName,
         K::BackendRequest,
-        K::DispatchCanceled,
     ];
     // Compile-time exhaustiveness: if a new variant is added, this match
     // forces an update before tests can compile.
@@ -547,8 +523,7 @@ fn test_every_connect_class_kind_classifies_as_pre_wire() {
             | K::H2Handshake
             | K::H2cHandshake
             | K::InvalidServerName
-            | K::BackendRequest
-            | K::DispatchCanceled => (),
+            | K::BackendRequest => (),
         };
         let err = GrpcProxyError::backend_unavailable(kind, format!("{kind:?} test"));
         let class = classify_grpc_proxy_error(&err);

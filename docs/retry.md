@@ -88,7 +88,6 @@ Connection failures are TCP/transport-level problems where the request **never r
 - TCP connect timeout (SYN sent, no response)
 - DNS resolution failure (hostname unresolvable)
 - TLS handshake failure (certificate error, protocol mismatch)
-- Pooled HTTP/2 sender cancellation before dispatch (hyper `is_canceled` on a buffered/replayable body — typical backend GOAWAY / connection-age race)
 
 These are retried when `retry_on_connect_failure: true` (the default). Because the request never reached the backend, **all HTTP methods are retried** — idempotency is not a concern since nothing was processed.
 

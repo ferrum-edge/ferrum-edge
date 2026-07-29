@@ -508,8 +508,9 @@ impl GrpcConnectionPool {
     /// Drop every cached sender for `proxy` so the next acquisition dials fresh.
     ///
     /// Call after a pooled `send_request` fails with hyper `is_canceled`
-    /// (request never left the client) while racing a backend GOAWAY /
-    /// connection-age close. Waiting for `is_closed()` on the next
+    /// while racing a backend GOAWAY / connection-age close. Cancellation is
+    /// not proof that the request stayed off the wire, but it does prove the
+    /// pooled sender should not be reused. Waiting for `is_closed()` on the next
     /// `cached()` probe is racy — the dying sender can still look healthy
     /// for one more poll — so the whole host shard ring is cleared.
     /// Sibling shards reconnect lazily on the next miss.
@@ -1218,23 +1219,11 @@ pub enum GrpcBackendUnavailableKind {
     /// `request_reached_wire` returns true and the connect-failure retry
     /// path does not replay non-idempotent POSTs across the same stream.
     BackendRequest,
-    /// A pooled H2 `send_request` failed with hyper `is_canceled() == true`
-    /// while the outbound body was still fully buffered and replayable.
-    /// hyper's contract for that flag is that the request was **never
-    /// dispatched onto the wire** (typical race: backend GOAWAY /
-    /// `MaxConnectionAge` while the pool still handed out a sender that
-    /// passed a single `ready()` probe). Pre-wire under the unified
-    /// [`crate::retry::request_reached_wire`] boundary — maps to
-    /// [`crate::retry::ErrorClass::ConnectionPoolError`] so
-    /// `retry_on_connect_failure` can redial. Streaming / channel bodies
-    /// keep [`Self::BackendRequest`] even on `is_canceled` because the
-    /// upload may already be unreplayable.
-    DispatchCanceled,
 }
 
 impl GrpcBackendUnavailableKind {
     /// Returns `true` for kinds that represent a pre-wire failure (DNS,
-    /// connect, handshake, never-dispatched pooled send) — safe to replay
+    /// connect or handshake) — safe to replay
     /// regardless of HTTP method idempotency.
     ///
     /// Returns `false` for [`Self::BackendRequest`], which is emitted
@@ -1249,8 +1238,7 @@ impl GrpcBackendUnavailableKind {
             | Self::TlsHandshake
             | Self::H2Handshake
             | Self::H2cHandshake
-            | Self::InvalidServerName
-            | Self::DispatchCanceled => true,
+            | Self::InvalidServerName => true,
             Self::BackendRequest => false,
         }
     }
@@ -3083,9 +3071,9 @@ pub(crate) async fn proxy_grpc_request_core(
     });
     let send_fut = sender.send_request(backend_req);
     let map_send_err = |e: hyper::Error| {
-        // Buffered unary/client bodies are fully held — hyper `is_canceled`
-        // proves the request never hit the wire, so classify pre-wire and
-        // drop the stale pooled sender for the next attempt / RPC.
+        // A canceled send can have reached the backend. Drop the stale pooled
+        // sender, but keep the failure post-wire so a state-changing RPC is
+        // never replayed merely because its buffered body is available.
         if e.is_canceled() {
             grpc_pool.invalidate_shards_for_proxy(proxy);
         }
@@ -3096,13 +3084,8 @@ pub(crate) async fn proxy_grpc_request_core(
                 message: format!("Backend timeout: {}", e),
             }
         } else {
-            let kind = if e.is_canceled() {
-                GrpcBackendUnavailableKind::DispatchCanceled
-            } else {
-                GrpcBackendUnavailableKind::BackendRequest
-            };
             GrpcProxyError::backend_unavailable_with_source(
-                kind,
+                GrpcBackendUnavailableKind::BackendRequest,
                 format!("Backend error: {}", e),
                 e,
             )
