@@ -14,7 +14,7 @@ Docker/kind install report.
 | Mode | Entry | Workflow / job |
 |---|---|---|
 | Live datapath (SPIRE-federated two kind clusters, bidirectional traffic + negatives + Stage-3 failure injection; GA-contract artifact gate) | `tests/k8s/multicluster-federation/run.sh` | `.github/workflows/multicluster-federation-live.yml` — path-filtered on PRs, force-run on every `main` push / `workflow_dispatch` (requires `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`) |
-| Local deploy-only smoke (rollouts, no traffic; optional operator shortcut) | same script with `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` | Not a CI/release gate — the dedicated live workflow is authoritative |
+| Deploy-only smoke (rollouts, no traffic) | same script with `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` | Legacy path-filtered `Mesh Multicluster Federation` CI job; a packaging/rollout check, not the authoritative datapath/release gate |
 
 In-process federation/discovery unit and integration coverage remains necessary
 but is not a substitute for the two-cluster harness. Preflight requires
@@ -125,12 +125,13 @@ It runs in two modes:
   `main` push run the full datapath, validate `live-assertions.json` against
   `ga_contract.yaml`, and feed exact-SHA release validation.
 - **Deploy-only smoke (`FERRUM_MULTICLUSTER_DEPLOY_ONLY=1`):** stops after the
-  SPIRE/workload deploy and rollouts, before driving traffic. This is an
-  optional local/operator shortcut only — CI no longer runs a deploy-only
-  multicluster job. The Helm chart is NOT a trigger and is NOT deployed — this
-  fixture uses hand-crafted NodePort manifests because the chart's east-west
-  Service is ClusterIP-only and not cross-cluster reachable; the chart is
-  covered by the dedicated `Helm Chart` CI job.
+  SPIRE/workload deploy and rollouts, before driving traffic. The legacy
+  path-filtered `Mesh Multicluster Federation` CI job keeps this narrower
+  packaging/rollout check; it is distinct from, and never substitutes for, the
+  dedicated full-datapath PR/main/release gate. The Helm chart is NOT a trigger
+  and is NOT deployed — this fixture uses hand-crafted NodePort manifests
+  because the chart's east-west Service is ClusterIP-only and not cross-cluster
+  reachable; the chart is covered by the dedicated `Helm Chart` CI job.
 
 Diagnostics are recorded under `${ARTIFACT_DIR:-.context/multicluster-federation}`.
 Preflight requires `docker`, `kind`, `kubectl`, `curl`, and `python3` and

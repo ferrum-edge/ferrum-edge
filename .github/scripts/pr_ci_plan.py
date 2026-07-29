@@ -620,6 +620,7 @@ EBPF_LIVE_PATTERNS = [
 
 JOB_GATE_NAMES = (
     "run_helm",
+    "run_mesh_federation",
     "run_mesh_sidecar_smoke",
     "run_ebpf_live",
     "run_ebpf_build",
@@ -675,6 +676,9 @@ def select_job_gates(event_name: str, changed_files: list[str]) -> dict[str, boo
 
     return {
         "run_helm": any_path_matches(HELM_PATTERNS, changed_files),
+        "run_mesh_federation": bool(
+            matched_files("mesh-federation", changed_files)
+        ),
         "run_mesh_sidecar_smoke": bool(
             matched_files("mesh-e2e-sidecar", changed_files)
         ),
@@ -729,6 +733,11 @@ def self_test() -> int:
             "pull_request",
             ["charts/ferrum-gateway/values.yaml"],
             {"run_helm": True},
+        ),
+        (
+            "pull_request",
+            ["tests/k8s/multicluster-federation/run.sh"],
+            {"run_mesh_federation": True},
         ),
         (
             "pull_request",

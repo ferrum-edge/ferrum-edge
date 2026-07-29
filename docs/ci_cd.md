@@ -125,16 +125,17 @@ edit cannot classify itself as light; edits to the planner therefore receive
 the full matrix. The required-CI verifier also checks that documentation paths
 used by live-suite filters remain in the planner's full-CI set.
 
-The same trusted planner emits fail-closed job outputs for Helm, the sidecar
-deployment smoke, eBPF program builds, and eBPF/netns live suites. Multicluster
-federation datapath coverage rides the dedicated
-`multicluster-federation-live.yml` workflow (path-filtered on PRs, force-run on
-every `main` push) rather than a deploy-only CI smoke. PRs outside those curated
-path sets skip the downstream job before GitHub allocates a runner. Pushes to
-`main` and manual runs force all of these gates on. Rust formatting and the
-integration-shard coverage contract also run as named steps in `CI Plan`,
-avoiding two additional runner allocations. The required `Tests` aggregate runs
-the first-party Markdown link checker through its CI contract verifier
+The same trusted planner emits fail-closed job outputs for Helm, the legacy
+multicluster deployment smoke, the sidecar deployment smoke, eBPF program
+builds, and eBPF/netns live suites. The deploy-only multicluster job remains a
+distinct packaging-and-rollout check; authoritative datapath coverage rides the
+dedicated `multicluster-federation-live.yml` workflow (path-filtered on PRs,
+force-run on every `main` push). PRs outside those curated path sets skip the
+downstream job before GitHub allocates a runner. Pushes to `main` and manual
+runs force all of these gates on. Rust formatting and the integration-shard
+coverage contract also run as named steps in `CI Plan`, avoiding two additional
+runner allocations. The required `Tests` aggregate runs the first-party
+Markdown link checker through its CI contract verifier
 (`.github/scripts/check_markdown_links.py`), including in light mode, so
 docs-only PRs still validate relative file targets and GitHub heading slugs.
 

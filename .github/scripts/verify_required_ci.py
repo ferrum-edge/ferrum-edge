@@ -36,6 +36,7 @@ REQUIRED_JOBS = {
     "test-vendor-patches",
     "test-functional",
     "plugin-hardening-redis-regression",
+    "mesh-multicluster-federation",
     "mesh-e2e-sidecar",
     "helm-chart",
     "lint",
@@ -68,6 +69,7 @@ DIRECT_FULL_CI_JOBS = {
 }
 
 PATH_GATED_JOBS = {
+    "mesh-multicluster-federation": "run_mesh_federation",
     "mesh-e2e-sidecar": "run_mesh_sidecar_smoke",
     "helm-chart": "run_helm",
     "build-ebpf": "run_ebpf_build",
@@ -84,10 +86,6 @@ REMOVED_JOBS = {
     "build-gateway-binary",
     "build-functional-tests-archive",
     "detect-ebpf-live-changes",
-    # Deploy-only multicluster smoke consolidated into the dedicated live
-    # workflow once that suite became the authoritative main/release gate
-    # (issue #2459).
-    "mesh-multicluster-federation",
 }
 
 REMOVED_MIRROR_JOBS = {
@@ -133,12 +131,17 @@ DEDICATED_REQUIRED_CHECKS = {
     ".github/workflows/multicluster-federation-live.yml": {
         "job": "gate",
         "name": "Multicluster Federation Live",
-        "needs": {"changes", "multicluster-federation-live"},
+        "needs": {
+            "changes",
+            "multicluster-federation-live",
+            "validate-live-contract",
+        },
         "contract": {
             '${{ needs.changes.result }}" != "success"',
             '${{ needs.changes.outputs.relevant }}" = "false"',
             '${{ needs.changes.outputs.relevant }}" != "true"',
             '${{ needs.multicluster-federation-live.result }}" != "success"',
+            '${{ needs.validate-live-contract.result }}" != "success"',
         },
     },
 }
