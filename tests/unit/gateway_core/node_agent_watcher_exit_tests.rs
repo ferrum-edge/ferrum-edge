@@ -57,6 +57,7 @@ fn seeded_attached_pod(uid: &str) -> PodAttachmentState {
         include_ports_policy: None,
         workload_identity_cgroup_ids: Vec::new(),
         node_probe_ports: vec![8080],
+        inbound_redirect_ports: Vec::new(),
     }
 }
 

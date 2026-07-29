@@ -2479,6 +2479,28 @@ pub struct MeshConfig {
     /// mesh subscription transports.
     #[serde(skip)]
     pub node_waypoint_assertors: Vec<SpiffeId>,
+    /// Runtime-only NodeWaypoint transparent-inbound-capture destination
+    /// inventory (issue #3287). CP-side this is resolved BEFORE the
+    /// request-namespace retains, with CP scope and bearer-namespace
+    /// authorization applied, so a NodeWaypoint can resolve an enrolled pod in
+    /// another authorized namespace. DP-side it is back-projected from
+    /// `MeshSlice.node_waypoint_capture_destinations`.
+    ///
+    /// `serde(skip)`: never operator-settable and never on the `config_json`
+    /// wire — the narrowed slice field is the only transport. Consumed ONLY by
+    /// `crate::proxy::resolve_node_waypoint_capture_destination`; it must never
+    /// be folded into `workloads` (that would widen routing / known-destination
+    /// visibility across namespaces).
+    #[serde(skip)]
+    pub node_waypoint_capture_destinations: Vec<Workload>,
+    /// Runtime-only PeerAuthentication candidates applicable to
+    /// [`Self::node_waypoint_capture_destinations`] (issue #3287). Resolved
+    /// alongside that inventory and, like it, never folded into
+    /// `peer_authentications` (which stays the subscription-namespace view that
+    /// governs this proxy's OWN inbound posture). `serde(skip)` for the same
+    /// reason.
+    #[serde(skip)]
+    pub node_waypoint_capture_peer_authentications: Vec<PeerAuthentication>,
     /// Runtime-only back-projection of the slice's narrowed **local-inbound**
     /// service view (`MeshSlice.local_inbound_services`), set by mesh
     /// preparation. `Some` exactly when Sidecar narrowing resolved the local
@@ -2552,6 +2574,8 @@ impl Default for MeshConfig {
             outbound_traffic_policy: None,
             extension_configs: Vec::new(),
             node_waypoint_assertors: Vec::new(),
+            node_waypoint_capture_destinations: Vec::new(),
+            node_waypoint_capture_peer_authentications: Vec::new(),
             local_inbound_services: None,
             local_ingress_listeners: Vec::new(),
             declared_ingress_http_ports: 0,

@@ -157,6 +157,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   containing those statuses must be repaired before upgrade — see the
   [Safe Upgrade Guide](docs/upgrade_guide.md#response-cache-shared-storage-hardening).
 
+### Added
+
+- `fault_injection` now supports UDP and DTLS. Session admission aborts run in
+  isolated per-source / per-DTLS-client `on_stream_connect` tasks; per-datagram
+  delays and silent abort drops run on `on_udp_datagram` (client→backend) inside
+  the established-session hook-ingress worker — never the shared listener recv
+  loop — so one peer's delay cannot stall another. UDP/DTLS stream connect skips
+  delay so the first-datagram path cannot stack two waits. Delays share the
+  existing one-minute ceiling, `FERRUM_MAX_CONCURRENT_FAULT_DELAYS` budget, and
+  shutdown cancellation; queued follow-ups remain under the hook-ingress
+  byte/datagram caps (#3293).
+
 ### Changed
 
 - Kubernetes controller Gateway API and Istio status writers now share one

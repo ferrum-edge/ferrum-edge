@@ -92,6 +92,10 @@ pub struct XdsClientConfig {
     pub workload_spiffe_id: Option<String>,
     pub waypoint_name: Option<String>,
     pub ambient_udp_source_scoping: bool,
+    /// This DP is a NodeWaypoint running the transparent inbound capture
+    /// listener (issue #3287); advertised in `Node.metadata` so the CP resolves
+    /// the cross-namespace capture destination / PeerAuthentication inventory.
+    pub node_waypoint_capture_scoping: bool,
     pub stream_channel_capacity: usize,
     pub primary_retry_secs: u64,
     /// Client connection timeout. `0` disables tonic's explicit connect timeout.
@@ -152,17 +156,17 @@ impl ClientSubscriptionState {
         cluster: &str,
         workload_spiffe_id: Option<&str>,
         waypoint_name: Option<&str>,
-        ambient_udp_source_scoping: bool,
+        scoping: crate::xds::carrier::XdsNodeScoping,
     ) -> Vec<DiscoveryRequest> {
         // Carry the workload SPIFFE in `Node.metadata` so a Ferrum CP can
         // identify this workload even when `node_id` is a hostname (the common
         // default). The CP needs it to compute Sidecar-aware narrowing and the
         // un-narrowed local-inbound-service view; without it a restrictive
         // Sidecar would narrow the local service out of the ECDS carriers.
-        let node_metadata = crate::xds::carrier::encode_node_metadata_with_waypoint_and_udp_scope(
+        let node_metadata = crate::xds::carrier::encode_node_metadata_with_scoping(
             workload_spiffe_id,
             waypoint_name,
-            ambient_udp_source_scoping,
+            scoping,
         );
         INITIAL_TYPE_URL_ORDER
             .iter()
@@ -789,7 +793,10 @@ async fn run_ads_stream_with_auth(
         &config.cluster,
         config.workload_spiffe_id.as_deref(),
         config.waypoint_name.as_deref(),
-        config.ambient_udp_source_scoping,
+        crate::xds::carrier::XdsNodeScoping {
+            ambient_udp_source_scoping: config.ambient_udp_source_scoping,
+            node_waypoint_capture_scoping: config.node_waypoint_capture_scoping,
+        },
     ) {
         tx.send(request)
             .await
@@ -1460,6 +1467,14 @@ fn reverse_translate(
         workloads: recovered.workloads,
         ambient_udp_source_workloads: recovered.ambient_udp_source_workloads,
         node_waypoint_assertors: recovered.node_waypoint_assertors,
+        // Issue #3287: the NodeWaypoint transparent-inbound-capture inventory
+        // rides its own carriers so an xDS-built slice enforces the same
+        // cross-namespace destination PeerAuthentication posture a native-built
+        // one does. Empty when the CP emitted no carrier — the capture path then
+        // resolves nothing and fails closed.
+        node_waypoint_capture_destinations: recovered.node_waypoint_capture_destinations,
+        node_waypoint_capture_peer_authentications: recovered
+            .node_waypoint_capture_peer_authentications,
         services,
         // Inbound-only un-narrowed local services recovered from the dedicated
         // carrier (kept separate from `services` so egress scope / the outbound
@@ -1623,6 +1638,8 @@ struct RecoveredSliceCarriers {
     workloads: Vec<crate::modes::mesh::config::Workload>,
     ambient_udp_source_workloads: Vec<crate::modes::mesh::config::Workload>,
     node_waypoint_assertors: Vec<crate::identity::spiffe::SpiffeId>,
+    node_waypoint_capture_destinations: Vec<crate::modes::mesh::config::Workload>,
+    node_waypoint_capture_peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
     virtual_service_cors_policies: Vec<crate::modes::mesh::config::MeshVirtualServiceCorsPolicy>,
     peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
@@ -1859,6 +1876,12 @@ fn apply_recovered_carrier(
             recovered.ambient_udp_source_workloads = value
         }
         MeshSliceCarrier::NodeWaypointAssertors(value) => recovered.node_waypoint_assertors = value,
+        MeshSliceCarrier::NodeWaypointCaptureDestinations(value) => {
+            recovered.node_waypoint_capture_destinations = value
+        }
+        MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(value) => {
+            recovered.node_waypoint_capture_peer_authentications = value
+        }
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
         MeshSliceCarrier::LabelsAmbiguous(value) => recovered.labels_ambiguous = value,
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
@@ -2063,6 +2086,7 @@ mod tests {
             workload_spiffe_id: None,
             waypoint_name: None,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
             stream_channel_capacity: 32,
             primary_retry_secs: 300,
             connect_timeout_seconds: 10,
@@ -2340,8 +2364,13 @@ mod tests {
 
     #[test]
     fn initial_requests_are_ordered_cds_first() {
-        let requests = ClientSubscriptionState::new()
-            .build_initial_requests("node-a", "default", None, None, false);
+        let requests = ClientSubscriptionState::new().build_initial_requests(
+            "node-a",
+            "default",
+            None,
+            None,
+            crate::xds::carrier::XdsNodeScoping::default(),
+        );
         let type_urls: Vec<&str> = requests
             .iter()
             .map(|request| request.type_url.as_str())
@@ -2378,15 +2407,20 @@ mod tests {
             "default",
             Some(spiffe),
             Some("waypoint"),
-            false,
+            crate::xds::carrier::XdsNodeScoping::default(),
         );
         let node = requests[0].node.as_ref().expect("node present");
         let metadata = crate::xds::carrier::decode_node_metadata(&node.metadata);
         assert_eq!(metadata.workload_spiffe_id.as_deref(), Some(spiffe));
         assert_eq!(metadata.waypoint_name.as_deref(), Some("waypoint"));
         // Without a workload SPIFFE, metadata stays empty (prior wire shape).
-        let none = ClientSubscriptionState::new()
-            .build_initial_requests("host-1", "default", None, None, false);
+        let none = ClientSubscriptionState::new().build_initial_requests(
+            "host-1",
+            "default",
+            None,
+            None,
+            crate::xds::carrier::XdsNodeScoping::default(),
+        );
         assert!(none[0].node.as_ref().unwrap().metadata.is_empty());
     }
 
@@ -2467,7 +2501,13 @@ mod tests {
         state.record_response(CDS_TYPE_URL, "v1", "n1");
         state.mark_acked(CDS_TYPE_URL);
 
-        let requests = state.build_initial_requests("node-a", "default", None, None, false);
+        let requests = state.build_initial_requests(
+            "node-a",
+            "default",
+            None,
+            None,
+            crate::xds::carrier::XdsNodeScoping::default(),
+        );
         let cds = requests
             .iter()
             .find(|request| request.type_url == CDS_TYPE_URL)
@@ -2508,7 +2548,13 @@ mod tests {
         assert!(
             state
                 .subscriptions
-                .build_initial_requests("node-a", "default", None, None, false)
+                .build_initial_requests(
+                    "node-a",
+                    "default",
+                    None,
+                    None,
+                    crate::xds::carrier::XdsNodeScoping::default(),
+                )
                 .iter()
                 .all(|request| request.version_info.is_empty())
         );
@@ -3533,9 +3579,13 @@ mod tests {
             .record_response(CDS_TYPE_URL, "v7", "n7");
         state.subscriptions.mark_acked(CDS_TYPE_URL);
         state.reset_for_new_stream();
-        let initial = state
-            .subscriptions
-            .build_initial_requests("node-a", "default", None, None, false);
+        let initial = state.subscriptions.build_initial_requests(
+            "node-a",
+            "default",
+            None,
+            None,
+            crate::xds::carrier::XdsNodeScoping::default(),
+        );
         let cds = initial
             .iter()
             .find(|r| r.type_url == CDS_TYPE_URL)

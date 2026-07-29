@@ -173,6 +173,21 @@ pub enum MeshListenerKind {
     /// cmsg, and (Stage 3) drops them — the egress relay is Stage 4. Only
     /// emitted when `FERRUM_MESH_CAPTURE_UDP_ENABLED` is set (default-off).
     PlaintextUdpCapture,
+    /// NodeWaypoint **transparent inbound capture** listener (issue #3287).
+    ///
+    /// Bound `IP_TRANSPARENT` on the wildcard `FERRUM_MESH_INBOUND_LISTEN_ADDR`,
+    /// and emitted only when the node-agent's eBPF tc ingress redirect is
+    /// configured. `ferrum_tc_ingress_redirect` steers captured inbound TCP for
+    /// an enrolled `podIP:appPort` here with `bpf_sk_assign()`, so the accepted
+    /// socket's local address IS the workload's original destination.
+    ///
+    /// **A separate protocol boundary from [`Self::HboneTermination`].** HBONE
+    /// terminates authenticated HTTP/2 CONNECT over verified mesh mTLS;
+    /// captured bytes are ordinary application traffic (possibly the app's own
+    /// TLS) and are relayed opaquely at L4 after the PeerAuthentication and
+    /// authorization gates. This listener never terminates TLS, so it must
+    /// never be given a mesh inbound `ServerConfig`.
+    TransparentInboundCapture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,6 +283,23 @@ impl MeshTopology {
     #[inline]
     fn uses_ambient_udp_source_scoping(self) -> bool {
         matches!(self, Self::Ambient | Self::ServiceWaypoint)
+    }
+
+    /// Whether this topology runs the transparent inbound CAPTURE listener that
+    /// terminates direct plaintext for enrolled pods (issue #3287), and so needs
+    /// the dedicated cross-namespace capture destination/PeerAuthentication
+    /// inventory.
+    ///
+    /// NodeWaypoint only. Deliberately NOT folded into
+    /// [`Self::uses_ambient_udp_source_scoping`]: NodeWaypoint UDP is
+    /// mesh-wide-only by architecture (a shared UDP frontend socket carries one
+    /// cookie for every client), so reusing that flag would either grant
+    /// NodeWaypoint a UDP source superset it must not act on or leave Ambient /
+    /// ServiceWaypoint carrying a capture inventory they have no capture
+    /// listener for.
+    #[inline]
+    fn uses_node_waypoint_capture_scoping(self) -> bool {
+        matches!(self, Self::NodeWaypoint)
     }
 }
 
@@ -738,6 +770,7 @@ impl MeshRuntimeConfig {
             workload_spiffe_id: self.workload_spiffe_id.clone(),
             waypoint_name: self.service_waypoint_name(),
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
+            node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
             labels: self.workload_labels.clone(),
             // Same `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` interval the xDS
             // client uses — the knob is protocol-agnostic failover/failback.
@@ -754,6 +787,7 @@ impl MeshRuntimeConfig {
             workload_spiffe_id: self.workload_spiffe_id.clone(),
             waypoint_name: self.service_waypoint_name(),
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
+            node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
             stream_channel_capacity: self.xds_stream_channel_capacity,
             primary_retry_secs: self.xds_primary_retry_secs,
             connect_timeout_seconds: self.xds_connect_timeout_seconds,
@@ -803,11 +837,13 @@ impl MeshRuntimeConfig {
                 listeners
             }
             MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint => {
-                vec![MeshListener {
+                let mut listeners = vec![MeshListener {
                     direction: MeshTrafficDirection::Inbound,
                     kind: MeshListenerKind::HboneTermination,
                     addr: self.hbone_listen_addr,
-                }]
+                }];
+                listeners.extend(self.transparent_inbound_capture_listener());
+                listeners
             }
             MeshTopology::EastWestGateway => Vec::new(),
             MeshTopology::EgressGateway => vec![MeshListener {
@@ -816,6 +852,89 @@ impl MeshRuntimeConfig {
                 addr: self.egress_listen_addr,
             }],
         }
+    }
+
+    /// The optional NodeWaypoint transparent inbound capture listener
+    /// (issue #3287), emitted only when the node-agent's eBPF tc ingress
+    /// redirect is configured on this node.
+    ///
+    /// Topology gating lives in
+    /// [`MeshRuntimeConfig::transparent_inbound_capture_requested`], shared with
+    /// the serving-path validator so the two can never disagree about whether
+    /// this listener is required.
+    ///
+    /// The address deliberately reuses `FERRUM_MESH_INBOUND_LISTEN_ADDR` — the
+    /// same variable the node-agent reads to learn the redirect's steer target
+    /// (see [`node_waypoint_ingress_capture_addr`]), so the two processes share
+    /// one source of truth.
+    ///
+    /// This helper is INFALLIBLE because read-only predicates and tests call
+    /// `listener_plan()`, so a malformed / zero-port / non-wildcard value can
+    /// only warn-and-skip here. That would be a silent black hole on its own —
+    /// the node-agent's classifier still steers every enrolled pod's inbound
+    /// traffic at that port and the packets are dropped fail-closed — so the
+    /// SERVING path validates the same value with `?` before anything binds:
+    /// [`MeshRuntimeConfig::validate_transparent_inbound_capture_settings`],
+    /// called from `prepare_mesh_runtime_before_owner`. A bad setting therefore
+    /// aborts mesh startup with a field-specific error instead of leaving the
+    /// proxy ready with only HBONE.
+    fn transparent_inbound_capture_listener(&self) -> Option<MeshListener> {
+        if !self.transparent_inbound_capture_requested() {
+            return None;
+        }
+        let addr = match node_waypoint_ingress_capture_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                warn!("Skipping the NodeWaypoint transparent inbound capture listener: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = validate_ingress_capture_addr(addr) {
+            warn!("Skipping the NodeWaypoint transparent inbound capture listener: {e}");
+            return None;
+        }
+        Some(MeshListener {
+            direction: MeshTrafficDirection::Inbound,
+            kind: MeshListenerKind::TransparentInboundCapture,
+            addr,
+        })
+    }
+
+    /// Whether this process is supposed to bind the NodeWaypoint transparent
+    /// inbound capture listener at all.
+    ///
+    /// Gated to `NodeWaypoint` alone: `ServiceWaypoint` serves a named set of
+    /// services over HBONE and has no node-agent installing a per-node tc
+    /// classifier, so binding a transparent capture socket there would claim a
+    /// port for a datapath that never delivers to it. `EastWestGateway` and the
+    /// gateways are likewise out of scope. Default-off beyond that: the
+    /// redirect must be explicitly requested via
+    /// `FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES`.
+    fn transparent_inbound_capture_requested(&self) -> bool {
+        self.topology == MeshTopology::NodeWaypoint
+            && crate::modes::node_agent::node_waypoint_ingress_redirect_configured()
+    }
+
+    /// Fail-closed validation of the NodeWaypoint transparent inbound capture
+    /// settings, for the SERVING path only (issue #3287).
+    ///
+    /// `listener_plan()` cannot fail — read-only predicates call it — so an
+    /// invalid `FERRUM_MESH_INBOUND_LISTEN_ADDR` would there merely warn and
+    /// drop the listener, leaving the proxy ready with HBONE alone while the
+    /// node-agent's `ferrum_tc_ingress_redirect` keeps steering every enrolled
+    /// pod's inbound traffic at a port nothing is listening on (the classifier
+    /// drops in-scope packets fail-closed). That is a node-wide inbound black
+    /// hole reported as healthy, so the serving path calls this with `?` and
+    /// aborts startup with a field-specific error instead.
+    ///
+    /// A no-op unless the redirect is actually requested for this topology, so
+    /// the default-off posture is unchanged.
+    pub(crate) fn validate_transparent_inbound_capture_settings(&self) -> Result<(), String> {
+        if !self.transparent_inbound_capture_requested() {
+            return Ok(());
+        }
+        let addr = node_waypoint_ingress_capture_addr()?;
+        validate_ingress_capture_addr(addr)
     }
 
     /// The optional UDP TPROXY capture listener (F3 §3.3), emitted on the two
@@ -967,6 +1086,7 @@ impl MeshRuntimeConfig {
             sidecar_egress_dry_run: self.sidecar_enforced_dry_run,
             enforce_sidecar_identity_narrowing: self.sidecar_identity_narrowing,
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
+            node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
         }
     }
 
@@ -1071,6 +1191,25 @@ fn prepare_normalized_gateway_config_for_mesh(
     // consume the filtered slice directly. Closes Gap #2.
     if let Some(mesh) = config.mesh.as_deref_mut() {
         mesh.service_entries = mesh_slice.service_entries.clone();
+        // Back-project the NodeWaypoint transparent-inbound-capture inventory
+        // (issue #3287) so `resolve_node_waypoint_capture_destination` reads the
+        // CURRENT epoch's destinations and their PeerAuthentication candidates
+        // from the same `RequestEpoch` snapshot everything else on the capture
+        // path uses. Assigned UNCONDITIONALLY (not merged) so a slice that no
+        // longer carries a destination — the pod moved off this node, left the
+        // mesh, or its namespace stopped being authorized — cannot leave a stale
+        // record behind that would keep admitting captured plaintext.
+        //
+        // Deliberately NOT folded into `mesh.workloads` / `mesh.peer_authentications`:
+        // those are the subscription-namespace routing and own-posture views, and
+        // widening them with cross-namespace records would leak destination
+        // visibility into known-destinations, the outbound registry, and this
+        // proxy's own inbound mTLS resolution.
+        mesh.node_waypoint_capture_destinations =
+            mesh_slice.node_waypoint_capture_destinations.clone();
+        mesh.node_waypoint_capture_peer_authentications = mesh_slice
+            .node_waypoint_capture_peer_authentications
+            .clone();
         // Back-project the slice's narrowed LOCAL-INBOUND service view (kept
         // SEPARATE from the egress-narrowed `services` — never folded in, per
         // the egress-scope security rule) so the router's inbound per-port
@@ -8769,13 +8908,28 @@ fn inject_mesh_global_plugins(
                 .collect(),
         );
     }
-    ensure_global_plugin(
-        config,
-        MESH_AUTHZ_PLUGIN_ID,
-        "mesh_authz",
-        mesh_authz_config,
-        &runtime.namespace,
-    );
+    // Transparent inbound capture admits unauthenticated direct plaintext, so
+    // the mesh-managed, slice-fed `__mesh_authz` instance must be present even
+    // when an operator global mesh_authz (including a disabled / capture-
+    // unaware override) would otherwise suppress injection. Redirect-off and
+    // non-capture topologies keep the historical operator-override behavior.
+    if runtime.transparent_inbound_capture_requested() {
+        force_ensure_global_plugin(
+            config,
+            MESH_AUTHZ_PLUGIN_ID,
+            "mesh_authz",
+            mesh_authz_config,
+            &runtime.namespace,
+        );
+    } else {
+        ensure_global_plugin(
+            config,
+            MESH_AUTHZ_PLUGIN_ID,
+            "mesh_authz",
+            mesh_authz_config,
+            &runtime.namespace,
+        );
+    }
 
     // Outbound registry: inject the `mesh_outbound_registry` plugin when
     // either the slice (CRD path) OR the runtime env var declares
@@ -9252,6 +9406,29 @@ fn ensure_global_plugin(
     plugin_config: serde_json::Value,
     namespace: &str,
 ) {
+    ensure_global_plugin_inner(config, id, plugin_name, plugin_config, namespace, false);
+}
+
+/// Like [`ensure_global_plugin`], but always upserts the reserved mesh-managed
+/// id even when an operator-managed global of the same type is present.
+fn force_ensure_global_plugin(
+    config: &mut GatewayConfig,
+    id: &str,
+    plugin_name: &str,
+    plugin_config: serde_json::Value,
+    namespace: &str,
+) {
+    ensure_global_plugin_inner(config, id, plugin_name, plugin_config, namespace, true);
+}
+
+fn ensure_global_plugin_inner(
+    config: &mut GatewayConfig,
+    id: &str,
+    plugin_name: &str,
+    plugin_config: serde_json::Value,
+    namespace: &str,
+    force: bool,
+) {
     let now = chrono::Utc::now();
     let mesh_plugin = PluginConfig {
         id: id.to_string(),
@@ -9273,16 +9450,19 @@ fn ensure_global_plugin(
         .find(|plugin| plugin.namespace == namespace && plugin.id == id)
     {
         *existing = mesh_plugin;
-    } else if config
-        .plugin_configs
-        .iter()
-        .any(|plugin| plugin.scope == PluginScope::Global && plugin.plugin_name == plugin_name)
+    } else if !force
+        && config
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.scope == PluginScope::Global && plugin.plugin_name == plugin_name)
     {
         // A user-managed global plugin of the same type is an explicit
         // operator override when plugin_configs are already present in the
         // GatewayConfig handed to mesh preparation. Native/xDS MeshSlice feeds
         // do not currently carry operator plugin_configs. Reserved
-        // mesh-managed IDs still update above.
+        // mesh-managed IDs still update above. Callers that require the
+        // mesh-managed instance (NodeWaypoint transparent capture) pass
+        // `force` so a disabled or capture-unaware override cannot suppress it.
     } else {
         config.plugin_configs.push(mesh_plugin);
     }
@@ -9656,6 +9836,21 @@ fn prepare_mesh_runtime_before_owner(
     // (which a later `?` would have left running for in-process retries/tests).
     crate::capture::udp_capture_settings_from_env()
         .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
+
+    // Same contract for the NodeWaypoint transparent inbound capture listener
+    // (issue #3287). `transparent_inbound_capture_listener()` feeding
+    // `listener_plan()` is infallible for the same reason, so on its own a
+    // malformed / zero-port / non-wildcard FERRUM_MESH_INBOUND_LISTEN_ADDR would
+    // warn-and-skip and let the proxy come up ready with HBONE alone — while the
+    // node-agent's `ferrum_tc_ingress_redirect` keeps steering every enrolled
+    // pod's inbound traffic at that port, where the classifier drops it fail
+    // closed. Validate here so an operator config error aborts mesh startup with
+    // a field-specific message instead of black-holing the node's inbound.
+    runtime
+        .validate_transparent_inbound_capture_settings()
+        .map_err(|e| {
+            anyhow::anyhow!("Invalid NodeWaypoint inbound capture listener settings: {e}")
+        })?;
 
     if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::BeforeOwner {
         let _ = take_mesh_startup_fault_inject();
@@ -10595,10 +10790,7 @@ async fn arm_mesh_runtime_startup(
     let mut startup_signals = admin_startup_signals;
     let mesh_topology = runtime.topology;
     for listener in runtime.listener_plan() {
-        let uses_mesh_inbound_tls = matches!(
-            listener.kind,
-            MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
-        );
+        let uses_mesh_inbound_tls = uses_mesh_inbound_tls_kind(listener.kind);
         let tls_config = if uses_mesh_inbound_tls {
             None
         } else {
@@ -10611,10 +10803,7 @@ async fn arm_mesh_runtime_startup(
             tls_config.is_some()
         };
         if !listener_has_tls
-            && matches!(
-                listener.kind,
-                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
-            )
+            && uses_mesh_inbound_tls_kind(listener.kind)
             && inbound_mtls_mode != config::MtlsMode::Disable
         {
             warn!(
@@ -10642,10 +10831,7 @@ async fn arm_mesh_runtime_startup(
                 addr = %addr,
                 "Starting mesh listener"
             );
-            let records_mesh_mtls_metric = matches!(
-                kind,
-                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
-            );
+            let records_mesh_mtls_metric = uses_mesh_inbound_tls_kind(kind);
             let listener_result = if records_mesh_mtls_metric {
                 let allows_plaintext = kind == MeshListenerKind::MtlsTermination
                     && mesh_inbound_listener_allows_plaintext(mesh_topology, mesh_production_mode);
@@ -10655,6 +10841,21 @@ async fn arm_mesh_runtime_startup(
                     shutdown,
                     Some(direction),
                     allows_plaintext,
+                    Some(started_tx),
+                )
+                .await
+            } else if matches!(kind, MeshListenerKind::TransparentInboundCapture) {
+                // NodeWaypoint transparent inbound capture (issue #3287). Its
+                // own accept loop: the socket binds IP_TRANSPARENT, recovers
+                // the original destination from `getsockname()` rather than
+                // SO_ORIGINAL_DST (the redirect performs no NAT), gates on the
+                // live PeerAuthentication posture for the recovered app port,
+                // and relays opaquely at L4. `tls_config` is always None — this
+                // listener terminates nothing.
+                proxy::node_waypoint_ingress_capture::start_listener(
+                    addr,
+                    state,
+                    shutdown,
                     Some(started_tx),
                 )
                 .await
@@ -12776,14 +12977,33 @@ fn validate_egress_gateway_mtls_config(
     Ok(())
 }
 
+/// Whether a listener kind runs the mesh inbound TLS path (a `ServerConfig`
+/// resolved per connection from the live PeerAuthentication policy).
+///
+/// Deliberately excludes `TransparentInboundCapture`: that listener carries raw
+/// captured application bytes — possibly the application's own TLS — and must
+/// relay them opaquely. Handing it a mesh inbound `ServerConfig` would both
+/// fail the handshake and mistake application TLS for mesh TLS.
+fn uses_mesh_inbound_tls_kind(kind: MeshListenerKind) -> bool {
+    matches!(
+        kind,
+        MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
+    )
+}
+
 fn listener_tls_config(
     listener: &MeshListener,
     frontend_tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Option<Arc<rustls::ServerConfig>> {
     match listener.kind {
-        // Both plaintext listeners (TCP outbound capture and the UDP TPROXY
-        // capture listener) terminate no TLS.
-        MeshListenerKind::PlaintextCapture | MeshListenerKind::PlaintextUdpCapture => None,
+        // The plaintext listeners (TCP outbound capture, the UDP TPROXY capture
+        // listener, and the NodeWaypoint transparent inbound capture listener)
+        // terminate no TLS. For the last of those it is load-bearing, not
+        // incidental: the captured stream may itself be application TLS, which
+        // must be relayed byte-for-byte and never mistaken for mesh TLS.
+        MeshListenerKind::PlaintextCapture
+        | MeshListenerKind::PlaintextUdpCapture
+        | MeshListenerKind::TransparentInboundCapture => None,
         MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination => frontend_tls,
     }
 }
@@ -14383,6 +14603,56 @@ fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
         .map_err(|e| format!("{key} must be a socket address (got '{raw}'): {e}"))
 }
 
+/// The NodeWaypoint **transparent inbound capture** listener address, resolved
+/// from `FERRUM_MESH_INBOUND_LISTEN_ADDR` (default `0.0.0.0:15006`).
+///
+/// This is the single source of truth for the eBPF ingress-redirect port
+/// contract, and it is deliberately ONE variable rather than a proxy-side and a
+/// node-agent-side setting that must be kept equal: the mesh proxy binds this
+/// address, and `node_agent` reads the very same function to decide what port
+/// `ferrum_tc_ingress_redirect` steers into. A chart that sets the variable on
+/// only one of the two DaemonSet containers therefore fails startup validation
+/// instead of producing a silent black hole.
+///
+/// NodeWaypoint topology otherwise leaves this address unused (its listener
+/// plan is HBONE-only), so reusing it introduces no new operator surface.
+pub fn node_waypoint_ingress_capture_addr() -> Result<SocketAddr, String> {
+    parse_socket_addr(
+        "FERRUM_MESH_INBOUND_LISTEN_ADDR",
+        resolve_ferrum_var("FERRUM_MESH_INBOUND_LISTEN_ADDR")
+            .as_deref()
+            .unwrap_or(DEFAULT_INBOUND_LISTEN_ADDR),
+    )
+}
+
+/// Fail-closed validation of a capture-listener bind address.
+///
+/// `bpf_sk_assign` resolves the listener with a **wildcard** socket lookup
+/// (`saddr = daddr = 0`), because the packet still carries the workload's real
+/// `podIP:appPort` and no address on this host matches it. A listener bound to
+/// a specific IP is therefore invisible to the classifier: every in-scope
+/// packet would fail the lookup and be dropped fail-closed. Reject that at
+/// startup rather than black-holing inbound traffic for every enrolled pod.
+pub fn validate_ingress_capture_addr(addr: SocketAddr) -> Result<(), String> {
+    if addr.port() == 0 {
+        return Err(
+            "FERRUM_MESH_INBOUND_LISTEN_ADDR must name a non-zero port when the NodeWaypoint \
+             eBPF ingress redirect is enabled: that port is the redirect's steer target"
+                .to_string(),
+        );
+    }
+    if !addr.ip().is_unspecified() {
+        return Err(format!(
+            "FERRUM_MESH_INBOUND_LISTEN_ADDR must be a wildcard address (0.0.0.0 or [::]) when \
+             the NodeWaypoint eBPF ingress redirect is enabled, got {addr}. The redirect resolves \
+             the capture listener with a wildcard socket lookup because the captured packet still \
+             carries the workload's own address; a specific-IP bind is invisible to it and every \
+             captured connection would be dropped"
+        ));
+    }
+    Ok(())
+}
+
 /// Parse `FERRUM_MESH_WORKLOAD_LABELS` (`k1=v1,k2=v2`). Empty / `None` returns
 /// an empty map. Whitespace around keys/values is trimmed; empty entries are
 /// skipped (so a trailing `,` is harmless). Duplicate keys are rejected so the
@@ -14599,6 +14869,12 @@ mod tests {
             "FERRUM_MESH_ALLOW_NO_CA",
             "FERRUM_MESH_CAPTURE_UDP_ENABLED",
             "FERRUM_MESH_CAPTURE_UDP_PORT",
+            "FERRUM_MESH_WAYPOINT_NAME",
+            // Shared with the node-agent: when set, NodeWaypoint plans a second
+            // transparent capture listener. Leaving it set after a redirect-on
+            // test would make the redirect-off plan assertion observe two
+            // listeners, and would fail-closed LocalPod node-agent parses.
+            "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES",
         ];
 
         for key in keys {
@@ -14618,10 +14894,14 @@ mod tests {
             unsafe { std::env::set_var("FERRUM_MESH_ALLOW_NO_CA", "true") };
         }
 
-        f();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
         for key in keys {
             unsafe { std::env::remove_var(key) };
+        }
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
         }
     }
 
@@ -19494,6 +19774,18 @@ mod tests {
         assert!(!runtime.xds_client_config().ambient_udp_source_scoping);
         assert!(!runtime.mesh_slice_request().ambient_udp_source_scoping);
 
+        // Issue #3287: NodeWaypoint — and only NodeWaypoint — asks the CP for
+        // the cross-namespace capture destination / PeerAuthentication
+        // inventory, and it must not also pick up Ambient UDP source scoping
+        // (NodeWaypoint UDP is mesh-wide-only by architecture).
+        runtime.topology = MeshTopology::NodeWaypoint;
+        assert!(runtime.native_client_config().node_waypoint_capture_scoping);
+        assert!(runtime.xds_client_config().node_waypoint_capture_scoping);
+        assert!(runtime.mesh_slice_request().node_waypoint_capture_scoping);
+        assert!(!runtime.native_client_config().ambient_udp_source_scoping);
+        assert!(!runtime.xds_client_config().ambient_udp_source_scoping);
+        assert!(!runtime.mesh_slice_request().ambient_udp_source_scoping);
+
         runtime.topology = MeshTopology::ServiceWaypoint;
 
         assert_eq!(
@@ -19511,6 +19803,12 @@ mod tests {
         assert!(runtime.native_client_config().ambient_udp_source_scoping);
         assert!(runtime.xds_client_config().ambient_udp_source_scoping);
         assert!(runtime.mesh_slice_request().ambient_udp_source_scoping);
+        // Issue #3287: the capture-destination inventory is NodeWaypoint-only
+        // and must NOT ride the Ambient-UDP source flag — a ServiceWaypoint has
+        // no transparent inbound capture listener to resolve destinations for.
+        assert!(!runtime.native_client_config().node_waypoint_capture_scoping);
+        assert!(!runtime.xds_client_config().node_waypoint_capture_scoping);
+        assert!(!runtime.mesh_slice_request().node_waypoint_capture_scoping);
 
         let mut config = GatewayConfig::default();
         inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
@@ -21501,6 +21799,8 @@ mod tests {
             workloads: Vec::new(),
             ambient_udp_source_workloads: Vec::new(),
             node_waypoint_assertors: Vec::new(),
+            node_waypoint_capture_destinations: Vec::new(),
+            node_waypoint_capture_peer_authentications: Vec::new(),
             services: Vec::new(),
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
@@ -22537,6 +22837,109 @@ mod tests {
     }
 
     #[test]
+    fn inject_mesh_global_plugins_forces_mesh_authz_when_capture_redirect_is_on() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+                ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                assert!(runtime.transparent_inbound_capture_requested());
+
+                for (label, operator) in [
+                    (
+                        "enabled override",
+                        global_mesh_authz_plugin(
+                            "operator-mesh-authz",
+                            serde_json::json!({ "trusted_hbone_assertors": [] }),
+                        ),
+                    ),
+                    ("disabled override", {
+                        let mut plugin = global_mesh_authz_plugin(
+                            "operator-mesh-authz-disabled",
+                            serde_json::json!({}),
+                        );
+                        plugin.enabled = false;
+                        plugin
+                    }),
+                ] {
+                    let mut config = GatewayConfig {
+                        plugin_configs: vec![operator.clone()],
+                        ..GatewayConfig::default()
+                    };
+                    inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+                    assert!(
+                        config
+                            .plugin_configs
+                            .iter()
+                            .any(|plugin| plugin.id == operator.id),
+                        "operator mesh_authz must remain present ({label})"
+                    );
+                    let managed = config
+                        .plugin_configs
+                        .iter()
+                        .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "capture-on NodeWaypoint must inject mesh-managed __mesh_authz \
+                                 even when an operator override exists ({label})"
+                            )
+                        });
+                    assert!(managed.enabled);
+                    assert_eq!(managed.plugin_name, "mesh_authz");
+                    assert!(
+                        managed
+                            .config
+                            .get("per_pod_policy_scoping")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false),
+                        "forced mesh-managed authz must be slice-fed for NodeWaypoint ({label})"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_keeps_operator_authz_override_when_capture_redirect_is_off() {
+        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+        assert!(
+            !runtime.transparent_inbound_capture_requested(),
+            "default NodeWaypoint fixture must leave the ingress redirect off"
+        );
+        let mut config = GatewayConfig {
+            plugin_configs: vec![global_mesh_authz_plugin(
+                "operator-mesh-authz",
+                serde_json::json!({ "trusted_hbone_assertors": [] }),
+            )],
+            ..GatewayConfig::default()
+        };
+        inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == "operator-mesh-authz")
+        );
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_AUTHZ_PLUGIN_ID),
+            "redirect-off NodeWaypoint must preserve operator mesh_authz override suppression"
+        );
+    }
+
+    #[test]
     fn inject_mesh_global_plugins_omits_runtime_assertors_when_operator_authz_uses_defaults() {
         let mut runtime = test_mesh_runtime_config();
         runtime.trusted_hbone_assertors =
@@ -23060,6 +23463,188 @@ mod tests {
                 assert_eq!(plan[0].direction, MeshTrafficDirection::Inbound);
                 assert_eq!(plan[0].kind, MeshListenerKind::HboneTermination);
                 assert_eq!(plan[0].addr.port(), 15008);
+            },
+        );
+    }
+
+    #[test]
+    fn node_waypoint_adds_a_separate_transparent_capture_listener_when_the_redirect_is_on() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+                ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let plan = runtime.listener_plan();
+
+                // The HBONE listener is untouched: it keeps its own protocol
+                // boundary (authenticated H2 CONNECT over mesh mTLS) and is
+                // never handed captured plaintext.
+                let hbone = plan
+                    .iter()
+                    .find(|listener| listener.kind == MeshListenerKind::HboneTermination)
+                    .expect("the HBONE listener must still be planned");
+                assert_eq!(hbone.addr.port(), 15008);
+
+                let capture = plan
+                    .iter()
+                    .find(|listener| listener.kind == MeshListenerKind::TransparentInboundCapture)
+                    .expect("the transparent inbound capture listener must be planned");
+                assert_eq!(capture.direction, MeshTrafficDirection::Inbound);
+                assert_ne!(
+                    capture.addr.port(),
+                    hbone.addr.port(),
+                    "the capture listener must be a DISTINCT protocol boundary from HBONE"
+                );
+                assert_eq!(capture.addr.port(), 15006);
+                assert!(
+                    capture.addr.ip().is_unspecified(),
+                    "bpf_sk_assign resolves the capture listener with a wildcard lookup"
+                );
+                // It terminates nothing: `listener_tls_config` maps this kind to
+                // the plaintext arm, so a frontend ServerConfig is never given
+                // to it. Feeding application bytes to a TLS terminator would
+                // both fail and mistake application TLS for mesh TLS.
+                assert!(listener_tls_config(capture, None).is_none());
+                assert!(
+                    !uses_mesh_inbound_tls_kind(capture.kind),
+                    "the capture listener must never take the mesh inbound TLS path"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn a_service_waypoint_never_binds_the_transparent_capture_listener() {
+        // ServiceWaypoint has no node-agent installing a per-node classifier,
+        // so binding a transparent socket there would claim a port for a
+        // datapath that never delivers to it.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "service_waypoint"),
+                ("FERRUM_MESH_WAYPOINT_NAME", "test-waypoint"),
+                ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                assert!(
+                    !runtime.listener_plan().iter().any(
+                        |listener| listener.kind == MeshListenerKind::TransparentInboundCapture
+                    )
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn a_non_wildcard_capture_address_is_refused() {
+        // `bpf_sk_assign` resolves the capture listener with a wildcard socket
+        // lookup, so a specific-IP bind is invisible to the classifier and
+        // every captured packet would be dropped fail-closed.
+        assert!(validate_ingress_capture_addr("0.0.0.0:15006".parse().unwrap()).is_ok());
+        assert!(validate_ingress_capture_addr("[::]:15006".parse().unwrap()).is_ok());
+        assert!(validate_ingress_capture_addr("10.0.0.5:15006".parse().unwrap()).is_err());
+        assert!(validate_ingress_capture_addr("0.0.0.0:0".parse().unwrap()).is_err());
+    }
+
+    /// The serving path must FAIL, not warn-skip, when the redirect is armed
+    /// but the capture address cannot be bound as the classifier's steer
+    /// target. `listener_plan()` is infallible by design, so without the
+    /// separate validator the proxy would come up ready with HBONE alone while
+    /// `ferrum_tc_ingress_redirect` keeps dropping every enrolled pod's inbound
+    /// traffic fail-closed. This drives the exact helper
+    /// `prepare_mesh_runtime_before_owner` applies with `?`.
+    #[test]
+    fn an_unbindable_capture_address_fails_the_serving_path_instead_of_warn_skipping() {
+        for (addr, expected) in [
+            ("0.0.0.0:0", "non-zero port"),
+            ("10.0.0.5:15006", "wildcard"),
+        ] {
+            with_mesh_env(
+                &[
+                    ("FERRUM_MODE", "mesh"),
+                    ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                    (
+                        "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                        "secret-padding-for-32-char-min!!",
+                    ),
+                    ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+                    ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
+                    ("FERRUM_MESH_INBOUND_LISTEN_ADDR", addr),
+                ],
+                || {
+                    let env = EnvConfig::from_env().expect("mesh env config");
+                    let runtime =
+                        MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                    // The plan silently omits it — that is exactly why the
+                    // serving path cannot rely on planning alone.
+                    assert!(
+                        !runtime
+                            .listener_plan()
+                            .iter()
+                            .any(|listener| listener.kind
+                                == MeshListenerKind::TransparentInboundCapture),
+                        "an invalid capture address warn-skips in the infallible plan"
+                    );
+
+                    let err = runtime
+                        .validate_transparent_inbound_capture_settings()
+                        .expect_err("the serving path must refuse to start");
+                    assert!(err.contains("FERRUM_MESH_INBOUND_LISTEN_ADDR"), "{err}");
+                    assert!(err.contains(expected), "{err}");
+                },
+            );
+        }
+    }
+
+    /// Default-off is preserved: with no redirect requested the validator is a
+    /// no-op even for an address the redirect would refuse, and NodeWaypoint
+    /// keeps its HBONE-only plan.
+    #[test]
+    fn the_capture_validator_is_inert_when_the_redirect_is_not_requested() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+                ("FERRUM_MESH_INBOUND_LISTEN_ADDR", "10.0.0.5:15006"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                assert!(
+                    runtime
+                        .validate_transparent_inbound_capture_settings()
+                        .is_ok()
+                );
+                assert!(
+                    !runtime.listener_plan().iter().any(
+                        |listener| listener.kind == MeshListenerKind::TransparentInboundCapture
+                    )
+                );
             },
         );
     }

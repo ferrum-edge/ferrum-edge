@@ -58,6 +58,7 @@ fn client_config(waypoint: Option<&str>, spiffe: Option<&str>) -> NativeMeshClie
         waypoint_name: waypoint.map(str::to_string),
         labels: HashMap::new(),
         ambient_udp_source_scoping: false,
+        node_waypoint_capture_scoping: false,
         primary_retry_secs: 0,
     }
 }

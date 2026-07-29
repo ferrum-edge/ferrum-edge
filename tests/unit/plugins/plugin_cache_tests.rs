@@ -10872,3 +10872,135 @@ fn test_transaction_debugger_body_capture_reload_flips_buffering_requirements() 
     assert!(!cache.requires_request_body_buffering("ferrum", "p1"));
     assert!(!cache.requires_response_body_buffering("ferrum", "p1"));
 }
+
+// ---------------------------------------------------------------------------
+// NodeWaypoint transparent-capture destination-authz readiness (issue #3287).
+//
+// The captured-connection path must never scan `config.plugin_configs` or the
+// built plugin chain to decide whether mesh-managed destination L4 authz can be
+// enforced. The plugin cache precomputes one generation-level bit at
+// construction/reload; these tests pin exactly what that bit means.
+// ---------------------------------------------------------------------------
+
+/// The reserved config id the mesh runtime injects for its managed, slice-fed
+/// authz instance. Operator-authored rows can never carry it.
+const MANAGED_MESH_AUTHZ_ID: &str = ferrum_edge::modes::mesh::MESH_AUTHZ_PLUGIN_ID;
+
+fn mesh_authz_plugin_config(id: &str, scope: PluginScope, enabled: bool) -> PluginConfig {
+    let proxy_id = if scope == PluginScope::Global {
+        None
+    } else {
+        Some("p1")
+    };
+    let mut plugin = make_plugin_config_with_json(id, "mesh_authz", json!({}), scope, proxy_id);
+    plugin.enabled = enabled;
+    plugin
+}
+
+fn node_waypoint_authz_ready(plugin_configs: Vec<PluginConfig>) -> bool {
+    let config = make_config(Vec::new(), plugin_configs);
+    let cache = PluginCache::new(&config).expect("mesh_authz plugin cache builds");
+    ferrum_edge::_test_support::node_waypoint_destination_authz_ready_for_test(&cache)
+}
+
+fn ready_from_counts(managed: bool, configured: usize, built: usize) -> bool {
+    ferrum_edge::_test_support::node_waypoint_destination_authz_ready_from_counts_for_test(
+        managed, configured, built,
+    )
+}
+
+#[test]
+fn managed_mesh_authz_plus_prebuilt_tcp_chain_is_destination_authz_ready() {
+    let plugin = mesh_authz_plugin_config(MANAGED_MESH_AUTHZ_ID, PluginScope::Global, true);
+    let config = make_config(Vec::new(), vec![plugin]);
+    let cache = PluginCache::new(&config).expect("mesh_authz plugin cache builds");
+
+    // The bit is only meaningful because the managed instance really is in the
+    // prebuilt GLOBAL TCP chain — the chain the dynamically synthesized capture
+    // relay resolves, since that proxy is never in `config.proxies`.
+    let tcp_chain = plugins_for_protocol_for_test(
+        &cache,
+        "ferrum",
+        "__mesh_inbound_tcp_relay_synthesized__",
+        ProxyProtocol::Tcp,
+    );
+    assert!(
+        tcp_chain.iter().any(|p| p.name() == "mesh_authz"),
+        "the managed mesh_authz runtime policy must be in the global TCP fallback chain"
+    );
+    assert!(
+        ferrum_edge::_test_support::node_waypoint_destination_authz_ready_for_test(&cache),
+        "an enabled managed __mesh_authz whose policy is in the global TCP chain is ready"
+    );
+}
+
+#[test]
+fn operator_only_mesh_authz_is_not_destination_authz_ready() {
+    // An operator global mesh_authz is not the mesh-managed, slice-fed capture
+    // enforcement instance, so it must never satisfy the managed requirement.
+    let operator = mesh_authz_plugin_config("operator-mesh-authz", PluginScope::Global, true);
+    assert!(!node_waypoint_authz_ready(vec![operator]));
+}
+
+#[test]
+fn disabled_managed_mesh_authz_is_not_destination_authz_ready() {
+    let disabled = mesh_authz_plugin_config(MANAGED_MESH_AUTHZ_ID, PluginScope::Global, false);
+    assert!(!node_waypoint_authz_ready(vec![disabled]));
+}
+
+#[test]
+fn proxy_scoped_managed_mesh_authz_id_is_not_destination_authz_ready() {
+    // Only a GLOBAL row lands in the global TCP fallback chain the synthesized
+    // relay resolves; a proxy-scoped row carrying the reserved id does not.
+    let scoped = mesh_authz_plugin_config(MANAGED_MESH_AUTHZ_ID, PluginScope::Proxy, true);
+    assert!(!node_waypoint_authz_ready(vec![scoped]));
+}
+
+#[test]
+fn reserved_id_on_a_different_plugin_is_not_destination_authz_ready() {
+    // The reserved id alone proves nothing: readiness requires the exact
+    // (id, plugin_name) pair the mesh runtime injects.
+    let impostor = make_plugin_config_with_json(
+        MANAGED_MESH_AUTHZ_ID,
+        "ip_restriction",
+        json!({ "allow": ["10.0.0.0/8"] }),
+        PluginScope::Global,
+        None,
+    );
+    assert!(!node_waypoint_authz_ready(vec![impostor]));
+}
+
+#[test]
+fn no_mesh_authz_at_all_is_not_destination_authz_ready() {
+    assert!(!node_waypoint_authz_ready(Vec::new()));
+}
+
+#[test]
+fn managed_and_operator_mesh_authz_together_stay_destination_authz_ready() {
+    // Both rows build and both survive the TCP protocol filter, so the managed
+    // instance is still provably present.
+    let managed = mesh_authz_plugin_config(MANAGED_MESH_AUTHZ_ID, PluginScope::Global, true);
+    let operator = mesh_authz_plugin_config("operator-mesh-authz", PluginScope::Global, true);
+    assert!(node_waypoint_authz_ready(vec![managed, operator]));
+}
+
+#[test]
+fn managed_config_without_its_runtime_policy_in_the_tcp_chain_is_not_ready() {
+    // Managed row configured, but nothing named `mesh_authz` reached the
+    // prebuilt global TCP chain: fail closed.
+    assert!(!ready_from_counts(true, 1, 0));
+    // Managed plus operator rows configured but only one instance reached the
+    // chain: which one survived is unknowable from trait objects, so this fails
+    // closed rather than assuming the managed one did.
+    assert!(!ready_from_counts(true, 2, 1));
+    // Every configured row is accounted for in the chain, so the managed
+    // instance is necessarily among them.
+    assert!(ready_from_counts(true, 1, 1));
+    assert!(ready_from_counts(true, 2, 2));
+    // An unexpected extra runtime instance also invalidates the exact
+    // config-to-chain proof and must fail closed.
+    assert!(!ready_from_counts(true, 1, 2));
+    // No managed row: an operator instance in the chain never satisfies it.
+    assert!(!ready_from_counts(false, 1, 1));
+    assert!(!ready_from_counts(true, 0, 0));
+}

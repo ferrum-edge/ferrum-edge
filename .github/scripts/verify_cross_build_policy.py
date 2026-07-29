@@ -1673,6 +1673,12 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     timeout-minutes: 30
     permissions:
       contents: read
+    # The repository-root Cargo config selects sccache, but this isolated fuzz
+    # job does not install it. Disable both Cargo wrapper inputs explicitly so
+    # toolchain discovery cannot fail before the pinned jobs run.
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -1763,6 +1769,12 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    # The repository-root Cargo config selects sccache, but this isolated fuzz
+    # job does not install it. Disable both Cargo wrapper inputs explicitly so
+    # toolchain discovery cannot fail before the pinned jobs run.
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -9139,13 +9151,26 @@ def validate_nested_cargo_configuration_tree(
     ]
 
 
-def validate_workflow_collection(
+def scan_workflow_collection_cross_surfaces(
     workflows: dict[str, str],
     source: str,
 ) -> list[str]:
-    """Reject Cross inputs in every workflow except the two hashed contracts."""
+    """Reject Cross inputs in every workflow except the two hashed contracts.
 
-    errors: list[str] = live_suite_relevance_errors(workflows, source)
+    This is the Cross-detection half of `validate_workflow_collection` and
+    nothing else: it says whether the workflows it is handed carry a Cross
+    executable or configuration input, not whether they are a complete
+    repository workflow collection. It exists so a scanner fixture can be one
+    synthetic workflow — the isolated shape every Cross-detection self-test
+    needs — without the completeness contract firing on the two governed live
+    workflows the fixture was never meant to contain. Production validation
+    goes through `validate_workflow_collection`, which is the only caller that
+    sees a real collection and which always enforces both halves; there is no
+    repository input, argument, or environment variable that reaches this
+    weaker entry point.
+    """
+
+    errors: list[str] = []
     for name, contents in sorted(workflows.items()):
         if name in PROTECTED_WORKFLOW_FILENAMES:
             continue
@@ -9203,20 +9228,39 @@ def validate_workflow_collection(
     return errors
 
 
-def compare_pr_workflow_collection(
+def validate_workflow_collection(
+    workflows: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Validate a complete workflow collection: relevance contract plus Cross.
+
+    Both halves are mandatory here and neither is selectable. A workflow
+    directory that omits a governed live gate is rejected before its Cross
+    surfaces are even considered, because a required check that never runs is
+    indistinguishable from a passing one.
+    """
+
+    return [
+        *live_suite_relevance_errors(workflows, source),
+        *scan_workflow_collection_cross_surfaces(workflows, source),
+    ]
+
+
+def scan_pr_workflow_collection_cross_surfaces(
     merge_base_workflows: dict[str, str],
     proposed_workflows: dict[str, str],
     source: str,
 ) -> list[str]:
-    """Permit safe workflow edits while rejecting new or changed Cross inputs."""
+    """Permit safe workflow edits while rejecting new or changed Cross inputs.
 
-    # Absolute, not comparative: the trusted-base relevance contract is what a
-    # required live gate must look like after the pull request, regardless of
-    # what the base happened to carry.
-    errors: list[str] = live_suite_relevance_errors(
-        proposed_workflows,
-        f"proposed {source}",
-    )
+    The comparison half of `compare_pr_workflow_collection`, split for the same
+    reason `scan_workflow_collection_cross_surfaces` is: an isolated two-file
+    before/after fixture must be able to prove that a hostile edit changes the
+    Cross surface without also being asked to be a whole repository. The
+    production pull-request path calls `compare_pr_workflow_collection`.
+    """
+
+    errors: list[str] = []
     names = sorted(
         (set(merge_base_workflows) | set(proposed_workflows))
         - PROTECTED_WORKFLOW_FILENAMES
@@ -9283,6 +9327,28 @@ def compare_pr_workflow_collection(
                     "configuration surfaces"
                 )
     return errors
+
+
+def compare_pr_workflow_collection(
+    merge_base_workflows: dict[str, str],
+    proposed_workflows: dict[str, str],
+    source: str,
+) -> list[str]:
+    """Compare a complete proposed collection: relevance contract plus Cross.
+
+    The relevance half is absolute, not comparative: the trusted-base relevance
+    contract is what a required live gate must look like after the pull
+    request, regardless of what the base happened to carry.
+    """
+
+    return [
+        *live_suite_relevance_errors(proposed_workflows, f"proposed {source}"),
+        *scan_pr_workflow_collection_cross_surfaces(
+            merge_base_workflows,
+            proposed_workflows,
+            source,
+        ),
+    ]
 
 
 def generic_action_cross_surfaces(
@@ -14557,7 +14623,7 @@ pre_build = []
         "      - run: echo safe\n"
     )
     benign_extra_edit = safe_extra_workflow.replace("echo safe", "echo still-safe")
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"coverage.yml": safe_extra_workflow},
         "self-test workflow directory",
     ):
@@ -14567,7 +14633,7 @@ pre_build = []
         'echo "packaging $(grep -c x files) files '
         '($(grep -c y files) profraw)"',
     )
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"coverage.yml": benign_embedded_substitutions},
         "self-test workflow directory",
     ):
@@ -14577,7 +14643,7 @@ pre_build = []
         "cmd=$(printf '\\143\\162\\157\\163\\163')\n"
         '          echo $("${cmd}" build --target aarch64-unknown-linux-gnu)',
     )
-    if not compare_pr_workflow_collection(
+    if not scan_pr_workflow_collection_cross_surfaces(
         {"coverage.yml": safe_extra_workflow},
         {
             "coverage.yml": safe_extra_workflow,
@@ -14586,7 +14652,7 @@ pre_build = []
         "self-test workflow directory",
     ):
         failures.append("opaque Cross executable in command substitution was not rejected")
-    if compare_pr_workflow_collection(
+    if scan_pr_workflow_collection_cross_surfaces(
         {"coverage.yml": safe_extra_workflow},
         {
             "coverage.yml": benign_extra_edit,
@@ -14600,7 +14666,7 @@ pre_build = []
         "echo safe",
         "cross build --target aarch64-unknown-linux-gnu",
     )
-    if not compare_pr_workflow_collection(
+    if not scan_pr_workflow_collection_cross_surfaces(
         {"coverage.yml": safe_extra_workflow},
         {"coverage.yml": safe_extra_workflow, "attacker.yml": added_cross_workflow},
         "self-test workflow directory",
@@ -14655,12 +14721,12 @@ pre_build = []
     }
     for label, command in inline_interpreter_bypasses.items():
         proposed = safe_extra_workflow.replace("echo safe", command)
-        if not validate_workflow_collection(
+        if not scan_workflow_collection_cross_surfaces(
             {"attacker.yml": proposed},
             "self-test workflow directory",
         ):
             failures.append(f"{label} was not rejected")
-        if not compare_pr_workflow_collection(
+        if not scan_pr_workflow_collection_cross_surfaces(
             {"coverage.yml": safe_extra_workflow},
             {"coverage.yml": proposed},
             "self-test workflow directory",
@@ -14680,7 +14746,7 @@ pre_build = []
     }
     for label, command in inline_interpreter_fail_closed.items():
         proposed = safe_extra_workflow.replace("echo safe", command)
-        if not compare_pr_workflow_collection(
+        if not scan_pr_workflow_collection_cross_surfaces(
             {"coverage.yml": safe_extra_workflow},
             {"coverage.yml": proposed},
             "self-test workflow directory",
@@ -14697,12 +14763,12 @@ pre_build = []
     }
     for label, command in benign_inline_interpreters.items():
         proposed = safe_extra_workflow.replace("echo safe", command)
-        if validate_workflow_collection(
+        if scan_workflow_collection_cross_surfaces(
             {"coverage.yml": proposed},
             "self-test workflow directory",
         ):
             failures.append(f"{label} was rejected")
-        if compare_pr_workflow_collection(
+        if scan_pr_workflow_collection_cross_surfaces(
             {"coverage.yml": proposed},
             {"coverage.yml": proposed.replace("name: Coverage", "name: Coverage 2")},
             "self-test workflow directory",
@@ -14742,12 +14808,12 @@ pre_build = []
     }
     for label, command in word_splitting_bypasses.items():
         proposed = safe_extra_workflow.replace("echo safe", command)
-        if not validate_workflow_collection(
+        if not scan_workflow_collection_cross_surfaces(
             {"attacker.yml": proposed},
             "self-test workflow directory",
         ):
             failures.append(f"{label} was not rejected")
-        if not compare_pr_workflow_collection(
+        if not scan_pr_workflow_collection_cross_surfaces(
             {"coverage.yml": safe_extra_workflow},
             {"coverage.yml": proposed},
             "self-test workflow directory",
@@ -14758,7 +14824,7 @@ pre_build = []
         "echo safe",
         'echo "cargo${SUFFIX} finished for ${MATRIX} targets"',
     )
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"coverage.yml": benign_expansion_workflow},
         "self-test workflow directory",
     ):
@@ -14802,12 +14868,12 @@ pre_build = []
     }
     for label, command in shim_bypasses.items():
         proposed = safe_extra_workflow.replace("echo safe", command)
-        if not validate_workflow_collection(
+        if not scan_workflow_collection_cross_surfaces(
             {"attacker.yml": proposed},
             "self-test workflow directory",
         ):
             failures.append(f"{label} was not rejected")
-        if not compare_pr_workflow_collection(
+        if not scan_pr_workflow_collection_cross_surfaces(
             {"coverage.yml": safe_extra_workflow},
             {"coverage.yml": proposed},
             "self-test workflow directory",
@@ -14821,7 +14887,7 @@ pre_build = []
     }
     for label, command in benign_shim_lookalikes.items():
         proposed = safe_extra_workflow.replace("echo safe", command)
-        if validate_workflow_collection(
+        if scan_workflow_collection_cross_surfaces(
             {"coverage.yml": proposed},
             "self-test workflow directory",
         ):
@@ -14862,12 +14928,12 @@ pre_build = []
         ),
     }
     for label, proposed in remote_action_bypasses.items():
-        if not validate_workflow_collection(
+        if not scan_workflow_collection_cross_surfaces(
             {"attacker.yml": proposed},
             "self-test workflow directory",
         ):
             failures.append(f"{label} was not rejected")
-        if not compare_pr_workflow_collection(
+        if not scan_pr_workflow_collection_cross_surfaces(
             {"coverage.yml": safe_extra_workflow},
             {"coverage.yml": proposed},
             "self-test workflow directory",
@@ -14886,12 +14952,12 @@ pre_build = []
         "          name: report\n"
         "          path: results/\n",
     )
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"coverage.yml": benign_remote_action_workflow},
         "self-test workflow directory",
     ):
         failures.append("benign pinned remote actions were rejected")
-    if compare_pr_workflow_collection(
+    if scan_pr_workflow_collection_cross_surfaces(
         {"coverage.yml": safe_extra_workflow},
         {"coverage.yml": benign_remote_action_workflow},
         "self-test workflow directory",
@@ -14920,7 +14986,7 @@ pre_build = []
         + "  duplicate:\n"
         + "    runs-on: ubuntu-latest\n"
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"malformed.yml": malformed_cross_workflow},
         "self-test workflow directory",
     ):
@@ -15255,7 +15321,7 @@ pre_build = []
         "          subprocess.run(['cross', 'build', '--target', "
         "'aarch64-unknown-linux-gnu'])\n",
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"python-shell.yml": python_shell_cross},
         "self-test workflow directory",
     ):
@@ -15275,7 +15341,7 @@ pre_build = []
         "          subprocess.run(['cross', 'build', '--target', "
         "'aarch64-unknown-linux-gnu'])\n"
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"default-python-shell.yml": default_python_shell_cross},
         "self-test workflow directory",
     ):
@@ -15290,7 +15356,7 @@ pre_build = []
         "'aarch64-unknown-linux-gnu'])\n"
         "          PY",
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"python-heredoc.yml": python_heredoc_cross},
         "self-test workflow directory",
     ):
@@ -15780,7 +15846,7 @@ pre_build = []
         "bash scripts/safe.sh",
         "bash -c \"$(printf '\\143\\162\\157\\163\\163 build')\"",
     )
-    if not compare_pr_workflow_collection(
+    if not scan_pr_workflow_collection_cross_surfaces(
         {"safe.yml": referenced_workflow},
         {"safe.yml": generated_shell_workflow},
         "self-test automation directory",
@@ -19210,7 +19276,7 @@ pre_build = []
         "          cross\n"
         f"          {arm_target}\n"
     )
-    if not compare_pr_workflow_collection(
+    if not scan_pr_workflow_collection_cross_surfaces(
         {"safe.yml": referenced_workflow},
         {"safe.yml": folded_workflow},
         "self-test automation directory",
@@ -19371,7 +19437,7 @@ pre_build = []
         "echo safe",
         "echo 'cargo install cross locally' # cross documentation",
     )
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"prose.yml": benign_cross_prose_workflow},
         "self-test workflow directory",
     ):
@@ -19380,12 +19446,12 @@ pre_build = []
         "echo safe",
         'echo "cargo install cross locally"',
     ) + "# cross; cross build is documentation only\n"
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"double-prose.yml": double_quoted_cross_prose},
         "self-test workflow directory",
     ):
         failures.append("double-quoted/commented workflow Cross prose was rejected")
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"hostile.yml": added_cross_workflow},
         "self-test workflow directory",
     ):
@@ -19394,7 +19460,7 @@ pre_build = []
         "    steps:\n",
         "    env:\n      CROSS_CONFIG: attacker.toml\n    steps:\n",
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"environment.yml": cross_environment_workflow},
         "self-test workflow directory",
     ):
@@ -19499,7 +19565,7 @@ pre_build = []
         "    steps:\n"
         f"      - run: {opaque_stdin_run}\n"
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"opaque_stdin.yml": opaque_stdin_workflow},
         "self-test workflow directory",
     ):
@@ -19583,7 +19649,7 @@ pre_build = []
         "python3 -c \"print('safe')\"",
         1,
     )
-    if not compare_pr_workflow_collection(
+    if not scan_pr_workflow_collection_cross_surfaces(
         {"inline-python.yml": benign_inline_python_workflow},
         {"inline-python.yml": opaque_inline_python_workflow},
         "self-test inline Python workflow",
@@ -19605,7 +19671,7 @@ pre_build = []
             "printf '%s\\n' 'echo safe' 'echo built' | bash",
         ),
     ):
-        benign_workflow_errors = validate_workflow_collection(
+        benign_workflow_errors = scan_workflow_collection_cross_surfaces(
             {
                 "benign_stdin.yml": opaque_stdin_workflow.replace(
                     opaque_stdin_run,
@@ -19676,7 +19742,7 @@ pre_build = []
         f"          $cmd build --target {TARGET}\n"
         "          TEMPLATE\n"
     )
-    if validate_workflow_collection(
+    if scan_workflow_collection_cross_surfaces(
         {"template.yml": template_workflow},
         "self-test workflow directory",
     ):
@@ -19684,7 +19750,7 @@ pre_build = []
             "a job that only writes a quoted heredoc template was reported as "
             "Cross-sensitive"
         )
-    if compare_pr_workflow_collection(
+    if scan_pr_workflow_collection_cross_surfaces(
         {"template.yml": template_workflow},
         {"template.yml": template_workflow.replace("render.sh", "rendered.sh", 1)},
         "self-test workflow directory",
@@ -19701,7 +19767,7 @@ pre_build = []
         "bash <<'TEMPLATE'",
         1,
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"executable_template.yml": executable_template_workflow},
         "self-test workflow directory",
     ):
@@ -19720,7 +19786,7 @@ pre_build = []
         f"          key: $($cmd build --target {TARGET})\n"
         "          TEMPLATE\n"
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"unquoted_template.yml": unquoted_template_workflow},
         "self-test workflow directory",
     ):
@@ -20171,14 +20237,14 @@ pre_build = []
         "./scripts/build",
         'eval "$(./scripts/build)"',
     )
-    if not validate_workflow_collection(
+    if not scan_workflow_collection_cross_surfaces(
         {"generated.yml": extensionless_eval_workflow},
         "self-test workflow directory",
     ):
         failures.append(
             "dynamic evaluation of extensionless Python output was accepted"
         )
-    if not compare_pr_workflow_collection(
+    if not scan_pr_workflow_collection_cross_surfaces(
         {"generated.yml": extensionless_workflow},
         {"generated.yml": extensionless_eval_workflow},
         "self-test workflow directory",
@@ -21964,6 +22030,142 @@ pre_build = []
     if not live_suite_relevance_errors(renamed_relevance, "self-test workflows"):
         failures.append("a renamed relevance job was not rejected")
 
+    # The relevance contract has to be enforced by the *collection* entry
+    # points, not only by `live_suite_relevance_errors` in isolation. The
+    # Cross-detection halves are separately reachable so a scanner fixture can
+    # be one synthetic workflow, and the whole risk of that split is that the
+    # production wrappers quietly stop carrying the contract. Each check below
+    # is written as a difference between the two APIs on the same input, so it
+    # fails if either half is dropped from a wrapper.
+    relevance_selftest_source = "self-test workflow collection"
+    isolated_fixture = {"coverage.yml": safe_extra_workflow}
+    if scan_workflow_collection_cross_surfaces(
+        isolated_fixture,
+        relevance_selftest_source,
+    ):
+        failures.append("an isolated benign scanner fixture was rejected")
+    if scan_pr_workflow_collection_cross_surfaces(
+        isolated_fixture,
+        isolated_fixture,
+        relevance_selftest_source,
+    ):
+        failures.append("an isolated benign scanner comparison was rejected")
+    incomplete_validation = validate_workflow_collection(
+        isolated_fixture,
+        relevance_selftest_source,
+    )
+    incomplete_comparison = compare_pr_workflow_collection(
+        isolated_fixture,
+        isolated_fixture,
+        relevance_selftest_source,
+    )
+    for contract_name in sorted(LIVE_SUITE_RELEVANCE_CONTRACTS):
+        if not any(contract_name in error for error in incomplete_validation):
+            failures.append(
+                "full workflow-collection validation no longer requires "
+                f"{contract_name}"
+            )
+        if not any(contract_name in error for error in incomplete_comparison):
+            failures.append(
+                "full workflow-collection comparison no longer requires "
+                f"{contract_name}"
+            )
+
+    # A conforming complete collection must reach exactly the Cross verdict:
+    # the enforcing wrapper may add nothing of its own to a collection that
+    # already satisfies the contract, or the repair would have traded a false
+    # failure for a permanent one.
+    complete_collection = {**relevance_workflows, **isolated_fixture}
+    if validate_workflow_collection(
+        complete_collection,
+        relevance_selftest_source,
+    ) != scan_workflow_collection_cross_surfaces(
+        complete_collection,
+        relevance_selftest_source,
+    ):
+        failures.append(
+            "a complete conforming workflow collection was charged a "
+            "live-suite relevance error"
+        )
+    if compare_pr_workflow_collection(
+        complete_collection,
+        complete_collection,
+        relevance_selftest_source,
+    ) != scan_pr_workflow_collection_cross_surfaces(
+        complete_collection,
+        complete_collection,
+        relevance_selftest_source,
+    ):
+        failures.append(
+            "a complete conforming workflow collection comparison was charged "
+            "a live-suite relevance error"
+        )
+
+    # Tampering with the contract inside an otherwise complete collection, and
+    # deleting a governed live workflow outright, are both invisible to the
+    # Cross scan. Only the wrapper can reject them, so each is asserted as the
+    # wrapper's verdict *differing* from the scan's on the same input.
+    severed_collection = {**severed_binding, **isolated_fixture}
+    severed_validation = validate_workflow_collection(
+        severed_collection,
+        relevance_selftest_source,
+    )
+    if not severed_validation or severed_validation == (
+        scan_workflow_collection_cross_surfaces(
+            severed_collection,
+            relevance_selftest_source,
+        )
+    ):
+        failures.append(
+            "full workflow-collection validation accepted a severed live-gate "
+            "relevance binding"
+        )
+    severed_comparison = compare_pr_workflow_collection(
+        complete_collection,
+        severed_collection,
+        relevance_selftest_source,
+    )
+    if not severed_comparison or severed_comparison == (
+        scan_pr_workflow_collection_cross_surfaces(
+            complete_collection,
+            severed_collection,
+            relevance_selftest_source,
+        )
+    ):
+        failures.append(
+            "full workflow-collection comparison accepted a severed live-gate "
+            "relevance binding"
+        )
+    dropped_contract = sorted(LIVE_SUITE_RELEVANCE_CONTRACTS)[0]
+    deleted_live_gate = {
+        name: contents
+        for name, contents in complete_collection.items()
+        if name != dropped_contract
+    }
+    if not any(
+        f"is missing {dropped_contract}" in error
+        for error in compare_pr_workflow_collection(
+            complete_collection,
+            deleted_live_gate,
+            relevance_selftest_source,
+        )
+    ):
+        failures.append(
+            "full workflow-collection comparison accepted deletion of a "
+            "required live gate"
+        )
+    if not any(
+        f"is missing {dropped_contract}" in error
+        for error in validate_workflow_collection(
+            deleted_live_gate,
+            relevance_selftest_source,
+        )
+    ):
+        failures.append(
+            "full workflow-collection validation accepted deletion of a "
+            "required live gate"
+        )
+
     # ------------------------------------------------------------------
     # Admitted fuzz/property lane
     # ------------------------------------------------------------------
@@ -21984,6 +22186,16 @@ pre_build = []
         if "contents: write" in admitted_text:
             failures.append(
                 f"the admitted {admitted_label} requests write permission"
+            )
+        wrapper_override_block = (
+            '    env:\n'
+            '      RUSTC_WRAPPER: ""\n'
+            '      CARGO_BUILD_RUSTC_WRAPPER: ""\n'
+        )
+        if wrapper_override_block not in admitted_text:
+            failures.append(
+                f"the admitted {admitted_label} no longer disables both "
+                "repository sccache wrapper inputs"
             )
     if (
         "\non:\n  schedule:\n    - cron: '30 6 * * 1'\n  workflow_dispatch:\n"

@@ -53,25 +53,18 @@ jobs:
             base_ref="origin/${BASE_REF}"
             git fetch --no-tags origin \
               "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
-            # Compile-check, never execute, the PROPOSED verifier. Only the
-            # trusted-base copy is ever run below, so a policy change otherwise
-            # receives no syntax validation on its own pull request and a
-            # broken file would land on main and break every later pull
-            # request's trusted-base execution of it. `py_compile` parses and
-            # byte-compiles without running any module-level code. Use
-            # `-X pycache_prefix` (not PYTHONPYCACHEPREFIX) because isolated
-            # mode (`-I`) ignores all PYTHON* environment variables.
-            python3 -I -X "pycache_prefix=$RUNNER_TEMP/cross-policy-pyc" \
-              -m py_compile .github/scripts/verify_cross_build_policy.py
+            # Never execute the pull request's verifier in this security-
+            # sensitive planning job. The separate read-only candidate-policy
+            # workflow parses and exercises the proposed source without
+            # producing any output consumed by CI planning.
             if git cat-file -e "${base_ref}:${policy}" 2>/dev/null; then
               trusted_policy="$RUNNER_TEMP/verify-cross-build-policy.py"
               git show "${base_ref}:${policy}" > "$trusted_policy"
               policy="$trusted_policy"
             fi
             # Otherwise this is the one-time bootstrap where the base has no
-            # verifier to execute yet: `policy` stays the reviewed proposal,
-            # already compile-checked above, and runs in isolated mode. All
-            # later PRs take the trusted-base branch.
+            # verifier to execute yet: `policy` stays the reviewed proposal and
+            # runs in isolated mode. All later PRs take the trusted-base branch.
           fi
 
           python3 -I "$policy" \
@@ -712,6 +705,7 @@ jobs:
               integration::tcp_frontend_tls_order_tests
               integration::tcp_fast_path_l4_plugins_tests
               integration::udp_hook_concurrency_tests
+              integration::udp_fault_injection_tests
               integration::gateway_hbone_pool_tests
               integration::gateway_svid_identity_tests
               integration::graceful_shutdown_tests

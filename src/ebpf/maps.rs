@@ -16,15 +16,17 @@ use aya::maps::lpm_trie::Key as LpmKey;
 use aya::maps::{HashMap as BpfHashMap, LpmTrie, MapData};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use ferrum_ebpf_common::{
-    BpfCaptureConfig, FERRUM_CAPTURE_CONFIG_KEY, IncludePortsPolicy, NodeProbePortKey4,
-    NodeProbePortKey6, PodInfo as BpfPodInfo, WorkloadIdentity,
+    BpfCaptureConfig, FERRUM_CAPTURE_CONFIG_KEY, InboundRedirectKey4, InboundRedirectKey6,
+    IncludePortsPolicy, NodeProbePortKey4, NodeProbePortKey6, PodInfo as BpfPodInfo,
+    WorkloadIdentity,
 };
 use ferrum_ebpf_common::{CidrKey4, CidrKey6};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::{
     BPF_MAP_CAPTURE_CONFIG, BPF_MAP_NODE_IPS, BPF_MAP_NODE_IPS6, BPF_MAP_NODE_PROBE_PORTS,
-    BPF_MAP_NODE_PROBE_PORTS6, BPF_MAP_POD_IPS6, BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
+    BPF_MAP_NODE_PROBE_PORTS6, BPF_MAP_POD_INBOUND_PORTS, BPF_MAP_POD_INBOUND_PORTS6,
+    BPF_MAP_POD_IPS6, BPF_MAP_WORKLOAD_IDENTITY, PodInfo,
 };
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -35,6 +37,8 @@ pub struct BpfMaps {
     node_ips6: Option<BpfHashMap<MapData, CidrKey6, u8>>,
     node_probe_ports: Option<BpfHashMap<MapData, NodeProbePortKey4, u8>>,
     node_probe_ports6: Option<BpfHashMap<MapData, NodeProbePortKey6, u8>>,
+    pod_inbound_ports: Option<BpfHashMap<MapData, InboundRedirectKey4, u8>>,
+    pod_inbound_ports6: Option<BpfHashMap<MapData, InboundRedirectKey6, u8>>,
     bypass_uids: BpfHashMap<MapData, u32, u8>,
     cidr_exclude4: LpmTrie<MapData, CidrKey4, u8>,
     cidr_exclude6: LpmTrie<MapData, CidrKey6, u8>,
@@ -108,6 +112,36 @@ impl BpfMaps {
             None => {
                 tracing::warn!(
                     "FERRUM_NODE_PROBE_PORTS6 map not found; startup readiness will reject node-waypoint eBPF capture before reporting ready"
+                );
+                None
+            }
+        };
+
+        // Redirect scope maps. A stale ELF without them is tolerated here and
+        // rejected by `validate_required` when the redirect is actually
+        // enabled, so a node-agent that cannot scope the redirect never arms
+        // it rather than redirecting on pod-IP alone.
+        let pod_inbound_ports = match bpf.take_map(BPF_MAP_POD_INBOUND_PORTS) {
+            Some(map) => Some(
+                BpfHashMap::try_from(map)
+                    .map_err(|e| format!("FERRUM_POD_INBOUND_PORTS type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_POD_INBOUND_PORTS map not found; the NodeWaypoint inbound tc redirect cannot be scoped and will not be enabled"
+                );
+                None
+            }
+        };
+
+        let pod_inbound_ports6 = match bpf.take_map(BPF_MAP_POD_INBOUND_PORTS6) {
+            Some(map) => Some(
+                BpfHashMap::try_from(map)
+                    .map_err(|e| format!("FERRUM_POD_INBOUND_PORTS6 type mismatch: {e}"))?,
+            ),
+            None => {
+                tracing::warn!(
+                    "FERRUM_POD_INBOUND_PORTS6 map not found; the NodeWaypoint inbound tc redirect cannot be scoped and will not be enabled"
                 );
                 None
             }
@@ -205,6 +239,8 @@ impl BpfMaps {
             node_ips6,
             node_probe_ports,
             node_probe_ports6,
+            pod_inbound_ports,
+            pod_inbound_ports6,
             bypass_uids,
             cidr_exclude4,
             cidr_exclude6,
@@ -215,6 +251,14 @@ impl BpfMaps {
             include_ports,
             workload_identity,
         })
+    }
+
+    /// `true` when both redirect scope maps are present. The node-agent
+    /// consults this before arming the inbound tc redirect: without the scope
+    /// maps the kernel could only match on pod IP, which would capture every
+    /// port of an enrolled pod rather than its declared inbound ports.
+    pub fn supports_inbound_redirect_scope(&self) -> bool {
+        self.pod_inbound_ports.is_some() && self.pod_inbound_ports6.is_some()
     }
 
     pub fn validate_required(&self, require_workload_identity: bool) -> Result<(), String> {
@@ -338,6 +382,111 @@ impl BpfMaps {
         tolerate_missing_map_remove(node_probe_ports6.remove(&key), || {
             format!("node IPv6 probe port {ip}:{port}")
         })
+    }
+
+    /// Replace the inbound-redirect scope of one enrolled IPv4 pod address with
+    /// exactly `ports`. An empty slice clears the pod's scope.
+    ///
+    /// **Stale entries are removed before new ones are added**, so a
+    /// `containerPorts` edit that *narrows* a pod's exposure converges instead
+    /// of leaving the removed port redirectable. Removal is keyed by scanning
+    /// the map for this address, which is what lets pod teardown work from a
+    /// Kubernetes delete event that carries no spec snapshot.
+    ///
+    /// An absent map is a **hard error** when there is anything to write: the
+    /// caller only reaches here after deciding to arm the redirect, and
+    /// silently succeeding would flag a pod as redirect-eligible with no
+    /// reachable port (a black hole, since in-scope traffic fails closed).
+    /// Clearing an absent map is a no-op so teardown still succeeds against an
+    /// older ELF.
+    ///
+    /// A key-iteration error is likewise a **hard error**, never skipped: the
+    /// scan is what finds the stale keys, so swallowing an error would return
+    /// success from a narrowing update that never removed the withdrawn
+    /// `(pod, port)` — leaving a port the operator just took out of
+    /// `containerPorts` still redirectable, with the caller's retry ledger
+    /// cleared because the write "succeeded".
+    pub fn replace_pod_inbound_ports(&mut self, ip: Ipv4Addr, ports: &[u16]) -> Result<(), String> {
+        let addr = ipv4_to_nbo_key(ip);
+        let Some(pod_inbound_ports) = self.pod_inbound_ports.as_mut() else {
+            if ports.is_empty() {
+                return Ok(());
+            }
+            return Err(format!(
+                "FERRUM_POD_INBOUND_PORTS map is absent; cannot scope the inbound redirect for {ip}"
+            ));
+        };
+
+        let mut stale: Vec<InboundRedirectKey4> = Vec::new();
+        for key in pod_inbound_ports.keys() {
+            let key = key.map_err(|e| {
+                format!(
+                    "Failed to scan FERRUM_POD_INBOUND_PORTS for stale inbound redirect ports of \
+                     {ip}: {e}. Refusing to report the scope replaced: a withdrawn port may still \
+                     be redirectable."
+                )
+            })?;
+            if key.addr == addr && !ports.contains(&key.port) {
+                stale.push(key);
+            }
+        }
+        for key in stale {
+            tolerate_missing_map_remove(pod_inbound_ports.remove(&key), || {
+                format!("inbound redirect port {ip}:{}", key.port)
+            })?;
+        }
+
+        for port in ports {
+            pod_inbound_ports
+                .insert(InboundRedirectKey4::new(addr, *port), 1u8, 0)
+                .map_err(|e| format!("Failed to insert inbound redirect port {ip}:{port}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// IPv6 counterpart to [`Self::replace_pod_inbound_ports`].
+    pub fn replace_pod_inbound_ports6(
+        &mut self,
+        ip: Ipv6Addr,
+        ports: &[u16],
+    ) -> Result<(), String> {
+        let addr = ipv6_to_nbo_words(ip);
+        let Some(pod_inbound_ports6) = self.pod_inbound_ports6.as_mut() else {
+            if ports.is_empty() {
+                return Ok(());
+            }
+            return Err(format!(
+                "FERRUM_POD_INBOUND_PORTS6 map is absent; cannot scope the inbound redirect for {ip}"
+            ));
+        };
+
+        let mut stale: Vec<InboundRedirectKey6> = Vec::new();
+        for key in pod_inbound_ports6.keys() {
+            let key = key.map_err(|e| {
+                format!(
+                    "Failed to scan FERRUM_POD_INBOUND_PORTS6 for stale inbound redirect ports of \
+                     {ip}: {e}. Refusing to report the scope replaced: a withdrawn port may still \
+                     be redirectable."
+                )
+            })?;
+            if key.addr == addr && !ports.contains(&key.port) {
+                stale.push(key);
+            }
+        }
+        for key in stale {
+            tolerate_missing_map_remove(pod_inbound_ports6.remove(&key), || {
+                format!("IPv6 inbound redirect port {ip}:{}", key.port)
+            })?;
+        }
+
+        for port in ports {
+            pod_inbound_ports6
+                .insert(InboundRedirectKey6::new(addr, *port), 1u8, 0)
+                .map_err(|e| {
+                    format!("Failed to insert IPv6 inbound redirect port {ip}:{port}: {e}")
+                })?;
+        }
+        Ok(())
     }
 
     pub fn insert_bypass_uid(&mut self, uid: u32) -> Result<(), String> {

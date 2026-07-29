@@ -2265,7 +2265,7 @@ pub struct EnvConfig {
     /// Removes entries where the active request count has dropped to zero.
     /// Only relevant when `max_concurrent_requests_per_ip > 0`. Default: 60.
     pub per_ip_cleanup_interval_seconds: u64,
-    /// Process-wide ceiling on requests/connections concurrently parked on an
+    /// Process-wide ceiling on requests/connections/datagrams concurrently parked on an
     /// injected `fault_injection` (or `mesh_route_dispatch` route-local) delay.
     ///
     /// Shared by every plugin instance in the process, so aggregate exposure is

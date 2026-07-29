@@ -1582,8 +1582,15 @@ fn quota_eviction_refreshes_inventory_when_a_candidate_disappears() {
     let calls_for_hook = Arc::clone(&calls);
     let vanishing = planted[0].clone();
     let peers_for_hook = peers.clone();
-    set_spool_write_hook_for_tests(Some(Arc::new(move |point| {
+    let hook_root = spool.namespace_root_for_tests().to_path_buf();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
         if point != SpoolWriteHookPoint::QuotaInventoryTaken {
+            return;
+        }
+        // The hook slot is process-global and the test binary runs in parallel:
+        // a concurrent test's eviction must not consume this test's one-shot
+        // mutation or inflate its pass accounting.
+        if namespace_root != hook_root.as_path() {
             return;
         }
         if calls_for_hook.fetch_add(1, Ordering::SeqCst) != 0 {
@@ -1672,8 +1679,15 @@ fn quota_eviction_fails_closed_when_the_inventory_never_stabilizes() {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_hook = Arc::clone(&calls);
     let day_for_hook = day.clone();
-    set_spool_write_hook_for_tests(Some(Arc::new(move |point| {
+    let hook_root = spool.namespace_root_for_tests().to_path_buf();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
         if point != SpoolWriteHookPoint::QuotaInventoryTaken {
+            return;
+        }
+        // The hook slot is process-global and the test binary runs in parallel:
+        // a concurrent test's eviction must not advance this test's generation
+        // counter, which is what bounds the asserted pass budget.
+        if namespace_root != hook_root.as_path() {
             return;
         }
         // Replace the whole observed generation on every pass. Deleting a
@@ -3500,12 +3514,19 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     };
 
     let hook_gate = Arc::clone(&gate);
-    set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
-        SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
-        SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
-        // This test gates only the write boundary; quota-eviction snapshots are
-        // not part of the stall it asserts.
-        SpoolWriteHookPoint::QuotaInventoryTaken => {}
+    let hook_spool_dir = temp.path().to_path_buf();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
+        // The hook slot is process-global: only gate this test's own spool.
+        if !namespace_root.starts_with(&hook_spool_dir) {
+            return;
+        }
+        match point {
+            SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
+            SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+            // This test gates only the write boundary; quota-eviction snapshots
+            // are not part of the stall it asserts.
+            SpoolWriteHookPoint::QuotaInventoryTaken => {}
+        }
     })));
 
     let (enqueued_baseline, written_baseline, lost_baseline) = spool_delivery_totals();
@@ -3842,12 +3863,19 @@ async fn saturated_spool_delivery_does_not_count_failed_high_water_diversion() {
         gate: Arc::clone(&gate),
     };
     let hook_gate = Arc::clone(&gate);
-    set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
-        SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
-        SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
-        // Quota inventory snapshots are unrelated to the delivery-channel
-        // saturation boundary this test intentionally stalls.
-        SpoolWriteHookPoint::QuotaInventoryTaken => {}
+    let hook_spool_dir = temp.path().to_path_buf();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
+        // The hook slot is process-global: only gate this test's own spool.
+        if !namespace_root.starts_with(&hook_spool_dir) {
+            return;
+        }
+        match point {
+            SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
+            SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+            // Quota inventory snapshots are unrelated to the delivery-channel
+            // saturation boundary this test intentionally stalls.
+            SpoolWriteHookPoint::QuotaInventoryTaken => {}
+        }
     })));
 
     let (_, _, spool_lost_baseline) = spool_delivery_totals();
@@ -7234,10 +7262,17 @@ fn compact_snapshot_recovery_serializes_take_write_restore_attempts() {
         gate: Arc::clone(&gate),
     };
     let hook_gate = Arc::clone(&gate);
-    set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
-        SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
-        SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
-        SpoolWriteHookPoint::QuotaInventoryTaken => {}
+    let hook_spool_dir = temp.path().to_path_buf();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
+        // The hook slot is process-global: only gate this test's own spool.
+        if !namespace_root.starts_with(&hook_spool_dir) {
+            return;
+        }
+        match point {
+            SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
+            SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+            SpoolWriteHookPoint::QuotaInventoryTaken => {}
+        }
     })));
 
     let first_recovery = Arc::clone(&recovery);

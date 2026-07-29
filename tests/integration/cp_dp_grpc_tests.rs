@@ -895,6 +895,7 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
         remote_discovery: false,
+        node_waypoint_capture_scoping: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -984,6 +985,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
         waypoint_name: "api-waypoint".to_string(),
         ambient_udp_source_scoping: false,
         remote_discovery: false,
+        node_waypoint_capture_scoping: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -1008,6 +1010,7 @@ async fn test_native_mesh_client_installs_mesh_slice_from_cp() {
         waypoint_name: None,
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         ambient_udp_source_scoping: false,
+        node_waypoint_capture_scoping: false,
         primary_retry_secs: 0,
     };
     let handle = tokio::spawn(start_native_mesh_client_with_shutdown(
@@ -1661,6 +1664,7 @@ async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
         remote_discovery: false,
+        node_waypoint_capture_scoping: false,
     });
 
     let result = client.mesh_subscribe(request).await;
@@ -4022,6 +4026,7 @@ async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
         remote_discovery: false,
+        node_waypoint_capture_scoping: false,
     });
 
     let result = client.mesh_subscribe(request).await;

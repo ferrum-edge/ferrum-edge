@@ -2194,6 +2194,7 @@ async fn fetch_remote_slice(
             // remote-discovery audience policy on the receiving CP. Both
             // classes fail closed there, so this flag widens nothing.
             remote_discovery: true,
+            node_waypoint_capture_scoping: false,
         };
         // Derive the expectation from the request actually sent, so the two can
         // never drift apart.

@@ -412,12 +412,15 @@ fn every_fault_delay_call_site_is_bounded() {
         "the route-local fault must delay through the shared helper"
     );
 
-    // The TCP stream hook has no per-context peer watch: the stream proxy
-    // races the whole hook against a socket-error watch. It still owes the
-    // shutdown token and the process-wide budget.
-    assert!(
-        plugin.contains("run_fault_delay(d.duration_ms, None)"),
-        "on_stream_connect must delay through the bounded helper"
+    // Stream admission (TCP + UDP/DTLS) and per-datagram UDP/DTLS delays share
+    // the bounded helper: shutdown token + process-wide budget. Peer watches
+    // are owned by the stream/datagram proxy paths that race or drop the hook.
+    assert_eq!(
+        plugin
+            .matches("run_fault_delay(d.duration_ms, None)")
+            .count(),
+        2,
+        "on_stream_connect and on_udp_datagram must each delay through the bounded helper once"
     );
 
     for (name, source) in [

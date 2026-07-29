@@ -507,6 +507,7 @@ fn k8s_proxy_config_reaches_native_and_xds_equivalent_mesh_slices() {
         enforce_sidecar_identity_narrowing: false,
         waypoint_name: None,
         ambient_udp_source_scoping: false,
+        node_waypoint_capture_scoping: false,
     };
     let native = MeshSlice::from_gateway_config(&gateway_config, request);
     assert_eq!(native.proxy_configs.len(), 1);

@@ -254,6 +254,7 @@ fn capp_subscribe_request(namespace: &str) -> MeshSubscribeRequest {
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
         remote_discovery: false,
+        node_waypoint_capture_scoping: false,
     }
 }
 

@@ -5997,7 +5997,7 @@ impl SpoolManager {
         // model real compression/write/fsync latency without changing the
         // request-path enqueue contract. Snapshot the hook once so AfterWrite
         // cannot observe a different (later-installed) hook than BeforeWrite.
-        let _after_hook = SpoolWriteHookAfterGuard::enter();
+        let _after_hook = SpoolWriteHookAfterGuard::enter(&self.namespace_root);
         self.prepare_live_storage_locked()?;
         let bytes = self.materialize_spool_artifact(events)?;
         let incoming_len = bytes.len() as u64;
@@ -6443,7 +6443,10 @@ impl SpoolManager {
             // "already fits" return so the common admission path is untouched,
             // and on a pass that has already paid for a full directory walk.
             if let Some(hook) = snapshot_spool_write_hook_for_tests() {
-                hook(SpoolWriteHookPoint::QuotaInventoryTaken);
+                hook(
+                    SpoolWriteHookPoint::QuotaInventoryTaken,
+                    &self.namespace_root,
+                );
             }
 
             let wall_clock = SystemTime::now();
@@ -7679,7 +7682,14 @@ pub enum SpoolWriteHookPoint {
     QuotaInventoryTaken,
 }
 
-type SpoolWriteHookForTests = Arc<dyn Fn(SpoolWriteHookPoint) + Send + Sync + 'static>;
+/// The hook carries the namespace root of the [`SpoolManager`] that reached the
+/// point, so a hook installed by one test is inert for every other manager.
+///
+/// The slot is process-global and the test binary runs tests in parallel, so
+/// without that discriminator an unrelated test's eviction or write fires the
+/// installed closure — which is an extra, unaccounted invocation for the test
+/// that owns it, not a bug in the code under test.
+type SpoolWriteHookForTests = Arc<dyn Fn(SpoolWriteHookPoint, &Path) + Send + Sync + 'static>;
 
 fn spool_write_hook_slot() -> &'static Mutex<Option<SpoolWriteHookForTests>> {
     static HOOK: OnceLock<Mutex<Option<SpoolWriteHookForTests>>> = OnceLock::new();
@@ -7688,8 +7698,9 @@ fn spool_write_hook_slot() -> &'static Mutex<Option<SpoolWriteHookForTests>> {
 
 /// Install or clear a process-global hook around spool filesystem writes.
 ///
-/// Tests must clear the hook before finishing (including panic paths) and
-/// serialize against other chargeback-sink tests that publish ACTIVE_SINKS.
+/// Tests must clear the hook before finishing (including panic paths), serialize
+/// against other chargeback-sink tests that publish ACTIVE_SINKS, and ignore
+/// every point whose namespace root is not their own spool.
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
@@ -7714,22 +7725,26 @@ fn snapshot_spool_write_hook_for_tests() -> Option<SpoolWriteHookForTests> {
 /// generation has not finished.
 struct SpoolWriteHookAfterGuard {
     hook: Option<SpoolWriteHookForTests>,
+    namespace_root: PathBuf,
 }
 
 impl SpoolWriteHookAfterGuard {
-    fn enter() -> Self {
+    fn enter(namespace_root: &Path) -> Self {
         let hook = snapshot_spool_write_hook_for_tests();
         if let Some(ref hook) = hook {
-            hook(SpoolWriteHookPoint::BeforeWrite);
+            hook(SpoolWriteHookPoint::BeforeWrite, namespace_root);
         }
-        Self { hook }
+        Self {
+            hook,
+            namespace_root: namespace_root.to_path_buf(),
+        }
     }
 }
 
 impl Drop for SpoolWriteHookAfterGuard {
     fn drop(&mut self) {
         if let Some(hook) = self.hook.take() {
-            hook(SpoolWriteHookPoint::AfterWrite);
+            hook(SpoolWriteHookPoint::AfterWrite, &self.namespace_root);
         }
     }
 }

@@ -299,6 +299,41 @@ pub(crate) struct MeshTcpInboundEntry {
     /// Postgres), where peeking would block the relay on the handshake clock
     /// before the backend greeting can arrive.
     pub(crate) first_bytes_inspect: bool,
+    /// `SO_MARK` to stamp on the backend dial, or `None` for an unmarked dial.
+    ///
+    /// `None` for the Sidecar loopback routes built here: the app shares the
+    /// pod netns and there is no per-pod guard to satisfy. The NodeWaypoint
+    /// transparent inbound capture relay synthesizes its own entry with
+    /// `Some(NODE_WAYPOINT_INBOUND_AUTH_MARK)`, because its dial leaves the
+    /// host netns and must be recognized by the pod-veth `ferrum_tc_inbound`
+    /// guard as an authorized relay dial rather than dropped as direct pod
+    /// traffic — and by `ferrum_tc_ingress_redirect` as already-relayed, so it
+    /// is never steered back into the capture listener in a loop.
+    pub(crate) socket_mark: Option<u32>,
+    /// Policy scope of the **destination** workload this relay serves, stamped
+    /// onto `StreamConnectionContext.node_waypoint_policy_scope` so `mesh_authz`
+    /// evaluates namespace/selector-scoped policies against the exact captured
+    /// destination.
+    ///
+    /// `None` for the Sidecar loopback routes built here — Sidecar topology
+    /// never installs the node-waypoint resolver and `per_pod_policy_scoping`
+    /// is off, so `mesh_authz` filters policies at construction against the
+    /// proxy's own identity instead. Only the NodeWaypoint transparent inbound
+    /// capture relay sets it: that listener serves many pods through one socket,
+    /// so the destination workload cannot be inferred from the listener and has
+    /// to ride the entry.
+    pub(crate) node_waypoint_policy_scope:
+        Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    /// When `true`, this entry is a NodeWaypoint transparent-capture relay and
+    /// must never take the Sidecar empty-plugin fast path: unauthenticated
+    /// direct plaintext must run destination L4 authz before the backend dial.
+    /// Precomputed at entry synthesis so the connect path is a bool check.
+    pub(crate) requires_destination_mesh_authz: bool,
+    /// Whether the synthesizing epoch carried an enabled mesh-managed
+    /// `__mesh_authz` instance. Captured with
+    /// [`Self::requires_destination_mesh_authz`] so a missing authz instance
+    /// fails closed without scanning the plugin chain on every connect.
+    pub(crate) has_destination_mesh_authz: bool,
 }
 
 /// Outcome of a raw-TCP egress lookup for a captured original destination
@@ -2246,6 +2281,20 @@ impl RouterCache {
                         service_fqdn: route.service_fqdn.clone(),
                         tls_inspect: route.tls_inspect,
                         first_bytes_inspect: route.first_bytes_inspect,
+                        // Sidecar loopback dial: same netns as the app, no
+                        // per-pod eBPF guard to satisfy.
+                        socket_mark: None,
+                        // Sidecar topology has no per-pod policy scoping: the
+                        // listener serves exactly one workload, so mesh_authz's
+                        // construction-time scope filter already narrowed the
+                        // policy set. Stamping a scope here would be the
+                        // node-waypoint code path on a topology that does not
+                        // enable it.
+                        node_waypoint_policy_scope: None,
+                        // Sidecar preserves the historical empty-chain fast
+                        // path; destination-authz gating is NodeWaypoint-only.
+                        requires_destination_mesh_authz: false,
+                        has_destination_mesh_authz: false,
                     })
                 });
             }
@@ -5691,6 +5740,24 @@ mod tests {
         assert_eq!(
             entry.relay_proxy.id,
             "__mesh-in-tcp-relay-default-redis-6380"
+        );
+        // Sidecar loopback routes are NOT the NodeWaypoint capture relay: the
+        // app shares the pod netns (no marked dial for a pod-veth guard to
+        // admit) and the listener serves exactly one workload, so mesh_authz
+        // narrowed its policy set at construction and per-pod scoping is off.
+        // Stamping either here would silently switch a Sidecar onto the
+        // node-waypoint code path.
+        assert_eq!(
+            entry.socket_mark, None,
+            "Sidecar loopback dials must stay unmarked"
+        );
+        assert!(
+            entry.node_waypoint_policy_scope.is_none(),
+            "Sidecar relay entries must not stamp a node-waypoint destination policy scope"
+        );
+        assert!(
+            !entry.requires_destination_mesh_authz,
+            "Sidecar relay entries must not require NodeWaypoint capture destination authz"
         );
 
         let tcp_entry = table

@@ -53,6 +53,24 @@ pub struct MeshSliceRequest {
     /// for destination-side Ambient UDP per-pod source scoping. The consumer
     /// re-filters it only after trusted pod evidence is validated.
     pub ambient_udp_source_scoping: bool,
+    /// This subscriber is a **NodeWaypoint** whose transparent inbound capture
+    /// listener terminates direct plaintext for the enrolled pods on its node
+    /// (issue #3287). Those pods can live in namespaces OTHER than the
+    /// NodeWaypoint's own, so the capture path needs a dedicated, least-privilege
+    /// destination inventory: the workloads whose trusted
+    /// `Workload.node_waypoint.spiffe_id` names THIS NodeWaypoint, plus the
+    /// PeerAuthentication candidates applicable to them.
+    ///
+    /// Deliberately SEPARATE from [`Self::ambient_udp_source_scoping`]: that flag
+    /// scopes Ambient/ServiceWaypoint UDP **source** evidence, while NodeWaypoint
+    /// UDP stays mesh-wide-only by architecture. Overloading one flag for both
+    /// would either widen the UDP source superset for NodeWaypoint or leave the
+    /// capture destinations unresolvable.
+    ///
+    /// The inventory NEVER widens the ordinary routing views (`workloads`,
+    /// `services`, `mesh_policies`, `peer_authentications`); it rides its own
+    /// slice fields consumed solely by the capture resolver.
+    pub node_waypoint_capture_scoping: bool,
 }
 
 impl Default for MeshSliceRequest {
@@ -68,6 +86,7 @@ impl Default for MeshSliceRequest {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         }
     }
 }
@@ -90,6 +109,7 @@ impl MeshSliceRequest {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         }
     }
 
@@ -110,6 +130,7 @@ impl MeshSliceRequest {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         }
     }
 
@@ -153,6 +174,14 @@ impl MeshSliceRequest {
 
     pub fn with_ambient_udp_source_scoping(mut self, enabled: bool) -> Self {
         self.ambient_udp_source_scoping = enabled;
+        self
+    }
+
+    /// Returns `self` marked as a NodeWaypoint transparent-inbound-capture
+    /// subscription (issue #3287). See
+    /// [`MeshSliceRequest::node_waypoint_capture_scoping`].
+    pub fn with_node_waypoint_capture_scoping(mut self, enabled: bool) -> Self {
+        self.node_waypoint_capture_scoping = enabled;
         self
     }
 
@@ -232,6 +261,38 @@ pub struct MeshSlice {
     /// trust the source node waypoint for legitimate cross-namespace traffic.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub node_waypoint_assertors: Vec<SpiffeId>,
+    /// Destination workloads this NodeWaypoint's transparent inbound capture
+    /// listener may terminate direct plaintext for (issue #3287).
+    ///
+    /// A NodeWaypoint serves every enrolled pod on its node, and those pods can
+    /// live in namespaces OTHER than the NodeWaypoint's own — so `workloads`
+    /// (narrowed to the subscription namespace / service-waypoint visibility)
+    /// cannot answer "which workload owns this captured original destination".
+    /// This inventory is derived from workloads whose trusted
+    /// `Workload.node_waypoint.spiffe_id` names THIS NodeWaypoint, with CP scope
+    /// and bearer-namespace constraints applied before it crosses the boundary.
+    ///
+    /// It is a CAPTURE-ONLY view: it never widens `workloads` / `services` /
+    /// routing visibility, and is read solely by
+    /// `crate::proxy::resolve_node_waypoint_capture_destination`. Empty means
+    /// the capture path resolves NOTHING and fails closed — never a PERMISSIVE
+    /// default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_waypoint_capture_destinations: Vec<Workload>,
+    /// PeerAuthentication candidates applicable to
+    /// [`Self::node_waypoint_capture_destinations`] (issue #3287).
+    ///
+    /// `peer_authentications` is narrowed to the subscription namespace, so a
+    /// STRICT PeerAuthentication in a CAPTURED pod's own namespace would never
+    /// reach a NodeWaypoint deployed elsewhere — and the capture resolver would
+    /// see no policy and default PERMISSIVE, admitting direct plaintext where
+    /// STRICT is required. This carries exactly the candidates the destination
+    /// resolution needs (mesh-wide/root-namespace, namespace-scoped, and
+    /// selector-scoped entries applicable to the destination workloads), and
+    /// nothing else. Istio precedence and port overrides are then resolved by
+    /// the canonical [`resolve_effective_mtls_mode`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_waypoint_capture_peer_authentications: Vec<PeerAuthentication>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<MeshService>,
     /// Inbound-only view: the LOCAL workload's own service(s), captured
@@ -472,6 +533,85 @@ pub(crate) fn node_waypoint_assertors_from_workloads<'a>(
     ids.into_values().collect()
 }
 
+/// Destination workloads a NodeWaypoint identified by `node_waypoint_spiffe_id`
+/// terminates transparent inbound capture for (issue #3287).
+///
+/// A workload is admitted only when its trusted `Workload.node_waypoint`
+/// endpoint names EXACTLY this NodeWaypoint's SPIFFE ID — the same field the
+/// secured NodeWaypoint transport pins as the destination's server identity.
+/// This is intentionally the narrowest available key: it is per-node, it is set
+/// by the config authority (never by the pod), and it does not depend on
+/// namespace visibility, so a legitimately cross-namespace enrolled pod is
+/// carried while every unrelated workload is excluded.
+///
+/// Fails closed on a missing/blank identity: without knowing WHICH NodeWaypoint
+/// is asking there is no least-privilege answer, so the inventory is empty and
+/// the capture path resolves nothing.
+///
+/// Callers are responsible for applying CP scope / bearer-namespace constraints
+/// to `workloads` BEFORE calling; this function applies no authorization of its
+/// own.
+pub(crate) fn node_waypoint_capture_destinations_from_workloads<'a>(
+    workloads: impl IntoIterator<Item = &'a Workload>,
+    node_waypoint_spiffe_id: Option<&str>,
+) -> Vec<Workload> {
+    let Some(node_waypoint_spiffe_id) = node_waypoint_spiffe_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    workloads
+        .into_iter()
+        .filter(|workload| {
+            workload
+                .node_waypoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.spiffe_id.as_str() == node_waypoint_spiffe_id)
+        })
+        .cloned()
+        .collect()
+}
+
+/// PeerAuthentication candidates applicable to `destinations` (issue #3287).
+///
+/// Uses the canonical `peer_auth_applies_to_workload` predicate against each
+/// destination workload's OWN namespace and labels, so Istio's root-namespace /
+/// mesh-wide, namespace-scoped, and selector-scoped applicability are all
+/// preserved exactly as the destination itself would resolve them. Precedence
+/// and port overrides are NOT resolved here — that stays with
+/// [`resolve_effective_mtls_mode`] at capture time, against the single exact
+/// destination.
+///
+/// Returns an empty vec for an empty destination set: with no destination there
+/// is nothing to authorize and carrying policy would only leak it.
+pub(crate) fn node_waypoint_capture_peer_authentications_for_destinations<'a>(
+    peer_authentications: impl IntoIterator<Item = &'a PeerAuthentication>,
+    destinations: &[Workload],
+) -> Vec<PeerAuthentication> {
+    if destinations.is_empty() {
+        return Vec::new();
+    }
+    let destination_scopes: Vec<(String, BTreeMap<String, String>)> = destinations
+        .iter()
+        .map(|workload| {
+            (
+                workload.namespace.clone(),
+                labels_to_btree(&workload.selector.labels),
+            )
+        })
+        .collect();
+    peer_authentications
+        .into_iter()
+        .filter(|peer_auth| {
+            destination_scopes.iter().any(|(namespace, labels)| {
+                peer_auth_applies_to_workload(peer_auth, namespace, labels)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 impl MeshSlice {
     /// Compare mesh-slice content while ignoring the transport version stamp.
     ///
@@ -493,6 +633,16 @@ impl MeshSlice {
             && self.workloads == other.workloads
             && self.ambient_udp_source_workloads == other.ambient_udp_source_workloads
             && self.node_waypoint_assertors == other.node_waypoint_assertors
+            // The NodeWaypoint capture inventory changes independently of
+            // `workloads` / `peer_authentications` (a pod in ANOTHER namespace
+            // enrolling on this node, or that namespace's PeerAuthentication
+            // flipping to STRICT, moves only these two fields). Omitting them
+            // from slice equality would let CP-side dedupe keep serving a stale
+            // capture posture — i.e. admitting plaintext after the operator made
+            // the destination STRICT.
+            && self.node_waypoint_capture_destinations == other.node_waypoint_capture_destinations
+            && self.node_waypoint_capture_peer_authentications
+                == other.node_waypoint_capture_peer_authentications
             && self.services == other.services
             && self.local_inbound_services == other.local_inbound_services
             && self.local_inbound_workloads == other.local_inbound_workloads
@@ -775,6 +925,40 @@ impl MeshSlice {
         } else {
             mesh.node_waypoint_assertors.clone()
         };
+        // NodeWaypoint transparent-inbound-capture inventory (issue #3287).
+        // Computed from the PRE-narrowing view on purpose: an enrolled pod this
+        // NodeWaypoint captures for can live in another namespace, so deriving it
+        // after the `workloads` narrowing below would silently drop exactly the
+        // cross-namespace destinations whose PeerAuthentication posture must be
+        // enforced. When the CP already resolved it (`filter_mesh_config_to_request`
+        // runs BEFORE its own namespace retains and applies scope/bearer
+        // authorization), that authoritative value wins; the `is_empty` fallback
+        // covers the file/local source and any CP that resolved nothing, and can
+        // only ever yield a SUBSET of the authorized inventory — never a widening.
+        let (node_waypoint_capture_destinations, node_waypoint_capture_peer_authentications) =
+            if request.node_waypoint_capture_scoping {
+                let destinations = if mesh.node_waypoint_capture_destinations.is_empty() {
+                    node_waypoint_capture_destinations_from_workloads(
+                        mesh.workloads.iter(),
+                        request.workload_spiffe_id.as_deref(),
+                    )
+                } else {
+                    mesh.node_waypoint_capture_destinations.clone()
+                };
+                let candidates = if mesh.node_waypoint_capture_peer_authentications.is_empty() {
+                    &mesh.peer_authentications
+                } else {
+                    &mesh.node_waypoint_capture_peer_authentications
+                };
+                let peer_authentications =
+                    node_waypoint_capture_peer_authentications_for_destinations(
+                        candidates.iter(),
+                        &destinations,
+                    );
+                (destinations, peer_authentications)
+            } else {
+                (Vec::new(), Vec::new())
+            };
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
@@ -1289,6 +1473,8 @@ impl MeshSlice {
             workloads,
             ambient_udp_source_workloads,
             node_waypoint_assertors,
+            node_waypoint_capture_destinations,
+            node_waypoint_capture_peer_authentications,
             services,
             local_inbound_services,
             local_inbound_workloads,
@@ -3121,6 +3307,7 @@ mod tests {
                 namespace: "infra".into(),
                 waypoint_name: Some("waypoint".into()),
                 ambient_udp_source_scoping: true,
+                node_waypoint_capture_scoping: false,
                 ..MeshSliceRequest::default()
             },
         );
@@ -3260,6 +3447,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         }
     }
 
@@ -3278,6 +3466,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         }
     }
 
@@ -3303,6 +3492,8 @@ mod tests {
             workloads: vec![make_workload("ns", "web", HashMap::new())],
             ambient_udp_source_workloads: Vec::new(),
             node_waypoint_assertors: Vec::new(),
+            node_waypoint_capture_destinations: Vec::new(),
+            node_waypoint_capture_peer_authentications: Vec::new(),
             services: vec![make_service("ns", "web")],
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
@@ -4433,6 +4624,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // The slice should inherit labels from the matched workload.
@@ -4491,6 +4683,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -4573,6 +4766,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -4646,6 +4840,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         };
 
         let slice = MeshSlice::from_gateway_config(&config, request);
@@ -4692,6 +4887,7 @@ mod tests {
             enforce_sidecar_identity_narrowing: false,
             waypoint_name: None,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
         // Explicit labels should be used, not the workload's labels.
@@ -5131,6 +5327,7 @@ mod tests {
                 enforce_sidecar_identity_narrowing: false,
                 waypoint_name: None,
                 ambient_udp_source_scoping: false,
+                node_waypoint_capture_scoping: false,
             },
         );
 
@@ -5940,6 +6137,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         }
     }
 
@@ -5958,6 +6156,7 @@ mod tests {
             sidecar_egress_dry_run: false,
             enforce_sidecar_identity_narrowing: false,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
         }
     }
 

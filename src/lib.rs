@@ -484,6 +484,35 @@ pub mod _test_support {
             .plugins_for_protocol(namespace, proxy_id, protocol)
     }
 
+    /// Read the generation-level NodeWaypoint transparent-capture
+    /// destination-authz readiness bit the plugin cache precomputed.
+    ///
+    /// This is the exact value `build_node_waypoint_capture_relay_entry` stamps
+    /// onto a synthesized capture relay entry and the value the captured-
+    /// connection handler re-checks before dialing the backend. Exposed so
+    /// external coverage can pin managed-vs-operator / disabled / wrong-scope /
+    /// wrong-name semantics without a config or plugin-chain scan.
+    pub fn node_waypoint_destination_authz_ready_for_test(cache: &crate::PluginCache) -> bool {
+        cache.load_inner().node_waypoint_destination_authz_ready()
+    }
+
+    /// Decide the same readiness bit straight from its three generation counts.
+    ///
+    /// Lets coverage pin the "managed reserved row is configured but its
+    /// runtime policy never reached the prebuilt global TCP chain" arm, which
+    /// cannot be produced by config alone.
+    pub fn node_waypoint_destination_authz_ready_from_counts_for_test(
+        managed_config_present: bool,
+        enabled_global_mesh_authz_configs: usize,
+        built_global_tcp_mesh_authz_plugins: usize,
+    ) -> bool {
+        crate::plugin_cache::node_waypoint_destination_authz_ready_from_counts(
+            managed_config_present,
+            enabled_global_mesh_authz_configs,
+            built_global_tcp_mesh_authz_plugins,
+        )
+    }
+
     /// Resolve the same protocol plugin list with a BARE proxy ID — the
     /// spelling that misses every namespace-keyed protocol entry and silently
     /// falls back to the global chain (issue #3094). Exposed only so

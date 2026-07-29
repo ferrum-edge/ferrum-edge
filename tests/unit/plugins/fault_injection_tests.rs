@@ -435,13 +435,9 @@ fn test_supported_protocols() {
     .unwrap();
     assert_eq!(
         plugin.supported_protocols(),
-        &[
-            ferrum_edge::plugins::ProxyProtocol::Http,
-            ferrum_edge::plugins::ProxyProtocol::Grpc,
-            ferrum_edge::plugins::ProxyProtocol::WebSocket,
-            ferrum_edge::plugins::ProxyProtocol::Tcp,
-        ]
+        ferrum_edge::plugins::ALL_PROTOCOLS
     );
+    assert!(plugin.requires_udp_datagram_hooks());
 }
 
 #[test]
@@ -1380,5 +1376,176 @@ mod peer_departure {
         assert!(matches!(result, PluginResult::Continue));
         assert_eq!(ctx.metadata.get("fault_type").unwrap(), "delay");
         assert!(!ctx.metadata.contains_key("fault_delay_outcome"));
+    }
+}
+
+// === UDP / DTLS datagram path ===
+
+mod udp_datagram_faults {
+    use super::*;
+    use ferrum_edge::plugins::{
+        StreamBytesKind, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
+        UdpMetadataSink,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    fn datagram_ctx<'a>(
+        direction: UdpDatagramDirection,
+        payload: &'a [u8],
+        sink: Option<UdpMetadataSink<'a>>,
+    ) -> UdpDatagramContext<'a> {
+        UdpDatagramContext {
+            client_ip: Arc::from("127.0.0.1"),
+            proxy_id: Arc::from("udp-proxy"),
+            proxy_name: Some(Arc::from("udp")),
+            listen_port: 9000,
+            datagram_size: payload.len(),
+            direction,
+            payload,
+            payload_kind: StreamBytesKind::PlaintextWire,
+            metadata_sink: sink,
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_drops_client_to_backend_datagram_and_records_metadata() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "abort": { "status_code": 503, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let metadata = Mutex::new(HashMap::new());
+        let ctx = datagram_ctx(
+            UdpDatagramDirection::ClientToBackend,
+            b"ping",
+            Some(UdpMetadataSink::new(&metadata)),
+        );
+        let verdict = plugin.on_udp_datagram(&ctx).await;
+        assert_eq!(verdict, UdpDatagramVerdict::Drop);
+
+        let map = metadata.lock().unwrap();
+        assert_eq!(map.get("fault_injected").unwrap(), "true");
+        assert_eq!(map.get("fault_type").unwrap(), "abort");
+        assert_eq!(map.get("fault_abort_status").unwrap(), "503");
+    }
+
+    #[tokio::test]
+    async fn abort_does_not_fault_backend_to_client_datagrams() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "abort": { "status_code": 503, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let ctx = datagram_ctx(UdpDatagramDirection::BackendToClient, b"pong", None);
+        assert_eq!(
+            plugin.on_udp_datagram(&ctx).await,
+            UdpDatagramVerdict::Forward
+        );
+    }
+
+    #[tokio::test]
+    async fn delay_then_abort_delays_before_drop() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "abort": { "status_code": 500, "percentage": 100.0 },
+            "delay": { "duration_ms": 1, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let metadata = Mutex::new(HashMap::new());
+        let ctx = datagram_ctx(
+            UdpDatagramDirection::ClientToBackend,
+            b"ping",
+            Some(UdpMetadataSink::new(&metadata)),
+        );
+        let start = std::time::Instant::now();
+        let verdict = plugin.on_udp_datagram(&ctx).await;
+        assert!(start.elapsed() >= std::time::Duration::from_millis(1));
+        assert_eq!(verdict, UdpDatagramVerdict::Drop);
+
+        let map = metadata.lock().unwrap();
+        assert_eq!(map.get("fault_type").unwrap(), "delay_and_abort");
+        assert_eq!(map.get("fault_delay_ms").unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn delay_only_forwards_after_wait() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "delay": { "duration_ms": 1, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let metadata = Mutex::new(HashMap::new());
+        let ctx = datagram_ctx(
+            UdpDatagramDirection::ClientToBackend,
+            b"ping",
+            Some(UdpMetadataSink::new(&metadata)),
+        );
+        assert_eq!(
+            plugin.on_udp_datagram(&ctx).await,
+            UdpDatagramVerdict::Forward
+        );
+        let map = metadata.lock().unwrap();
+        assert_eq!(map.get("fault_type").unwrap(), "delay");
+        assert_eq!(map.get("fault_delay_ms").unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn stream_connect_abort_rejects_udp_session_admission() {
+        use ferrum_edge::config::types::BackendScheme;
+        use ferrum_edge::consumer_index::ConsumerIndex;
+        use ferrum_edge::plugins::StreamConnectionContext;
+
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "abort": { "status_code": 503, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let mut ctx = StreamConnectionContext::new(
+            "127.0.0.1".to_string(),
+            "127.0.0.1".to_string(),
+            "udp-proxy".to_string(),
+            Some("udp".to_string()),
+            9000,
+            BackendScheme::Udp,
+            Arc::new(ConsumerIndex::new(&[])),
+        );
+        match plugin.on_stream_connect(&mut ctx).await {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 503),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+        let metadata = ctx.take_metadata();
+        assert_eq!(metadata.get("fault_type").unwrap(), "abort");
+    }
+
+    #[tokio::test]
+    async fn stream_connect_delay_is_skipped_for_udp_so_datagram_hook_owns_latency() {
+        use ferrum_edge::config::types::BackendScheme;
+        use ferrum_edge::consumer_index::ConsumerIndex;
+        use ferrum_edge::plugins::StreamConnectionContext;
+
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "delay": { "duration_ms": 5_000, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let mut ctx = StreamConnectionContext::new(
+            "127.0.0.1".to_string(),
+            "127.0.0.1".to_string(),
+            "udp-proxy".to_string(),
+            None,
+            9000,
+            BackendScheme::Udp,
+            Arc::new(ConsumerIndex::new(&[])),
+        );
+        let start = std::time::Instant::now();
+        assert!(matches!(
+            plugin.on_stream_connect(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "UDP stream connect must not park on delay"
+        );
     }
 }

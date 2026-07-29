@@ -6,9 +6,10 @@
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::{HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf};
 use ferrum_ebpf_common::{
-    BpfCaptureConfig, CidrKey4, CidrKey6, ConnTuple4, ConnTuple6, IncludePortsPolicy,
-    NodeProbePortKey4, NodeProbePortKey6, OrigDst4, OrigDst6, OrigDstKey, PodInfo,
-    WorkloadIdentity, SOCK_OPS_RINGBUF_DEFAULT_BYTES, SOCK_OPS_STATS_LEN,
+    BpfCaptureConfig, CidrKey4, CidrKey6, ConnTuple4, ConnTuple6, InboundRedirectKey4,
+    InboundRedirectKey6, IncludePortsPolicy, NodeProbePortKey4, NodeProbePortKey6, OrigDst4,
+    OrigDst6, OrigDstKey, PodInfo, WorkloadIdentity, SOCK_OPS_RINGBUF_DEFAULT_BYTES,
+    SOCK_OPS_STATS_LEN,
 };
 
 /// Original IPv4 destination before connect rewrite, keyed by socket cookie.
@@ -86,6 +87,22 @@ pub static FERRUM_NODE_PROBE_PORTS: HashMap<NodeProbePortKey4, u8> =
 /// IPv6 counterpart to `FERRUM_NODE_PROBE_PORTS`.
 #[map]
 pub static FERRUM_NODE_PROBE_PORTS6: HashMap<NodeProbePortKey6, u8> =
+    HashMap::with_max_entries(16384, 0);
+
+/// Inbound TCP application ports the NodeWaypoint relay is authorized to
+/// terminate on behalf of an enrolled IPv4 pod.
+///
+/// `ferrum_tc_ingress_redirect` requires an exact `(pod address, destination
+/// port)` hit before it steers a packet into the local relay, so the redirect
+/// is scoped to the ports the enrolled workload actually declares. An enrolled
+/// pod's undeclared ports and every un-enrolled pod are left untouched.
+#[map]
+pub static FERRUM_POD_INBOUND_PORTS: HashMap<InboundRedirectKey4, u8> =
+    HashMap::with_max_entries(16384, 0);
+
+/// IPv6 counterpart to `FERRUM_POD_INBOUND_PORTS`.
+#[map]
+pub static FERRUM_POD_INBOUND_PORTS6: HashMap<InboundRedirectKey6, u8> =
     HashMap::with_max_entries(16384, 0);
 
 /// UIDs exempt from outbound capture (proxy UID 1337).

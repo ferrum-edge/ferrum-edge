@@ -853,6 +853,12 @@ pub fn pod_event_from_request<'a>(
         pod_ip_str: None,
         pod_source_ips: crate::modes::node_agent::PodSourceIps::default(),
         node_probe_ports: Vec::new(),
+        // The CNI wire carries no pod spec, so no `containerPorts` are known
+        // here. Empty means the pod is NOT enrolled for the inbound tc ingress
+        // redirect on this event — the kube-rs watcher reconciles the real
+        // declared ports moments later. Fail-closed by construction: an
+        // unscoped pod is never flagged for redirect.
+        inbound_redirect_ports: Vec::new(),
         pod_pid: None,
         veth_iface_override: None,
     }

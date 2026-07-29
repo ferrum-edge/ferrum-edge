@@ -410,3 +410,276 @@ async fn resolve_stream_against_real_accepted_socket_maps_to_pod_scope() {
          namespace policy to the source pod"
     );
 }
+
+// ── NodeWaypoint transparent-inbound-capture destination inventory (#3287) ──
+//
+// A NodeWaypoint serves every ENROLLED pod on its node, and those pods routinely
+// live in namespaces other than the NodeWaypoint's own. The capture listener
+// terminates unauthenticated direct plaintext, so the destination's own
+// PeerAuthentication posture is the only gate — and the ordinary
+// subscription-namespace `peer_authentications` view cannot express it.
+//
+// These cases pin the TRANSPORT: that the cross-namespace destination and its
+// STRICT policy actually reach the DP over each config protocol (native/file
+// slice projection, and the xDS ECDS carriers), and that an unauthorized or
+// foreign-node destination is absent. The resolver-side enforcement is pinned in
+// `src/proxy/node_waypoint_ingress_capture.rs`, which can reach the crate-private
+// resolver directly.
+mod node_waypoint_capture_inventory {
+    use std::collections::HashMap;
+
+    use ferrum_edge::config::types::GatewayConfig;
+    use ferrum_edge::identity::SpiffeId;
+    use ferrum_edge::identity::spiffe::TrustDomain;
+    use ferrum_edge::modes::mesh::config::{
+        AppProtocol, MeshConfig, MtlsMode, NodeWaypointEndpoint, PeerAuthentication, PolicyScope,
+        Workload, WorkloadPort, WorkloadSelector,
+    };
+    use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
+    use ferrum_edge::xds::carrier::MeshSliceCarrier;
+
+    const THIS_WAYPOINT: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-a";
+    const OTHER_WAYPOINT: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-b";
+    const APP_PORT: u16 = 8080;
+
+    fn workload(namespace: &str, name: &str, waypoint: &str, address: &str) -> Workload {
+        let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+        Workload {
+            spiffe_id: SpiffeId::new(format!("spiffe://cluster.local/ns/{namespace}/sa/{name}"))
+                .expect("workload SPIFFE ID"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), name.to_string())]),
+                namespace: Some(namespace.to_string()),
+            },
+            service_name: name.to_string(),
+            addresses: vec![address.to_string()],
+            ports: vec![WorkloadPort {
+                port: APP_PORT,
+                protocol: AppProtocol::Http,
+                name: None,
+            }],
+            trust_domain,
+            namespace: namespace.to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some(name.to_string()),
+            pod_uid: None,
+            node_waypoint: Some(NodeWaypointEndpoint {
+                address: "10.0.0.1".to_string(),
+                hbone_port: 15008,
+                spiffe_id: SpiffeId::new(waypoint).expect("node waypoint SPIFFE ID"),
+                node_name: None,
+                node_uid: None,
+                network: None,
+                cluster: None,
+            }),
+            remote_provenance: false,
+        }
+    }
+
+    fn namespace_peer_auth(namespace: &str, mode: MtlsMode) -> PeerAuthentication {
+        PeerAuthentication {
+            name: format!("{namespace}-default"),
+            namespace: namespace.to_string(),
+            scope: Some(PolicyScope::Namespace {
+                namespace: namespace.to_string(),
+            }),
+            selector: None,
+            mtls_mode: mode,
+            port_overrides: HashMap::new(),
+        }
+    }
+
+    /// The local document a `FERRUM_MESH_CONFIG_PROTOCOL=file` NodeWaypoint
+    /// loads, or the CP-authorized view a native subscriber receives.
+    fn config_with_workloads() -> GatewayConfig {
+        GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![
+                    workload("payments", "ledger", THIS_WAYPOINT, "10.244.1.7"),
+                    workload("payments", "reports", OTHER_WAYPOINT, "10.244.1.8"),
+                ],
+                peer_authentications: vec![
+                    namespace_peer_auth("payments", MtlsMode::Strict),
+                    namespace_peer_auth("ferrum", MtlsMode::Permissive),
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        }
+    }
+
+    fn node_waypoint_request() -> MeshSliceRequest {
+        MeshSliceRequest {
+            node_id: "node-a".to_string(),
+            namespace: "ferrum".to_string(),
+            workload_spiffe_id: Some(THIS_WAYPOINT.to_string()),
+            node_waypoint_capture_scoping: true,
+            ..MeshSliceRequest::default()
+        }
+    }
+
+    /// File/local slicing derives the inventory DP-side from the same document.
+    /// The `payments` STRICT policy must ride the capture fields even though the
+    /// NodeWaypoint's own namespace is `ferrum`, and the pod enrolled on another
+    /// node's NodeWaypoint must be absent.
+    #[test]
+    fn local_slicing_carries_the_cross_namespace_capture_destination_and_policy() {
+        let slice =
+            MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
+
+        assert_eq!(
+            slice
+                .node_waypoint_capture_destinations
+                .iter()
+                .map(|workload| workload.service_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ledger"],
+            "only pods enrolled on THIS NodeWaypoint may be captured for"
+        );
+        assert_eq!(
+            slice
+                .node_waypoint_capture_peer_authentications
+                .iter()
+                .map(|policy| policy.namespace.as_str())
+                .collect::<Vec<_>>(),
+            vec!["payments"],
+            "the captured pod's OWN namespace STRICT policy must be carried; the NodeWaypoint's \
+             own `ferrum` policy is not applicable to it and must not be"
+        );
+        assert_eq!(
+            slice.node_waypoint_capture_peer_authentications[0].mtls_mode,
+            MtlsMode::Strict
+        );
+
+        // Routing visibility is untouched: the cross-namespace pod does not
+        // appear in `workloads`, and the capture policy does not leak into the
+        // proxy's own `peer_authentications` posture view.
+        assert!(
+            slice
+                .workloads
+                .iter()
+                .all(|workload| workload.namespace == "ferrum"),
+            "the capture inventory must not widen the routing workload view"
+        );
+        assert!(
+            slice
+                .peer_authentications
+                .iter()
+                .all(|policy| policy.namespace == "ferrum"),
+            "the capture inventory must not widen the proxy's own PeerAuthentication view"
+        );
+    }
+
+    /// A non-NodeWaypoint subscriber (the flag absent) receives no inventory at
+    /// all — the capture path is the only consumer, and carrying it elsewhere
+    /// would be a gratuitous cross-namespace disclosure.
+    #[test]
+    fn a_non_node_waypoint_subscription_receives_no_capture_inventory() {
+        let mut request = node_waypoint_request();
+        request.node_waypoint_capture_scoping = false;
+        let slice = MeshSlice::from_gateway_config(&config_with_workloads(), request);
+        assert!(slice.node_waypoint_capture_destinations.is_empty());
+        assert!(slice.node_waypoint_capture_peer_authentications.is_empty());
+    }
+
+    /// A NodeWaypoint whose own identity is unknown cannot be matched against
+    /// `Workload.node_waypoint.spiffe_id`, so there is no least-privilege answer
+    /// and the inventory is empty (the capture path then refuses every
+    /// connection rather than resolving one with the wrong policy).
+    #[test]
+    fn an_identity_less_node_waypoint_subscription_fails_closed() {
+        let mut request = node_waypoint_request();
+        request.workload_spiffe_id = None;
+        let slice = MeshSlice::from_gateway_config(&config_with_workloads(), request);
+        assert!(slice.node_waypoint_capture_destinations.is_empty());
+        assert!(slice.node_waypoint_capture_peer_authentications.is_empty());
+    }
+
+    /// xDS parity: the inventory rides its OWN ECDS carriers, so an xDS-built
+    /// slice reaches the same capture posture a native-built one does. Without
+    /// this the xDS DP would silently hold an empty inventory.
+    #[test]
+    fn the_capture_inventory_round_trips_over_the_xds_ecds_carriers() {
+        let slice =
+            MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
+        let resources = ferrum_edge::xds::translator::translate_mesh_slice_carriers(&slice);
+
+        let mut rebuilt = MeshSlice::default();
+        let mut saw_destinations = false;
+        let mut saw_peer_authentications = false;
+        for resource in &resources {
+            // The ECDS resource body is an encoded `TypedExtensionConfig`; the
+            // Ferrum carrier is its inner `Any`, exactly as the DP recovers it.
+            let typed_extension =
+                <ferrum_edge::xds::proto::TypedExtensionConfig as prost::Message>::decode(
+                    resource.value.as_slice(),
+                )
+                .expect("ECDS resource decodes as TypedExtensionConfig");
+            let Some(inner) = typed_extension.typed_config.as_ref() else {
+                continue;
+            };
+            let Some(carrier) =
+                MeshSliceCarrier::decode(&inner.type_url, &inner.value).expect("carrier decodes")
+            else {
+                continue;
+            };
+            saw_destinations |= matches!(
+                carrier,
+                MeshSliceCarrier::NodeWaypointCaptureDestinations(_)
+            );
+            saw_peer_authentications |= matches!(
+                carrier,
+                MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(_)
+            );
+            ferrum_edge::xds::carrier::apply_carrier(&mut rebuilt, carrier);
+        }
+
+        assert!(
+            saw_destinations && saw_peer_authentications,
+            "both capture carriers must be emitted when the inventory is non-empty"
+        );
+        assert_eq!(
+            rebuilt.node_waypoint_capture_destinations,
+            slice.node_waypoint_capture_destinations
+        );
+        assert_eq!(
+            rebuilt.node_waypoint_capture_peer_authentications,
+            slice.node_waypoint_capture_peer_authentications
+        );
+    }
+
+    /// `content_eq` backs CP-side update dedupe. The capture inventory moves
+    /// independently of every other field (a pod in another namespace enrolling,
+    /// or that namespace flipping to STRICT), so omitting it would keep serving
+    /// a stale — and more permissive — capture posture.
+    #[test]
+    fn content_eq_observes_the_capture_inventory() {
+        let strict =
+            MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
+
+        let mut permissive_config = config_with_workloads();
+        permissive_config
+            .mesh
+            .as_deref_mut()
+            .expect("mesh")
+            .peer_authentications[0] = namespace_peer_auth("payments", MtlsMode::Permissive);
+        let permissive =
+            MeshSlice::from_gateway_config(&permissive_config, node_waypoint_request());
+
+        assert!(
+            !strict.content_eq(&permissive),
+            "a captured destination's PeerAuthentication flipping STRICT→PERMISSIVE must not be \
+             deduped away"
+        );
+
+        let mut dropped = strict.clone();
+        dropped.node_waypoint_capture_destinations.clear();
+        assert!(
+            !strict.content_eq(&dropped),
+            "a captured destination leaving the inventory must not be deduped away"
+        );
+    }
+}

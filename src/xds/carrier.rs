@@ -109,6 +109,20 @@ pub const FERRUM_ECDS_AMBIENT_UDP_SOURCE_WORKLOADS_TYPE_URL: &str =
 /// Inner `type_url` for the exact NodeWaypoint assertor SPIFFE inventory.
 pub const FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.NodeWaypointAssertorsCarrier";
+/// Inner `type_url` for the NodeWaypoint transparent-inbound-capture destination
+/// workload inventory (issue #3287). Carried SEPARATELY from `WorkloadsCarrier`
+/// because it is a cross-namespace, capture-only view: it must never widen the
+/// DP's routing / known-destination visibility.
+pub const FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_DESTINATIONS_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.NodeWaypointCaptureDestinationsCarrier";
+/// Inner `type_url` for the PeerAuthentication candidates applicable to the
+/// NodeWaypoint capture destinations (issue #3287). Carried SEPARATELY from
+/// `PeerAuthenticationsCarrier`, which is the subscription-namespace view that
+/// governs this proxy's OWN inbound posture; without this carrier a captured
+/// pod's cross-namespace STRICT policy never reaches the DP and the capture
+/// resolver would default PERMISSIVE.
+pub const FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.NodeWaypointCapturePeerAuthenticationsCarrier";
 /// Inner `type_url` for the effective workload-label context carrier.
 pub const FERRUM_ECDS_LABELS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WorkloadLabelsCarrier";
@@ -185,6 +199,12 @@ pub enum MeshSliceCarrier {
     Workloads(Vec<Workload>),
     AmbientUdpSourceWorkloads(Vec<Workload>),
     NodeWaypointAssertors(Vec<SpiffeId>),
+    /// Cross-namespace NodeWaypoint capture destination workloads (issue #3287);
+    /// see [`FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_DESTINATIONS_TYPE_URL`].
+    NodeWaypointCaptureDestinations(Vec<Workload>),
+    /// PeerAuthentication candidates for those destinations (issue #3287); see
+    /// [`FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL`].
+    NodeWaypointCapturePeerAuthentications(Vec<PeerAuthentication>),
     WorkloadLabels(BTreeMap<String, String>),
     /// Marker: `WorkloadLabels` is an ambiguous shared-SPIFFE intersection, not
     /// the workload's authoritative labels. Always `true` when emitted (the CP
@@ -231,6 +251,12 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::NodeWaypointAssertors(_) => {
                 FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL
             }
+            MeshSliceCarrier::NodeWaypointCaptureDestinations(_) => {
+                FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_DESTINATIONS_TYPE_URL
+            }
+            MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(_) => {
+                FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL
+            }
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::LabelsAmbiguous(_) => FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL,
             MeshSliceCarrier::MeshPolicies(_) => FERRUM_ECDS_MESH_POLICIES_TYPE_URL,
@@ -262,6 +288,12 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::Workloads(_) => "workloads",
             MeshSliceCarrier::AmbientUdpSourceWorkloads(_) => "ambient-udp-source-workloads",
             MeshSliceCarrier::NodeWaypointAssertors(_) => "node-waypoint-assertors",
+            MeshSliceCarrier::NodeWaypointCaptureDestinations(_) => {
+                "node-waypoint-capture-destinations"
+            }
+            MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(_) => {
+                "node-waypoint-capture-peer-authentications"
+            }
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::LabelsAmbiguous(_) => "workload-labels-ambiguous",
             MeshSliceCarrier::MeshPolicies(_) => "mesh-policies",
@@ -292,6 +324,8 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::Workloads(value) => encode(value),
             MeshSliceCarrier::AmbientUdpSourceWorkloads(value) => encode(value),
             MeshSliceCarrier::NodeWaypointAssertors(value) => encode(value),
+            MeshSliceCarrier::NodeWaypointCaptureDestinations(value) => encode(value),
+            MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(value) => encode(value),
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
             MeshSliceCarrier::LabelsAmbiguous(value) => encode(value),
             MeshSliceCarrier::MeshPolicies(value) => encode(value),
@@ -348,6 +382,12 @@ impl MeshSliceCarrier {
             }
             FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL => {
                 MeshSliceCarrier::NodeWaypointAssertors(decode_json(value)?)
+            }
+            FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_DESTINATIONS_TYPE_URL => {
+                MeshSliceCarrier::NodeWaypointCaptureDestinations(decode_json(value)?)
+            }
+            FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL => {
+                MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(decode_json(value)?)
             }
             FERRUM_ECDS_LABELS_TYPE_URL => MeshSliceCarrier::WorkloadLabels(decode_json(value)?),
             FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL => {
@@ -419,6 +459,12 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         }
         FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL => {
             Some("ferrum-mesh-carrier/node-waypoint-assertors")
+        }
+        FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_DESTINATIONS_TYPE_URL => {
+            Some("ferrum-mesh-carrier/node-waypoint-capture-destinations")
+        }
+        FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL => {
+            Some("ferrum-mesh-carrier/node-waypoint-capture-peer-authentications")
         }
         FERRUM_ECDS_LABELS_TYPE_URL => Some("ferrum-mesh-carrier/workload-labels"),
         FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL => {
@@ -527,6 +573,20 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
             slice.node_waypoint_assertors.clone(),
         ));
     }
+    // NodeWaypoint transparent-inbound-capture inventory (issue #3287). Emitted
+    // on their own carriers so an xDS-built slice reaches the same capture
+    // posture a native-built one does; absent carriers leave the DP inventory
+    // empty and the capture path fails closed.
+    if !slice.node_waypoint_capture_destinations.is_empty() {
+        carriers.push(MeshSliceCarrier::NodeWaypointCaptureDestinations(
+            slice.node_waypoint_capture_destinations.clone(),
+        ));
+    }
+    if !slice.node_waypoint_capture_peer_authentications.is_empty() {
+        carriers.push(MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(
+            slice.node_waypoint_capture_peer_authentications.clone(),
+        ));
+    }
     // Emitted UNCONDITIONALLY (unlike the other field groups, which are gated
     // on non-empty), even when `slice.labels` is empty. This push is
     // load-bearing: it is what makes `recovered.slice_carrier_seen` reliably
@@ -617,6 +677,12 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
             slice.ambient_udp_source_workloads = value
         }
         MeshSliceCarrier::NodeWaypointAssertors(value) => slice.node_waypoint_assertors = value,
+        MeshSliceCarrier::NodeWaypointCaptureDestinations(value) => {
+            slice.node_waypoint_capture_destinations = value
+        }
+        MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(value) => {
+            slice.node_waypoint_capture_peer_authentications = value
+        }
         MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
         MeshSliceCarrier::LabelsAmbiguous(value) => slice.labels_ambiguous = value,
         MeshSliceCarrier::MeshPolicies(value) => slice.mesh_policies = value,
@@ -653,6 +719,41 @@ pub struct XdsNodeMetadata {
     pub waypoint_name: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ambient_udp_source_scoping: bool,
+    /// This node is a NodeWaypoint running the transparent inbound CAPTURE
+    /// listener (issue #3287), so the CP must resolve the cross-namespace
+    /// capture destination / PeerAuthentication inventory for it. Absent on
+    /// legacy DPs, which then receive no inventory and fail closed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub node_waypoint_capture_scoping: bool,
+}
+
+/// Per-node scoping flags the CP remembers for an ADS stream and replays into
+/// every `MeshSliceRequest` it builds for that node.
+///
+/// Kept as one value rather than parallel booleans so a call site cannot thread
+/// one flag and silently drop the other — the two select DIFFERENT
+/// cross-namespace inventories (Ambient UDP source evidence vs. NodeWaypoint
+/// capture destinations) and are never interchangeable.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct XdsNodeScoping {
+    pub ambient_udp_source_scoping: bool,
+    pub node_waypoint_capture_scoping: bool,
+}
+
+impl XdsNodeScoping {
+    /// `true` when the node requested no cross-namespace inventory at all.
+    pub fn is_default(&self) -> bool {
+        !self.ambient_udp_source_scoping && !self.node_waypoint_capture_scoping
+    }
+}
+
+impl From<&XdsNodeMetadata> for XdsNodeScoping {
+    fn from(metadata: &XdsNodeMetadata) -> Self {
+        Self {
+            ambient_udp_source_scoping: metadata.ambient_udp_source_scoping,
+            node_waypoint_capture_scoping: metadata.node_waypoint_capture_scoping,
+        }
+    }
 }
 
 /// Encode `Node.metadata` bytes for an outgoing DP request. Returns empty when
@@ -673,6 +774,21 @@ pub fn encode_node_metadata_with_waypoint_and_udp_scope(
     waypoint_name: Option<&str>,
     ambient_udp_source_scoping: bool,
 ) -> Vec<u8> {
+    encode_node_metadata_with_scoping(
+        workload_spiffe_id,
+        waypoint_name,
+        XdsNodeScoping {
+            ambient_udp_source_scoping,
+            node_waypoint_capture_scoping: false,
+        },
+    )
+}
+
+pub fn encode_node_metadata_with_scoping(
+    workload_spiffe_id: Option<&str>,
+    waypoint_name: Option<&str>,
+    scoping: XdsNodeScoping,
+) -> Vec<u8> {
     let metadata = XdsNodeMetadata {
         workload_spiffe_id: workload_spiffe_id
             .filter(|spiffe| !spiffe.is_empty())
@@ -680,11 +796,12 @@ pub fn encode_node_metadata_with_waypoint_and_udp_scope(
         waypoint_name: waypoint_name
             .filter(|name| !name.trim().is_empty())
             .map(ToString::to_string),
-        ambient_udp_source_scoping,
+        ambient_udp_source_scoping: scoping.ambient_udp_source_scoping,
+        node_waypoint_capture_scoping: scoping.node_waypoint_capture_scoping,
     };
     if metadata.workload_spiffe_id.is_none()
         && metadata.waypoint_name.is_none()
-        && !metadata.ambient_udp_source_scoping
+        && scoping.is_default()
     {
         Vec::new()
     } else {
@@ -743,6 +860,8 @@ mod tests {
             MeshSliceCarrier::NodeWaypointAssertors(vec![
                 SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint").unwrap(),
             ]),
+            MeshSliceCarrier::NodeWaypointCaptureDestinations(Vec::new()),
+            MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),
                 "api".to_string(),
@@ -838,6 +957,8 @@ mod tests {
             MeshSliceCarrier::NodeWaypointAssertors(vec![
                 SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/node-waypoint").unwrap(),
             ]),
+            MeshSliceCarrier::NodeWaypointCaptureDestinations(Vec::new()),
+            MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),
                 "api".to_string(),

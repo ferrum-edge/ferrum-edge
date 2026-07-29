@@ -120,6 +120,7 @@ fn client_config() -> NativeMeshClientConfig {
         waypoint_name: None,
         labels: HashMap::new(),
         ambient_udp_source_scoping: false,
+        node_waypoint_capture_scoping: false,
         primary_retry_secs: 0,
     }
 }
@@ -893,6 +894,7 @@ fn xds_consumer_surfaces_stale_revision_as_stream_terminal() {
             workload_spiffe_id: None,
             waypoint_name: None,
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
             stream_channel_capacity: 32,
             primary_retry_secs: 300,
             connect_timeout_seconds: 10,

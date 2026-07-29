@@ -60,9 +60,12 @@ use crate::FERRUM_VERSION;
 use crate::config::types::{GatewayConfig, default_namespace};
 use crate::modes::mesh::config::{
     MeshConfig, MeshSidecar, MeshSidecarEgress, PeerAuthentication, PolicyScope,
-    SidecarHostPattern, WorkloadSelector, service_entry_exported_to_namespace,
+    SidecarHostPattern, Workload, WorkloadSelector, service_entry_exported_to_namespace,
 };
-use crate::modes::mesh::slice::{MeshSliceRequest, node_waypoint_assertors_from_workloads};
+use crate::modes::mesh::slice::{
+    MeshSliceRequest, node_waypoint_assertors_from_workloads,
+    node_waypoint_capture_destinations_from_workloads,
+};
 
 /// Application-level ConfigSync heartbeat interval (matches DP silence budget).
 pub const CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL: Duration =
@@ -906,6 +909,51 @@ impl CpGrpcServer {
                 scope,
             );
         }
+
+        // NodeWaypoint transparent-inbound-capture inventory (issue #3287).
+        // Resolved HERE — before the `workloads` / `peer_authentications` retains
+        // below narrow both to the subscription namespace — because a
+        // NodeWaypoint captures direct plaintext for every ENROLLED pod on its
+        // node, and those pods can live in other namespaces. Deriving it after
+        // the retains would drop exactly the cross-namespace destination whose
+        // STRICT PeerAuthentication must be enforced, and the capture resolver
+        // would then see no policy and default PERMISSIVE.
+        //
+        // Least privilege: only workloads whose trusted
+        // `Workload.node_waypoint.spiffe_id` names THIS NodeWaypoint, and only
+        // within namespaces this CP scope and the bearer's `ns` claim authorize.
+        // The result rides its own slice fields — the ordinary routing views are
+        // untouched.
+        //
+        // Preserved when already present for the same reason the assertor
+        // inventory is: a stream-local config refiltered after an incremental
+        // delta has ALREADY had its `workloads` narrowed, so recomputing would
+        // shrink the inventory to the destination-visible slice. Deltas never
+        // carry mesh resources (mesh changes arrive as full snapshots, which
+        // refilter from the authoritative config), so the preserved value cannot
+        // go stale.
+        if request.node_waypoint_capture_scoping {
+            if mesh.node_waypoint_capture_destinations.is_empty() {
+                let destinations = node_waypoint_capture_destinations_from_workloads(
+                    mesh.workloads.iter().filter(|workload| {
+                        Self::node_waypoint_capture_namespace_allowed(&workload.namespace, scope)
+                            && bearer_namespaces
+                                .is_none_or(|allowed| allowed.contains(&workload.namespace))
+                    }),
+                    request.workload_spiffe_id.as_deref(),
+                );
+                mesh.node_waypoint_capture_destinations = destinations;
+            }
+            if mesh.node_waypoint_capture_peer_authentications.is_empty() {
+                let capture_peer_authentications =
+                    Self::node_waypoint_capture_peer_authentications_for_destinations(
+                        &mesh.peer_authentications,
+                        &mesh.node_waypoint_capture_destinations,
+                        &istio_root_namespace,
+                    );
+                mesh.node_waypoint_capture_peer_authentications = capture_peer_authentications;
+            }
+        }
         mesh.workloads.retain(|workload| {
             visible_namespaces.contains(&workload.namespace)
                 || (workload.pod_uid.is_some()
@@ -1213,6 +1261,50 @@ impl CpGrpcServer {
             Some(CpScope::Set(scope_namespaces)) => scope_namespaces.contains(namespace),
             Some(CpScope::All) | None => true,
         }
+    }
+
+    /// Namespace authorization for the NodeWaypoint capture destination
+    /// inventory (issue #3287).
+    ///
+    /// Identical boundary to Ambient UDP source evidence, and deliberately so: a
+    /// `Single`-scope CP is an authorization boundary for cross-namespace
+    /// EVIDENCE even though the general helper treats `Single` as unrestricted
+    /// for ordinary destination visibility. A no-claim token must never receive
+    /// pod records or policy from namespaces other than its validated
+    /// subscription namespace, whichever cross-namespace inventory asked.
+    fn node_waypoint_capture_namespace_allowed(namespace: &str, scope: Option<&CpScope>) -> bool {
+        Self::ambient_udp_source_namespace_allowed(namespace, scope)
+    }
+
+    /// PeerAuthentication candidates the CP may hand a NodeWaypoint for its
+    /// capture destinations (issue #3287).
+    ///
+    /// Namespace-level applicability only — the CP does not evaluate selectors
+    /// against a destination it is not serving. The exact per-workload narrowing
+    /// (and Istio precedence / port overrides) happens in the slice builder and
+    /// at capture time, so this hop stays the coarsest of the three while still
+    /// carrying strictly less than the whole mesh's PeerAuthentication set.
+    fn node_waypoint_capture_peer_authentications_for_destinations(
+        peer_authentications: &[PeerAuthentication],
+        destinations: &[Workload],
+        root_namespace: &str,
+    ) -> Vec<PeerAuthentication> {
+        if destinations.is_empty() {
+            return Vec::new();
+        }
+        let destination_namespaces: BTreeSet<&str> = destinations
+            .iter()
+            .map(|workload| workload.namespace.as_str())
+            .collect();
+        peer_authentications
+            .iter()
+            .filter(|policy| {
+                destination_namespaces.iter().any(|namespace| {
+                    Self::peer_auth_can_apply_to_namespace(policy, namespace, root_namespace)
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     fn node_waypoint_assertors_for_request(
@@ -3011,6 +3103,199 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![waypoint_beta],
             "explicit CP namespace scopes must bound the assertor inventory"
+        );
+    }
+
+    /// Issue #3287 root finding: a NodeWaypoint deployed in `ferrum` captures
+    /// direct plaintext for an enrolled pod in `payments`. The CP narrows
+    /// `workloads` and `peer_authentications` to the subscription namespace, so
+    /// without a dedicated inventory the `payments` STRICT PeerAuthentication
+    /// never reaches the DP and the capture resolver defaults PERMISSIVE.
+    ///
+    /// Also pins the authorization boundary: an unauthorized namespace (outside
+    /// the CP scope, or outside the bearer `ns` claim) contributes NOTHING, and a
+    /// pod enrolled on a DIFFERENT NodeWaypoint is never carried.
+    #[test]
+    fn mesh_request_filter_carries_cross_namespace_node_waypoint_capture_inventory() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{MtlsMode, NodeWaypointEndpoint, Workload};
+        use crate::modes::mesh::slice::MeshSlice;
+
+        let this_waypoint = "spiffe://test.local/ns/ferrum/sa/node-waypoint-a";
+        let other_waypoint = "spiffe://test.local/ns/ferrum/sa/node-waypoint-b";
+        let workload = |namespace: &str, name: &str, waypoint: &str, address: &str| Workload {
+            spiffe_id: SpiffeId::new(format!("spiffe://test.local/ns/{namespace}/sa/{name}"))
+                .expect("fixture SPIFFE ID should be valid"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), name.to_string())]),
+                namespace: Some(namespace.to_string()),
+            },
+            service_name: name.to_string(),
+            addresses: vec![address.to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("test.local")
+                .expect("fixture trust domain should be valid"),
+            namespace: namespace.to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some(name.to_string()),
+            pod_uid: None,
+            node_waypoint: Some(NodeWaypointEndpoint {
+                address: "10.0.0.1".to_string(),
+                hbone_port: 15008,
+                spiffe_id: SpiffeId::new(waypoint)
+                    .expect("fixture waypoint SPIFFE ID should be valid"),
+                node_name: None,
+                node_uid: None,
+                network: None,
+                cluster: None,
+            }),
+            remote_provenance: false,
+        };
+        let namespace_peer_auth = |namespace: &str, mode: MtlsMode| PeerAuthentication {
+            name: format!("{namespace}-default"),
+            namespace: namespace.to_string(),
+            scope: Some(PolicyScope::Namespace {
+                namespace: namespace.to_string(),
+            }),
+            selector: None,
+            mtls_mode: mode,
+            port_overrides: HashMap::new(),
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![
+                    // Enrolled on THIS NodeWaypoint, in another namespace.
+                    workload("payments", "ledger", this_waypoint, "10.244.1.7"),
+                    // Enrolled on ANOTHER node's NodeWaypoint.
+                    workload("payments", "reports", other_waypoint, "10.244.1.8"),
+                    // Enrolled on THIS NodeWaypoint but in a namespace the
+                    // restricted scopes below do not authorize.
+                    workload("secrets", "vault", this_waypoint, "10.244.1.9"),
+                ],
+                peer_authentications: vec![
+                    namespace_peer_auth("payments", MtlsMode::Strict),
+                    namespace_peer_auth("secrets", MtlsMode::Strict),
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let request = MeshSliceRequest {
+            namespace: "ferrum".to_string(),
+            workload_spiffe_id: Some(this_waypoint.to_string()),
+            node_waypoint_capture_scoping: true,
+            ..MeshSliceRequest::default()
+        };
+
+        let filtered =
+            CpGrpcServer::filter_config_to_mesh_request_for_scope(&config, &request, &CpScope::All);
+        let mesh = filtered.mesh.as_ref().expect("mesh should remain");
+        assert!(
+            mesh.workloads.is_empty() && mesh.peer_authentications.is_empty(),
+            "the ordinary namespace views must stay narrowed to `ferrum` — the inventory is the \
+             ONLY channel, so this must not widen routing visibility"
+        );
+        assert_eq!(
+            mesh.node_waypoint_capture_destinations
+                .iter()
+                .map(|workload| workload.service_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ledger", "vault"],
+            "only workloads enrolled on THIS NodeWaypoint may enter the capture inventory"
+        );
+        assert_eq!(
+            mesh.node_waypoint_capture_peer_authentications
+                .iter()
+                .map(|policy| policy.namespace.as_str())
+                .collect::<Vec<_>>(),
+            vec!["payments", "secrets"],
+            "each captured destination's own-namespace PeerAuthentication must be carried"
+        );
+
+        let slice = MeshSlice::from_gateway_config(&filtered, request.clone());
+        assert_eq!(
+            slice
+                .node_waypoint_capture_destinations
+                .iter()
+                .map(|workload| workload.service_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ledger", "vault"],
+            "the narrowed slice must carry capture destinations that are no longer visible as \
+             workloads"
+        );
+        assert_eq!(
+            slice.node_waypoint_capture_peer_authentications.len(),
+            2,
+            "and the PeerAuthentication candidates applicable to them"
+        );
+
+        // A `Single`-scope CP is an authorization boundary for cross-namespace
+        // evidence: only its own namespace may contribute, so a NodeWaypoint
+        // subscribed as `ferrum` gets NOTHING here.
+        let single = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &request,
+            &CpScope::Single("ferrum".to_string()),
+        );
+        let single_mesh = single.mesh.as_ref().expect("mesh should remain");
+        assert!(
+            single_mesh.node_waypoint_capture_destinations.is_empty()
+                && single_mesh
+                    .node_waypoint_capture_peer_authentications
+                    .is_empty(),
+            "a single-namespace CP scope must not hand out other namespaces' pods or policy"
+        );
+
+        // An explicit bearer `ns` claim intersects the scope: `payments` is
+        // authorized, `secrets` is not.
+        let bearer = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            &config,
+            &request,
+            &CpScope::Set(HashSet::from([
+                "ferrum".to_string(),
+                "payments".to_string(),
+                "secrets".to_string(),
+            ])),
+            Some(&HashSet::from(["payments".to_string()])),
+        );
+        let bearer_mesh = bearer.mesh.as_ref().expect("mesh should remain");
+        assert_eq!(
+            bearer_mesh
+                .node_waypoint_capture_destinations
+                .iter()
+                .map(|workload| workload.namespace.as_str())
+                .collect::<Vec<_>>(),
+            vec!["payments"],
+            "an unauthorized namespace must be absent from the capture inventory"
+        );
+        assert_eq!(
+            bearer_mesh
+                .node_waypoint_capture_peer_authentications
+                .iter()
+                .map(|policy| policy.namespace.as_str())
+                .collect::<Vec<_>>(),
+            vec!["payments"],
+            "and its policy must not ride along either"
+        );
+
+        // Without the flag the CP resolves no inventory at all.
+        let mut unflagged_request = request;
+        unflagged_request.node_waypoint_capture_scoping = false;
+        let unflagged = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &unflagged_request,
+            &CpScope::All,
+        );
+        let unflagged_mesh = unflagged.mesh.as_ref().expect("mesh should remain");
+        assert!(
+            unflagged_mesh.node_waypoint_capture_destinations.is_empty()
+                && unflagged_mesh
+                    .node_waypoint_capture_peer_authentications
+                    .is_empty(),
+            "a non-NodeWaypoint subscription must not receive the capture inventory"
         );
     }
 

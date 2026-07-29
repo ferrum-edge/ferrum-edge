@@ -85,6 +85,8 @@
   "FERRUM_NODE_AGENT_NODE_NAME"
   "FERRUM_NODE_AGENT_NODE_IP"
   "FERRUM_NODE_AGENT_NODE_IPS"
+  "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES"
+  "FERRUM_MESH_INBOUND_LISTEN_ADDR"
   "FERRUM_NODE_AGENT_CNI_ENABLED"
   "FERRUM_NODE_AGENT_CNI_SOCKET_PATH"
 -}}
@@ -235,6 +237,39 @@ spec:
             {{- if .Values.nodeAgent.trustedKubeletProbeSourceIps }}
             - name: FERRUM_NODE_AGENT_NODE_IPS
               value: {{ .Values.nodeAgent.trustedKubeletProbeSourceIps | quote }}
+            {{- end }}
+            {{- if .Values.nodeAgent.ingressRedirectIfaces }}
+            {{- if ne $nodeAgentProxyMode "node_waypoint" }}
+            {{- fail "nodeAgent.ingressRedirectIfaces requires nodeAgent.proxyMode=node_waypoint; only NodeWaypoint runs the transparent inbound capture listener the redirect steers into" }}
+            {{- end }}
+            {{- /* The redirect fails closed: an in-scope packet with no
+                   resolvable capture-listener socket is dropped, never
+                   delivered. So the ambient NodeWaypoint proxy must actually be
+                   deployed on this node, or enabling the redirect would
+                   black-hole inbound traffic for every enrolled workload. */ -}}
+            {{- $ambientTopology := replace "-" "_" (lower (trim (toString (index (default dict .Values.ambient.env) "FERRUM_MESH_TOPOLOGY")))) }}
+            {{- if or (not .Values.ambient.enabled) (ne $ambientTopology "node_waypoint") }}
+            {{- fail "nodeAgent.ingressRedirectIfaces requires ambient.enabled=true with ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint: the redirect steers inbound TCP into the node's transparent inbound capture listener and drops in-scope traffic when no such listener exists" }}
+            {{- end }}
+            - name: FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES
+              value: {{ .Values.nodeAgent.ingressRedirectIfaces | quote }}
+            {{- /* PORT CONTRACT. The redirect steers at the proxy's transparent
+                   inbound CAPTURE listener, which binds
+                   FERRUM_MESH_INBOUND_LISTEN_ADDR — never the HBONE port, which
+                   terminates authenticated H2 CONNECT over mesh mTLS and cannot
+                   consume raw application bytes. The node-agent derives the
+                   steer port from the SAME variable, so it must be rendered
+                   identically into BOTH containers; an operator override that
+                   reached only the proxy would leave the classifier steering at
+                   the default port and drop every captured connection.
+                   The node-agent additionally refuses to start unless the value
+                   is a wildcard address with a non-zero port distinct from the
+                   HBONE and outbound capture ports. */ -}}
+            {{- $ambientInboundAddr := toString (index (default dict .Values.ambient.env) "FERRUM_MESH_INBOUND_LISTEN_ADDR") }}
+            {{- if $ambientInboundAddr }}
+            - name: FERRUM_MESH_INBOUND_LISTEN_ADDR
+              value: {{ $ambientInboundAddr | quote }}
+            {{- end }}
             {{- end }}
             {{- if and $cni $cni.enabled }}
             - name: FERRUM_NODE_AGENT_CNI_ENABLED

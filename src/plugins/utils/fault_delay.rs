@@ -20,6 +20,9 @@
 //!    instance in the process, so aggregate exposure is bounded even when many
 //!    proxies each attach their own `fault_injection` instance. Exhaustion is
 //!    fail-closed: the delay is *skipped*, never queued and never retained.
+//!    A delayed unit may be an HTTP request, a TCP session admission, or a
+//!    UDP/DTLS client→backend datagram parked on the isolated session worker
+//!    (never the shared listener recv loop).
 //! 3. **Cancellation** — the timer races a peer-gone signal and a gateway
 //!    shutdown token. Whichever fires first ends the wait, so the caller can
 //!    release its guards immediately through its own protocol-correct cleanup
@@ -36,6 +39,10 @@
 //!   half-close (FIN) is deliberately *not* cancellation: a request/response
 //!   client may legitimately finish its request and wait for the answer, and
 //!   queued application bytes must survive.
+//! - UDP/DTLS `on_udp_datagram` — the per-session hook-ingress worker (and the
+//!   isolated first-datagram / DTLS accept setup task) select the hook against
+//!   session stop. Teardown drops the delay future, releasing the admission
+//!   permit without forwarding. No application bytes are read here.
 //! - HTTP/3 `before_proxy` — [`crate::plugins::PeerConnectionSignal`] carries a
 //!   QUIC connection-close watch. Connection close is observable without
 //!   polling the request stream, so no detached watcher competes for the

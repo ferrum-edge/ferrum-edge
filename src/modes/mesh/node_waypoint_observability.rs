@@ -28,6 +28,12 @@
 //! a single authz decision: identity rejection is recorded first and skips the
 //! destination-policy counter.
 //!
+//! The transparent inbound capture listener (issue #3287,
+//! `crate::proxy::node_waypoint_ingress_capture`) records **only** the
+//! destination-policy counter, for the open-relay guard it shares with the HBONE
+//! relay. It records no handshake phase: it terminates no TLS and admits no
+//! CONNECT, so none of the three phases above describe it.
+//!
 //! ## Reset / monotonicity
 //!
 //! Counters are process-static atomics:

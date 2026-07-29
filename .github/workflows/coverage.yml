@@ -173,6 +173,7 @@ jobs:
               integration::grpc_proxy_tests
               integration::scripted_backend_smoke_tests
               integration::dtls_integration_tests
+              integration::udp_fault_injection_tests
               integration::backend_mtls_tests
               integration::backend_tls_san_allow_list_tests
               integration::frontend_tls_live_reload_tests

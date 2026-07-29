@@ -1393,6 +1393,154 @@ async fn start_dtls_echo_server(port: u16) -> tokio::task::JoinHandle<()> {
 }
 
 // ============================================================================
+// Fault injection (issue #3293)
+// ============================================================================
+
+/// Abort faults drop UDP client→backend datagrams without an echo.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_fault_injection_abort_drops_datagram() {
+    let backend_port = 19890u16;
+    let proxy_port = 19891u16;
+    let gateway_http_port = 18290u16;
+
+    let echo_server = start_udp_echo_server(backend_port).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-fault"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_idle_timeout_seconds: 30
+    plugins:
+      - plugin_config_id: "udp-fault-abort"
+
+consumers: []
+plugin_configs:
+  - id: "udp-fault-abort"
+    plugin_name: fault_injection
+    scope: proxy
+    proxy_id: "udp-fault"
+    enabled: true
+    config:
+      abort:
+        status_code: 503
+        percentage: 100.0
+"#
+        ),
+    );
+
+    let mut gateway =
+        start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .send_to(b"should-drop", format!("127.0.0.1:{proxy_port}"))
+        .await
+        .unwrap();
+
+    let mut buf = vec![0u8; 65535];
+    let timed_out = tokio::time::timeout(Duration::from_millis(500), client.recv_from(&mut buf))
+        .await
+        .is_err();
+    assert!(
+        timed_out,
+        "100% abort fault must drop the UDP datagram (no echo)"
+    );
+
+    shutdown_gateway_child(&mut gateway);
+    echo_server.abort();
+    println!("test_udp_proxy_fault_injection_abort_drops_datagram PASSED");
+}
+
+/// Delay faults park one peer without head-of-line blocking another peer.
+#[ignore]
+#[tokio::test]
+async fn test_udp_proxy_fault_injection_delay_isolates_peers() {
+    let backend_port = 19892u16;
+    let proxy_port = 19893u16;
+    let gateway_http_port = 18292u16;
+
+    let echo_server = start_udp_echo_server(backend_port).await;
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            r#"
+version: "1"
+proxies:
+  - id: "udp-fault-delay"
+    listen_port: {proxy_port}
+    backend_scheme: udp
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    udp_idle_timeout_seconds: 30
+    plugins:
+      - plugin_config_id: "udp-fault-delay-cfg"
+
+consumers: []
+plugin_configs:
+  - id: "udp-fault-delay-cfg"
+    plugin_name: fault_injection
+    scope: proxy
+    proxy_id: "udp-fault-delay"
+    enabled: true
+    config:
+      delay:
+        duration_ms: 1500
+        percentage: 100.0
+"#
+        ),
+    );
+
+    let mut gateway =
+        start_gateway(config_path.to_str().unwrap(), gateway_http_port).expect("Failed to start");
+    sleep(Duration::from_secs(3)).await;
+
+    let client_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+    let gateway_addr = format!("127.0.0.1:{proxy_port}");
+
+    client_a.send_to(b"peer-a", &gateway_addr).await.unwrap();
+    sleep(Duration::from_millis(50)).await;
+
+    let b_start = Instant::now();
+    client_b.send_to(b"peer-b", &gateway_addr).await.unwrap();
+    let mut buf = vec![0u8; 65535];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), client_b.recv_from(&mut buf))
+        .await
+        .expect("peer B timeout")
+        .expect("peer B recv");
+    let b_elapsed = b_start.elapsed();
+    assert_eq!(&buf[..n], b"peer-b");
+    assert!(
+        b_elapsed < Duration::from_millis(2800),
+        "peer B must not wait behind peer A's remaining delay; elapsed {b_elapsed:?}"
+    );
+
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), client_a.recv_from(&mut buf))
+        .await
+        .expect("peer A timeout")
+        .expect("peer A recv");
+    assert_eq!(&buf[..n], b"peer-a");
+
+    shutdown_gateway_child(&mut gateway);
+    echo_server.abort();
+    println!("test_udp_proxy_fault_injection_delay_isolates_peers PASSED");
+}
+
+// ============================================================================
 // Test Certificate Generation
 // ============================================================================
 

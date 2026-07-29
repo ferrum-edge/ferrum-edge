@@ -41,8 +41,10 @@ use crate::ebpf::{
     CaptureContract, DEFAULT_NODE_AGENT_SOCKET_PATH, EbpfBackend, FallbackMode, INCLUDE_PORTS_MAX,
     IncludePortsPolicy, NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE,
     NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK, NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
-    NODE_AGENT_CAPTURE_STATE_READY, NODE_AGENT_CAPTURE_STATE_UNAVAILABLE, NodeAgentMetrics,
-    NodeAgentProxyMode, PodAttachmentState, PodInfo, TcAttachDirection,
+    NODE_AGENT_CAPTURE_STATE_READY, NODE_AGENT_CAPTURE_STATE_UNAVAILABLE,
+    NODE_WAYPOINT_INGRESS_REDIRECT_MARK, NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY,
+    NODE_WAYPOINT_INGRESS_REDIRECT_TABLE, NodeAgentMetrics, NodeAgentProxyMode, PodAttachmentState,
+    PodInfo, TcAttachDirection,
 };
 use crate::modes::node_agent_cni_server::{
     self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
@@ -73,11 +75,13 @@ const CAPTURE_FAILURE_NODE_PROBE_PORT_REMOVE: &str = "node_probe_port_remove";
 const CAPTURE_FAILURE_INCLUDE_PORTS_REMOVE: &str = "include_ports_remove";
 const CAPTURE_FAILURE_WORKLOAD_IDENTITY_REMOVE: &str = "workload_identity_remove";
 const CAPTURE_FAILURE_UDP_READINESS: &str = "udp_readiness";
+const CAPTURE_FAILURE_INBOUND_REDIRECT_UPDATE: &str = "inbound_redirect_update";
 const CAPTURE_FAILURE_DETAIL_POD_IP: &str = "pod_ip";
 const CAPTURE_FAILURE_DETAIL_POD_IP6: &str = "pod_ip6";
 const CAPTURE_FAILURE_DETAIL_POD_DETACH: &str = "pod_detach";
 const CAPTURE_FAILURE_DETAIL_NODE_PROBE_PORTS: &str = "node_probe_ports";
 const CAPTURE_FAILURE_DETAIL_UDP_READINESS: &str = "udp_readiness";
+const CAPTURE_FAILURE_DETAIL_INBOUND_REDIRECT: &str = "inbound_redirect_ports";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -287,6 +291,63 @@ impl NodeAgentConfig {
         // ready yet, connect6 redirects to `[::1]:<port>` and fails closed by
         // connection refusal until the proxy publishes `.ready6`.
         capture_contract.ipv6_outbound_deny = false;
+
+        // Inbound tc ingress redirect (issue #3287). Off unless the operator
+        // names at least one node capture interface: the redirect replaces the
+        // node-global iptables REDIRECT for enrolled workloads and needs an
+        // explicit attach point, and silently guessing the uplink would be a
+        // node-wide datapath change made on the node-agent's own initiative.
+        capture_contract.ingress_redirect_ifaces = node_agent_ingress_redirect_ifaces_from_env();
+        capture_contract.node_waypoint_ingress_redirect_mark =
+            if capture_contract.ingress_redirect_ifaces.is_empty() {
+                0
+            } else {
+                NODE_WAYPOINT_INGRESS_REDIRECT_MARK
+            };
+        // The steer target is the proxy's TRANSPARENT INBOUND CAPTURE listener,
+        // NOT the HBONE listener: HBONE terminates authenticated H2 CONNECT
+        // over mesh mTLS, while captured traffic is raw application bytes.
+        //
+        // Both processes derive the port from the SAME variable
+        // (`FERRUM_MESH_INBOUND_LISTEN_ADDR`, which the proxy binds), so there
+        // is no second setting that can silently disagree — and a chart that
+        // sets it on only one of the two DaemonSet containers lands on the
+        // default on the other, which the validation below still catches if the
+        // two are incompatible.
+        if !capture_contract.ingress_redirect_ifaces.is_empty() {
+            let capture_addr = crate::modes::mesh::node_waypoint_ingress_capture_addr()?;
+            crate::modes::mesh::validate_ingress_capture_addr(capture_addr)?;
+            capture_contract.ingress_capture_port = capture_addr.port();
+            // `0.0.0.0` binds an AF_INET socket, and the kernel never returns
+            // an AF_INET socket for an IPv6 wildcard lookup — so the
+            // classifier's IPv6 path could not resolve it and would drop every
+            // in-scope IPv6 packet fail-closed. Only a `[::]` bind is
+            // dual-stack, so IPv6 scope is published only for that case.
+            capture_contract.ingress_capture_supports_ipv6 = capture_addr.is_ipv6();
+            if !capture_contract.ingress_capture_supports_ipv6 {
+                info!(
+                    %capture_addr,
+                    "The NodeWaypoint inbound capture listener is bound IPv4-only; enrolled pods' \
+                     IPv6 inbound traffic is left un-redirected and keeps its existing direct-pod \
+                     behavior. Bind FERRUM_MESH_INBOUND_LISTEN_ADDR to [::] to redirect IPv6 too."
+                );
+            }
+        }
+        // Fail closed on the whole port contract before anything is attached.
+        capture_contract.validate_ingress_redirect()?;
+        // The redirect is armed only when every precondition holds; if the
+        // operator asked for it and it did not arm, that is a bug in the gate
+        // above rather than a silent downgrade, so refuse to start.
+        if !capture_contract.ingress_redirect_ifaces.is_empty()
+            && !capture_contract.ingress_redirect_enabled()
+        {
+            return Err(
+                "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES is set but the inbound tc ingress \
+                 redirect could not be armed; refusing to start rather than silently leaving \
+                 inbound capture on the previous datapath"
+                    .to_string(),
+            );
+        }
         if node_waypoint_in_netns
             && !capture_config
                 .include_cidrs
@@ -355,6 +416,423 @@ impl NodeAgentConfig {
         })
     }
 }
+
+/// Parse `FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES` into a deduplicated,
+/// order-preserving interface list.
+///
+/// Empty / unset (the default) disables the inbound tc ingress redirect
+/// entirely. Entries are deduplicated because attaching the same classifier
+/// twice to one interface would install two filters that both try to
+/// `bpf_sk_assign` the same packet.
+fn node_agent_ingress_redirect_ifaces_from_env() -> Vec<String> {
+    let Some(raw) = resolve_ferrum_var("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES") else {
+        return Vec::new();
+    };
+    let mut ifaces: Vec<String> = Vec::new();
+    for name in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let name = name.to_string();
+        if !ifaces.contains(&name) {
+            ifaces.push(name);
+        }
+    }
+    ifaces
+}
+
+/// Whether this node is configured for the NodeWaypoint inbound tc ingress
+/// redirect.
+///
+/// Read by the **mesh proxy** (not just the node-agent) to decide whether to
+/// emit its transparent inbound CAPTURE listener: the redirect preserves the
+/// packet's original destination, so that listener's accepted socket carries
+/// the workload's `podIP:appPort` and replies can only be routed from a
+/// transparent socket. Both processes read the same operator variable, so there
+/// is no IPC to keep in sync — mirroring the pinned-path / registry-dir
+/// contracts the node-waypoint datapath already uses. The PORT contract is
+/// likewise single-sourced, from `FERRUM_MESH_INBOUND_LISTEN_ADDR`
+/// (`crate::modes::mesh::node_waypoint_ingress_capture_addr`).
+///
+/// Evaluated once per listener plan / startup, never on a request path.
+pub fn node_waypoint_ingress_redirect_configured() -> bool {
+    !node_agent_ingress_redirect_ifaces_from_env().is_empty()
+}
+
+/// Declared inbound TCP application ports for a pod, derived from its
+/// `containerPorts`.
+///
+/// These are the ports the tc ingress redirect is allowed to steer. Non-TCP
+/// ports are excluded (the redirect is TCP-only — `bpf_sk_assign` on the TCP
+/// path), and so is port `0`. Kubernetes probe ports are deliberately NOT
+/// folded in: those keep their existing direct-to-pod exemption through
+/// `FERRUM_NODE_PROBE_PORTS` so kubelet health checking never depends on the
+/// relay being up.
+fn pod_inbound_redirect_ports_from_spec(spec: Option<&PodSpec>) -> Vec<u16> {
+    let Some(spec) = spec else {
+        return Vec::new();
+    };
+    let mut ports = Vec::new();
+    for container in &spec.containers {
+        let Some(container_ports) = container.ports.as_ref() else {
+            continue;
+        };
+        for declared in container_ports {
+            if declared
+                .protocol
+                .as_deref()
+                .is_some_and(|protocol| !protocol.eq_ignore_ascii_case("TCP"))
+            {
+                continue;
+            }
+            if let Some(port) = valid_probe_port(declared.container_port) {
+                ports.push(port);
+            }
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// `ip` argument vectors that install local delivery for tc-ingress-redirected
+/// inbound packets, for one address family.
+///
+/// `bpf_sk_assign` attaches the relay socket to the skb, but the IP input path
+/// still consults the routing tables: without a rule that classifies the marked
+/// packet as LOCAL, `main` resolves it as forwardable and it is delivered to
+/// the pod with the assignment silently discarded. The RPDB is scanned in
+/// ascending priority order, so the rule sits at
+/// `NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY` (101) — a LOWER priority
+/// number than the kernel `main` rule at 32766, and therefore evaluated
+/// **before** it. A rule numbered above `main` would never be reached for these
+/// packets.
+///
+/// The table (`33134`) is Ferrum-owned and distinct from the UDP TPROXY table
+/// (`33133`), so tearing one down can never reap the other, and from Istio's
+/// conventional tables so a co-resident Istio is unaffected.
+///
+/// Pure so the exact rule/route shape is unit-testable without root.
+pub(crate) fn ingress_redirect_routing_commands(ipv6: bool) -> Vec<Vec<String>> {
+    let ip_family: &[&str] = if ipv6 { &["-6"] } else { &[] };
+    let default_route = if ipv6 { "::/0" } else { "0.0.0.0/0" };
+    let mark = format!("{NODE_WAYPOINT_INGRESS_REDIRECT_MARK:#x}");
+    let table = NODE_WAYPOINT_INGRESS_REDIRECT_TABLE.to_string();
+    let priority = NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY.to_string();
+
+    let build = |args: Vec<&str>| -> Vec<String> {
+        ip_family
+            .iter()
+            .copied()
+            .chain(args)
+            .map(str::to_string)
+            .collect()
+    };
+
+    vec![
+        // Delete-before-add keeps installation idempotent across restarts.
+        build(vec!["rule", "del", "priority", &priority, "lookup", &table]),
+        build(vec![
+            "rule", "add", "priority", &priority, "fwmark", &mark, "lookup", &table,
+        ]),
+        build(vec![
+            "route",
+            "replace",
+            "local",
+            default_route,
+            "dev",
+            "lo",
+            "table",
+            &table,
+        ]),
+    ]
+}
+
+/// `ip` argument vectors that remove exactly the Ferrum-owned rule and route.
+///
+/// Deletion names the exact priority + table (never `flush`, never a
+/// lookup-only match), so a co-resident routing policy is never disturbed.
+pub(crate) fn ingress_redirect_routing_teardown_commands(ipv6: bool) -> Vec<Vec<String>> {
+    let ip_family: &[&str] = if ipv6 { &["-6"] } else { &[] };
+    let default_route = if ipv6 { "::/0" } else { "0.0.0.0/0" };
+    let table = NODE_WAYPOINT_INGRESS_REDIRECT_TABLE.to_string();
+    let priority = NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY.to_string();
+
+    let build = |args: Vec<&str>| -> Vec<String> {
+        ip_family
+            .iter()
+            .copied()
+            .chain(args)
+            .map(str::to_string)
+            .collect()
+    };
+
+    vec![
+        build(vec!["rule", "del", "priority", &priority, "lookup", &table]),
+        build(vec![
+            "route",
+            "del",
+            "local",
+            default_route,
+            "dev",
+            "lo",
+            "table",
+            &table,
+        ]),
+    ]
+}
+
+/// Install the inbound-redirect local-delivery routing for every family the
+/// capture listener can actually accept.
+///
+/// The load-bearing `rule add` / `route replace` are **fatal** on failure —
+/// TPROXY-style steering without local delivery is a black hole, so the two go
+/// in together or not at all. Only the idempotence `rule del` is best-effort.
+///
+/// Failure is **partial by nature**: an earlier command can be in place when a
+/// later route fails, so `initialize_backend_after_load` removes the
+/// Ferrum-owned routing in place on that path — safe there because no
+/// classifier has attached yet. Once a classifier IS attached, removal moves to
+/// [`release_ingress_redirect_routing`], which runs after `cleanup_all` has
+/// retried the detach and withholds the removal while a classifier may be live.
+fn install_ingress_redirect_routing(supports_ipv6: bool) -> Result<(), String> {
+    #[cfg(test)]
+    let result = ingress_redirect_routing_seam::install(supports_ipv6);
+    #[cfg(not(test))]
+    let result = install_ingress_redirect_routing_impl(supports_ipv6);
+    result
+}
+
+/// Best-effort teardown of the inbound-redirect routing. Always best-effort:
+/// it runs on shutdown and on every unsuccessful startup path, where a missing
+/// rule is the expected outcome, and a failure must never mask the original
+/// error.
+///
+/// Do NOT call this directly from a path where a classifier may be attached —
+/// go through [`release_ingress_redirect_routing`], which gates on the
+/// classifier being provably gone.
+fn remove_ingress_redirect_routing() {
+    #[cfg(test)]
+    ingress_redirect_routing_seam::remove();
+    #[cfg(not(test))]
+    remove_ingress_redirect_routing_impl();
+}
+
+/// Unit-test seam for the routing halves. `ip` is a privileged, node-global
+/// side effect, so the in-crate tests never run it: they drive install/teardown
+/// ordering through this recorder instead. Not activating it is itself a
+/// failure, so a test can never silently shell out.
+#[cfg(test)]
+pub(crate) mod ingress_redirect_routing_seam {
+    use std::cell::RefCell;
+
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    pub(crate) struct RoutingCalls {
+        pub installs: usize,
+        pub removals: usize,
+        pub install_supports_ipv6: Option<bool>,
+    }
+
+    struct SeamState {
+        fail_install: bool,
+        calls: RoutingCalls,
+        /// Optional log shared with a `MockEbpfBackend`, so a test can assert
+        /// the ordering between classifier detach and routing removal from one
+        /// interleaved sequence.
+        op_log: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    }
+
+    thread_local! {
+        static SEAM: RefCell<Option<SeamState>> = const { RefCell::new(None) };
+    }
+
+    /// Arm the seam for the current thread. `fail_install` models a partially
+    /// applied `ip` batch (e.g. the v4 rule landed, the v6 route did not).
+    pub(crate) fn activate(fail_install: bool) {
+        activate_with_log(fail_install, None);
+    }
+
+    pub(crate) fn activate_with_log(
+        fail_install: bool,
+        op_log: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    ) {
+        SEAM.with(|seam| {
+            *seam.borrow_mut() = Some(SeamState {
+                fail_install,
+                calls: RoutingCalls::default(),
+                op_log,
+            });
+        });
+    }
+
+    fn record(state: &SeamState, op: &str) {
+        if let Some(log) = &state.op_log
+            && let Ok(mut entries) = log.lock()
+        {
+            entries.push(op.to_string());
+        }
+    }
+
+    /// Disarm and return what the production code did.
+    pub(crate) fn take_calls() -> RoutingCalls {
+        SEAM.with(|seam| {
+            seam.borrow_mut()
+                .take()
+                .map(|state| state.calls)
+                .unwrap_or_default()
+        })
+    }
+
+    pub(super) fn install(supports_ipv6: bool) -> Result<(), String> {
+        SEAM.with(|seam| match seam.borrow_mut().as_mut() {
+            Some(state) => {
+                state.calls.installs += 1;
+                state.calls.install_supports_ipv6 = Some(supports_ipv6);
+                record(state, "install_ingress_redirect_routing");
+                if state.fail_install {
+                    Err("injected ingress redirect routing install failure".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            // Never shell out to a privileged `ip` from a unit test.
+            None => Err("ingress redirect routing seam is not activated".to_string()),
+        })
+    }
+
+    pub(super) fn remove() {
+        SEAM.with(|seam| {
+            if let Some(state) = seam.borrow_mut().as_mut() {
+                state.calls.removals += 1;
+                record(state, "remove_ingress_redirect_routing");
+            }
+        });
+    }
+}
+
+#[cfg(all(target_os = "linux", not(test)))]
+fn install_ingress_redirect_routing_impl(supports_ipv6: bool) -> Result<(), String> {
+    for ipv6 in [false, true] {
+        if ipv6 && !supports_ipv6 {
+            continue;
+        }
+        for args in ingress_redirect_routing_commands(ipv6) {
+            let best_effort = args.iter().any(|arg| arg == "del");
+            match std::process::Command::new("ip").args(&args).output() {
+                Ok(output) if output.status.success() => {}
+                Ok(output) if best_effort => {
+                    debug!(
+                        args = ?args,
+                        stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                        "Idempotence delete of the inbound redirect routing found nothing to remove"
+                    );
+                }
+                Ok(output) => {
+                    return Err(format!(
+                        "`ip {}` failed: {}",
+                        args.join(" "),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!("could not run `ip {}`: {e}", args.join(" ")));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "linux"), not(test)))]
+fn install_ingress_redirect_routing_impl(_supports_ipv6: bool) -> Result<(), String> {
+    Err("the NodeWaypoint inbound tc ingress redirect is Linux-only".to_string())
+}
+
+/// Teardown stays **best-effort** — it runs on shutdown and on every
+/// unsuccessful startup path, where "nothing to remove" is the expected outcome
+/// and a failure must never mask the original error. But best-effort is not the
+/// same as unobserved: a command that RUNS and exits non-zero for a reason other
+/// than "no such rule/route" means Ferrum-owned policy routing is still claiming
+/// the redirect fwmark, which can interfere with other software on the node and
+/// will silently pre-satisfy a later reinstall.
+///
+/// So each command's exit status is inspected and reported. The diagnostic is
+/// bounded (`ip`'s stderr, trimmed, first line only, capped) and carries nothing
+/// operator-sensitive: the argv is Ferrum's own fixed rule/route/table/priority
+/// constants and `ip` reports only netlink-level failures.
+#[cfg(all(target_os = "linux", not(test)))]
+fn remove_ingress_redirect_routing_impl() {
+    /// Upper bound on the `ip` stderr text folded into a log line.
+    const MAX_TEARDOWN_STDERR_BYTES: usize = 200;
+
+    for ipv6 in [false, true] {
+        for args in ingress_redirect_routing_teardown_commands(ipv6) {
+            match std::process::Command::new("ip").args(&args).output() {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => {
+                    let stderr = bounded_command_stderr(&output.stderr, MAX_TEARDOWN_STDERR_BYTES);
+                    // An absent rule/route is the normal, expected teardown
+                    // outcome (idempotent delete), so it stays at debug; any
+                    // other non-zero exit leaves Ferrum-owned routing behind and
+                    // is surfaced.
+                    if teardown_stderr_is_absent_entry(&stderr) {
+                        debug!(
+                            args = ?args,
+                            status = ?output.status.code(),
+                            stderr = %stderr,
+                            "Inbound redirect routing teardown found nothing to remove"
+                        );
+                    } else {
+                        warn!(
+                            args = ?args,
+                            status = ?output.status.code(),
+                            stderr = %stderr,
+                            "Inbound redirect routing teardown command exited non-zero; the \
+                             Ferrum-owned rule/route may still claim the redirect fwmark. Remove \
+                             it manually with the same `ip` arguments if it persists."
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        args = ?args,
+                        error = %e,
+                        "Could not run the inbound redirect routing teardown command; the \
+                         Ferrum-owned rule/route may still claim the redirect fwmark"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// First line of a command's stderr, trimmed and capped at `max_bytes` on a
+/// character boundary. Keeps a teardown diagnostic bounded no matter what the
+/// tool wrote.
+#[cfg(all(target_os = "linux", not(test)))]
+fn bounded_command_stderr(stderr: &[u8], max_bytes: usize) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.len() <= max_bytes {
+        return line.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &line[..end])
+}
+
+/// Whether an `ip rule del` / `ip route del` failure means the entry simply was
+/// not there. iproute2 has no stable exit code for this, so match its messages.
+#[cfg(all(target_os = "linux", not(test)))]
+fn teardown_stderr_is_absent_entry(stderr: &str) -> bool {
+    let lowered = stderr.to_ascii_lowercase();
+    lowered.contains("no such file or directory")
+        || lowered.contains("no such process")
+        || lowered.contains("cannot find")
+        || lowered.contains("rtnetlink answers: no such")
+}
+
+#[cfg(all(not(target_os = "linux"), not(test)))]
+fn remove_ingress_redirect_routing_impl() {}
 
 fn cidr_is_ipv6(cidr: &str) -> bool {
     let Some((addr, _prefix)) = cidr.split_once('/') else {
@@ -861,7 +1339,8 @@ async fn run_with_backend(
     // (normal shutdown, Kubernetes client construction failure, and Drop on
     // any other exit). Do not call `cleanup_all` on a second path.
     initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
-    let mut owner = InitializedBackendOwner::new(backend);
+    let mut owner =
+        InitializedBackendOwner::new(backend, config.capture_contract.ingress_redirect_enabled());
 
     let client = match build_node_agent_kube_client().await {
         Ok(client) => client,
@@ -903,7 +1382,10 @@ where
     I: IntoIterator<Item = PodAttachmentState>,
 {
     initialize_backend(backend, config, metrics.as_ref())?;
-    let mut owner = InitializedBackendOwner::borrowed(backend);
+    let mut owner = InitializedBackendOwner::borrowed(
+        backend,
+        config.capture_contract.ingress_redirect_enabled(),
+    );
     let startup_ready = Arc::new(AtomicBool::new(false));
     let cni_config = CniListenerConfig {
         enabled: false,
@@ -1433,6 +1915,7 @@ fn apply_cni_add_from_pod(
     let pod_ip = status.and_then(|status| status.pod_ip.as_deref());
     let pod_source_ips = PodSourceIps::from_status(status);
     let node_probe_ports = pod_probe_ports_from_spec(pod.spec.as_ref());
+    let inbound_redirect_ports = pod_inbound_redirect_ports_from_spec(pod.spec.as_ref());
     let service_account = pod
         .spec
         .as_ref()
@@ -1447,6 +1930,7 @@ fn apply_cni_add_from_pod(
         pod_ip_str: pod_ip,
         pod_source_ips,
         node_probe_ports,
+        inbound_redirect_ports,
         pod_pid: None,
         veth_iface_override: None,
     };
@@ -2150,6 +2634,7 @@ fn handle_kube_pod_applied(
     let pod_ip = status.and_then(|status| status.pod_ip.as_deref());
     let pod_source_ips = PodSourceIps::from_status(status);
     let node_probe_ports = pod_probe_ports_from_spec(pod.spec.as_ref());
+    let inbound_redirect_ports = pod_inbound_redirect_ports_from_spec(pod.spec.as_ref());
     let service_account = pod
         .spec
         .as_ref()
@@ -2164,6 +2649,7 @@ fn handle_kube_pod_applied(
         pod_ip_str: pod_ip,
         pod_source_ips,
         node_probe_ports,
+        inbound_redirect_ports,
         pod_pid: None,
         veth_iface_override: None,
     };
@@ -2185,6 +2671,13 @@ pub struct PodEvent<'a> {
     pub pod_ip_str: Option<&'a str>,
     pub pod_source_ips: PodSourceIps,
     pub node_probe_ports: Vec<u16>,
+    /// Declared inbound TCP application ports (`containerPorts`) that the
+    /// NodeWaypoint relay may terminate on this pod's behalf. These scope the
+    /// tc ingress redirect: only an exact `(pod address, port)` pair here is
+    /// ever steered into the relay. Distinct from `node_probe_ports`, which
+    /// grants kubelet a *direct* path that deliberately does NOT go through
+    /// the relay.
+    pub inbound_redirect_ports: Vec<u16>,
     pub pod_pid: Option<u32>,
     /// Pre-resolved host-side veth interface name for this pod, bypassing
     /// the production resolver. Production always sets this to `None` and
@@ -2236,6 +2729,7 @@ struct RetryablePodEnrollment {
     pod_ip: Option<String>,
     pod_source_ips: PodSourceIps,
     node_probe_ports: Vec<u16>,
+    inbound_redirect_ports: Vec<u16>,
     pod_pid: Option<u32>,
 }
 
@@ -2251,6 +2745,7 @@ impl RetryablePodEnrollment {
             pod_ip: event.pod_ip_str.map(ToOwned::to_owned),
             pod_source_ips: event.pod_source_ips,
             node_probe_ports: event.node_probe_ports.clone(),
+            inbound_redirect_ports: event.inbound_redirect_ports.clone(),
             pod_pid: event.pod_pid,
         }
     }
@@ -2269,6 +2764,7 @@ impl RetryablePodEnrollment {
             pod_ip_str: self.pod_ip.as_deref(),
             pod_source_ips: self.pod_source_ips,
             node_probe_ports: self.node_probe_ports.clone(),
+            inbound_redirect_ports: self.inbound_redirect_ports.clone(),
             pod_pid: self.pod_pid,
             // Production always re-resolves the veth on retry (see struct docs).
             veth_iface_override: None,
@@ -2605,6 +3101,15 @@ fn merge_failed_enrollment_cleanup_state(
     for port in &prior.node_probe_ports {
         if !merged.node_probe_ports.contains(port) {
             merged.node_probe_ports.push(*port);
+        }
+    }
+    // Union the redirect scope the same way: a prior partial attempt may have
+    // installed inbound-redirect entries this attempt's spec no longer declares,
+    // and dropping them from the cleanup baseline would leave those
+    // `(pod address, port)` pairs permanently redirect-eligible.
+    for port in &prior.inbound_redirect_ports {
+        if !merged.inbound_redirect_ports.contains(port) {
+            merged.inbound_redirect_ports.push(*port);
         }
     }
     merged.pod_ip = merged.pod_ip.or(prior.pod_ip);
@@ -3068,21 +3573,38 @@ fn retry_pending_pod_ip_removals(
             continue;
         }
 
-        let result = match ip {
+        // Re-run the full removal contract: delete (or tolerate already-absent)
+        // the pod-IP entry first, then clear the family scope. Completing the
+        // handoff after only the map delete would permanently leak bounded
+        // `(pod, port)` scope keys when clear failed earlier.
+        let remove_result = match ip {
             std::net::IpAddr::V4(ip) => backend.remove_pod_ip(ip),
             std::net::IpAddr::V6(ip) => backend.remove_pod_ip6(ip),
         };
-        match result {
+        if let Err(e) = remove_result {
+            warn!(
+                %ip,
+                error = %e,
+                "Retrying pending pod IP map removal failed; keeping capture state degraded"
+            );
+            continue;
+        }
+        let clear_result = match ip {
+            std::net::IpAddr::V4(ip) => backend.clear_pod_inbound_ports(ip),
+            std::net::IpAddr::V6(ip) => backend.clear_pod_inbound_ports6(ip),
+        };
+        match clear_result {
             Ok(()) => {
                 PENDING_CAPTURE_FAILURES.remove(&failure_key);
-                debug!(%ip, "Recovered pending pod IP map removal failure");
+                debug!(%ip, "Recovered pending pod IP map removal and inbound redirect scope clear");
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
             Err(e) => {
                 warn!(
                     %ip,
                     error = %e,
-                    "Retrying pending pod IP map removal failed; keeping capture state degraded"
+                    "Retrying pending inbound redirect scope clear after pod IP removal failed; \
+                     keeping capture state degraded"
                 );
             }
         }
@@ -3595,6 +4117,25 @@ fn pod_map_info(config: &NodeAgentConfig, udp_ready: bool) -> PodInfo {
     )
 }
 
+/// The inbound-redirect flag for ONE address family, derived from the scope
+/// that family can actually have published.
+///
+/// The flag and the `(pod address, port)` scope must agree per family: the
+/// classifier drops an in-scope packet whose family has no capture listener, so
+/// an IPv4-only capture bind (`0.0.0.0`) must never advertise a true IPv6 flag —
+/// `bpf_sk_assign`'s wildcard socket lookup is per-family, so there is no v6
+/// listener for it to resolve. IPv4 always tracks the tracked scope.
+fn pod_inbound_redirect_flag(
+    config: &NodeAgentConfig,
+    state: &PodAttachmentState,
+    ipv6: bool,
+) -> bool {
+    if state.inbound_redirect_ports.is_empty() {
+        return false;
+    }
+    !ipv6 || config.capture_contract.ingress_capture_supports_ipv6
+}
+
 fn udp_readiness_reconcile_enabled(config: &NodeAgentConfig) -> bool {
     config.capture_config.udp_capture_enabled
         || (config.node_waypoint_pod_registry_dir.is_some()
@@ -3637,13 +4178,22 @@ fn reconcile_udp_capture_readiness_with_sync_state(
             if let Some(dir) = &config.node_waypoint_pod_registry_dir {
                 remove_udp_not_ready_ack(dir, uid);
             }
-            let info = pod_map_info(config, false);
+            // Preserve the inbound-redirect flag across this rewrite: a UDP
+            // readiness reconcile must never silently un-enroll a workload from
+            // inbound capture. The flag is derived PER FAMILY so an IPv4-only
+            // capture listener cannot get a true IPv6 flag reinstated here.
+            let base = pod_map_info(config, false);
+            let info_v4 = base
+                .clone()
+                .with_inbound_redirect(pod_inbound_redirect_flag(config, state.value(), false));
+            let info_v6 =
+                base.with_inbound_redirect(pod_inbound_redirect_flag(config, state.value(), true));
             let v4_ok = state
                 .pod_ip
-                .is_none_or(|ip| backend.update_pod_ip(ip, &info).is_ok());
+                .is_none_or(|ip| backend.update_pod_ip(ip, &info_v4).is_ok());
             let v6_ok = state
                 .pod_ip6
-                .is_none_or(|ip| backend.update_pod_ip6(ip, &info).is_ok());
+                .is_none_or(|ip| backend.update_pod_ip6(ip, &info_v6).is_ok());
             if v4_ok && v6_ok {
                 forget_pending_capture_failure(
                     &state_key,
@@ -3714,13 +4264,20 @@ fn reconcile_udp_capture_readiness_with_sync_state(
                 remove_udp_not_ready_ack(dir, uid);
             }
         }
-        let info = pod_map_info(config, ready);
+        // Per-family flags: an IPv4-only capture listener never advertises an
+        // IPv6 redirect, so this rewrite cannot resurrect one.
+        let base = pod_map_info(config, ready);
+        let info_v4 = base
+            .clone()
+            .with_inbound_redirect(pod_inbound_redirect_flag(config, state.value(), false));
+        let info_v6 =
+            base.with_inbound_redirect(pod_inbound_redirect_flag(config, state.value(), true));
         let v4_ok = state
             .pod_ip
-            .is_none_or(|ip| backend.update_pod_ip(ip, &info).is_ok());
+            .is_none_or(|ip| backend.update_pod_ip(ip, &info_v4).is_ok());
         let v6_ok = state
             .pod_ip6
-            .is_none_or(|ip| backend.update_pod_ip6(ip, &info).is_ok());
+            .is_none_or(|ip| backend.update_pod_ip6(ip, &info_v6).is_ok());
         if v4_ok && v6_ok {
             forget_pending_capture_failure(
                 &state_key,
@@ -3872,6 +4429,19 @@ fn handle_pod_added_inner(
             let pod_ip6_reconcile = reconcile_existing_pod_ip6(
                 backend, config, metrics, &state_key, pod_uid, pod_ip6, &mut state,
             );
+            // Runs AFTER both pod-IP reconcilers so it works against the pod's
+            // current addresses: an event that changes the pod IP *and* narrows
+            // `containerPorts` moves the old scope with the address first, then
+            // converges the scope itself here.
+            let inbound_redirect_reconcile = reconcile_existing_pod_inbound_redirect(
+                backend,
+                config,
+                metrics,
+                &state_key,
+                pod_uid,
+                &event.inbound_redirect_ports,
+                &mut state,
+            );
             reconcile_existing_pod_include_ports(
                 backend,
                 metrics,
@@ -3918,11 +4488,17 @@ fn handle_pod_added_inner(
             let current_pod_ip = state.pod_ip;
             let current_pod_ip6 = state.pod_ip6;
             let stale_node_probe_ports = node_probe_reconcile.stale_probe_ports.clone();
-            debug!(pod_uid, pod_name, "Pod already enrolled, reconciled state");
+            debug!(
+                pod_uid,
+                pod_name,
+                inbound_redirect_retry_pending = inbound_redirect_reconcile.update_failed,
+                "Pod already enrolled, reconciled state"
+            );
             drop(state);
             if pod_ip_reconcile.recovered_pending_failure
                 || pod_ip6_reconcile.recovered_pending_failure
                 || node_probe_reconcile.recovered_pending_failure
+                || inbound_redirect_reconcile.recovered_pending_failure
             {
                 clear_partial_capture_state_if_recovered(pod_states, metrics);
             }
@@ -4042,6 +4618,7 @@ fn handle_pod_added_inner(
         include_ports_policy: None,
         workload_identity_cgroup_ids: Vec::new(),
         node_probe_ports: event.node_probe_ports.clone(),
+        inbound_redirect_ports: Vec::new(),
     };
 
     // A same-UID sandbox replacement must never inherit the old producer's
@@ -4232,8 +4809,93 @@ fn handle_pod_added_inner(
                     metrics.set_topology_degraded("node_waypoint_node_source_ipv6_missing");
                 }
             }
+            // Inbound tc ingress redirect scope (issue #3287). The
+            // `(pod address, port)` entries MUST land before the pod-IP map
+            // entry carries the redirect flag: the classifier requires both,
+            // and flagging first would open a window where in-scope traffic
+            // fails closed (dropped) because no port entry exists yet.
+            //
+            // A pod that declares no inbound TCP port is deliberately NOT
+            // flagged — there is nothing for the relay to terminate, so the
+            // pre-existing direct-pod guard stays its only inbound control.
+            let redirect_ports = if config.capture_contract.ingress_redirect_enabled() {
+                event.inbound_redirect_ports.as_slice()
+            } else {
+                &[][..]
+            };
+            // IPv6 scope is published only when the capture listener can
+            // actually accept IPv6 (a `[::]` bind). Under an IPv4-only
+            // `0.0.0.0` bind the classifier's v6 wildcard lookup can never
+            // resolve the listener, so an in-scope v6 packet would be
+            // dropped fail-closed; leaving v6 out of scope keeps it on the
+            // pre-existing direct-pod guard instead.
+            //
+            // The two families therefore get INDEPENDENT flags below: a shared
+            // boolean would pair an IPv4-only scope with a true IPv6 flag, and
+            // a pinned-map entry left by a prior dual-stack configuration would
+            // then combine that flag with stale v6 scope and black-hole IPv6.
+            let redirect_pod_v4 = !redirect_ports.is_empty();
+            let redirect_pod_v6 =
+                redirect_pod_v4 && config.capture_contract.ingress_capture_supports_ipv6;
+            if redirect_pod_v4 {
+                let mut scope_result = Ok(());
+                if let Some(ip) = pod_ip {
+                    scope_result = backend.update_pod_inbound_ports(ip, redirect_ports);
+                }
+                if scope_result.is_ok()
+                    && let Some(ip) = pod_ip6
+                {
+                    scope_result = if redirect_pod_v6 {
+                        backend.update_pod_inbound_ports6(ip, redirect_ports)
+                    } else {
+                        // Explicitly clear rather than skip: the scope map is
+                        // pinned, so a prior dual-stack generation's entries for
+                        // this address would otherwise survive into an IPv4-only
+                        // configuration.
+                        backend.clear_pod_inbound_ports6(ip)
+                    };
+                }
+                if let Err(e) = scope_result {
+                    warn!(
+                        pod_uid,
+                        ?redirect_ports,
+                        error = %e,
+                        "Failed to write the inbound redirect scope; the pod is not enrolled for \
+                         inbound capture"
+                    );
+                    metrics.record_attach_error();
+                    cleanup_partial_pod_enrollment(backend, pod_states, metrics, pod_uid, &state);
+                    remember_failed_pod_enrollment_with_merged_cleanup_state(
+                        &state_key,
+                        attempt_signature,
+                        enrollment_snapshot.clone(),
+                        prior_cleanup_state.as_ref(),
+                        &state,
+                    );
+                    return;
+                }
+            } else {
+                // Converge a pod that USED to declare inbound ports (or that
+                // lost the redirect on reload) back to un-redirected, so a
+                // narrowed spec never leaves a stale redirectable port.
+                if let Some(ip) = pod_ip
+                    && let Err(e) = backend.clear_pod_inbound_ports(ip)
+                {
+                    warn!(pod_uid, %ip, error = %e, "Failed to clear stale inbound redirect scope");
+                }
+                if let Some(ip) = pod_ip6
+                    && let Err(e) = backend.clear_pod_inbound_ports6(ip)
+                {
+                    warn!(pod_uid, %ip, error = %e, "Failed to clear stale IPv6 inbound redirect scope");
+                }
+            }
+
+            // Record the scope on the tracked state: every later rewrite of the
+            // pod-IP map entry restores the flag from here, and teardown uses it
+            // as the removal baseline.
+            state.inbound_redirect_ports = redirect_ports.to_vec();
             if let Some(ip) = pod_ip {
-                let info = pod_map_info(config, false);
+                let info = pod_map_info(config, false).with_inbound_redirect(redirect_pod_v4);
                 if let Err(e) = backend.update_pod_ip(ip, &info) {
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IP map");
                     metrics.record_attach_error();
@@ -4249,7 +4911,7 @@ fn handle_pod_added_inner(
                 }
             }
             if let Some(ip) = pod_ip6 {
-                let info = pod_map_info(config, false);
+                let info = pod_map_info(config, false).with_inbound_redirect(redirect_pod_v6);
                 if let Err(e) = backend.update_pod_ip6(ip, &info) {
                     warn!(pod_uid, %ip, error = %e, "Failed to update pod IPv6 map");
                     metrics.record_attach_error();
@@ -4446,7 +5108,32 @@ fn reconcile_existing_pod_ip(
         return PodIpReconcileResult::default();
     }
 
-    let info = pod_map_info(config, udp_ready_marker_exists(config, pod_uid));
+    // A pod IP change moves the redirect scope with it: the scope map is keyed
+    // by address, so the entries must be re-created under `new_ip` before the
+    // pod-IP entry advertises the flag, and the old address cleared afterwards.
+    let redirect_ports = state.inbound_redirect_ports.clone();
+    if !redirect_ports.is_empty()
+        && let Err(e) = backend.update_pod_inbound_ports(new_ip, &redirect_ports)
+    {
+        warn!(
+            pod_uid,
+            %new_ip,
+            error = %e,
+            "Failed to move the inbound redirect scope to the pod's new IP"
+        );
+        metrics.record_attach_error();
+        remember_pending_capture_failure(
+            state_key,
+            CAPTURE_FAILURE_POD_IP_UPDATE,
+            CAPTURE_FAILURE_DETAIL_POD_IP,
+        );
+        return PodIpReconcileResult {
+            pod_ip_update_failed: true,
+            ..PodIpReconcileResult::default()
+        };
+    }
+    let info = pod_map_info(config, udp_ready_marker_exists(config, pod_uid))
+        .with_inbound_redirect(!redirect_ports.is_empty());
     if let Err(e) = backend.update_pod_ip(new_ip, &info) {
         warn!(pod_uid, %new_ip, error = %e, "Failed to update pod IP map for existing pod");
         metrics.record_attach_error();
@@ -4490,7 +5177,35 @@ fn reconcile_existing_pod_ip6(
         return PodIpReconcileResult::default();
     }
 
-    let info = pod_map_info(config, udp_ready_marker_exists(config, pod_uid));
+    // Gated on the capture listener's family for the same reason enrollment is:
+    // an IPv4-only bind is invisible to the classifier's IPv6 wildcard lookup.
+    let redirect_ports = if config.capture_contract.ingress_capture_supports_ipv6 {
+        state.inbound_redirect_ports.clone()
+    } else {
+        Vec::new()
+    };
+    if !redirect_ports.is_empty()
+        && let Err(e) = backend.update_pod_inbound_ports6(new_ip, &redirect_ports)
+    {
+        warn!(
+            pod_uid,
+            %new_ip,
+            error = %e,
+            "Failed to move the IPv6 inbound redirect scope to the pod's new IP"
+        );
+        metrics.record_attach_error();
+        remember_pending_capture_failure(
+            state_key,
+            CAPTURE_FAILURE_POD_IP_UPDATE,
+            CAPTURE_FAILURE_DETAIL_POD_IP6,
+        );
+        return PodIpReconcileResult {
+            pod_ip_update_failed: true,
+            ..PodIpReconcileResult::default()
+        };
+    }
+    let info = pod_map_info(config, udp_ready_marker_exists(config, pod_uid))
+        .with_inbound_redirect(!redirect_ports.is_empty());
     if let Err(e) = backend.update_pod_ip6(new_ip, &info) {
         warn!(pod_uid, %new_ip, error = %e, "Failed to update pod IPv6 map for existing pod");
         metrics.record_attach_error();
@@ -4515,6 +5230,160 @@ fn reconcile_existing_pod_ip6(
         stale_pod_ip: old_ip,
         recovered_pending_failure: true,
         pod_ip_update_failed: false,
+    }
+}
+
+#[derive(Debug, Default)]
+struct InboundRedirectReconcileResult {
+    /// A deterministic map or pod-IP write failed. The tracked scope is left
+    /// unchanged so the next event re-derives the same delta and retries.
+    update_failed: bool,
+    recovered_pending_failure: bool,
+}
+
+/// Bring ONE address family's redirect scope and flag to `desired`.
+///
+/// The two orderings are not interchangeable, and both exist to avoid a window
+/// where a true flag is paired with scope the classifier cannot honour (that
+/// combination is a fail-closed DROP, not a pass-through):
+///
+/// - widening/installing: write the `(pod address, port)` scope FIRST, raise the
+///   flag second, so in-scope traffic always finds its port entry;
+/// - narrowing to nothing: lower the flag FIRST, clear the scope second.
+///
+/// A pure narrowing between two non-empty sets is one replacing scope write
+/// (the map write replaces the address's whole entry set), so a removed port
+/// simply stops matching while the flag stays legitimately true.
+fn apply_pod_inbound_redirect_v4(
+    backend: &mut dyn EbpfBackend,
+    base: PodInfo,
+    ip: std::net::Ipv4Addr,
+    desired: &[u16],
+) -> Result<(), String> {
+    if desired.is_empty() {
+        backend.update_pod_ip(ip, &base.with_inbound_redirect(false))?;
+        backend.clear_pod_inbound_ports(ip)
+    } else {
+        backend.update_pod_inbound_ports(ip, desired)?;
+        backend.update_pod_ip(ip, &base.with_inbound_redirect(true))
+    }
+}
+
+/// IPv6 counterpart of [`apply_pod_inbound_redirect_v4`], with the same
+/// ordering contract.
+fn apply_pod_inbound_redirect_v6(
+    backend: &mut dyn EbpfBackend,
+    base: PodInfo,
+    ip: std::net::Ipv6Addr,
+    desired: &[u16],
+) -> Result<(), String> {
+    if desired.is_empty() {
+        backend.update_pod_ip6(ip, &base.with_inbound_redirect(false))?;
+        backend.clear_pod_inbound_ports6(ip)
+    } else {
+        backend.update_pod_inbound_ports6(ip, desired)?;
+        backend.update_pod_ip6(ip, &base.with_inbound_redirect(true))
+    }
+}
+
+/// Re-evaluate an already-enrolled pod's inbound tc redirect scope (issue
+/// #3287). Kubernetes `Apply` events conflate "added" and "modified", so a
+/// spec edit that adds, narrows, or removes `containerPorts` arrives on the
+/// already-enrolled path — without this hook the pod would keep the redirect
+/// scope it was enrolled with until it was recreated, leaving withdrawn
+/// `(pod address, port)` pairs redirect-eligible.
+///
+/// This is deliberately narrow: it reconciles scope + flags only, never
+/// re-attaches programs (the attachment target is unchanged on this path, which
+/// is what put us in the already-enrolled branch at all).
+///
+/// The families are reconciled INDEPENDENTLY: IPv6 desired scope is empty
+/// whenever the capture listener cannot accept IPv6, so a v4-only bind both
+/// clears any stale v6 scope and keeps the v6 flag false.
+///
+/// A failed write is a visible, retryable capture failure: the tracked scope is
+/// NOT advanced (so the next event recomputes the same delta) and a pending
+/// capture failure is recorded rather than silently claiming success.
+fn reconcile_existing_pod_inbound_redirect(
+    backend: &mut dyn EbpfBackend,
+    config: &NodeAgentConfig,
+    metrics: &NodeAgentMetrics,
+    state_key: &str,
+    pod_uid: &str,
+    event_ports: &[u16],
+    state: &mut PodAttachmentState,
+) -> InboundRedirectReconcileResult {
+    // Desired scope comes from the NEW event, and only while the redirect is
+    // enabled at all: with the feature off the desired scope is empty, so a
+    // disabled reload converges an already-enrolled pod back to un-redirected.
+    let desired: Vec<u16> = if config.capture_contract.ingress_redirect_enabled() {
+        let mut ports = event_ports.to_vec();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    } else {
+        Vec::new()
+    };
+    if desired == state.inbound_redirect_ports {
+        return InboundRedirectReconcileResult::default();
+    }
+    let desired_v6: &[u16] = if config.capture_contract.ingress_capture_supports_ipv6 {
+        &desired
+    } else {
+        &[]
+    };
+
+    // Preserve the pod's UDP readiness bit across these rewrites, exactly as
+    // the pod-IP reconcilers do: the redirect flag is the only bit we own here.
+    let base = pod_map_info(config, udp_ready_marker_exists(config, pod_uid));
+    let mut failed = false;
+    if let Some(ip) = state.pod_ip
+        && let Err(e) = apply_pod_inbound_redirect_v4(backend, base.clone(), ip, &desired)
+    {
+        warn!(
+            pod_uid,
+            %ip,
+            ?desired,
+            error = %e,
+            "Failed to reconcile the inbound redirect scope for an existing pod; will retry"
+        );
+        failed = true;
+    }
+    if let Some(ip) = state.pod_ip6
+        && let Err(e) = apply_pod_inbound_redirect_v6(backend, base, ip, desired_v6)
+    {
+        warn!(
+            pod_uid,
+            %ip,
+            desired = ?desired_v6,
+            error = %e,
+            "Failed to reconcile the IPv6 inbound redirect scope for an existing pod; will retry"
+        );
+        failed = true;
+    }
+
+    if failed {
+        metrics.record_attach_error();
+        remember_pending_capture_failure(
+            state_key,
+            CAPTURE_FAILURE_INBOUND_REDIRECT_UPDATE,
+            CAPTURE_FAILURE_DETAIL_INBOUND_REDIRECT,
+        );
+        return InboundRedirectReconcileResult {
+            update_failed: true,
+            recovered_pending_failure: false,
+        };
+    }
+
+    state.inbound_redirect_ports = desired;
+    let recovered_pending_failure = forget_pending_capture_failure(
+        state_key,
+        CAPTURE_FAILURE_INBOUND_REDIRECT_UPDATE,
+        CAPTURE_FAILURE_DETAIL_INBOUND_REDIRECT,
+    );
+    InboundRedirectReconcileResult {
+        update_failed: false,
+        recovered_pending_failure,
     }
 }
 
@@ -4551,8 +5420,24 @@ fn remove_pod_ip_if_unowned(
         );
         return;
     }
-    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
-    clear_partial_capture_state_if_recovered(pod_states, metrics);
+    // The pod-IP entry is gone, so the classifier already refuses to redirect
+    // for this address; clearing the now-unreachable scope entries afterwards
+    // keeps the bounded scope map from accumulating across pod churn. Ordered
+    // after the pod-IP removal on purpose: scope-first would briefly leave a
+    // flagged pod with no reachable port, which fails closed (drops) rather
+    // than passing through. Scope clear is part of the durable removal key —
+    // a transient clear failure must stay pending/retryable, not complete the
+    // handoff while unreachable `(pod, port)` keys remain.
+    finish_pod_ip_removal_scope_clear(
+        backend,
+        pod_states,
+        metrics,
+        &state_key,
+        pod_uid,
+        std::net::IpAddr::V4(ip),
+        removal_reason,
+        false,
+    );
 }
 
 fn remove_pod_ip6_if_unowned(
@@ -4588,8 +5473,16 @@ fn remove_pod_ip6_if_unowned(
         );
         return;
     }
-    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
-    clear_partial_capture_state_if_recovered(pod_states, metrics);
+    finish_pod_ip_removal_scope_clear(
+        backend,
+        pod_states,
+        metrics,
+        &state_key,
+        pod_uid,
+        std::net::IpAddr::V6(ip),
+        removal_reason,
+        false,
+    );
 }
 
 fn other_pod_owning_ip(
@@ -4711,7 +5604,20 @@ fn remove_pre_enrollment_pod_ip_if_unowned(
         );
         return;
     }
-    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+    // A partially-enrolled pod may already have had its inbound-redirect scope
+    // written (scope lands before the pod-IP flag), so the same after-the-IP
+    // clear the enrolled teardown does is needed here or those
+    // `(pod address, port)` pairs accumulate in the bounded scope map.
+    finish_pod_ip_removal_scope_clear(
+        backend,
+        pod_states,
+        metrics,
+        &state_key,
+        pod_uid,
+        std::net::IpAddr::V4(ip),
+        removal_reason,
+        true,
+    );
 }
 
 fn remove_pre_enrollment_pod_ip6_if_unowned(
@@ -4751,7 +5657,64 @@ fn remove_pre_enrollment_pod_ip6_if_unowned(
         );
         return;
     }
-    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+    finish_pod_ip_removal_scope_clear(
+        backend,
+        pod_states,
+        metrics,
+        &state_key,
+        pod_uid,
+        std::net::IpAddr::V6(ip),
+        removal_reason,
+        true,
+    );
+}
+
+/// After a successful (or already-absent) pod-IP map delete, clear the family
+/// scope and only then drop the durable `pod_ip_remove` failure. A clear
+/// failure keeps the same pending key so periodic retry re-runs both steps.
+#[allow(clippy::too_many_arguments)]
+fn finish_pod_ip_removal_scope_clear(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    state_key: &str,
+    pod_uid: &str,
+    ip: std::net::IpAddr,
+    removal_reason: &'static str,
+    pre_enrollment: bool,
+) -> bool {
+    let clear_result = match ip {
+        std::net::IpAddr::V4(ip) => backend.clear_pod_inbound_ports(ip),
+        std::net::IpAddr::V6(ip) => backend.clear_pod_inbound_ports6(ip),
+    };
+    if let Err(e) = clear_result {
+        let scope_label = if pre_enrollment {
+            if ip.is_ipv6() {
+                "Failed to clear pre-enrollment IPv6 inbound redirect scope after pod IP removal"
+            } else {
+                "Failed to clear pre-enrollment inbound redirect scope after pod IP removal"
+            }
+        } else if ip.is_ipv6() {
+            "Failed to clear IPv6 inbound redirect scope after pod IP removal"
+        } else {
+            "Failed to clear inbound redirect scope after pod IP removal"
+        };
+        warn!(
+            pod_uid,
+            %ip,
+            error = %e,
+            removal_reason,
+            "{scope_label}"
+        );
+        metrics.record_attach_error();
+        remember_pending_capture_failure(state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+        return false;
+    }
+    forget_pending_capture_failure(state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+    if !pre_enrollment {
+        clear_partial_capture_state_if_recovered(pod_states, metrics);
+    }
+    true
 }
 
 /// Re-evaluate the `includeOutboundPorts` annotations of an already-enrolled
@@ -5710,14 +6673,24 @@ fn initialize_backend(
         return Err(anyhow::Error::msg(e));
     }
 
+    // Single owner of the inbound-redirect ROUTING teardown across this
+    // function. Set once the routing is installed and cleared the moment it is
+    // removed, so exactly one path removes it: the in-place removal on a
+    // partially-applied install (no classifier ever attached there), or the
+    // rollback sweep below — which runs AFTER `cleanup_all` has retried the
+    // classifier detach, because routing must never be pulled out from under a
+    // classifier that may still be live.
+    let routing_installed = std::cell::Cell::new(false);
+
     // Programs (and any bpffs pins created during load) are live. Every
     // subsequent failure must roll back via `cleanup_all` before returning so
     // a crashed/retried startup cannot leave stale Ferrum maps under
     // `/sys/fs/bpf/ferrum`. The guard also covers an unwind out of the init
     // steps. `run_with_backend` takes ownership only after this function
     // returns Ok, so exactly one of the two owners ever cleans up.
-    let mut rollback = LoadedBackendRollback::new(backend);
-    match initialize_backend_after_load(rollback.backend_mut(), config, metrics) {
+    let mut rollback = LoadedBackendRollback::new(backend, &routing_installed);
+    match initialize_backend_after_load(rollback.backend_mut(), config, metrics, &routing_installed)
+    {
         Ok(()) => {
             rollback.commit();
             Ok(())
@@ -5733,6 +6706,7 @@ fn initialize_backend_after_load(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
+    routing_installed: &std::cell::Cell<bool>,
 ) -> Result<(), anyhow::Error> {
     let require_sock_ops = config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint;
     if let Err(e) = backend.update_capture_config(&config.capture_contract.bpf_capture_config()) {
@@ -5855,7 +6829,94 @@ fn initialize_backend_after_load(
         }
     }
 
+    // Inbound tc ingress redirect (issue #3287). Routing goes in BEFORE the
+    // classifier: the classifier is what starts assigning sockets, and a
+    // classifier live without the local-delivery rule would mark packets that
+    // the `main` table then forwards to the pod anyway — an assigned-but-
+    // forwarded packet that never reaches either endpoint. Installing routing
+    // first means an aborted startup leaves only inert routing behind.
+    let ingress_redirect_enabled = config.capture_contract.ingress_redirect_enabled();
+    if ingress_redirect_enabled {
+        if let Err(e) =
+            install_ingress_redirect_routing(config.capture_contract.ingress_capture_supports_ipv6)
+        {
+            // The `ip` batch is not atomic: the v4 rule can be installed when
+            // the v6 route fails. Remove exactly the Ferrum-owned rule/route on
+            // this path too — an inert leftover priority/table entry still
+            // claims the fwmark, which can interfere with other software that
+            // uses it (and would silently pre-satisfy a later reinstall).
+            //
+            // Safe to remove IN PLACE, unlike every other failure path below:
+            // no classifier has been attached yet, so there is nothing live that
+            // could be stranded by the routing going away first. The flag stays
+            // false so the rollback sweep does not remove it a second time.
+            remove_ingress_redirect_routing();
+            metrics.set_topology_degraded("node_waypoint_ingress_redirect_unavailable");
+            metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+            anyhow::bail!(
+                "NodeWaypoint inbound tc ingress redirect requires policy routing for local \
+                 delivery of assigned packets, but installing it failed: {e}. Ensure iproute2 \
+                 (`ip`) is present in the node-agent image and the container has NET_ADMIN."
+            );
+        }
+        // From here on the routing exists and the rollback owns removing it,
+        // after `cleanup_all` has retried the classifier detach.
+        routing_installed.set(true);
+        for iface in &config.capture_contract.ingress_redirect_ifaces {
+            if let Err(e) = backend.attach_ingress_redirect(iface) {
+                // Fail closed and unwind: a half-attached redirect would capture
+                // inbound traffic on some interfaces and not others, which is
+                // exactly the ambiguous state this feature exists to remove.
+                //
+                // Detach here, but do NOT remove the routing yet: if this detach
+                // fails, the classifier attached to an earlier interface is
+                // still live, and removing its local-delivery routing would
+                // strand every packet it assigns. The rollback sweep removes the
+                // routing after `cleanup_all` has retried the detach, and
+                // withholds it if the classifier still cannot be proven gone.
+                if let Err(detach_err) = backend.detach_ingress_redirect() {
+                    warn!(
+                        error = %detach_err,
+                        "Failed to detach the NodeWaypoint inbound tc ingress redirect while \
+                         unwinding a failed attach; cleanup will retry before its routing is \
+                         removed"
+                    );
+                }
+                metrics.set_topology_degraded("node_waypoint_ingress_redirect_unavailable");
+                metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+                anyhow::bail!(
+                    "Failed to attach the NodeWaypoint inbound tc ingress redirect to \
+                     '{iface}': {e}. Verify the interface exists on this node \
+                     (FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES) and the container has \
+                     NET_ADMIN."
+                );
+            }
+        }
+        info!(
+            ifaces = ?config.capture_contract.ingress_redirect_ifaces,
+            capture_port = config.capture_contract.ingress_capture_port,
+            hbone_port = config.capture_contract.hbone_redirect_port,
+            mark = format!("{:#x}", config.capture_contract.node_waypoint_ingress_redirect_mark),
+            table = NODE_WAYPOINT_INGRESS_REDIRECT_TABLE,
+            "NodeWaypoint inbound tc ingress redirect installed; enrolled workloads no longer \
+             depend on a node-global iptables REDIRECT for inbound capture"
+        );
+    }
+
     if let Err(e) = backend.validate_startup_ready(require_sock_ops) {
+        // Startup is not ready, so nothing may keep steering inbound traffic:
+        // unwind the redirect in the same order shutdown uses — detach the
+        // classifier FIRST, and only remove the routing it depended on once the
+        // classifier is provably gone — so no window exists where packets are
+        // assigned but no longer locally delivered. The routing removal itself
+        // is the rollback sweep's, after `cleanup_all` retries this detach.
+        if ingress_redirect_enabled && let Err(detach_err) = backend.detach_ingress_redirect() {
+            warn!(
+                error = %detach_err,
+                "Failed to detach the NodeWaypoint inbound tc ingress redirect while unwinding \
+                 a failed startup validation; cleanup will retry before its routing is removed"
+            );
+        }
         if require_sock_ops && e.contains("SOCK_OPS") {
             metrics.set_topology_degraded("node_waypoint_sock_ops_unavailable");
             metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE);
@@ -5876,18 +6937,25 @@ fn initialize_backend_after_load(
 /// nothing owns them yet, so any exit — error return **or unwind** — must
 /// `cleanup_all` exactly once. `commit` hands the window off to
 /// [`InitializedBackendOwner`] instead.
-struct LoadedBackendRollback<'a> {
+struct LoadedBackendRollback<'a, 'r> {
     backend: &'a mut dyn EbpfBackend,
     /// Cleared by the first of `commit`/`roll_back`/`Drop`, so cleanup is
     /// exactly-once no matter which one wins.
     armed: bool,
+    /// Shared with `initialize_backend_after_load`: `true` once the
+    /// inbound-redirect policy routing is installed and not yet removed. This
+    /// rollback is its single removal owner from that point on, and removes it
+    /// only AFTER `cleanup_all` (which retries the classifier detach) and only
+    /// when no classifier is still recorded as attached.
+    routing_installed: &'r std::cell::Cell<bool>,
 }
 
-impl<'a> LoadedBackendRollback<'a> {
-    fn new(backend: &'a mut dyn EbpfBackend) -> Self {
+impl<'a, 'r> LoadedBackendRollback<'a, 'r> {
+    fn new(backend: &'a mut dyn EbpfBackend, routing_installed: &'r std::cell::Cell<bool>) -> Self {
         Self {
             backend,
             armed: true,
+            routing_installed,
         }
     }
 
@@ -5896,9 +6964,12 @@ impl<'a> LoadedBackendRollback<'a> {
     }
 
     /// Initialization succeeded: disarm without cleanup so the caller's
-    /// `InitializedBackendOwner` becomes the single cleanup owner.
+    /// `InitializedBackendOwner` becomes the single cleanup owner. The routing
+    /// stays installed — it is now the running agent's, torn down by
+    /// `shutdown_backend_state`.
     fn commit(mut self) {
         self.armed = false;
+        self.routing_installed.set(false);
     }
 
     /// Roll back now. Cleanup errors are warned alongside the original cause
@@ -5913,10 +6984,20 @@ impl<'a> LoadedBackendRollback<'a> {
                  original error preserved"
             );
         }
+        self.release_routing("startup rollback");
+    }
+
+    /// Remove the Ferrum-owned inbound-redirect routing, once and only once
+    /// `cleanup_all` has run and left no classifier recorded as attached.
+    fn release_routing(&mut self, context: &'static str) {
+        if !self.routing_installed.replace(false) {
+            return;
+        }
+        release_ingress_redirect_routing(&*self.backend, context);
     }
 }
 
-impl Drop for LoadedBackendRollback<'_> {
+impl Drop for LoadedBackendRollback<'_, '_> {
     fn drop(&mut self) {
         // Only reached on an unwind out of the init steps; the error and
         // success paths disarm first. `cleanup_all` is synchronous, so this is
@@ -5931,7 +7012,34 @@ impl Drop for LoadedBackendRollback<'_> {
                 "Failed to roll back BPF state while unwinding out of node-agent initialization"
             );
         }
+        self.release_routing("startup unwind");
     }
+}
+
+/// Remove the Ferrum-owned inbound-redirect policy routing — but only once no
+/// classifier can still be live.
+///
+/// The ordering is the whole point. A live classifier WITHOUT its local-delivery
+/// routing is the harmful half-state: it keeps assigning packets to the capture
+/// socket while the `main` table forwards them to the pod, so they reach neither
+/// endpoint. An inert leftover `ip rule`/`ip route` is harmless by comparison
+/// (it only claims the redirect fwmark). So when the detach did not provably
+/// succeed — after `cleanup_all` has already retried it — the routing is
+/// deliberately RETAINED and the operator is told how to finish the teardown.
+fn release_ingress_redirect_routing(backend: &dyn EbpfBackend, context: &'static str) {
+    if backend.ingress_redirect_attached() {
+        warn!(
+            context,
+            table = NODE_WAYPOINT_INGRESS_REDIRECT_TABLE,
+            "The NodeWaypoint inbound tc ingress redirect classifier is still attached after \
+             cleanup retried its detach, so its local-delivery routing is deliberately RETAINED: \
+             removing it now would strand every packet the classifier still assigns. Remove the \
+             classifier manually (`tc filter del dev <iface> ingress`); the leftover `ip rule` / \
+             `ip route` entries are inert until then."
+        );
+        return;
+    }
+    remove_ingress_redirect_routing();
 }
 
 /// Single owner of `cleanup_all` after successful `initialize_backend`.
@@ -5960,22 +7068,32 @@ struct InitializedBackendOwner<'a> {
     /// no-op. This is the whole exactly-once mechanism; there is no second
     /// cleanup owner after `initialize_backend` returns `Ok`.
     cleaned_up: bool,
+    /// Whether this agent installed the inbound-redirect policy routing.
+    ///
+    /// `initialize_backend` hands routing ownership over on success, so every
+    /// exit from here — normal shutdown, a late startup/runtime error, or `Drop`
+    /// — releases it through [`release_ingress_redirect_routing`]. Without this
+    /// the non-shutdown exits would leave an inert Ferrum-owned rule/route
+    /// claiming the redirect fwmark.
+    ingress_redirect_enabled: bool,
 }
 
 impl InitializedBackendOwner<'static> {
-    fn new(backend: Box<dyn EbpfBackend>) -> Self {
+    fn new(backend: Box<dyn EbpfBackend>, ingress_redirect_enabled: bool) -> Self {
         Self {
             backend: InitializedBackend::Owned(backend),
             cleaned_up: false,
+            ingress_redirect_enabled,
         }
     }
 }
 
 impl<'a> InitializedBackendOwner<'a> {
-    fn borrowed(backend: &'a mut dyn EbpfBackend) -> Self {
+    fn borrowed(backend: &'a mut dyn EbpfBackend, ingress_redirect_enabled: bool) -> Self {
         Self {
             backend: InitializedBackend::Borrowed(backend),
             cleaned_up: false,
+            ingress_redirect_enabled,
         }
     }
 
@@ -6017,6 +7135,7 @@ impl<'a> InitializedBackendOwner<'a> {
                 "Failed to cleanup BPF state; pins may remain under bpffs until the next successful cleanup"
             );
         }
+        self.release_ingress_redirect_routing(context);
     }
 
     fn cleanup_once_preserving(&mut self, original: &anyhow::Error, context: &'static str) {
@@ -6032,6 +7151,18 @@ impl<'a> InitializedBackendOwner<'a> {
                 "Failed to cleanup BPF state after error; original error preserved"
             );
         }
+        self.release_ingress_redirect_routing(context);
+    }
+
+    /// Release the inbound-redirect routing after `cleanup_all` has retried the
+    /// classifier detach. `shutdown_pods` does its own ordered release inside
+    /// [`shutdown_backend_state`] and latches `cleaned_up`, so the two never
+    /// both run.
+    fn release_ingress_redirect_routing(&mut self, context: &'static str) {
+        if !self.ingress_redirect_enabled {
+            return;
+        }
+        release_ingress_redirect_routing(&*self.backend.as_mut(), context);
     }
 }
 
@@ -6096,12 +7227,33 @@ fn shutdown_backend_state(
     config: &NodeAgentConfig,
 ) {
     detach_enrolled_pods(backend, pod_states, config);
+    let ingress_redirect_enabled = config.capture_contract.ingress_redirect_enabled();
+    // Detach the node-level ingress redirect BEFORE removing its routing: with
+    // the classifier gone no further packets are assigned, so the window
+    // between the two steps cannot strand an assigned packet with no local
+    // route. `cleanup_all` below RETRIES a failed detach (the links are owned by
+    // the backend, so a failure keeps its attachment recorded), and the routing
+    // removal is deferred until after that retry — and skipped entirely if the
+    // classifier still cannot be proven gone.
+    if ingress_redirect_enabled && let Err(e) = backend.detach_ingress_redirect() {
+        warn!(
+            error = %e,
+            context = "shutdown",
+            "Failed to detach the inbound tc ingress redirect; inbound traffic for enrolled \
+             pods may be steered at a listener that is going away until the classifier is \
+             removed manually (`tc filter del dev <iface> ingress`). Cleanup will retry before \
+             its local-delivery routing is removed."
+        );
+    }
     if let Err(cleanup_err) = backend.cleanup_all() {
         warn!(
             error = %cleanup_err,
             context = "shutdown",
             "Failed to cleanup BPF state; pins may remain under bpffs until the next successful cleanup"
         );
+    }
+    if ingress_redirect_enabled {
+        release_ingress_redirect_routing(&*backend, "shutdown");
     }
 }
 
@@ -6294,7 +7446,8 @@ pub mod startup_cleanup_test_seams {
             Err(probe) => return probe,
         };
         let sampled = init.sampled;
-        let owner = InitializedBackendOwner::new(Box::new(init.backend));
+        let ingress_redirect = init.config.capture_contract.ingress_redirect_enabled();
+        let owner = InitializedBackendOwner::new(Box::new(init.backend), ingress_redirect);
         // Production path: `run_with_backend` funnels a kube-client error here.
         let err = owner.fail_with(anyhow::anyhow!("injected kube client construction failure"));
         observed(&watch, sampled, Some(err.to_string()))
@@ -6309,7 +7462,8 @@ pub mod startup_cleanup_test_seams {
             Err(probe) => return probe,
         };
         let (config, sampled) = (init.config, init.sampled);
-        let mut owner = InitializedBackendOwner::new(Box::new(init.backend));
+        let ingress_redirect = config.capture_contract.ingress_redirect_enabled();
+        let mut owner = InitializedBackendOwner::new(Box::new(init.backend), ingress_redirect);
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         owner.shutdown_pods(&pod_states, &config);
         // Drop must observe the latched flag and NOT clean up a second time.
@@ -6330,7 +7484,8 @@ pub mod startup_cleanup_test_seams {
             Err(probe) => return probe,
         };
         let sampled = init.sampled;
-        let owner = InitializedBackendOwner::new(Box::new(init.backend));
+        let ingress_redirect = init.config.capture_contract.ingress_redirect_enabled();
+        let owner = InitializedBackendOwner::new(Box::new(init.backend), ingress_redirect);
         let err = owner.fail_with(anyhow::anyhow!("original injected startup failure"));
         observed(&watch, sampled, Some(err.to_string()))
     }
@@ -6345,17 +7500,32 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn with_env_vars<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        let previous: Vec<(&str, Option<std::ffi::OsString>)> = vars
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        // Always isolate vars that other modules' tests may leave set. Restoring
+        // only the caller's list is not enough: a leaked
+        // `FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES` from a mesh test would
+        // fail-closed every LocalPod `from_env_config` parse and poison the
+        // env lock for the rest of this module.
+        let isolated_keys = ["FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES"];
+        let mut previous: Vec<(&str, Option<std::ffi::OsString>)> = isolated_keys
             .iter()
-            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .map(|key| (*key, std::env::var_os(key)))
             .collect();
+        for (key, _) in vars {
+            if !isolated_keys.contains(key) {
+                previous.push((*key, std::env::var_os(key)));
+            }
+        }
+        for key in isolated_keys {
+            // SAFETY: this test helper serializes all env mutation in this module.
+            unsafe { std::env::remove_var(key) };
+        }
         for (key, value) in vars {
             // SAFETY: this test helper serializes all env mutation in this module.
             unsafe { std::env::set_var(key, value) };
         }
 
-        let result = f();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
         for (key, value) in previous {
             // SAFETY: this test helper serializes all env mutation in this module.
@@ -6367,7 +7537,10 @@ mod tests {
             }
         }
 
-        result
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn test_failed_enrollment_signature(
@@ -6401,6 +7574,7 @@ mod tests {
             pod_ip: Some(pod_ip.to_string()),
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
         }
     }
@@ -6767,6 +7941,751 @@ mod tests {
     }
 
     #[test]
+    fn pod_inbound_redirect_ports_use_declared_tcp_container_ports_only() {
+        use k8s_openapi::api::core::v1::ContainerPort;
+
+        let spec = PodSpec {
+            containers: vec![
+                Container {
+                    name: "app".to_string(),
+                    ports: Some(vec![
+                        ContainerPort {
+                            container_port: 8080,
+                            ..Default::default()
+                        },
+                        // Explicit TCP is equivalent to an omitted protocol.
+                        ContainerPort {
+                            container_port: 8443,
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        },
+                        // UDP must NOT be redirected: the redirect is TCP-only.
+                        ContainerPort {
+                            container_port: 5353,
+                            protocol: Some("UDP".to_string()),
+                            ..Default::default()
+                        },
+                        // Port 0 is not a reachable destination.
+                        ContainerPort {
+                            container_port: 0,
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                },
+                Container {
+                    name: "sidecar".to_string(),
+                    // Duplicate across containers collapses to one entry.
+                    ports: Some(vec![ContainerPort {
+                        container_port: 8080,
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+                // A container declaring no ports contributes nothing.
+                Container {
+                    name: "quiet".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            pod_inbound_redirect_ports_from_spec(Some(&spec)),
+            vec![8080, 8443]
+        );
+        // No spec (or no declared ports) means the pod is never flagged for
+        // redirect, so the direct-pod guard stays its only inbound control.
+        assert!(pod_inbound_redirect_ports_from_spec(None).is_empty());
+        assert!(
+            pod_inbound_redirect_ports_from_spec(Some(&PodSpec::default())).is_empty(),
+            "a pod declaring no containerPorts must not be redirect-enrolled"
+        );
+    }
+
+    #[test]
+    fn ingress_redirect_ifaces_parse_dedupes_and_defaults_to_disabled() {
+        // Unset is the default and must disable the redirect entirely.
+        with_env_vars(&[], || {
+            assert!(node_agent_ingress_redirect_ifaces_from_env().is_empty());
+            assert!(!node_waypoint_ingress_redirect_configured());
+        });
+
+        with_env_vars(
+            &[(
+                "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES",
+                " eth0 , eth1 ,, eth0 ",
+            )],
+            || {
+                // Trimmed, empty entries dropped, and DEDUPED — attaching the same
+                // classifier twice to one interface would install two filters both
+                // trying to assign the same packet.
+                assert_eq!(
+                    node_agent_ingress_redirect_ifaces_from_env(),
+                    vec!["eth0".to_string(), "eth1".to_string()]
+                );
+                assert!(node_waypoint_ingress_redirect_configured());
+            },
+        );
+
+        // An all-whitespace value is equivalent to unset, not to an interface
+        // literally named "".
+        with_env_vars(
+            &[("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", " , ")],
+            || {
+                assert!(node_agent_ingress_redirect_ifaces_from_env().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn ingress_redirect_capture_config_is_published_only_when_fully_enabled() {
+        use crate::ebpf::NODE_WAYPOINT_INGRESS_REDIRECT_MARK;
+
+        let mut contract = CaptureContract::local_pod_defaults();
+        contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
+        contract.node_waypoint_ingress_redirect_mark = NODE_WAYPOINT_INGRESS_REDIRECT_MARK;
+
+        // A mark with no interface is not an installed redirect: arming the
+        // kernel without an attach point (and without the local-delivery
+        // routing that goes in beside it) would be a lie the classifier acts on.
+        assert!(!contract.ingress_redirect_enabled());
+        assert_eq!(
+            contract
+                .bpf_capture_config()
+                .node_waypoint_ingress_redirect_mark,
+            0
+        );
+
+        contract.ingress_redirect_ifaces = vec!["eth0".to_string()];
+        // Still not armed: the steer target is the transparent inbound CAPTURE
+        // listener, and without its port there is no socket to assign.
+        assert!(!contract.ingress_redirect_enabled());
+
+        contract.ingress_capture_port = ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_CAPTURE_PORT;
+        assert!(contract.ingress_redirect_enabled());
+        let published = contract.bpf_capture_config();
+        assert_eq!(
+            published.node_waypoint_ingress_redirect_mark,
+            NODE_WAYPOINT_INGRESS_REDIRECT_MARK
+        );
+        assert_eq!(
+            published.node_waypoint_ingress_capture_port,
+            ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_CAPTURE_PORT as u32
+        );
+        assert_ne!(
+            published.node_waypoint_ingress_capture_port, published.hbone_redirect_port,
+            "the kernel must steer at the capture listener, never at the HBONE listener"
+        );
+        assert!(published.ingress_redirect_armed());
+
+        // Local-pod mode has no capture listener, so the redirect stays disarmed
+        // even with interfaces, a mark, and a port configured.
+        contract.proxy_mode = NodeAgentProxyMode::LocalPod;
+        assert!(!contract.ingress_redirect_enabled());
+        assert_eq!(
+            contract
+                .bpf_capture_config()
+                .node_waypoint_ingress_redirect_mark,
+            0
+        );
+        assert_eq!(
+            contract
+                .bpf_capture_config()
+                .node_waypoint_ingress_capture_port,
+            0
+        );
+    }
+
+    #[test]
+    fn ingress_redirect_routing_rule_is_evaluated_before_main_and_owns_its_table() {
+        for ipv6 in [false, true] {
+            let commands = ingress_redirect_routing_commands(ipv6);
+            let joined: Vec<String> = commands.iter().map(|args| args.join(" ")).collect();
+            let all = joined.join("\n");
+
+            // The RPDB is scanned in ascending priority order, so the fwmark
+            // rule MUST carry a LOWER priority number than the kernel `main`
+            // rule (32766) to be evaluated before it; otherwise `main` resolves
+            // the marked packet first and the redirect black-holes.
+            assert!(
+                all.contains("rule add priority 101 fwmark 0x735 lookup 33134"),
+                "ipv6={ipv6}: {all}"
+            );
+            // Ferrum-owned table, distinct from the UDP TPROXY table 33133.
+            assert!(!all.contains("33133"), "ipv6={ipv6}: {all}");
+            // Local delivery is what makes the assigned packet reach the relay
+            // instead of being forwarded to the pod.
+            assert!(all.contains("route replace local"), "ipv6={ipv6}: {all}");
+            assert!(all.contains("dev lo table 33134"), "ipv6={ipv6}: {all}");
+            // Delete-before-add keeps installation idempotent across restarts.
+            assert!(joined[0].contains("rule del"), "ipv6={ipv6}: {all}");
+
+            // Family selection rides `ip -6`, never a v4 command with a v6
+            // default route (or vice versa).
+            if ipv6 {
+                assert!(commands.iter().all(|args| args[0] == "-6"), "{all}");
+                assert!(all.contains("::/0") && !all.contains("0.0.0.0/0"), "{all}");
+            } else {
+                assert!(commands.iter().all(|args| args[0] != "-6"), "{all}");
+                assert!(all.contains("0.0.0.0/0") && !all.contains("::/0"), "{all}");
+            }
+        }
+    }
+
+    #[test]
+    fn ingress_redirect_routing_teardown_names_the_exact_ferrum_rule() {
+        for ipv6 in [false, true] {
+            let all = ingress_redirect_routing_teardown_commands(ipv6)
+                .iter()
+                .map(|args| args.join(" "))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // Deletion names the exact priority AND table so a co-resident
+            // routing policy is never disturbed.
+            assert!(
+                all.contains("rule del priority 101 lookup 33134"),
+                "ipv6={ipv6}: {all}"
+            );
+            assert!(all.contains("route del local"), "ipv6={ipv6}: {all}");
+            // Never a table flush and never a by-lookup-only match.
+            assert!(!all.contains("flush"), "ipv6={ipv6}: {all}");
+            assert!(!all.contains("33133"), "ipv6={ipv6}: {all}");
+        }
+    }
+
+    /// NodeWaypoint config whose inbound tc ingress redirect is armed.
+    fn node_waypoint_redirect_config(cgroup_root: String, supports_ipv6: bool) -> NodeAgentConfig {
+        let mut capture_config = CaptureConfig::explicit(15006, 15001);
+        capture_config.mode = CaptureMode::Ebpf;
+        let mut capture_contract = CaptureContract::local_pod_defaults();
+        capture_contract.proxy_mode = NodeAgentProxyMode::NodeWaypoint;
+        capture_contract.ingress_redirect_ifaces = vec!["eth0".to_string()];
+        capture_contract.node_waypoint_ingress_redirect_mark = NODE_WAYPOINT_INGRESS_REDIRECT_MARK;
+        capture_contract.ingress_capture_port = 15006;
+        capture_contract.ingress_capture_supports_ipv6 = supports_ipv6;
+        assert!(capture_contract.ingress_redirect_enabled());
+        NodeAgentConfig {
+            node_name: "test-node".to_string(),
+            capture_config,
+            cgroup_root,
+            bpf_fs_path: "/sys/fs/bpf".to_string(),
+            fallback_mode: FallbackMode::Iptables,
+            excluded_namespaces: HashSet::new(),
+            capture_contract,
+            trust_domain: "cluster.local".to_string(),
+            node_waypoint_pod_registry_dir: None,
+        }
+    }
+
+    fn scope<const N: usize>(ports: [u16; N]) -> std::collections::BTreeSet<u16> {
+        ports.into_iter().collect()
+    }
+
+    fn redirect_scope_v4(
+        backend: &MockEbpfBackend,
+        ip: std::net::Ipv4Addr,
+    ) -> std::collections::BTreeSet<u16> {
+        backend
+            .pod_inbound_ports
+            .iter()
+            .filter(|(entry_ip, _)| *entry_ip == ip)
+            .map(|(_, port)| *port)
+            .collect()
+    }
+
+    fn redirect_scope_v6(
+        backend: &MockEbpfBackend,
+        ip: std::net::Ipv6Addr,
+    ) -> std::collections::BTreeSet<u16> {
+        backend
+            .pod_inbound_ports6
+            .iter()
+            .filter(|(entry_ip, _)| *entry_ip == ip)
+            .map(|(_, port)| *port)
+            .collect()
+    }
+
+    /// A pod that is ALREADY enrolled must track later `containerPorts` edits:
+    /// Kubernetes `Apply` events conflate add and modify, so without the
+    /// existing-enrollment reconcile a narrowed or emptied spec would leave the
+    /// withdrawn `(pod address, port)` pairs redirect-eligible until the pod was
+    /// recreated. None of it may re-attach programs.
+    #[test]
+    fn existing_pod_reconciles_expanded_narrowed_and_removed_redirect_ports() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        let root = cgroup_root.path().to_string_lossy().to_string();
+        let config = node_waypoint_redirect_config(root, true);
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations = HashMap::new();
+        let pod_ip: std::net::Ipv4Addr = "10.0.0.5".parse().unwrap();
+
+        let drive = |backend: &mut MockEbpfBackend, ports: Vec<u16>| {
+            let event = PodEvent {
+                pod_uid: "pod-uid-1",
+                pod_name: "test-pod",
+                namespace: "default",
+                service_account: None,
+                labels: &labels,
+                annotations: &annotations,
+                pod_ip_str: Some("10.0.0.5"),
+                pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+                node_probe_ports: Vec::new(),
+                inbound_redirect_ports: ports,
+                pod_pid: None,
+                veth_iface_override: Some("veth-mock"),
+            };
+            handle_pod_added(backend, &pod_states, &config, &metrics, &event);
+        };
+        let tracked = || {
+            pod_states
+                .get("pod-uid-1")
+                .unwrap()
+                .inbound_redirect_ports
+                .clone()
+        };
+
+        drive(&mut backend, vec![8080, 9090]);
+        assert_eq!(redirect_scope_v4(&backend, pod_ip), scope([8080, 9090]));
+        assert!(backend.pod_ips[&pod_ip].inbound_redirect_enabled());
+        let tc_attachments = backend.tc_attachments.len();
+        let cgroup_attachments = backend.cgroup_attachments.len();
+
+        // Expand.
+        drive(&mut backend, vec![7000, 8080, 9090]);
+        assert_eq!(
+            redirect_scope_v4(&backend, pod_ip),
+            scope([7000, 8080, 9090])
+        );
+        assert!(backend.pod_ips[&pod_ip].inbound_redirect_enabled());
+        assert_eq!(tracked(), vec![7000, 8080, 9090]);
+
+        // Narrow: the withdrawn ports must stop matching immediately, while the
+        // pod stays flagged for the ports it still declares.
+        drive(&mut backend, vec![9090]);
+        assert_eq!(redirect_scope_v4(&backend, pod_ip), scope([9090]));
+        assert!(backend.pod_ips[&pod_ip].inbound_redirect_enabled());
+        assert_eq!(tracked(), vec![9090]);
+
+        // Remove every declared port: flag down AND scope cleared.
+        drive(&mut backend, Vec::new());
+        assert!(redirect_scope_v4(&backend, pod_ip).is_empty());
+        assert!(!backend.pod_ips[&pod_ip].inbound_redirect_enabled());
+        assert!(tracked().is_empty());
+
+        // Scope reconciliation is not a re-enrollment.
+        assert_eq!(backend.tc_attachments.len(), tc_attachments);
+        assert_eq!(backend.cgroup_attachments.len(), cgroup_attachments);
+        assert_eq!(backend.ingress_redirect_detach_calls, 0);
+    }
+
+    /// An IPv4-only capture bind (`0.0.0.0`) is invisible to the classifier's
+    /// per-family wildcard socket lookup, so the IPv6 flag must stay false AND
+    /// any stale v6 scope (from a prior dual-stack generation of the pinned map)
+    /// must be cleared. A true flag plus stale scope drops IPv6 fail-closed.
+    #[test]
+    fn ipv4_only_capture_listener_clears_and_never_advertises_ipv6_redirect() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_ip: std::net::Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let pod_ip6: std::net::Ipv6Addr = "fd00::5".parse().unwrap();
+        // Stale entry a prior `[::]`-bound generation left in the pinned map.
+        backend.pod_inbound_ports6.insert((pod_ip6, 8080));
+
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        let root = cgroup_root.path().to_string_lossy().to_string();
+        let config = node_waypoint_redirect_config(root, false);
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations = HashMap::new();
+
+        let drive = |backend: &mut MockEbpfBackend, ports: Vec<u16>| {
+            let event = PodEvent {
+                pod_uid: "pod-uid-1",
+                pod_name: "test-pod",
+                namespace: "default",
+                service_account: None,
+                labels: &labels,
+                annotations: &annotations,
+                pod_ip_str: Some("10.0.0.5"),
+                pod_source_ips: PodSourceIps {
+                    ipv4: Some(pod_ip),
+                    ipv6: Some(pod_ip6),
+                },
+                node_probe_ports: Vec::new(),
+                inbound_redirect_ports: ports,
+                pod_pid: None,
+                veth_iface_override: Some("veth-mock"),
+            };
+            handle_pod_added(backend, &pod_states, &config, &metrics, &event);
+        };
+
+        drive(&mut backend, vec![8080]);
+        assert_eq!(redirect_scope_v4(&backend, pod_ip), scope([8080]));
+        assert!(backend.pod_ips[&pod_ip].inbound_redirect_enabled());
+        // Stale IPv6 scope must be CLEARED, not merely skipped.
+        assert!(redirect_scope_v6(&backend, pod_ip6).is_empty());
+        // An IPv4-only capture listener must not advertise an IPv6 flag.
+        assert!(!backend.pod_ips6[&pod_ip6].inbound_redirect_enabled());
+
+        // The same holds through an existing-pod reconcile.
+        drive(&mut backend, vec![8080, 9090]);
+        assert_eq!(redirect_scope_v4(&backend, pod_ip), scope([8080, 9090]));
+        assert!(redirect_scope_v6(&backend, pod_ip6).is_empty());
+        assert!(!backend.pod_ips6[&pod_ip6].inbound_redirect_enabled());
+    }
+
+    /// A failed scope-map or pod-IP rewrite on the existing-pod path must stay
+    /// visible and retryable: the tracked scope may not advance (that would
+    /// claim a reconciliation that never happened), and a later event must
+    /// converge once the transient failure clears.
+    #[test]
+    fn failed_redirect_rewrite_stays_retryable_and_claims_no_state() {
+        let mut backend = MockEbpfBackend::default();
+        backend.load_programs().unwrap();
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+        let metrics = NodeAgentMetrics::default();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cgroup_root.path().join("kubepods/podpod-uid-1")).unwrap();
+        let root = cgroup_root.path().to_string_lossy().to_string();
+        let config = node_waypoint_redirect_config(root, true);
+        let labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
+        let annotations = HashMap::new();
+        let pod_ip: std::net::Ipv4Addr = "10.0.0.5".parse().unwrap();
+
+        let drive = |backend: &mut MockEbpfBackend, ports: Vec<u16>| {
+            let event = PodEvent {
+                pod_uid: "pod-uid-1",
+                pod_name: "test-pod",
+                namespace: "default",
+                service_account: None,
+                labels: &labels,
+                annotations: &annotations,
+                pod_ip_str: Some("10.0.0.5"),
+                pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
+                node_probe_ports: Vec::new(),
+                inbound_redirect_ports: ports,
+                pod_pid: None,
+                veth_iface_override: Some("veth-mock"),
+            };
+            handle_pod_added(backend, &pod_states, &config, &metrics, &event);
+        };
+        let tracked = || {
+            pod_states
+                .get("pod-uid-1")
+                .unwrap()
+                .inbound_redirect_ports
+                .clone()
+        };
+        // Scope the pending-failure assertions to this pod's redirect operation
+        // rather than the whole map: the failure registry is process-global.
+        let retry_pending = || {
+            PENDING_CAPTURE_FAILURES.contains_key(&pending_capture_failure_key(
+                &pod_state_key(&pod_states, "pod-uid-1"),
+                CAPTURE_FAILURE_INBOUND_REDIRECT_UPDATE,
+                CAPTURE_FAILURE_DETAIL_INBOUND_REDIRECT,
+            ))
+        };
+
+        drive(&mut backend, vec![8080]);
+        assert_eq!(redirect_scope_v4(&backend, pod_ip), scope([8080]));
+        let errors_before = metrics.snapshot().attach_errors;
+
+        // A failed scope-map write must not claim the new scope.
+        backend.fail_update_pod_inbound_port = true;
+        drive(&mut backend, vec![8080, 9090]);
+        assert_eq!(tracked(), vec![8080]);
+        assert_eq!(redirect_scope_v4(&backend, pod_ip), scope([8080]));
+        assert!(metrics.snapshot().attach_errors > errors_before);
+        assert!(retry_pending());
+
+        // The transient condition clears: the next event converges.
+        backend.fail_update_pod_inbound_port = false;
+        drive(&mut backend, vec![8080, 9090]);
+        assert_eq!(redirect_scope_v4(&backend, pod_ip), scope([8080, 9090]));
+        assert_eq!(tracked(), vec![8080, 9090]);
+        assert!(!retry_pending());
+
+        // A pod-IP rewrite failure on the DISABLE path fails at the first step
+        // (lowering the flag), so the scope is deliberately left intact: the
+        // pod stays consistently redirected until the retry succeeds.
+        backend.fail_update_pod_ip = true;
+        drive(&mut backend, Vec::new());
+        assert_eq!(redirect_scope_v4(&backend, pod_ip), scope([8080, 9090]));
+        assert!(backend.pod_ips[&pod_ip].inbound_redirect_enabled());
+        assert_eq!(tracked(), vec![8080, 9090]);
+        assert!(retry_pending());
+
+        backend.fail_update_pod_ip = false;
+        drive(&mut backend, Vec::new());
+        assert!(redirect_scope_v4(&backend, pod_ip).is_empty());
+        assert!(!backend.pod_ips[&pod_ip].inbound_redirect_enabled());
+        assert!(tracked().is_empty());
+        assert!(!retry_pending());
+    }
+
+    /// A partially applied routing install (the `ip` batch is not atomic — the
+    /// v4 rule can land before the v6 route fails) must not leave Ferrum-owned
+    /// priority/table state behind: even an inert rule claims the fwmark.
+    #[test]
+    fn startup_routing_install_failure_removes_ferrum_owned_routing() {
+        ingress_redirect_routing_seam::activate(true);
+        let config = node_waypoint_redirect_config("/sys/fs/cgroup".to_string(), false);
+        let mut backend = MockEbpfBackend::default();
+        let metrics = NodeAgentMetrics::default();
+
+        let err = with_env_vars(&[("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10")], || {
+            initialize_backend(&mut backend, &config, &metrics)
+                .expect_err("a failed routing install must fail startup")
+        });
+        let calls = ingress_redirect_routing_seam::take_calls();
+
+        assert!(err.to_string().contains("policy routing"), "{err}");
+        assert_eq!(calls.installs, 1);
+        assert_eq!(
+            calls.install_supports_ipv6,
+            Some(false),
+            "an IPv4-only capture listener must not install fatal IPv6 routing commands"
+        );
+        assert_eq!(
+            calls.removals, 1,
+            "the partially installed Ferrum-owned rule/route must be removed"
+        );
+        assert!(
+            backend.ingress_redirect_attachments.is_empty(),
+            "the classifier must never attach when its routing failed"
+        );
+        assert_eq!(
+            metrics.snapshot().topology_degraded_reason,
+            Some("node_waypoint_ingress_redirect_unavailable")
+        );
+    }
+
+    /// Startup validation failing AFTER the classifier attached must unwind in
+    /// the safe order: detach the classifier first (nothing is assigned any
+    /// more), then remove the routing it depended on.
+    #[test]
+    fn startup_validation_failure_detaches_before_removing_routing() {
+        let op_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        ingress_redirect_routing_seam::activate_with_log(false, Some(op_log.clone()));
+        let config = node_waypoint_redirect_config("/sys/fs/cgroup".to_string(), false);
+        let mut backend = MockEbpfBackend {
+            fail_validate_startup_ready: true,
+            op_log: Some(op_log.clone()),
+            ..MockEbpfBackend::default()
+        };
+        let metrics = NodeAgentMetrics::default();
+
+        let err = with_env_vars(&[("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10")], || {
+            initialize_backend(&mut backend, &config, &metrics)
+                .expect_err("failed startup validation must fail startup")
+        });
+        let calls = ingress_redirect_routing_seam::take_calls();
+        let entries = op_log.lock().unwrap().clone();
+
+        assert!(
+            err.to_string().contains("startup validation failed"),
+            "{err}"
+        );
+        assert_eq!(calls.installs, 1);
+        assert_eq!(
+            calls.install_supports_ipv6,
+            Some(false),
+            "an IPv4-only capture listener must not install fatal IPv6 routing commands"
+        );
+        assert_eq!(
+            calls.removals, 1,
+            "an unsuccessful startup must remove the routing it installed"
+        );
+        let install = entries
+            .iter()
+            .position(|op| op == "install_ingress_redirect_routing")
+            .expect("routing installed");
+        let attach = entries
+            .iter()
+            .position(|op| op.starts_with("attach_ingress_redirect"))
+            .expect("classifier attached");
+        let detach = entries
+            .iter()
+            .position(|op| op == "detach_ingress_redirect")
+            .expect("classifier detached on the failure path");
+        let remove = entries
+            .iter()
+            .position(|op| op == "remove_ingress_redirect_routing")
+            .expect("routing removed on the failure path");
+        assert!(
+            install < attach,
+            "routing installs before attach: {entries:?}"
+        );
+        assert!(
+            detach < remove,
+            "classifier must detach before its routing is removed: {entries:?}"
+        );
+    }
+
+    /// A failed detach must NOT release the local-delivery routing. A live
+    /// classifier without its routing assigns packets to the capture socket
+    /// that the `main` table then forwards to the pod, so they reach neither
+    /// endpoint — strictly worse than an inert leftover `ip rule`/`ip route`.
+    /// `cleanup_all` gets the retry, and only its success releases the routing.
+    #[test]
+    fn a_failed_detach_retains_the_routing_and_cleanup_retries_it() {
+        let op_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        ingress_redirect_routing_seam::activate_with_log(false, Some(op_log.clone()));
+        let config = node_waypoint_redirect_config("/sys/fs/cgroup".to_string(), false);
+        let mut backend = MockEbpfBackend {
+            fail_validate_startup_ready: true,
+            // Only the FIRST detach fails; `cleanup_all`'s retry succeeds.
+            fail_detach_ingress_redirect_times: 1,
+            op_log: Some(op_log.clone()),
+            ..MockEbpfBackend::default()
+        };
+        let metrics = NodeAgentMetrics::default();
+
+        let _err = with_env_vars(&[("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10")], || {
+            initialize_backend(&mut backend, &config, &metrics)
+                .expect_err("failed startup validation must fail startup")
+        });
+        let calls = ingress_redirect_routing_seam::take_calls();
+        let entries = op_log.lock().unwrap().clone();
+
+        assert_eq!(
+            backend.ingress_redirect_detach_calls, 2,
+            "cleanup_all must RETRY the failed detach rather than treating the dropped link ids \
+             as already gone: {entries:?}"
+        );
+        assert!(
+            !backend.ingress_redirect_attached(),
+            "the retry succeeded, so nothing may still be recorded as attached"
+        );
+        assert_eq!(
+            calls.removals, 1,
+            "the routing is released exactly once, after the retry proved the classifier gone"
+        );
+        let last_detach = entries
+            .iter()
+            .rposition(|op| op == "detach_ingress_redirect")
+            .expect("classifier detached");
+        let remove = entries
+            .iter()
+            .position(|op| op == "remove_ingress_redirect_routing")
+            .expect("routing removed once the classifier was gone");
+        assert!(
+            last_detach < remove,
+            "the routing must only be removed after the SUCCESSFUL detach: {entries:?}"
+        );
+    }
+
+    /// When even `cleanup_all`'s retry cannot detach the classifier, the
+    /// routing is deliberately RETAINED (fail-safe half-state) instead of being
+    /// removed under a classifier that is still assigning packets.
+    #[test]
+    fn a_permanently_failing_detach_withholds_the_routing_teardown() {
+        ingress_redirect_routing_seam::activate(false);
+        let config = node_waypoint_redirect_config("/sys/fs/cgroup".to_string(), false);
+        let mut backend = MockEbpfBackend {
+            fail_validate_startup_ready: true,
+            fail_detach_ingress_redirect_times: usize::MAX,
+            ..MockEbpfBackend::default()
+        };
+        let metrics = NodeAgentMetrics::default();
+
+        let _err = with_env_vars(&[("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10")], || {
+            initialize_backend(&mut backend, &config, &metrics)
+                .expect_err("failed startup validation must fail startup")
+        });
+        let calls = ingress_redirect_routing_seam::take_calls();
+
+        assert_eq!(calls.installs, 1);
+        assert!(
+            backend.ingress_redirect_attached(),
+            "a failed detach must KEEP its attachment recorded so the routing gate can see it"
+        );
+        assert_eq!(
+            calls.removals, 0,
+            "routing must never be pulled out from under a classifier that may still be live"
+        );
+    }
+
+    /// Normal shutdown uses the same ordering: detach, then `cleanup_all` (the
+    /// retry), then release the routing.
+    #[test]
+    fn shutdown_releases_the_routing_only_after_cleanup_confirms_the_detach() {
+        let op_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        ingress_redirect_routing_seam::activate_with_log(false, Some(op_log.clone()));
+        let config = node_waypoint_redirect_config("/sys/fs/cgroup".to_string(), false);
+        let mut backend = MockEbpfBackend {
+            fail_detach_ingress_redirect_times: 1,
+            op_log: Some(op_log.clone()),
+            ..MockEbpfBackend::default()
+        };
+        backend
+            .attach_ingress_redirect("eth0")
+            .expect("attach the classifier");
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+
+        shutdown_backend_state(&mut backend, &pod_states, &config);
+
+        let calls = ingress_redirect_routing_seam::take_calls();
+        let entries = op_log.lock().unwrap().clone();
+        assert_eq!(
+            backend.ingress_redirect_detach_calls, 2,
+            "shutdown detaches, then cleanup_all retries: {entries:?}"
+        );
+        assert!(!backend.ingress_redirect_attached());
+        assert_eq!(
+            calls.removals, 1,
+            "the routing is released exactly once on shutdown"
+        );
+        let last_detach = entries
+            .iter()
+            .rposition(|op| op == "detach_ingress_redirect")
+            .expect("classifier detached");
+        let remove = entries
+            .iter()
+            .position(|op| op == "remove_ingress_redirect_routing")
+            .expect("routing removed on shutdown");
+        assert!(
+            last_detach < remove,
+            "shutdown must not remove routing before the classifier is gone: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn pod_info_inbound_redirect_flag_is_explicit_and_reversible() {
+        let base = PodInfo::for_capture(15001, false, false);
+        assert!(
+            !base.inbound_redirect_enabled(),
+            "capture alone must never imply inbound redirect"
+        );
+        let flagged = base.clone().with_inbound_redirect(true);
+        assert!(flagged.inbound_redirect_enabled());
+        // Reversible so a narrowed / un-enrolled pod converges back.
+        assert!(
+            !flagged
+                .with_inbound_redirect(false)
+                .inbound_redirect_enabled(),
+            "clearing the flag must un-enroll the pod from the redirect"
+        );
+        // The UDP lifecycle flags are untouched by the redirect flag.
+        let udp = PodInfo::for_capture(15001, true, false).with_inbound_redirect(true);
+        assert!(udp.inbound_redirect_enabled());
+        assert_eq!(
+            udp.capture_flags & !crate::ebpf::POD_CAPTURE_FLAG_INBOUND_REDIRECT,
+            PodInfo::for_capture(15001, true, false).capture_flags
+        );
+    }
+
+    #[test]
     fn pod_probe_ports_from_spec_resolves_named_and_numeric_ports() {
         use k8s_openapi::api::core::v1::{
             ContainerPort, GRPCAction, HTTPGetAction, TCPSocketAction,
@@ -7094,6 +9013,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: vec![8080],
+                inbound_redirect_ports: Vec::new(),
             },
         );
         pod_states.insert(
@@ -7111,6 +9031,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: vec![8080],
+                inbound_redirect_ports: Vec::new(),
             },
         );
 
@@ -7165,6 +9086,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: vec![8080],
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let config = NodeAgentConfig {
@@ -7243,6 +9165,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let mut capture_config = CaptureConfig::explicit(15006, 15001);
@@ -7305,6 +9228,7 @@ mod tests {
                     include_ports_policy: None,
                     workload_identity_cgroup_ids: Vec::new(),
                     node_probe_ports: Vec::new(),
+                    inbound_redirect_ports: Vec::new(),
                 },
             );
             let state_key = pod_state_key(&pod_states, "pod-udp");
@@ -7408,6 +9332,7 @@ mod tests {
             include_ports_policy: None,
             workload_identity_cgroup_ids: vec![42],
             node_probe_ports: vec![15021],
+            inbound_redirect_ports: Vec::new(),
         };
         let mut retryable = test_retryable_enrollment(pod_uid, ip);
         retryable.labels = HashMap::from([("ferrum.io/mesh".to_string(), "enabled".to_string())]);
@@ -7501,6 +9426,7 @@ mod tests {
             include_ports_policy: None,
             workload_identity_cgroup_ids: Vec::new(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
         };
         remember_failed_pod_enrollment_with_cleanup_state(
             &state_key,
@@ -7525,6 +9451,7 @@ mod tests {
                 pod_ip: Some(ip.to_string()),
                 pod_source_ips: PodSourceIps::default(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
             },
             &failed_cleanup_state,
@@ -7620,6 +9547,7 @@ mod tests {
             include_ports_policy: None,
             workload_identity_cgroup_ids: Vec::new(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
         };
         remember_failed_pod_enrollment_with_cleanup_state(
             &state_key,
@@ -7644,6 +9572,7 @@ mod tests {
                 pod_ip: Some(ip.to_string()),
                 pod_source_ips: PodSourceIps::default(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
             },
             &failed_cleanup_state,
@@ -7741,6 +9670,7 @@ mod tests {
             include_ports_policy: None,
             workload_identity_cgroup_ids: vec![52],
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
         };
         remember_failed_pod_enrollment_with_cleanup_state(
             &state_key,
@@ -7833,6 +9763,7 @@ mod tests {
             include_ports_policy: Some(IncludePortsPolicy::all()),
             workload_identity_cgroup_ids: cgroup_ids.clone(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
         };
         remember_failed_pod_enrollment_with_cleanup_state(
             &state_key,
@@ -7877,6 +9808,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.31"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.31")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-test"),
         };
@@ -7926,6 +9858,7 @@ mod tests {
                 include_ports_policy: Some(IncludePortsPolicy::all()),
                 workload_identity_cgroup_ids: vec![72],
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let state_key = pod_state_key(&pod_states, pod_uid);
@@ -8017,6 +9950,7 @@ mod tests {
                 pod_ip: Some("10.0.0.13".to_string()),
                 pod_source_ips: PodSourceIps::default(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
             },
         );
@@ -8172,6 +10106,7 @@ mod tests {
                     include_ports_policy: None,
                     workload_identity_cgroup_ids: Vec::new(),
                     node_probe_ports: Vec::new(),
+                    inbound_redirect_ports: Vec::new(),
                 },
             );
             let mut backend = MockEbpfBackend::default();
@@ -8425,6 +10360,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let mut backend = MockEbpfBackend::default();
@@ -8517,6 +10453,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -8961,6 +10898,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -9024,6 +10962,7 @@ mod tests {
                 pod_ip_str: Some("10.0.0.9"),
                 pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.9")),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
                 veth_iface_override: Some("veth-udp"),
             };
@@ -9088,6 +11027,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.10"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.10")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-udp"),
         };
@@ -9136,6 +11076,7 @@ mod tests {
                 ipv6: Some("fd00::5".parse().unwrap()),
             },
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -9211,6 +11152,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips,
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -9271,6 +11213,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips,
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -9359,6 +11302,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: source_ips,
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -9437,6 +11381,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some(veth),
         };
@@ -9574,6 +11519,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -9647,6 +11593,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -9722,6 +11669,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -9804,6 +11752,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.6"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.6")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -9880,6 +11829,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.7"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.7")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -9932,6 +11882,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -9971,6 +11922,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -10010,6 +11962,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: vec![8080],
+            inbound_redirect_ports: Vec::new(),
             pod_pid: Some(4242),
             veth_iface_override: Some("veth-mock"),
         };
@@ -10079,6 +12032,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             // None mirrors production and the retry snapshot; veth resolves via
             // the override guard above.
@@ -10187,6 +12141,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         backend
@@ -10221,6 +12176,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-new"),
         };
@@ -10256,6 +12212,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: vec![8080],
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let config = NodeAgentConfig {
@@ -10280,6 +12237,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.8"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             node_probe_ports: vec![8080],
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -10314,6 +12272,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: vec![8080, 9090],
+                inbound_redirect_ports: Vec::new(),
             },
         );
         backend.update_node_probe_port(ip, 8080).unwrap();
@@ -10340,6 +12299,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.8"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             node_probe_ports: vec![9090],
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -10386,6 +12346,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: vec![8080],
+                inbound_redirect_ports: Vec::new(),
             },
         );
         backend.update_node_probe_port(old_ip, 8080).unwrap();
@@ -10411,6 +12372,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.9"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.9")),
             node_probe_ports: vec![9090],
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -10452,6 +12414,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let config = NodeAgentConfig {
@@ -10479,6 +12442,7 @@ mod tests {
                 ipv6: Some(ip6),
             },
             node_probe_ports: vec![8080],
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -10532,6 +12496,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let config = NodeAgentConfig {
@@ -10556,6 +12521,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.8"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             node_probe_ports: vec![8080],
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -10632,6 +12598,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: vec![8080, 9090],
+                inbound_redirect_ports: Vec::new(),
             },
         );
         pod_states.insert(
@@ -10649,6 +12616,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: vec![9090],
+                inbound_redirect_ports: Vec::new(),
             },
         );
         backend.update_node_probe_port(ip, 8080).unwrap();
@@ -10688,6 +12656,7 @@ mod tests {
             include_ports_policy: None,
             workload_identity_cgroup_ids: Vec::new(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
         };
         backend
             .update_pod_ip(
@@ -10754,6 +12723,7 @@ mod tests {
             include_ports_policy: None,
             workload_identity_cgroup_ids: Vec::new(),
             node_probe_ports: vec![8080],
+            inbound_redirect_ports: Vec::new(),
         };
         backend.update_node_probe_port(ip, 8080).unwrap();
         metrics.record_attach_error();
@@ -10813,6 +12783,7 @@ mod tests {
                 pod_ip_str: Some(ip),
                 pod_source_ips: PodSourceIps::from_primary_str(Some(ip)),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
                 veth_iface_override: None,
             };
@@ -10923,6 +12894,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: None,
         };
@@ -10968,6 +12940,7 @@ mod tests {
             pod_ip_str: None,
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -10998,6 +12971,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let config = NodeAgentConfig {
@@ -11021,6 +12995,7 @@ mod tests {
             pod_ip_str: None,
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -11053,6 +13028,7 @@ mod tests {
             include_ports_policy: None,
             workload_identity_cgroup_ids: Vec::new(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
         };
         remember_failed_pod_enrollment_with_cleanup_state(
             &state_key,
@@ -11081,6 +13057,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.23"),
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-test"),
         };
@@ -11119,6 +13096,7 @@ mod tests {
             pod_ip_str: None,
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -11151,6 +13129,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: vec![8080],
+                inbound_redirect_ports: Vec::new(),
             },
         );
         backend
@@ -11219,6 +13198,7 @@ mod tests {
                     include_ports_policy: None,
                     workload_identity_cgroup_ids: Vec::new(),
                     node_probe_ports: Vec::new(),
+                    inbound_redirect_ports: Vec::new(),
                 },
             );
         }
@@ -11339,6 +13319,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let mut backend = MockEbpfBackend::default();
@@ -11513,6 +13494,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let mut backend = MockEbpfBackend::default();
@@ -11704,6 +13686,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let req = CniRpcRequest {
@@ -11737,6 +13720,7 @@ mod tests {
             include_ports_policy: None,
             workload_identity_cgroup_ids: Vec::new(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
         }
     }
 
@@ -11924,6 +13908,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let req = CniRpcRequest {
@@ -12016,6 +14001,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let resp = apply_cni_request(&mut backend, &pod_states, &config, &metrics, &req);
@@ -12055,6 +14041,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
 
@@ -12068,6 +14055,7 @@ mod tests {
             pod_ip_str: None,
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -12113,6 +14101,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
 
@@ -12126,6 +14115,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.9"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.9")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-new"),
         };
@@ -12184,6 +14174,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
 
@@ -12197,6 +14188,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.8"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -12244,6 +14236,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         let event = PodEvent {
@@ -12256,6 +14249,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.8"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -12330,6 +14324,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         backend
@@ -12374,6 +14369,236 @@ mod tests {
     }
 
     #[test]
+    fn tracked_pod_ip_scope_clear_failure_stays_pending_until_retry() {
+        for (family, ip_v4, ip_v6) in [
+            (
+                "ipv4",
+                Some(std::net::Ipv4Addr::new(10, 0, 0, 31)),
+                None::<std::net::Ipv6Addr>,
+            ),
+            (
+                "ipv6",
+                None::<std::net::Ipv4Addr>,
+                Some("fd00::31".parse::<std::net::Ipv6Addr>().unwrap()),
+            ),
+        ] {
+            let registry = tempfile::tempdir().unwrap();
+            let mut capture_config = CaptureConfig::explicit(15006, 15001);
+            capture_config.udp_capture_enabled = true;
+            let config = NodeAgentConfig {
+                node_name: "test-node".to_string(),
+                capture_config,
+                cgroup_root: "/nonexistent".to_string(),
+                bpf_fs_path: "/nonexistent".to_string(),
+                fallback_mode: FallbackMode::Fail,
+                excluded_namespaces: HashSet::new(),
+                capture_contract: CaptureContract::local_pod_defaults(),
+                trust_domain: "cluster.local".to_string(),
+                node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+            };
+            let pod_uid = format!("pod-scope-clear-{family}");
+            let pod_states = DashMap::new();
+            pod_states.insert(
+                pod_uid.clone(),
+                PodAttachmentState {
+                    pod_uid: pod_uid.clone(),
+                    pod_name: pod_uid.clone(),
+                    namespace: "default".to_string(),
+                    pod_ip: ip_v4,
+                    pod_ip6: ip_v6,
+                    cgroup_path: Some(format!("/cg/{pod_uid}")),
+                    veth_iface: Some("veth-scope".to_string()),
+                    attached: true,
+                    include_ports_cgroup_ids: Vec::new(),
+                    include_ports_policy: None,
+                    workload_identity_cgroup_ids: Vec::new(),
+                    node_probe_ports: Vec::new(),
+                    inbound_redirect_ports: vec![8080],
+                },
+            );
+            let state_key = pod_state_key(&pod_states, &pod_uid);
+            let mut backend = MockEbpfBackend {
+                fail_clear_pod_inbound_ports: true,
+                ..MockEbpfBackend::default()
+            };
+            if let Some(ip) = ip_v4 {
+                backend
+                    .update_pod_ip(ip, &PodInfo::for_capture(15001, true, true))
+                    .unwrap();
+                backend.update_pod_inbound_ports(ip, &[8080]).unwrap();
+            }
+            if let Some(ip) = ip_v6 {
+                backend
+                    .update_pod_ip6(ip, &PodInfo::for_capture(15001, true, true))
+                    .unwrap();
+                backend.update_pod_inbound_ports6(ip, &[8080]).unwrap();
+            }
+            let metrics = NodeAgentMetrics::default();
+
+            handle_pod_removed(&mut backend, &pod_states, &config, &metrics, &pod_uid);
+
+            let detail = ip_v4
+                .map(|ip| ip.to_string())
+                .or_else(|| ip_v6.map(|ip| ip.to_string()))
+                .unwrap();
+            let failure_key =
+                pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &detail);
+            assert!(
+                PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+                "scope clear failure must keep the durable pod_ip_remove key ({family})"
+            );
+            assert!(has_pending_removal_blocking_failure(&state_key));
+            assert!(
+                !registry
+                    .path()
+                    .join(".udp-gate-cleaned")
+                    .join(&pod_uid)
+                    .exists(),
+                "UDP cleaned-gate handoff must wait for scope clear ({family})"
+            );
+            if let Some(ip) = ip_v4 {
+                assert!(!backend.pod_ips.contains_key(&ip));
+                assert!(backend.pod_inbound_ports.contains(&(ip, 8080)));
+            }
+            if let Some(ip) = ip_v6 {
+                assert!(!backend.pod_ips6.contains_key(&ip));
+                assert!(backend.pod_inbound_ports6.contains(&(ip, 8080)));
+            }
+
+            // Retry while clear still fails: pod-IP is already absent (ENOENT
+            // path) but scope remains, so the pending key must stay.
+            retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
+            assert!(
+                PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+                "retry must keep the pending key while scope clear fails ({family})"
+            );
+            assert!(
+                !registry
+                    .path()
+                    .join(".udp-gate-cleaned")
+                    .join(&pod_uid)
+                    .exists()
+            );
+
+            backend.fail_clear_pod_inbound_ports = false;
+            retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
+
+            assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+            if let Some(ip) = ip_v4 {
+                assert!(!backend.pod_inbound_ports.contains(&(ip, 8080)));
+            }
+            if let Some(ip) = ip_v6 {
+                assert!(!backend.pod_inbound_ports6.contains(&(ip, 8080)));
+            }
+            assert!(
+                registry
+                    .path()
+                    .join(".udp-gate-cleaned")
+                    .join(&pod_uid)
+                    .is_file(),
+                "successful scope-clear retry must complete the UDP handoff ({family})"
+            );
+            assert_eq!(
+                metrics.snapshot().capture_state,
+                NODE_AGENT_CAPTURE_STATE_READY
+            );
+        }
+    }
+
+    #[test]
+    fn pre_enrollment_pod_ip_scope_clear_failure_stays_pending_until_retry() {
+        for (family, ip_v4, ip_v6) in [
+            (
+                "ipv4",
+                Some(std::net::Ipv4Addr::new(10, 0, 0, 32)),
+                None::<std::net::Ipv6Addr>,
+            ),
+            (
+                "ipv6",
+                None::<std::net::Ipv4Addr>,
+                Some("fd00::32".parse::<std::net::Ipv6Addr>().unwrap()),
+            ),
+        ] {
+            let pod_states = DashMap::new();
+            let pod_uid = format!("pod-pre-enroll-scope-{family}");
+            let state_key = pod_state_key(&pod_states, &pod_uid);
+            let mut backend = MockEbpfBackend {
+                fail_clear_pod_inbound_ports: true,
+                ..MockEbpfBackend::default()
+            };
+            let metrics = NodeAgentMetrics::default();
+            if let Some(ip) = ip_v4 {
+                backend
+                    .update_pod_ip(ip, &PodInfo::for_capture(15001, true, true))
+                    .unwrap();
+                backend.update_pod_inbound_ports(ip, &[9090]).unwrap();
+                remove_pre_enrollment_pod_ip_if_unowned(
+                    &mut backend,
+                    &pod_states,
+                    &metrics,
+                    &pod_uid,
+                    ip,
+                    "failed enrollment cleanup",
+                );
+            }
+            if let Some(ip) = ip_v6 {
+                backend
+                    .update_pod_ip6(ip, &PodInfo::for_capture(15001, true, true))
+                    .unwrap();
+                backend.update_pod_inbound_ports6(ip, &[9090]).unwrap();
+                remove_pre_enrollment_pod_ip6_if_unowned(
+                    &mut backend,
+                    &pod_states,
+                    &metrics,
+                    &pod_uid,
+                    ip,
+                    "failed enrollment cleanup",
+                );
+            }
+
+            let detail = ip_v4
+                .map(|ip| ip.to_string())
+                .or_else(|| ip_v6.map(|ip| ip.to_string()))
+                .unwrap();
+            let failure_key =
+                pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &detail);
+            assert!(
+                PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+                "pre-enrollment scope clear failure must stay pending ({family})"
+            );
+            if let Some(ip) = ip_v4 {
+                assert!(!backend.pod_ips.contains_key(&ip));
+                assert!(backend.pod_inbound_ports.contains(&(ip, 9090)));
+            }
+            if let Some(ip) = ip_v6 {
+                assert!(!backend.pod_ips6.contains_key(&ip));
+                assert!(backend.pod_inbound_ports6.contains(&(ip, 9090)));
+            }
+
+            let config = NodeAgentConfig {
+                node_name: "test-node".to_string(),
+                capture_config: CaptureConfig::explicit(15006, 15001),
+                cgroup_root: "/nonexistent".to_string(),
+                bpf_fs_path: "/nonexistent".to_string(),
+                fallback_mode: FallbackMode::Fail,
+                excluded_namespaces: HashSet::new(),
+                capture_contract: CaptureContract::local_pod_defaults(),
+                trust_domain: "cluster.local".to_string(),
+                node_waypoint_pod_registry_dir: None,
+            };
+            backend.fail_clear_pod_inbound_ports = false;
+            retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
+            assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+            if let Some(ip) = ip_v4 {
+                assert!(!backend.pod_inbound_ports.contains(&(ip, 9090)));
+            }
+            if let Some(ip) = ip_v6 {
+                assert!(!backend.pod_inbound_ports6.contains(&(ip, 9090)));
+            }
+        }
+    }
+
+    #[test]
     fn node_probe_port_remove_failure_retries_stale_map_entry() {
         let mut backend = MockEbpfBackend {
             fail_remove_node_probe_port: true,
@@ -12408,6 +14633,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: vec![8080],
+                inbound_redirect_ports: Vec::new(),
             },
         );
         backend.update_node_probe_port(ip, 8080).unwrap();
@@ -12528,6 +14754,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
         backend
@@ -12566,6 +14793,7 @@ mod tests {
                 include_ports_policy: None,
                 workload_identity_cgroup_ids: Vec::new(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
             },
         );
 
@@ -12617,6 +14845,7 @@ mod tests {
                     include_ports_policy: None,
                     workload_identity_cgroup_ids: Vec::new(),
                     node_probe_ports: Vec::new(),
+                    inbound_redirect_ports: Vec::new(),
                 },
             );
         }
@@ -12640,6 +14869,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.8"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.8")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-a"),
         };
@@ -13105,6 +15335,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -13172,6 +15403,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -13241,6 +15473,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -13308,6 +15541,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -13362,6 +15596,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -13415,6 +15650,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -13463,6 +15699,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         };
@@ -13528,6 +15765,7 @@ mod tests {
             pod_ip_str: Some("10.0.0.5"),
             pod_source_ips: PodSourceIps::from_primary_str(Some("10.0.0.5")),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
             veth_iface_override: Some("veth-mock"),
         }

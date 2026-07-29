@@ -18768,7 +18768,7 @@ components:
     FaultInjectionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; raw TCP faults run on stream connect. UDP and DTLS are not supported."
+      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; TCP/UDP/DTLS session admission faults run on stream connect; UDP/DTLS also apply per-datagram faults on on_udp_datagram (client→backend) in isolated session workers without blocking the shared recv loop."
       properties:
         abort:
           type: [object, "null"]

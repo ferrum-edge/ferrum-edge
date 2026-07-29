@@ -115,6 +115,21 @@ message MeshSubscribeRequest {
   //            "ferrum-mesh-subscribe:local"; missing or discovery-purpose
   //            audiences are refused.
   bool remote_discovery = 8;
+  // True when this subscriber is a NodeWaypoint whose transparent inbound
+  // CAPTURE listener terminates direct plaintext for the enrolled pods on its
+  // node (issue #3287). Those pods can live in namespaces other than the
+  // NodeWaypoint's own, so the CP additionally resolves a dedicated,
+  // least-privilege capture inventory — the workloads whose trusted
+  // `Workload.node_waypoint.spiffe_id` names THIS NodeWaypoint (subject to CP
+  // scope and the bearer `ns` claim) plus the PeerAuthentication candidates
+  // applicable to them — onto the slice's
+  // `node_waypoint_capture_destinations` / `node_waypoint_capture_peer_
+  // authentications` fields. It does NOT widen `workloads` / `services` /
+  // `peer_authentications`. Deliberately separate from
+  // `ambient_udp_source_scoping`: NodeWaypoint UDP stays mesh-wide-only.
+  // Absent/false on legacy DPs, which then receive no inventory and whose
+  // capture path resolves nothing (fail closed).
+  bool node_waypoint_capture_scoping = 9;
 }
 
 // A MeshSubscribe response frame.

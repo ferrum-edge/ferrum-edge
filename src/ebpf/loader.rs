@@ -20,9 +20,14 @@ use aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::sock_ops::SockOpsLinkId;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::programs::tc::SchedClassifierLinkId;
+use aya::programs::tc::{SchedClassifierLink, SchedClassifierLinkId};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::programs::{CgroupAttachMode, CgroupSockAddr, SchedClassifier, SockOps, TcAttachType};
+// `Link` is the trait that owns `SchedClassifierLink::detach`; the
+// ingress-redirect teardown owns its links rather than tracking link ids, so it
+// calls that method directly.
+use aya::programs::{
+    CgroupAttachMode, CgroupSockAddr, Link, SchedClassifier, SockOps, TcAttachType,
+};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::{Ebpf, EbpfLoader};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -55,13 +60,46 @@ const CGROUP_PROGRAMS: &[&str] = &[
 ];
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-const TC_PROGRAM: &str = "ferrum_tc_inbound";
+const TC_PROGRAM: &str = super::BPF_PROGRAM_TC_INBOUND;
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+const INGRESS_REDIRECT_PROGRAM: &str = super::BPF_PROGRAM_TC_INGRESS_REDIRECT;
 
 /// Tracks per-pod attachment state for cleanup.
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 struct PodLinks {
     cgroup_link_ids: Vec<CgroupSockAddrLinkId>,
     tc_link_ids: Vec<SchedClassifierLinkId>,
+}
+
+/// One node-level tc ingress-redirect classifier attachment.
+///
+/// The link is **owned here**, taken out of the program's link map right after
+/// attach, instead of being tracked by `SchedClassifierLinkId` alone. That is
+/// load-bearing for retry: aya's `SchedClassifier::detach(id)` removes the link
+/// from the program's map and then consumes it, so after a FAILED detach the id
+/// refers to nothing (`ProgramError::NotAttached` on any retry) and the failure
+/// is unrecoverable and — worse — invisible. Owning the link lets a failed
+/// detach reconstruct an equivalent one from its netlink filter identity
+/// (`ifname`, attach type, priority, handle) so `cleanup_all` really is the
+/// backstop its callers treat it as.
+///
+/// Owning it also means the link is NOT torn down when the `Ebpf` object is
+/// dropped; this struct's own `Drop` (via `SchedClassifierLink`) is the final
+/// best-effort detach.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+struct IngressRedirectLink {
+    /// Interface the classifier is attached to, so failures are reported (and
+    /// retried) per interface.
+    iface: String,
+    /// The owned link, or `None` when a failed detach consumed it and no
+    /// equivalent could be rebuilt (the interface disappeared, or the link was
+    /// a TCX fd link — whose detach is infallible, so this is unreachable in
+    /// practice). The entry is still RETAINED in that case: the kernel filter
+    /// may be live, and reporting "detached" would let the node-agent pull the
+    /// local-delivery routing out from under a classifier that is still
+    /// assigning sockets — the exact harmful half-state.
+    link: Option<SchedClassifierLink>,
 }
 
 /// Real aya-backed eBPF loader. Only available on Linux with `--features ebpf`.
@@ -75,6 +113,11 @@ pub struct AyaEbpfBackend {
     /// implicitly when `Ebpf` is dropped, but holding the id lets future
     /// callers detach explicitly if needed).
     sock_ops_link_id: Option<SockOpsLinkId>,
+    /// Node-level tc ingress redirect attachments, keyed by interface so a
+    /// detach can be reported (and retried) per interface. These are
+    /// node-scoped, not per-pod, so they deliberately live outside `pod_links`.
+    /// An entry survives a failed detach — see [`IngressRedirectLink`].
+    ingress_redirect_links: Vec<IngressRedirectLink>,
     orig_dst_maps_pinned: bool,
     /// Tracks whether at least one trusted node source IP has been installed
     /// for each family, so enrollment can surface a per-family gap (the
@@ -92,6 +135,7 @@ impl AyaEbpfBackend {
             maps: None,
             pod_links: HashMap::new(),
             sock_ops_link_id: None,
+            ingress_redirect_links: Vec::new(),
             orig_dst_maps_pinned: false,
             node_source_ipv4_present: false,
             node_source_ipv6_present: false,
@@ -153,6 +197,24 @@ impl EbpfBackend for AyaEbpfBackend {
         tc.load()
             .map_err(|e| format!("Failed to load BPF program '{TC_PROGRAM}': {e}"))?;
         debug!(program = TC_PROGRAM, "BPF tc program loaded");
+
+        // The inbound ingress-redirect classifier is loaded (and therefore
+        // verifier-checked) unconditionally, even when the redirect is not
+        // enabled: a load failure must surface at startup rather than at the
+        // first attach, and the program is inert until the capture config
+        // publishes a non-zero redirect mark.
+        let ingress_redirect: &mut SchedClassifier = bpf
+            .program_mut(INGRESS_REDIRECT_PROGRAM)
+            .ok_or_else(|| format!("BPF program '{INGRESS_REDIRECT_PROGRAM}' not found in ELF"))?
+            .try_into()
+            .map_err(|e| format!("'{INGRESS_REDIRECT_PROGRAM}' is not a SchedClassifier: {e}"))?;
+        ingress_redirect
+            .load()
+            .map_err(|e| format!("Failed to load BPF program '{INGRESS_REDIRECT_PROGRAM}': {e}"))?;
+        debug!(
+            program = INGRESS_REDIRECT_PROGRAM,
+            "BPF tc ingress redirect program loaded"
+        );
 
         // Load the SOCK_OPS observability program. Best-effort: failing
         // to load this program does NOT break capture — it only loses
@@ -340,6 +402,155 @@ impl EbpfBackend for AyaEbpfBackend {
         self.node_source_ipv6_present
     }
 
+    fn attach_ingress_redirect(&mut self, iface: &str) -> Result<(), String> {
+        let bpf = self.bpf_mut()?;
+        let prog: &mut SchedClassifier = bpf
+            .program_mut(INGRESS_REDIRECT_PROGRAM)
+            .ok_or_else(|| format!("BPF program '{INGRESS_REDIRECT_PROGRAM}' not found"))?
+            .try_into()
+            .map_err(|e| format!("'{INGRESS_REDIRECT_PROGRAM}' type mismatch: {e}"))?;
+
+        // `bpf_sk_assign` is ingress-only, so this classifier is never attached
+        // on egress. Attaching it there would silently no-op the redirect while
+        // still consuming a filter slot.
+        let link_id = prog.attach(iface, TcAttachType::Ingress).map_err(|e| {
+            format!("Failed to attach '{INGRESS_REDIRECT_PROGRAM}' to '{iface}' ingress: {e}")
+        })?;
+        // Take ownership of the link immediately. See [`IngressRedirectLink`]:
+        // a link id alone is single-use, so keeping it in the program's map
+        // would make a failed detach unrecoverable and unobservable.
+        //
+        // `take_link` can only fail if the id is absent from the map, which
+        // cannot happen for an id `attach` just returned; treat it as an attach
+        // failure and record nothing, so no phantom "attached" entry pins the
+        // local-delivery routing. The link stays owned by the program and is
+        // detached when `Ebpf` is dropped by `cleanup_all`.
+        let link = prog.take_link(link_id).map_err(|e| {
+            format!(
+                "Attached '{INGRESS_REDIRECT_PROGRAM}' to '{iface}' ingress but could not take \
+                 ownership of its link: {e}"
+            )
+        })?;
+        self.ingress_redirect_links.push(IngressRedirectLink {
+            iface: iface.to_string(),
+            link: Some(link),
+        });
+
+        info!(
+            program = INGRESS_REDIRECT_PROGRAM,
+            iface, "NodeWaypoint inbound tc ingress redirect attached"
+        );
+        Ok(())
+    }
+
+    /// Detach every attached ingress-redirect classifier, **retaining every
+    /// attachment that did not provably come down**.
+    ///
+    /// Needs no program lookup at all: the links are owned here (see
+    /// [`IngressRedirectLink`]), so there is no `program_mut` / type-conversion
+    /// step that could drop the whole set before a single detach was attempted.
+    ///
+    /// A per-interface failure keeps its entry — rebuilt from the link's netlink
+    /// filter identity when possible, so `cleanup_all`'s retry is a real second
+    /// attempt rather than a no-op — and keeps
+    /// [`Self::ingress_redirect_attached`] reporting `true`, which is what stops
+    /// the node-agent from removing the local-delivery routing while a
+    /// classifier may still be assigning sockets.
+    fn detach_ingress_redirect(&mut self) -> Result<(), String> {
+        if self.ingress_redirect_links.is_empty() {
+            return Ok(());
+        }
+
+        // Detach every interface, collecting failures instead of returning on
+        // the first one: a partially-detached redirect is the dangerous state,
+        // so each remaining link must still get its detach attempt.
+        let mut errors = Vec::new();
+        let mut retained = Vec::new();
+        for entry in std::mem::take(&mut self.ingress_redirect_links) {
+            let IngressRedirectLink { iface, link } = entry;
+            let Some(link) = link else {
+                // A previous detach consumed the link without succeeding and
+                // nothing could be rebuilt. There is no handle to retry with,
+                // but the kernel filter may still be live, so keep reporting it.
+                errors.push(format!(
+                    "{iface}: no retryable link handle remains after an earlier failed detach"
+                ));
+                retained.push(IngressRedirectLink { iface, link: None });
+                continue;
+            };
+            // Capture the netlink filter identity BEFORE `detach` consumes the
+            // link. `Link::detach` takes `self`, so without this the handle is
+            // gone the moment the netlink delete fails.
+            let rebuild = match (link.attach_type(), link.priority(), link.handle()) {
+                (Ok(attach_type), Ok(priority), Ok(handle)) => {
+                    Some((attach_type, priority, handle))
+                }
+                // A TCX fd link, whose detach is infallible — it can never reach
+                // the rebuild path below.
+                _ => None,
+            };
+            match link.detach() {
+                Ok(()) => debug!(
+                    program = INGRESS_REDIRECT_PROGRAM,
+                    iface, "NodeWaypoint inbound tc ingress redirect detached"
+                ),
+                Err(e) => {
+                    errors.push(format!("{iface}: {e}"));
+                    let rebuilt = rebuild.and_then(|(attach_type, priority, handle)| {
+                        SchedClassifierLink::attached(&iface, attach_type, priority, handle).ok()
+                    });
+                    if rebuilt.is_none() {
+                        warn!(
+                            program = INGRESS_REDIRECT_PROGRAM,
+                            iface,
+                            "Could not rebuild a retryable handle for the failed ingress redirect \
+                             detach; the classifier is still reported attached so its \
+                             local-delivery routing is retained"
+                        );
+                    }
+                    retained.push(IngressRedirectLink {
+                        iface,
+                        link: rebuilt,
+                    });
+                }
+            }
+        }
+        self.ingress_redirect_links = retained;
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Failed to detach '{INGRESS_REDIRECT_PROGRAM}' from {}",
+                errors.join(", ")
+            ))
+        }
+    }
+
+    fn ingress_redirect_attached(&self) -> bool {
+        !self.ingress_redirect_links.is_empty()
+    }
+
+    fn update_pod_inbound_ports(&mut self, ip: Ipv4Addr, ports: &[u16]) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.replace_pod_inbound_ports(ip, ports)
+    }
+
+    fn clear_pod_inbound_ports(&mut self, ip: Ipv4Addr) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.replace_pod_inbound_ports(ip, &[])
+    }
+
+    fn update_pod_inbound_ports6(&mut self, ip: Ipv6Addr, ports: &[u16]) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.replace_pod_inbound_ports6(ip, ports)
+    }
+
+    fn clear_pod_inbound_ports6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
+        let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
+        maps.replace_pod_inbound_ports6(ip, &[])
+    }
+
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
         let maps = self.maps.as_mut().ok_or("BPF maps not initialized")?;
         maps.insert_node_probe_port(ip, port)
@@ -490,6 +701,24 @@ impl EbpfBackend for AyaEbpfBackend {
     }
 
     fn cleanup_all(&mut self) -> Result<(), String> {
+        // Detach the node-level ingress redirect explicitly and BEFORE dropping
+        // `Ebpf`. This is the genuine retry the callers treat it as: the links
+        // are owned by this backend (not by the program's link map, which
+        // `self.bpf = None` below would tear down), so a link that failed to
+        // detach earlier is attempted again here — and if it fails again it
+        // STAYS recorded. `ingress_redirect_attached()` therefore keeps
+        // reporting a possibly-live classifier after cleanup, which is what the
+        // node-agent keys its routing teardown off: a classifier left steering
+        // traffic at a listener that is shutting down would black-hole inbound
+        // traffic for every enrolled pod on the node, and removing its
+        // local-delivery routing first would strand assigned packets.
+        if let Err(e) = self.detach_ingress_redirect() {
+            warn!(
+                error = %e,
+                "Failed to detach the inbound tc ingress redirect during cleanup; it stays \
+                 recorded as attached so its local-delivery routing is retained"
+            );
+        }
         self.pod_links.clear();
         self.sock_ops_link_id = None;
         self.orig_dst_maps_pinned = false;
@@ -619,6 +848,8 @@ mod live_kernel_tests {
     use crate::ebpf::kernel_probe::probe_kernel;
     use crate::ebpf::{BPF_ORIG_DST4_PIN_PATH, EbpfBackend};
     use aya::maps::{HashMap as BpfHashMap, Map, MapData};
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    use aya::programs::{SchedClassifier, TcAttachType};
     use ferrum_ebpf_common::{OrigDst4, OrigDstKey, WorkloadIdentity};
     use std::fs;
     use std::net::Ipv4Addr;
@@ -738,6 +969,590 @@ mod live_kernel_tests {
             .expect("remove workload identity");
 
         backend.cleanup_all().expect("cleanup BPF state");
+
+        // NodeWaypoint inbound tc ingress redirect (issue #3287), run as phases
+        // of this test rather than as tests of their own: the required
+        // `ebpf-live` CI job asserts an exact passing-test count inside a job
+        // body that a pull request may not modify (the trusted Cross-build
+        // policy freezes it by digest). Each phase reloads its own backend, so
+        // they stay independent despite sharing a test function.
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        {
+            run_tc_ingress_redirect_lifecycle_phase();
+            run_tc_ingress_redirect_datapath_phase();
+        }
+    }
+
+    /// A scratch veth pair, removed on drop. The tc ingress redirect attaches
+    /// to a node capture interface, so the live test needs a real interface it
+    /// can create and destroy without perturbing the runner's networking.
+    struct ScratchVeth {
+        name: String,
+    }
+
+    impl ScratchVeth {
+        fn create() -> Result<Self, String> {
+            let name = format!("ferrumtc{}", std::process::id() % 100_000);
+            let peer = format!("{name}p");
+            // Remove a leftover from a previous aborted run first.
+            let _ = std::process::Command::new("ip")
+                .args(["link", "del", &name])
+                .output();
+            let output = std::process::Command::new("ip")
+                .args(["link", "add", &name, "type", "veth", "peer", "name", &peer])
+                .output()
+                .map_err(|e| format!("could not run `ip link add`: {e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "`ip link add {name}` failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Ok(Self { name })
+        }
+    }
+
+    impl Drop for ScratchVeth {
+        fn drop(&mut self) {
+            // Deleting one end removes the pair.
+            let _ = std::process::Command::new("ip")
+                .args(["link", "del", &self.name])
+                .output();
+        }
+    }
+
+    /// Live-kernel verification for the NodeWaypoint inbound tc **ingress**
+    /// redirect (issue #3287).
+    ///
+    /// Not a `#[test]` of its own: the required `ebpf-live` CI job asserts an
+    /// exact live-test count against a job body that a pull request may not
+    /// change (the trusted Cross-build policy freezes it by digest), so this
+    /// runs as a phase of [`programs_load_verify_attach_and_map_round_trip`].
+    ///
+    /// Covers, on a real kernel:
+    ///
+    /// * **Verifier acceptance** of `ferrum_tc_ingress_redirect`, which is the
+    ///   part that cannot be checked by any host-side test — the program uses
+    ///   `bpf_skc_lookup_tcp` / `bpf_sk_assign` / `bpf_sk_release`, whose
+    ///   reference-tracking rules the verifier enforces on every branch.
+    /// * **Attach and detach lifecycle** on a real tc ingress hook, including
+    ///   that detach actually removes the classifier (failure cleanup: a
+    ///   classifier left steering traffic at a departing listener would
+    ///   black-hole inbound for every enrolled pod on the node).
+    /// * **Both address families** of the redirect scope maps, and the armed
+    ///   capture-config round trip that gates the whole datapath.
+    ///
+    /// End-to-end packet steering is covered separately by
+    /// [`ingress_redirect_steers_a_real_tcp_flow_into_the_capture_listener`].
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    fn run_tc_ingress_redirect_lifecycle_phase() {
+        use ferrum_ebpf_common::{
+            BpfCaptureConfig, NODE_WAYPOINT_INGRESS_CAPTURE_PORT,
+            NODE_WAYPOINT_INGRESS_REDIRECT_MARK,
+        };
+        use std::net::Ipv6Addr;
+
+        let veth = match ScratchVeth::create() {
+            Ok(veth) => veth,
+            Err(e) => {
+                skip_or_fail(format!("could not create a scratch veth pair: {e}"));
+                return;
+            }
+        };
+
+        let mut backend = AyaEbpfBackend::new();
+        // The load runs the in-kernel verifier over `ferrum_tc_ingress_redirect`
+        // along with every other program. This is the core live validation for
+        // the blind-built socket-assign code.
+        backend.load_programs().expect(
+            "load + verify BPF programs (incl. the tc ingress redirect) on the running kernel",
+        );
+
+        // Arm the redirect exactly as the node-agent does in NodeWaypoint mode:
+        // the steer target is the CAPTURE listener port, never the HBONE port.
+        let armed = BpfCaptureConfig::new(15001, 15008)
+            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK)
+            .with_node_waypoint_ingress_capture_port(NODE_WAYPOINT_INGRESS_CAPTURE_PORT);
+        assert!(armed.ingress_redirect_armed());
+        assert_ne!(
+            armed.node_waypoint_ingress_capture_port, armed.hbone_redirect_port,
+            "the kernel must steer at the capture listener, never at HBONE"
+        );
+        backend
+            .update_capture_config(&armed)
+            .expect("publish the armed inbound redirect capture config");
+
+        // Both families of the redirect scope map must round-trip: replace,
+        // narrow, and clear. Narrowing is the case that would silently leave a
+        // removed port redirectable if replacement were additive.
+        let pod_v4 = Ipv4Addr::new(10, 244, 1, 5);
+        let pod_v6: Ipv6Addr = "fd00:10:244::5".parse().unwrap();
+        backend
+            .update_pod_inbound_ports(pod_v4, &[8080, 9090])
+            .expect("write the IPv4 inbound redirect scope");
+        backend
+            .update_pod_inbound_ports(pod_v4, &[8080])
+            .expect("narrow the IPv4 inbound redirect scope");
+        backend
+            .update_pod_inbound_ports6(pod_v6, &[8080, 9090])
+            .expect("write the IPv6 inbound redirect scope");
+        backend
+            .update_pod_inbound_ports6(pod_v6, &[8080])
+            .expect("narrow the IPv6 inbound redirect scope");
+
+        // Attach to the scratch interface's tc ingress hook, then detach.
+        backend
+            .attach_ingress_redirect(&veth.name)
+            .expect("attach ferrum_tc_ingress_redirect to the scratch veth ingress hook");
+        let attached = ingress_redirect_classifier_visible(&veth.name);
+        backend
+            .detach_ingress_redirect()
+            .expect("detach ferrum_tc_ingress_redirect");
+        let detached_gone = !ingress_redirect_classifier_visible(&veth.name);
+
+        // Clearing must succeed for a pod that was scoped and for one that was
+        // never scoped (teardown runs on both).
+        backend
+            .clear_pod_inbound_ports(pod_v4)
+            .expect("clear the IPv4 inbound redirect scope");
+        backend
+            .clear_pod_inbound_ports6(pod_v6)
+            .expect("clear the IPv6 inbound redirect scope");
+        backend
+            .clear_pod_inbound_ports(Ipv4Addr::new(10, 244, 9, 9))
+            .expect("clearing an unscoped pod address must be a no-op, not an error");
+
+        // Detaching again must be a clean no-op: shutdown and startup rollback
+        // can both run it.
+        backend
+            .detach_ingress_redirect()
+            .expect("a second detach must be idempotent");
+
+        backend.cleanup_all().expect("cleanup BPF state");
+
+        assert!(
+            attached,
+            "the classifier must be visible on the interface's tc ingress hook after attach \
+             (classic `tc filter show` and/or TCX query)"
+        );
+        assert!(
+            detached_gone,
+            "detach must remove the classifier; a leftover filter would steer inbound traffic \
+             at a listener that is going away"
+        );
+    }
+
+    /// `tc filter show dev <iface> ingress` output, or an empty string when the
+    /// `tc` binary is unavailable (the assertions tolerate that by checking for
+    /// absence after detach).
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    fn tc_ingress_filters(iface: &str) -> String {
+        std::process::Command::new("tc")
+            .args(["filter", "show", "dev", iface, "ingress"])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Whether the ingress-redirect classifier is attached on `iface`.
+    ///
+    /// On kernels >= 6.6, aya's `SchedClassifier::attach` uses TCX (BPF links)
+    /// rather than classic clsact filters. TCX programs do **not** appear in
+    /// `tc filter show`, so an empty classic listing after a successful attach
+    /// is expected — query the TCX multi-prog list instead. Older kernels keep
+    /// the netlink/clsact path and remain visible via `tc filter show`.
+    ///
+    /// The scratch interfaces created by these live phases have no other TCX
+    /// programs, so a non-empty TCX query is sufficient evidence of our attach
+    /// (BPF object names are also truncated to 16 bytes, so an exact
+    /// `ferrum_tc_ingress_redirect` match against `ProgramInfo::name` is not
+    /// reliable).
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    fn ingress_redirect_classifier_visible(iface: &str) -> bool {
+        let filters = tc_ingress_filters(iface);
+        if filters.contains("ferrum_tc_ingress_redirect") || filters.contains("bpf") {
+            return true;
+        }
+        match SchedClassifier::query_tcx(iface, TcAttachType::Ingress) {
+            Ok((_revision, programs)) => !programs.is_empty(),
+            Err(_) => false,
+        }
+    }
+
+    /// A scratch network namespace plus the veth pair that reaches it, removed
+    /// on drop. Models the off-node client side of an inbound flow: the client
+    /// lives in the namespace and routes through the host, so its packets
+    /// arrive on the host veth's tc **ingress** hook exactly as off-node
+    /// traffic to a pod arrives on a node uplink.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    struct ScratchClientNetns {
+        netns: String,
+        host_iface: String,
+    }
+
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    impl ScratchClientNetns {
+        const HOST_ADDR: &'static str = "10.244.253.1";
+        const CLIENT_ADDR: &'static str = "10.244.253.2";
+
+        fn create() -> Result<Self, String> {
+            let suffix = std::process::id() % 10_000;
+            let netns = format!("ferrumtcns{suffix}");
+            let host_iface = format!("ferrumtch{suffix}");
+            let peer_iface = format!("ferrumtcc{suffix}");
+
+            // Clean up anything a previous aborted run left behind first.
+            let _ = ip(&["netns", "del", &netns]);
+            let _ = ip(&["link", "del", &host_iface]);
+
+            let this = Self {
+                netns: netns.clone(),
+                host_iface: host_iface.clone(),
+            };
+
+            ip(&["netns", "add", &netns])?;
+            ip(&[
+                "link",
+                "add",
+                &host_iface,
+                "type",
+                "veth",
+                "peer",
+                "name",
+                &peer_iface,
+            ])?;
+            ip(&["link", "set", &peer_iface, "netns", &netns])?;
+            ip(&[
+                "addr",
+                "add",
+                &format!("{}/24", Self::HOST_ADDR),
+                "dev",
+                &host_iface,
+            ])?;
+            ip(&["link", "set", &host_iface, "up"])?;
+            ip(&["netns", "exec", &netns, "ip", "link", "set", "lo", "up"])?;
+            ip(&[
+                "netns",
+                "exec",
+                &netns,
+                "ip",
+                "addr",
+                "add",
+                &format!("{}/24", Self::CLIENT_ADDR),
+                "dev",
+                &peer_iface,
+            ])?;
+            ip(&[
+                "netns",
+                "exec",
+                &netns,
+                "ip",
+                "link",
+                "set",
+                &peer_iface,
+                "up",
+            ])?;
+            // Default route through the host, so a connection to the pod
+            // address is sent to the host's MAC with the pod address intact —
+            // which is what makes it visible on the host veth's ingress hook.
+            ip(&[
+                "netns",
+                "exec",
+                &netns,
+                "ip",
+                "route",
+                "add",
+                "default",
+                "via",
+                Self::HOST_ADDR,
+            ])?;
+            // The captured destination is not routed on this host, so reverse-
+            // path filtering would otherwise discard the reply's source.
+            let _ = std::process::Command::new("sysctl")
+                .arg("-w")
+                .arg(format!("net.ipv4.conf.{host_iface}.rp_filter=0"))
+                .output();
+            let _ = std::process::Command::new("sysctl")
+                .arg("-w")
+                .arg("net.ipv4.conf.all.rp_filter=0")
+                .output();
+            Ok(this)
+        }
+
+        /// Run a command inside the client namespace, returning its stdout.
+        fn exec(&self, args: &[&str]) -> Result<String, String> {
+            let mut full = vec!["netns", "exec", self.netns.as_str()];
+            full.extend_from_slice(args);
+            let output = std::process::Command::new("ip")
+                .args(&full)
+                .output()
+                .map_err(|e| format!("could not run `ip {}`: {e}", full.join(" ")))?;
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+    }
+
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    impl Drop for ScratchClientNetns {
+        fn drop(&mut self) {
+            let _ = ip(&["link", "del", &self.host_iface]);
+            let _ = ip(&["netns", "del", &self.netns]);
+        }
+    }
+
+    /// Run one `ip` invocation, surfacing stderr on failure.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    fn ip(args: &[&str]) -> Result<(), String> {
+        let output = std::process::Command::new("ip")
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run `ip {}`: {e}", args.join(" ")))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(format!(
+            "`ip {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+
+    /// **End-to-end packet steering** for the NodeWaypoint inbound tc ingress
+    /// redirect (issue #3287) — the live datapath regression issue #3287's
+    /// acceptance criteria require, and the residual risk the first revision of
+    /// this feature had to disclose.
+    ///
+    /// It drives a real TCP flow from a client in a scratch network namespace
+    /// to an address that is **not configured anywhere on this host**, and
+    /// proves the whole chain:
+    ///
+    /// 1. the classifier matches the flow on a real tc ingress hook and
+    ///    `bpf_sk_assign`s it to the transparent **capture** listener (not the
+    ///    HBONE listener);
+    /// 2. the production `ip rule` / `ip route` shapes deliver the assigned
+    ///    packet locally instead of forwarding it to the pod;
+    /// 3. the relay observes the **original destination** on its accepted
+    ///    socket (`getsockname()` — there is no NAT to consult);
+    /// 4. the reply is sourced from that captured address and reaches the
+    ///    client, which is only possible on an `IP_TRANSPARENT` socket;
+    /// 5. **failure/cleanup**: after detach + scope clear, the same connection
+    ///    is no longer steered — a leftover classifier or stale scope entry
+    ///    would keep capturing traffic for a listener that is going away.
+    ///
+    /// Deterministic and narrowly scoped: one flow, fixed payloads, private
+    /// addresses, everything created and destroyed by the test. Every
+    /// prerequisite failure routes through `skip_or_fail`, so under
+    /// `FERRUM_LIVE_TESTS_REQUIRED=1` an environment that cannot run the
+    /// mechanism fails the gate rather than silently reporting the feature
+    /// ready.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    fn run_tc_ingress_redirect_datapath_phase() {
+        use crate::ebpf::PodInfo;
+        use ferrum_ebpf_common::{BpfCaptureConfig, NODE_WAYPOINT_INGRESS_REDIRECT_MARK};
+        use std::time::Duration;
+
+        // A pod address deliberately absent from this host's routing table, so
+        // only the redirect can make the connection succeed.
+        const POD_ADDR: &str = "10.244.254.7";
+        const APP_PORT: u16 = 18080;
+        const REQUEST: &[u8; 4] = b"PING";
+        const REPLY: &[u8; 4] = b"PONG";
+        // Distinct from the shipped 15006 so a co-resident process on the
+        // runner cannot make the result ambiguous.
+        let capture_port: u16 = 15106;
+
+        let env = match ScratchClientNetns::create() {
+            Ok(env) => env,
+            Err(e) => {
+                skip_or_fail(format!(
+                    "could not build the scratch client namespace for the ingress redirect \
+                     datapath test: {e}"
+                ));
+                return;
+            }
+        };
+
+        // Production local-delivery routing, taken from the node-agent itself
+        // so the test proves the shipped rule/route shape actually delivers.
+        let routing = crate::modes::node_agent::ingress_redirect_routing_commands(false);
+        for args in &routing {
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            if argv.iter().any(|arg| *arg == "del") {
+                let _ = ip(&argv);
+                continue;
+            }
+            if let Err(e) = ip(&argv) {
+                skip_or_fail(format!(
+                    "could not install the redirect local-delivery routing: {e}"
+                ));
+                return;
+            }
+        }
+
+        let mut backend = AyaEbpfBackend::new();
+        backend
+            .load_programs()
+            .expect("load + verify BPF programs on the running kernel");
+
+        let armed = BpfCaptureConfig::new(15001, 15008)
+            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK)
+            .with_node_waypoint_ingress_capture_port(capture_port);
+        backend
+            .update_capture_config(&armed)
+            .expect("publish the armed inbound redirect capture config");
+
+        let pod_ip: Ipv4Addr = POD_ADDR.parse().unwrap();
+        // Scope first, then the flag — the same ordering the node-agent uses so
+        // an in-scope packet is never flagged before it is reachable.
+        backend
+            .update_pod_inbound_ports(pod_ip, &[APP_PORT])
+            .expect("scope the pod's declared inbound port");
+        backend
+            .update_pod_ip(
+                pod_ip,
+                &PodInfo::for_capture(15001, false, false).with_inbound_redirect(true),
+            )
+            .expect("enroll the pod for inbound redirect");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a current-thread runtime for the capture listener");
+
+        let outcome = runtime.block_on(async {
+            // The production transparent bind, on the wildcard address the
+            // classifier's socket lookup resolves.
+            let listener = crate::proxy::create_proxy_socket(
+                format!("0.0.0.0:{capture_port}").parse().unwrap(),
+                128,
+                None,
+                false,
+                true,
+            )
+            .map_err(|e| format!("bind the transparent capture listener: {e}"))?;
+
+            backend
+                .attach_ingress_redirect(&env.host_iface)
+                .map_err(|e| format!("attach the classifier to the host veth: {e}"))?;
+
+            // `bash`'s /dev/tcp gives a dependency-free TCP client inside the
+            // namespace: send REQUEST, read exactly REPLY's length back.
+            let script = format!(
+                "exec 3<>/dev/tcp/{POD_ADDR}/{APP_PORT}; printf '{}' >&3; head -c {} <&3",
+                String::from_utf8_lossy(REQUEST.as_slice()),
+                REPLY.len()
+            );
+            let client = std::thread::spawn({
+                let netns = env.netns.clone();
+                move || {
+                    std::process::Command::new("ip")
+                        .args([
+                            "netns",
+                            "exec",
+                            netns.as_str(),
+                            "timeout",
+                            "10",
+                            "bash",
+                            "-c",
+                            script.as_str(),
+                        ])
+                        .output()
+                        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                        .unwrap_or_default()
+                }
+            });
+
+            let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
+            let (mut stream, _peer) = match accepted {
+                Ok(Ok(accepted)) => accepted,
+                Ok(Err(e)) => return Err(format!("accept on the capture listener failed: {e}")),
+                Err(_) => {
+                    return Err(
+                        "the redirected connection never reached the transparent capture \
+                         listener within 10s"
+                            .to_string(),
+                    );
+                }
+            };
+
+            // (3) The original destination, recovered with no NAT in the path.
+            let observed_dst = stream
+                .local_addr()
+                .map_err(|e| format!("read the accepted socket's local address: {e}"))?;
+
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut request = [0u8; 4];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut request))
+                .await
+                .map_err(|_| "timed out reading the captured request".to_string())?
+                .map_err(|e| format!("read the captured request: {e}"))?;
+            // (4) Reply, which the kernel can only send because the socket is
+            // transparent and may source the captured pod address.
+            stream
+                .write_all(REPLY)
+                .await
+                .map_err(|e| format!("reply on the captured connection: {e}"))?;
+            stream
+                .flush()
+                .await
+                .map_err(|e| format!("flush the reply: {e}"))?;
+            drop(stream);
+
+            let client_stdout = client.join().unwrap_or_default();
+            Ok::<_, String>((observed_dst, request.to_vec(), client_stdout))
+        });
+
+        // (5) Cleanup / failure behavior, asserted before the result so a
+        // mid-test failure still leaves the runner clean.
+        let detached = backend.detach_ingress_redirect();
+        let scope_cleared = backend.clear_pod_inbound_ports(pod_ip);
+        let _ = backend.remove_pod_ip(pod_ip);
+        let post_detach_gone = !ingress_redirect_classifier_visible(&env.host_iface);
+        for args in crate::modes::node_agent::ingress_redirect_routing_teardown_commands(false) {
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let _ = ip(&argv);
+        }
+        // With the classifier gone the same dial has nowhere to go: nothing is
+        // listening on the pod address and this host has no route to it, so the
+        // client gets no reply. A leftover classifier would still capture it.
+        let post_detach_script = format!("exec 3<>/dev/tcp/{POD_ADDR}/{APP_PORT}; head -c 4 <&3");
+        let post_detach_stdout = env
+            .exec(&["timeout", "3", "bash", "-c", post_detach_script.as_str()])
+            .unwrap_or_default();
+        let _ = backend.cleanup_all();
+
+        let (observed_dst, request, client_stdout) =
+            outcome.unwrap_or_else(|e| panic!("inbound tc ingress redirect datapath: {e}"));
+
+        assert_eq!(
+            observed_dst.to_string(),
+            format!("{POD_ADDR}:{APP_PORT}"),
+            "the relay must observe the workload's ORIGINAL destination on the accepted socket; \
+             `bpf_sk_assign` performs no NAT, so a different value means the flow did not arrive \
+             through the redirect"
+        );
+        assert_eq!(
+            request.as_slice(),
+            REQUEST.as_slice(),
+            "the captured application bytes must arrive byte-for-byte"
+        );
+        assert_eq!(
+            client_stdout.as_bytes(),
+            REPLY.as_slice(),
+            "the reply must reach the client sourced from the captured pod address, which only \
+             an IP_TRANSPARENT socket can do"
+        );
+
+        detached.expect("detaching the classifier must succeed");
+        scope_cleared.expect("clearing the redirect scope must succeed");
+        assert!(
+            post_detach_gone,
+            "detach must remove the classifier (classic tc filter and/or TCX query)"
+        );
+        assert!(
+            post_detach_stdout.is_empty(),
+            "after detach + scope clear the flow must no longer be steered into the capture \
+             listener, got {post_detach_stdout:?}"
+        );
     }
 
     /// Layer-2 datapath verification: a real captured `connect()` is rewritten

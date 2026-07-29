@@ -190,9 +190,45 @@ attached on host-side veth ingress:
 `FERRUM_POD_IPS` / `FERRUM_POD_IPS6` mark enrolled destination addresses, and
 packets to those addresses are dropped unless `skb->mark` equals the
 NodeWaypoint inbound-auth mark set by the destination HBONE relay before it
-dials the local backend pod. This is intentionally a guard, not a redirect;
-unauthenticated direct pod-IP traffic never reaches the app outside destination
-policy.
+dials the local backend pod. That classifier is intentionally a guard, not a
+redirect; unauthenticated direct pod-IP traffic never reaches the app outside
+destination policy.
+
+A second, opt-in tc **ingress** classifier (`ferrum_tc_ingress_redirect`, issue
+#3287) sits alongside it, off unless
+`FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES` names capture interfaces. Rather
+than dropping in-scope direct pod traffic, it steers it — with
+`bpf_sk_assign()`, never NAT — into the mesh proxy's transparent inbound
+**capture** listener on `FERRUM_MESH_INBOUND_LISTEN_ADDR`, which is a distinct
+protocol boundary from HBONE (`:15008`): it terminates no TLS and relays
+captured application bytes at L4. That does not weaken this section's rule,
+because the captured connection is then subject to destination policy before
+any byte reaches the app:
+
+- the recovered destination must pass the **same** open-relay guard as the
+  inbound HBONE relay (a slice-declared in-mesh workload address and port),
+  tightened to exactly one unambiguous workload identity, counted as
+  `relay_destination_denied` on rejection. This runs first: one capture listener
+  serves every enrolled pod on the node, so the two gates below are properties
+  of that workload, not of the listener;
+- the effective PeerAuthentication posture of **that destination workload** on
+  the captured app port must admit plaintext — resolved from the workload's own
+  namespace/labels, never from a listener-wide per-port table, so a `PERMISSIVE`
+  pod cannot admit plaintext to a `STRICT` pod sharing the app port. `STRICT`
+  still refuses direct plaintext and forces the peer onto authenticated mesh
+  transport;
+- the L4 `on_stream_connect` chain — including `__mesh_authz` — runs with the
+  captured app port as the authorization destination and that workload's
+  `PolicyScopeCache` stamped on the stream context, so namespace/selector-scoped
+  policies are evaluated against the captured destination rather than denied
+  `scope_missing`.
+
+The relay's own backend dial carries the same NodeWaypoint inbound-auth mark, so
+the pod-veth guard admits it and the redirect bypasses it as already-relayed. An
+in-scope packet for which no capture-listener socket resolves is dropped, not
+delivered unredirected. Because this listener is not an HBONE session, it
+records no `inbound_tls` / `inbound_connect` handshake phase; only the
+destination-policy counter above applies to it.
 
 The live gate asserts both denied in-mesh sources and unmanaged non-mesh sources
 cannot reach enrolled destination pods directly over IPv4, plus the unmanaged
@@ -238,7 +274,7 @@ labels.
 |---|---|---|---|---|---|---|
 | HBONE handshake success/failure | `ferrum_mesh_node_waypoint_hbone_handshakes_total` + `mesh.node_waypoint_observability.hbone_handshakes.*` on authenticated `/health` | `phase` ∈ {`inbound_tls`,`inbound_connect`,`outbound_dial`}, `result` ∈ {`success`,`failure`} | TLS accept (`src/tls/mod.rs`); CONNECT admission (`src/proxy/hbone_proxy.rs`); outbound dial (`HboneConnectionPool::get_tunnel_via` for pooled HTTP/raw-TCP egress and `get_ws_byte_tunnel` for the 1:1 WebSocket byte tunnel; counted per opened CONNECT tunnel, including tunnels multiplexed onto an already-established pooled H2 connection. Datagram tunnels are out of scope — NodeWaypoint emits no UDP capture listener) | `tests/unit/gateway_core/node_waypoint_observability_tests.rs` | mesh-overview NW panels; live IDs `node_waypoint.observability.hbone_handshake_inbound_tls_failure`, `node_waypoint.observability.hbone_handshake_outbound_success` | **Implemented + live-wired** |
 | Asserted source identity accepted/rejected | `ferrum_mesh_node_waypoint_asserted_identity_total` + admin `asserted_identity.*` | `result` ∈ {`accepted`,`rejected`}, `reason` ∈ {`honored`,`untrusted_assertor`,`trust_domain_mismatch`,`unauthenticated_hbone`,`malformed`,`stale_or_unknown`} | `mesh_authz` when `per_pod_policy_scoping` | unit observability tests + existing mesh_authz plugin tests | live ID `node_waypoint.observability.asserted_identity_rejected` | **Implemented + live-wired** |
-| Destination policy rejection | `ferrum_mesh_node_waypoint_destination_policy_rejections_total` + admin `destination_policy_rejections.*` | `reason` ∈ {`authz_deny`,`scope_missing`,`destination_scope_missing`,`relay_destination_denied`} | `mesh_authz` / open-relay guard (mutually exclusive with asserted-identity reject for one decision) | unit observability tests | Live deny paths exercise authz; counter panels on mesh-overview | **Implemented** |
+| Destination policy rejection | `ferrum_mesh_node_waypoint_destination_policy_rejections_total` + admin `destination_policy_rejections.*` | `reason` ∈ {`authz_deny`,`scope_missing`,`destination_scope_missing`,`relay_destination_denied`} | `mesh_authz` / open-relay guard — the HBONE relay (`src/proxy/hbone_proxy.rs`) and the transparent inbound capture listener (`src/proxy/node_waypoint_ingress_capture.rs`), which shares the same guard; mutually exclusive with asserted-identity reject for one decision | unit observability tests | Live deny paths exercise authz; counter panels on mesh-overview | **Implemented** |
 | Missing destination NodeWaypoint metadata | `ferrum_mesh_node_waypoint_missing_destination_metadata_total` + admin field | none | `build_outbound_mesh_targets` skip when identity-backed posture requires metadata | `mesh_outbound_node_waypoint_identity_backed_missing_metadata_fails_closed` + observability unit tests | Dashboard panel; live profile always publishes metadata so counter stays observational in H2 | **Implemented** |
 | Prohibited plaintext fallback attempt | `ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total` + admin field | none | Same fail-closed skip (blocked plaintext retention) | same as missing-metadata | Dashboard panel | **Implemented** |
 

@@ -1,4 +1,15 @@
-//! Local raw-TCP Sidecar inbound relay.
+//! Local raw-TCP captured-inbound relay.
+//!
+//! Two callers share it. The Sidecar inbound listener routes REDIRECT-captured
+//! plaintext here (the original path, described below), and the NodeWaypoint
+//! transparent inbound capture listener
+//! ([`crate::proxy::node_waypoint_ingress_capture`], issue #3287) hands off a
+//! per-connection synthesized entry. The two differ only in what the entry
+//! carries: the NodeWaypoint entry sets `socket_mark` (the dial leaves the host
+//! netns and must be recognized by the pod-veth guard) and
+//! `node_waypoint_policy_scope` (that listener serves many pods, so the
+//! destination workload's policy scope cannot be inferred from the listener).
+//! Sidecar entries leave both `None` and behave exactly as before.
 //!
 //! When Sidecar inbound TLS is disabled or absent in permissive mode, the
 //! inbound listener can receive REDIRECT-captured plaintext TCP for local
@@ -38,6 +49,31 @@ use crate::plugins::{
 use crate::request_epoch::RequestEpoch;
 use crate::router_cache::MeshTcpInboundEntry;
 
+/// Fail-closed gate for NodeWaypoint transparent capture: refuse before the
+/// backend dial unless the mesh-managed `__mesh_authz` runtime policy is
+/// positively proven present in the global TCP chain this connection will run.
+///
+/// Both inputs are O(1) bits precomputed per plugin-cache generation, so this
+/// adds no per-connection scan:
+/// - `entry.has_destination_mesh_authz` is what the SYNTHESIZING generation saw
+///   when the relay entry was built.
+/// - `epoch_destination_authz_ready` is what the generation actually serving
+///   this connection reports.
+///
+/// Requiring both closes the otherwise-representable skew where an entry is
+/// built under a ready generation and handled under one that no longer carries
+/// the managed policy.
+///
+/// Sidecar entries leave `requires_destination_mesh_authz` false and keep the
+/// historical empty-chain fast path.
+pub(crate) fn capture_requires_destination_authz_refusal(
+    entry: &MeshTcpInboundEntry,
+    epoch_destination_authz_ready: bool,
+) -> bool {
+    entry.requires_destination_mesh_authz
+        && !(entry.has_destination_mesh_authz && epoch_destination_authz_ready)
+}
+
 pub(crate) async fn handle_mesh_tcp_inbound(
     client_stream: TcpStream,
     remote_addr: std::net::SocketAddr,
@@ -68,10 +104,41 @@ pub(crate) async fn handle_mesh_tcp_inbound(
             .plugin_cache
             .plugins_for_protocol(&proxy.namespace, &proxy.id, ProxyProtocol::Tcp);
 
+    // NodeWaypoint transparent capture admits unauthenticated direct plaintext.
+    // Never take the Sidecar empty-chain fast path for those entries, and fail
+    // closed unless the mesh-managed destination authz policy is provably in
+    // the chain resolved above. Both operands are generation-level bits
+    // precomputed by the plugin cache — no hot-path config or plugin scan.
+    if capture_requires_destination_authz_refusal(
+        entry,
+        epoch.plugin_cache.node_waypoint_destination_authz_ready(),
+    ) {
+        warn!(
+            service = %entry.service_fqdn,
+            orig_dst = %orig_dst,
+            client_ip = %client_ip,
+            "Refusing NodeWaypoint transparent inbound capture: mesh-managed \
+             destination authz is absent; closing without dialing the backend"
+        );
+        return;
+    }
+
     // No global TCP chain resolved: relay immediately. There is no plugin state
     // to track and no policy to evaluate, so the connect/disconnect lifecycle is
     // a no-op and we skip building a summary that nothing consumes.
+    // Capture entries never reach here without authz (gated above); Sidecar
+    // preserves this historical empty-chain fast path.
     if plugins.is_empty() {
+        if entry.requires_destination_mesh_authz {
+            warn!(
+                service = %entry.service_fqdn,
+                orig_dst = %orig_dst,
+                client_ip = %client_ip,
+                "Refusing NodeWaypoint transparent inbound capture: TCP plugin \
+                 chain is empty despite capture requiring destination authz"
+            );
+            return;
+        }
         relay_to_loopback(client_stream, state, entry, orig_dst, &client_ip).await;
         return;
     }
@@ -185,10 +252,19 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     // traffic — so `mesh_authz` treats `listen_port` as the inbound
     // destination port (parity with the materialized HTTP inbound path).
     stream_ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
-    // The constructor intentionally leaves per-pod scope absent because
-    // Sidecar topology never installs the node-waypoint resolver;
-    // `mesh_authz` evaluates mesh-wide + namespace/selector policies against
-    // the connection identity.
+    // Per-pod policy scope of the DESTINATION workload, present only for the
+    // NodeWaypoint transparent inbound capture relay (issue #3287): that
+    // listener serves every enrolled pod on the node, so `mesh_authz` (which
+    // runs with `per_pod_policy_scoping` on for NodeWaypoint) has no other way
+    // to know whose namespace/selector-scoped policies to evaluate — without it
+    // every captured connection is denied `scope_missing` as soon as one scoped
+    // policy exists.
+    //
+    // Sidecar routes carry `None` and are unchanged: that topology never
+    // installs the node-waypoint resolver, `per_pod_policy_scoping` is off, and
+    // `mesh_authz` narrowed its policy set at construction against the proxy's
+    // own identity.
+    stream_ctx.node_waypoint_policy_scope = entry.node_waypoint_policy_scope.clone();
     // Populate the first-byte snapshot captured above before hooks run.
     stream_ctx.first_bytes = first_bytes;
     stream_ctx.first_bytes_kind = first_bytes_kind;
@@ -242,7 +318,13 @@ pub(crate) async fn handle_mesh_tcp_inbound(
         }
     }
 
-    let connect = TcpStream::connect(entry.backend_addr);
+    // Marked when the entry demands it (NodeWaypoint capture relay): the dial
+    // leaves the host netns and must be recognized as an authorized relay dial
+    // by the pod-veth guard, and as already-relayed by the ingress redirect.
+    let connect = crate::socket_opts::connect_with_socket_opts_and_mark(
+        entry.backend_addr,
+        entry.socket_mark,
+    );
     let backend_stream = if proxy.backend_connect_timeout_ms == 0 {
         connect.await
     } else {
@@ -405,7 +487,13 @@ async fn relay_to_loopback(
     client_ip: &str,
 ) {
     let proxy = entry.relay_proxy.as_ref();
-    let connect = TcpStream::connect(entry.backend_addr);
+    // Marked when the entry demands it (NodeWaypoint capture relay): the dial
+    // leaves the host netns and must be recognized as an authorized relay dial
+    // by the pod-veth guard, and as already-relayed by the ingress redirect.
+    let connect = crate::socket_opts::connect_with_socket_opts_and_mark(
+        entry.backend_addr,
+        entry.socket_mark,
+    );
     let backend_stream = if proxy.backend_connect_timeout_ms == 0 {
         connect.await
     } else {
@@ -548,5 +636,75 @@ async fn emit_disconnect(
     }
     for plugin in plugins.iter() {
         plugin.on_stream_disconnect(&summary).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modes::mesh::config::MeshInboundTcpRoute;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    fn sample_entry(
+        requires_destination_mesh_authz: bool,
+        has_destination_mesh_authz: bool,
+    ) -> MeshTcpInboundEntry {
+        let backend_addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
+        let route = MeshInboundTcpRoute {
+            match_port: 6379,
+            backend_addr,
+            namespace: "default".to_string(),
+            service_name: "redis".to_string(),
+            service_fqdn: "redis.default.svc.cluster.local".to_string(),
+            tls_inspect: false,
+            first_bytes_inspect: false,
+        };
+        MeshTcpInboundEntry {
+            relay_proxy: Arc::new(crate::modes::mesh::mesh_inbound_tcp_relay_proxy(&route)),
+            backend_addr,
+            service_fqdn: route.service_fqdn,
+            tls_inspect: false,
+            first_bytes_inspect: false,
+            socket_mark: if requires_destination_mesh_authz {
+                Some(crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK)
+            } else {
+                None
+            },
+            node_waypoint_policy_scope: None,
+            requires_destination_mesh_authz,
+            has_destination_mesh_authz,
+        }
+    }
+
+    #[test]
+    fn sidecar_entries_never_refuse_for_missing_destination_authz() {
+        let entry = sample_entry(false, false);
+        // Sidecar keeps the historical empty-chain fast path under either
+        // generation readiness value.
+        assert!(!capture_requires_destination_authz_refusal(&entry, false));
+        assert!(!capture_requires_destination_authz_refusal(&entry, true));
+    }
+
+    #[test]
+    fn capture_entries_refuse_when_mesh_managed_authz_is_absent() {
+        let entry = sample_entry(true, false);
+        assert!(capture_requires_destination_authz_refusal(&entry, true));
+        assert!(capture_requires_destination_authz_refusal(&entry, false));
+    }
+
+    #[test]
+    fn capture_entries_proceed_when_mesh_managed_authz_is_present() {
+        let entry = sample_entry(true, true);
+        assert!(!capture_requires_destination_authz_refusal(&entry, true));
+    }
+
+    /// The entry was synthesized under a ready generation, but the generation
+    /// serving the connection no longer proves the managed policy is in its
+    /// global TCP chain. That skew must fail closed before the backend dial.
+    #[test]
+    fn capture_entries_refuse_when_the_serving_generation_is_not_ready() {
+        let entry = sample_entry(true, true);
+        assert!(capture_requires_destination_authz_refusal(&entry, false));
     }
 }

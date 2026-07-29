@@ -353,14 +353,9 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "fault_injection",
         classification: BuiltinPluginClassification::Public,
         priority: 2940,
-        active_phases: "before_proxy, on_stream_connect",
-        matrix_protocols: &[
-            ProxyProtocol::Http,
-            ProxyProtocol::Grpc,
-            ProxyProtocol::WebSocket,
-            ProxyProtocol::Tcp,
-        ],
-        protocol_rationale: "Probabilistic aborts and delays; raw TCP only for stream hooks (no UDP/DTLS)",
+        active_phases: "before_proxy, on_stream_connect, on_udp_datagram",
+        matrix_protocols: ALL_PROTOCOLS,
+        protocol_rationale: "Probabilistic aborts and delays across HTTP-family, TCP stream connect, and UDP/DTLS session + datagram hooks",
     },
     BuiltinPluginParityMeta {
         name: "body_validator",

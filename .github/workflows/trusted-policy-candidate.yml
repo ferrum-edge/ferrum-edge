@@ -1,0 +1,41 @@
+name: Trusted Policy Candidate
+
+# A pull request cannot replace the trusted policy used by CI Plan or the
+# protected-policy check. This isolated, read-only lane provides the missing
+# complementary evidence: candidate policy source is compiled and its own
+# static self-tests execute without producing any output consumed by another
+# job.
+on:
+  pull_request:
+    paths:
+      - .github/scripts/verify_cross_build_policy.py
+      - .github/workflows/ci.yml
+      - .github/workflows/trusted-policy-candidate.yml
+  push:
+    branches:
+      - main
+    paths:
+      - .github/scripts/verify_cross_build_policy.py
+      - .github/workflows/ci.yml
+      - .github/workflows/trusted-policy-candidate.yml
+
+permissions:
+  contents: read
+
+jobs:
+  candidate-self-test:
+    name: Candidate policy self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Exercise the candidate policy
+        run: |
+          set -euo pipefail
+          policy=.github/scripts/verify_cross_build_policy.py
+          python3 -I "$policy" --self-test

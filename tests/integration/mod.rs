@@ -95,6 +95,7 @@ mod scripted_backend_smoke_tests;
 mod spec_expose_integration_tests;
 mod tcp_fast_path_l4_plugins_tests;
 mod tcp_frontend_tls_order_tests;
+mod udp_fault_injection_tests;
 mod udp_hook_concurrency_tests;
 mod upstream_name_uniqueness_tests;
 mod vendor_integrity_tests;

@@ -29,7 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arc_swap::ArcSwap;
 use ferrum_ebpf_common::{BpfCaptureConfig, INBOUND_HBONE_PORT, OUTBOUND_CAPTURE_PORT};
 pub use ferrum_ebpf_common::{
-    INCLUDE_PORTS_MAX, IncludePortsPolicy, NODE_WAYPOINT_INBOUND_AUTH_MARK, WorkloadIdentity,
+    INCLUDE_PORTS_MAX, IncludePortsPolicy, NODE_WAYPOINT_INBOUND_AUTH_MARK,
+    NODE_WAYPOINT_INGRESS_REDIRECT_MARK, NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY,
+    NODE_WAYPOINT_INGRESS_REDIRECT_TABLE, POD_CAPTURE_FLAG_INBOUND_REDIRECT, WorkloadIdentity,
 };
 
 pub const NODE_AGENT_CAPTURE_STATE_STARTING: &str = "starting";
@@ -57,6 +59,10 @@ pub const BPF_MAP_NODE_IPS: &str = "FERRUM_NODE_IPS";
 pub const BPF_MAP_NODE_IPS6: &str = "FERRUM_NODE_IPS6";
 pub const BPF_MAP_NODE_PROBE_PORTS: &str = "FERRUM_NODE_PROBE_PORTS";
 pub const BPF_MAP_NODE_PROBE_PORTS6: &str = "FERRUM_NODE_PROBE_PORTS6";
+/// Declared inbound application ports of enrolled pods. Scopes the tc ingress
+/// redirect to `(pod address, port)` pairs the workload actually serves.
+pub const BPF_MAP_POD_INBOUND_PORTS: &str = "FERRUM_POD_INBOUND_PORTS";
+pub const BPF_MAP_POD_INBOUND_PORTS6: &str = "FERRUM_POD_INBOUND_PORTS6";
 pub const BPF_MAP_BYPASS_UIDS: &str = "FERRUM_BYPASS_UIDS";
 pub const BPF_MAP_CIDR_EXCLUDE4: &str = "FERRUM_CIDR_EXCLUDE4";
 pub const BPF_MAP_CIDR_EXCLUDE6: &str = "FERRUM_CIDR_EXCLUDE6";
@@ -96,6 +102,15 @@ pub const BPF_ORIG_DST6_PIN_PATH: &str = "/sys/fs/bpf/ferrum/orig_dst6";
 
 /// Program name of the SOCK_OPS kernel program in the ELF.
 pub const BPF_PROGRAM_SOCK_OPS: &str = "ferrum_sock_ops";
+
+/// Program name of the per-pod-veth direct-inbound guard classifier.
+pub const BPF_PROGRAM_TC_INBOUND: &str = "ferrum_tc_inbound";
+
+/// Program name of the node-level tc **ingress** redirect classifier. Attached
+/// once per configured node capture interface (never per pod), it steers
+/// inbound TCP for enrolled workloads into the local NodeWaypoint relay with
+/// `bpf_sk_assign` instead of relying on a node-global iptables REDIRECT.
+pub const BPF_PROGRAM_TC_INGRESS_REDIRECT: &str = "ferrum_tc_ingress_redirect";
 
 /// Node-agent proxy topology for the capture contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +156,8 @@ pub struct CaptureBpfMaps {
     pub node_ips6: &'static str,
     pub node_probe_ports: &'static str,
     pub node_probe_ports6: &'static str,
+    pub pod_inbound_ports: &'static str,
+    pub pod_inbound_ports6: &'static str,
     pub bypass_uids: &'static str,
     pub cidr_exclude4: &'static str,
     pub cidr_exclude6: &'static str,
@@ -162,6 +179,8 @@ impl Default for CaptureBpfMaps {
             node_ips6: BPF_MAP_NODE_IPS6,
             node_probe_ports: BPF_MAP_NODE_PROBE_PORTS,
             node_probe_ports6: BPF_MAP_NODE_PROBE_PORTS6,
+            pod_inbound_ports: BPF_MAP_POD_INBOUND_PORTS,
+            pod_inbound_ports6: BPF_MAP_POD_INBOUND_PORTS6,
             bypass_uids: BPF_MAP_BYPASS_UIDS,
             cidr_exclude4: BPF_MAP_CIDR_EXCLUDE4,
             cidr_exclude6: BPF_MAP_CIDR_EXCLUDE6,
@@ -189,9 +208,104 @@ pub struct CaptureContract {
     /// closed by connection refusal.
     pub ipv6_outbound_deny: bool,
     pub node_waypoint_inbound_auth_mark: u32,
+    /// Node capture interfaces that carry the tc **ingress** redirect
+    /// classifier. Empty (the default) means the redirect is not installed and
+    /// the datapath keeps its previous inbound behavior.
+    ///
+    /// These are node uplink interfaces, not pod veths: off-node traffic to an
+    /// enrolled pod is only visible on a tc ingress hook before routing decides
+    /// to forward it, and `bpf_sk_assign` is ingress-only. The program is still
+    /// scoped per packet by the enrolled-pod maps, so attaching here does not
+    /// capture unenrolled traffic.
+    pub ingress_redirect_ifaces: Vec<String>,
+    /// `skb->mark` used for local delivery of redirected inbound packets. Zero
+    /// (the default) disarms the kernel-side redirect entirely.
+    pub node_waypoint_ingress_redirect_mark: u32,
+    /// TCP port of the proxy's transparent inbound **capture** listener — the
+    /// redirect's steer target, read from the same
+    /// `FERRUM_MESH_INBOUND_LISTEN_ADDR` the proxy binds so the two processes
+    /// cannot drift. Zero disarms the redirect.
+    ///
+    /// Never [`Self::hbone_redirect_port`]: HBONE terminates authenticated H2
+    /// CONNECT over mesh mTLS, while captured traffic is raw application bytes.
+    /// [`Self::validate_ingress_redirect`] rejects a configuration that
+    /// collapses the two.
+    pub ingress_capture_port: u16,
+    /// Whether the capture listener's bind address can accept IPv6.
+    ///
+    /// `bpf_sk_assign` resolves the listener with a wildcard socket lookup in
+    /// the packet's own address family, and the kernel never returns an
+    /// `AF_INET` socket for an IPv6 lookup. So a listener bound `0.0.0.0` (the
+    /// default) is invisible to the classifier's IPv6 path, and an in-scope
+    /// IPv6 packet would be **dropped** fail-closed rather than delivered. A
+    /// `[::]` bind is dual-stack (`bindv6only=0`) and covers both families.
+    ///
+    /// The node-agent therefore publishes IPv6 redirect scope only when this is
+    /// set; otherwise enrolled pods' IPv6 traffic stays out of scope entirely
+    /// and falls through to the pre-existing direct-pod guard, exactly as it
+    /// did before the redirect existed.
+    pub ingress_capture_supports_ipv6: bool,
 }
 
 impl CaptureContract {
+    /// `true` when the inbound tc ingress redirect should be installed: it is
+    /// NodeWaypoint-only (local-pod mode has no capture listener to steer
+    /// into), needs at least one capture interface, a non-zero delivery mark,
+    /// and a non-zero capture listener port.
+    pub fn ingress_redirect_enabled(&self) -> bool {
+        self.proxy_mode == NodeAgentProxyMode::NodeWaypoint
+            && self.node_waypoint_ingress_redirect_mark != 0
+            && self.ingress_capture_port != 0
+            && !self.ingress_redirect_ifaces.is_empty()
+    }
+
+    /// Fail-closed validation of the ingress-redirect port contract, run at
+    /// node-agent startup before anything is attached.
+    ///
+    /// The node-agent and the mesh proxy are separate processes in the same
+    /// DaemonSet; they agree on the capture port only because both read
+    /// `FERRUM_MESH_INBOUND_LISTEN_ADDR`. This check makes a disagreement (or a
+    /// port collision that would make the datapath ambiguous) a startup error
+    /// rather than a silent black hole.
+    pub fn validate_ingress_redirect(&self) -> Result<(), String> {
+        if self.ingress_redirect_ifaces.is_empty() {
+            return Ok(());
+        }
+        if self.proxy_mode != NodeAgentProxyMode::NodeWaypoint {
+            return Err(format!(
+                "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES requires \
+                 FERRUM_NODE_AGENT_PROXY_MODE=node_waypoint (got {}); only NodeWaypoint runs the \
+                 transparent inbound capture listener the redirect steers into",
+                self.proxy_mode
+            ));
+        }
+        if self.ingress_capture_port == 0 {
+            return Err(
+                "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES requires a non-zero port in \
+                 FERRUM_MESH_INBOUND_LISTEN_ADDR: that is the transparent inbound capture \
+                 listener the redirect steers captured traffic into"
+                    .to_string(),
+            );
+        }
+        if self.ingress_capture_port == self.hbone_redirect_port {
+            return Err(format!(
+                "the NodeWaypoint inbound capture port ({}) must differ from the HBONE port \
+                 (FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT={}). HBONE terminates authenticated \
+                 HTTP/2 CONNECT over mesh mTLS; captured traffic is raw application bytes, so \
+                 steering it at the HBONE listener would fail the mesh TLS handshake",
+                self.ingress_capture_port, self.hbone_redirect_port
+            ));
+        }
+        if self.ingress_capture_port == self.outbound_capture_port {
+            return Err(format!(
+                "the NodeWaypoint inbound capture port ({}) must differ from the outbound \
+                 capture port ({})",
+                self.ingress_capture_port, self.outbound_capture_port
+            ));
+        }
+        Ok(())
+    }
+
     pub fn new(
         proxy_mode: NodeAgentProxyMode,
         outbound_capture_port: u16,
@@ -223,6 +337,10 @@ impl CaptureContract {
             bpf_maps: CaptureBpfMaps::default(),
             ipv6_outbound_deny: false,
             node_waypoint_inbound_auth_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
+            ingress_redirect_ifaces: Vec::new(),
+            node_waypoint_ingress_redirect_mark: 0,
+            ingress_capture_port: 0,
+            ingress_capture_supports_ipv6: false,
         })
     }
 
@@ -235,6 +353,10 @@ impl CaptureContract {
             bpf_maps: CaptureBpfMaps::default(),
             ipv6_outbound_deny: false,
             node_waypoint_inbound_auth_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
+            ingress_redirect_ifaces: Vec::new(),
+            node_waypoint_ingress_redirect_mark: 0,
+            ingress_capture_port: 0,
+            ingress_capture_supports_ipv6: false,
         }
     }
 
@@ -243,9 +365,27 @@ impl CaptureContract {
             NodeAgentProxyMode::LocalPod => 0,
             NodeAgentProxyMode::NodeWaypoint => self.node_waypoint_inbound_auth_mark,
         };
+        // The kernel-side redirect mark is published only when every
+        // precondition holds (NodeWaypoint, a capture interface to attach to,
+        // and a configured mark). Publishing it otherwise would arm a kernel
+        // datapath whose local-delivery routing was never installed.
+        //
+        // The capture PORT is published on the same all-or-nothing condition:
+        // a port without a mark (or vice versa) would leave the classifier
+        // half-configured, and `ingress_redirect_armed()` requires both.
+        let (ingress_redirect_mark, ingress_capture_port) = if self.ingress_redirect_enabled() {
+            (
+                self.node_waypoint_ingress_redirect_mark,
+                self.ingress_capture_port,
+            )
+        } else {
+            (0, 0)
+        };
         BpfCaptureConfig::new(self.outbound_capture_port, self.hbone_redirect_port)
             .with_ipv6_outbound_deny(self.ipv6_outbound_deny)
             .with_node_waypoint_inbound_auth_mark(inbound_auth_mark)
+            .with_node_waypoint_ingress_redirect_mark(ingress_redirect_mark)
+            .with_node_waypoint_ingress_capture_port(ingress_capture_port)
     }
 }
 
@@ -517,6 +657,25 @@ impl PodInfo {
             capture_flags,
         }
     }
+
+    /// Opt this pod into the NodeWaypoint inbound tc ingress redirect.
+    ///
+    /// Deliberately a separate, explicit step rather than a `for_capture`
+    /// parameter: the flag must be set only after the pod's declared inbound
+    /// ports have been written to the redirect scope maps, so an enrolled pod
+    /// is never advertised as redirect-eligible before it is reachable.
+    pub fn with_inbound_redirect(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.capture_flags |= POD_CAPTURE_FLAG_INBOUND_REDIRECT;
+        } else {
+            self.capture_flags &= !POD_CAPTURE_FLAG_INBOUND_REDIRECT;
+        }
+        self
+    }
+
+    pub fn inbound_redirect_enabled(&self) -> bool {
+        self.capture_flags & POD_CAPTURE_FLAG_INBOUND_REDIRECT != 0
+    }
 }
 
 /// State tracked per attached pod for graceful cleanup on removal.
@@ -567,6 +726,17 @@ pub struct PodAttachmentState {
     /// removal baseline because Kubernetes delete events do not carry a stable
     /// spec snapshot.
     pub node_probe_ports: Vec<u16>,
+    /// Declared inbound TCP application ports written to
+    /// `FERRUM_POD_INBOUND_PORTS*` for this pod, scoping the tc ingress
+    /// redirect. Like `node_probe_ports` this is the removal baseline: a
+    /// Kubernetes delete event carries no spec, so the ports the redirect was
+    /// scoped to must be remembered or teardown would leave the pod's addresses
+    /// permanently redirect-eligible.
+    ///
+    /// Empty means the redirect is not scoped for this pod, which — combined
+    /// with the per-pod [`POD_CAPTURE_FLAG_INBOUND_REDIRECT`] flag — is the
+    /// "never capture this pod" posture.
+    pub inbound_redirect_ports: Vec<u16>,
 }
 
 /// Fallback behavior when the kernel does not support eBPF capture.
@@ -644,6 +814,58 @@ pub trait EbpfBackend: Send + Sync {
     /// dropped by the source-bound guard) instead of silently black-holing it.
     fn has_node_source_ipv4(&self) -> bool;
     fn has_node_source_ipv6(&self) -> bool;
+    /// Attach the node-level tc **ingress** redirect classifier to one node
+    /// capture interface. Called once per configured interface at startup (not
+    /// per pod); the program is scoped per packet by the enrolled-pod maps.
+    ///
+    /// Attaching twice to the same interface is the caller's responsibility to
+    /// avoid — the node-agent attaches from a deduplicated interface list.
+    fn attach_ingress_redirect(&mut self, iface: &str) -> Result<(), String>;
+
+    /// Detach every node-level ingress redirect classifier this backend
+    /// attached. Used when the redirect is turned off on reload and by
+    /// shutdown cleanup, so a disabled redirect never leaves a live classifier
+    /// steering traffic at a listener that is going away.
+    ///
+    /// **Retry contract:** an attachment that did not provably come down must
+    /// stay recorded, so a later call (notably from `cleanup_all`) really is a
+    /// second attempt and [`Self::ingress_redirect_attached`] keeps reporting
+    /// it. Dropping a failed attachment would report success while the
+    /// classifier is still assigning sockets.
+    fn detach_ingress_redirect(&mut self) -> Result<(), String>;
+
+    /// Whether any node-level ingress redirect classifier is still recorded as
+    /// attached — i.e. a detach was never attempted, or was attempted and did
+    /// not succeed.
+    ///
+    /// The node-agent gates the local-delivery **routing** teardown on this.
+    /// A live classifier without its routing is the harmful half-state: the
+    /// classifier keeps assigning packets to the capture socket while the
+    /// `main` table forwards them to the pod, so they reach neither endpoint.
+    /// Inert leftover routing is the safe one, so routing is removed only once
+    /// this reports `false`.
+    fn ingress_redirect_attached(&self) -> bool;
+
+    /// Replace the declared inbound TCP application ports of an enrolled IPv4
+    /// pod. Without a matching `(address, port)` entry the tc ingress redirect
+    /// leaves the packet alone, so this is the per-port scope gate.
+    ///
+    /// Set-valued rather than per-port on purpose: the removal baseline is the
+    /// **pod address**, not a list the caller has to carry. A Kubernetes delete
+    /// event does not include a spec snapshot, so an enumerated removal list
+    /// would go stale exactly when it matters. Replacing wholesale also makes
+    /// a spec change (`containerPorts` edited on a live pod) converge without
+    /// leaving a widened stale port behind.
+    fn update_pod_inbound_ports(&mut self, ip: Ipv4Addr, ports: &[u16]) -> Result<(), String>;
+
+    /// Remove **every** inbound-redirect scope entry for a pod address.
+    /// Idempotent, and safe to call for a pod that was never scoped.
+    fn clear_pod_inbound_ports(&mut self, ip: Ipv4Addr) -> Result<(), String>;
+
+    fn update_pod_inbound_ports6(&mut self, ip: Ipv6Addr, ports: &[u16]) -> Result<(), String>;
+
+    fn clear_pod_inbound_ports6(&mut self, ip: Ipv6Addr) -> Result<(), String>;
+
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String>;
     fn remove_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String>;
     fn update_node_probe_port6(&mut self, ip: Ipv6Addr, port: u16) -> Result<(), String>;
@@ -745,6 +967,14 @@ pub struct MockEbpfBackend {
     pub node_ips6: HashSet<Ipv6Addr>,
     pub node_probe_ports: HashSet<(Ipv4Addr, u16)>,
     pub node_probe_ports6: HashSet<(Ipv6Addr, u16)>,
+    /// Declared inbound application ports written to the redirect scope maps.
+    pub pod_inbound_ports: HashSet<(Ipv4Addr, u16)>,
+    pub pod_inbound_ports6: HashSet<(Ipv6Addr, u16)>,
+    /// Node capture interfaces the ingress redirect classifier is attached to.
+    pub ingress_redirect_attachments: Vec<String>,
+    /// Number of times `detach_ingress_redirect` ran, so lifecycle tests can
+    /// prove a disable/teardown really removed the classifier.
+    pub ingress_redirect_detach_calls: usize,
     pub bypass_uids: Vec<u32>,
     pub cidr_excludes: Vec<String>,
     pub cidr_includes: Vec<String>,
@@ -802,6 +1032,47 @@ pub struct MockEbpfBackend {
     /// exists to recover from. Flip it back to `false` to model the transient
     /// condition clearing so a re-driven enrollment can succeed.
     pub fail_attach_tc: bool,
+    /// When `true`, `attach_ingress_redirect` fails, letting tests prove the
+    /// node-agent fails closed (capture unavailable) rather than reporting a
+    /// redirect that is not installed.
+    pub fail_attach_ingress_redirect: bool,
+    /// Number of upcoming `detach_ingress_redirect` calls that fail (each call
+    /// decrements). A failed detach RETAINS `ingress_redirect_attachments`,
+    /// mirroring the real backend's retry contract, so tests can prove that
+    /// (a) the routing teardown is withheld while a classifier may be live and
+    /// (b) `cleanup_all`'s retry is a real second attempt that releases the
+    /// routing once it succeeds.
+    pub fail_detach_ingress_redirect_times: usize,
+    /// When `true`, `update_pod_inbound_port` (and the v6 variant) fail, so
+    /// tests can prove a pod whose redirect scope could not be written is not
+    /// left flagged for redirect.
+    pub fail_update_pod_inbound_port: bool,
+    /// When `true`, `clear_pod_inbound_ports` / `clear_pod_inbound_ports6` fail
+    /// so removal tests can prove a successful pod-IP map delete that cannot
+    /// clear the bounded scope map stays pending and retryable.
+    pub fail_clear_pod_inbound_ports: bool,
+    /// When `true`, `validate_startup_ready` fails even though every earlier
+    /// step succeeded, so tests can drive the post-attach startup-validation
+    /// unwind (classifier detached, then Ferrum-owned routing removed).
+    pub fail_validate_startup_ready: bool,
+    /// Optional log shared with a test's own recorder, so ordering between mock
+    /// operations and side effects the mock does not own — notably the
+    /// node-agent's `ip rule`/`ip route` teardown — can be asserted from one
+    /// interleaved sequence. Mirrors [`Self::operations`] for the ingress
+    /// redirect attach/detach entries.
+    pub op_log: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+}
+
+impl MockEbpfBackend {
+    /// Record an operation on both the local log and the shared one (if any).
+    fn record_operation(&mut self, op: String) {
+        if let Some(log) = self.op_log.clone()
+            && let Ok(mut entries) = log.lock()
+        {
+            entries.push(op.clone());
+        }
+        self.operations.push(op);
+    }
 }
 
 impl EbpfBackend for MockEbpfBackend {
@@ -904,6 +1175,91 @@ impl EbpfBackend for MockEbpfBackend {
 
     fn has_node_source_ipv6(&self) -> bool {
         !self.node_ips6.is_empty()
+    }
+
+    fn attach_ingress_redirect(&mut self, iface: &str) -> Result<(), String> {
+        if self.fail_attach_ingress_redirect {
+            return Err(format!(
+                "injected ingress redirect attach failure for {iface}"
+            ));
+        }
+        self.record_operation(format!("attach_ingress_redirect:{iface}"));
+        self.ingress_redirect_attachments.push(iface.to_string());
+        Ok(())
+    }
+
+    fn detach_ingress_redirect(&mut self) -> Result<(), String> {
+        self.ingress_redirect_detach_calls += 1;
+        self.record_operation("detach_ingress_redirect".to_string());
+        if self.fail_detach_ingress_redirect_times > 0 {
+            // Model the real backend's retry contract: a failed detach RETAINS
+            // its attachments, so the next call is a genuine second attempt and
+            // `ingress_redirect_attached()` keeps reporting them.
+            self.fail_detach_ingress_redirect_times -= 1;
+            return Err(format!(
+                "injected ingress redirect detach failure for {:?}",
+                self.ingress_redirect_attachments
+            ));
+        }
+        self.ingress_redirect_attachments.clear();
+        Ok(())
+    }
+
+    fn ingress_redirect_attached(&self) -> bool {
+        !self.ingress_redirect_attachments.is_empty()
+    }
+
+    fn update_pod_inbound_ports(&mut self, ip: Ipv4Addr, ports: &[u16]) -> Result<(), String> {
+        if self.fail_update_pod_inbound_port {
+            return Err(format!(
+                "injected pod inbound redirect scope update failure for {ip} ({} ports)",
+                ports.len()
+            ));
+        }
+        // Replace, matching the real backend: a removed port must not survive.
+        self.pod_inbound_ports
+            .retain(|(entry_ip, _)| *entry_ip != ip);
+        for port in ports {
+            self.pod_inbound_ports.insert((ip, *port));
+        }
+        Ok(())
+    }
+
+    fn clear_pod_inbound_ports(&mut self, ip: Ipv4Addr) -> Result<(), String> {
+        if self.fail_clear_pod_inbound_ports {
+            return Err(format!(
+                "injected pod inbound redirect scope clear failure for {ip}"
+            ));
+        }
+        self.pod_inbound_ports
+            .retain(|(entry_ip, _)| *entry_ip != ip);
+        Ok(())
+    }
+
+    fn update_pod_inbound_ports6(&mut self, ip: Ipv6Addr, ports: &[u16]) -> Result<(), String> {
+        if self.fail_update_pod_inbound_port {
+            return Err(format!(
+                "injected pod IPv6 inbound redirect scope update failure for {ip} ({} ports)",
+                ports.len()
+            ));
+        }
+        self.pod_inbound_ports6
+            .retain(|(entry_ip, _)| *entry_ip != ip);
+        for port in ports {
+            self.pod_inbound_ports6.insert((ip, *port));
+        }
+        Ok(())
+    }
+
+    fn clear_pod_inbound_ports6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
+        if self.fail_clear_pod_inbound_ports {
+            return Err(format!(
+                "injected pod IPv6 inbound redirect scope clear failure for {ip}"
+            ));
+        }
+        self.pod_inbound_ports6
+            .retain(|(entry_ip, _)| *entry_ip != ip);
+        Ok(())
     }
 
     fn update_node_probe_port(&mut self, ip: Ipv4Addr, port: u16) -> Result<(), String> {
@@ -1016,6 +1372,16 @@ impl EbpfBackend for MockEbpfBackend {
 
     fn cleanup_all(&mut self) -> Result<(), String> {
         self.cleanup_all_calls = self.cleanup_all_calls.saturating_add(1);
+        // Mirror the real backend: cleanup RETRIES the ingress-redirect detach
+        // before wiping anything, and a still-failing detach leaves the
+        // attachment recorded. This is what makes the node-agent's
+        // "routing teardown only once no classifier may be live" ordering
+        // testable against the mock.
+        if !self.ingress_redirect_attachments.is_empty()
+            && let Err(e) = self.detach_ingress_redirect()
+        {
+            self.operations.push(format!("cleanup_detach_failed:{e}"));
+        }
         // Snapshot before the wipe so post-cleanup assertions stay meaningful.
         // Only the FIRST cleanup records: a second call would overwrite the
         // pre-rollback view with an already-empty one.
@@ -1070,6 +1436,9 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn validate_startup_ready(&self, require_sock_ops: bool) -> Result<(), String> {
+        if self.fail_validate_startup_ready {
+            return Err("injected startup validation failure".to_string());
+        }
         if !self.programs_loaded {
             return Err("BPF programs not loaded".to_string());
         }
@@ -1086,6 +1455,7 @@ impl EbpfBackend for MockEbpfBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_CAPTURE_PORT;
 
     #[test]
     fn fallback_mode_parse_valid() {
@@ -1145,6 +1515,75 @@ mod tests {
             BpfCaptureConfig::new(16001, 16008)
                 .with_node_waypoint_inbound_auth_mark(NODE_WAYPOINT_INBOUND_AUTH_MARK)
         );
+    }
+
+    #[test]
+    fn ingress_redirect_port_contract_fails_closed() {
+        let mut contract = CaptureContract::new(
+            NodeAgentProxyMode::NodeWaypoint,
+            OUTBOUND_CAPTURE_PORT,
+            INBOUND_HBONE_PORT,
+            "/tmp/ferrum.sock",
+        )
+        .unwrap();
+
+        // Redirect not requested: nothing to validate, and nothing published.
+        assert!(contract.validate_ingress_redirect().is_ok());
+        assert!(!contract.ingress_redirect_enabled());
+
+        contract.ingress_redirect_ifaces = vec!["eth0".to_string()];
+        contract.node_waypoint_ingress_redirect_mark = NODE_WAYPOINT_INGRESS_REDIRECT_MARK;
+
+        // Requested but with no capture listener port: the proxy would never
+        // bind a socket for the classifier to assign, so in-scope traffic would
+        // be dropped. Startup must refuse.
+        contract.ingress_capture_port = 0;
+        let error = contract.validate_ingress_redirect().unwrap_err();
+        assert!(
+            error.contains("FERRUM_MESH_INBOUND_LISTEN_ADDR"),
+            "the error must name the variable both processes read: {error}"
+        );
+        assert!(
+            !contract.ingress_redirect_enabled(),
+            "a missing capture port must leave the redirect disarmed"
+        );
+        assert_eq!(
+            contract
+                .bpf_capture_config()
+                .node_waypoint_ingress_redirect_mark,
+            0,
+            "a disarmed redirect must publish no mark to the kernel"
+        );
+
+        // The HBONE port is NOT a legal capture port — that collapse is the
+        // protocol-boundary bug this contract exists to prevent.
+        contract.ingress_capture_port = INBOUND_HBONE_PORT;
+        let error = contract.validate_ingress_redirect().unwrap_err();
+        assert!(error.contains("HBONE"), "{error}");
+
+        // Nor is the outbound capture port.
+        contract.ingress_capture_port = OUTBOUND_CAPTURE_PORT;
+        assert!(contract.validate_ingress_redirect().is_err());
+
+        // A distinct capture port is the supported configuration.
+        contract.ingress_capture_port = NODE_WAYPOINT_INGRESS_CAPTURE_PORT;
+        assert!(contract.validate_ingress_redirect().is_ok());
+        assert!(contract.ingress_redirect_enabled());
+        let published = contract.bpf_capture_config();
+        assert_eq!(
+            published.node_waypoint_ingress_capture_port,
+            NODE_WAYPOINT_INGRESS_CAPTURE_PORT as u32
+        );
+        assert_ne!(
+            published.node_waypoint_ingress_capture_port, published.hbone_redirect_port,
+            "the kernel must steer at the capture listener, never at HBONE"
+        );
+        assert!(published.ingress_redirect_armed());
+
+        // Local-pod mode has no capture listener at all.
+        contract.proxy_mode = NodeAgentProxyMode::LocalPod;
+        assert!(contract.validate_ingress_redirect().is_err());
+        assert!(!contract.ingress_redirect_enabled());
     }
 
     #[test]

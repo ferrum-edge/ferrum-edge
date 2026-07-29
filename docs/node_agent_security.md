@@ -38,6 +38,29 @@ mesh-mode topology see [`docs/mesh.md`](mesh.md).
     (`connect4`, `connect6`, `getpeername4`, `getpeername6` — `cgroup_sock_addr`).
   - The **host-side veth ingress/egress** of every enrolled pod
     (`ferrum_tc_inbound` — `sched_cls` classifier on tc ingress/egress).
+  - When `FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES` is set, one additional
+    `sched_cls` classifier (`ferrum_tc_ingress_redirect`) on the tc **ingress**
+    hook of each named node capture interface, plus a Ferrum-owned policy route
+    (`ip rule` priority 101 / table 33134, per family). It uses
+    `bpf_sk_assign()` to steer inbound TCP for enrolled workloads into the
+    proxy's transparent inbound **capture** listener — never the HBONE
+    listener, which terminates authenticated H2 CONNECT over mesh mTLS. It
+    rewrites no addresses and adds no capability beyond the `CAP_NET_ADMIN` the
+    existing tc attachments already require. Unset (the default) leaves it
+    uninstalled and the kernel program inert. Redirection is scoped per packet
+    to an enrolled, opted-in pod address on a declared inbound port (fragments
+    excluded), so it cannot capture unenrolled traffic; an in-scope packet with
+    no resolvable capture-listener socket is dropped rather than delivered.
+    Captured plaintext is then admitted only where the live PeerAuthentication
+    posture **of the exact destination workload** allows it — `STRICT` still
+    requires verified mesh transport — and only to a workload in this
+    NodeWaypoint's authorized capture destination inventory, on a port that
+    workload declares, after the L4 `mesh_authz` chain. That inventory (and the
+    PeerAuthentication candidates applicable to it) is resolved control-plane
+    side under the CP namespace scope and the bearer `ns` claim, so a
+    cross-namespace enrolled pod's own `STRICT` policy is enforced while an
+    unauthorized namespace contributes nothing; a missing inventory refuses the
+    connection rather than defaulting `PERMISSIVE`.
   - The **cgroup root** for global socket-ops telemetry
     (`ferrum_sock_ops` — `sock_ops`, attached once at startup).
 - Pins SOCK_OPS event and stats maps into `/sys/fs/bpf/ferrum/` so the
@@ -103,7 +126,7 @@ capability traces to a specific kernel API used by the code.
 | Capability | Required for | Kernel API | Code site |
 |---|---|---|---|
 | `CAP_BPF` | Loading BPF programs and creating BPF maps. Available on kernel **≥ 5.8** — split out of `CAP_SYS_ADMIN`. | `bpf(BPF_PROG_LOAD)`, `bpf(BPF_MAP_CREATE)`, `bpf(BPF_*_ELEM)` | `EbpfLoader::load()` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); map updates in [`src/ebpf/maps.rs`](../src/ebpf/maps.rs) |
-| `CAP_NET_ADMIN` | Attaching BPF programs to cgroups (`BPF_PROG_ATTACH` for `BPF_CGROUP_INET_*`/`BPF_CGROUP_SOCK_OPS` types); attaching tc classifiers; managing host veth qdiscs; iptables/ip6tables NAT rules on the fallback path. | `bpf(BPF_PROG_ATTACH)` for cgroup hooks; `tc` netlink (`RTM_NEWTFILTER`); `iptables-restore`/`ip6tables` syscalls. | `attach_cgroup`, `attach_tc`, `attach_sock_ops` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); `execute_iptables_commands` in [`src/modes/node_agent.rs`](../src/modes/node_agent.rs) |
+| `CAP_NET_ADMIN` | Attaching BPF programs to cgroups (`BPF_PROG_ATTACH` for `BPF_CGROUP_INET_*`/`BPF_CGROUP_SOCK_OPS` types); attaching tc classifiers (incl. the opt-in `ferrum_tc_ingress_redirect` on node capture interfaces); managing host veth qdiscs; the Ferrum-owned `ip rule`/`ip route` policy route for redirect local delivery; binding the single `IP_TRANSPARENT` inbound capture listener (no other listener is transparent); iptables/ip6tables NAT rules on the fallback path. | `bpf(BPF_PROG_ATTACH)` for cgroup hooks; `tc` netlink (`RTM_NEWTFILTER`); `iptables-restore`/`ip6tables` syscalls. | `attach_cgroup`, `attach_tc`, `attach_sock_ops` in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs); `execute_iptables_commands` in [`src/modes/node_agent.rs`](../src/modes/node_agent.rs) |
 | `CAP_PERFMON` | Reading BPF program / map info from the kernel (BTF, prog info, map info) on kernel **≥ 5.8**. Split out of `CAP_SYS_ADMIN`. | `bpf(BPF_OBJ_GET_INFO_BY_FD)`, `bpf(BPF_BTF_LOAD)` | `aya::Ebpf::load` BTF resolution; map iteration in [`src/ebpf/loader.rs`](../src/ebpf/loader.rs) |
 | `CAP_SYS_ADMIN` | Kernel-backcompat for BPF on kernel **< 5.8**. Also required in `node_waypoint` mode on every supported kernel because the agent enters pod network namespaces with `setns()` to resolve host-side veth peers before tc attachment. The chart drops `SYS_ADMIN` for `local_pod` mode on modern kernels but always adds it for `nodeAgent.proxyMode=node_waypoint`. | Older-kernel BPF operations; `setns(CLONE_NEWNET)` for pod-netns veth discovery. | Same as `CAP_BPF` / `CAP_PERFMON`; `discover_host_veth_for_pod` in [`src/ebpf/veth.rs`](../src/ebpf/veth.rs) |
 | `CAP_SYS_PTRACE` | NodeWaypoint ambient proxy only. With `hostPID: true`, Linux still applies `ptrace_may_access` checks to `/proc/{pid}/ns/net`; workloads running with different UIDs or dumpability can otherwise return `EACCES` before the proxy can enter the pod netns. This is not used for `PTRACE_ATTACH`. | `stat`/`open` of `/proc/{pid}/ns/net` for enrolled pod PIDs. | `netns_inode_for_cgroup` and `NetnsGuard::enter` in [`src/proxy/netns_capture.rs`](../src/proxy/netns_capture.rs) |

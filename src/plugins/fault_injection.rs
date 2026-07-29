@@ -2,7 +2,8 @@
 //!
 //! Injects controlled failures (delays and aborts) into request processing
 //! for chaos engineering workflows. Both fault types are probabilistic —
-//! each has a `percentage` field (0.0–100.0) checked per-request.
+//! each has a `percentage` field (0.0–100.0) checked per-request / per
+//! datagram / per stream admission.
 //!
 //! Runs in the `before_proxy` phase for HTTP-family requests so it fires after
 //! authentication, authorization, and consumer rate limiting but before backend
@@ -10,9 +11,21 @@
 //! until the resolved backend path has been authorized, so a delay or abort
 //! cannot precede the route-sensitive denial. Raw TCP proxies run the same fault
 //! decision in `on_stream_connect`; stream rejects close the connection and do
-//! not deliver HTTP status bodies to clients. UDP and DTLS are not supported
-//! because delaying their shared listener/session loops would head-of-line block
-//! unrelated datagrams.
+//! not deliver HTTP status bodies to clients.
+//!
+//! UDP and DTLS use the same configured percentages without per-datagram config
+//! scans. Session admission aborts run in the isolated per-source /
+//! per-DTLS-client setup task (`on_stream_connect`). Per-datagram delays and
+//! aborts run in `on_udp_datagram` on the established-session hook-ingress
+//! worker (and the first-datagram setup path), never inside the shared listener
+//! recv loop, so a delay for peer A cannot stall peer B. UDP/DTLS stream connect
+//! deliberately skips delay so the first-datagram path cannot stack two waits;
+//! TCP keeps delay+abort on connect. Within one session the worker preserves
+//! client→backend ordering: a delayed datagram parks that session's worker under
+//! the shared delayed-work budget while later datagrams remain in the bounded
+//! hook-ingress queue (or drop fail-closed when that queue is full). Abort is a
+//! silent datagram drop. Stream rejects still close / refuse the UDP/DTLS
+//! session.
 //!
 //! ## Config
 //!
@@ -54,13 +67,16 @@
 //!
 //! ## Delay retention bounds
 //!
-//! An injected delay deliberately parks a live request or connection, so it is
-//! bounded three ways by [`super::utils::fault_delay`]: the configuration
-//! ceiling ([`MAX_FAULT_DELAY_MS`]), a process-wide budget of concurrently
-//! delayed work (`FERRUM_MAX_CONCURRENT_FAULT_DELAYS`), and cancellation on
-//! peer departure or gateway shutdown drain. A delay that ends early records
-//! `fault_delay_outcome` in metadata; a delay cut short because the client
-//! transport is gone rejects with 499 instead of dialing a backend.
+//! An injected delay deliberately parks a live request, connection, or
+//! datagram, so it is bounded three ways by [`super::utils::fault_delay`]: the
+//! configuration ceiling ([`MAX_FAULT_DELAY_MS`]), a process-wide budget of
+//! concurrently delayed work (`FERRUM_MAX_CONCURRENT_FAULT_DELAYS`), and
+//! cancellation on peer departure or gateway shutdown drain. A delay that ends
+//! early records `fault_delay_outcome` in metadata; a delay cut short because
+//! the client transport is gone rejects with 499 instead of dialing a backend
+//! on HTTP paths. UDP/DTLS session teardown cancels an in-flight datagram delay
+//! by dropping the hook future (releasing the admission permit) without
+//! forwarding.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -68,7 +84,10 @@ use std::collections::HashMap;
 
 use super::utils::fault_delay::{FaultDelayOutcome, run_fault_delay};
 use super::utils::fault_roll::{FaultRoller, MAX_FAULT_DELAY_MS};
-use super::{Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext};
+use super::{
+    ALL_PROTOCOLS, Plugin, PluginResult, RequestContext, StreamConnectionContext,
+    UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
+};
 
 pub mod runtime_overlay;
 
@@ -139,13 +158,6 @@ pub(crate) async fn run_http_fault_delay(
         FaultDelayDisposition::Proceed
     }
 }
-
-const NON_UDP_PROTOCOLS: &[ProxyProtocol] = &[
-    ProxyProtocol::Http,
-    ProxyProtocol::Grpc,
-    ProxyProtocol::WebSocket,
-    ProxyProtocol::Tcp,
-];
 
 struct AbortFault {
     status_code: u16,
@@ -362,6 +374,19 @@ impl FaultInjectionPlugin {
             headers: HashMap::new(),
         }
     }
+
+    /// Record fault metadata onto the UDP/DTLS session summary when a sink is
+    /// available. Missing sinks (unit tests without a session map) are no-ops.
+    fn record_udp_metadata(&self, ctx: &UdpDatagramContext<'_>, entries: &[(&str, &str)]) {
+        let Some(sink) = ctx.metadata_sink else {
+            return;
+        };
+        sink.update(|map| {
+            for (key, value) in entries {
+                map.insert((*key).to_string(), (*value).to_string());
+            }
+        });
+    }
 }
 
 /// Private source marker written by a route-local fault. A normal
@@ -388,7 +413,11 @@ impl Plugin for FaultInjectionPlugin {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        NON_UDP_PROTOCOLS
+        ALL_PROTOCOLS
+    }
+
+    fn requires_udp_datagram_hooks(&self) -> bool {
+        true
     }
 
     fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
@@ -455,6 +484,16 @@ impl Plugin for FaultInjectionPlugin {
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
         let (delay_triggered, abort_triggered) = self.decide_faults();
 
+        // UDP/DTLS application latency is owned by `on_udp_datagram` so the
+        // first-datagram setup path (datagram hook, then stream connect) cannot
+        // stack two delays for one packet. Session abort still refuses admission
+        // here, matching TCP stream rejects. TCP keeps delay+abort on connect.
+        let udp_family = matches!(
+            ctx.backend_scheme,
+            crate::config::types::BackendScheme::Udp | crate::config::types::BackendScheme::Dtls
+        );
+        let delay_triggered = delay_triggered && !udp_family;
+
         if !delay_triggered && !abort_triggered {
             return PluginResult::Continue;
         }
@@ -462,12 +501,13 @@ impl Plugin for FaultInjectionPlugin {
         ctx.insert_metadata("fault_injected".to_string(), "true".to_string());
 
         if delay_triggered && let Some(d) = self.delay.as_ref() {
-            // No per-context peer watch here: the stream proxy owns the
-            // accepted socket and races this whole hook against a
-            // read-half-preserving socket-error watch
-            // (`tcp_proxy::wait_for_tcp_peer_reset`), which cancels this future
-            // and drops the admission permit. What the plugin still owns is the
-            // shutdown token and the process-wide delayed-work budget.
+            // No per-context peer watch here: TCP races this whole hook against
+            // a read-half-preserving socket-error watch
+            // (`tcp_proxy::wait_for_tcp_peer_reset`); UDP/DTLS session setup
+            // already runs in an isolated per-source / per-client task that is
+            // cancelled when the pending gate / DTLS accept handler exits. What
+            // the plugin still owns is the shutdown token and the process-wide
+            // delayed-work budget.
             let outcome = run_fault_delay(d.duration_ms, None).await;
             ctx.insert_metadata("fault_delay_ms".to_string(), d.duration_ms.to_string());
             if !outcome.completed() {
@@ -492,5 +532,63 @@ impl Plugin for FaultInjectionPlugin {
         ctx.insert_metadata("fault_type".to_string(), "delay".to_string());
 
         PluginResult::Continue
+    }
+
+    async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
+        // Mirror HTTP/TCP request-path semantics: only client→backend datagrams
+        // are faulted. Backend replies continue so a delayed request can still
+        // observe a response after the delay elapses.
+        if ctx.direction != UdpDatagramDirection::ClientToBackend {
+            return UdpDatagramVerdict::Forward;
+        }
+
+        let (delay_triggered, abort_triggered) = self.decide_faults();
+        if !delay_triggered && !abort_triggered {
+            return UdpDatagramVerdict::Forward;
+        }
+
+        self.record_udp_metadata(ctx, &[("fault_injected", "true")]);
+
+        if delay_triggered && let Some(d) = self.delay.as_ref() {
+            // Runs on the per-session hook-ingress worker (or the isolated
+            // first-datagram setup task), never the shared recv loop. Session
+            // teardown selects against this future and drops it, releasing the
+            // admission permit without forwarding.
+            let outcome = run_fault_delay(d.duration_ms, None).await;
+            let delay_ms = d.duration_ms.to_string();
+            if outcome.completed() {
+                self.record_udp_metadata(ctx, &[("fault_delay_ms", delay_ms.as_str())]);
+            } else {
+                self.record_udp_metadata(
+                    ctx,
+                    &[
+                        ("fault_delay_ms", delay_ms.as_str()),
+                        (FAULT_DELAY_OUTCOME_METADATA_KEY, outcome.metadata_label()),
+                    ],
+                );
+            }
+            // Shutdown / admission-skip continue like HTTP/TCP (delay skipped).
+            // Peer/session teardown cancels by dropping this future before Forward.
+        }
+
+        if abort_triggered && let Some(a) = self.abort.as_ref() {
+            let fault_type = if delay_triggered {
+                "delay_and_abort"
+            } else {
+                "abort"
+            };
+            let status = a.status_code.to_string();
+            self.record_udp_metadata(
+                ctx,
+                &[
+                    ("fault_type", fault_type),
+                    ("fault_abort_status", status.as_str()),
+                ],
+            );
+            return UdpDatagramVerdict::Drop;
+        }
+
+        self.record_udp_metadata(ctx, &[("fault_type", "delay")]);
+        UdpDatagramVerdict::Forward
     }
 }

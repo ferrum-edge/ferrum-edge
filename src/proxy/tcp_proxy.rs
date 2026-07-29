@@ -1328,7 +1328,10 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
 
     // Create the first listener up front; additional listeners bind below via
     // SO_REUSEPORT so the kernel can distribute stream accepts across workers.
-    let first_listener = crate::proxy::create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
+    // Stream listeners are never the NodeWaypoint inbound relay, so they never
+    // bind transparent — only the mesh inbound listener opts in (issue #3287).
+    let first_listener =
+        crate::proxy::create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)?;
 
     // Convert to Arc<str> so per-connection clones are a cheap pointer bump.
     let proxy_id: Arc<str> = Arc::from(proxy_id);
@@ -1393,7 +1396,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     listeners.push(first_listener);
     for _ in 1..actual_accept_threads {
         listeners.push(crate::proxy::create_proxy_socket(
-            addr, backlog, tfo_queue, reuse_port,
+            addr, backlog, tfo_queue, reuse_port, false,
         )?);
     }
 

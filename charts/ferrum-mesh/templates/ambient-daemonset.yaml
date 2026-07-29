@@ -184,6 +184,21 @@ spec:
             - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
               value: {{ .Values.nodeAgent.podRegistryDir | quote }}
             {{- end }}
+            {{- /* The tc ingress redirect preserves the packet's original
+                   destination instead of NAT-ing it, so the proxy answers it on
+                   a dedicated TRANSPARENT INBOUND CAPTURE listener (bound on
+                   FERRUM_MESH_INBOUND_LISTEN_ADDR) — deliberately NOT the HBONE
+                   listener, which terminates authenticated H2 CONNECT over mesh
+                   mTLS and cannot consume raw application bytes. The proxy
+                   emits that listener only when it sees the SAME operator
+                   variable the node-agent does (no IPC), so the chart must
+                   render it into both pods — otherwise the redirect delivers
+                   SYNs nothing is listening for. Mirrors the registry-dir
+                   pattern: an explicit ambient.env entry wins. */ -}}
+            {{- if and $nodeWaypointRegistryEnabled .Values.nodeAgent.ingressRedirectIfaces (not (hasKey $ambientEnv "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES")) }}
+            - name: FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES
+              value: {{ .Values.nodeAgent.ingressRedirectIfaces | quote }}
+            {{- end }}
             {{- if $ambientSpireEnabled }}
             {{- if $ambientSpireUsesNodeName }}
             - name: FERRUM_K8S_NODE_NAME
