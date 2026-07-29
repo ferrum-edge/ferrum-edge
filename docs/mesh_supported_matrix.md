@@ -84,9 +84,30 @@ CI today."
   (PeerAuthentication DISABLE, or no usable server identity) is refused in
   production, and a configured-but-unloadable SVID verifier (TLS without
   trust-domain verification) is fatal regardless of mode.
-- **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), `Ambient` HBONE, `EastWestGateway`
-  SNI passthrough, HTTP-family `EgressGateway`, `ServiceWaypoint` (GAMMA),
-  trust-bundle federation.
+- **GA track — cross-cluster east-west federation.** `EastWestGateway` SNI
+  passthrough + SPIRE trust-bundle federation are enrolled vertically as well
+  (issue #2459): `mesh.multicluster.spire_trust_federation`,
+  `mesh.multicluster.eastwest_authenticated_datapath`,
+  `mesh.multicluster.untrusted_peer_rejected`,
+  `mesh.multicluster.trust_revocation_recovery`, and
+  `mesh.multicluster.endpoint_failure_recovery` in
+  `tests/conformance/ga_contract.yaml`, with semantics pinned by the
+  `mesh_multicluster_federation` conformance module (fail-closed federated-bundle
+  requirement, federated trust-domain uniqueness, `local_cluster` /
+  `RemoteCluster` canonical-identity rejection, peer-trust withdrawal, and the
+  east-west gateway host/port floor) plus the `mesh_topology_matrix`
+  `EastWestGateway topology` row. The live half is the `multicluster-federation`
+  suite on the `kind-spire-multicluster-federation` profile: two SPIRE-federated
+  kind clusters proving bidirectional authenticated east-west traffic,
+  untrusted-peer rejection, trust revocation → fail-closed → restore → recover,
+  and destination black-hole → recover, gated on all thirteen required
+  `multicluster.*` assertions by the fixture, by the workflow `gate` job's
+  emitted-artifact validation, and by `release.yml` SHA validation. **Excluded
+  and still Experimental:** poller-driven cross-cluster *endpoint discovery*
+  (see below); the poller partition / last-good-retention live gate stays
+  deferred under [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331).
+- **Beta.** xDS ADS (Ferrum-CP↔Ferrum-DP), `Ambient` HBONE, HTTP-family
+  `EgressGateway`, `ServiceWaypoint` (GAMMA).
 - **Experimental.** `NodeWaypoint` sidecarless capture (IPv4 and IPv6 capture
   paths gated by a privileged live job; secured node-to-node transport,
   production SPIRE, stale source-IP reuse, and inbound direct-pod enforcement
