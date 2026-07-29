@@ -965,6 +965,7 @@ jobs:
               functional_opa_key_auth_redaction_test
               functional_plugin_extended_test
               functional_plugin_test
+              functional_mcp_gateway_batch_test
               functional_compression_bodyless_test
               functional_example_plugin_test
               functional_plugins_network_test

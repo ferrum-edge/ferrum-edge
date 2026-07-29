@@ -2218,6 +2218,17 @@ pub struct RequestContext {
     /// under the public name only when the final wire name exactly matches
     /// this trusted upstream alias.
     pub(crate) mcp_trusted_tool_name_rewrite: Option<(String, String)>,
+    /// Set while `mcp_gateway` dispatches a member of an aggregate JSON-RPC
+    /// batch. Routed handlers then validate policy without dialing upstream or
+    /// returning `Continue`, because executing a batch member from
+    /// `before_proxy` would bypass every later configured plugin phase.
+    ///
+    /// This is a network-dispatch boundary, so it is deliberately **not** in
+    /// `metadata`: that map is public plugin scratch space that inbound
+    /// request data and sibling plugins can write. Keeping it private means no
+    /// forged `mcp.*` key can either force or clear the guard, and it never
+    /// reaches transaction metadata.
+    pub(crate) mcp_batch_forbids_upstream: bool,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -2627,6 +2638,7 @@ impl RequestContext {
             a2a_gateway_streaming: false,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
+            mcp_batch_forbids_upstream: false,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_instance_scores: HashMap::new(),
@@ -3472,6 +3484,7 @@ impl RequestContext {
             a2a_gateway_streaming: self.a2a_gateway_streaming,
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
+            mcp_batch_forbids_upstream: self.mcp_batch_forbids_upstream,
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_instance_scores: self.waf_instance_scores.clone(),

@@ -22764,7 +22764,7 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, tool argument JSON Schema validation, and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
       required: [mode, endpoint, servers]
       properties:
         enabled:
@@ -22786,7 +22786,7 @@ components:
               items:
                 type: string
               default: ["2025-11-25"]
-              description: Supported MCP protocol versions, in preference order. The first entry is the gateway's preferred version, returned by aggregate-mode initialize when the client requests an unsupported version.
+              description: Supported MCP protocol versions, in preference order. The first entry is the gateway's preferred version, returned by aggregate-mode initialize when the client requests an unsupported version. Includes 2025-03-26 when JSON-RPC batches are desired; batches are admitted under validation.max_batch_* limits.
         discovery:
           type: object
           properties:
@@ -22953,6 +22953,30 @@ components:
               minimum: 1
               default: 8388608
               description: "Maximum total serialized bytes accumulated across paginated catalog list pages before the aggregation is rejected. Must be greater than 0."
+            max_batch_items:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 32
+              description: "Maximum JSON-RPC batch array members admitted before session, catalog, or upstream work. Empty batches are rejected separately as Invalid Request. Must be greater than 0."
+            max_batch_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 1048576
+              description: "Maximum aggregate request-body bytes admitted for a JSON-RPC batch. Enforced on the raw request body before any JSON parsing, using the first non-whitespace byte to detect array-shaped input. Must be greater than 0 and at least max_batch_item_bytes."
+            max_batch_item_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 262144
+              description: "Maximum raw wire bytes admitted for one JSON-RPC batch member. Measured on the member's exact raw JSON slice as received (internal whitespace and escape sequences included, array separators and surrounding inter-member whitespace excluded), before the member is deserialized, so a member cannot shrink under the cap by normalizing. Oversized members yield a bounded per-item Invalid Request with id null (their id is never materialized or reflected) while siblings continue. Must be greater than 0 and must not exceed max_batch_bytes."
+            max_batch_response_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 1048576
+              description: "Maximum serialized bytes admitted for an assembled JSON-RPC batch response array (including array framing). Oversized aggregates fail closed without returning a partial body. Must be greater than 0."
         observability:
           type: object
           properties:
