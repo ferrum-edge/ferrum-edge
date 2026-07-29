@@ -56,6 +56,9 @@ For production with authentication, always use `?authSource=admin` (or your auth
 | `FERRUM_MONGO_AUTH_MECHANISM` | (auto) | Auth override: `SCRAM-SHA-256`, `MONGODB-X509`, etc. |
 | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | (unset) | Explicit server selection timeout. Unset preserves URI/`serverSelectionTimeoutMS` (or driver default); when set, overrides the URI |
 | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | (unset) | Explicit TCP connect timeout. Unset preserves URI/`connectTimeoutMS` (or driver default); when set, overrides the URI |
+| `FERRUM_MONGO_CHANGE_STREAM_ENABLED` | `false` | Database mode, replica sets only. Wake the config poll loop from a `config_changes` change stream instead of waiting for the next interval. See [Change-Stream Reloads](#change-stream-triggered-reloads) |
+| `FERRUM_MONGO_CHANGE_STREAM_DEBOUNCE_MS` | `250` | Burst-coalescing window before a stream-triggered reload; also caps the wake rate at one poll per window. Clamped to 10–60000 |
+| `FERRUM_MONGO_CHANGE_STREAM_MAX_BACKOFF_SECONDS` | `30` | Watcher reconnect backoff ceiling. Starts at 1s, doubles, ±25% jitter. Clamped to 1–3600 |
 
 ### MongoDB Driver Runtime Options
 
@@ -126,6 +129,90 @@ runtime load path, so concurrent writes can require a later poll to converge.
 `FERRUM_DB_READ_REPLICA_URL` is SQL-only. MongoDB replica sets are still useful
 for primary failover, transactions, and majority write concern; they are not a
 Ferrum config-polling read-offload mechanism.
+
+## Change-Stream-Triggered Reloads
+
+Database mode normally learns about committed config changes on the next
+`FERRUM_DB_POLL_INTERVAL` tick (default 30s). On a replica set you can opt into
+a change-stream watcher that wakes that same poll loop as soon as a change
+commits:
+
+```bash
+FERRUM_MONGO_REPLICA_SET=rs0
+FERRUM_MONGO_CHANGE_STREAM_ENABLED=true
+# Optional tuning
+FERRUM_MONGO_CHANGE_STREAM_DEBOUNCE_MS=250
+FERRUM_MONGO_CHANGE_STREAM_MAX_BACKOFF_SECONDS=30
+```
+
+### What it is (and is not)
+
+The watcher is a **coalesced wake-up signal only**. It watches the durable
+`config_changes` collection — not the resource collections — and it never reads
+a resource document, decodes a change payload, advances the accepted sequence
+cursor, or publishes a runtime config generation. Each wake-up runs exactly the
+authoritative cursor-based incremental/full reload path that a periodic tick
+would have run, with the same validation, the same last-good retention on
+rejection, and the same unchanged cursor on rejection.
+
+That design makes the failure modes uninteresting by construction:
+
+| Situation | Result |
+|---|---|
+| Duplicate or out-of-order notifications | Harmless — the sequence cursor decides what is applied |
+| A malformed or unexpected event | Harmless — the payload is never read; only "something changed" is used |
+| A missed event (watcher down, history lost, defect) | Repaired by the next periodic poll; nothing is skipped |
+| Burst of mutations | Coalesced into one reload per `FERRUM_MONGO_CHANGE_STREAM_DEBOUNCE_MS` window |
+| Reload rejected by validation | Identical to polling: last known-good config keeps serving, cursor unchanged, backoff applies |
+| Standalone MongoDB, or failover onto a non-replica-set topology | Watcher is not started (or marks itself `unsupported_topology`); periodic polling continues unchanged |
+
+Namespace isolation is enforced server-side: the change stream matches only
+`config_changes` inserts whose `namespace` equals `FERRUM_NAMESPACE`, so a
+co-tenant namespace's mutations neither wake nor are visible to this gateway.
+Retention-compaction deletes are excluded, so pruning cannot manufacture reload
+work.
+
+### Reconnect, invalidation, and shutdown
+
+A resume point is retained **in memory only** — never persisted, never logged.
+On primary election, connection loss, or any stream error the watcher marks
+itself degraded, raises one wake-up so the authoritative poll closes whatever
+gap may exist, and reconnects with exponential backoff from 1s to
+`FERRUM_MONGO_CHANGE_STREAM_MAX_BACKOFF_SECONDS` with ±25% jitter. Backoff
+escalates across open-then-immediate-error/end cycles; it resets to the initial
+delay only after a watch session has delivered at least one usable event, not
+merely because `watch()` opened successfully. If the resume point falls out of
+the oplog (`ChangeStreamHistoryLost`) or the collection is
+dropped/renamed (invalidation), the token is dropped and the watch reopens from
+now; the sequence cursor is what actually repairs the gap. Shutdown joins the
+watcher task with the other background tasks.
+
+Required MongoDB privileges: `changeStream` and `find` on the configured
+database (both are included in `read`).
+
+### Observability
+
+Authenticated `GET /health` reports the watcher under
+`database_polling.change_stream`, and `GET /admin/metrics` under
+`database_polling.change_stream`. A disconnected watcher is a **reload-latency**
+signal and does not force `status: degraded`, because polling still applies
+committed changes.
+
+`GET /metrics` exposes fixed-cardinality families (the only deployment label is
+the configured gateway namespace; no resource IDs or URLs appear as labels):
+
+- `ferrum_database_change_stream_connected`
+- `ferrum_database_change_stream_degraded_reason{reason="none|connect_failed|stream_error|history_lost|invalidated|unauthorized|unsupported_topology|stopped"}`
+- `ferrum_database_change_stream_events_total`
+- `ferrum_database_change_stream_reconnects_total`
+- `ferrum_database_change_stream_invalidations_total`
+- `ferrum_database_change_stream_history_losses_total`
+
+Counters refresh on watcher state transitions and on every completed poll, so
+they can lag a scrape by at most one poll interval.
+
+Scope: database mode only. Control-plane (`cp`) mode continues to use periodic
+polling for its distribution loop.
 
 ## Failover
 
@@ -211,7 +298,7 @@ FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key
 | Single-document CRUD | Atomic | Atomic |
 | Multi-document operations (e.g., delete proxy + plugins) | Hand-managed proxy deletes use fail-safe sequential ordering; direct API-spec-owned proxy deletes are **rejected with `501` before mutation** | Transactional (ACID) via `ClientSession::start_transaction` |
 | `POST /batch` (all-or-nothing config graph) | **Rejected with `501` before any mutation** | Supported — the whole graph commits in one transaction |
-| Change streams (future) | Not available | Available |
+| Change-stream-triggered config reloads | Not available (periodic polling only) | Available, opt-in via `FERRUM_MONGO_CHANGE_STREAM_ENABLED` |
 | Read preference routing | Not available | Available |
 | Automatic failover | Not available | Automatic |
 
@@ -360,7 +447,9 @@ FERRUM_DB_TLS_CA_CERT_PATH=/certs/rds-combined-ca-bundle.pem
 - Download the [Amazon RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html) for TLS verification
 - When using `FERRUM_DB_TLS_MODE` and `FERRUM_DB_TLS_CA_CERT_PATH`, leave URI TLS options such as `tls=true` out of `FERRUM_DB_URL` so Ferrum builds the MongoDB driver's TLS options from the env settings.
   If you configure TLS in the URI instead, include `tlsCAFile` in the URI and omit the env CA path.
-- Change streams require enabling them on the cluster parameter group
+- Change streams require enabling them on the cluster parameter group before
+  `FERRUM_MONGO_CHANGE_STREAM_ENABLED=true` can connect. Until then the watcher
+  reports `degraded_reason` and periodic polling stays authoritative
 - **Migration lease uses the client clock on DocumentDB.** On real MongoDB the
   migration lease evaluates expiry and stamps timestamps from MongoDB *server*
   time (an aggregation-pipeline `$$NOW` update), so replica clock skew can never

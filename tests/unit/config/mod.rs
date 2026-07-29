@@ -7,6 +7,7 @@ mod backend_egress_policy_tests;
 mod batch_atomicity_tests;
 mod conf_file_tests;
 mod config_backup_tests;
+mod config_change_watch_tests;
 mod config_file_loader_tests;
 mod config_migration_tests;
 mod config_types_tests;

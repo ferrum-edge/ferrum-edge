@@ -11664,6 +11664,70 @@ components:
             attempt, including empty-success, rejection, and handled-error
             outcomes. Panic/abort/cancellation do not advance it. Absent until the
             first poll tick finishes.
+        change_stream:
+          $ref: "#/components/schemas/ConfigChangeWatcherStatus"
+
+    ConfigChangeWatcherStatus:
+      type: object
+      description: |
+        Backend-native config-change watcher state (database mode, MongoDB
+        replica sets, `FERRUM_MONGO_CHANGE_STREAM_ENABLED=true`). Absent unless
+        a watcher was started for this process.
+
+        The watcher is a **coalesced wake-up signal only**: it carries no
+        config, never advances the accepted durable sequence cursor, and never
+        publishes a runtime config generation. Every notification runs the same
+        authoritative cursor-based incremental/full reload a periodic poll tick
+        would have run, so duplicate, out-of-order, and missed notifications are
+        harmless. `connected: false` is therefore a reload-latency signal, not a
+        config-outage signal, and never forces `status: degraded` — periodic
+        polling continues to apply committed changes.
+
+        Every field is a counter, flag, or fixed enum label. Resource IDs,
+        namespaces, connection strings, resume tokens, and backend error bodies
+        are never exposed here.
+      required:
+        - enabled
+        - connected
+        - degraded_reason
+        - events_total
+        - reconnects_total
+        - invalidations_total
+        - history_losses_total
+        - resume_token_retained
+      properties:
+        enabled:
+          type: boolean
+          description: A watcher task was started for this process.
+        connected:
+          type: boolean
+          description: A watch is currently open and delivering wake-ups.
+        degraded_reason:
+          type: string
+          enum: [none, connect_failed, stream_error, history_lost, invalidated, unauthorized, unsupported_topology, stopped]
+        events_total:
+          type: integer
+          format: int64
+        reconnects_total:
+          type: integer
+          format: int64
+        invalidations_total:
+          type: integer
+          format: int64
+        history_losses_total:
+          type: integer
+          format: int64
+        resume_token_retained:
+          type: boolean
+          description: |
+            Whether a resume point is currently retained in memory. Resume
+            tokens are never persisted and never logged.
+        last_event_at:
+          type: string
+          format: date-time
+          description: |
+            RFC3339 timestamp of the most recent observed change notification.
+            Absent until the first one arrives.
 
     DatabaseDeltaPollingMetrics:
       type: object
@@ -11722,6 +11786,8 @@ components:
           anyOf:
             - $ref: "#/components/schemas/DatabaseDeltaPollingDegraded"
             - type: "null"
+        change_stream:
+          $ref: "#/components/schemas/ConfigChangeWatcherStatus"
 
     # ── Admin metrics ───────────────────────────────────────────────
     AdminMetrics:

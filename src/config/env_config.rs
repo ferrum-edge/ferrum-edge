@@ -1214,6 +1214,19 @@ pub struct EnvConfig {
     pub mongo_replica_set: Option<String>,
     /// MongoDB auth mechanism override (e.g. "SCRAM-SHA-256", "MONGODB-X509").
     pub mongo_auth_mechanism: Option<String>,
+    /// Enable the MongoDB change-stream watcher on the durable `config_changes`
+    /// collection in database mode (issue #3330). Opt-in, and additionally
+    /// gated on a replica-set-capable topology. The watcher is a coalesced
+    /// wake-up signal only: the durable sequence cursor, incremental/full
+    /// reload, validation, and the periodic poll interval stay authoritative.
+    pub mongo_change_stream_enabled: bool,
+    /// Burst-coalescing window, in milliseconds, applied before a change-
+    /// stream-triggered reload. Also bounds the maximum wake rate to one
+    /// authoritative poll per window.
+    pub mongo_change_stream_debounce_ms: u64,
+    /// Reconnect backoff ceiling, in seconds, for the MongoDB change-stream
+    /// watcher. Backoff starts at 1s and doubles with +/-25% jitter.
+    pub mongo_change_stream_max_backoff_seconds: u64,
     /// Explicit MongoDB server selection timeout in seconds.
     ///
     /// `None` (unset) preserves `serverSelectionTimeoutMS` from `FERRUM_DB_URL`
@@ -2548,6 +2561,9 @@ impl Default for EnvConfig {
             mongo_app_name: None,
             mongo_replica_set: None,
             mongo_auth_mechanism: None,
+            mongo_change_stream_enabled: false,
+            mongo_change_stream_debounce_ms: 250,
+            mongo_change_stream_max_backoff_seconds: 30,
             mongo_server_selection_timeout_seconds: None,
             mongo_connect_timeout_seconds: None,
             cp_grpc_listen_addr: None,
@@ -2929,6 +2945,9 @@ impl EnvConfig {
             mongo_app_name: Option<String> = "FERRUM_MONGO_APP_NAME";
             mongo_replica_set: Option<String> = "FERRUM_MONGO_REPLICA_SET";
             mongo_auth_mechanism: Option<String> = "FERRUM_MONGO_AUTH_MECHANISM";
+            mongo_change_stream_enabled: bool = "FERRUM_MONGO_CHANGE_STREAM_ENABLED" => false;
+            mongo_change_stream_debounce_ms: u64 = "FERRUM_MONGO_CHANGE_STREAM_DEBOUNCE_MS" => 250u64, clamp(10u64, 60_000u64);
+            mongo_change_stream_max_backoff_seconds: u64 = "FERRUM_MONGO_CHANGE_STREAM_MAX_BACKOFF_SECONDS" => 30u64, clamp(1u64, 3600u64);
             mongo_server_selection_timeout_seconds: Option<u64> = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS";
             mongo_connect_timeout_seconds: Option<u64> = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS";
         }
@@ -3664,6 +3683,9 @@ impl EnvConfig {
             mongo_app_name,
             mongo_replica_set,
             mongo_auth_mechanism,
+            mongo_change_stream_enabled,
+            mongo_change_stream_debounce_ms,
+            mongo_change_stream_max_backoff_seconds,
             mongo_server_selection_timeout_seconds,
             mongo_connect_timeout_seconds,
             cp_grpc_listen_addr,

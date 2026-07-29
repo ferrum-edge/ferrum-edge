@@ -7,6 +7,8 @@
 //! - `db_loader` — Database config loader with incremental polling
 //! - `file_loader` — YAML/JSON file loader with version migration
 //! - `config_backup` — On-disk JSON backup for DB-unreachable startup failover
+//! - `config_change_watch` — Coalesced wake-up signal for backend-native
+//!   config-change watchers (MongoDB replica-set change streams)
 //! - `config_migration` — Config format version migrations (chain-of-responsibility)
 //! - `migrations` — SQL schema migrations for database mode
 //! - `pool_config` — Connection pool configuration (global defaults + per-proxy overrides)
@@ -18,6 +20,10 @@
 pub mod batch_atomicity;
 pub mod conf_file;
 pub mod config_backup;
+// Wake-up plumbing for backend-native config-change watchers. Some accessors
+// are consumed only through external tests, which the bin target cannot see.
+#[allow(dead_code)]
+pub mod config_change_watch;
 pub mod config_migration;
 pub mod db_backend;
 pub mod db_loader;

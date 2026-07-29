@@ -29,6 +29,10 @@ use crate::admin::jwt_auth::create_jwt_manager_from_env;
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::config_backup::load_config_backup;
+use crate::config::config_change_watch::{
+    ConfigChangeWakeSignal, ConfigChangeWakeWatcherParams, ConfigChangeWatchSettings,
+    ConfigChangeWatcherHealth, ConfigChangeWatcherStatus, wait_for_config_poll_wake,
+};
 use crate::config::db_backend::{self, DatabaseBackend};
 use crate::config::db_loader::{DatabaseStore, DbPoolConfig};
 use crate::config::types::GatewayConfig;
@@ -105,6 +109,12 @@ pub struct DatabaseDeltaPollMetricsSnapshot {
     #[serde(skip)]
     pub last_poll_completed_at_unix_ms: u64,
     pub degraded: Option<DatabaseDeltaPollDegraded>,
+    /// Backend-native config-change watcher state (issue #3330). `None` unless
+    /// a watcher was started for this process. Present only as a reload-latency
+    /// signal: the durable sequence cursor and this poll loop stay
+    /// authoritative whatever the watcher reports.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_stream: Option<ConfigChangeWatcherStatus>,
 }
 
 /// Bounded observability for database incremental-delta rejections.
@@ -135,6 +145,10 @@ pub struct DatabaseDeltaPollMetrics {
     /// Unix millis of last completed poll outcome; `0` means never completed.
     last_poll_completed_at_unix_ms: AtomicU64,
     degraded: ArcSwap<Option<DatabaseDeltaPollDegraded>>,
+    /// Shared with the optional backend config-change watcher task. Stays
+    /// "not enabled" (and absent from every output surface) unless a watcher
+    /// actually starts.
+    change_stream: Arc<ConfigChangeWatcherHealth>,
 }
 
 impl Default for DatabaseDeltaPollMetrics {
@@ -155,6 +169,7 @@ impl Default for DatabaseDeltaPollMetrics {
             last_resource_category: AtomicU8::new(DatabaseDeltaResourceCategory::None as u8),
             last_poll_completed_at_unix_ms: AtomicU64::new(0),
             degraded: ArcSwap::from_pointee(None),
+            change_stream: Arc::new(ConfigChangeWatcherHealth::new()),
         }
     }
 }
@@ -295,7 +310,13 @@ impl DatabaseDeltaPollMetrics {
             last_poll_completed_at,
             last_poll_completed_at_unix_ms: last_poll_ms,
             degraded: self.degraded(),
+            change_stream: self.change_stream.snapshot(),
         }
+    }
+
+    /// Handle shared with an optional backend config-change watcher task.
+    pub fn change_stream_health(&self) -> Arc<ConfigChangeWatcherHealth> {
+        self.change_stream.clone()
     }
 
     fn counter_for_category(&self, category: DatabaseDeltaResourceCategory) -> &AtomicU64 {
@@ -2012,6 +2033,50 @@ pub async fn run(
     // respawn generations force an authoritative full reload (issue #2986).
     let poll_generation = Arc::new(AtomicU64::new(0));
 
+    // Optional backend-native config-change watcher (issue #3330). Today only
+    // replica-set MongoDB implements it, and only as a coalesced wake-up: the
+    // signal carries no config, never advances the accepted sequence cursor,
+    // and never publishes a generation. `poll_interval` above stays armed as
+    // the correctness backstop, so a watcher that is absent, degraded, or
+    // silently dropping events degrades to plain periodic polling.
+    let change_stream_settings = ConfigChangeWatchSettings::from_env(&env_config);
+    let config_change_wake = Arc::new(ConfigChangeWakeSignal::new());
+    let mut change_stream_redact_urls = vec![effective_url.clone()];
+    change_stream_redact_urls.extend(failover_urls.iter().cloned());
+    let config_change_watcher =
+        db.spawn_config_change_wake_watcher(ConfigChangeWakeWatcherParams {
+            namespace: env_config.namespace.clone(),
+            signal: config_change_wake.clone(),
+            health: database_delta_poll_metrics.change_stream_health(),
+            settings: change_stream_settings,
+            shutdown: shutdown_tx.subscribe(),
+            redact_urls: change_stream_redact_urls,
+        });
+    // `Some` only when the backend accepted the watch. The poll loop keeps its
+    // periodic tick either way and simply gains a wake-up source.
+    let poll_wake_signal = config_change_watcher
+        .as_ref()
+        .map(|_| config_change_wake.clone());
+    match config_change_watcher {
+        Some(handle) => {
+            info!(
+                "Backend change-stream config reloads enabled (coalesced wake-up only; the \
+                 durable sequence cursor and the {}s poll interval remain authoritative)",
+                env_config.db_poll_interval
+            );
+            background_handles.push(handle);
+        }
+        None if change_stream_settings.enabled => {
+            info!(
+                "Change-stream config reloads requested but not active for this backend/topology; \
+                 continuing with {}s periodic polling only",
+                env_config.db_poll_interval
+            );
+        }
+        None => {}
+    }
+    let change_stream_debounce = change_stream_settings.debounce;
+
     let db_poll_supervisor = tokio::spawn(async move {
         let spawn_poll = {
             let db_poll = db_poll.clone();
@@ -2029,6 +2094,7 @@ pub async fn run(
             let replica_hostname = replica_hostname.clone();
             let poll_generation = poll_generation.clone();
             let poll_shutdown_tx = poll_shutdown_tx.clone();
+            let poll_wake_signal = poll_wake_signal.clone();
             move || {
                 let db_poll = db_poll.clone();
                 let proxy_state_poll = proxy_state_poll.clone();
@@ -2044,6 +2110,7 @@ pub async fn run(
                 let poll_namespace = poll_namespace.clone();
                 let db_hostname = db_hostname.clone();
                 let replica_hostname = replica_hostname.clone();
+                let poll_wake_signal = poll_wake_signal.clone();
                 let generation = poll_generation.fetch_add(1, Ordering::AcqRel);
                 let mut poll_shutdown = poll_shutdown_tx.subscribe();
                 tokio::spawn(async move {
@@ -2057,6 +2124,10 @@ pub async fn run(
                     let last_replica_ips: crate::modes::AdminReadReplicaDnsWatermark =
                         Arc::new(tokio::sync::Mutex::new(None));
                     let mut force_full_reload = false;
+                    // Active rejected-delta retry deadline. A change-stream
+                    // wake-up must never run before it, or a stream of
+                    // committed-but-invalid changes could defeat the backoff.
+                    let mut earliest_wake: Option<tokio::time::Instant> = None;
                     let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
                     let mut rejected_delta_tracker = RejectedDeltaTracker::new(
                         rejected_delta_initial_backoff,
@@ -2075,7 +2146,16 @@ pub async fn run(
 
                     loop {
                         tokio::select! {
-                                _ = interval.tick() => {
+                                // Periodic backstop tick, or a coalesced
+                                // backend wake-up. Both run identical
+                                // authoritative cursor work below — the wake-up
+                                // only decides *when*, never *what*.
+                                _ = wait_for_config_poll_wake(
+                                    &mut interval,
+                                    poll_wake_signal.as_ref(),
+                                    change_stream_debounce,
+                                    earliest_wake,
+                                ) => {
                         // Replica reconnect/DNS-watermark maintenance must run even when
                         // the plugin-migration gate later blocks publication.
                         if let Some(ref replica_url) = replica_url_for_reconnect {
@@ -2374,7 +2454,14 @@ pub async fn run(
                                             }
 
                                             if !recovered_by_full_reload {
-                                                interval.reset_after(decision.backoff);
+                                                let backoff = decision.backoff;
+                                                interval.reset_after(backoff);
+                                                // Gate stream wake-ups on the
+                                                // same backoff as the tick.
+                                                earliest_wake =
+                                                    Some(tokio::time::Instant::now() + backoff);
+                                            } else {
+                                                earliest_wake = None;
                                             }
                                         }
                                     }

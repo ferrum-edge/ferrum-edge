@@ -1845,6 +1845,11 @@ pub async fn handle_admin_request(
             && let Some(snapshot) = crate::plugins::prometheus_metrics::global_registry()
                 .database_delta_poll_metrics_snapshot()
         {
+            // Backend config-change watcher (issue #3330). Reported as a
+            // reload-latency signal only: a disconnected or degraded watcher
+            // never forces `status: degraded`, because periodic polling remains
+            // authoritative and keeps applying committed changes.
+            let change_stream = snapshot.change_stream.clone();
             if let Some(degraded) = snapshot.degraded {
                 health_status["status"] = json!("degraded");
                 let mut polling = json!({
@@ -1872,6 +1877,12 @@ pub async fn handle_admin_request(
                     polling["last_poll_completed_at"] = json!(at);
                 }
                 health_status["database_polling"] = polling;
+            }
+            if let Some(change_stream) = change_stream
+                && let Ok(value) = serde_json::to_value(&change_stream)
+                && let Some(polling) = health_status.get_mut("database_polling")
+            {
+                polling["change_stream"] = value;
             }
         }
 

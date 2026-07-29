@@ -721,5 +721,8 @@ fn sample_database_polling() -> DatabaseDeltaPollMetricsSnapshot {
         last_poll_completed_at: Some("2026-03-29T14:23:07.482Z".to_string()),
         last_poll_completed_at_unix_ms: 1_711_720_987_482,
         degraded: None,
+        // Absent unless a backend config-change watcher is running; the
+        // fixture keeps the common SQL-backend shape.
+        change_stream: None,
     }
 }

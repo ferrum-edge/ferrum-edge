@@ -45,6 +45,12 @@ mod inner {
         AtomicBatchAbort, AtomicBatchCounts, AtomicBatchFault, AtomicBatchGraph, AtomicBatchPhase,
         AtomicBatchUnsupported, BatchAdmissionLeaseLost,
     };
+    use crate::config::config_change_watch::{
+        ConfigChangeWakeWatcherParams, ConfigChangeWatchDegradedReason,
+        ConfigChangeWatcherStopGuard, classify_mongo_change_stream_failure,
+        config_change_watch_backoff_after_session, next_config_change_watch_backoff_secs,
+        truncate_watch_error,
+    };
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
         DeleteAllResourcesError, DeleteMode, FullConfigLoadPurpose, IncrementalResult,
@@ -74,6 +80,8 @@ mod inner {
     use mongodb::bson::{
         Binary, Bson, DateTime as BsonDateTime, Document, doc, spec::BinarySubtype,
     };
+    use mongodb::change_stream::ChangeStream;
+    use mongodb::change_stream::event::{ChangeStreamEvent, OperationType, ResumeToken};
     use mongodb::options::{
         ClientOptions, FindOptions, ReadConcern, ReadPreference, ReturnDocument, SelectionCriteria,
         Tls, TlsOptions, WriteConcern,
@@ -108,6 +116,9 @@ mod inner {
     const MONGO_ERR_INDEX_OPTIONS_CONFLICT: i32 = 85;
     const MONGO_ERR_INDEX_KEY_SPECS_CONFLICT: i32 = 86;
     const MONGO_ERR_DUPLICATE_KEY: i32 = 11_000;
+    /// `maxAwaitTimeMS` for the config-change stream's `getMore`. Bounds how
+    /// long one server-side await blocks; it does not delay event delivery.
+    const CONFIG_CHANGE_STREAM_MAX_AWAIT: Duration = Duration::from_secs(10);
     const CHANGE_LOG_BATCH_LIMIT: i64 = 10_000;
     const CHANGE_LOG_RETAIN_PER_NAMESPACE: u64 = 100_000;
     const MONGO_MIGRATION_LOCK_ID: &str = "global";
@@ -2752,6 +2763,248 @@ mod inner {
 
         fn config_change_counters(&self) -> MongoCollectionHandle {
             self.collection("config_change_counters")
+        }
+
+        /// Open a namespace-scoped change stream over `config_changes`.
+        ///
+        /// The server-side `$match` keeps two disjoint classes of event:
+        /// committed change-log inserts **for this gateway's namespace only**
+        /// (namespace isolation — a co-tenant namespace's mutations can neither
+        /// wake this gateway nor be observed by it), and collection-lifecycle
+        /// events, which must never be filtered out or the watcher would block
+        /// forever on an invalidated stream. Compaction deletes are excluded so
+        /// retention pruning cannot manufacture reload work.
+        async fn open_config_changes_change_stream(
+            &self,
+            collection: &MongoCollectionHandle,
+            namespace: &str,
+            resume_after: Option<ResumeToken>,
+        ) -> mongodb::error::Result<ChangeStream<ChangeStreamEvent<Document>>> {
+            let pipeline = vec![doc! {
+                "$match": {
+                    "$or": [
+                        {
+                            "operationType": "insert",
+                            "fullDocument.namespace": namespace,
+                        },
+                        {
+                            "operationType": {
+                                "$in": ["invalidate", "drop", "dropDatabase", "rename"],
+                            },
+                        },
+                    ],
+                },
+            }];
+            let mut watch = collection
+                .watch()
+                .pipeline(pipeline)
+                .max_await_time(CONFIG_CHANGE_STREAM_MAX_AWAIT);
+            if let Some(token) = resume_after {
+                // `start_after` (not `resume_after`) so a stream that was
+                // invalidated and re-opened still resumes correctly.
+                watch = watch.start_after(token);
+            }
+            watch.await
+        }
+
+        /// Long-lived wake-up watcher for the durable `config_changes`
+        /// collection (issue #3330).
+        ///
+        /// This task is **only** a latency optimization. It never reads
+        /// resource documents, never decodes change payloads, never advances
+        /// the accepted sequence cursor, and never publishes runtime config.
+        /// Every signal it raises makes the database-mode poll loop run the
+        /// same authoritative cursor-based incremental/full reload a periodic
+        /// tick would have run, so duplicate, out-of-order, malformed, and
+        /// missed events are all harmless, and a validation-rejected reload
+        /// still keeps the last known-good config plus the unchanged cursor.
+        ///
+        /// Failure handling is fail-closed toward periodic polling: any open or
+        /// stream error marks the watcher degraded, raises one wake-up so the
+        /// authoritative poll repairs whatever the gap may have contained, and
+        /// reconnects with jittered exponential backoff bounded by
+        /// `settings.max_backoff`.
+        async fn run_config_change_watch_loop(self, params: ConfigChangeWakeWatcherParams) {
+            let ConfigChangeWakeWatcherParams {
+                namespace,
+                signal,
+                health,
+                settings,
+                mut shutdown,
+                redact_urls,
+            } = params;
+            health.mark_enabled();
+            // Flips the watcher to `stopped` on every exit path, including a
+            // panic or a shutdown abort, so health can never keep advertising a
+            // connected watcher that is gone.
+            let _stop_guard = ConfigChangeWatcherStopGuard::new(health.clone());
+            let redact_refs: Vec<&str> = redact_urls.iter().map(String::as_str).collect();
+            let initial_backoff_secs = settings.initial_backoff.as_secs().max(1);
+            let max_backoff_secs = settings.max_backoff.as_secs().max(1);
+            let mut backoff_secs: u64 = 0;
+            // Resume points live in memory only: they are never persisted and
+            // never logged. Two consecutive failed re-opens with a retained
+            // token drop it, so a token the server rejects for a reason we do
+            // not classify can never wedge the watcher.
+            let mut resume_token: Option<ResumeToken> = None;
+            let mut failed_opens_with_token: u32 = 0;
+
+            loop {
+                if *shutdown.borrow() {
+                    break;
+                }
+                if backoff_secs > 0 {
+                    let delay = crate::util::backoff::jittered_backoff(backoff_secs);
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = shutdown.changed() => break,
+                    }
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                }
+
+                // Re-check on every attempt: a failover reconnect can land on a
+                // topology that cannot serve change streams.
+                if !self.replica_set_configured() {
+                    health.mark_degraded(ConfigChangeWatchDegradedReason::UnsupportedTopology);
+                    backoff_secs = next_config_change_watch_backoff_secs(
+                        backoff_secs,
+                        initial_backoff_secs,
+                        max_backoff_secs,
+                    );
+                    continue;
+                }
+
+                let collection = self.config_changes();
+                let resume = resume_token.clone();
+                // Race the open against shutdown: `watch()` is a network round
+                // trip (and can wait on server selection) that would otherwise
+                // ignore the watch channel until the driver call returns.
+                let opened = tokio::select! {
+                    _ = shutdown.changed() => break,
+                    opened = self
+                        .open_config_changes_change_stream(&collection, &namespace, resume) => opened,
+                };
+                let mut stream = match opened {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        let reason = match classify_change_stream_error(&e) {
+                            // An unclassified failure while *opening* is a
+                            // connect problem, not a mid-stream fault.
+                            ConfigChangeWatchDegradedReason::StreamError => {
+                                ConfigChangeWatchDegradedReason::ConnectFailed
+                            }
+                            other => other,
+                        };
+                        if matches!(reason, ConfigChangeWatchDegradedReason::HistoryLost) {
+                            resume_token = None;
+                            health.set_resume_token_retained(false);
+                            failed_opens_with_token = 0;
+                        } else if resume_token.is_some() {
+                            failed_opens_with_token = failed_opens_with_token.saturating_add(1);
+                            if failed_opens_with_token >= 2 {
+                                resume_token = None;
+                                health.set_resume_token_retained(false);
+                                failed_opens_with_token = 0;
+                            }
+                        }
+                        health.mark_degraded(reason);
+                        warn!(
+                            reason = reason.as_str(),
+                            "MongoDB config-change watcher could not open a change stream; \
+                             periodic polling remains authoritative: {}",
+                            redacted_watch_error(&e, &redact_refs)
+                        );
+                        // Whatever we could not observe is still in
+                        // `config_changes`; let the cursor poll pick it up now.
+                        signal.signal();
+                        backoff_secs = next_config_change_watch_backoff_secs(
+                            backoff_secs,
+                            initial_backoff_secs,
+                            max_backoff_secs,
+                        );
+                        continue;
+                    }
+                };
+
+                health.mark_connected();
+                failed_opens_with_token = 0;
+                // Do not clear reconnect backoff here: a server that accepts the
+                // watch and then immediately ends/errors must keep escalating.
+                // Only a usable (non-lifecycle) delivered event resets the
+                // failure sequence — see `config_change_watch_backoff_after_session`.
+                debug!(
+                    "MongoDB config-change watcher connected; wake-ups are advisory and the \
+                     durable sequence cursor stays authoritative"
+                );
+                // A newly (re)opened stream may have missed commits while it was
+                // down. One wake-up makes the authoritative poll close the gap.
+                signal.signal();
+
+                let mut delivered_usable_event = false;
+                let degraded_reason = loop {
+                    let next_event = tokio::select! {
+                        _ = shutdown.changed() => return,
+                        next_event = futures_util::StreamExt::next(&mut stream) => next_event,
+                    };
+                    match next_event {
+                        Some(Ok(event)) => {
+                            if let Some(token) = stream.resume_token() {
+                                resume_token = Some(token);
+                                health.set_resume_token_retained(true);
+                            }
+                            match event.operation_type {
+                                OperationType::Invalidate
+                                | OperationType::Drop
+                                | OperationType::DropDatabase
+                                | OperationType::Rename => {
+                                    // The watched collection is gone or renamed.
+                                    // Drop the resume point and re-open from
+                                    // now; the cursor poll (and its full-reload
+                                    // fallback) is what actually repairs state.
+                                    resume_token = None;
+                                    health.set_resume_token_retained(false);
+                                    break ConfigChangeWatchDegradedReason::Invalidated;
+                                }
+                                _ => {
+                                    health.record_event();
+                                    signal.signal();
+                                    delivered_usable_event = true;
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            let reason = classify_change_stream_error(&e);
+                            if matches!(reason, ConfigChangeWatchDegradedReason::HistoryLost) {
+                                resume_token = None;
+                                health.set_resume_token_retained(false);
+                            }
+                            warn!(
+                                reason = reason.as_str(),
+                                "MongoDB config-change stream failed; periodic polling remains \
+                                 authoritative and the watcher will reconnect: {}",
+                                redacted_watch_error(&e, &redact_refs)
+                            );
+                            break reason;
+                        }
+                        None => break ConfigChangeWatchDegradedReason::StreamError,
+                    }
+                };
+
+                health.mark_degraded(degraded_reason);
+                // Same gap argument as above: reconnecting is best-effort, the
+                // authoritative poll is not.
+                signal.signal();
+                backoff_secs = config_change_watch_backoff_after_session(
+                    backoff_secs,
+                    initial_backoff_secs,
+                    max_backoff_secs,
+                    delivered_usable_event,
+                );
+            }
+
+            debug!("MongoDB config-change watcher stopped");
         }
 
         fn config_admission_locks(&self) -> MongoCollectionHandle {
@@ -5540,6 +5793,31 @@ mod inner {
         }
     }
 
+    /// URL-redact and length-bound a driver error before it reaches a log line.
+    fn redacted_watch_error(error: &mongodb::error::Error, urls: &[&str]) -> String {
+        truncate_watch_error(&crate::config::db_backend::redact_error_text(error, urls))
+    }
+
+    /// Map a driver error onto the bounded watcher degraded-reason label.
+    ///
+    /// Only the server command code and the authentication-failure shape are
+    /// consulted; the error body itself never becomes a label, so `/health` and
+    /// `/metrics` cardinality stays fixed and no backend message can leak into
+    /// a metric dimension.
+    fn classify_change_stream_error(
+        error: &mongodb::error::Error,
+    ) -> ConfigChangeWatchDegradedReason {
+        let command_code = match error.kind.as_ref() {
+            mongodb::error::ErrorKind::Command(command_error) => Some(command_error.code),
+            _ => None,
+        };
+        let authentication_failure = matches!(
+            error.kind.as_ref(),
+            mongodb::error::ErrorKind::Authentication { .. }
+        );
+        classify_mongo_change_stream_failure(command_code, authentication_failure)
+    }
+
     #[async_trait]
     impl DatabaseBackend for MongoStore {
         async fn health_check(&self) -> Result<(), anyhow::Error> {
@@ -5560,6 +5838,29 @@ mod inner {
         fn has_read_replica(&self) -> bool {
             // MongoDB driver handles read preference internally via connection string
             false
+        }
+
+        /// Replica-set-gated `config_changes` change-stream watcher (issue
+        /// #3330). Returns `None` for standalone topologies, which keeps their
+        /// behavior byte-for-byte identical to periodic polling.
+        fn spawn_config_change_wake_watcher(
+            &self,
+            params: ConfigChangeWakeWatcherParams,
+        ) -> Option<tokio::task::JoinHandle<()>> {
+            if !params.settings.enabled {
+                return None;
+            }
+            if !self.replica_set_configured() {
+                info!(
+                    "MongoDB change-stream config reloads requested but the connected topology is \
+                     not replica-set capable; keeping periodic polling only"
+                );
+                return None;
+            }
+            let store = self.clone();
+            Some(tokio::spawn(async move {
+                store.run_config_change_watch_loop(params).await
+            }))
         }
 
         fn failover_topology_status(&self) -> crate::config::db_backend::DbFailoverTopologyStatus {

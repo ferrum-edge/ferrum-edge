@@ -1572,6 +1572,27 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         None
     }
 
+    /// Optionally start a backend-native config-change **wake-up** watcher
+    /// (issue #3330).
+    ///
+    /// Returning `Some(handle)` means the backend will raise coalesced
+    /// wake-ups on `params.signal` when a durable config change commits. The
+    /// signal carries no config data and must never advance the accepted
+    /// sequence cursor: every wake-up runs the same authoritative cursor-based
+    /// poll a periodic tick would have run, and the periodic interval stays
+    /// armed as the correctness backstop.
+    ///
+    /// The default is `None` — no watcher, unchanged periodic polling. A
+    /// backend must also return `None` when its connected topology cannot
+    /// support the watch (e.g. standalone MongoDB).
+    fn spawn_config_change_wake_watcher(
+        &self,
+        params: crate::config::config_change_watch::ConfigChangeWakeWatcherParams,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let _ = params;
+        None
+    }
+
     // -----------------------------------------------------------------------
     // Settings (mutable — called once at startup before sharing via Arc)
     // -----------------------------------------------------------------------

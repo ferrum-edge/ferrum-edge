@@ -312,6 +312,9 @@ These settings only apply when `FERRUM_DB_TYPE=mongodb`. `FERRUM_DB_POOL_*` sett
 | `FERRUM_MONGO_AUTH_MECHANISM` | No | (auto) | Auth mechanism override: `SCRAM-SHA-256`, `MONGODB-X509`, etc. |
 | `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | No | — | Explicit server selection timeout. When unset, preserves `serverSelectionTimeoutMS` from `FERRUM_DB_URL` (or the driver default). When set, overrides the URI value |
 | `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | No | — | Explicit TCP connect timeout. When unset, preserves `connectTimeoutMS` from `FERRUM_DB_URL` (or the driver default). When set, overrides the URI value |
+| `FERRUM_MONGO_CHANGE_STREAM_ENABLED` | No | `false` | Database mode only. Watch the durable `config_changes` collection with a MongoDB change stream and wake the existing poll loop as soon as a change commits. Additionally gated on a replica-set-capable topology (ignored on standalone). Wake-up only: the durable sequence cursor, incremental/full reload, validation, and the `FERRUM_DB_POLL_INTERVAL` backstop stay authoritative |
+| `FERRUM_MONGO_CHANGE_STREAM_DEBOUNCE_MS` | No | `250` | Burst-coalescing window before a change-stream-triggered reload. Also caps the wake rate at one authoritative poll per window. Clamped to 10–60000 |
+| `FERRUM_MONGO_CHANGE_STREAM_MAX_BACKOFF_SECONDS` | No | `30` | Reconnect backoff ceiling for the change-stream watcher. Backoff starts at 1s and doubles with ±25% jitter. Clamped to 1–3600 |
 
 See [mongodb.md](mongodb.md) for the full deployment guide including read preference, replica sets, Atlas, and Kubernetes examples.
 

@@ -1749,7 +1749,8 @@ impl MetricsRegistry {
             + self.tls_source_fetch_failure_counter.len() * 220
             + self.tls_cert_rotation_counter.len() * 220
             + if self.database_delta_poll_metrics.load().is_some() {
-                1700
+                // Includes the optional config-change watcher families.
+                3200
             } else {
                 0
             }
@@ -2555,6 +2556,88 @@ impl MetricsRegistry {
                 last_poll_secs,
                 &ns_label,
             );
+
+            // Backend config-change watcher (issue #3330). Fixed cardinality:
+            // one series per family plus one `reason` label from the bounded
+            // degraded-reason enum. The only deployment label is the existing
+            // stable gateway namespace; there are no resource IDs or URLs.
+            if let Some(change_stream) = snapshot.change_stream {
+                output.push_str(
+                    "# HELP ferrum_database_change_stream_connected Whether the backend config-change watcher currently has an open stream (1) or is degraded (0). Periodic polling stays authoritative either way.\n",
+                );
+                output.push_str("# TYPE ferrum_database_change_stream_connected gauge\n");
+                render_process_counter(
+                    &mut output,
+                    "ferrum_database_change_stream_connected",
+                    u64::from(change_stream.connected),
+                    &ns_label,
+                );
+
+                output.push_str(
+                    "# HELP ferrum_database_change_stream_degraded_reason Current bounded degraded reason for the backend config-change watcher. Exactly one reason is 1.\n",
+                );
+                output.push_str("# TYPE ferrum_database_change_stream_degraded_reason gauge\n");
+                for reason in
+                    crate::config::config_change_watch::CONFIG_CHANGE_WATCH_DEGRADED_REASON_LABELS
+                {
+                    let value = if reason == change_stream.degraded_reason {
+                        1
+                    } else {
+                        0
+                    };
+                    output.push_str(&format!(
+                        "ferrum_database_change_stream_degraded_reason{{reason=\"{}\"{}}} {}\n",
+                        reason, ns_label, value
+                    ));
+                }
+
+                output.push_str(
+                    "# HELP ferrum_database_change_stream_events_total Config-change notifications observed by the backend watcher. Each one only triggers the authoritative cursor poll; it never advances the accepted sequence.\n",
+                );
+                output.push_str("# TYPE ferrum_database_change_stream_events_total counter\n");
+                render_process_counter(
+                    &mut output,
+                    "ferrum_database_change_stream_events_total",
+                    change_stream.events_total,
+                    &ns_label,
+                );
+
+                output.push_str(
+                    "# HELP ferrum_database_change_stream_reconnects_total Times the backend config-change watcher (re)established a stream.\n",
+                );
+                output.push_str("# TYPE ferrum_database_change_stream_reconnects_total counter\n");
+                render_process_counter(
+                    &mut output,
+                    "ferrum_database_change_stream_reconnects_total",
+                    change_stream.reconnects_total,
+                    &ns_label,
+                );
+
+                output.push_str(
+                    "# HELP ferrum_database_change_stream_invalidations_total Backend config-change watch invalidations (watched collection dropped, renamed, or database dropped).\n",
+                );
+                output
+                    .push_str("# TYPE ferrum_database_change_stream_invalidations_total counter\n");
+                render_process_counter(
+                    &mut output,
+                    "ferrum_database_change_stream_invalidations_total",
+                    change_stream.invalidations_total,
+                    &ns_label,
+                );
+
+                output.push_str(
+                    "# HELP ferrum_database_change_stream_history_losses_total Times the retained watch resume point fell out of the backend's history and was dropped.\n",
+                );
+                output.push_str(
+                    "# TYPE ferrum_database_change_stream_history_losses_total counter\n",
+                );
+                render_process_counter(
+                    &mut output,
+                    "ferrum_database_change_stream_history_losses_total",
+                    change_stream.history_losses_total,
+                    &ns_label,
+                );
+            }
         }
 
         if let Some(snapshot) = self.configsync_divergence_metrics_snapshot() {

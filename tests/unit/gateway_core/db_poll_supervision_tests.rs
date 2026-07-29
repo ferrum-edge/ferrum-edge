@@ -450,13 +450,14 @@ async fn dropping_in_flight_poll_attempt_future_does_not_advance_freshness() {
     );
 }
 
-/// Extract the poll-tick arm body between `interval.tick()` and the shutdown arm.
-fn poll_tick_body<'a>(source: &'a str, shutdown_marker: &str) -> &'a str {
-    let tick = source
-        .find("_ = interval.tick() => {")
-        .expect("poll tick arm");
-    let shutdown = source[tick..].find(shutdown_marker).expect("shutdown arm") + tick;
-    &source[tick..shutdown]
+/// Extract the authoritative poll-attempt arm between its wake boundary and
+/// the shutdown arm. Database mode may wake from either the periodic backstop
+/// or the coalesced MongoDB change-stream signal; control-plane mode uses the
+/// periodic tick directly.
+fn poll_attempt_body<'a>(source: &'a str, wake_marker: &str, shutdown_marker: &str) -> &'a str {
+    let wake = source.find(wake_marker).expect("poll wake arm");
+    let shutdown = source[wake..].find(shutdown_marker).expect("shutdown arm") + wake;
+    &source[wake..shutdown]
 }
 
 fn assert_every_continue_records_completion(tick_body: &str, label: &str) {
@@ -512,7 +513,11 @@ fn database_poll_tick_records_on_every_normal_exit_without_async_wrapper() {
         "Drop-based poll completion must not return (panic/abort false positives)"
     );
 
-    let tick = poll_tick_body(source, "_ = poll_shutdown.changed() => {");
+    let tick = poll_attempt_body(
+        source,
+        "_ = wait_for_config_poll_wake(",
+        "_ = poll_shutdown.changed() => {",
+    );
     assert!(
         !tick.contains("async {"),
         "database poll tick must not introduce a nested async block around the body"
@@ -542,7 +547,11 @@ fn control_plane_poll_tick_records_on_every_normal_exit_without_async_wrapper() 
         "control-plane mode must not wrap the poll tick in an async completion helper"
     );
 
-    let tick = poll_tick_body(source, "_ = cp_poll_shutdown.changed() => {");
+    let tick = poll_attempt_body(
+        source,
+        "_ = interval.tick() => {",
+        "_ = cp_poll_shutdown.changed() => {",
+    );
     assert!(
         !tick.contains("async {"),
         "control-plane poll tick must not introduce a nested async block around the body"
