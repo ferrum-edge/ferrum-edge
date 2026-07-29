@@ -142,10 +142,38 @@ impl DpCpConnectionState {
 /// (`FERRUM_CP_DP_GRPC_JWT_ISSUER`) since the secret and issuer always travel
 /// together: every token minted with this secret needs to bear the configured
 /// issuer or the CP will reject it.
-#[derive(Clone, Debug)]
+///
+/// Since advisory GHSA-3f2j-wwqw-grmg it carries the full client-side
+/// credential, not just a secret: a `kid` selecting which of the control
+/// plane's namespace-bound verification credentials must verify the minted
+/// token, and optionally a path to an *externally issued* token this node
+/// presents instead of minting one at all. The latter is the preferred
+/// posture — with a token file the node holds no signing key, so it cannot
+/// mint an authorization for any namespace, its own included.
+#[derive(Clone)]
 pub struct GrpcJwtSecret {
     secret: String,
     issuer: String,
+    /// JWS `kid` header stamped on self-minted tokens
+    /// (`FERRUM_CP_DP_GRPC_JWT_KEY_ID`).
+    key_id: Option<String>,
+    /// Path to an externally issued bearer token
+    /// (`FERRUM_DP_CP_GRPC_TOKEN_FILE`).
+    token_file: Option<String>,
+}
+
+impl std::fmt::Debug for GrpcJwtSecret {
+    /// The secret is credential material and is never rendered — not in a
+    /// panic message, not under `{:#?}`, not through a struct that derives
+    /// `Debug` and happens to contain one. `kid` and issuer are
+    /// operator-authored non-secret identifiers.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrpcJwtSecret")
+            .field("issuer", &self.issuer)
+            .field("key_id", &self.key_id)
+            .field("token_file_configured", &self.token_file.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl GrpcJwtSecret {
@@ -165,7 +193,31 @@ impl GrpcJwtSecret {
 
     /// Create a `GrpcJwtSecret` with an operator-configured issuer.
     pub fn with_issuer(secret: String, issuer: String) -> Self {
-        Self { secret, issuer }
+        Self {
+            secret,
+            issuer,
+            key_id: None,
+            token_file: None,
+        }
+    }
+
+    /// Stamp a JWS `kid` on self-minted tokens so a control plane running a
+    /// namespace-bound trust bundle can select this node's tenant credential.
+    /// Blank values are treated as unset rather than emitted as an empty `kid`,
+    /// which no bundle can match.
+    pub fn with_key_id(mut self, key_id: Option<String>) -> Self {
+        self.key_id = key_id
+            .map(|kid| kid.trim().to_string())
+            .filter(|kid| !kid.is_empty());
+        self
+    }
+
+    /// Present the token at `path` instead of minting one.
+    pub fn with_token_file(mut self, token_file: Option<String>) -> Self {
+        self.token_file = token_file
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty());
+        self
     }
 
     pub fn as_str(&self) -> &str {
@@ -174,6 +226,58 @@ impl GrpcJwtSecret {
 
     pub fn issuer(&self) -> &str {
         &self.issuer
+    }
+
+    pub fn key_id(&self) -> Option<&str> {
+        self.key_id.as_deref()
+    }
+
+    /// True when this node presents an externally issued token rather than
+    /// minting its own. Startup logs use this to state the posture without
+    /// rendering any material.
+    pub fn uses_external_token(&self) -> bool {
+        self.token_file.is_some()
+    }
+
+    /// Produce the bearer token for one connection attempt.
+    ///
+    /// With `FERRUM_DP_CP_GRPC_TOKEN_FILE` configured the file is re-read on
+    /// every attempt, so a short-lived projected token rotated by an external
+    /// issuer is picked up without a restart, and `namespace`/`audience` are
+    /// **not** applied — the issuer, not this node, decides what the token
+    /// asserts. That is the whole point: a node that cannot stamp its own `ns`
+    /// claim cannot forge one for another tenant.
+    ///
+    /// Otherwise the token is self-minted with the configured `kid`, `ns`, and
+    /// `aud`. A self-minted token is only ever *authorization* on a control
+    /// plane whose trust bundle binds this node's `kid` to a namespace
+    /// allow-list, or on a single-namespace control plane where there is no
+    /// second tenant to reach.
+    pub fn mint(
+        &self,
+        node_id: &str,
+        namespace: Option<&str>,
+        audience: Option<&str>,
+    ) -> Result<String, anyhow::Error> {
+        if let Some(path) = self.token_file.as_deref() {
+            let token = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!("failed to read FERRUM_DP_CP_GRPC_TOKEN_FILE '{path}': {e}")
+            })?;
+            let token = token.trim();
+            if token.is_empty() {
+                anyhow::bail!("FERRUM_DP_CP_GRPC_TOKEN_FILE '{path}' is empty");
+            }
+            // The token itself is never logged or echoed into an error.
+            return Ok(token.to_string());
+        }
+        generate_dp_jwt_full_with_key_id(
+            &self.secret,
+            node_id,
+            &self.issuer,
+            namespace,
+            audience,
+            self.key_id.as_deref(),
+        )
     }
 }
 
@@ -378,6 +482,25 @@ pub fn generate_dp_jwt_full(
     namespace: Option<&str>,
     audience: Option<&str>,
 ) -> Result<String, anyhow::Error> {
+    generate_dp_jwt_full_with_key_id(secret, node_id, issuer, namespace, audience, None)
+}
+
+/// As [`generate_dp_jwt_full`], plus a JWS `kid` header.
+///
+/// The `kid` tells a control plane running a namespace-bound trust bundle
+/// **which verification credential** must check this signature (advisory
+/// GHSA-3f2j-wwqw-grmg). It is a selector, not a grant: naming another tenant's
+/// `kid` without holding that tenant's key simply fails verification, and the
+/// namespace ceiling the CP applies comes from its own configuration for the
+/// selected key — never from anything in this token.
+pub fn generate_dp_jwt_full_with_key_id(
+    secret: &str,
+    node_id: &str,
+    issuer: &str,
+    namespace: Option<&str>,
+    audience: Option<&str>,
+    key_id: Option<&str>,
+) -> Result<String, anyhow::Error> {
     let now = chrono::Utc::now().timestamp();
     let mut claims = json!({
         "sub": node_id,
@@ -397,8 +520,13 @@ pub fn generate_dp_jwt_full(
     if let Some(aud) = audience.map(str::trim).filter(|aud| !aud.is_empty()) {
         object.insert("aud".to_string(), json!(aud));
     }
+    let mut header = Header::new(Algorithm::HS256);
+    header.kid = key_id
+        .map(str::trim)
+        .filter(|kid| !kid.is_empty())
+        .map(str::to_string);
     let token = encode(
-        &Header::new(Algorithm::HS256),
+        &header,
         &claims,
         &EncodingKey::from_secret(secret.as_bytes()),
     )?;
@@ -1410,18 +1538,21 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     // multi-namespace CPs configured with `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`
     // accept self-minted DP tokens. Single-namespace CPs ignore the extra
     // claim — it never restricts the back-compat path.
-    let auth_token = generate_dp_jwt_with_issuer_and_namespace(
-        jwt_secret.as_str(),
-        node_id,
-        jwt_secret.issuer(),
-        Some(namespace),
-    )?;
-    info!(
-        "Generated fresh DP JWT (TTL={}s, iss='{}', ns='{}') for CP authentication",
-        DP_JWT_TTL_SECONDS,
-        jwt_secret.issuer(),
-        namespace,
-    );
+    let auth_token = jwt_secret.mint(node_id, Some(namespace), None)?;
+    if jwt_secret.uses_external_token() {
+        info!(
+            "Presenting externally issued CP/DP token from FERRUM_DP_CP_GRPC_TOKEN_FILE \
+             (iss='{}') for CP authentication",
+            jwt_secret.issuer(),
+        );
+    } else {
+        info!(
+            "Generated fresh DP JWT (TTL={}s, iss='{}', ns='{}') for CP authentication",
+            DP_JWT_TTL_SECONDS,
+            jwt_secret.issuer(),
+            namespace,
+        );
+    }
     let token: MetadataValue<_> = format!("Bearer {}", auth_token).parse()?;
 
     #[allow(clippy::result_large_err)]

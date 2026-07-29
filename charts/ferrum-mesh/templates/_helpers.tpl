@@ -67,6 +67,26 @@ invalid CP settings so an unusable control-plane pod is not rendered.
 {{- $creds := $cp.credentials | default dict -}}
 {{- include "ferrum-mesh.validateOneSource" (dict "label" "controlPlane.credentials.adminJwtSecret" "source" ($creds.adminJwtSecret | default dict) "minLength" 32) -}}
 {{- include "ferrum-mesh.validateOneSource" (dict "label" "controlPlane.credentials.cpDpGrpcJwtSecret" "source" ($creds.cpDpGrpcJwtSecret | default dict) "minLength" 32) -}}
+{{/* Advisory GHSA-3f2j-wwqw-grmg: the fleet-wide cpDpGrpcJwtSecret is handed to
+     the very data planes it authorizes, so it cannot separate tenants. A CP
+     serving more than one namespace (FERRUM_CP_NAMESPACES naming a set, or "*")
+     REFUSES TO START without FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH
+     (src/modes/control_plane.rs / src/grpc/cp_trust.rs). Mirror that at render
+     so the failure is a helm error, not a crash-looping pod that times out
+     live CI installs. */}}
+{{- $cpNamespacesRaw := "" -}}
+{{- if hasKey $env "FERRUM_CP_NAMESPACES" -}}
+{{- $cpNamespacesRaw = index $env "FERRUM_CP_NAMESPACES" | toString -}}
+{{- end -}}
+{{- $cpNsList := compact (splitList "," ($cpNamespacesRaw | replace " " "")) -}}
+{{- $cpMultiNamespace := or (has "*" $cpNsList) (gt (len $cpNsList) 1) -}}
+{{- $cpTrustBundle := "" -}}
+{{- if hasKey $env "FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH" -}}
+{{- $cpTrustBundle = index $env "FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH" | toString | trim -}}
+{{- end -}}
+{{- if and $cpMultiNamespace (eq $cpTrustBundle "") -}}
+{{- fail (printf "controlPlane.env.FERRUM_CP_NAMESPACES=%q makes this a multi-namespace control plane, which refuses to start with only controlPlane.credentials.cpDpGrpcJwtSecret: that value is distributed to the data planes it would authorize, so any tenant holding it can re-sign the JWT `ns` claim and subscribe to another tenant (advisory GHSA-3f2j-wwqw-grmg). Set controlPlane.env.FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH to a mounted JSON bundle of namespace-bound verification credentials (see docs/cp_namespace_tenancy.md), or serve one namespace per CP via FERRUM_NAMESPACE / a single FERRUM_CP_NAMESPACES entry." $cpNamespacesRaw) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 

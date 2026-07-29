@@ -26,10 +26,14 @@
 //!   `aud`, so any audience at all is refused, preserving `jsonwebtoken`'s
 //!   strict `validate_aud` posture.
 
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use jsonwebtoken::{Validation, decode, decode_header};
 use serde_json::Value;
 use std::collections::HashSet;
 use tonic::Status;
+
+use super::cp_trust::{
+    CpDpVerifier, CpGrpcConnectInfo, TenantAuthRejectReason, resolve_authorized_namespaces,
+};
 
 /// Reserved JWT `aud` prefix for cross-cluster mesh **remote-discovery**
 /// tokens. The prefix is what makes the token class self-describing: any
@@ -225,44 +229,101 @@ fn enforce_audience(
 
 /// Namespaces a DP ConfigSync JWT bearer is authorised to subscribe to.
 ///
-/// The `ns` claim is optional only for back-compat with single-namespace CPs.
-/// Multi-namespace CP scopes require it automatically. Carriers:
-/// - `None` — token has no `ns` claim; only accepted by single-namespace CPs
-///   when `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=false`.
-/// - `Some(set)` — the bearer may only subscribe to the listed namespaces.
+/// Two independent facts are tracked:
+///
+/// - **Claim presence** ([`Self::is_present`]) — whether the JWT body
+///   contained an `ns` claim at all (including an empty array). Multi-namespace
+///   CP scopes, and single-namespace CPs with
+///   `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`, require this to be true. A
+///   server-derived ceiling (trust-bundle credential or SPIFFE peer) must
+///   never make a missing claim look present.
+/// - **Effective set** ([`Self::effective_namespaces`], [`Self::allows`],
+///   [`Self::sole_namespace`]) — the authorized namespaces after
+///   credential ∩ peer ∩ claim. Mesh/xDS bearer filtering and per-request
+///   namespace checks use this set. It may be `Some` even when the token
+///   carried no `ns` claim (single-scope CP with `require_ns_claim=false`
+///   still applies the intersected bound).
+///
+/// The admin JWT parser only sees the claim (no server-derived ceiling), so
+/// for that path claim presence and the effective set stay aligned via
+/// [`Self::claimed`] / [`Self::empty`].
 ///
 /// Tokens may carry the claim as either a single string (`"ns": "prod"`) or
 /// an array (`"ns": ["prod","staging"]`). The verifier normalises both into
 /// a `HashSet<String>` here so callers don't have to branch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AllowedNamespaces(pub Option<HashSet<String>>);
+pub struct AllowedNamespaces {
+    /// Whether the JWT body contained an `ns` claim (any value, even empty).
+    claim_present: bool,
+    /// Authorized namespaces after credential ∩ peer ∩ claim.
+    ///
+    /// `None` only when there is no server-derived ceiling and the token
+    /// carried no claim (legacy single-namespace shared-secret path).
+    effective: Option<HashSet<String>>,
+}
 
 impl AllowedNamespaces {
-    /// Empty (no claim present).
+    /// Empty (no claim present, no effective bound).
     pub fn empty() -> Self {
-        Self(None)
+        Self {
+            claim_present: false,
+            effective: None,
+        }
     }
 
-    /// True when the claim is present (any value, even empty array).
+    /// Construct from a parsed `ns` claim. Marks the claim present.
+    ///
+    /// Used by the admin JWT parser and by unit tests that model a claim
+    /// without going through CP-side credential intersection.
+    pub fn claimed(set: HashSet<String>) -> Self {
+        Self {
+            claim_present: true,
+            effective: Some(set),
+        }
+    }
+
+    /// Server-resolved authorization: claim presence tracked separately from
+    /// the effective intersection produced by credential ∩ peer ∩ claim.
+    pub(crate) fn resolved(claim_present: bool, effective: Option<HashSet<String>>) -> Self {
+        Self {
+            claim_present,
+            effective,
+        }
+    }
+
+    /// True when the JWT contained an `ns` claim (any value, even empty array).
+    ///
+    /// Independent of whether a trust-bundle or SPIFFE peer later produced an
+    /// effective namespace set. This is the contract the admin API and
+    /// `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM` rely on.
     pub fn is_present(&self) -> bool {
-        self.0.is_some()
+        self.claim_present
     }
 
-    /// True when the bearer is authorised for `namespace`. Returns `false`
-    /// when no claim is present — callers must combine with the back-compat
-    /// fallback logic.
+    /// Effective authorized namespaces after credential ∩ peer ∩ claim.
+    ///
+    /// Used by mesh/xDS bearer filtering. `None` means no server-derived
+    /// ceiling and no claim (legacy single-namespace shared-secret path).
+    pub fn effective_namespaces(&self) -> Option<&HashSet<String>> {
+        self.effective.as_ref()
+    }
+
+    /// True when the bearer is authorised for `namespace` under the effective
+    /// set. Returns `false` when there is no effective set — callers must
+    /// combine with the back-compat fallback logic for legacy single-namespace
+    /// shared-secret tokens that carry no claim.
     pub fn allows(&self, namespace: &str) -> bool {
-        match &self.0 {
+        match &self.effective {
             Some(set) => set.contains(namespace),
             None => false,
         }
     }
 
-    /// Return the only authorised namespace when the claim is present and
-    /// contains exactly one namespace. Protocols without an explicit namespace
-    /// request use this to avoid guessing tenant identity from node metadata.
+    /// Return the only authorised namespace when the effective set contains
+    /// exactly one namespace. Protocols without an explicit namespace request
+    /// use this to avoid guessing tenant identity from node metadata.
     pub fn sole_namespace(&self) -> Option<&str> {
-        let set = self.0.as_ref()?;
+        let set = self.effective.as_ref()?;
         if set.len() == 1 {
             set.iter().next().map(String::as_str)
         } else {
@@ -274,10 +335,10 @@ impl AllowedNamespaces {
 #[allow(clippy::result_large_err, dead_code)]
 pub(crate) fn verify_grpc_jwt_metadata(
     metadata: &tonic::metadata::MetadataMap,
-    jwt_secret: &str,
+    verifier: &CpDpVerifier,
     expected_issuer: &str,
 ) -> Result<(), Status> {
-    verify_grpc_jwt_metadata_with_claims(metadata, jwt_secret, expected_issuer).map(|_| ())
+    verify_grpc_jwt_metadata_with_claims(metadata, verifier, expected_issuer, None).map(|_| ())
 }
 
 /// Verify the JWT and return any `ns` claim it carried. Use this variant
@@ -294,14 +355,16 @@ pub(crate) fn verify_grpc_jwt_metadata(
 #[allow(clippy::result_large_err)]
 pub(crate) fn verify_grpc_jwt_metadata_with_claims(
     metadata: &tonic::metadata::MetadataMap,
-    jwt_secret: &str,
+    verifier: &CpDpVerifier,
     expected_issuer: &str,
+    peer: Option<&CpGrpcConnectInfo>,
 ) -> Result<AllowedNamespaces, Status> {
     verify_grpc_jwt_metadata_with_audience(
         metadata,
-        jwt_secret,
+        verifier,
         expected_issuer,
         GrpcAudiencePolicy::ReservedForbidden,
+        peer,
     )
     .map_err(|(status, _)| status)
 }
@@ -316,9 +379,10 @@ pub(crate) fn verify_grpc_jwt_metadata_with_claims(
 #[allow(clippy::result_large_err, clippy::type_complexity)]
 pub(crate) fn verify_grpc_jwt_metadata_with_audience(
     metadata: &tonic::metadata::MetadataMap,
-    jwt_secret: &str,
+    verifier: &CpDpVerifier,
     expected_issuer: &str,
     audience_policy: GrpcAudiencePolicy<'_>,
+    peer: Option<&CpGrpcConnectInfo>,
 ) -> Result<AllowedNamespaces, (Status, Option<AudienceRejectReason>)> {
     let token = metadata
         .get("authorization")
@@ -331,8 +395,20 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
             )
         })?;
 
-    let key = DecodingKey::from_secret(jwt_secret.as_bytes());
-    let mut validation = Validation::new(Algorithm::HS256);
+    // The JWS header selects WHICH credential must verify the signature. It is
+    // read before verification because it has to be — but it authorizes
+    // nothing: naming another tenant's `kid` without holding that key fails the
+    // signature check below, and the namespace ceiling comes from CP-side
+    // configuration attached to the selected key, never from the token.
+    let header = decode_header(token).map_err(|_| {
+        let reason = TenantAuthRejectReason::MalformedHeader;
+        (
+            Status::unauthenticated(reason.as_status_message()),
+            None::<AudienceRejectReason>,
+        )
+    })?;
+
+    let mut validation = Validation::new(header.alg);
     validation.validate_exp = true;
     validation.required_spec_claims = required_grpc_claims();
     validation.set_issuer(&[expected_issuer]);
@@ -341,10 +417,34 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
     // closed instead of matching on any element.
     validation.validate_aud = false;
 
-    let token_data = decode::<Value>(token, &key, &validation).map_err(|err| {
+    let (decoded, bound_namespaces) = verifier
+        .with_decoding_key(
+            header.kid.as_deref(),
+            header.alg,
+            |key, algorithm, bound| {
+                // `algorithm` is the credential's configured algorithm, which
+                // `with_decoding_key` already proved equal to the header's. Pin the
+                // validation to it rather than to the header so a future selection
+                // change cannot silently widen the accepted algorithm set.
+                validation.algorithms = vec![algorithm];
+                (decode::<Value>(token, key, &validation), bound.cloned())
+            },
+        )
+        .map_err(|reason| {
+            (
+                Status::unauthenticated(reason.as_status_message()),
+                None::<AudienceRejectReason>,
+            )
+        })?;
+
+    // Signature and standard-claim validation failures share the same outward
+    // message as unknown-key / algorithm mismatch so an unauthenticated caller
+    // cannot tell whether selection reached a known credential.
+    let token_data = decoded.map_err(|_| {
+        let reason = TenantAuthRejectReason::TokenValidation;
         (
-            Status::unauthenticated(format!("Invalid token: {err}")),
-            None,
+            Status::unauthenticated(reason.as_status_message()),
+            None::<AudienceRejectReason>,
         )
     })?;
 
@@ -355,7 +455,29 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
         ));
     }
 
-    extract_ns_claim(&token_data.claims).map_err(|status| (status, None))
+    let claim = extract_ns_claim(&token_data.claims).map_err(|status| (status, None))?;
+    let claim_present = claim.is_present();
+    let claim_namespaces = claim.effective_namespaces().cloned();
+
+    // Server-derived binding. The claim can only narrow what the CP already
+    // decided this credential (and, when present, this authenticated peer) may
+    // reach — so a re-signed `ns` naming another tenant resolves to an empty
+    // set and is refused here, before any tenant configuration is serialized.
+    // Claim *presence* is preserved separately: a missing claim must not look
+    // present merely because a trust bundle or SPIFFE peer produced a set.
+    let effective = resolve_authorized_namespaces(
+        bound_namespaces.as_ref(),
+        peer.and_then(|info| info.peer_namespace_scope.as_ref()),
+        claim_namespaces.as_ref(),
+    )
+    .map_err(|reason| {
+        (
+            Status::permission_denied(reason.as_status_message()),
+            None::<AudienceRejectReason>,
+        )
+    })?;
+
+    Ok(AllowedNamespaces::resolved(claim_present, effective))
 }
 
 fn required_grpc_claims() -> HashSet<String> {
@@ -395,7 +517,7 @@ pub(crate) fn parse_ns_claim(claims: &Value) -> Result<AllowedNamespaces, String
         }
         let mut set = HashSet::new();
         set.insert(trimmed.to_string());
-        return Ok(AllowedNamespaces(Some(set)));
+        return Ok(AllowedNamespaces::claimed(set));
     }
 
     if let Some(arr) = raw.as_array() {
@@ -410,7 +532,7 @@ pub(crate) fn parse_ns_claim(claims: &Value) -> Result<AllowedNamespaces, String
             }
             set.insert(trimmed.to_string());
         }
-        return Ok(AllowedNamespaces(Some(set)));
+        return Ok(AllowedNamespaces::claimed(set));
     }
 
     Err("JWT `ns` claim must be a string or an array of strings".to_string())
@@ -444,10 +566,24 @@ mod tests {
     fn ns_claim_array_normalised_to_set() {
         let claims = json!({ "ns": ["prod", "staging", "prod"] });
         let allowed = extract_ns_claim(&claims).expect("array claim is valid");
-        let inner = allowed.0.expect("set should be present");
+        let inner = allowed
+            .effective_namespaces()
+            .expect("set should be present");
         assert_eq!(inner.len(), 2);
         assert!(inner.contains("prod"));
         assert!(inner.contains("staging"));
+    }
+
+    #[test]
+    fn resolved_without_claim_keeps_is_present_false() {
+        // A trust-bundle / SPIFFE ceiling must not make a missing `ns` claim
+        // look present — that would bypass multi-namespace claim requirements.
+        let mut effective = HashSet::new();
+        effective.insert("tenant-a".to_string());
+        let allowed = AllowedNamespaces::resolved(false, Some(effective));
+        assert!(!allowed.is_present());
+        assert!(allowed.allows("tenant-a"));
+        assert_eq!(allowed.sole_namespace(), Some("tenant-a"));
     }
 
     #[test]

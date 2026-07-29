@@ -10,8 +10,20 @@ conventions so they feel like one product.
 |------|--------------|-------|-------|--------------|
 | Database | `database` | yes | read/write | `database.*`, `admin.jwtSecret` (>=32) |
 | File | `file` | yes | read-only | `file.inlineConfig` or `file.existingConfigMap` |
-| Control plane | `cp` | no | read/write | `database.*`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) |
-| Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) |
+| Control plane | `cp` | no | read/write | `database.*`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) or `cp.trustBundlePath` |
+| Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) or `dp.cpGrpcTokenFile` |
+
+### Multi-tenant control planes
+
+`grpc.jwtSecret` is a *fleet* secret: it is distributed to the very data planes
+it would authorize, so a compromised tenant can re-sign the JWT `ns` claim and
+read another tenant's configuration (advisory GHSA-3f2j-wwqw-grmg). A control
+plane serving more than one namespace therefore requires
+`cp.trustBundlePath` — a mounted JSON bundle of namespace-bound verification
+credentials — and the chart fails render without it. Data planes then present
+either an externally issued token (`dp.cpGrpcTokenFile`, no signing key on the
+node) or a per-tenant secret selected by `grpc.jwtKeyId`. See
+[docs/cp_namespace_tenancy.md](../../docs/cp_namespace_tenancy.md).
 
 The `mode` value is first-class and required. `mesh` / `injector` / `node_agent`
 fail at template time with a pointer to [`ferrum-mesh`](../ferrum-mesh).

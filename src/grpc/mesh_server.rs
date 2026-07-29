@@ -20,6 +20,7 @@ use super::auth::{
     remote_discovery_audience, verify_grpc_jwt_metadata_with_audience,
 };
 use super::cp_server::{CpGrpcServer, CpScope, DEFAULT_CP_DP_JWT_ISSUER};
+use super::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
 use super::mesh_registry::{MeshNodeInfo, MeshNodeRegistry};
 use super::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use super::proto::{MeshConfigUpdate, MeshSubscribeRequest};
@@ -74,7 +75,10 @@ where
 
 pub struct MeshGrpcServer {
     config: Arc<ArcSwap<GatewayConfig>>,
-    jwt_secret: String,
+    /// Shared with the ConfigSync and xDS servers so native MeshSubscribe
+    /// enforces the same namespace-bound verification credentials
+    /// (advisory GHSA-3f2j-wwqw-grmg).
+    verifier: Arc<CpDpVerifier>,
     expected_issuer: String,
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     registry: Arc<MeshNodeRegistry>,
@@ -109,7 +113,7 @@ pub struct MeshGrpcServer {
 
 pub struct MeshGrpcServerBuilder {
     config: Arc<ArcSwap<GatewayConfig>>,
-    jwt_secret: String,
+    verifier: Arc<CpDpVerifier>,
     channel_capacity: usize,
     registry: Arc<MeshNodeRegistry>,
     expected_issuer: String,
@@ -127,7 +131,7 @@ impl MeshGrpcServerBuilder {
     fn new(config: Arc<ArcSwap<GatewayConfig>>, jwt_secret: String) -> Self {
         Self {
             config,
-            jwt_secret,
+            verifier: Arc::new(CpDpVerifier::SharedSecret(jwt_secret)),
             channel_capacity: 128,
             registry: Arc::new(MeshNodeRegistry::new()),
             expected_issuer: DEFAULT_CP_DP_JWT_ISSUER.to_string(),
@@ -154,6 +158,13 @@ impl MeshGrpcServerBuilder {
 
     pub fn expected_issuer(mut self, expected_issuer: String) -> Self {
         self.expected_issuer = expected_issuer;
+        self
+    }
+
+    /// Replace the seeded shared-secret verifier with the CP's configured
+    /// namespace-bound trust bundle.
+    pub fn verifier(mut self, verifier: Arc<CpDpVerifier>) -> Self {
+        self.verifier = verifier;
         self
     }
 
@@ -210,7 +221,7 @@ impl MeshGrpcServerBuilder {
         (
             MeshGrpcServer {
                 config: self.config,
-                jwt_secret: self.jwt_secret,
+                verifier: self.verifier,
                 expected_issuer: self.expected_issuer,
                 mesh_update_tx: tx,
                 registry: self.registry,
@@ -337,13 +348,15 @@ impl MeshGrpcServer {
     fn verify_jwt_metadata(
         &self,
         metadata: &tonic::metadata::MetadataMap,
+        extensions: &tonic::Extensions,
         remote_discovery: bool,
     ) -> Result<AllowedNamespaces, (Status, Option<AudienceRejectReason>)> {
         verify_grpc_jwt_metadata_with_audience(
             metadata,
-            &self.jwt_secret,
+            &self.verifier,
             &self.expected_issuer,
             self.audience_policy_for(remote_discovery),
+            extensions.get::<CpGrpcConnectInfo>(),
         )
     }
 
@@ -509,7 +522,11 @@ impl MeshConfigSync for MeshGrpcServer {
         request: Request<MeshSubscribeRequest>,
     ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
         let remote_discovery = request.get_ref().remote_discovery;
-        let allowed = match self.verify_jwt_metadata(request.metadata(), remote_discovery) {
+        let allowed = match self.verify_jwt_metadata(
+            request.metadata(),
+            request.extensions(),
+            remote_discovery,
+        ) {
             Ok(allowed) => allowed,
             Err((status, audience_reason)) => {
                 let req = request.get_ref();
@@ -584,7 +601,7 @@ impl MeshConfigSync for MeshGrpcServer {
         let node_id = inner.node_id;
         let node_version = inner.ferrum_version;
         let node_namespace = inner.namespace;
-        let bearer_namespaces = allowed.0.clone();
+        let bearer_namespaces = allowed.effective_namespaces().cloned();
 
         let slice_request = MeshSliceRequest::from_native(
             node_id.clone(),
@@ -835,7 +852,7 @@ mod tests {
     }
 
     fn allowed_namespaces(namespaces: &[&str]) -> AllowedNamespaces {
-        AllowedNamespaces(Some(namespaces.iter().map(|ns| ns.to_string()).collect()))
+        AllowedNamespaces::claimed(namespaces.iter().map(|ns| ns.to_string()).collect())
     }
 
     #[test]

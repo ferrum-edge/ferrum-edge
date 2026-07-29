@@ -210,6 +210,22 @@
         },
         "probes": {
           "$ref": "#/definitions/workloadProbes"
+        },
+        "extraVolumes": {
+          "type": "array",
+          "description": "Free-form extra control-plane pod volumes (Kubernetes Volume objects). A multi-namespace CP (FERRUM_CP_NAMESPACES=* or a CSV set) must mount a real file at FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH (advisory GHSA-3f2j-wwqw-grmg).",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "extraVolumeMounts": {
+          "type": "array",
+          "description": "Free-form extra control-plane container volume mounts (Kubernetes VolumeMount objects), e.g. the CP/DP trust bundle at FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
         }
       }
     },

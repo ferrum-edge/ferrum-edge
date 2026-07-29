@@ -50,7 +50,15 @@ spec:
               value: {{ $value | quote }}
             {{- end }}
             {{- end }}
+          {{- with .Values.controlPlane.extraVolumeMounts }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.controlPlane.probes "liveHandler" $liveHandler "readyHandler" $readyHandler) }}
+      {{- with .Values.controlPlane.extraVolumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service

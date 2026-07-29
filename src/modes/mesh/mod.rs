@@ -9414,12 +9414,25 @@ pub async fn run(
             "Mesh mode initialized localized file config source (SIGHUP reloads)"
         );
     } else {
+        // Advisory GHSA-3f2j-wwqw-grmg: a mesh node with
+        // `FERRUM_DP_CP_GRPC_TOKEN_FILE` presents an externally issued token
+        // and holds no signing key; otherwise it self-mints and stamps
+        // `FERRUM_CP_DP_GRPC_JWT_KEY_ID` for trust-bundle key selection.
         let jwt_secret = GrpcJwtSecret::with_issuer(
-            env_config.cp_dp_grpc_jwt_secret.clone().ok_or_else(|| {
-                anyhow::anyhow!("FERRUM_CP_DP_GRPC_JWT_SECRET is required in mesh mode")
-            })?,
+            match env_config.cp_dp_grpc_jwt_secret.clone() {
+                Some(secret) => secret,
+                None if env_config.dp_cp_grpc_token_file.is_some() => String::new(),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "FERRUM_CP_DP_GRPC_JWT_SECRET is required in mesh mode unless \
+                         FERRUM_DP_CP_GRPC_TOKEN_FILE supplies an externally issued token"
+                    ));
+                }
+            },
             env_config.cp_dp_grpc_jwt_issuer.clone(),
-        );
+        )
+        .with_key_id(env_config.cp_dp_grpc_jwt_key_id.clone())
+        .with_token_file(env_config.dp_cp_grpc_token_file.clone());
         let grpc_tls = build_dp_grpc_tls_config(&env_config, &runtime.cp_urls, "Mesh")?;
         let mesh_grpc_tls_reload_handle =
             crate::modes::grpc_tls_reload::start_dp_grpc_tls_reload_task(
@@ -10433,11 +10446,17 @@ async fn arm_mesh_runtime_startup(
     // "MeshRemoteDiscovery gRPC TLS configured" log on every mesh startup even
     // when discovery was never enabled (F4).
     let remote_discovery_config = if env_config.mesh_remote_discovery_poll_interval_seconds != 0 {
+        // Cross-cluster remote discovery mints its own audience-bound token
+        // (issue #2475) and therefore still needs the shared secret; a
+        // token-file-only node simply does not serve remote discovery. The
+        // `kid` rides along so a peer CP running a trust bundle can select the
+        // credential bound to this cluster's namespaces.
         let remote_grpc_secret = env_config.cp_dp_grpc_jwt_secret.clone().map(|secret| {
             crate::grpc::dp_client::GrpcJwtSecret::with_issuer(
                 secret,
                 env_config.cp_dp_grpc_jwt_issuer.clone(),
             )
+            .with_key_id(env_config.cp_dp_grpc_jwt_key_id.clone())
         });
         let remote_grpc_tls = multicluster::RemoteDiscoveryTlsConfig {
             tls_urls: build_dp_grpc_tls_config(
@@ -10514,9 +10533,14 @@ async fn arm_mesh_runtime_startup(
                 );
             }
         }
+        // The `kid` rides on per-remote credentials exactly as it does on the
+        // shared-secret fallback above, so a peer CP running a namespace-bound
+        // trust bundle can select this cluster's credential either way
+        // (advisory GHSA-3f2j-wwqw-grmg).
         let remote_discovery_credentials = match multicluster::parse_remote_discovery_credentials(
             env_config.mesh_remote_discovery_credentials.as_deref(),
             &env_config.cp_dp_grpc_jwt_issuer,
+            env_config.cp_dp_grpc_jwt_key_id.as_deref(),
         ) {
             Ok(map) => std::sync::Arc::new(map),
             Err(err) => {

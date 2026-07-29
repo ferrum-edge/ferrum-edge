@@ -8600,7 +8600,7 @@ mod tests {
         // Claimed namespace → allowed; unlisted → denied.
         let mut set = std::collections::HashSet::new();
         set.insert("staging".to_string());
-        let scoped = AllowedNamespaces(Some(set));
+        let scoped = AllowedNamespaces::claimed(set);
         assert!(enforce_namespace_claim(&actor(scoped.clone()), "staging", "/proxies").is_none());
         let denied = enforce_namespace_claim(&actor(scoped), "prod", "/proxies");
         assert_eq!(
@@ -8609,12 +8609,17 @@ mod tests {
         );
 
         // Present-but-empty claim (operator assigned no namespaces) denies all.
-        let empty_set = AllowedNamespaces(Some(std::collections::HashSet::new()));
+        let empty_set = AllowedNamespaces::claimed(std::collections::HashSet::new());
         let denied = enforce_namespace_claim(&actor(empty_set), "ferrum", "/proxies");
         assert_eq!(
             denied.map(|resp| resp.status()),
             Some(StatusCode::FORBIDDEN)
         );
+
+        // Admin parser semantics: is_present tracks the claim, not a
+        // server-derived ceiling (admin has none).
+        assert!(!AllowedNamespaces::empty().is_present());
+        assert!(AllowedNamespaces::claimed(std::collections::HashSet::new()).is_present());
     }
 
     #[test]

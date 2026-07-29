@@ -145,8 +145,10 @@ admin:
     type: ClusterIP
     annotations: {}
 
-# CP/DP gRPC JWT secret (FERRUM_CP_DP_GRPC_JWT_SECRET). REQUIRED and >=32 chars
-# for cp and dp modes; the CP mints/validates and the DP presents this token.
+# CP/DP gRPC JWT secret (FERRUM_CP_DP_GRPC_JWT_SECRET). >=32 chars, and required
+# for cp and dp modes UNLESS cp.trustBundlePath (cp) or dp.cpGrpcTokenFile (dp)
+# is configured. NOTE: this secret is not a tenancy boundary — see
+# cp.trustBundlePath and docs/cp_namespace_tenancy.md.
 grpc:
   jwtSecret:
     # value: "at-least-32-characters-long-dev-only"
@@ -154,6 +156,11 @@ grpc:
       name: ""
       key: cp-dp-grpc-jwt-secret
     valueFrom: {}
+  # JWS `kid` stamped on tokens this DP mints (FERRUM_CP_DP_GRPC_JWT_KEY_ID). It
+  # selects which of the CP trust bundle's namespace-bound credentials verifies
+  # them; a CP running a bundle rejects a token with no `kid`. Ignored when
+  # dp.cpGrpcTokenFile is set (the issuer stamps its own header).
+  jwtKeyId: ""
   # Explicitly permit PLAINTEXT CP/DP config sync (FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT).
   # The binary hard-fails on a non-loopback plaintext CP gRPC bind (cp mode) or a
   # non-loopback http:// CP URL (dp mode) unless gRPC TLS is configured or this is
@@ -232,6 +239,16 @@ cp:
   namespaces: ""
   # Require a JWT `ns` claim on namespace-scoped gRPC calls (FERRUM_CP_REQUIRE_NAMESPACE_CLAIM).
   requireNamespaceClaim: false
+  # In-container path to the namespace-bound CP/DP verification credentials
+  # (FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH). Mount the JSON bundle yourself with
+  # extraVolumes/extraVolumeMounts (or secretFileMounts) and point this at it.
+  #
+  # REQUIRED whenever cp.namespaces names more than one namespace or "*": the
+  # fleet-wide grpc.jwtSecret is handed to the data planes it would authorize, so
+  # any tenant holding it can re-sign the JWT `ns` claim and read another
+  # tenant's config (advisory GHSA-3f2j-wwqw-grmg). The chart fails render, and
+  # the binary refuses to start, without it. See docs/cp_namespace_tenancy.md.
+  trustBundlePath: ""
   # gRPC Service (ClusterIP) exposing the CP to DP pods.
   service:
     enabled: true
@@ -253,6 +270,13 @@ dp:
   # 0 disables primary-CP retry and is rendered explicitly; "" (or null) omits the
   # env and takes the binary's 300s default.
   failoverPrimaryRetrySeconds: ""
+  # In-container path to an externally issued CP/DP bearer token
+  # (FERRUM_DP_CP_GRPC_TOKEN_FILE). When set, this DP presents that token instead
+  # of minting one, so it holds no signing key and cannot forge an authorization
+  # for any namespace — the preferred posture under GHSA-3f2j-wwqw-grmg. The file
+  # is re-read on every connection attempt, so a projected short-lived token
+  # rotates without a restart. Setting this makes grpc.jwtSecret optional.
+  cpGrpcTokenFile: ""
 
 # -----------------------------------------------------------------------------
 # TLS material. Each enabled surface mounts a Secret (standard tls.crt/tls.key/

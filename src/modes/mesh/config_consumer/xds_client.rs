@@ -13,9 +13,7 @@ use super::common::{
     next_backoff_secs, refresh_dp_grpc_tls_config_if_changed, should_race_primary_retry,
     tonic_tls_config, wait_for_shutdown, wait_optional_tls_reload,
 };
-use crate::grpc::dp_client::{
-    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_with_issuer_and_namespace,
-};
+use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::modes::mesh::config::{
     AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, ServicePort,
 };
@@ -72,13 +70,12 @@ struct AdsAuth {
 
 impl AdsAuth {
     fn bearer_token(&self) -> Result<BearerToken, tonic::Status> {
-        let auth_token = generate_dp_jwt_with_issuer_and_namespace(
-            self.jwt_secret.as_str(),
-            &self.node_id,
-            self.jwt_secret.issuer(),
-            Some(&self.namespace),
-        )
-        .map_err(|e| tonic::Status::unauthenticated(format!("failed to mint xDS JWT: {e}")))?;
+        let auth_token = self
+            .jwt_secret
+            .mint(&self.node_id, Some(&self.namespace), None)
+            .map_err(|e| {
+                tonic::Status::unauthenticated(format!("failed to obtain xDS bearer token: {e}"))
+            })?;
         format!("Bearer {auth_token}").parse().map_err(|e| {
             tonic::Status::internal(format!("failed to build authorization metadata: {e}"))
         })

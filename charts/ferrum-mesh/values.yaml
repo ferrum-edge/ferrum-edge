@@ -39,7 +39,10 @@ controlPlane:
     # turn them off with a one-line env override without editing the
     # chart values. Same applies to FERRUM_K8S_WATCH_NAMESPACES: when
     # unset, the controller follows the T2-A CP namespace scope
-    # (FERRUM_CP_NAMESPACES). The chart renders
+    # (FERRUM_CP_NAMESPACES). Multi-namespace scope (`*` or a CSV set)
+    # additionally requires FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH — the
+    # fleet-wide cpDpGrpcJwtSecret alone is rejected (advisory
+    # GHSA-3f2j-wwqw-grmg). The chart renders
     # FERRUM_K8S_CONTROLLER_NAMESPACE to the Helm release namespace unless
     # explicitly overridden here, so managed workload namespace settings do
     # not affect trusted NodeWaypoint discovery.
@@ -109,6 +112,12 @@ controlPlane:
       initialDelaySeconds: 5
       periodSeconds: 10
       override: {}
+  # Operator-supplied mounts (TLS material, CP/DP trust bundle, etc.).
+  # Multi-namespace CP (FERRUM_CP_NAMESPACES=* or a CSV set) requires a real
+  # file at FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH — declaring the path alone is
+  # not enough (advisory GHSA-3f2j-wwqw-grmg).
+  extraVolumes: []
+  extraVolumeMounts: []
 
 injector:
   # Disabled by default: the webhook requires a serving-cert Secret and should

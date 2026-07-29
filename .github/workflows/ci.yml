@@ -687,6 +687,7 @@ jobs:
               integration::cp_dp_grpc_tests
               integration::cp_grpc_handshake_admission_tests
               integration::cp_multi_namespace_tests
+              integration::cp_tenant_trust_binding_tests
               integration::connection_pool_tests
               integration::http2_pool_tests
               integration::http3_integration_tests
@@ -1893,6 +1894,45 @@ jobs:
             exit 1
           fi
           grep -F 'structured Secret-backed username/password cannot be safely percent-encoded into FERRUM_DB_URL' "$RUNNER_TEMP/ferrum-helm-results/structured-secret-credentials.err"
+          # Advisory GHSA-3f2j-wwqw-grmg: multi-namespace CP + only the fleet-wide
+          # shared secret must fail at helm render (mirrors binary fail-closed).
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set controlPlane.enabled=true \
+            --set controlPlane.database.type=sqlite \
+            --set-string controlPlane.database.sqlite.path=/tmp/ferrum.db \
+            --set controlPlane.credentials.adminJwtSecret.value=ferrum-edge-helm-chart-admin-secret-32b \
+            --set controlPlane.credentials.cpDpGrpcJwtSecret.value=ferrum-edge-helm-chart-grpc-secret-32bxx \
+            --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=*' \
+            > "$RUNNER_TEMP/ferrum-helm-results/multi-ns-shared-secret-rendered.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/multi-ns-shared-secret.err"; then
+            echo "::error title=Multi-namespace shared-secret CP rendered successfully::FERRUM_CP_NAMESPACES=* without a trust bundle must fail helm validation (GHSA-3f2j-wwqw-grmg)"
+            exit 1
+          fi
+          grep -F 'GHSA-3f2j' "$RUNNER_TEMP/ferrum-helm-results/multi-ns-shared-secret.err"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set controlPlane.enabled=true \
+            --set controlPlane.database.type=sqlite \
+            --set-string controlPlane.database.sqlite.path=/tmp/ferrum.db \
+            --set controlPlane.credentials.adminJwtSecret.value=ferrum-edge-helm-chart-admin-secret-32b \
+            --set controlPlane.credentials.cpDpGrpcJwtSecret.value=ferrum-edge-helm-chart-grpc-secret-32bxx \
+            --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=tenant-a\,tenant-b' \
+            > "$RUNNER_TEMP/ferrum-helm-results/multi-ns-csv-shared-secret-rendered.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/multi-ns-csv-shared-secret.err"; then
+            echo "::error title=CSV multi-namespace shared-secret CP rendered successfully::FERRUM_CP_NAMESPACES CSV without a trust bundle must fail helm validation (GHSA-3f2j-wwqw-grmg)"
+            exit 1
+          fi
+          grep -F 'GHSA-3f2j' "$RUNNER_TEMP/ferrum-helm-results/multi-ns-csv-shared-secret.err"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set controlPlane.enabled=true \
+            --set controlPlane.database.type=sqlite \
+            --set-string controlPlane.database.sqlite.path=/tmp/ferrum.db \
+            --set controlPlane.credentials.adminJwtSecret.value=ferrum-edge-helm-chart-admin-secret-32b \
+            --set controlPlane.credentials.cpDpGrpcJwtSecret.value=ferrum-edge-helm-chart-grpc-secret-32bxx \
+            --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=*' \
+            --set-string 'controlPlane.env.FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH=/etc/ferrum/cp-dp-trust-bundle.json' \
+            > "$RUNNER_TEMP/ferrum-helm-results/multi-ns-trust-bundle-rendered.yaml"
+          grep -A1 'name: FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH' "$RUNNER_TEMP/ferrum-helm-results/multi-ns-trust-bundle-rendered.yaml" \
+            | grep -Fq 'value: "/etc/ferrum/cp-dp-trust-bundle.json"'
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set controlPlane.enabled=true \
             --set controlPlane.database.type=postgres \
@@ -1919,6 +1959,29 @@ jobs:
               exit 1
             fi
           done
+          if ! grep -A1 'name: FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH' "$RUNNER_TEMP/ferrum-helm-results/production-existing-secrets-rendered.yaml" \
+            | grep -Fq 'value: "/etc/ferrum/cp-dp-trust-bundle.json"'; then
+            echo "::error title=Production multi-namespace example missing trust bundle path::FERRUM_CP_NAMESPACES=* requires FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH (GHSA-3f2j-wwqw-grmg)"
+            exit 1
+          fi
+          # Path alone is not enough: the production example must also mount a
+          # real trust-bundle file so the CP can fail closed on a missing
+          # dependency at helm-render time for operators, and so kind readiness
+          # smoke does not crash-loop waiting for a file that was never mounted.
+          if ! grep -Fq 'mountPath: /etc/ferrum/cp-dp-trust-bundle.json' \
+            "$RUNNER_TEMP/ferrum-helm-results/production-existing-secrets-rendered.yaml"; then
+            echo "::error title=Production example missing trust bundle mount::FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH requires a volumeMount at that path (GHSA-3f2j-wwqw-grmg)"
+            exit 1
+          fi
+          if ! grep -Fq 'secretName: ferrum-mesh-production-trust-bundle' \
+            "$RUNNER_TEMP/ferrum-helm-results/production-existing-secrets-rendered.yaml"; then
+            echo "::error title=Production example missing trust bundle Secret volume::production-existing-secrets-values.yaml must mount ferrum-mesh-production-trust-bundle (GHSA-3f2j-wwqw-grmg)"
+            exit 1
+          fi
+          if grep -A1 'name: FERRUM_CP_NAMESPACES' "$RUNNER_TEMP/ferrum-helm-results/development-rendered.yaml" | grep -Fq 'value: "*"'; then
+            echo "::error title=Development example still uses cluster-wide CP without trust binding::development-values.yaml must stay single-namespace or mount a trust bundle (GHSA-3f2j-wwqw-grmg)"
+            exit 1
+          fi
           # Mesh workload probes (#2450): helm stays in this trusted workflow shell;
           # assertions live in .github/scripts/verify_mesh_workload_probes.py so the
           # trusted ARM64 build-policy gate does not freeze probe-shape edits here.
@@ -3141,6 +3204,34 @@ jobs:
           kubectl -n ferrum-prod create secret generic ferrum-mesh-production-credentials \
             --from-literal=admin-jwt-secret="${admin_secret}" \
             --from-literal=cp-dp-grpc-jwt-secret="${grpc_secret}"
+          # Multi-namespace production example declares
+          # FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH and mounts this Secret. Supply a
+          # real JSON bundle so fail-closed startup can load it (GHSA-3f2j).
+          # `kid` selects the credential; `namespaces` is the server-derived
+          # ceiling. The secret is generated here and masked, never written into
+          # this workflow: a credential MUST NOT be backed by the fleet-wide
+          # FERRUM_CP_DP_GRPC_JWT_SECRET (every data plane holds that value, so
+          # any of them could name this `kid` — the very forgery the advisory
+          # closes). Asymmetric material is the recommended production shape.
+          tenant_bundle_secret="$(openssl rand -hex 32)"
+          echo "::add-mask::${tenant_bundle_secret}"
+          trust_bundle_dir="$(mktemp -d)"
+          cat > "${trust_bundle_dir}/cp-dp-trust-bundle.json" <<EOF
+          {
+            "version": 1,
+            "keys": [
+              {
+                "kid": "ci-production-smoke",
+                "algorithm": "HS256",
+                "secret": "${tenant_bundle_secret}",
+                "namespaces": ["ferrum"]
+              }
+            ]
+          }
+          EOF
+          kubectl -n ferrum-prod create secret generic ferrum-mesh-production-trust-bundle \
+            --from-file=cp-dp-trust-bundle.json="${trust_bundle_dir}/cp-dp-trust-bundle.json"
+          rm -rf "${trust_bundle_dir}"
           # Kind smoke keeps the production example's secret wiring, but the
           # example intentionally omits CP gRPC TLS. Without this escape hatch the
           # binary refuses non-loopback plaintext at startup; readiness probes then
@@ -3152,18 +3243,27 @@ jobs:
             --set image.tag=helm-chart-ci \
             --set image.pullPolicy=IfNotPresent \
             --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
+          set +e
           kubectl -n ferrum-prod rollout status deployment/ferrum-mesh-control-plane --timeout=180s
+          rollout_rc=$?
+          set -e
           kubectl -n ferrum-prod get pods -o wide > "$RUNNER_TEMP/ferrum-helm-results/production-pods.txt"
           kubectl -n ferrum-prod describe deployment/ferrum-mesh-control-plane > "$RUNNER_TEMP/ferrum-helm-results/production-control-plane-deployment.txt"
           kubectl -n ferrum-prod get events --sort-by=.lastTimestamp > "$RUNNER_TEMP/ferrum-helm-results/production-events.txt"
-          kubectl -n ferrum-prod logs deployment/ferrum-mesh-control-plane --all-containers --tail=1000 > "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log"
-          for secret in "$pg_password" "$db_url" "$admin_secret" "$grpc_secret"; do
+          kubectl -n ferrum-prod logs deployment/ferrum-mesh-control-plane --all-containers --tail=1000 \
+            > "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log" 2>&1 || true
+          # tenant_bundle_secret is trust-bundle key material: cp_trust.rs must
+          # never render it, not even in a bundle-load failure (GHSA-3f2j).
+          for secret in "$pg_password" "$db_url" "$admin_secret" "$grpc_secret" "$tenant_bundle_secret"; do
             if grep -Fq "$secret" "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log"; then
               rm -f "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log"
               echo "::error title=Secret leaked to logs::production-style control-plane logs contained a secret value"
               exit 1
             fi
           done
+          if [ "$rollout_rc" -ne 0 ]; then
+            exit "$rollout_rc"
+          fi
 
       - name: Collect Helm chart diagnostics
         if: always()

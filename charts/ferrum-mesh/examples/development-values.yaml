@@ -23,7 +23,10 @@ controlPlane:
     FERRUM_MODE: cp
     FERRUM_XDS_ENABLED: "true"
     FERRUM_LOG_LEVEL: info
-    FERRUM_CP_NAMESPACES: "*"
+    # Single-namespace lab posture (FERRUM_NAMESPACE defaults to the release
+    # namespace). A multi-namespace CP (FERRUM_CP_NAMESPACES naming a set or "*")
+    # additionally requires FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH — the fleet-wide
+    # cpDpGrpcJwtSecret alone is rejected (advisory GHSA-3f2j-wwqw-grmg).
     # Development example: expose CP/DP gRPC inside the local cluster without TLS.
     # Production installs should configure FERRUM_CP_GRPC_TLS_* instead.
     FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT: "true"

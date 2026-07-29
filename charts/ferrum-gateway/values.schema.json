@@ -138,9 +138,13 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "jwtKeyId": {
+          "type": "string",
+          "description": "JWS `kid` stamped on self-minted CP/DP tokens (FERRUM_CP_DP_GRPC_JWT_KEY_ID), selecting which of the CP trust bundle's namespace-bound credentials verifies them. Rendered in dp mode."
+        },
         "jwtSecret": {
           "type": "object",
-          "description": "Required in cp/dp unless supplied by secretFileMounts name=FERRUM_CP_DP_GRPC_JWT_SECRET.",
+          "description": "Required in cp/dp unless supplied by secretFileMounts name=FERRUM_CP_DP_GRPC_JWT_SECRET, or made optional by cp.trustBundlePath (cp) / dp.cpGrpcTokenFile (dp).",
           "additionalProperties": false,
           "properties": {
             "value": { "type": "string", "minLength": 32 },
@@ -226,6 +230,10 @@
         "grpcBindAddress": { "type": "string" },
         "namespaces": { "type": "string" },
         "requireNamespaceClaim": { "type": "boolean" },
+        "trustBundlePath": {
+          "type": "string",
+          "description": "In-container path to the namespace-bound CP/DP verification credentials (FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH). Required whenever cp.namespaces names more than one namespace or '*': the fleet-wide grpc.jwtSecret is distributed to the data planes it would authorize and therefore cannot separate tenants (advisory GHSA-3f2j-wwqw-grmg)."
+        },
         "service": {
           "type": "object",
           "additionalProperties": false,
@@ -247,6 +255,10 @@
       "additionalProperties": false,
       "properties": {
         "cpGrpcUrls": { "type": "string" },
+        "cpGrpcTokenFile": {
+          "type": "string",
+          "description": "In-container path to an externally issued CP/DP bearer token (FERRUM_DP_CP_GRPC_TOKEN_FILE). When set the DP presents that token instead of minting one, holds no signing key, and grpc.jwtSecret becomes optional."
+        },
         "failoverPrimaryRetrySeconds": {
           "oneOf": [
             { "type": "integer", "minimum": 0 },

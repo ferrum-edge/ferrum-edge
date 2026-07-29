@@ -1233,6 +1233,34 @@ pub struct EnvConfig {
     /// with this value. Defaults to "ferrum-edge-cp-dp". Operators rotating
     /// the issuer must update CP and all DPs together.
     pub cp_dp_grpc_jwt_issuer: String,
+    /// Path to the CP's namespace-bound verification credentials
+    /// (`FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH`, advisory GHSA-3f2j-wwqw-grmg).
+    ///
+    /// A JSON document listing verification credentials, each selected by JWS
+    /// `kid` and immutably bound — by *this* control-plane configuration — to a
+    /// namespace allow-list. A token's `ns` claim may only narrow that list.
+    /// Asymmetric credentials are preferred: the CP then holds only public
+    /// material and no data plane is a signing authority at all.
+    ///
+    /// Required for multi-namespace control planes: `FERRUM_CP_NAMESPACES`
+    /// naming a set (or `*`) with only `FERRUM_CP_DP_GRPC_JWT_SECRET`
+    /// configured is refused at startup, because that secret is distributed to
+    /// the very data planes it would authorize. Single-namespace CPs may keep
+    /// using the shared secret, where it is security-equivalent.
+    /// CP mode only.
+    pub cp_dp_grpc_trust_bundle_path: Option<String>,
+    /// JWS `kid` header stamped on tokens this node mints
+    /// (`FERRUM_CP_DP_GRPC_JWT_KEY_ID`). Selects which of the CP's trust-bundle
+    /// credentials verifies them. DP / mesh / xDS client side; unset reproduces
+    /// the pre-advisory token shape, which a trust-bundle CP refuses.
+    pub cp_dp_grpc_jwt_key_id: Option<String>,
+    /// Path to an externally issued CP/DP bearer token
+    /// (`FERRUM_DP_CP_GRPC_TOKEN_FILE`). When set, this node presents the file's
+    /// contents instead of minting its own token, so the signing key never
+    /// exists on the data plane at all. The file is re-read on every connection
+    /// attempt, so a rotating projected token is picked up without a restart.
+    /// DP / mesh / xDS client side.
+    pub dp_cp_grpc_token_file: Option<String>,
     /// Comma-separated, priority-ordered list of CP gRPC URLs for DP failover.
     /// The DP connects to the first URL and fails over to subsequent URLs when
     /// unreachable.
@@ -2525,6 +2553,9 @@ impl Default for EnvConfig {
             cp_grpc_listen_addr: None,
             cp_dp_grpc_jwt_secret: None,
             cp_dp_grpc_jwt_issuer: "ferrum-edge-cp-dp".to_string(),
+            cp_dp_grpc_trust_bundle_path: None,
+            cp_dp_grpc_jwt_key_id: None,
+            dp_cp_grpc_token_file: None,
             dp_cp_grpc_urls: Vec::new(),
             dp_cp_failover_primary_retry_secs: 300,
             cp_dp_grpc_allow_plaintext: false,
@@ -2954,9 +2985,18 @@ impl EnvConfig {
             // config protocol is active — that conditional check lives in
             // `EnvConfig::validate()`'s Mesh arm (the macro cannot see
             // FERRUM_MESH_CONFIG_PROTOCOL).
-            cp_dp_grpc_jwt_secret: Option<String> = "FERRUM_CP_DP_GRPC_JWT_SECRET"
-                => required_for(["cp", "dp"]) min_len(crate::config::types::MIN_JWT_SECRET_LENGTH);
+            // Presence is mode- AND credential-conditional (advisory
+            // GHSA-3f2j-wwqw-grmg): a CP configured with a namespace-bound
+            // trust bundle, and a DP/mesh node presenting an externally issued
+            // token file, both hold no shared secret at all. The requirement
+            // and the minimum length are enforced together in
+            // `EnvConfig::validate()`, which can see those settings; the macro
+            // cannot.
+            cp_dp_grpc_jwt_secret: Option<String> = "FERRUM_CP_DP_GRPC_JWT_SECRET";
             cp_dp_grpc_jwt_issuer: String = "FERRUM_CP_DP_GRPC_JWT_ISSUER" => "ferrum-edge-cp-dp".to_string();
+            cp_dp_grpc_trust_bundle_path: Option<String> = "FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH";
+            cp_dp_grpc_jwt_key_id: Option<String> = "FERRUM_CP_DP_GRPC_JWT_KEY_ID";
+            dp_cp_grpc_token_file: Option<String> = "FERRUM_DP_CP_GRPC_TOKEN_FILE";
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
             dp_cp_failover_primary_retry_secs: u64 = "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS" => 300u64;
             cp_dp_grpc_allow_plaintext: bool = "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT" => false;
@@ -3629,6 +3669,9 @@ impl EnvConfig {
             cp_grpc_listen_addr,
             cp_dp_grpc_jwt_secret,
             cp_dp_grpc_jwt_issuer,
+            cp_dp_grpc_trust_bundle_path,
+            cp_dp_grpc_jwt_key_id,
+            dp_cp_grpc_token_file,
             dp_cp_grpc_urls,
             dp_cp_failover_primary_retry_secs,
             cp_dp_grpc_allow_plaintext,
@@ -4647,6 +4690,57 @@ impl EnvConfig {
             }
         }
 
+        // CP/DP gRPC credential presence (advisory GHSA-3f2j-wwqw-grmg).
+        //
+        // The shared secret is no longer the only credential shape, so
+        // "required" now depends on what else is configured:
+        //
+        // - CP with `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH`: the bundle carries
+        //   the verification credentials, so the shared secret is optional.
+        // - DP/mesh with `FERRUM_DP_CP_GRPC_TOKEN_FILE`: the node presents an
+        //   externally issued token and never mints one, so it needs no secret.
+        //
+        // Whenever a secret *is* configured it still has to clear the minimum
+        // length, on every mode — the macro used to enforce that only where it
+        // was required.
+        if let Some(secret) = self
+            .cp_dp_grpc_jwt_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            && secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH
+        {
+            return Err(format!(
+                "FERRUM_CP_DP_GRPC_JWT_SECRET must be at least {} characters (got {})",
+                crate::config::types::MIN_JWT_SECRET_LENGTH,
+                secret.len()
+            ));
+        }
+        let has_cp_dp_secret = self
+            .cp_dp_grpc_jwt_secret
+            .as_deref()
+            .is_some_and(|secret| !secret.is_empty());
+        match &self.mode {
+            OperatingMode::ControlPlane => {
+                if !has_cp_dp_secret && self.cp_dp_grpc_trust_bundle_path.is_none() {
+                    return Err(
+                        "FERRUM_CP_DP_GRPC_JWT_SECRET is required in cp mode unless \
+                                FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH is configured"
+                            .into(),
+                    );
+                }
+            }
+            OperatingMode::DataPlane
+                if !has_cp_dp_secret && self.dp_cp_grpc_token_file.is_none() =>
+            {
+                return Err(
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode unless \
+                            FERRUM_DP_CP_GRPC_TOKEN_FILE supplies an externally issued token"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+
         match &self.mode {
             OperatingMode::Database | OperatingMode::ControlPlane => {
                 if self.db_type.is_none() {
@@ -4704,13 +4798,19 @@ impl EnvConfig {
                     if self.dp_cp_grpc_urls.is_empty() {
                         return Err("FERRUM_DP_CP_GRPC_URLS is required in mesh mode".into());
                     }
-                    crate::config::env_config::env_config_macro::validate_required_string_in_modes(
-                        "FERRUM_CP_DP_GRPC_JWT_SECRET",
-                        self.cp_dp_grpc_jwt_secret.as_deref(),
-                        &OperatingMode::Mesh,
-                        &["mesh"],
-                        crate::config::types::MIN_JWT_SECRET_LENGTH,
-                    )?;
+                    // A mesh node presenting an externally issued token
+                    // (`FERRUM_DP_CP_GRPC_TOKEN_FILE`) mints nothing and
+                    // therefore holds no signing secret — the preferred posture
+                    // under advisory GHSA-3f2j-wwqw-grmg.
+                    if self.dp_cp_grpc_token_file.is_none() {
+                        crate::config::env_config::env_config_macro::validate_required_string_in_modes(
+                            "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                            self.cp_dp_grpc_jwt_secret.as_deref(),
+                            &OperatingMode::Mesh,
+                            &["mesh"],
+                            crate::config::types::MIN_JWT_SECRET_LENGTH,
+                        )?;
+                    }
                 }
                 // Validate the mesh CA backend value (reject unknown strings).
                 let mesh_ca_backend =

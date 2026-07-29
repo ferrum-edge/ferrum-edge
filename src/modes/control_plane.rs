@@ -24,7 +24,7 @@ use tokio::net::TcpStream;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::Server;
-use tonic::transport::server::{Connected, TcpConnectInfo};
+use tonic::transport::server::Connected;
 use tracing::{debug, error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
@@ -39,6 +39,7 @@ use crate::config::validation_pipeline::{
 };
 use crate::dns::{DnsCache, DnsConfig};
 use crate::grpc::cp_server::{CpGrpcServer, CpScope};
+use crate::grpc::cp_trust::{CpDpTrustBundle, CpDpVerifier, CpGrpcConnectInfo, PeerNamespaceScope};
 use crate::grpc::mesh_registry::{
     MESH_NODE_REGISTRY_REAPER_INTERVAL, mesh_node_registry_stale_ttl,
 };
@@ -167,6 +168,15 @@ pub struct CpGrpcTlsIo {
     inner: tokio_rustls::server::TlsStream<TcpStream>,
     local_addr: Option<SocketAddr>,
     remote_addr: Option<SocketAddr>,
+    /// Namespace scope derived from the peer's SPIFFE certificate identity,
+    /// computed once when the handshake completes rather than per request.
+    ///
+    /// `None` means the peer presented no certificate, or presented one that
+    /// encodes no SPIFFE namespace. Either way it contributes no namespace
+    /// evidence — a shared-CA certificate is not namespace authorization, and
+    /// this value can only ever narrow what a verification credential already
+    /// permits (advisory GHSA-3f2j-wwqw-grmg).
+    peer_namespace_scope: Option<PeerNamespaceScope>,
     /// Released when this value drops; see [`CpGrpcIo`].
     _permit: ConnPermit,
 }
@@ -212,17 +222,24 @@ impl AsyncWrite for CpGrpcIo {
 }
 
 impl Connected for CpGrpcIo {
-    type ConnectInfo = TcpConnectInfo;
+    /// Ferrum's own connect info rather than tonic's `TcpConnectInfo`: the CP
+    /// authorization path needs the mTLS peer's SPIFFE-derived namespace scope,
+    /// and tonic's type carries only addresses.
+    type ConnectInfo = CpGrpcConnectInfo;
 
     fn connect_info(&self) -> Self::ConnectInfo {
         match self {
-            Self::Plain(stream) => TcpConnectInfo {
+            Self::Plain(stream) => CpGrpcConnectInfo {
                 local_addr: stream.inner.local_addr().ok(),
                 remote_addr: stream.inner.peer_addr().ok(),
+                // A plaintext connection has no peer certificate, so it
+                // supplies no server-derived namespace evidence.
+                peer_namespace_scope: None,
             },
-            Self::Tls(stream) => TcpConnectInfo {
+            Self::Tls(stream) => CpGrpcConnectInfo {
                 local_addr: stream.local_addr,
                 remote_addr: stream.remote_addr,
+                peer_namespace_scope: stream.peer_namespace_scope.clone(),
             },
         }
     }
@@ -409,10 +426,26 @@ async fn run_cp_grpc_tls_accept_loop(
                             .await
                             {
                                 Ok(inner) => {
+                                    // Derive the peer's namespace scope once,
+                                    // here, from the verified leaf certificate.
+                                    // rustls has already validated the chain
+                                    // against the configured client CA; what
+                                    // this adds is the *namespace* the peer's
+                                    // SPIFFE identity encodes, which chain
+                                    // validation alone cannot express.
+                                    let peer_namespace_scope = inner
+                                        .get_ref()
+                                        .1
+                                        .peer_certificates()
+                                        .and_then(|certs| certs.first())
+                                        .and_then(|leaf| {
+                                            PeerNamespaceScope::from_peer_cert_der(leaf)
+                                        });
                                     let io = CpGrpcIo::Tls(Box::new(CpGrpcTlsIo {
                                         inner,
                                         local_addr,
                                         remote_addr: Some(remote_addr),
+                                        peer_namespace_scope,
                                         _permit: permit,
                                     }));
                                     let _ = tx.send(Ok(io)).await;
@@ -1936,15 +1969,86 @@ pub async fn run(
         env_config.runtime_metrics_cache_ttl_ms,
     );
 
-    let grpc_secret = match env_config.cp_dp_grpc_jwt_secret.clone() {
-        Some(secret) if !secret.is_empty() => secret,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "FERRUM_CP_DP_GRPC_JWT_SECRET must be set and non-empty in control plane mode. \
-                 Without it, any client can forge valid gRPC authentication tokens."
-            ));
+    // Resolve how inbound CP/DP tokens are verified, and what each credential
+    // is allowed to reach (advisory GHSA-3f2j-wwqw-grmg).
+    //
+    // A trust bundle binds every verification credential to a namespace
+    // allow-list in *control-plane* configuration, so a token's `ns` claim can
+    // only narrow it. The legacy fleet-wide secret supplies no such binding —
+    // it is the same value handed to the data planes being authorized — so a
+    // multi-namespace CP refuses to start with it. There is deliberately no
+    // unsafe override.
+    let (grpc_secret, cp_dp_verifier) = match env_config.cp_dp_grpc_trust_bundle_path.as_deref() {
+        Some(path) => {
+            // The effective fleet secret is threaded in so a bound credential
+            // backed by it is refused rather than silently re-creating the
+            // advisory (GHSA-3f2j-wwqw-grmg). It is used for comparison only
+            // and is never rendered.
+            let fleet_secret = env_config.cp_dp_grpc_jwt_secret.as_deref();
+            let bundle = CpDpTrustBundle::load_from_path(path, fleet_secret).map_err(|e| {
+                anyhow::anyhow!("FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH could not be loaded: {e}")
+            })?;
+            // Warn (not fail) on a served namespace no credential can reach:
+            // it is a real rollout gap, but refusing to start would make adding
+            // a tenant a two-step outage.
+            if let Some(namespaces) = cp_scope.explicit_namespaces() {
+                let bound = bundle.bound_namespaces();
+                let unreachable: Vec<&str> = namespaces
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|namespace| !bound.contains(namespace))
+                    .collect();
+                if !unreachable.is_empty() {
+                    warn!(
+                        "CP/DP trust bundle binds no verification credential to {} served \
+                         namespace(s): [{}]. Data planes in those namespaces cannot subscribe \
+                         until a credential is bound to them.",
+                        unreachable.len(),
+                        unreachable.join(", ")
+                    );
+                }
+            }
+            // The legacy secret stays optional here: with a trust bundle
+            // configured it is no longer an authorization input, and CP mode
+            // mints nothing with it. Every server builder below is seeded with
+            // it purely so the pre-`.verifier(..)` shape stays uniform; the
+            // seeded `SharedSecret` arm is replaced before any request is
+            // served. An absent secret therefore leaves that seed empty, which
+            // `CpDpVerifier::with_decoding_key` refuses outright rather than
+            // verifying against an empty HS256 key.
+            //
+            // In particular this is NOT the cross-cluster remote-discovery
+            // minting key. That minting happens on a mesh-mode node
+            // (`modes::mesh` → `multicluster::fetch_remote_slice`).
+            // `FERRUM_MESH_CLUSTER_AUDIENCE` on a control plane is the
+            // *receiving* side's identity — it selects the audience policy this
+            // CP requires of inbound remote-discovery subscriptions, which the
+            // trust bundle verifies on its own. See the log below.
+            let seed_secret = env_config.cp_dp_grpc_jwt_secret.clone().unwrap_or_default();
+            (seed_secret, CpDpVerifier::TrustBundle(bundle))
+        }
+        None => {
+            let secret = match env_config.cp_dp_grpc_jwt_secret.clone() {
+                Some(secret) if !secret.is_empty() => secret,
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "FERRUM_CP_DP_GRPC_JWT_SECRET must be set and non-empty in control plane \
+                         mode unless FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH is configured. Without \
+                         either, any client can forge valid gRPC authentication tokens."
+                    ));
+                }
+            };
+            (secret.clone(), CpDpVerifier::SharedSecret(secret))
         }
     };
+    cp_dp_verifier
+        .validate_for_scope(cp_scope.requires_namespace_claim_by_default())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    info!(
+        "CP/DP gRPC namespace authorization source: {}",
+        cp_dp_verifier.describe()
+    );
+    let cp_dp_verifier = Arc::new(cp_dp_verifier);
 
     // Create gRPC server with shared DP node registry. The expected JWT
     // issuer and namespace are threaded in from EnvConfig: DPs must mint
@@ -1955,6 +2059,7 @@ pub async fn run(
     let (grpc_server, update_tx) = CpGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
         .channel_capacity(env_config.cp_broadcast_channel_capacity)
         .registry(dp_registry.clone())
+        .verifier(cp_dp_verifier.clone())
         .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
         .scope(cp_scope.clone())
         .require_ns_claim(env_config.cp_require_namespace_claim)
@@ -1965,6 +2070,7 @@ pub async fn run(
         MeshGrpcServer::builder(config_arc.clone(), grpc_secret.clone())
             .channel_capacity(env_config.cp_broadcast_channel_capacity)
             .registry(mesh_registry.clone())
+            .verifier(cp_dp_verifier.clone())
             .expected_issuer(env_config.cp_dp_grpc_jwt_issuer.clone())
             .namespace(env_config.namespace.clone())
             .scope(cp_scope.clone())
@@ -2003,6 +2109,7 @@ pub async fn run(
             .with_sidecar_enforcement_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .with_sidecar_identity_narrowing(env_config.mesh_sidecar_identity_narrowing)
             .with_cluster_domain(env_config.k8s_cluster_domain.clone())
+            .with_verifier(cp_dp_verifier.clone())
             .with_scope(cp_scope.clone())
             .with_require_namespace_claim(env_config.cp_require_namespace_claim)
             .with_namespace_broadcasts(broadcasts.clone())

@@ -157,12 +157,26 @@ pub async fn run(
             cp_urls.len()
         );
     }
+    // Advisory GHSA-3f2j-wwqw-grmg: with `FERRUM_DP_CP_GRPC_TOKEN_FILE` this DP
+    // presents an externally issued token and holds no signing key at all, so
+    // the shared secret is optional. Otherwise it self-mints and stamps
+    // `FERRUM_CP_DP_GRPC_JWT_KEY_ID` so a trust-bundle CP can select this
+    // tenant's namespace-bound verification credential.
     let jwt_secret = crate::grpc::dp_client::GrpcJwtSecret::with_issuer(
-        env_config.cp_dp_grpc_jwt_secret.clone().ok_or_else(|| {
-            anyhow::anyhow!("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode")
-        })?,
+        match env_config.cp_dp_grpc_jwt_secret.clone() {
+            Some(secret) => secret,
+            None if env_config.dp_cp_grpc_token_file.is_some() => String::new(),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode unless \
+                     FERRUM_DP_CP_GRPC_TOKEN_FILE supplies an externally issued token"
+                ));
+            }
+        },
         env_config.cp_dp_grpc_jwt_issuer.clone(),
-    );
+    )
+    .with_key_id(env_config.cp_dp_grpc_jwt_key_id.clone())
+    .with_token_file(env_config.dp_cp_grpc_token_file.clone());
 
     // Build DP gRPC TLS config if any TLS settings are provided.
     let dp_grpc_tls =

@@ -11,6 +11,7 @@
 pub mod auth;
 pub mod configsync_lifecycle;
 pub mod cp_server;
+pub mod cp_trust;
 pub mod dp_client;
 pub mod mesh_registry;
 pub mod mesh_server;

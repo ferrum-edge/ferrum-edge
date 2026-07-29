@@ -730,7 +730,25 @@ Validation: fail render on missing/unsafe configuration.
 {{- $grpc := .Values.grpc | default dict -}}
 {{- $tlsAll := .Values.tls | default dict -}}
 {{- if eq $mode "cp" -}}
+{{/* Advisory GHSA-3f2j-wwqw-grmg: the fleet-wide grpc.jwtSecret is handed to the
+     very data planes it authorizes, so it cannot separate tenants. A CP serving
+     more than one namespace (cp.namespaces naming a set, or "*") REFUSES TO
+     START without cp.trustBundlePath (src/modes/control_plane.rs). Mirror that
+     at render so the failure is a helm error, not a crash-looping pod. */}}
+{{- $cpTrustBundle := (.Values.cp | default dict).trustBundlePath | default "" -}}
+{{- $cpNsList := compact (splitList "," ((.Values.cp | default dict).namespaces | default "" | replace " " "")) -}}
+{{- $cpMultiNamespace := or (has "*" $cpNsList) (gt (len $cpNsList) 1) -}}
+{{- if and $cpMultiNamespace (not $cpTrustBundle) -}}
+{{- fail (printf "cp.namespaces=%q makes this a multi-namespace control plane, which refuses to start with only grpc.jwtSecret: that value is distributed to the data planes it would authorize, so any tenant holding it can re-sign the JWT `ns` claim and subscribe to another tenant (advisory GHSA-3f2j-wwqw-grmg). Set cp.trustBundlePath to a mounted JSON bundle of namespace-bound verification credentials (see docs/cp_namespace_tenancy.md), or serve one namespace per CP." (.Values.cp.namespaces | default "")) -}}
+{{- end -}}
+{{/* With a trust bundle the verification credentials live in the bundle, so the
+     shared secret is optional (it stays permitted for cross-cluster mesh remote
+     discovery, which still self-mints an audience-bound token). */}}
+{{- if $cpTrustBundle -}}
+{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" ($grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET" "optional" true) -}}
+{{- else -}}
 {{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" ($grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET") -}}
+{{- end -}}
 {{/* The binary rejects a non-loopback PLAINTEXT CP gRPC bind (no TLS) unless
      FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true (src/config/env_config.rs). */}}
 {{- $cpBind := .Values.cp.grpcBindAddress | default "0.0.0.0" -}}
@@ -768,7 +786,14 @@ Validation: fail render on missing/unsafe configuration.
 {{- end -}}
 {{- end -}}
 {{- if eq $mode "dp" -}}
+{{/* A DP presenting an externally issued token (dp.cpGrpcTokenFile) holds no
+     signing key at all — the preferred posture under GHSA-3f2j-wwqw-grmg — so
+     the shared secret is optional there. */}}
+{{- if (.Values.dp | default dict).cpGrpcTokenFile -}}
+{{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" ($grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET" "optional" true) -}}
+{{- else -}}
 {{- include "ferrum-gateway.validateOneSource" (dict "label" "grpc.jwtSecret" "source" ($grpc.jwtSecret | default dict) "minLength" 32 "root" . "envName" "FERRUM_CP_DP_GRPC_JWT_SECRET") -}}
+{{- end -}}
 {{- if not .Values.dp.cpGrpcUrls -}}
 {{- fail "dp.cpGrpcUrls is required for mode=dp (comma-separated CP gRPC URLs, e.g. https://ferrum-cp:50051)" -}}
 {{- end -}}
@@ -922,7 +947,7 @@ Env assembly.
      probes, Services, ports, or Secret wiring from the running process, so both
      env passthroughs reject them. Keep this list the single source of truth. */}}
 {{- define "ferrum-gateway.reservedEnv" -}}
-FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
+FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRET FERRUM_CP_DP_GRPC_JWT_SECRET FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT FERRUM_DP_CP_GRPC_URLS FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS FERRUM_CP_GRPC_LISTEN_ADDR FERRUM_CP_NAMESPACES FERRUM_CP_REQUIRE_NAMESPACE_CLAIM FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH FERRUM_CP_DP_GRPC_JWT_KEY_ID FERRUM_DP_CP_GRPC_TOKEN_FILE FERRUM_FILE_CONFIG_PATH FERRUM_PROXY_HTTP_PORT FERRUM_PROXY_HTTPS_PORT FERRUM_ADMIN_HTTP_PORT FERRUM_ADMIN_HTTPS_PORT FERRUM_ADMIN_BIND_ADDRESS FERRUM_ADMIN_ALLOWED_CIDRS FERRUM_ALLOW_INSECURE_ADMIN_HTTP FERRUM_SHUTDOWN_DRAIN_SECONDS FERRUM_FRONTEND_TLS_CERT_PATH FERRUM_FRONTEND_TLS_KEY_PATH FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_ADMIN_TLS_CERT_PATH FERRUM_ADMIN_TLS_KEY_PATH FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH FERRUM_BACKEND_TLS_CLIENT_CERT_PATH FERRUM_BACKEND_TLS_CLIENT_KEY_PATH FERRUM_CP_GRPC_TLS_CERT_PATH FERRUM_CP_GRPC_TLS_KEY_PATH FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH FERRUM_DP_GRPC_TLS_CA_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_CERT_PATH FERRUM_DP_GRPC_TLS_CLIENT_KEY_PATH
 {{- end -}}
 
 {{- define "ferrum-gateway.modeEnv" -}}
@@ -958,6 +983,10 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 - name: FERRUM_CP_REQUIRE_NAMESPACE_CLAIM
   value: "true"
 {{- end }}
+{{- if .Values.cp.trustBundlePath }}
+- name: FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH
+  value: {{ .Values.cp.trustBundlePath | quote }}
+{{- end }}
 {{- end }}
 {{- if eq $mode "dp" }}
 - name: FERRUM_DP_CP_GRPC_URLS
@@ -972,6 +1001,14 @@ FERRUM_MODE FERRUM_NAMESPACE FERRUM_DB_TYPE FERRUM_DB_URL FERRUM_ADMIN_JWT_SECRE
 - name: FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS
   value: {{ .Values.dp.failoverPrimaryRetrySeconds | quote }}
 {{- end }}
+{{- if .Values.dp.cpGrpcTokenFile }}
+- name: FERRUM_DP_CP_GRPC_TOKEN_FILE
+  value: {{ .Values.dp.cpGrpcTokenFile | quote }}
+{{- end }}
+{{- end }}
+{{- if and (eq $mode "dp") (.Values.grpc | default dict).jwtKeyId }}
+- name: FERRUM_CP_DP_GRPC_JWT_KEY_ID
+  value: {{ .Values.grpc.jwtKeyId | quote }}
 {{- end }}
 {{- if and (or (eq $mode "cp") (eq $mode "dp")) (.Values.grpc | default dict).allowPlaintext }}
 - name: FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT
