@@ -9188,11 +9188,23 @@ def ci_fuzz_smoke_aggregate_wiring(contents: str, source: str) -> FuzzAggregateW
     )
     if failures:
         return FuzzAggregateWiring("invalid", contents, failures)
-    if block is None:
-        return FuzzAggregateWiring("absent", contents, [])
-    if not any(
+    has_admitted_job = CI_FUZZ_SMOKE_JOB_NAME in admitted_ci_job_names(
+        contents, source
+    )
+    has_wiring = block is not None and any(
         added in block for _, _, added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS
-    ):
+    )
+    if not has_wiring and has_admitted_job:
+        return FuzzAggregateWiring(
+            "invalid",
+            contents,
+            [
+                f"{source} carries the admitted {CI_FUZZ_SMOKE_JOB_NAME!r} job, "
+                f"so the {CI_AGGREGATE_JOB_NAME!r} aggregate must carry all of "
+                "its admitted required-gate wiring"
+            ],
+        )
+    if not has_wiring:
         return FuzzAggregateWiring("absent", contents, [])
 
     errors: list[str] = []
@@ -9214,7 +9226,7 @@ def ci_fuzz_smoke_aggregate_wiring(contents: str, source: str) -> FuzzAggregateW
             )
             continue
         withheld = withheld.replace(anchor + added, anchor, 1)
-    if CI_FUZZ_SMOKE_JOB_NAME not in admitted_ci_job_names(contents, source):
+    if not has_admitted_job:
         errors.append(
             f"{source} job {CI_AGGREGATE_JOB_NAME!r} requires the "
             f"{CI_FUZZ_SMOKE_JOB_NAME!r} gate, so that job must be present and "
@@ -22552,6 +22564,13 @@ pre_build = []
         + CI_FUZZ_SMOKE_JOB
         + aggregate_wired_job
     )
+    aggregate_job_only = (
+        aggregate_prologue
+        + aggregate_planner_job
+        + aggregate_lint_job
+        + CI_FUZZ_SMOKE_JOB
+        + aggregate_job
+    )
     aggregate_surfaces, aggregate_surface_failures = pr_workflow_job_surfaces(
         aggregate_baseline,
         "self-test CI workflow",
@@ -22570,6 +22589,25 @@ pre_build = []
         "self-test CI workflow",
     ) != FuzzAggregateWiring("absent", aggregate_baseline, []):
         failures.append("an unadopted aggregate was not read as absent wiring")
+    job_only_wiring = ci_fuzz_smoke_aggregate_wiring(
+        aggregate_job_only,
+        "self-test CI workflow",
+    )
+    if job_only_wiring.state != "invalid" or not job_only_wiring.errors:
+        failures.append(
+            "the admitted fuzz-smoke job was accepted without its required "
+            "aggregate wiring"
+        )
+    if not compare_pr_workflow_job(
+        aggregate_baseline,
+        aggregate_job_only,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "initial adoption of the byte-frozen fuzz job without its required "
+            "aggregate wiring was not rejected"
+        )
     adopted_wiring = ci_fuzz_smoke_aggregate_wiring(
         aggregate_adopted,
         "self-test CI workflow",
