@@ -153,8 +153,9 @@ async fn mesh_l7_routing_istio_query_match_sets_route_override() {
         "GET".to_string(),
         "/search?variant=beta".to_string(),
     );
-    ctx.query_params
-        .insert("variant".to_string(), "beta".to_string());
+    // Query predicates read the canonical decoding of the forwarded query, not
+    // the lossy single-value map (GHSA-j2j6-f9c7-hh85 / GHSA-gr4p-3qw3-87r5).
+    ctx.set_raw_query_string("variant=beta".to_string());
     assert!(matches!(
         dispatch.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue

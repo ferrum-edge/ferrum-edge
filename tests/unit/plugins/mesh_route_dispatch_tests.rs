@@ -1842,3 +1842,194 @@ mod grpc_route_predicate_dispatch {
         );
     }
 }
+
+// --- Query predicates are fail-closed and read the forwarded query
+// (advisories GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5).
+
+fn query_rule_plugin() -> MeshRouteDispatch {
+    MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"query_params": {"tenant": "admin"}},
+            "destination": {"upstream_id": "privileged"}
+        }],
+        "reject_unmatched": true
+    }))
+    .expect("valid query-predicate dispatch config")
+}
+
+fn ctx_with_query(raw_query: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    ctx.set_raw_query_string(raw_query.to_string());
+    ctx
+}
+
+async fn dispatch(plugin: &MeshRouteDispatch, ctx: &mut RequestContext) -> PluginResult {
+    let mut headers = HashMap::new();
+    plugin.before_proxy(ctx, &mut headers).await
+}
+
+#[tokio::test]
+async fn query_predicate_matches_on_the_forwarded_query() {
+    let mut ctx = ctx_with_query("tenant=admin");
+    assert!(matches!(
+        dispatch(&query_rule_plugin(), &mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.route_override_upstream_id.as_deref(),
+        Some("privileged")
+    );
+}
+
+#[tokio::test]
+async fn duplicate_query_name_is_rejected_before_any_rule_runs() {
+    // GHSA-j2j6-f9c7-hh85 reproduction: last-value-wins would select the
+    // privileged route on `admin` while a first-value-wins backend executes
+    // `victim`. Neither route may be selected.
+    let mut ctx = ctx_with_query("tenant=victim&tenant=admin");
+    match dispatch(&query_rule_plugin(), &mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected a 400 reject, got {other:?}"),
+    }
+    assert!(
+        ctx.route_override_upstream_id.is_none(),
+        "no route override may be published for an ambiguous query"
+    );
+}
+
+#[tokio::test]
+async fn percent_encoded_duplicate_alias_is_rejected() {
+    let mut ctx = ctx_with_query("tenant=victim&%74enant=admin");
+    match dispatch(&query_rule_plugin(), &mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected a 400 reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn bare_and_valued_pair_of_one_name_is_rejected() {
+    let mut ctx = ctx_with_query("tenant&tenant=admin");
+    match dispatch(&query_rule_plugin(), &mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected a 400 reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn literal_plus_query_is_rejected() {
+    // GHSA-gr4p-3qw3-87r5 reproduction: Ferrum would route on the literal
+    // `public+api` while a form-decoding backend executes `public api`.
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"query_params": {"scope": "public+api"}},
+            "destination": {"upstream_id": "public"}
+        }]
+    }))
+    .expect("valid config");
+    let mut ctx = ctx_with_query("scope=public+api");
+    match dispatch(&plugin, &mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected a 400 reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn percent_encoded_space_and_plus_route_normally() {
+    // `%20`/`%2B` are unambiguous, so the inverse policy stays routable.
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"query_params": {"scope": "public api"}},
+            "destination": {"upstream_id": "public"}
+        }]
+    }))
+    .expect("valid config");
+    let mut ctx = ctx_with_query("scope=public%20api");
+    assert!(matches!(
+        dispatch(&plugin, &mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("public"));
+}
+
+#[tokio::test]
+async fn malformed_percent_encoding_is_rejected() {
+    let mut ctx = ctx_with_query("tenant=%zz");
+    match dispatch(&query_rule_plugin(), &mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 400),
+        other => panic!("expected a 400 reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn empty_segments_do_not_make_a_query_ambiguous() {
+    let mut ctx = ctx_with_query("&tenant=admin&&");
+    assert!(matches!(
+        dispatch(&query_rule_plugin(), &mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.route_override_upstream_id.as_deref(),
+        Some("privileged")
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_query_is_ignored_when_no_rule_declares_a_query_predicate() {
+    // A dispatch config that does not route on the query must be completely
+    // unaffected — no decode, no rejection.
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"upstream_id": "canary"}
+        }]
+    }))
+    .expect("valid config");
+    let mut ctx = ctx_with_query("tenant=victim&tenant=admin&x=a+b");
+    assert!(matches!(
+        dispatch(&plugin, &mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(ctx.route_override_upstream_id.as_deref(), Some("canary"));
+}
+
+#[tokio::test]
+async fn query_predicates_ignore_the_lossy_shared_map() {
+    // The single-value map is protocol-dependent (H3 materializes raw values
+    // by default). Predicates must not read it, so a map entry with no
+    // matching forwarded pair cannot select the privileged route.
+    let mut ctx = ctx_with_query("tenant=guest");
+    ctx.query_params
+        .insert("tenant".to_string(), "admin".to_string());
+    match dispatch(&query_rule_plugin(), &mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 404),
+        other => panic!("expected the unmatched 404, got {other:?}"),
+    }
+    assert!(ctx.route_override_upstream_id.is_none());
+}
+
+#[tokio::test]
+async fn query_predicate_reads_the_credential_stripped_query() {
+    // An authentication-owned strip changes what the backend receives, so it
+    // must also change what the predicate evaluates.
+    let plugin = MeshRouteDispatch::new(&json!({
+        "rules": [{
+            "match": {"query_params": {"token": "secret"}},
+            "destination": {"upstream_id": "privileged"}
+        }],
+        "reject_unmatched": true
+    }))
+    .expect("valid config");
+    let mut ctx = ctx_with_query("token=secret");
+    ctx.metadata.insert(
+        "auth.strip_query_param.token".to_string(),
+        "true".to_string(),
+    );
+    match dispatch(&plugin, &mut ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 404),
+        other => panic!("expected the unmatched 404, got {other:?}"),
+    }
+}

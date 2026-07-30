@@ -61,6 +61,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 
 use crate::config::types::{
     BackendTlsConfig, BackoffStrategy, MAX_BACKEND_HOST_LENGTH,
@@ -77,6 +78,7 @@ use crate::plugins::mesh::authz::{
     NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA, NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA,
 };
 use crate::plugins::utils::fault_roll::{FaultRoller, MAX_FAULT_DELAY_MS};
+use crate::plugins::utils::query::{CanonicalQuery, canonical_query_for_policy};
 use crate::plugins::utils::route_header_transform::{
     RawRouteHeaderTransformRule, RouteHeaderTransformRule, parse_route_header_transforms,
 };
@@ -814,8 +816,17 @@ pub struct MatchCriteria {
     #[serde(default)]
     pub headers: HashMap<String, HeaderMatchOp>,
     /// Query parameter equality matches (all-of). Names and values match
-    /// exactly after percent-decoding (the gateway materializes
-    /// `ctx.query_params` from the raw query string).
+    /// exactly after percent-decoding the backend-bound query representation
+    /// available at this dispatch hook, including authentication-owned
+    /// credential strips and any priority-overridden query transformer that
+    /// already ran. A later route/request transform remains an intentional,
+    /// separately ordered operation.
+    ///
+    /// A request whose query cannot be decoded to one such value is rejected
+    /// with 400 before any rule is evaluated: a repeated or percent-encoded
+    /// duplicate name, a literal `+` (RFC 3986 plus vs form-urlencoded space),
+    /// malformed percent-encoding, or a non-UTF-8 decoding. See
+    /// [`crate::plugins::utils::query::CanonicalQuery`].
     #[serde(default)]
     pub query_params: HashMap<String, String>,
     /// Source workload Kubernetes namespace (exact match). Resolved from the
@@ -1432,14 +1443,23 @@ fn default_redirect_code() -> u16 {
 pub struct MeshRouteDispatch {
     config: MeshRouteDispatchConfig,
     aggregate_reject_unmatched: AtomicBool,
+    /// Whether any rule declares a `query_params` predicate. Precomputed at
+    /// config load so the hot path never rescans the rule list, and so a
+    /// dispatch config that does not route on the query costs nothing.
+    has_query_predicates: bool,
 }
 
 impl MeshRouteDispatch {
     pub fn new(config: &serde_json::Value) -> Result<Self, String> {
         let parsed = MeshRouteDispatchConfig::from_value_normalized(config)?;
+        let has_query_predicates = parsed
+            .rules
+            .iter()
+            .any(|rule| !rule.match_.query_params.is_empty());
         Ok(Self {
             config: parsed,
             aggregate_reject_unmatched: AtomicBool::new(false),
+            has_query_predicates,
         })
     }
 
@@ -1768,11 +1788,13 @@ impl Plugin for MeshRouteDispatch {
         HTTP_FAMILY_PROTOCOLS
     }
 
+    /// Query predicates are evaluated against the canonical decoding of the
+    /// forwarded query, not `ctx.query_params`, so routing is already
+    /// H1/H2/H3-identical. This stays keyed on query predicates so the shared
+    /// map other plugins on the proxy see is decoded whenever this plugin
+    /// routes on the query.
     fn requires_decoded_query_params(&self) -> bool {
-        self.config
-            .rules
-            .iter()
-            .any(|rule| !rule.match_.query_params.is_empty())
+        self.has_query_predicates
     }
 
     fn modifies_request_headers(&self) -> bool {
@@ -1806,8 +1828,32 @@ impl Plugin for MeshRouteDispatch {
         {
             return PluginResult::Continue;
         }
+        // Query predicates select a backend, so they are a security decision.
+        // Decode the exact bytes this request will forward and fail closed if
+        // that decoding is not the one the backend is guaranteed to read —
+        // otherwise a route can be selected under `tenant=admin` while the
+        // application executes `tenant=victim` (advisories
+        // GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5). A dispatch config with no
+        // query predicates never reaches this and is completely unaffected.
+        let canonical_query = if self.has_query_predicates {
+            let query = canonical_query_for_policy(ctx);
+            if let Some(ambiguity) = query.first_ambiguity() {
+                // Fixed-cardinality reason only — the query is
+                // attacker-controlled and may carry credentials.
+                warn!(
+                    plugin = "mesh_route_dispatch",
+                    reason = "ambiguous_query",
+                    ambiguity = ambiguity.reason(),
+                    "Refusing to route on a query that the backend is not guaranteed to decode identically"
+                );
+                return reject_ambiguous_query_result();
+            }
+            Some(query)
+        } else {
+            None
+        };
         for rule in &self.config.rules {
-            if rule_matches(rule, ctx, headers) {
+            if rule_matches(rule, ctx, headers, canonical_query.as_ref()) {
                 ctx.mesh_route_dispatch_matched = true;
                 // Per-rule redirect (Istio `http[].redirect`): answer the
                 // request ourselves with a 3xx + `Location`. Highest
@@ -1919,6 +1965,18 @@ impl Plugin for MeshRouteDispatch {
             return reject_unmatched_result();
         }
         PluginResult::Continue
+    }
+}
+
+/// Fail-closed answer for a request whose query cannot be decoded to one value
+/// both this dispatcher and the backend must read. 400 rather than 404: the
+/// request itself is unprocessable, and a 404 would be indistinguishable from
+/// an ordinary no-route-matched outcome.
+pub(crate) fn reject_ambiguous_query_result() -> PluginResult {
+    PluginResult::Reject {
+        status_code: 400,
+        body: "ambiguous query parameters for mesh_route_dispatch predicates".to_string(),
+        headers: HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
     }
 }
 
@@ -2266,7 +2324,12 @@ async fn apply_fault_action(
     None
 }
 
-fn rule_matches(rule: &RouteRule, ctx: &RequestContext, headers: &HashMap<String, String>) -> bool {
+fn rule_matches(
+    rule: &RouteRule,
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+    canonical_query: Option<&CanonicalQuery>,
+) -> bool {
     let m = &rule.match_;
     if m.is_empty() {
         // Empty match means "match all". `normalize_and_validate` accepts
@@ -2312,10 +2375,19 @@ fn rule_matches(rule: &RouteRule, ctx: &RequestContext, headers: &HashMap<String
             _ => return false,
         }
     }
-    for (name, expected) in &m.query_params {
-        match ctx.query_params.get(name.as_str()) {
-            Some(actual) if actual == expected => {}
-            _ => return false,
+    if !m.query_params.is_empty() {
+        // The caller supplies the canonical query whenever any rule declares a
+        // query predicate, and has already failed the request closed if that
+        // decoding was ambiguous. An absent view here means no rule declared a
+        // predicate, so a rule that does declare one cannot match.
+        let Some(query) = canonical_query else {
+            return false;
+        };
+        for (name, expected) in &m.query_params {
+            match query.get(name.as_str()) {
+                Some(actual) if actual == expected => {}
+                _ => return false,
+            }
         }
     }
     if let Some(expected_ns) = m.source_namespace.as_deref() {
@@ -2909,8 +2981,8 @@ mod tests {
         }))
         .unwrap();
         let mut ctx = ctx_with("GET", "/api");
-        ctx.query_params
-            .insert("variant".to_string(), "beta".to_string());
+        // Predicates read the forwarded query, not the lossy shared map.
+        ctx.set_raw_query_string("variant=beta".to_string());
         let mut headers = HashMap::new();
         let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert_eq!(

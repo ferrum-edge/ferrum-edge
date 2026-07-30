@@ -73,6 +73,7 @@ use tracing::{debug, info, warn};
 use url::{Host, Url};
 
 use super::utils::aws_sigv4;
+use super::utils::query::{QueryAmbiguity, canonical_query_for_policy, has_valid_percent_triplets};
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
@@ -1067,50 +1068,40 @@ fn reject_encoded_request_body(
 fn unambiguous_query_params(
     ctx: &RequestContext,
 ) -> Result<serde_json::Map<String, Value>, InvocationFailure> {
-    // Start from the same canonical backend-visible query primary dispatch
-    // uses: transformer-published outbound query (when present) composed with
-    // authentication-owned credential strips. That representation already
-    // honors operator query transforms without resurrecting stripped secrets.
-    let mut ordered = BTreeMap::new();
-    let effective_query = crate::proxy::effective_backend_query_string(ctx);
-    if !effective_query.is_empty() {
-        for pair in effective_query.split('&').filter(|pair| !pair.is_empty()) {
-            let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-            if raw_key.contains('+') || raw_value.contains('+') {
-                return Err(InvocationFailure::governed_input(
-                    "ambiguous_query_encoding",
-                    "query forwarding rejected a raw '+' character",
-                ));
-            }
-            if !has_valid_percent_triplets(raw_key) || !has_valid_percent_triplets(raw_value) {
-                return Err(InvocationFailure::governed_input(
-                    "invalid_query_encoding",
-                    "query forwarding rejected malformed percent encoding",
-                ));
-            }
-            let key = percent_decode_str(raw_key).decode_utf8().map_err(|_| {
-                InvocationFailure::governed_input(
-                    "invalid_query_encoding",
-                    "query parameter name was not valid percent-encoded UTF-8",
-                )
-            })?;
-            let value = percent_decode_str(raw_value).decode_utf8().map_err(|_| {
-                InvocationFailure::governed_input(
-                    "invalid_query_encoding",
-                    "query parameter value was not valid percent-encoded UTF-8",
-                )
-            })?;
-            if ordered
-                .insert(key.into_owned(), value.into_owned())
-                .is_some()
-            {
-                return Err(InvocationFailure::governed_input(
-                    "duplicate_query_parameter",
-                    "query forwarding rejected a duplicate decoded parameter name",
-                ));
-            }
-        }
-    } else if ctx.raw_query_string().is_none()
+    // Decode the exact backend-visible bytes — transformer-published outbound
+    // query (when present) composed with authentication-owned credential
+    // strips — through the same shared canonicalizer OPA and
+    // `mesh_route_dispatch` use, so a delegated pre-proxy decision can never be
+    // made on a value different from the one the backend executes (advisories
+    // GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5).
+    let canonical = canonical_query_for_policy(ctx);
+    if let Some(ambiguity) = canonical.first_ambiguity() {
+        // Fixed-cardinality classes; never echo query bytes.
+        return Err(match ambiguity {
+            QueryAmbiguity::LiteralPlus => InvocationFailure::governed_input(
+                "ambiguous_query_encoding",
+                "query forwarding rejected a raw '+' character",
+            ),
+            QueryAmbiguity::MalformedPercentEncoding => InvocationFailure::governed_input(
+                "invalid_query_encoding",
+                "query forwarding rejected malformed percent encoding",
+            ),
+            QueryAmbiguity::NonUtf8Name => InvocationFailure::governed_input(
+                "invalid_query_encoding",
+                "query parameter name was not valid percent-encoded UTF-8",
+            ),
+            QueryAmbiguity::NonUtf8Value => InvocationFailure::governed_input(
+                "invalid_query_encoding",
+                "query parameter value was not valid percent-encoded UTF-8",
+            ),
+            QueryAmbiguity::DuplicateName => InvocationFailure::governed_input(
+                "duplicate_query_parameter",
+                "query forwarding rejected a duplicate decoded parameter name",
+            ),
+        });
+    }
+    if canonical.is_empty()
+        && ctx.raw_query_string().is_none()
         && ctx.outbound_query_string().is_none()
         && !ctx.query_params.is_empty()
     {
@@ -1119,29 +1110,18 @@ fn unambiguous_query_params(
             "query parameters were materialized without their original encoded representation",
         ));
     }
+    // Sorted by decoded name for a stable payload. Safe only because the
+    // canonical query is unambiguous here: every name occurs exactly once, so
+    // reordering cannot pick a different value than the backend executes.
+    let ordered: BTreeMap<&str, &str> = canonical
+        .params()
+        .iter()
+        .map(|param| (param.name.as_str(), param.value.as_str()))
+        .collect();
     Ok(ordered
         .into_iter()
-        .map(|(key, value)| (key, Value::String(value)))
+        .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
         .collect())
-}
-
-fn has_valid_percent_triplets(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len()
-                || !bytes[index + 1].is_ascii_hexdigit()
-                || !bytes[index + 2].is_ascii_hexdigit()
-            {
-                return false;
-            }
-            index += 3;
-        } else {
-            index += 1;
-        }
-    }
-    true
 }
 
 #[derive(Clone)]
@@ -2739,6 +2719,16 @@ impl Plugin for ServerlessFunction {
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.requires_body
+    }
+
+    /// The invocation payload itself is built from the canonical decoding of
+    /// the forwarded query, so it is already identical on H1/H2/H3. This opts
+    /// the proxy's shared `ctx.query_params` map into the decoded form as well,
+    /// so a query-forwarding function and the rest of its plugin chain never
+    /// see one representation on H1/H2 and a raw percent-escaped one on H3
+    /// (advisory GHSA-gr4p-3qw3-87r5).
+    fn requires_decoded_query_params(&self) -> bool {
+        self.forward_query_params
     }
 
     fn should_buffer_request_body(&self, _ctx: &RequestContext) -> bool {

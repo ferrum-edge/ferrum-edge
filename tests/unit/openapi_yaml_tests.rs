@@ -5860,6 +5860,26 @@ fn opa_schema_matches_runtime_validation_contract() {
         .insert("decision_pointr".to_string(), json!(["result", "allow"]));
     assert_component_validity(&spec, "OpaPluginConfig", &unknown, false);
 
+    // The query-ambiguity posture is fail-closed by default and its value set
+    // is closed, matching `QueryAmbiguityPolicy::parse` (advisories
+    // GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5).
+    assert_eq!(
+        component.pointer("/properties/query_ambiguity_policy/default"),
+        Some(&json!("reject"))
+    );
+    assert_eq!(
+        component.pointer("/properties/query_ambiguity_policy/enum"),
+        Some(&json!(["reject", "delegate"]))
+    );
+    for (value, valid) in [("reject", true), ("delegate", true), ("allow", false)] {
+        let mut policy = base.clone();
+        policy
+            .as_object_mut()
+            .expect("OPA test config is an object")
+            .insert("query_ambiguity_policy".to_string(), json!(value));
+        assert_component_validity(&spec, "OpaPluginConfig", &policy, valid);
+    }
+
     for field in ["max_response_bytes", "max_body_bytes"] {
         let mut zero = base.clone();
         zero.as_object_mut()

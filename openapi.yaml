@@ -15870,7 +15870,19 @@ components:
                     type: object
                     additionalProperties:
                       type: string
-                    description: Query parameter equality matches (all-of). Decoded after percent-decoding.
+                    description: >-
+                      Query parameter equality matches (all-of), compared after
+                      percent-decoding the backend-bound query representation
+                      available at the dispatch hook, including
+                      authentication-owned credential strips and any
+                      priority-overridden request_transformer that already ran.
+                      A deliberately later route/request transform remains a
+                      separate ordered operation. A request whose query cannot
+                      be decoded to one value is rejected with 400 before any
+                      rule is evaluated: a repeated or percent-encoded duplicate
+                      name, a literal '+' (RFC 3986 plus vs form-urlencoded
+                      space), malformed percent-encoding, or a non-UTF-8
+                      decoding.
                   uri:
                     description: |
                       Optional URI predicate (Istio `StringMatch` shape).
@@ -17403,16 +17415,19 @@ components:
           type: boolean
           default: true
           description: >-
-            Include decoded, non-redacted query parameters as input.query.
-            Present query parameters configured as authentication credential
-            locations are omitted by default.
+            Include the backend-bound request query as input.query (a flat
+            decoded map, emitted only when unambiguous), input.query_pairs (an
+            ordered, occurrence-complete pair list), and
+            input.query_ambiguity (fixed-cardinality ambiguity
+            classifications). Present query parameters configured as
+            authentication credential locations are omitted by default.
         include_query_credentials:
           type: boolean
           default: false
           description: >-
             Unsafe opt-in to include built-in and authentication-plugin-marked
-            query credentials in input.query. Keys listed in redact_query_keys
-            remain redacted.
+            query credentials in input.query and input.query_pairs. Keys
+            listed in redact_query_keys remain redacted from both views.
         include_headers:
           type: boolean
           default: true
@@ -17442,17 +17457,30 @@ components:
         include_service:
           type: boolean
           default: true
-        reject_duplicate_query_keys:
-          type: boolean
-          default: true
+        query_ambiguity_policy:
+          type: string
+          enum:
+            - reject
+            - delegate
+          default: reject
           description: >-
-            When include_query is enabled, reject requests whose query string
-            contains duplicate keys with conflicting values (e.g. a=1&a=2) to
-            prevent OPA/backend authorization mismatch. Identical-value
-            duplicates (a=1&a=1) are allowed. Rejection uses the configured
-            deny_status and deny_body. Set to false for APIs that use
-            array-style repeated query keys, or disable include_query entirely
-            to skip the check.
+            When include_query is enabled, controls what happens to a request
+            whose query cannot be decoded to one value OPA and the backend are
+            guaranteed to read identically: a duplicate decoded parameter name
+            (including a percent-encoded alias such as a=1&%61=2 or a bare/valued
+            pair such as flag&flag=1), a literal '+' (RFC 3986 plus vs
+            form-urlencoded space), malformed percent-encoding, or a non-UTF-8
+            decoding. 'reject' denies the request with the configured deny_status
+            and deny_body before calling OPA. 'delegate' calls OPA anyway and
+            lets the policy decide from the ordered, occurrence-complete
+            input.query_pairs array and the input.query_ambiguity
+            classifications; non-UTF-8 components are replacement-decoded and
+            explicitly classified. input.query is omitted in that case so no
+            rule can read from the flat map a value the backend does not
+            execute. Omission is not itself a denial: an undefined input.query
+            makes a deny-style Rego rule undefined rather than true, so a
+            'delegate' policy must deny on any input.query_ambiguity
+            classification it does not handle.
         redact_headers:
           type: array
           items:
@@ -17481,10 +17509,11 @@ components:
             minLength: 1
           default: []
           description: >-
-            Additional query parameter names to omit from input.query,
-            matched case-insensitively. Built-in credential names and query
-            locations marked by authentication plugins are already omitted
-            unless include_query_credentials is explicitly enabled.
+            Additional query parameter names to omit from input.query and
+            input.query_pairs, matched case-insensitively. Built-in credential
+            names and query locations marked by authentication plugins are
+            already omitted unless include_query_credentials is explicitly
+            enabled.
 
     AccessControlConfig:
       type: object
@@ -20536,7 +20565,7 @@ components:
         forward_query_params:
           type: boolean
           default: false
-          description: "Include decoded query parameters in the function payload after omitting credentials that an earlier auth plugin marked for backend stripping. Duplicate decoded names, invalid percent-encoded UTF-8, raw '+' ambiguity, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
+          description: "Include decoded query parameters from the shared canonical backend-bound query view in the function payload, after omitting credentials that an earlier auth plugin marked for backend stripping. Behavior is identical on HTTP/1.1, HTTP/2, and HTTP/3 and includes any earlier ordered query transform. Duplicate decoded names (including percent-encoded aliases and bare/valued pairs), literal '+', malformed percent-encoding, non-UTF-8 decodings, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
         timeout_ms:
           type: integer
           format: uint64

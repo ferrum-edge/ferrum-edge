@@ -20,6 +20,7 @@ use url::{Host, Url};
 
 use crate::retry::classify_reqwest_error;
 
+use super::utils::query::{CanonicalQuery, canonical_query_for_policy};
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
@@ -59,7 +60,7 @@ const OPA_CONFIG_KEYS: &[&str] = &[
     "include_consumer",
     "include_client_ip",
     "include_service",
-    "reject_duplicate_query_keys",
+    "query_ambiguity_policy",
     "redact_headers",
     "redact_query_keys",
 ];
@@ -125,9 +126,42 @@ pub struct Opa {
     include_consumer: bool,
     include_client_ip: bool,
     include_service: bool,
-    reject_duplicate_query_keys: bool,
+    query_ambiguity_policy: QueryAmbiguityPolicy,
     redact_headers: HashSet<String>,
     redact_query_keys: HashSet<String>,
+}
+
+/// What to do when the request query cannot be reduced to one decoded view
+/// that OPA and the backend are guaranteed to read identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryAmbiguityPolicy {
+    /// Deny the request before calling OPA. Default: a policy decision must
+    /// never be made on a value different from the one the backend executes.
+    Reject,
+    /// Call OPA anyway and let Rego decide, using the ordered occurrence list
+    /// in `input.query_pairs` plus the `input.query_ambiguity` classifications.
+    /// `input.query` is omitted for an ambiguous query so no rule can read a
+    /// flat value the backend may not execute.
+    ///
+    /// Omission is not itself a denial, and this mode moves that decision to
+    /// the operator by design: an `allow` rule that reads `input.query`
+    /// becomes undefined and denies, but the deny-list idiom
+    /// (`deny { input.query.x == "bad" }` with `allow { not deny }`) leaves
+    /// `deny` undefined and therefore allows. A `delegate` policy must deny
+    /// on a non-empty `input.query_ambiguity` it does not handle.
+    Delegate,
+}
+
+impl QueryAmbiguityPolicy {
+    fn parse(object: &Map<String, Value>) -> Result<Self, String> {
+        match parse_optional_string(object, "query_ambiguity_policy")?.as_deref() {
+            None | Some("reject") => Ok(Self::Reject),
+            Some("delegate") => Ok(Self::Delegate),
+            Some(_) => Err(
+                "opa: 'query_ambiguity_policy' must be one of 'reject' or 'delegate'".to_string(),
+            ),
+        }
+    }
 }
 
 impl Opa {
@@ -199,17 +233,17 @@ impl Opa {
             include_consumer: parse_optional_bool(object, "include_consumer")?.unwrap_or(true),
             include_client_ip: parse_optional_bool(object, "include_client_ip")?.unwrap_or(true),
             include_service: parse_optional_bool(object, "include_service")?.unwrap_or(true),
-            reject_duplicate_query_keys: parse_optional_bool(
-                object,
-                "reject_duplicate_query_keys",
-            )?
-            .unwrap_or(true),
+            query_ambiguity_policy: QueryAmbiguityPolicy::parse(object)?,
             redact_headers,
             redact_query_keys,
         })
     }
 
-    fn build_input(&self, ctx: &mut RequestContext) -> Map<String, Value> {
+    fn build_input(
+        &self,
+        ctx: &mut RequestContext,
+        query: Option<&CanonicalQuery>,
+    ) -> Map<String, Value> {
         let mut input = Map::new();
 
         if self.include_method {
@@ -218,9 +252,35 @@ impl Opa {
         if self.include_path {
             input.insert("path".to_string(), Value::String(ctx.path.clone()));
         }
-        if self.include_query {
-            ctx.materialize_query_params();
-            input.insert("query".to_string(), self.query_input(ctx));
+        if let Some(query) = query {
+            // `input.query` is the convenient flat view and is emitted only
+            // when the canonical decoding is the one the backend must also
+            // read. For an ambiguous query it is omitted entirely, so a Rego
+            // rule can never read from it a value the backend does not
+            // execute — the whole of both advisories. Under `delegate` the
+            // policy itself must still deny on a non-empty
+            // `input.query_ambiguity`; see `QueryAmbiguityPolicy::Delegate`.
+            if query.is_unambiguous() {
+                input.insert("query".to_string(), self.query_map_input(ctx, query));
+            }
+            // The ordered occurrence-complete representation and the ambiguity
+            // classifications are always present, so a policy that opts into
+            // `query_ambiguity_policy: delegate` can validate the query
+            // against its own backend's duplicate/plus contract.
+            input.insert(
+                "query_pairs".to_string(),
+                self.query_pairs_input(ctx, query),
+            );
+            input.insert(
+                "query_ambiguity".to_string(),
+                Value::Array(
+                    query
+                        .ambiguities()
+                        .iter()
+                        .map(|ambiguity| Value::String(ambiguity.reason().to_string()))
+                        .collect(),
+                ),
+            );
         }
         if self.include_headers {
             ctx.materialize_headers();
@@ -241,22 +301,47 @@ impl Opa {
         input
     }
 
-    fn query_input(&self, ctx: &RequestContext) -> Value {
-        let mut query = Map::with_capacity(ctx.query_params.len());
-        for (key, value) in &ctx.query_params {
-            if self
-                .redact_query_keys
-                .iter()
-                .any(|redacted| redacted.eq_ignore_ascii_case(key))
-                || (!self.include_query_credentials
-                    && (is_default_sensitive_query_key(key)
-                        || query_key_marked_as_credential(ctx, key)))
-            {
+    /// Flat decoded `name -> value` view. Only built for an unambiguous
+    /// canonical query, where each name occurs exactly once.
+    fn query_map_input(&self, ctx: &RequestContext, query: &CanonicalQuery) -> Value {
+        let mut map = Map::with_capacity(query.len());
+        for param in query.params() {
+            if self.query_key_is_redacted(ctx, &param.name) {
                 continue;
             }
-            query.insert(key.clone(), Value::String(value.clone()));
+            map.insert(param.name.clone(), Value::String(param.value.clone()));
         }
-        Value::Object(query)
+        Value::Object(map)
+    }
+
+    /// Ordered occurrence view: every pair in wire order, with the
+    /// bare-parameter bit that distinguishes `?flag` from `?flag=`. Credential
+    /// redaction applies here exactly as it does to the flat map, so opting
+    /// into `delegate` never widens what OPA is told. Non-UTF-8 components are
+    /// lossy-decoded and carry an explicit ambiguity classification; Rego must
+    /// reject that class when it needs exact bytes.
+    fn query_pairs_input(&self, ctx: &RequestContext, query: &CanonicalQuery) -> Value {
+        let mut pairs = Vec::with_capacity(query.len());
+        for param in query.params() {
+            if self.query_key_is_redacted(ctx, &param.name) {
+                continue;
+            }
+            let mut entry = Map::with_capacity(3);
+            entry.insert("name".to_string(), Value::String(param.name.clone()));
+            entry.insert("value".to_string(), Value::String(param.value.clone()));
+            entry.insert("bare".to_string(), Value::Bool(param.bare));
+            pairs.push(Value::Object(entry));
+        }
+        Value::Array(pairs)
+    }
+
+    fn query_key_is_redacted(&self, ctx: &RequestContext, key: &str) -> bool {
+        self.redact_query_keys
+            .iter()
+            .any(|redacted| redacted.eq_ignore_ascii_case(key))
+            || (!self.include_query_credentials
+                && (is_default_sensitive_query_key(key)
+                    || query_key_marked_as_credential(ctx, key)))
     }
 
     fn header_input(&self, ctx: &RequestContext) -> Value {
@@ -432,21 +517,30 @@ impl Plugin for Opa {
     }
 
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
-        if self.include_query
-            && self.reject_duplicate_query_keys
-            && ctx
-                .raw_query_string()
-                .is_some_and(super::utils::query::has_conflicting_duplicate_query_key)
+        // Decode the backend-bound query representation at the OPA hook,
+        // including authentication-owned strips, instead of the lossy shared
+        // map. A deliberately later request_transformer remains a separate
+        // ordered operation (advisories GHSA-j2j6-f9c7-hh85,
+        // GHSA-gr4p-3qw3-87r5).
+        let query = self.include_query.then(|| canonical_query_for_policy(ctx));
+
+        if let Some(query) = query.as_ref()
+            && let Some(ambiguity) = query.first_ambiguity()
+            && self.query_ambiguity_policy == QueryAmbiguityPolicy::Reject
         {
+            // The reason is a fixed-cardinality token; query bytes are
+            // attacker-controlled and may carry credentials, so they are never
+            // logged here.
             warn!(
                 plugin = "opa",
-                reason = "duplicate_query_parameters",
-                "Rejecting request with duplicate query parameter keys to avoid OPA/backend authorization mismatch"
+                reason = "ambiguous_query",
+                ambiguity = ambiguity.reason(),
+                "Rejecting request whose query cannot be decoded to one value OPA and the backend both read"
             );
             return self.reject_policy_denial();
         }
 
-        let input = self.build_input(ctx);
+        let input = self.build_input(ctx, query.as_ref());
         let payload = OpaDecisionPayload {
             input: OpaInputPayload {
                 fields: input,
@@ -531,6 +625,10 @@ impl Plugin for Opa {
         self.include_body.then_some(self.max_body_bytes)
     }
 
+    /// OPA's own decision no longer reads `ctx.query_params` — it decodes the
+    /// forwarded query itself, identically on H1/H2/H3. This stays true so a
+    /// proxy configured with OPA keeps exposing the decoded shared map to the
+    /// other plugins in its chain, rather than flipping H3 back to raw values.
     fn requires_decoded_query_params(&self) -> bool {
         self.include_query
     }

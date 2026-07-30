@@ -4656,13 +4656,22 @@ async fn test_ambiguous_query_fails_before_external_egress() {
         default_client(),
     )
     .unwrap();
-    assert!(!plugin.requires_decoded_query_params());
+    // A query-forwarding function opts the proxy's shared map into the decoded
+    // representation, so H3 no longer differs from H1/H2 for its plugin chain
+    // (advisory GHSA-gr4p-3qw3-87r5).
+    assert!(plugin.requires_decoded_query_params());
 
     for (raw_query, expected_code) in [
         ("role=user&role=admin", "duplicate_query_parameter"),
+        ("role=admin&role=admin", "duplicate_query_parameter"),
+        ("role=user&%72ole=admin", "duplicate_query_parameter"),
+        ("role&role=admin", "duplicate_query_parameter"),
         ("name=alice+bob", "ambiguous_query_encoding"),
+        ("a+b=1", "ambiguous_query_encoding"),
         ("name=%FF", "invalid_query_encoding"),
+        ("%FF=1", "invalid_query_encoding"),
         ("name=%ZZ", "invalid_query_encoding"),
+        ("name=%", "invalid_query_encoding"),
     ] {
         let mut ctx = create_test_context();
         ctx.set_raw_query_string(raw_query.to_string());

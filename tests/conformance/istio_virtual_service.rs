@@ -962,16 +962,16 @@ async fn vs_route_local_fault_injection() {
 }
 
 /// VS feature: `queryParams.X.exact`. Captured as a `mesh_route_dispatch`
-/// rule with query-param equality; the rule opts the proxy into decoded
-/// `ctx.query_params` materialization.
+/// rule with query-param equality. The rule evaluates the canonical forwarded
+/// query and also opts the proxy into decoded `ctx.query_params`
+/// materialization for other plugins.
 #[tokio::test]
 async fn vs_query_params_exact_match() {
     register_feature!(
         category = CATEGORY,
         feature = "queryParams.X.exact",
         status = Status::Supported,
-        notes =
-            "mesh_route_dispatch rule with query-param equality; auto-decodes ctx.query_params.",
+        notes = "mesh_route_dispatch matches the canonical forwarded query and materializes ctx.query_params for sibling plugins.",
     );
     let plugin_config = dispatch_plugin_for_host_only(&[virtual_service(json!({
         "hosts": ["api.example.com"],
@@ -989,8 +989,8 @@ async fn vs_query_params_exact_match() {
     );
 
     let mut req = ctx("GET", "/search");
-    req.query_params
-        .insert("variant".to_string(), "beta".to_string());
+    req.set_raw_query_string("variant=beta".to_string());
+    req.materialize_query_params();
     let mut headers = HashMap::new();
     assert!(matches!(
         dispatch.before_proxy(&mut req, &mut headers).await,

@@ -2819,7 +2819,7 @@ Delegates HTTP request authorization to [Open Policy Agent](https://www.openpoli
 | `decision_pointer` | String[] | `["result"]` | Path inside the OPA JSON response to evaluate. Use `["result","allow"]` for `{ "result": { "allow": true } }`. |
 | `include_method` | Boolean | `true` | Include `input.method`. |
 | `include_path` | Boolean | `true` | Include `input.path`. |
-| `include_query` | Boolean | `true` | Include decoded, non-redacted query parameters as `input.query`. Query credentials are omitted by default. |
+| `include_query` | Boolean | `true` | Include the request query as `input.query` (flat decoded map), `input.query_pairs` (ordered occurrence-complete pairs), and `input.query_ambiguity`. All three are decoded from the exact backend-visible query bytes. Query credentials are omitted by default. |
 | `include_query_credentials` | Boolean | `false` | Unsafe opt-in to send built-in and authentication-plugin-marked query credentials to OPA. Explicit `redact_query_keys` remain omitted. |
 | `include_headers` | Boolean | `true` | Include request headers as `input.headers` after redaction. |
 | `include_body` | Boolean | `false` | After authentication succeeds, buffer and forward the request body. UTF-8 bodies use `input.body`; non-UTF-8 raw bytes use `input.body_base64`. |
@@ -2827,11 +2827,34 @@ Delegates HTTP request authorization to [Open Policy Agent](https://www.openpoli
 | `include_consumer` | Boolean | `true` | Include mapped Consumer data or external authenticated identity. |
 | `include_client_ip` | Boolean | `true` | Include `input.client_ip`. |
 | `include_service` | Boolean | `true` | Include matched proxy/service data. |
-| `reject_duplicate_query_keys` | Boolean | `true` | Before calling OPA, reject conflicting duplicate query values (for example `id=1&id=2`) with `deny_status` / `deny_body`. Identical duplicates pass. Set `false` for intentional repeated-key APIs, or set `include_query: false` when policy does not inspect query data. |
+| `query_ambiguity_policy` | String | `reject` | What to do when the query cannot be decoded to one value OPA and the backend are guaranteed to read identically. `reject` denies with `deny_status` / `deny_body` before calling OPA. `delegate` calls OPA anyway and lets Rego decide from `input.query_pairs` + `input.query_ambiguity`; `input.query` is omitted in that case, and the policy itself must deny on a classification it does not handle. |
 | `redact_headers` | String[] | built-ins | Additional request headers to omit from `input.headers`; built-in sensitive headers and active authentication credential headers are always omitted. |
-| `redact_query_keys` | String[] | `[]` | Additional query parameter names to omit from `input.query`, matched case-insensitively. Built-in credential names and query locations used by authentication plugins are omitted automatically. |
+| `redact_query_keys` | String[] | `[]` | Additional query parameter names to omit from `input.query` and `input.query_pairs`, matched case-insensitively. Built-in credential names and query locations used by authentication plugins are omitted automatically. |
 
 Unknown or misspelled top-level OPA config keys are rejected at config load.
+
+#### Query canonicalization (advisories GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5)
+
+`input.query` is not read from the lossy shared query map. It is decoded from the backend-bound query representation available at the OPA hook, after authentication-owned credential strips. The same canonicalizer is used by `mesh_route_dispatch` query predicates and `serverless_function` query forwarding. A deliberately later `request_transformer` remains a separate ordered operation; consumers that run after it, including the default-priority serverless hook, observe its published query.
+
+A query is *ambiguous* when Ferrum cannot prove the backend will read it the same way:
+
+| Classification | Trigger |
+|---|---|
+| `duplicate_name` | The same decoded name occurs more than once, including through a percent-encoded alias (`a=1&%61=2`) or a bare/valued pair (`flag&flag=1`). Backends variously take the first value, the last value, all values, or reject. |
+| `literal_plus` | A literal `+` in a name or value. RFC 3986 reads it as a plus sign; `application/x-www-form-urlencoded` decoders read it as a space. |
+| `malformed_percent_encoding` | A `%` that does not begin a complete `%HH` triplet. |
+| `non_utf8_name` / `non_utf8_value` | The percent-decoded name or value is not valid UTF-8. |
+
+Under the default `query_ambiguity_policy: reject`, such a request is denied before OPA is called. Under `delegate`, OPA receives:
+
+- `input.query_pairs` — every occurrence in wire order as `{"name": …, "value": …, "bare": …}`. `bare` distinguishes `?flag` from `?flag=`; both decode to an empty `value`. A non-UTF-8 component is replacement-decoded and classified in `input.query_ambiguity`; a policy that needs exact bytes must reject that class.
+- `input.query_ambiguity` — the classification tokens above, in the order encountered. Empty for an unambiguous query.
+- `input.query` — **omitted** when `input.query_ambiguity` is non-empty, so no rule can read from the flat map a value the backend does not execute.
+
+`%20` and `%2B` are unambiguous and decode to a space and a `+` respectively; only a *literal* `+` byte is ambiguous. Use `delegate` only when the backend's duplicate-parameter and `+` conventions are known and encoded in Rego.
+
+**`delegate` moves the fail-closed decision into your policy.** Withholding `input.query` removes the misleading value, but it does not by itself deny the request: an `allow` rule that reads `input.query` becomes undefined and denies, while the common deny-list idiom (`deny { input.query.action == "delete record" }` with `allow { not deny }`) leaves `deny` undefined and therefore *allows*. A `delegate` policy must gate on the classifications explicitly — for example `deny { count(input.query_ambiguity) > 0 }`, or a narrower rule that denies every classification it cannot resolve against the backend's own duplicate-parameter and `+` conventions — before reading `input.query_pairs`. `query_ambiguity_policy: reject` needs no such rule.
 
 Allow decisions:
 
@@ -2856,8 +2879,10 @@ config:
   max_response_bytes: 262144
   include_body: true
   max_body_bytes: 1048576
-  # Array-style API: allow repeated keys such as id=1&id=2.
-  reject_duplicate_query_keys: false
+  # Array-style API: let Rego resolve repeated keys such as id=1&id=2 from
+  # input.query_pairs instead of denying at the gateway. The policy must then
+  # deny on any input.query_ambiguity classification it does not handle.
+  query_ambiguity_policy: delegate
   redact_query_keys: [session_id]
   headers:
     Authorization: "Bearer opa-client-token"
@@ -3412,7 +3437,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | `mode` | String | `"pre_proxy"` | `"pre_proxy"` or `"terminate"`. Unknown values rejected at plugin load. In `terminate` mode, native `application/grpc` requests use the [gRPC terminate response contract](#function-response-format-terminate-mode--native-grpc) (raw protobuf message bytes plus protocol-owned status/trailers). gRPC-Web terminate is rejected with 500; HTTP terminate behavior is unchanged |
 | `forward_body` | bool | `false` | Include the lossless buffered request body for every method. UTF-8 bytes are an exact string with `body_encoding: "utf8"`; other bytes are base64 with `body_encoding: "base64"`. The active media type is carried separately as `body_content_type` |
 | `forward_headers` | String[] | `[]` | Header names to forward to the function (lowercased at config load). Read from the effective `before_proxy` header view, so a field line an earlier plugin removed — `authorization` under `strip_authorization_on_success`, or a gateway-owned `claim_headers` destination with no verified claim — is absent from the payload rather than re-read from the client's original request |
-| `forward_query_params` | bool | `false` | Include decoded query parameters after omitting credentials that an earlier auth plugin marked for backend stripping. Starts from the same canonical backend-visible query primary dispatch uses (including any prior `request_transformer` ordered query mutation). Duplicate decoded names, invalid percent-encoded UTF-8, raw `+` ambiguity, and parameters lacking the original encoded representation fail before invocation |
+| `forward_query_params` | bool | `false` | Include decoded query parameters after omitting credentials that an earlier auth plugin marked for backend stripping. Decodes the same canonical backend-visible query primary dispatch forwards (including any prior `request_transformer` ordered query mutation), through the shared canonicalizer OPA and `mesh_route_dispatch` use, so the payload is identical on HTTP/1.1, HTTP/2, and HTTP/3. Duplicate decoded names (including percent-encoded aliases and bare/valued pairs), literal `+` ambiguity, malformed percent-encoding, non-UTF-8 decodings, and parameters lacking the original encoded representation fail closed before invocation — including before a pre-proxy function can approve the request |
 | `timeout_ms` | u64 | `5000` | Function invocation timeout in milliseconds. Must be > 0 |
 | `max_response_body_bytes` | u64 | `10485760` | Max function response body size (10 MiB). Must be > 0 |
 | `on_error` | String | `"reject"` | `"reject"` returns error to client; `"continue"` skips and proxies normally. Unknown values rejected at plugin load |
@@ -6397,6 +6422,8 @@ Applies per-request route overrides generated from mesh/Istio routing resources.
 **Strict config validation:** unknown keys are rejected at every security-relevant nesting level — top-level plugin config, each rule, match, destination, fault, rewrite, redirect, transform, route-local `retry`, nested retry backoff, and destination `backend_tls`. Misspellings such as `reject_unmtached`, `requires_node_waypoint_auth`, `retry.max_retry`, or `backend_tls.client_certpath` fail admission on native/file/admin/translated/CP-DP paths instead of silently disabling fail-closed controls. Shared gateway `RetryConfig` / `BackendTlsConfig` consumers keep their existing compatibility boundary; mesh route policy uses strict route-local wire shapes that convert into those runtime types after validation.
 
 An `upstream_id` destination resolves in the matched proxy's namespace. Scoped plugin references are validated in their resource namespace; a gateway-wide global reference must exist in every proxy namespace where that global is effective (excluding proxies that replace it with a scoped `mesh_route_dispatch` instance). A same-ID upstream in another namespace never satisfies the reference.
+
+**Query predicates are fail-closed (advisories GHSA-j2j6-f9c7-hh85, GHSA-gr4p-3qw3-87r5).** `match.query_params` compares against the canonical decoding of the backend-bound query representation available at the dispatch hook, after authentication-owned credential strips and any priority-overridden query transformer that already ran. Selecting a route is a security decision, so a request whose query cannot be decoded to one value is rejected with `400` **before any rule is evaluated**, using the same [classifications](#query-canonicalization-advisories-ghsa-j2j6-f9c7-hh85-ghsa-gr4p-3qw3-87r5) OPA applies: a repeated or percent-encoded duplicate name (`?tenant=victim&tenant=admin`, `?a=1&%61=2`, `?flag&flag=1`), a literal `+`, malformed percent-encoding, or a non-UTF-8 decoding. `%20` and `%2B` are unambiguous. Behavior is identical on HTTP/1.1, HTTP/2, and HTTP/3, because predicates no longer read the protocol-dependent `ctx.query_params` map. A later route/request transform remains an intentional, separately ordered operation. A dispatch config that declares no `query_params` predicate is completely unaffected — no query is decoded and no request is rejected on this path.
 
 See [Mesh VirtualService translation](mesh.md#virtualservice-translation) and [plugin execution order](plugin_execution_order.md#why-this-order-matters) for route-collapse, fault, rewrite, redirect, and HBONE behavior.
 
