@@ -1165,6 +1165,9 @@ shapes and nothing else:
   count **before** publication — with the upload gated on that bounding step
   having succeeded, from one fixed path, at short retention. Its environment
   carries the same empty wrapper and `RUSTFLAGS` overrides as the smoke job.
+  Each matrix job gives cold sanitizer compilation a 90-minute outer deadline
+  and uses 16 codegen units; the target itself remains independently capped at
+  300 seconds, so build variance cannot widen the actual fuzzing budget.
 
 A lane nothing observes is not a gate, so adopting `CI_FUZZ_SMOKE_JOB` also has
 to make it a required input of the `test` (`Tests`) aggregate. That aggregate is

@@ -1806,7 +1806,7 @@ jobs:
   fuzz-sanitized:
     name: Fuzz sanitizer lane
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     permissions:
       contents: read
     # The repository-root Cargo config selects sccache and host linker flags,
@@ -1871,7 +1871,7 @@ jobs:
           esac
 
           mkdir -p "artifacts/$FUZZ_TARGET"
-          cargo fuzz run -s address "$FUZZ_TARGET" -- \
+          cargo fuzz run --codegen-units 16 -s address "$FUZZ_TARGET" -- \
             -max_total_time=300 \
             -max_len=65536 \
             -timeout=5 \
@@ -22800,6 +22800,14 @@ pre_build = []
     if any("scheduled fuzz lane" in error for error in scheduled_adoption):
         failures.append("initial adoption of the scheduled fuzz lane was rejected")
     fuzz_workflow_tampering: dict[str, tuple[str, str]] = {
+        "shortened cold-build deadline": (
+            "    timeout-minutes: 90\n",
+            "    timeout-minutes: 45\n",
+        ),
+        "reduced compilation parallelism": (
+            'cargo fuzz run --codegen-units 16 -s address "$FUZZ_TARGET" -- \\',
+            'cargo fuzz run --codegen-units 1 -s address "$FUZZ_TARGET" -- \\',
+        ),
         "untrusted trigger": (
             "  workflow_dispatch:\n",
             "  workflow_dispatch:\n  pull_request:\n",
