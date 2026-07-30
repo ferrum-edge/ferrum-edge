@@ -1046,85 +1046,12 @@ enum CrossKindListener {
 /// cross-kind traffic on the conflicting one, so the conservative withdrawal
 /// is the fail-closed choice.
 fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApiRouteConflict> {
-    // listener -> the routes attached to it, with the hostnames they claim
-    // there. Two different parentRef shapes selecting one listener land in the
-    // same bucket, and one wildcard parentRef spanning several listeners is
-    // arbitrated independently on each of them.
-    let mut by_listener: BTreeMap<CrossKindListener, Vec<CrossKindListenerClaim<'_>>> =
-        BTreeMap::new();
-    for (index, entry) in entries.iter().enumerate() {
-        let mut claims: BTreeMap<CrossKindListener, BTreeSet<&str>> = BTreeMap::new();
-        for key in &entry.keys {
-            for listener in entry.listeners_for(&key.parent_ref, &key.hostname) {
-                claims
-                    .entry(listener)
-                    .or_default()
-                    .insert(key.hostname.as_str());
-            }
-        }
-        for (listener, hostnames) in claims {
-            by_listener
-                .entry(listener)
-                .or_default()
-                .push(CrossKindListenerClaim {
-                    index,
-                    entry,
-                    hostnames,
-                });
-        }
-    }
-
-    // (route index, listener) -> the accepted opposite-kind Route that
-    // displaced it there.
-    let mut losses: HashMap<(usize, CrossKindListener), K8sResourceKey> = HashMap::new();
-    for (listener, mut claims) in by_listener {
-        if claims.len() < 2 {
-            continue;
-        }
-        // `kind` is the final tiebreak, and it is load-bearing *only* here.
-        // Within one kind `{namespace}/{name}` is unique, so the Gateway API
-        // order (oldest `creationTimestamp`, then `{namespace}/{name}`) is
-        // already total. Across kinds it is not: `HTTPRoute demo/echo` and
-        // `GRPCRoute demo/echo` are distinct objects that can carry the same
-        // name *and* the same timestamp — `metadata.creationTimestamp` has
-        // second granularity, so one `kubectl apply` of both routinely ties.
-        // Without this the accepted Route would depend on watch arrival order.
-        claims.sort_by(|left, right| {
-            compare_conflict_candidates(&left.entry.candidate, &right.entry.candidate).then_with(
-                || {
-                    left.entry
-                        .candidate
-                        .resource
-                        .kind
-                        .cmp(&right.entry.candidate.resource.kind)
-                },
-            )
-        });
-
-        let mut accepted: Vec<&CrossKindListenerClaim<'_>> = Vec::new();
-        for claim in &claims {
-            let kind = &claim.entry.candidate.resource.kind;
-            let winner = accepted
-                .iter()
-                .find(|other| {
-                    other.entry.candidate.resource.kind != *kind
-                        && cross_kind_hostnames_overlap(&other.hostnames, &claim.hostnames)
-                })
-                .map(|other| other.entry.candidate.resource.clone());
-            let Some(winner) = winner else {
-                accepted.push(claim);
-                continue;
-            };
-            losses.insert((claim.index, listener.clone()), winner);
-        }
-    }
-
-    // Project the per-listener losses back onto the route's own conflict keys.
-    // Those keys carry the *literal* originating parentRef — the identity route
-    // status, materialized-parent accounting, and losing-match suppression all
-    // key on — so the loss is expressed at the finest granularity a key can
-    // express: one `(parentRef, hostname)` claim.
-    let mut conflicts = Vec::new();
+    // Build the indivisible `(parentRef, hostname)` claims first. Arbitration
+    // must process each claim across all of its listeners atomically: inserting
+    // a claim on listeners it wins before discovering that it loses elsewhere
+    // lets a subsequently withdrawn route preempt a later, otherwise valid
+    // route on those listeners.
+    let mut claims = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         let mut keys_by_claim: BTreeMap<(&str, &str), Vec<&GatewayApiRouteConflictKey>> =
             BTreeMap::new();
@@ -1135,58 +1062,81 @@ fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApi
                 .push(key);
         }
         for ((parent_ref, hostname), keys) in keys_by_claim {
-            // One wildcard parentRef can reach several listeners while emitting
-            // a single shared conflict key, and the materialized route is
-            // port-agnostic, so a claim kept because it won on listener B would
-            // still serve traffic on listener A, where Gateway API forbids the
-            // HTTPRoute/GRPCRoute merge. The representation cannot express
-            // "accepted on B only", so the whole claim is withdrawn on the
-            // first loss.
-            //
-            // The reported winner is the accepted opposite-kind Route on the
-            // lowest-ordered listener the claim lost on. `listeners_for`
-            // returns an ordered set and per-listener arbitration is greedy
-            // over a total `(creationTimestamp, namespace, name, kind)` order,
-            // so the choice is deterministic and independent of the order the
-            // objects arrived in.
-            let listeners = entry.listeners_for(parent_ref, hostname);
-            let Some(winner) = listeners
-                .iter()
-                .find_map(|listener| losses.get(&(index, listener.clone())))
-                .cloned()
-            else {
-                continue;
-            };
-            for key in keys {
+            claims.push(CrossKindRouteClaim {
+                index,
+                entry,
+                parent_ref,
+                hostname,
+                keys,
+                listeners: entry.listeners_for(parent_ref, hostname),
+            });
+        }
+    }
+
+    // `kind` is the final resource-order tiebreak. The claim identity follows
+    // only to make multiple claims from one resource deterministic.
+    claims.sort_by(|left, right| {
+        compare_conflict_candidates(&left.entry.candidate, &right.entry.candidate)
+            .then_with(|| {
+                left.entry
+                    .candidate
+                    .resource
+                    .kind
+                    .cmp(&right.entry.candidate.resource.kind)
+            })
+            .then_with(|| left.parent_ref.cmp(right.parent_ref))
+            .then_with(|| left.hostname.cmp(right.hostname))
+            .then_with(|| left.index.cmp(&right.index))
+    });
+
+    // Accepted claims are installed on all listeners only after the claim has
+    // proved it loses on none. Thus a whole-withdrawn claim can never remain a
+    // stale winner for a later route.
+    let mut accepted: BTreeMap<CrossKindListener, Vec<&CrossKindRouteClaim<'_>>> = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for claim in &claims {
+        let kind = &claim.entry.candidate.resource.kind;
+        let winner = claim.listeners.iter().find_map(|listener| {
+            accepted.get(listener).and_then(|accepted_claims| {
+                accepted_claims.iter().find_map(|other| {
+                    (other.entry.candidate.resource.kind != *kind
+                        && cross_kind_hostnames_overlap(claim.hostname, other.hostname))
+                    .then(|| other.entry.candidate.resource.clone())
+                })
+            })
+        });
+        if let Some(winner) = winner {
+            for key in &claim.keys {
                 conflicts.push(GatewayApiRouteConflict {
-                    key: key.clone(),
+                    key: (*key).clone(),
                     winner: winner.clone(),
-                    loser: entry.candidate.resource.clone(),
+                    loser: claim.entry.candidate.resource.clone(),
                 });
             }
+            continue;
+        }
+        for listener in &claim.listeners {
+            accepted.entry(listener.clone()).or_default().push(claim);
         }
     }
     conflicts
 }
 
-struct CrossKindListenerClaim<'a> {
-    /// Index of the claiming route in the `entries` slice, used to key its
-    /// per-listener losses without re-deriving a resource identity.
+struct CrossKindRouteClaim<'a> {
     index: usize,
     entry: &'a CrossKindRouteEntry,
-    hostnames: BTreeSet<&'a str>,
+    parent_ref: &'a str,
+    hostname: &'a str,
+    keys: Vec<&'a GatewayApiRouteConflictKey>,
+    listeners: BTreeSet<CrossKindListener>,
 }
 
 /// Do two routes claim any hostname in common on one listener? Conflict-key
 /// hostnames are already the listener-intersected effective hostnames (with
 /// `*` standing for "the route did not constrain the hostname"), so this is
 /// the same wildcard-aware intersection the listener attachment uses.
-fn cross_kind_hostnames_overlap(left: &BTreeSet<&str>, right: &BTreeSet<&str>) -> bool {
-    left.iter().any(|left| {
-        right
-            .iter()
-            .any(|right| intersect_hostnames(left, right).is_some())
-    })
+fn cross_kind_hostnames_overlap(left: &str, right: &str) -> bool {
+    intersect_hostnames(left, right).is_some()
 }
 
 pub(crate) fn route_conflict_keys_for_acc(
@@ -9323,6 +9273,91 @@ mod tests {
                 result.warnings
             );
             assert!(result.config.validate_unique_listen_paths().is_ok());
+        }
+    }
+
+    #[test]
+    fn a_whole_withdrawn_claim_cannot_preempt_a_later_route() {
+        let gateway = cross_kind_gateway(serde_json::json!([
+            {
+                "name": "listener-a",
+                "port": 80,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": {"from": "All"},
+                    "kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]
+                }
+            },
+            {
+                "name": "listener-b",
+                "port": 8080,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": {"from": "All"},
+                    "kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]
+                }
+            }
+        ]));
+        let http_a = cross_kind_http_route(
+            serde_json::json!({"name": "edge", "sectionName": "listener-a"}),
+            Some(serde_json::json!([{
+                "path": {"type": "PathPrefix", "value": "/admin"}
+            }])),
+        );
+        let grpc_broad = cross_kind_grpc_route(
+            serde_json::json!({"name": "edge"}),
+            serde_json::json!({"method": "SayHello"}),
+        );
+        let mut http_b = cross_kind_http_route(
+            serde_json::json!({"name": "edge", "sectionName": "listener-b"}),
+            Some(serde_json::json!([{
+                "path": {"type": "PathPrefix", "value": "/user"}
+            }])),
+        );
+        http_b.metadata.name = "web-b".to_string();
+        http_b.metadata.creation_timestamp = Some("2026-03-01T00:00:00Z".to_string());
+        http_b.spec["rules"][0]["backendRefs"][0]["port"] = serde_json::json!(9090);
+
+        for objects in [
+            vec![
+                gateway.clone(),
+                http_a.clone(),
+                grpc_broad.clone(),
+                http_b.clone(),
+            ],
+            vec![
+                http_b.clone(),
+                grpc_broad.clone(),
+                http_a.clone(),
+                gateway.clone(),
+            ],
+        ] {
+            let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+            let mut ports: Vec<u16> = result
+                .config
+                .proxies
+                .iter()
+                .map(|proxy| proxy.backend_port)
+                .collect();
+            ports.sort_unstable();
+            assert_eq!(
+                ports,
+                vec![8080, 9090],
+                "the broad GRPCRoute loses on listener A and must not remain an accepted winner \
+                 that suppresses the later HTTPRoute on listener B"
+            );
+            assert!(
+                result.route_conflicts.iter().any(|conflict| {
+                    conflict.loser.kind == "GRPCRoute" && conflict.loser.name == "grpc"
+                }),
+                "the broad GRPCRoute must still be withdrawn"
+            );
+            assert!(
+                !result.route_conflicts.iter().any(|conflict| {
+                    conflict.loser.kind == "HTTPRoute" && conflict.loser.name == "web-b"
+                }),
+                "the later HTTPRoute must not lose to the already-withdrawn GRPCRoute"
+            );
         }
     }
 
