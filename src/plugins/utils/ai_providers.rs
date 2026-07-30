@@ -9,6 +9,12 @@ pub enum AiProvider {
     Cohere,
     Mistral,
     Bedrock,
+    /// Hugging Face Text Generation Inference in its **native** (non
+    /// OpenAI-compatible) shape. TGI reports authoritative counts only in the
+    /// terminal `details` object; a TGI deployment served through its
+    /// `/v1/chat/completions` compatibility route is an OpenAI response and is
+    /// detected as [`AiProvider::OpenAi`] instead.
+    Tgi,
 }
 
 impl AiProvider {
@@ -20,6 +26,7 @@ impl AiProvider {
             Self::Cohere => "cohere",
             Self::Mistral => "mistral",
             Self::Bedrock => "bedrock",
+            Self::Tgi => "tgi",
         }
     }
 }
@@ -98,11 +105,25 @@ pub fn parse_ai_provider(provider: &str) -> Option<AiProvider> {
         "cohere" => Some(AiProvider::Cohere),
         "mistral" => Some(AiProvider::Mistral),
         "bedrock" => Some(AiProvider::Bedrock),
+        "tgi" => Some(AiProvider::Tgi),
         _ => None,
     }
 }
 
 pub fn detect_response_provider(json: &Value) -> Option<AiProvider> {
+    // Native TGI is the only supported shape that reports its counts under a
+    // terminal `details` object rather than a `usage`-family container, so it
+    // is unambiguous and is checked first. A TGI deployment behind the
+    // OpenAI-compatible route carries `usage` instead and falls through to the
+    // OpenAI branch below.
+    if json
+        .get("details")
+        .and_then(|details| details.get("generated_tokens"))
+        .is_some_and(Value::is_u64)
+    {
+        return Some(AiProvider::Tgi);
+    }
+
     if json
         .get("usageMetadata")
         .and_then(|usage| usage.get("promptTokenCount"))
@@ -224,6 +245,7 @@ pub fn extract_response_usage(json: &Value, provider: AiProvider) -> AiTokenUsag
         AiProvider::Google => extract_google_usage(json),
         AiProvider::Cohere => extract_cohere_usage(json),
         AiProvider::Bedrock => extract_bedrock_usage(json),
+        AiProvider::Tgi => extract_tgi_usage(json),
     }
 }
 
@@ -534,6 +556,37 @@ fn extract_bedrock_usage(json: &Value) -> AiTokenUsage {
             .or_else(|| sum_pair(prompt, completion)),
         model: None,
         provider: Some(AiProvider::Bedrock),
+    }
+}
+
+/// Native Hugging Face TGI usage, reported only on the terminal generation
+/// object.
+///
+/// TGI documents `details.generated_tokens` as the authoritative completion
+/// count and `details.prefill` as the tokenized prompt, so the prefill array's
+/// length is the prompt count. Both streaming and non-streaming native TGI
+/// carry `details` on the final object only; every earlier stream event has
+/// `details: null`, which yields an empty usage here and is therefore never
+/// mistaken for an authoritative zero.
+///
+/// `prefill` is optional (TGI omits it unless `decoder_input_details` was
+/// requested), so a missing prompt count stays `None` rather than becoming a
+/// silent `0`.
+fn extract_tgi_usage(json: &Value) -> AiTokenUsage {
+    let details = json.get("details");
+    let completion = details
+        .and_then(|details| details.get("generated_tokens"))
+        .and_then(|value| value.as_u64());
+    let prompt = details
+        .and_then(|details| details.get("prefill"))
+        .and_then(|value| value.as_array())
+        .map(|prefill| prefill.len() as u64);
+    AiTokenUsage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: sum_pair(prompt, completion),
+        model: None,
+        provider: Some(AiProvider::Tgi),
     }
 }
 

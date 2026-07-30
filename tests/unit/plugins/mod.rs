@@ -9,6 +9,7 @@ mod adaptive_concurrency_tests;
 mod ai_federation_tests;
 mod ai_prompt_compressor_tests;
 mod ai_prompt_shield_tests;
+mod ai_rate_limiter_stream_accounting_tests;
 mod ai_rate_limiter_tests;
 mod ai_request_guard_tests;
 mod ai_response_guard_tests;

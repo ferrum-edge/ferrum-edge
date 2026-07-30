@@ -561,7 +561,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ai_rate_limiter",
         classification: BuiltinPluginClassification::Public,
         priority: 4200,
-        active_phases: "before_proxy, after_proxy, on_response_body",
+        active_phases: "before_proxy, on_final_request_body, after_proxy, on_response_body, response_stream_inspector, on_response_stream_terminated",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP JSON/SSE token accounting only; native gRPC protobuf frames have no supported usage schema, so gRPC attachment would never charge",
     },

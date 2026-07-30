@@ -363,10 +363,15 @@ pub(crate) const BACKEND_STATUS_METADATA_KEY: &str = "ai_ratelimit_backend_statu
 
 /// The token estimate `ai_rate_limiter` reserved for this request in its
 /// `before_proxy` pass. Set only when a body-derived pre-reservation was taken
-/// (non-zero estimate). `run_after_proxy_hooks` reads this to decide whether to
-/// record `BACKEND_STATUS_METADATA_KEY`, and the plugin reads it back during
-/// reconciliation. Shared here (rather than as a private copy in the plugin) so
-/// the proxy-side writer/reader and the plugin-side writer/reader cannot drift.
+/// (non-zero estimate). `run_after_proxy_hooks` reads this as a PRESENCE flag to
+/// decide whether recording `BACKEND_STATUS_METADATA_KEY` is worthwhile. Shared
+/// here (rather than as a private copy in the plugin) so the proxy-side and
+/// plugin-side writers cannot drift.
+///
+/// The VALUE is telemetry only. With several `ai_rate_limiter` instances on one
+/// proxy the last admission pass wins it, so no accounting decision may read it:
+/// every reservation field the plugin reconciles against lives in that
+/// instance's own typed record instead (GHSA-wh4p-pmxm-3784).
 pub(crate) const RESERVED_TOKENS_METADATA_KEY: &str = "ai_ratelimit_reserved_tokens";
 
 /// Marker set by `ai_rate_limiter::before_proxy` whenever it identified the

@@ -2044,10 +2044,9 @@ async fn reject_mode_does_not_release_on_gateway_rejection() {
 
     ctx.metadata
         .insert("ferrum:rejection_response".to_string(), "true".to_string());
-    ctx.metadata.insert(
-        "ai_ratelimit_unmetered_action".to_string(),
-        "reject".to_string(),
-    );
+    // The applied unmetered action is part of this instance's own reservation
+    // record, not a shared metadata key, so seed it through the instance.
+    plugin.seed_unmetered_action_for_test(&mut ctx, "reject");
 
     let mut response_headers = HashMap::new();
     assert_continue(
@@ -2076,9 +2075,11 @@ async fn non_2xx_release_then_gateway_rejection_reconciles_exactly_once() {
     // `reserved` from the shared window, so a double-release double-subtracts and
     // under-counts the consumer's own budget, permitting oversubscription.
     //
-    // `reconcile_usage` now sets `ai_ratelimit_reservation_reconciled` on the first
-    // pass and short-circuits to `Continue` on any later pass, so the reservation
-    // is reconciled EXACTLY ONCE across both backends. This twin exercises the
+    // `reconcile_usage` now marks THIS INSTANCE's reservation record settled on
+    // the first pass and short-circuits to `Continue` on any later pass, so the
+    // reservation is settled EXACTLY ONCE across both backends. The marker is
+    // per instance, so a sibling limiter's settlement can no longer suppress
+    // this one's (GHSA-wh4p-pmxm-3784). This twin exercises the
     // marker gate on the in-memory limiter; the assertions below would also catch
     // the Redis double-subtract (which would drive the shared window below the
     // single-release value).
@@ -2104,9 +2105,8 @@ async fn non_2xx_release_then_gateway_rejection_reconciles_exactly_once() {
         "the pre-request reservation should be charged to the window"
     );
     assert!(
-        !ctx.metadata
-            .contains_key("ai_ratelimit_reservation_reconciled"),
-        "the reservation must not be marked reconciled before any response phase"
+        !plugin.reservation_settled_for_test(&ctx),
+        "the reservation must not be marked settled before any response phase"
     );
 
     // Phase 1 — `on_response_body` with a non-2xx backend releases the full
@@ -2118,9 +2118,8 @@ async fn non_2xx_release_then_gateway_rejection_reconciles_exactly_once() {
             .await,
     );
     assert!(
-        ctx.metadata
-            .contains_key("ai_ratelimit_reservation_reconciled"),
-        "the non-2xx release must mark the reservation reconciled"
+        plugin.reservation_settled_for_test(&ctx),
+        "the non-2xx release must mark the reservation settled"
     );
     assert_eq!(
         observed_usage(&plugin).await,
@@ -4519,15 +4518,14 @@ fn unreachable_redis_ai_config(failure_policy: Option<&str>) -> serde_json::Valu
 /// is Redis dying *after* admission — a `fail_closed` plugin whose store is
 /// already unreachable refuses at admission and never reaches reconciliation at
 /// all (see `fail_closed_admission_refuses_when_enforcement_is_unavailable`).
-fn reconcilable_ai_ctx(reserved: u64) -> RequestContext {
+fn reconcilable_ai_ctx(plugin: &AiRateLimiter, reserved: u64) -> RequestContext {
     let mut ctx = ai_request_ctx(200, "hello reconcile");
+    // The reservation lifecycle is scoped to the limiter INSTANCE, so seed it
+    // through that instance rather than through shared metadata keys.
+    plugin.seed_reservation_for_test(&mut ctx, reserved, None, Some(42), true);
     ctx.metadata.insert(
         "ai_ratelimit_reserved_tokens".to_string(),
         reserved.to_string(),
-    );
-    ctx.metadata.insert(
-        "ai_ratelimit_reserved_window_index".to_string(),
-        "42".to_string(),
     );
     ctx.metadata
         .insert("ai_ratelimit_request".to_string(), "true".to_string());
@@ -4598,7 +4596,7 @@ async fn fail_closed_reconcile_refuses_uncharged_successful_response() {
     let config = unreachable_redis_ai_config(None);
     let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
 
-    let mut ctx = reconcilable_ai_ctx(120);
+    let mut ctx = reconcilable_ai_ctx(&plugin, 120);
     let mut response_headers = json_headers();
     let body = openai_response(40, 60);
     let reconciled = plugin
@@ -4619,7 +4617,7 @@ async fn fail_closed_reconcile_refuses_uncharged_federated_response() {
     let config = unreachable_redis_ai_config(None);
     let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
 
-    let mut ctx = reconcilable_ai_ctx(120);
+    let mut ctx = reconcilable_ai_ctx(&plugin, 120);
     mark_federated(&mut ctx, "200", "100");
 
     let mut response_headers = json_headers();
@@ -4637,7 +4635,7 @@ async fn fail_closed_reconcile_keeps_an_already_failed_response() {
     let config = unreachable_redis_ai_config(None);
     let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
 
-    let mut ctx = reconcilable_ai_ctx(120);
+    let mut ctx = reconcilable_ai_ctx(&plugin, 120);
     mark_federated(&mut ctx, "500", "100");
 
     let mut response_headers = json_headers();
@@ -4657,7 +4655,7 @@ async fn local_fallback_reconcile_charges_local_state_instead_of_refusing() {
     let config = unreachable_redis_ai_config(Some("local_fallback"));
     let plugin = AiRateLimiter::new(&config, PluginHttpClient::default()).unwrap();
 
-    let mut ctx = reconcilable_ai_ctx(120);
+    let mut ctx = reconcilable_ai_ctx(&plugin, 120);
     let mut response_headers = json_headers();
     let body = openai_response(40, 60);
     assert_continue(
@@ -4747,8 +4745,9 @@ async fn framed_grpc_requests_are_never_ai_candidates_or_reserved() {
             0,
             "framed body must not reserve tokens for {content_type}"
         );
-        assert!(
-            !ctx.metadata.contains_key("ai_ratelimit_reservation_id"),
+        assert_eq!(
+            plugin.reserved_tokens_for_test(&ctx),
+            0,
             "framed body must not hold a reservation for {content_type}"
         );
 
@@ -4808,9 +4807,7 @@ async fn framed_grpc_web_response_is_not_charged_as_json_usage() {
         "a framed gRPC-Web body must never be reconciled as provider-reported usage"
     );
     assert_eq!(
-        ctx.metadata
-            .get("ai_ratelimit_unmetered_action")
-            .map(String::as_str),
+        plugin.unmetered_action_for_test(&ctx).as_deref(),
         Some("charge_estimate"),
         "framed gRPC-Web must take the unmetered policy path, not JSON usage extract"
     );

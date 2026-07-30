@@ -22180,12 +22180,21 @@ components:
             on the rejection-path after_proxy.
         provider:
           type: string
-          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock]
+          enum: [auto, openai, anthropic, google, cohere, mistral, bedrock, tgi]
           default: auto
           description: >-
             LLM provider format for token extraction. Accepted values: auto,
-            openai, anthropic, google, cohere, mistral, bedrock. Gemini/Vertex
-            payloads use `google`.
+            openai, anthropic, google, cohere, mistral, bedrock, tgi.
+            Gemini/Vertex payloads use `google`. Use `tgi` for native Hugging
+            Face Text Generation Inference responses, whose authoritative counts
+            are reported as `details.generated_tokens` (and `details.prefill`)
+            on the terminal object; a TGI deployment served through its
+            OpenAI-compatible route is `openai`. Streaming responses are metered
+            incrementally and are never buffered: `text/event-stream` (OpenAI,
+            Anthropic, Cohere v2, Gemini `usageMetadata`, native TGI) and
+            `application/vnd.amazon.eventstream` (Bedrock
+            InvokeModelWithResponseStream / ConverseStream) are both decoded in
+            flight.
         on_unmetered_response:
           type: string
           enum: [reject, charge_estimate, warn]
