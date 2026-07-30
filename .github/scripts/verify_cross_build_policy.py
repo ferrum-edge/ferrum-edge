@@ -22856,7 +22856,7 @@ pre_build = []
             "actions/checkout@v6",
         ),
         "shell indirection": (
-            'cargo fuzz run -s address "$FUZZ_TARGET" -- \\',
+            'cargo fuzz run --codegen-units 16 -s address "$FUZZ_TARGET" -- \\',
             'bash -c "$FUZZ_TARGET" -- \\',
         ),
         "arbitrary target selection": (
