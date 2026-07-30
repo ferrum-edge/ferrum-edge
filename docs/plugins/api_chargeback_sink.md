@@ -543,6 +543,13 @@ Queued export and spool-delivery events retain the same byte leases under
 escape or double-count that budget. The minimum admitted budget is 9312 bytes,
 the conservative maximum retained size of one field-bounded charge event.
 
+The contiguous JSONEachRow HTTP insert body is a second retained representation
+and is charged to the process-wide retained-byte ceiling
+(`FERRUM_LOG_DELIVERY_MAX_RETAINED_BYTES`), not a second time to
+`buffer_max_bytes`. Admission reserves a provisional escaping/framing bound
+before serialization, then shrinks to the exact retained buffer capacity for the
+body's lifetime (including while a ClickHouse acknowledgement is held).
+
 ### Delivery outcomes
 
 Replay classifies each ClickHouse HTTP attempt before deciding whether to keep,
@@ -575,11 +582,12 @@ fields are never logged.
   or expanded without limit inside the billing process.
 - Building a spool artifact is charged to the process-wide retained-byte
   ceiling. The JSONEachRow serialization and, under `zstd`, its compressed form
-  are each reserved **before** they are allocated — the queued charge events
-  still hold their export leases at that point — and the compressed artifact's
-  reservation is held across the blocking write, fsync, and rename. A ceiling
-  refusal is reported through the existing spool-write failure accounting and
-  publishes nothing.
+  are each reserved **before** they are allocated from a provisional
+  escaping/framing (or compression) bound, then shrunk to the exact retained
+  allocation — the queued charge events still hold their export leases at that
+  point — and the compressed artifact's reservation is held across the blocking
+  write, fsync, and rename. A ceiling refusal is reported through the existing
+  spool-write failure accounting and publishes nothing.
 - The writer additionally refuses any artifact whose *replay* would not fit
   under the same configured process ceiling. Replay retains, at its peak, one
   decoded text buffer, one `(start, end)` line index entry per row, a

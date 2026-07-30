@@ -384,7 +384,7 @@ fn process_ceiling_config_bounds_are_clamped_not_silently_accepted() {
 fn batch_materialization_is_charged_for_the_payload_lifetime_and_released_on_drop() {
     let ceiling = test_ceiling(64 * 1024);
 
-    let payload = materialize_reserved_payload(ceiling, 4_096, |writer| {
+    let payload = materialize_reserved_payload(ceiling, 64 * 1024, |writer| {
         writer
             .write_all(&b"x".repeat(1_000))
             .map_err(|error| error.to_string())
@@ -392,10 +392,16 @@ fn batch_materialization_is_charged_for_the_payload_lifetime_and_released_on_dro
     .expect("payload fits the ceiling");
 
     assert_eq!(payload.len(), 1_000);
-    // The conservative bound stays charged for the payload's whole life: the
-    // buffer handed to `Bytes` still owns its allocation, so shrinking to the
-    // written length would under-charge the ceiling.
-    assert_eq!(ceiling.used(), 4_096);
+    // Provisional `bound` is reserved before the write; afterwards the charge
+    // shrinks to the buffer's exact retained capacity (framing/escaping
+    // included). A 1_000-byte body must not keep a 64 KiB provisional bound
+    // pinned for the delivery lifetime.
+    let held = ceiling.used();
+    assert!(held >= 1_000, "exact charge must cover the written body: held={held}");
+    assert!(
+        held < 16 * 1024,
+        "exact charge must release unused provisional headroom: held={held}"
+    );
 
     // Retries reuse the same immutable bytes rather than re-serializing.
     let first = payload.bytes();
@@ -403,12 +409,12 @@ fn batch_materialization_is_charged_for_the_payload_lifetime_and_released_on_dro
     assert_eq!(first, second);
     assert_eq!(
         ceiling.used(),
-        4_096,
+        held,
         "a retry handle must not add a second charge"
     );
     drop(first);
     drop(second);
-    assert_eq!(ceiling.used(), 4_096);
+    assert_eq!(ceiling.used(), held);
 
     drop(payload);
     assert_eq!(
@@ -495,11 +501,18 @@ fn concurrent_instances_cannot_multiply_batch_materialization_past_the_ceiling()
     let ceiling = test_ceiling(32 * 1024);
 
     let first = materialize_reserved_payload(ceiling, 24 * 1024, |writer| {
+        // Fill the provisional bound so the exact retained charge still saturates
+        // enough of the ceiling to refuse a second concurrent instance.
         writer
-            .write_all(b"first")
+            .write_all(&vec![b'x'; 24 * 1024])
             .map_err(|error| error.to_string())
     })
     .expect("first instance's batch fits");
+    assert_eq!(
+        ceiling.used(),
+        24 * 1024,
+        "a full-bound body keeps its exact retained charge"
+    );
 
     // A second sink instance's batch is refused by the aggregate ceiling even
     // though its own per-instance budget is untouched.

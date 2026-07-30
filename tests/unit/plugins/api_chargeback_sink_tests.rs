@@ -15,7 +15,7 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     compile_charge_event_projection, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     encode_spool_bytes_without_content_size_for_tests,
     encode_spool_bytes_without_ratio_padding_for_tests, new_ulid,
-    probe_charge_body_materialization_for_tests,
+    probe_charge_body_delivery_retention_for_tests, probe_charge_body_materialization_for_tests,
     probe_charge_body_materialization_with_projection_for_tests,
     probe_compact_recovery_retry_for_tests, render_prometheus, render_status_json,
     replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
@@ -6479,12 +6479,14 @@ fn snapshot_exports_at_limit_identity_verbatim() {
 }
 
 // ---------------------------------------------------------------------------
-// JSONEachRow request-body retained-byte ownership — GHSA-83h5-52mw-f33p.
+// JSONEachRow request-body retained-byte ownership — issue #3041 /
+// GHSA-83h5-52mw-f33p.
 //
 // The queued `ChargeEvent`s hold a per-instance lease covering one copy. The
 // serialized insert body is a second attacker-shaped copy that coexists with
-// them, so it is reserved against the retained-byte ceiling before serialization
-// and released when the request (and every retry handle) is gone.
+// them, so a provisional escaping/framing bound is reserved against the
+// retained-byte ceiling before serialization, then shrunk to the exact retained
+// allocation, and released when the request (and every retry handle) is gone.
 // ---------------------------------------------------------------------------
 
 fn leaked_chargeback_test_ceiling(max_bytes: usize) -> &'static RetainedByteCeiling {
@@ -6494,25 +6496,135 @@ fn leaked_chargeback_test_ceiling(max_bytes: usize) -> &'static RetainedByteCeil
     ceiling
 }
 
+/// Maximum-sized charge-event fields filled with a JSON control byte so each
+/// retained byte expands six-fold on the wire (`\u00XX`).
+fn escape_heavy_event(id: &str) -> ChargeEvent {
+    // `bound_key_field` / field caps in production are 512 / 256; tests build
+    // the struct directly so the body path sees the worst-case raw lengths.
+    const FIELD: usize = 512;
+    const META: usize = 256;
+    let heavy_field = "\u{0001}".repeat(FIELD);
+    let heavy_meta = "\u{0001}".repeat(META);
+    ChargeEvent {
+        event_id: id.to_string(),
+        received_at: 1_774_000_000_000_000_000,
+        node_id: heavy_field.clone(),
+        namespace: heavy_field.clone(),
+        consumer_id: heavy_field.clone(),
+        consumer_name: Some(heavy_field.clone()),
+        proxy_id: heavy_field.clone(),
+        proxy_name: heavy_field.clone(),
+        route_id: Some(heavy_field.clone()),
+        status_code: 200,
+        http_status_code: Some(200),
+        grpc_status: None,
+        protocol: heavy_field.clone(),
+        call_count: 1,
+        charge_call: 0.01,
+        bytes_sent: 100,
+        bytes_received: 200,
+        charge_bytes_sent: 0.0001,
+        charge_bytes_received: 0.0004,
+        charge_total: 0.0105,
+        currency: heavy_meta.clone(),
+        pricing_version: heavy_meta.clone(),
+        request_id: Some(heavy_meta.clone()),
+        trace_id: Some(heavy_meta.clone()),
+        snapshot_id: Some(heavy_meta),
+    }
+}
+
 #[test]
 fn chargeback_insert_body_is_reserved_before_serialization_and_released_on_drop() {
     let ceiling = leaked_chargeback_test_ceiling(4 * 1024 * 1024);
     let events: Vec<ChargeEvent> = (0..8)
         .map(|index| sample_event(&format!("event-{index}")))
         .collect();
+    let rendered = serialize_json_each_row(&events).unwrap();
 
     let (bound, held, after) =
         probe_charge_body_materialization_for_tests(ceiling, &events).expect("body materialized");
 
-    assert!(bound > 0);
-    assert_eq!(
-        held, bound,
-        "the reserved bound stays charged for the request body's whole life"
+    assert!(bound >= rendered.len(), "provisional bound covers the body");
+    assert!(
+        held >= rendered.len(),
+        "exact retained charge must cover the serialized body: held={held} body={}",
+        rendered.len()
+    );
+    assert!(
+        held <= bound,
+        "exact charge must not exceed the provisional bound: held={held} bound={bound}"
+    );
+    // Ordinary (non-escape-heavy) bodies shrink well below the 6x provisional.
+    assert!(
+        held < bound,
+        "exact shrink must release unused provisional escaping headroom"
     );
     assert_eq!(
         after, 0,
         "the body reservation releases exactly once, with no underflow"
     );
+}
+
+#[test]
+fn chargeback_escape_heavy_insert_body_charges_exact_framing_and_escaping() {
+    let ceiling = leaked_chargeback_test_ceiling(64 * 1024 * 1024);
+    let events = vec![escape_heavy_event("escape-heavy-0")];
+    let rendered = serialize_json_each_row(&events).unwrap();
+
+    // Raw field lengths cannot cover `\u00XX` expansion; the body must grow.
+    let raw_field_bytes = events[0].node_id.len()
+        + events[0].namespace.len()
+        + events[0].consumer_id.len()
+        + events[0].consumer_name.as_ref().map(String::len).unwrap_or(0)
+        + events[0].proxy_id.len()
+        + events[0].proxy_name.len()
+        + events[0].route_id.as_ref().map(String::len).unwrap_or(0)
+        + events[0].protocol.len()
+        + events[0].currency.len()
+        + events[0].pricing_version.len()
+        + events[0].request_id.as_ref().map(String::len).unwrap_or(0)
+        + events[0].trace_id.as_ref().map(String::len).unwrap_or(0)
+        + events[0].snapshot_id.as_ref().map(String::len).unwrap_or(0);
+    assert!(
+        rendered.len() > raw_field_bytes,
+        "control bytes must expand under JSON escaping: body={} raw={}",
+        rendered.len(),
+        raw_field_bytes
+    );
+
+    let high_water_before = ceiling.high_water();
+    let (bound, held, after) =
+        probe_charge_body_materialization_for_tests(ceiling, &events).expect("body materialized");
+
+    assert!(bound >= rendered.len());
+    assert!(
+        held >= rendered.len(),
+        "exact charge must cover escape-expanded framing: held={held} body={}",
+        rendered.len()
+    );
+    assert!(
+        held <= bound,
+        "exact charge must not exceed the provisional bound: held={held} bound={bound}"
+    );
+    // Spare capacity after shrink_to_fit is allocator slack only. For this
+    // escape-heavy fixture the provisional bound is already close to the body,
+    // so a 2x body ceiling still proves we are not pinning a large unused
+    // provisional headroom beyond the escaped representation.
+    assert!(
+        held <= rendered.len().saturating_mul(2),
+        "exact charge must track the escaped body, not a large unused spare: held={held} body={}",
+        rendered.len()
+    );
+    assert!(
+        ceiling.high_water() > high_water_before,
+        "peak must observe the body reservation"
+    );
+    assert!(
+        ceiling.high_water() >= held,
+        "high-water must cover the exact held body charge"
+    );
+    assert_eq!(after, 0, "escape-heavy body releases exactly once");
 }
 
 #[test]
@@ -6534,6 +6646,50 @@ fn chargeback_insert_body_is_refused_rather_than_serialized_under_a_saturated_ce
         "a refused body must not charge the ceiling"
     );
     assert!(ceiling.rejections() > 0);
+}
+
+#[test]
+fn chargeback_escape_heavy_body_is_refused_before_serialization_when_ceiling_is_tight() {
+    let events = vec![escape_heavy_event("escape-heavy-refuse")];
+    let rendered = serialize_json_each_row(&events).unwrap();
+    // One byte short of the provisional bound is still enough to refuse before
+    // any attacker-shaped body exists; exact shrink never runs on this path.
+    let (bound, _held, _after) = {
+        let roomy = leaked_chargeback_test_ceiling(64 * 1024 * 1024);
+        probe_charge_body_materialization_for_tests(roomy, &events).expect("measure bound")
+    };
+    assert!(bound > rendered.len());
+    let ceiling = leaked_chargeback_test_ceiling(bound - 1);
+    let error = probe_charge_body_materialization_for_tests(ceiling, &events)
+        .expect_err("provisional bound must fail closed before serialization");
+    assert!(error.contains("ceiling"), "got: {error}");
+    assert_eq!(ceiling.used(), 0);
+    assert_eq!(ceiling.high_water(), 0);
+    assert!(ceiling.rejections() > 0);
+}
+
+#[tokio::test]
+async fn chargeback_insert_body_stays_charged_while_clickhouse_ack_is_held() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(200)))
+        .mount(&server)
+        .await;
+
+    let ceiling = leaked_chargeback_test_ceiling(16 * 1024 * 1024);
+    let events = vec![escape_heavy_event("escape-heavy-delivery")];
+    let rendered_len = serialize_json_each_row(&events).unwrap().len();
+
+    let (held_in_flight, after) =
+        probe_charge_body_delivery_retention_for_tests(ceiling, events, &server.uri())
+            .await
+            .expect("delivery probe");
+
+    assert!(
+        held_in_flight >= rendered_len,
+        "exact body charge must remain while the acknowledgement is held: held={held_in_flight} body={rendered_len}"
+    );
+    assert_eq!(after, 0, "delivery releases the body reservation on every path");
 }
 
 // ---------------------------------------------------------------------------
@@ -7609,10 +7765,15 @@ fn charge_event_projection_reservation_bound_still_covers_the_body() {
     let rendered = serialize_json_each_row_projected(&events, Some(projection.as_ref())).unwrap();
     assert!(
         bound >= rendered.len(),
-        "reservation {bound} must cover the projected body {}",
+        "provisional reservation {bound} must cover the projected body {}",
         rendered.len()
     );
-    assert!(held >= rendered.len(), "body stays charged while held");
+    assert!(
+        held >= rendered.len(),
+        "exact body charge stays charged while held: held={held} body={}",
+        rendered.len()
+    );
+    assert!(held <= bound, "exact charge must not exceed the provisional bound");
     assert_eq!(after, 0, "reservation released on drop");
     assert!(projection.row_overhead_bytes() > 0);
 }

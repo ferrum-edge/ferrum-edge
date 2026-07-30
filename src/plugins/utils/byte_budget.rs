@@ -407,6 +407,10 @@ where
         return Err(PayloadMaterializationError::BoundExceeded);
     }
     buffer.truncate(written);
+    // The provisional `bound`-sized allocation is returned; charge only what
+    // the truncated buffer still retains for the payload's lifetime.
+    buffer.shrink_to_fit();
+    reservation.shrink_to(buffer.capacity());
     Ok(ReservedPayload {
         bytes: Bytes::from(buffer),
         _reservation: reservation,
@@ -791,10 +795,12 @@ impl ReservedPayload {
 /// `write` into a writer that fails closed at `bound`, and hand back an owned
 /// payload that keeps holding the reservation.
 ///
-/// The reservation is deliberately not shrunk to the produced length: the buffer
-/// handed to `Bytes` still owns its full allocation, so holding the conservative
-/// bound for the payload's short delivery lifetime can never under-charge the
-/// ceiling. Every failure path drops the reservation exactly once.
+/// `bound` is a fail-closed provisional ceiling (typically a worst-case JSON
+/// framing/escaping estimate). After a successful write the buffer is
+/// `shrink_to_fit`'d and the reservation shrinks to the buffer's exact retained
+/// `capacity`, so escape-expanded bodies stay fully charged while ordinary
+/// payloads do not pin the provisional over-estimate for the delivery lifetime.
+/// Every failure path drops the reservation exactly once.
 pub fn materialize_reserved_payload<F>(
     ceiling: &'static RetainedByteCeiling,
     bound: usize,
@@ -814,6 +820,10 @@ where
     if outcome.is_err() {
         return Err(PayloadMaterializationError::WriteFailed);
     }
+    // `Bytes` retains the `Vec`'s allocation, so charge capacity — not `len` —
+    // after discarding unused spare capacity from geometric growth.
+    writer.bytes.shrink_to_fit();
+    reservation.shrink_to(writer.bytes.capacity());
     Ok(ReservedPayload {
         bytes: Bytes::from(writer.bytes),
         _reservation: reservation,

@@ -2605,7 +2605,9 @@ struct ClickHouseFlushConfig {
     metrics: Arc<SinkMetrics>,
     /// Retained-byte ceiling the JSONEachRow request body is charged to. The
     /// queued `ChargeEvent`s already hold a per-instance lease; the serialized
-    /// body is a second attacker-shaped copy that coexists with them.
+    /// body is a second attacker-shaped copy that coexists with them. Admission
+    /// takes a provisional escaping/framing bound, then shrinks to the exact
+    /// retained allocation for the body's lifetime.
     ceiling: &'static RetainedByteCeiling,
     /// Compiled charge-event projection for the emitted representation.
     /// `None` keeps the native JSONEachRow rows byte-for-byte.
@@ -4355,9 +4357,13 @@ impl ClickHouseAckIncomplete {
 /// serialized charge event costs beyond its own retained strings.
 const CHARGE_ROW_JSON_OVERHEAD_BYTES: usize = 1_024;
 
-/// Conservative upper bound on the JSONEachRow request body for `batch`.
+/// Provisional upper bound on the JSONEachRow request body for `batch`.
 ///
 /// Charge-event strings are raw, so JSON escaping can expand each byte six-fold.
+/// This bound is reserved **before** serialization; after the body exists the
+/// reservation shrinks to the buffer's exact retained capacity (framing and
+/// escaping included), so the delivery lifetime never pins the provisional
+/// over-estimate.
 fn charge_body_byte_bound(
     batch: &[ChargeEvent],
     projection: Option<&ChargeEventProjection>,
@@ -4381,9 +4387,10 @@ fn charge_body_byte_bound(
 /// Serialize `batch` into the reserved-and-charged JSONEachRow request body.
 ///
 /// The queued events still hold their per-instance leases here, so the body is a
-/// second attacker-shaped copy: it is reserved against the retained-byte ceiling
-/// before serialization and stays charged until the request (and every retry
-/// handle taken from it) is gone.
+/// second attacker-shaped copy: a provisional escaping/framing bound is reserved
+/// against the retained-byte ceiling before serialization, then shrunk to the
+/// exact retained allocation, and stays charged until the request (and every
+/// retry handle taken from it) is gone.
 fn materialize_charge_body(
     cfg: &ClickHouseFlushConfig,
     batch: &[ChargeEvent],
@@ -4451,9 +4458,12 @@ fn write_json_each_row<W: Write>(
 /// against `ceiling` before a single byte is written and stays charged for the
 /// payload's whole life.
 ///
-/// Every producer of an attacker-shaped JSONEachRow representation — the HTTP
-/// delivery body and the durable spool artifact alike — goes through here, so
-/// no caller can serialize first and measure afterwards.
+/// Admission uses a provisional escaping/framing bound so serialization cannot
+/// outgrow the ceiling; after the write succeeds the charge shrinks to the
+/// exact retained buffer capacity (JSON framing and escaping included). Every
+/// producer of an attacker-shaped JSONEachRow representation — the HTTP delivery
+/// body and the durable spool artifact alike — goes through here, so no caller
+/// can serialize first and measure afterwards.
 fn materialize_json_each_row(
     ceiling: &'static RetainedByteCeiling,
     batch: &[ChargeEvent],
@@ -4480,7 +4490,7 @@ async fn send_batch(cfg: &ClickHouseFlushConfig, batch: Vec<ChargeEvent>) -> Res
     })?;
     // The reserved body is the only representation delivery needs; the events
     // themselves are released here so peak retention is the queue's leases plus
-    // one bounded body rather than the queue plus per-attempt copies.
+    // one exactly-charged body rather than the queue plus per-attempt copies.
     drop(batch);
     match post_json_each_row(cfg, body, event_count).await {
         DeliveryOutcome::Delivered => Ok(()),
@@ -8701,8 +8711,12 @@ pub async fn replay_spool_once_with_ceiling_for_tests(
 
 /// Deterministic body-materialization probe for external unit tests.
 ///
-/// Returns `(reserved_bound, ceiling_used_while_body_held, ceiling_used_after_drop)`,
+/// Returns `(provisional_bound, ceiling_used_while_body_held, ceiling_used_after_drop)`,
 /// or `Err` when the ceiling refused the body before it was serialized.
+///
+/// `ceiling_used_while_body_held` is the **exact** retained charge after the
+/// provisional escaping/framing reservation has been shrunk to the buffer's
+/// capacity — not the provisional bound.
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn probe_charge_body_materialization_for_tests(
@@ -8713,8 +8727,9 @@ pub fn probe_charge_body_materialization_for_tests(
 }
 
 /// [`probe_charge_body_materialization_for_tests`] under a compiled projection,
-/// so a schema's reservation bound can be asserted to still precede — and cover
-/// — the projected serialization.
+/// so a schema's provisional reservation bound can be asserted to still precede
+/// — and cover — the projected serialization, while the held charge reflects
+/// the exact retained body allocation.
 #[doc(hidden)]
 #[allow(dead_code)]
 pub fn probe_charge_body_materialization_with_projection_for_tests(
@@ -8740,6 +8755,41 @@ pub fn probe_charge_body_materialization_with_projection_for_tests(
     let held = ceiling.used();
     drop(body);
     Ok((bound, held, ceiling.used()))
+}
+
+/// Deliver `batch` against `insert_url` while reporting the exact body charge
+/// observed before the request returns and after the payload is released.
+///
+/// Returns `(held_while_in_flight, ceiling_used_after_delivery)`. The in-flight
+/// observation is taken after materialization and before `post_json_each_row`
+/// returns, so a slow ClickHouse acknowledgement keeps the exact body charge
+/// visible for the whole request lifetime. Cancellation, success, and error
+/// paths all release through `ReservedPayload`'s drop.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn probe_charge_body_delivery_retention_for_tests(
+    ceiling: &'static RetainedByteCeiling,
+    batch: Vec<ChargeEvent>,
+    insert_url: &str,
+) -> Result<(usize, usize), String> {
+    let metrics = Arc::new(SinkMetrics::default());
+    let cfg = ClickHouseFlushConfig {
+        http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
+        insert_url: insert_url.to_string(),
+        redacted_insert_url: redacted_endpoint_url_str(insert_url),
+        username: None,
+        password: None,
+        timeout: Duration::from_secs(5),
+        metrics,
+        ceiling,
+        projection: None,
+    };
+    let event_count = batch.len();
+    let body = materialize_charge_body(&cfg, &batch)?;
+    drop(batch);
+    let held_while_in_flight = ceiling.used();
+    let _ = post_json_each_row(&cfg, body, event_count).await;
+    Ok((held_while_in_flight, ceiling.used()))
 }
 
 #[doc(hidden)]
