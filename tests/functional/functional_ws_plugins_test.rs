@@ -8,14 +8,13 @@
 //! All tests are #[ignore] — run with:
 //!   cargo test --test functional_tests functional_ws_plugins -- --ignored --nocapture
 
+use crate::common::{TestGateway, TestGatewayBuilder};
+
 use futures_util::{SinkExt, StreamExt};
-use std::io::Write;
-use std::time::{Duration, Instant};
-use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::collections::HashSet;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
@@ -23,13 +22,6 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, O
 // ============================================================================
 // Helpers
 // ============================================================================
-
-async fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind to port 0");
-    listener.local_addr().unwrap().port()
-}
 
 async fn bind_ws_backend_listener() -> (u16, TcpListener) {
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -144,159 +136,12 @@ async fn start_ws_echo_server_recording_close(
     }
 }
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
-fn start_gateway(
-    config_path: &str,
-    http_port: u16,
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    // Fresh admin HTTP port + admin HTTPS disabled so parallel gateways in the
-    // same shard never contend on the default admin ports (9000/9443); an admin
-    // bind failure aborts startup. These tests do not use the admin API.
-    let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
-        .unwrap_or(0);
-    let cmd = std::process::Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", config_path)
-        .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
-        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
-        .env("RUST_LOG", "ferrum_edge=debug")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    Ok(cmd)
-}
-
-/// Wait for the gateway to become ready by sending a complete HTTP probe.
-async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let addr = format!("127.0.0.1:{}", gateway_port);
-    let mut last_err = String::new();
-
-    loop {
-        if Instant::now() >= deadline {
-            return Err(format!("Gateway did not start within 30 seconds: {last_err}").into());
-        }
-        match probe_gateway_http(&addr).await {
-            Ok(_) => return Ok(()),
-            Err(error) => {
-                last_err = error.to_string();
-                sleep(Duration::from_millis(300)).await;
-            }
-        }
-    }
-}
-
-async fn probe_gateway_http(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stream = tokio::time::timeout(
-        Duration::from_millis(750),
-        tokio::net::TcpStream::connect(addr),
-    )
-    .await??;
-    let _ = stream.set_nodelay(true);
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        stream.write_all(
-            b"GET /__ferrum_startup_probe HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-        ),
-    )
-    .await??;
-    let mut buf = [0u8; 12];
-    let n = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf)).await??;
-    if n == 0 {
-        return Err("gateway closed startup probe without a response".into());
-    }
-    if !buf[..n].starts_with(b"HTTP/") {
-        return Err(format!(
-            "gateway startup probe returned non-HTTP bytes: {:?}",
-            &buf[..n]
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn child_exit_status(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
-    match child.try_wait() {
-        Ok(status) => status,
-        Err(error) => {
-            eprintln!("could not inspect gateway child status: {error}");
-            None
-        }
-    }
-}
-
-/// Start the gateway with retry logic to handle ephemeral port races.
-///
-/// Each attempt allocates a fresh gateway port, starts the gateway subprocess,
-/// and waits for it to become healthy. On failure the process is killed and a
-/// new attempt is made with a different port. Panics only after all attempts
-/// are exhausted.
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16) {
-    const MAX_ATTEMPTS: u32 = 3;
-    let mut last_err = String::new();
-    for attempt in 1..=MAX_ATTEMPTS {
-        let gateway_port = free_port().await;
-        match start_gateway(config_path, gateway_port) {
-            Ok(mut child) => match wait_for_gateway(gateway_port).await {
-                Ok(()) => {
-                    if let Some(status) = child_exit_status(&mut child) {
-                        last_err = format!("gateway exited immediately after readiness: {status}");
-                        eprintln!(
-                            "Gateway startup attempt {}/{} failed (port {}): {}",
-                            attempt, MAX_ATTEMPTS, gateway_port, last_err
-                        );
-                        let _ = child.wait();
-                    } else {
-                        return (child, gateway_port);
-                    }
-                }
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Gateway startup attempt {}/{} failed (port {}): {}",
-                        attempt, MAX_ATTEMPTS, gateway_port, last_err
-                    );
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            },
-            Err(e) => {
-                last_err = e.to_string();
-                eprintln!(
-                    "Gateway spawn attempt {}/{} failed: {}",
-                    attempt, MAX_ATTEMPTS, last_err
-                );
-            }
-        }
-        if attempt < MAX_ATTEMPTS {
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
-    panic!(
-        "Gateway did not start after {} attempts: {}",
-        MAX_ATTEMPTS, last_err
-    );
-}
-
-fn write_ws_config_with_plugins(
-    config_path: &std::path::Path,
+fn ws_plugins_config_yaml(
     backend_port: u16,
     plugin_configs_yaml: &str,
     proxy_plugins_yaml: &str,
-) {
-    let config = format!(
+) -> String {
+    format!(
         r#"
 version: "1"
 proxies:
@@ -314,11 +159,66 @@ consumers: []
 plugin_configs:
 {plugin_configs_yaml}
 "#,
-    );
+    )
+}
 
-    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
-    file.write_all(config.as_bytes())
-        .expect("Failed to write config");
+fn ws_plugins_gateway_builder(
+    backend_port: u16,
+    plugin_configs_yaml: &str,
+    proxy_plugins_yaml: &str,
+) -> TestGatewayBuilder {
+    TestGateway::builder()
+        .mode_file(ws_plugins_config_yaml(
+            backend_port,
+            plugin_configs_yaml,
+            proxy_plugins_yaml,
+        ))
+        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
+}
+
+async fn spawn_ws_plugins_gateway(
+    backend_port: u16,
+    plugin_configs_yaml: &str,
+    proxy_plugins_yaml: &str,
+) -> TestGateway {
+    ws_plugins_gateway_builder(backend_port, plugin_configs_yaml, proxy_plugins_yaml)
+        .spawn()
+        .await
+        .expect("spawn ws plugins gateway")
+}
+
+fn ws_frame_log_connection_ids(output: &str) -> (HashSet<u64>, HashSet<u64>) {
+    let mut frame_ids = HashSet::new();
+    let mut disconnect_ids = HashSet::new();
+    for line in output.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("target").and_then(|target| target.as_str()) != Some("ws_frame_log") {
+            continue;
+        }
+        let fields = value.get("fields").unwrap_or(&value);
+        let Some(id) = fields.get("connection_id").and_then(|value| value.as_u64()) else {
+            continue;
+        };
+        let is_disconnect = fields.get("event").and_then(|event| event.as_str())
+            == Some("disconnect")
+            || fields
+                .get("message")
+                .and_then(|message| message.as_str())
+                .is_some_and(|message| message.contains("session ended"));
+        if is_disconnect {
+            disconnect_ids.insert(id);
+        } else if fields.get("frame_type").is_some()
+            || fields
+                .get("message")
+                .and_then(|message| message.as_str())
+                .is_some_and(|message| message.contains("WebSocket frame"))
+        {
+            frame_ids.insert(id);
+        }
+    }
+    (frame_ids, disconnect_ids)
 }
 
 // ============================================================================
@@ -337,10 +237,7 @@ async fn test_ws_message_size_limiting_e2e() {
         backend_close_tx,
     ));
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_ws_config_with_plugins(
-        &config_path,
+    let gateway = spawn_ws_plugins_gateway(
         backend_port,
         r#"  - id: "ws-size-limit"
     plugin_name: "ws_message_size_limiting"
@@ -352,9 +249,9 @@ async fn test_ws_message_size_limiting_e2e() {
       max_message_bytes: 200
       close_reason: "payload exceeds gateway limit""#,
         r#"      - plugin_config_id: "ws-size-limit""#,
-    );
-
-    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    )
+    .await;
+    let gateway_port = gateway.proxy_port;
 
     // Connect
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
@@ -447,8 +344,6 @@ async fn test_ws_message_size_limiting_e2e() {
     assert_eq!(backend_code, CloseCode::Size);
     assert_eq!(backend_reason, "payload exceeds gateway limit");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
     echo_handle.abort();
     println!("test_ws_message_size_limiting_e2e PASSED");
 }
@@ -465,10 +360,7 @@ async fn test_ws_message_size_limiting_backend_direction_and_instances_e2e() {
         backend_close_tx,
     ));
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_ws_config_with_plugins(
-        &config_path,
+    let gateway = spawn_ws_plugins_gateway(
         backend_port,
         r#"  - id: "ws-size-loose"
     plugin_name: "ws_message_size_limiting"
@@ -489,9 +381,9 @@ async fn test_ws_message_size_limiting_backend_direction_and_instances_e2e() {
       close_reason: "strict proxy limit""#,
         r#"      - plugin_config_id: "ws-size-loose"
       - plugin_config_id: "ws-size-strict""#,
-    );
-
-    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    )
+    .await;
+    let gateway_port = gateway.proxy_port;
     let url = format!("ws://127.0.0.1:{gateway_port}/ws-echo");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
@@ -520,8 +412,6 @@ async fn test_ws_message_size_limiting_backend_direction_and_instances_e2e() {
     assert_eq!(backend_code, CloseCode::Size);
     assert_eq!(backend_reason, "strict proxy limit");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
     echo_handle.abort();
 }
 
@@ -536,10 +426,7 @@ async fn test_ws_message_size_limiting_reassembly_bound_e2e() {
         backend_close_tx,
     ));
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_ws_config_with_plugins(
-        &config_path,
+    let gateway = spawn_ws_plugins_gateway(
         backend_port,
         r#"  - id: "ws-frame-limit"
     plugin_name: "ws_message_size_limiting"
@@ -561,9 +448,9 @@ async fn test_ws_message_size_limiting_reassembly_bound_e2e() {
       close_reason: "reassembly limit""#,
         r#"      - plugin_config_id: "ws-frame-limit"
       - plugin_config_id: "ws-message-limit""#,
-    );
-
-    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    )
+    .await;
+    let gateway_port = gateway.proxy_port;
     let url = format!("ws://127.0.0.1:{gateway_port}/ws-echo");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
@@ -632,8 +519,6 @@ async fn test_ws_message_size_limiting_reassembly_bound_e2e() {
     assert_eq!(backend_code, CloseCode::Size);
     assert_eq!(backend_reason, "reassembly limit");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
     echo_handle.abort();
 }
 
@@ -649,10 +534,7 @@ async fn test_ws_frame_logging_e2e() {
 
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_ws_config_with_plugins(
-        &config_path,
+    let gateway = spawn_ws_plugins_gateway(
         backend_port,
         r#"  - id: "ws-logging"
     plugin_name: "ws_frame_logging"
@@ -664,9 +546,9 @@ async fn test_ws_frame_logging_e2e() {
       include_payload_preview: true
       payload_preview_bytes: 64"#,
         r#"      - plugin_config_id: "ws-logging""#,
-    );
-
-    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    )
+    .await;
+    let gateway_port = gateway.proxy_port;
 
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
@@ -691,8 +573,6 @@ async fn test_ws_frame_logging_e2e() {
     // Clean close
     ws.send(Message::Close(None)).await.unwrap();
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
     echo_handle.abort();
     println!("test_ws_frame_logging_e2e PASSED");
 }
@@ -702,16 +582,10 @@ async fn test_ws_frame_logging_e2e() {
 #[ignore]
 #[tokio::test]
 async fn test_ws_frame_logging_connection_id_correlates_frame_and_disconnect() {
-    use std::io::{BufRead, BufReader};
-    use std::sync::{Arc, Mutex};
-
     let (backend_port, backend_listener) = bind_ws_backend_listener().await;
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_ws_config_with_plugins(
-        &config_path,
+    let gateway = ws_plugins_gateway_builder(
         backend_port,
         r#"  - id: "ws-logging"
     plugin_name: "ws_frame_logging"
@@ -721,46 +595,13 @@ async fn test_ws_frame_logging_connection_id_correlates_frame_and_disconnect() {
     config:
       log_level: "info""#,
         r#"      - plugin_config_id: "ws-logging""#,
-    );
-
-    let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
-        .unwrap_or(0);
-    let gateway_port = free_port().await;
-    let log_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let log_lines_reader = Arc::clone(&log_lines);
-
-    let mut gateway = std::process::Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
-        .env("FERRUM_PROXY_HTTP_PORT", gateway_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
-        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        // Admit info-level ws_frame_log records (frame + disconnect).
-        .env("FERRUM_LOG_LEVEL", "info")
-        .env("RUST_LOG", "ws_frame_log=info")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn gateway");
-
-    let stdout = gateway.stdout.take().expect("piped stdout");
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if line.contains("ws_frame_log") || line.contains("connection_id") {
-                log_lines_reader.lock().unwrap().push(line);
-            }
-        }
-    });
-
-    wait_for_gateway(gateway_port)
-        .await
-        .expect("gateway readiness");
+    )
+    .capture_output()
+    .env("RUST_LOG", "ws_frame_log=info")
+    .spawn()
+    .await
+    .expect("spawn ws frame logging gateway");
+    let gateway_port = gateway.proxy_port;
 
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
     let (mut ws_a, _) = tokio_tungstenite::connect_async(&url)
@@ -780,50 +621,29 @@ async fn test_ws_frame_logging_connection_id_correlates_frame_and_disconnect() {
     ws_a.send(Message::Close(None)).await.unwrap();
     let _ = ws_a.next().await;
 
-    // Allow disconnect hooks to flush structured logs.
-    sleep(Duration::from_millis(500)).await;
-
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    let captured = gateway
+        .wait_for_captured_output(
+            |output| {
+                let (frame_ids, disconnect_ids) = ws_frame_log_connection_ids(output);
+                frame_ids.len() >= 2 && disconnect_ids == frame_ids
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_or_default();
+    let logs: Vec<String> = captured
+        .lines()
+        .filter(|line| line.contains("ws_frame_log") || line.contains("connection_id"))
+        .map(str::to_string)
+        .collect();
     echo_handle.abort();
 
-    let logs = log_lines.lock().unwrap().clone();
     assert!(
         !logs.is_empty(),
         "expected ws_frame_log output; got none (check FERRUM_LOG_LEVEL / RUST_LOG)"
     );
 
-    let mut frame_ids = std::collections::HashSet::new();
-    let mut disconnect_ids = std::collections::HashSet::new();
-    for line in &logs {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value.get("target").and_then(|t| t.as_str()) != Some("ws_frame_log") {
-            continue;
-        }
-        // tracing-subscriber JSON nests event attributes under `fields` while
-        // leaving `target` at the envelope root.
-        let fields = value.get("fields").unwrap_or(&value);
-        let Some(id) = fields.get("connection_id").and_then(|v| v.as_u64()) else {
-            continue;
-        };
-        let is_disconnect = fields.get("event").and_then(|e| e.as_str()) == Some("disconnect")
-            || fields
-                .get("message")
-                .and_then(|m| m.as_str())
-                .is_some_and(|m| m.contains("session ended"));
-        if is_disconnect {
-            disconnect_ids.insert(id);
-        } else if fields.get("frame_type").is_some()
-            || fields
-                .get("message")
-                .and_then(|m| m.as_str())
-                .is_some_and(|m| m.contains("WebSocket frame"))
-        {
-            frame_ids.insert(id);
-        }
-    }
+    let (frame_ids, disconnect_ids) = ws_frame_log_connection_ids(&captured);
 
     assert!(
         frame_ids.len() >= 2,
@@ -843,18 +663,13 @@ async fn test_ws_frame_logging_connection_id_correlates_frame_and_disconnect() {
 #[ignore]
 #[tokio::test]
 async fn test_ws_frame_logging_peer_close_and_disconnect_fields() {
-    use std::io::{BufRead, BufReader};
-    use std::sync::{Arc, Mutex};
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
     let (backend_port, backend_listener) = bind_ws_backend_listener().await;
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_ws_config_with_plugins(
-        &config_path,
+    let gateway = ws_plugins_gateway_builder(
         backend_port,
         r#"  - id: "ws-logging"
     plugin_name: "ws_frame_logging"
@@ -864,45 +679,13 @@ async fn test_ws_frame_logging_peer_close_and_disconnect_fields() {
     config:
       log_level: "info""#,
         r#"      - plugin_config_id: "ws-logging""#,
-    );
-
-    let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
-        .unwrap_or(0);
-    let gateway_port = free_port().await;
-    let log_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let log_lines_reader = Arc::clone(&log_lines);
-
-    let mut gateway = std::process::Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
-        .env("FERRUM_PROXY_HTTP_PORT", gateway_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
-        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        .env("FERRUM_LOG_LEVEL", "info")
-        .env("RUST_LOG", "ws_frame_log=info")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn gateway");
-
-    let stdout = gateway.stdout.take().expect("piped stdout");
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if line.contains("ws_frame_log") {
-                log_lines_reader.lock().unwrap().push(line);
-            }
-        }
-    });
-
-    wait_for_gateway(gateway_port)
-        .await
-        .expect("gateway readiness");
+    )
+    .capture_output()
+    .env("RUST_LOG", "ws_frame_log=info")
+    .spawn()
+    .await
+    .expect("spawn ws frame logging gateway");
+    let gateway_port = gateway.proxy_port;
 
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
@@ -931,10 +714,38 @@ async fn test_ws_frame_logging_peer_close_and_disconnect_fields() {
     })
     .await;
 
-    // Allow disconnect logging to flush.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    let logs = log_lines.lock().unwrap().clone();
+    let captured = gateway
+        .wait_for_captured_output(
+            |output| {
+                let close_delivered = output.lines().any(|line| {
+                    line.contains("ws_frame_log")
+                        && line.contains("frame_type")
+                        && line.contains("close")
+                        && line.contains("outcome")
+                        && line.contains("delivered")
+                        && line.contains("close_code")
+                        && line.contains("1000")
+                });
+                let disconnect_complete = output.lines().any(|line| {
+                    line.contains("ws_frame_log")
+                        && line.contains("event")
+                        && line.contains("disconnect")
+                        && line.contains("bytes_c2b")
+                        && line.contains("bytes_b2c")
+                        && line.contains("io_side")
+                        && line.contains("frames_c2b")
+                });
+                close_delivered && disconnect_complete
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_or_default();
+    let logs: Vec<String> = captured
+        .lines()
+        .filter(|line| line.contains("ws_frame_log"))
+        .map(str::to_string)
+        .collect();
     let close_lines: Vec<_> = logs
         .iter()
         .filter(|line| line.contains("frame_type") && line.contains("close"))
@@ -978,8 +789,6 @@ async fn test_ws_frame_logging_peer_close_and_disconnect_fields() {
         "disconnect must expose success-only byte totals and io_side; disconnect_lines={disconnect_lines:?}"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
     echo_handle.abort();
     println!("test_ws_frame_logging_peer_close_and_disconnect_fields PASSED");
 }
@@ -996,13 +805,7 @@ async fn test_ws_rate_limiting_e2e() {
 
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    // Use a generous burst to allow some round-trips to pass, then exhaust it.
-    // Each round-trip counts 2 frames (client->backend + backend->client echo).
-    // burst_size=20 allows ~10 round-trips, then rapidly sending should exhaust it.
-    write_ws_config_with_plugins(
-        &config_path,
+    let gateway = spawn_ws_plugins_gateway(
         backend_port,
         r#"  - id: "ws-rate-limit"
     plugin_name: "ws_rate_limiting"
@@ -1013,9 +816,9 @@ async fn test_ws_rate_limiting_e2e() {
       frames_per_second: 5
       burst_size: 20"#,
         r#"      - plugin_config_id: "ws-rate-limit""#,
-    );
-
-    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    )
+    .await;
+    let gateway_port = gateway.proxy_port;
 
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
@@ -1084,8 +887,6 @@ async fn test_ws_rate_limiting_e2e() {
         "Connection should have been closed by rate limiter"
     );
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
     echo_handle.abort();
     println!("test_ws_rate_limiting_e2e PASSED");
 }
@@ -1102,10 +903,7 @@ async fn test_ws_combined_plugins_e2e() {
 
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_ws_config_with_plugins(
-        &config_path,
+    let gateway = spawn_ws_plugins_gateway(
         backend_port,
         r#"  - id: "ws-size-limit"
     plugin_name: "ws_message_size_limiting"
@@ -1132,9 +930,9 @@ async fn test_ws_combined_plugins_e2e() {
         r#"      - plugin_config_id: "ws-size-limit"
       - plugin_config_id: "ws-logging"
       - plugin_config_id: "ws-rate-limit""#,
-    );
-
-    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    )
+    .await;
+    let gateway_port = gateway.proxy_port;
 
     let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
@@ -1152,8 +950,6 @@ async fn test_ws_combined_plugins_e2e() {
     // Clean close
     ws.send(Message::Close(None)).await.unwrap();
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
     echo_handle.abort();
     println!("test_ws_combined_plugins_e2e PASSED");
 }
@@ -1170,10 +966,7 @@ async fn test_ws_size_rejection_preserved_over_exhausted_rate_limiter_e2e() {
         backend_close_tx,
     ));
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_ws_config_with_plugins(
-        &config_path,
+    let gateway = spawn_ws_plugins_gateway(
         backend_port,
         r#"  - id: "ws-size"
     plugin_name: "ws_message_size_limiting"
@@ -1194,9 +987,9 @@ async fn test_ws_size_rejection_preserved_over_exhausted_rate_limiter_e2e() {
       close_reason: "frame rate exceeded""#,
         r#"      - plugin_config_id: "ws-size"
       - plugin_config_id: "ws-rate""#,
-    );
-
-    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    )
+    .await;
+    let gateway_port = gateway.proxy_port;
     let url = format!("ws://127.0.0.1:{gateway_port}/ws-echo");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
@@ -1249,8 +1042,6 @@ async fn test_ws_size_rejection_preserved_over_exhausted_rate_limiter_e2e() {
     assert_eq!(backend_code, CloseCode::Size);
     assert_eq!(backend_reason, "message too large");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
     echo_handle.abort();
     println!("test_ws_size_rejection_preserved_over_exhausted_rate_limiter_e2e PASSED");
 }
@@ -1267,10 +1058,7 @@ async fn test_ws_size_rejection_preserved_over_rate_limiter_backend_direction_e2
         backend_close_tx,
     ));
 
-    let temp_dir = TempDir::new().unwrap();
-    let config_path = temp_dir.path().join("config.yaml");
-    write_ws_config_with_plugins(
-        &config_path,
+    let gateway = spawn_ws_plugins_gateway(
         backend_port,
         r#"  - id: "ws-size"
     plugin_name: "ws_message_size_limiting"
@@ -1291,9 +1079,9 @@ async fn test_ws_size_rejection_preserved_over_rate_limiter_backend_direction_e2
       close_reason: "frame rate exceeded""#,
         r#"      - plugin_config_id: "ws-size"
       - plugin_config_id: "ws-rate""#,
-    );
-
-    let (mut gateway, gateway_port) = start_gateway_with_retry(config_path.to_str().unwrap()).await;
+    )
+    .await;
+    let gateway_port = gateway.proxy_port;
     let url = format!("ws://127.0.0.1:{gateway_port}/ws-echo");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
@@ -1343,7 +1131,5 @@ async fn test_ws_size_rejection_preserved_over_rate_limiter_backend_direction_e2
     assert_eq!(backend_code, CloseCode::Size);
     assert_eq!(backend_reason, "message too large");
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
     echo_handle.abort();
 }

@@ -122,6 +122,31 @@ impl CooldownGate {
         }
     }
 
+    /// Clear a previously acquired cooldown so a failed delivery does not
+    /// silently consume the window.
+    ///
+    /// The compare-and-swap is load-bearing: a slow delivery may settle after
+    /// its cooldown elapsed and a newer dispatch rearmed the same slot. That
+    /// stale settle must not clear the newer dispatch's reservation.
+    pub fn release(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        channel_id: u32,
+        ownership_generation: u64,
+        reserved_at_ms: u64,
+    ) {
+        let Some(per_proxy) = self.last_sent.get(&(rule_id, channel_id)) else {
+            return;
+        };
+        let Some(per_generation) = per_proxy.get(proxy_id) else {
+            return;
+        };
+        if let Some(atomic) = per_generation.get_cloned(&ownership_generation) {
+            let _ = atomic.compare_exchange(reserved_at_ms, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
     /// Drop cooldown rows for proxies absent from `active_proxy_generations`
     /// or whose stored generation does not match the published incarnation.
     ///
@@ -188,15 +213,64 @@ impl CooldownGate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleState {
     Healthy,
-    Active { fired_at_ms: u64 },
-    Recovering { left_threshold_at_ms: u64 },
+    /// Trigger accepted for dispatch but delivery has not settled yet.
+    /// Suppresses duplicate Trigger admissions until success (→ Active) or
+    /// failure/abandon (→ Healthy, cooldown released).
+    PendingTrigger {
+        reserved_at_ms: u64,
+    },
+    Active {
+        fired_at_ms: u64,
+    },
+    Recovering {
+        left_threshold_at_ms: u64,
+    },
+    /// Resolve accepted for dispatch but delivery has not settled yet.
+    /// Suppresses duplicate Resolve admissions until success (→ Healthy) or
+    /// failure/abandon (→ Recovering, so the next healthy sample can retry).
+    PendingResolve {
+        left_threshold_at_ms: u64,
+        reserved_at_ms: u64,
+    },
+    /// The rule breached again while its Resolve was **already externally in
+    /// flight** — the uncertain delivery boundary.
+    ///
+    /// The Resolve cannot be unsent, and cancelling or retiring its local
+    /// future is not a rollback: the endpoint may have received it and marked
+    /// the incident resolved. Returning straight to `Active` here (the previous
+    /// behaviour) permanently suppressed the Trigger for a genuinely breached
+    /// incident, because `Active` + `StillActive` never re-enters the
+    /// `Trigger` transition.
+    ///
+    /// So the breach is *retained* instead: no notification is emitted yet (a
+    /// Trigger dispatched now could overtake the in-flight Resolve and leave
+    /// "resolved" as the operator's last view), and when the Resolve settles —
+    /// success, failure, or abandonment alike — the state converges to
+    /// [`RuleState::CompensatingTrigger`].
+    ResolveInFlightRebreached {
+        /// Reservation token of the Resolve that is still externally in flight.
+        resolve_reserved_at_ms: u64,
+        /// When the re-breach was observed.
+        rebreached_at_ms: u64,
+    },
+    /// A Resolve that may have been delivered is now known to be stale: the
+    /// incident is breached and owes the operator a Trigger.
+    ///
+    /// The next breaching observation emits that compensating Trigger (subject
+    /// to the ordinary cooldown gate, so it stays bounded and never queues). If
+    /// the rule is no longer breaching by then, the possibly-delivered Resolve
+    /// already matches reality and the state falls back to `Healthy` with no
+    /// phantom alert.
+    CompensatingTrigger {
+        rebreached_at_ms: u64,
+    },
 }
 
 /// Outcome of evaluating a single observation against the recovery state
 /// machine. The dispatch loop translates this into zero or one notification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleOutcome {
-    /// Healthy → Active. Caller should dispatch a `Trigger` notification
+    /// Healthy → PendingTrigger. Caller should dispatch a `Trigger` notification
     /// (subject to cooldown).
     Trigger,
     /// Active → Active. Caller MAY dispatch a re-trigger if its cooldown
@@ -205,11 +279,15 @@ pub enum LifecycleOutcome {
     StillActive,
     /// Active → Recovering. No notification.
     EnteringRecovery,
-    /// Recovering → Healthy. Caller should dispatch a `Resolve` notification
-    /// (no cooldown applies — recovery events are always one-shot).
+    /// Recovering → PendingResolve. Caller should dispatch a `Resolve`
+    /// notification (no cooldown applies — recovery events are always one-shot).
     Resolve,
-    /// Recovering → Active (re-breach inside the resolved window). No
-    /// notification — the rule is still considered alerting.
+    /// Re-breach while the incident was recovering or while its Resolve was
+    /// externally in flight. No notification is emitted on this transition
+    /// itself — either the rule is still considered alerting (`Recovering` →
+    /// `Active`), or a compensating Trigger is being retained until the
+    /// in-flight Resolve settles (`PendingResolve` →
+    /// [`RuleState::ResolveInFlightRebreached`]).
     Reactivate,
     /// No transition; the rule remains in its prior state.
     Quiet,
@@ -337,12 +415,17 @@ impl RecoveryGate {
     ) -> LifecycleOutcome {
         match (*state, breach) {
             (RuleState::Healthy, true) => {
-                *state = RuleState::Active {
-                    fired_at_ms: now_ms,
+                *state = RuleState::PendingTrigger {
+                    reserved_at_ms: now_ms,
                 };
                 LifecycleOutcome::Trigger
             }
             (RuleState::Healthy, false) => LifecycleOutcome::Quiet,
+            // PendingTrigger holds the seat until delivery settles. A continued
+            // breach stays quiet (no duplicate dispatch); a clear while pending
+            // stays pending so a late success still lands on Active, and a late
+            // failure rolls back to Healthy via [`Self::settle_trigger`].
+            (RuleState::PendingTrigger { .. }, _) => LifecycleOutcome::Quiet,
             (RuleState::Active { .. }, true) => LifecycleOutcome::StillActive,
             (RuleState::Active { .. }, false) if recovery_ms == 0 => {
                 *state = RuleState::Healthy;
@@ -365,7 +448,10 @@ impl RecoveryGate {
                     LifecycleOutcome::Quiet
                 } else if let Some(elapsed) = now_ms.checked_sub(left_threshold_at_ms) {
                     if elapsed >= recovery_ms {
-                        *state = RuleState::Healthy;
+                        *state = RuleState::PendingResolve {
+                            left_threshold_at_ms,
+                            reserved_at_ms: now_ms,
+                        };
                         LifecycleOutcome::Resolve
                     } else {
                         LifecycleOutcome::Quiet
@@ -380,8 +466,8 @@ impl RecoveryGate {
                 }
             }
             (RuleState::Recovering { .. }, true) if recovery_ms == 0 => {
-                *state = RuleState::Active {
-                    fired_at_ms: now_ms,
+                *state = RuleState::PendingTrigger {
+                    reserved_at_ms: now_ms,
                 };
                 LifecycleOutcome::Trigger
             }
@@ -391,7 +477,253 @@ impl RecoveryGate {
                 };
                 LifecycleOutcome::Reactivate
             }
+            // PendingResolve holds the seat until delivery settles.
+            (RuleState::PendingResolve { reserved_at_ms, .. }, true) => {
+                // Re-breach while the Resolve is externally in flight. The
+                // Resolve may already have been delivered, so this is NOT a
+                // rollback to Active: retain the re-breach against the
+                // outstanding reservation token and let the settle converge to
+                // a compensating Trigger. Emitting a Trigger right now could
+                // overtake the in-flight Resolve on the wire and leave the
+                // operator's last view as "resolved".
+                *state = RuleState::ResolveInFlightRebreached {
+                    resolve_reserved_at_ms: reserved_at_ms,
+                    rebreached_at_ms: now_ms,
+                };
+                LifecycleOutcome::Reactivate
+            }
+            (RuleState::PendingResolve { .. }, false) => LifecycleOutcome::Quiet,
+            // Waiting for the in-flight Resolve to settle. Further samples in
+            // either direction change nothing: the compensating decision is
+            // owned by the settle, which cannot be lost (a retired generation
+            // still settles exactly once, as Abandoned).
+            (RuleState::ResolveInFlightRebreached { .. }, _) => LifecycleOutcome::Quiet,
+            // The compensating Trigger the possibly-delivered Resolve owes the
+            // operator. Cooldown still applies, so this cannot storm; if the
+            // gate suppresses it the state is left in place and the next
+            // sample retries.
+            (RuleState::CompensatingTrigger { .. }, true) => {
+                *state = RuleState::PendingTrigger {
+                    reserved_at_ms: now_ms,
+                };
+                LifecycleOutcome::Trigger
+            }
+            // No longer breaching: the possibly-delivered Resolve is now an
+            // accurate description of reality, so no compensating Trigger is
+            // owed and no phantom alert is emitted.
+            (RuleState::CompensatingTrigger { .. }, false) => {
+                *state = RuleState::Healthy;
+                LifecycleOutcome::Quiet
+            }
         }
+    }
+
+    /// Commit a successful Trigger delivery: PendingTrigger → Active.
+    ///
+    /// No-op when the state is no longer PendingTrigger (e.g. retired
+    /// generation or a concurrent Reactivate path).
+    pub fn settle_trigger_success(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        reserved_at_ms: u64,
+        fired_at_ms: u64,
+    ) {
+        let per_generation = self.per_proxy_generations(rule_id, proxy_id);
+        let _ = per_generation.with_mut(
+            ownership_generation,
+            || RuleState::Healthy,
+            |state| {
+                if matches!(
+                    state,
+                    RuleState::PendingTrigger {
+                        reserved_at_ms: current,
+                    } if *current == reserved_at_ms
+                ) {
+                    *state = RuleState::Active { fired_at_ms };
+                }
+                LifecycleOutcome::Quiet
+            },
+        );
+    }
+
+    /// Roll back a failed/abandoned Trigger: PendingTrigger → Healthy.
+    pub fn settle_trigger_failure(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        reserved_at_ms: u64,
+    ) {
+        let per_generation = self.per_proxy_generations(rule_id, proxy_id);
+        let _ = per_generation.with_mut(
+            ownership_generation,
+            || RuleState::Healthy,
+            |state| {
+                if matches!(
+                    state,
+                    RuleState::PendingTrigger {
+                        reserved_at_ms: current,
+                    } if *current == reserved_at_ms
+                ) {
+                    *state = RuleState::Healthy;
+                }
+                LifecycleOutcome::Quiet
+            },
+        );
+    }
+
+    /// Roll back a Trigger/Resolve reservation that `observe` committed on a
+    /// path that never admitted delivery (non-event evaluate → commit).
+    ///
+    /// The evaluate/permit/observe split can race: a non-event snapshot (e.g.
+    /// `PendingResolve` + breach → [`LifecycleOutcome::Reactivate`]) may see
+    /// its outstanding resolve settle to `Healthy` before the matching
+    /// `observe` runs, so the commit installs `PendingTrigger`/`PendingResolve`
+    /// instead. Leaving that seat without a dispatch permit orphans it forever.
+    ///
+    /// `reserved_at_ms` must be the `now_ms` passed to the `observe` that
+    /// produced `committed`. Only event-reserving outcomes are rolled back, and
+    /// only via the token-matched failure settlers so a newer reservation
+    /// cannot be damaged. [`LifecycleOutcome::StillActive`] and other
+    /// non-reserving outcomes are no-ops.
+    pub fn rollback_unadmitted_reservation(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        committed: LifecycleOutcome,
+        reserved_at_ms: u64,
+    ) {
+        match committed {
+            LifecycleOutcome::Trigger => {
+                self.settle_trigger_failure(
+                    rule_id,
+                    proxy_id,
+                    ownership_generation,
+                    reserved_at_ms,
+                );
+            }
+            LifecycleOutcome::Resolve => {
+                let Some(RuleState::PendingResolve {
+                    left_threshold_at_ms,
+                    reserved_at_ms: current,
+                }) = self.current_state(rule_id, proxy_id, ownership_generation)
+                else {
+                    return;
+                };
+                if current != reserved_at_ms {
+                    return;
+                }
+                self.settle_resolve_failure(
+                    rule_id,
+                    proxy_id,
+                    ownership_generation,
+                    left_threshold_at_ms,
+                    reserved_at_ms,
+                );
+            }
+            LifecycleOutcome::StillActive
+            | LifecycleOutcome::EnteringRecovery
+            | LifecycleOutcome::Reactivate
+            | LifecycleOutcome::Quiet => {}
+        }
+    }
+
+    /// Commit a successful Resolve delivery: PendingResolve → Healthy.
+    ///
+    /// If the incident re-breached while this Resolve was in flight
+    /// ([`RuleState::ResolveInFlightRebreached`] carrying this reservation
+    /// token), the incident is genuinely alerting again and the delivered
+    /// Resolve is stale — converge to [`RuleState::CompensatingTrigger`] so the
+    /// next breaching sample re-alerts instead of being suppressed forever.
+    pub fn settle_resolve_success(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        reserved_at_ms: u64,
+    ) {
+        self.settle_resolve(
+            rule_id,
+            proxy_id,
+            ownership_generation,
+            reserved_at_ms,
+            None,
+        );
+    }
+
+    /// Roll back a failed/abandoned Resolve: PendingResolve → Recovering.
+    ///
+    /// A re-breach observed while the Resolve was in flight converges to
+    /// [`RuleState::CompensatingTrigger`] here too, and deliberately so: a
+    /// failed or abandoned Resolve is *not* proof the endpoint did not act.
+    /// Transport timeouts, post-write connection errors, and cancellation after
+    /// bytes left the process are all reported as failure/abandonment while the
+    /// peer may have processed the notification. Treating that uncertain
+    /// boundary as "possibly delivered" is the safe direction: the worst case is
+    /// one extra Trigger for a genuinely breached incident, versus a silently
+    /// suppressed alert.
+    pub fn settle_resolve_failure(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        left_threshold_at_ms: u64,
+        reserved_at_ms: u64,
+    ) {
+        self.settle_resolve(
+            rule_id,
+            proxy_id,
+            ownership_generation,
+            reserved_at_ms,
+            Some(left_threshold_at_ms),
+        );
+    }
+
+    /// Shared Resolve settle. `rollback_to_recovering_at` is `Some` for a
+    /// failed/abandoned delivery and `None` for a success.
+    ///
+    /// Both variants are token-matched, so a stale settle from a superseded
+    /// generation or a replaced reservation can never clear a newer row.
+    fn settle_resolve(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        reserved_at_ms: u64,
+        rollback_to_recovering_at: Option<u64>,
+    ) {
+        let per_generation = self.per_proxy_generations(rule_id, proxy_id);
+        let _ = per_generation.with_mut(
+            ownership_generation,
+            || RuleState::Healthy,
+            |state| {
+                match *state {
+                    RuleState::PendingResolve {
+                        reserved_at_ms: current,
+                        ..
+                    } if current == reserved_at_ms => {
+                        *state = match rollback_to_recovering_at {
+                            Some(left_threshold_at_ms) => RuleState::Recovering {
+                                left_threshold_at_ms,
+                            },
+                            None => RuleState::Healthy,
+                        };
+                    }
+                    RuleState::ResolveInFlightRebreached {
+                        resolve_reserved_at_ms,
+                        rebreached_at_ms,
+                    } if resolve_reserved_at_ms == reserved_at_ms => {
+                        // Uncertain delivery + a real re-breach: owe a Trigger.
+                        *state = RuleState::CompensatingTrigger { rebreached_at_ms };
+                    }
+                    _ => {}
+                }
+                LifecycleOutcome::Quiet
+            },
+        );
     }
 
     /// Returns the current state for the given (rule, proxy, generation)

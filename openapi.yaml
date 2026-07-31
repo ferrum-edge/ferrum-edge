@@ -13891,7 +13891,9 @@ components:
 
         Unknown top-level keys are rejected. Present values must match their
         declared types (`enabled` boolean, `quiet_hours_utc` array,
-        `max_concurrent_dispatches` integer >= 1). The `channels` map remains
+        `max_concurrent_dispatches` integer >= 1, `max_delivery_retries`
+        integer 0..=8, `delivery_retry_base_ms` / `delivery_retry_max_ms`
+        integers in [10, 60000]). The `channels` map remains
         open for arbitrary channel names; each channel/rule variant is closed
         to its selected shape. Rules may also be `enabled: false` drafts.
       additionalProperties: false
@@ -13934,6 +13936,31 @@ components:
           minimum: 1
           default: 8
           description: Maximum concurrent outbound notification requests. Excess alerts are dropped, not queued.
+        max_delivery_retries:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 8
+          default: 2
+          description: |
+            Number of re-attempts after the initial send for transient
+            transport/HTTP failures (408/429/5xx and connect/timeout errors).
+            Retries hold the dispatch semaphore permit and never enqueue extra
+            work. Permanent failures (other 4xx) are not retried.
+        delivery_retry_base_ms:
+          type: integer
+          format: uint32
+          minimum: 10
+          maximum: 60000
+          default: 100
+          description: Initial jittered backoff delay between transient delivery retries.
+        delivery_retry_max_ms:
+          type: integer
+          format: uint32
+          minimum: 10
+          maximum: 60000
+          default: 2000
+          description: Upper bound for exponential jittered backoff between transient delivery retries. Must be >= delivery_retry_base_ms.
         quiet_hours_utc:
           type: array
           default: []
@@ -13970,6 +13997,9 @@ components:
         default_window_seconds: 60
         default_resolved_window_seconds: 300
         max_concurrent_dispatches: 8
+        max_delivery_retries: 2
+        delivery_retry_base_ms: 100
+        delivery_retry_max_ms: 2000
         quiet_hours_utc:
           - from: "23:00"
             to: "06:00"
@@ -22232,7 +22262,7 @@ components:
     AiRateLimiterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Pre-dispatch prompt estimates walk the request JSON once, counting billable string values, visited object member names (including tool/function schema property names), and JSON scalar literals at serialized width so a present recognized field cannot suppress unknown billed text; exclusions are path/context aware (unsigned numeric output caps only at the exact paths also read for completion-budget reservation — negative/fractional values count fail-closed; multimodal URL/base64/file leaves only inside matching provider content-part family and part type — member names and unrelated textual siblings still count; wrong-family/malformed parts and ordinary strings including data: URLs in instructions/schemas always count). The estimate is a conservative chars/4 heuristic, not provider tokenizer parity. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       required: [token_limit]
       properties:
         token_limit:

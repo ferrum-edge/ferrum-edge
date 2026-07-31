@@ -43,6 +43,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/dependency-policy.md`, `docs/vendored-patch-lifecycle.json`, and
   `docs/upstream-*-patches/` off the lightweight documentation path.
 
+### Changed
+
+- `proxy_alerts` / notification delivery now expose bounded-cardinality
+  Prometheus delivery metrics (`attempted` / `succeeded` /
+  `failed_transient` / `failed_permanent` / `backpressure_dropped` /
+  `abandoned_at_deadline` / `in_flight`, labeled only by fixed
+  `channel_type`), classify transport/HTTP outcomes into permanent vs
+  transient failures with a bounded jittered retry budget, track dispatch
+  tasks per plugin generation (reload stops admission and cooperatively
+  cancels; process shutdown drains via the shared observability delivery
+  budget), and commit Trigger/Resolve cooldown + incident state only after
+  a defined delivery settle (`PendingTrigger` / `PendingResolve`). See
+  `docs/proxy_alerts.md` and `docs/notifications.md` (#2448).
+- Abandonment is now reported under a fixed, compiled-in reason taxonomy
+  instead of one catch-all counter. New
+  `ferrum_notification_delivery_rejected_total{channel_type,reason}`
+  (`generation_closed`, `registry_rejected`) covers drops where the
+  registry-owned delivery body never started — including the pre-`begin_task`
+  generation rejection that previously incremented nothing at all — and new
+  `ferrum_notification_delivery_abandoned_total{channel_type,reason}`
+  (`generation_retired`, `shutdown_deadline`, `task_dropped`) covers bodies
+  that started without a committed outcome (channel transport may or may not
+  have been polled). `ferrum_notification_delivery_attempted_total` advances at
+  that body-start boundary (not the first channel call) so hard-deadline drop
+  classification and the accounting identity stay race-free; an admit-then-cancel
+  race can therefore increment `attempted` with no bytes on the wire.
+  `ferrum_notification_delivery_abandoned_at_deadline_total` increments
+  **only** for the true hard abort at the global shutdown drain deadline; a
+  rejected or reload-retired send no longer inflates it, and a pre-body
+  rejection never inflates `attempted`. Every rejection path still runs the
+  producer settle callback exactly once (#2448).
+- `proxy_alerts` re-breach during an externally in-flight Resolve no longer
+  silently suppresses the follow-up alert. The incident parks in
+  `ResolveInFlightRebreached` (no notification that could overtake the Resolve
+  on the wire), and the Resolve's settle — success, failure, or abandonment
+  alike, because none of those proves the endpoint did not act — converges to
+  `CompensatingTrigger`, so the next breaching sample re-alerts through the
+  ordinary cooldown gate. A rule that recovered again in the meantime returns
+  to `Healthy` with no phantom alert (#2448).
+- Documented the best-effort endpoint delivery contract: bounded
+  backpressure/failure paths can produce zero copies, while transport timeouts,
+  connection errors after the request was written, and cancellation after bytes
+  left the process can duplicate a delivery on retry or report an abandoned
+  outcome despite endpoint action. Retries preserve `fired_at`, but later
+  re-admission does not; Ferrum supplies no cross-admission idempotency key.
+  Webhook/email consumers must be idempotent or duplicate-tolerant (#2448).
+
 ### Security
 
 - `body_validator` and `openapi_validator` validation diagnostics no longer
@@ -80,6 +127,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `openapi_validator`'s unknown-operation detail no longer interpolates the
   request method and target.
 
+- Updated the transitive `event-listener` dependency from 5.4.1 to 5.4.2,
+  removing the `StackSlot` cross-thread unsoundness reported as
+  RUSTSEC-2026-0221.
+
+- `ai_rate_limiter` pre-dispatch prompt reservation no longer under-counts billed
+  prompt text when a recognized field is present (GHSA-2r5g-438w-85hr). The
+  estimator walks the already-parsed request JSON once and sums billable string
+  values, visited object member names (including nested tool / function JSON
+  Schema property names), and JSON scalar literals (`null` / booleans / numbers
+  at serialized width), so sibling instructions, schema keys, and schema scalars
+  cannot be omitted from the reservation. Exclusions are path/context aware —
+  unsigned numeric output caps only at the exact paths also read for
+  completion-budget reservation (negative/fractional values count fail-closed),
+  and multimodal URL/base64/file leaves only inside matching provider
+  content-part family and part `type` (member names and unrelated textual
+  siblings still count; wrong-family / malformed parts count fail-closed).
+  Ordinary strings, including well-formed `data:` URLs in `instructions` or
+  schemas, always count; collision-shaped reserved spellings outside those
+  contexts count fail-closed. The walk remains a conservative `chars/4`
+  heuristic, not provider tokenizer parity.
 - Irreversible request egress no longer precedes request-body transformation or
   final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
   `serverless_function` previously ran their external dispatch in

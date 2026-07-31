@@ -2574,8 +2574,7 @@ async fn completion_count_mode_uses_max_output_tokens_field() {
 }
 
 // Build a POST JSON request whose ONLY recognized prompt field is a single
-// `prompt` string, so the estimated prompt-character count is exactly the
-// string length (no `messages` key/value recursion to reason about).
+// `prompt` string (plus a token-cap field that must stay excluded).
 fn ai_prompt_field_ctx(prompt: &str, max_tokens: u64) -> RequestContext {
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
@@ -2595,9 +2594,8 @@ fn ai_prompt_field_ctx(prompt: &str, max_tokens: u64) -> RequestContext {
 #[tokio::test]
 async fn prompt_count_mode_estimates_from_prompt_text() {
     // With count_mode = "prompt_tokens" the estimate is derived from prompt
-    // character count (chars / 4, rounded up) from the recognized prompt
-    // fields, ignoring the max_tokens completion budget. Exercises
-    // `estimate_prompt_tokens` / `prompt_character_count` `prompt` branch.
+    // character count (chars / 4, rounded up) over the prompt value and its
+    // member name, ignoring the max_tokens completion budget.
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 1000,
@@ -2610,16 +2608,16 @@ async fn prompt_count_mode_estimates_from_prompt_text() {
     )
     .unwrap();
 
-    // 40-char prompt -> ceil(40/4) = 10 prompt tokens. max_tokens is present
-    // but must be ignored in prompt_tokens mode.
+    // Member name `prompt` (6) + 40-char value = 46 -> ceil(46/4) = 12.
+    // max_tokens is present but must be ignored in prompt_tokens mode.
     let prompt = "0123456789012345678901234567890123456789"; // 40 chars
     let mut ctx = ai_prompt_field_ctx(prompt, 900);
     let mut headers = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(
         reserved_tokens(&ctx),
-        10,
-        "prompt_tokens mode estimates from prompt chars only"
+        12,
+        "prompt_tokens mode estimates from prompt value + member name"
     );
 }
 
@@ -2639,24 +2637,22 @@ async fn total_count_mode_sums_prompt_and_completion() {
     )
     .unwrap();
 
-    // 40-char prompt -> 10 prompt tokens; max_tokens 64 completion.
+    // Member name `prompt` (6) + 40-char value = 46 -> 12 prompt tokens; max_tokens 64.
     let prompt = "0123456789012345678901234567890123456789"; // 40 chars
     let mut ctx = ai_prompt_field_ctx(prompt, 64);
     let mut headers = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(
         reserved_tokens(&ctx),
-        74,
-        "total mode sums prompt (10) + completion (64)"
+        76,
+        "total mode sums prompt (12) + completion (64)"
     );
 }
 
 #[tokio::test]
 async fn prompt_estimate_covers_system_prompt_input_and_tools_fields() {
-    // `prompt_character_count` accumulates across system / messages / prompt /
-    // input / contents / tools fields. Use prompt_tokens mode and a body that
-    // exercises the `system`, `prompt`, `input`, `contents`, and `tools`
-    // branches together so their character counts sum into the reservation.
+    // Whole-body prompt walk accumulates string values and object member names
+    // under system/prompt/input/contents/tools together into the reservation.
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 100_000,
@@ -2673,8 +2669,9 @@ async fn prompt_estimate_covers_system_prompt_input_and_tools_fields() {
     ctx.method = "POST".to_string();
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
-    // 4 chars in each of system/prompt/input/contents + 4 chars inside tools
-    // = 20 chars total -> ceil(20/4) = 5 tokens.
+    // String values: 4 chars × 5 fields = 20.
+    // Member names: system(6)+prompt(6)+input(5)+contents(8)+tools(5)+name(4) = 34.
+    // Total 54 chars -> ceil(54/4) = 14 tokens.
     ctx.metadata.insert(
         "request_body".to_string(),
         serde_json::to_string(&json!({
@@ -2691,19 +2688,16 @@ async fn prompt_estimate_covers_system_prompt_input_and_tools_fields() {
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(
         reserved_tokens(&ctx),
-        5,
-        "prompt estimate must sum system+prompt+input+contents+tools chars"
+        14,
+        "prompt estimate must sum system+prompt+input+contents+tools values and keys"
     );
 }
 
 #[tokio::test]
-async fn prompt_estimate_falls_back_to_whole_body_when_no_known_fields() {
-    // When an LLM-shaped body uses none of the prompt fields
-    // `prompt_character_count` recognizes (system/messages/prompt/input/
-    // contents/tools), the estimate falls back to counting the whole JSON body's
-    // string values (minus the max_* keys). A TGI body (`inputs` — a strong
-    // AI-request marker, but not one of the itemized prompt fields) exercises that
-    // fallback branch while still passing the LLM-shape gate.
+async fn prompt_estimate_counts_ai_marker_outside_common_prompt_containers() {
+    // An LLM-shaped body whose only string text sits under an AI marker that is
+    // not a common prompt container (Responses continuation `previous_response_id`)
+    // must still reserve via the whole-body walk (value + member name).
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 100_000,
@@ -2720,20 +2714,18 @@ async fn prompt_estimate_falls_back_to_whole_body_when_no_known_fields() {
     ctx.method = "POST".to_string();
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
-    // TGI `inputs` is a strong AI-request marker but is NOT among the fields
-    // `prompt_character_count` sums, so the estimate falls back to counting the
-    // whole body's string values (minus the max_* keys): 7 chars -> ceil(7/4) = 2.
+    // Member name `previous_response_id` (20) + value (7) = 27 -> ceil(27/4) = 7.
     ctx.metadata.insert(
         "request_body".to_string(),
-        serde_json::to_string(&json!({"inputs": "yyyyyyy"})).unwrap(),
+        serde_json::to_string(&json!({"previous_response_id": "yyyyyyy"})).unwrap(),
     );
 
     let mut headers = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(
         reserved_tokens(&ctx),
-        2,
-        "estimate falls back to counting the whole body's string values"
+        7,
+        "estimate must count AI-marker values and their member names"
     );
 }
 
@@ -2842,13 +2834,14 @@ async fn anthropic_base64_image_source_excluded_from_estimate() {
 }
 
 #[tokio::test]
-async fn inline_data_url_in_text_field_excluded_from_estimate() {
-    // Defense-in-depth: even a `data:` URL embedded directly in a text-bearing
-    // field (not under a known binary key) must count as zero, since it is an
-    // inline binary blob rather than prose.
+async fn inline_data_url_in_text_field_is_counted() {
+    // Path-context fix: a well-formed `data:` URL in an ordinary text-bearing
+    // field (not a recognized multimodal leaf) is billed prompt text and must
+    // reserve. The pre-09514f4b / shape-only walk counted it as zero.
+    // Length 48 (= 0 mod 4) keeps the chars/4 token delta exact vs empty.
     let plugin = AiRateLimiter::new(
         &json!({
-            "token_limit": 10_000,
+            "token_limit": 10_000_000,
             "window_seconds": 60,
             "count_mode": "prompt_tokens",
             "limit_by": "ip",
@@ -2858,7 +2851,25 @@ async fn inline_data_url_in_text_field_excluded_from_estimate() {
     )
     .unwrap();
 
-    let data_url = format!("data:image/png;base64,{}", "Q".repeat(500_000));
+    let data_url = format!("data:text/plain,{}", "X".repeat(32)); // 16+32=48
+    assert_eq!(data_url.chars().count(), 48);
+
+    let mut empty_ctx = create_test_context();
+    empty_ctx.method = "POST".to_string();
+    empty_ctx
+        .headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    empty_ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({ "prompt": "" })).unwrap(),
+    );
+    let mut empty_headers = HashMap::new();
+    assert_continue(
+        plugin
+            .before_proxy(&mut empty_ctx, &mut empty_headers)
+            .await,
+    );
+    let empty_reserved = reserved_tokens(&empty_ctx);
 
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
@@ -2871,10 +2882,11 @@ async fn inline_data_url_in_text_field_excluded_from_estimate() {
 
     let mut headers = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
     assert_eq!(
-        reserved_tokens(&ctx),
-        0,
-        "a bare data: URL in a text field must not be counted as prompt characters"
+        reserved - empty_reserved,
+        12,
+        "48-char data:text/plain literal in prompt must reserve ceil(48/4)=12"
     );
 }
 
@@ -2898,9 +2910,9 @@ async fn prose_starting_with_data_prefix_is_counted_not_treated_as_data_url() {
     )
     .unwrap();
 
-    // 40-char prose prompt beginning with "data:" — counted, so the estimate is
-    // chars/4 = 10 tokens (> 0). The leading space after the colon and the
-    // absence of a header `,` disqualify it as a data URL.
+    // Member name `prompt` (6) + 40-char prose = 46 -> ceil(46/4) = 12 tokens.
+    // The leading space after the colon and the absence of a header `,`
+    // disqualify it as a data URL.
     let prose = "data: my notes about the quarterly plan!"; // 40 chars
     assert_eq!(prose.chars().count(), 40);
 
@@ -2917,26 +2929,1683 @@ async fn prose_starting_with_data_prefix_is_counted_not_treated_as_data_url() {
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(
         reserved_tokens(&ctx),
-        10,
+        12,
         "prose beginning with 'data:' must be counted as prompt characters"
     );
+}
 
-    // Sanity: a genuine base64 data URL of the same logical field IS excluded.
-    let data_url = format!("data:image/png;base64,{}", "Q".repeat(500_000));
-    let mut ctx2 = create_test_context();
-    ctx2.method = "POST".to_string();
-    ctx2.headers
+// ─── Fail-closed whole-body prompt reservation (GHSA-2r5g-438w-85hr) ──────────
+//
+// Pre-dispatch estimation walks billable string values, visited object member
+// names, and JSON scalar literals once so a present recognized field cannot
+// suppress unknown (or known) billed siblings, tool/function schema property
+// names cannot be omitted, and coincidental reserved spellings (`max_tokens`,
+// `image_url`, `source`, …) cannot hide schema prose. Exclusions are
+// path/context aware (exact token-cap paths; multimodal leaves inside
+// recognized content blocks only). Exact token deltas isolate value or
+// member-name text by keeping the compared key structure identical in the
+// baseline (empty string / empty property name). These tests drive the public
+// `before_proxy` surface in `prompt_tokens` mode.
+
+/// Reserved prompt-token estimate for `body` under an isolated
+/// `prompt_tokens`-mode limiter with a budget far above any test request.
+async fn prompt_tokens_reserved(body: serde_json::Value) -> u64 {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1_000_000,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
-    ctx2.metadata.insert(
+    ctx.metadata.insert(
         "request_body".to_string(),
-        serde_json::to_string(&json!({ "prompt": data_url })).unwrap(),
+        serde_json::to_string(&body).unwrap(),
     );
-    let mut headers2 = HashMap::new();
-    assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
+
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    reserved_tokens(&ctx)
+}
+
+/// 32-character billed text keeps `div_ceil(4)` deltas exact regardless of the
+/// baseline remainder when only that text (or a same-length member name) changes.
+const PROMPT_DELTA_32: &str = "0123456789abcdef0123456789abcdef";
+
+#[tokio::test]
+async fn prompt_estimate_sums_responses_instructions_with_input() {
+    // OpenAI Responses: a tiny `input` must not suppress a large `instructions`
+    // sibling — both are billed prompt text and both must reserve. Baseline keeps
+    // the `instructions` key so the delta isolates the 32-char value (member name
+    // already counted on both sides).
+    let input_only = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "input": "abcd",
+        "instructions": ""
+    }))
+    .await;
+    let with_instructions = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "input": "abcd",
+        "instructions": PROMPT_DELTA_32
+    }))
+    .await;
+
+    assert!(
+        with_instructions > input_only,
+        "Responses instructions must be reserved alongside input"
+    );
     assert_eq!(
-        reserved_tokens(&ctx2),
-        0,
-        "a real data:<mediatype>;base64,<payload> URL must still be excluded"
+        with_instructions - input_only,
+        8,
+        "instructions delta must be exactly ceil(32/4)=8 tokens"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_sums_gemini_system_instruction_with_contents() {
+    // Gemini: tiny `contents` must not suppress `systemInstruction`.
+    let contents_only = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}],
+        "systemInstruction": {"parts": [{"text": ""}]}
+    }))
+    .await;
+    let with_system = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}],
+        "systemInstruction": {"parts": [{"text": PROMPT_DELTA_32}]}
+    }))
+    .await;
+
+    assert!(with_system > contents_only);
+    assert_eq!(with_system - contents_only, 8);
+}
+
+#[tokio::test]
+async fn prompt_estimate_sums_gemini_system_instruction_snake_alias() {
+    // Both Gemini casings are billed siblings; snake_case must reserve too.
+    let contents_only = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}],
+        "system_instruction": {"parts": [{"text": ""}]}
+    }))
+    .await;
+    let with_system = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}],
+        "system_instruction": {"parts": [{"text": PROMPT_DELTA_32}]}
+    }))
+    .await;
+
+    assert_eq!(with_system - contents_only, 8);
+}
+
+#[tokio::test]
+async fn prompt_estimate_sums_cohere_preamble_and_documents_with_message() {
+    // Cohere v1: `message` must not suppress `preamble` or `documents`.
+    let message_only = prompt_tokens_reserved(json!({
+        "model": "command-r",
+        "message": "abcd",
+        "preamble": "",
+        "documents": [{"text": ""}]
+    }))
+    .await;
+    let with_siblings = prompt_tokens_reserved(json!({
+        "model": "command-r",
+        "message": "abcd",
+        "preamble": "0123456789abcdef", // 16 chars
+        "documents": [{"text": "0123456789abcdef"}] // 16 chars
+    }))
+    .await;
+
+    assert_eq!(
+        with_siblings - message_only,
+        8,
+        "preamble+documents (32 chars) must add ceil(32/4)=8 tokens"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_titan_input_text_and_bedrock_system() {
+    // Titan `inputText` value delta is isolated against an empty same-key baseline.
+    assert_eq!(
+        prompt_tokens_reserved(json!({ "inputText": PROMPT_DELTA_32 })).await
+            - prompt_tokens_reserved(json!({ "inputText": "" })).await,
+        8
+    );
+
+    // TGI `inputs` likewise reserves alongside another textual sibling (`tools`)
+    // — the recognized tools field must not hide the inputs prompt.
+    let tools_only = prompt_tokens_reserved(json!({
+        "inputs": "",
+        "tools": [{"name": "abcd"}]
+    }))
+    .await;
+    let with_inputs = prompt_tokens_reserved(json!({
+        "inputs": PROMPT_DELTA_32,
+        "tools": [{"name": "abcd"}]
+    }))
+    .await;
+    assert_eq!(with_inputs - tools_only, 8);
+
+    // Bedrock Converse-style: top-level `system` alongside `messages`.
+    let messages_only = prompt_tokens_reserved(json!({
+        "model": "anthropic.claude-3-sonnet",
+        "system": [{"text": ""}],
+        "messages": [{"role": "user", "content": [{"text": "abcd"}]}]
+    }))
+    .await;
+    let with_system = prompt_tokens_reserved(json!({
+        "model": "anthropic.claude-3-sonnet",
+        "system": [{"text": PROMPT_DELTA_32}],
+        "messages": [{"role": "user", "content": [{"text": "abcd"}]}]
+    }))
+    .await;
+    assert_eq!(with_system - messages_only, 8);
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_tools_alongside_messages_without_dropping_siblings() {
+    let messages_only = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": ""
+            }
+        }]
+    }))
+    .await;
+    let with_tools = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": PROMPT_DELTA_32
+            }
+        }]
+    }))
+    .await;
+
+    assert_eq!(
+        with_tools - messages_only,
+        8,
+        "tool schema description must reserve exactly ceil(32/4)=8 alongside messages"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_nested_tool_schema_property_names() {
+    // Root review: string-value-only walks omit JSON Schema property names that
+    // providers bill. Identical string values with an empty vs 32-char property
+    // name under `parameters.properties` must differ by exactly 8 tokens — the
+    // old omission yields delta 0.
+    let empty_prop = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "": {
+                            "type": "string",
+                            "description": "x"
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+    let named_prop = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "0123456789abcdef0123456789abcdef": {
+                            "type": "string",
+                            "description": "x"
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+
+    assert!(
+        named_prop > empty_prop,
+        "schema property names must increase the reservation (got named={named_prop}, empty={empty_prop})"
+    );
+    assert_eq!(
+        named_prop - empty_prop,
+        8,
+        "nested schema property-name delta must be exactly ceil(32/4)=8 tokens"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_nested_schema_keys_under_provider_siblings() {
+    // Nested `properties` / `$defs`-style keys under a Gemini systemInstruction
+    // sibling must reserve; baseline keeps the same object shape with an empty
+    // property name so only the 32-char member name contributes to the delta.
+    let empty_name = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}],
+        "systemInstruction": {
+            "parts": [{
+                "text": "use schema",
+                "tool_schema": {
+                    "type": "object",
+                    "properties": {
+                        "": {"type": "number"}
+                    }
+                }
+            }]
+        }
+    }))
+    .await;
+    let named = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}],
+        "systemInstruction": {
+            "parts": [{
+                "text": "use schema",
+                "tool_schema": {
+                    "type": "object",
+                    "properties": {
+                        "0123456789abcdef0123456789abcdef": {"type": "number"}
+                    }
+                }
+            }]
+        }
+    }))
+    .await;
+
+    assert_eq!(
+        named - empty_name,
+        8,
+        "nested provider-sibling schema property names must reserve ceil(32/4)=8"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_does_not_double_count_alias_pair_as_nested_duplicate() {
+    // When both Gemini casings carry DISTINCT text, both contribute (conservative).
+    // Baseline already carries an empty snake_case sibling so the delta isolates
+    // the 32-char value (member names cancel).
+    let single = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}],
+        "systemInstruction": {"parts": [{"text": PROMPT_DELTA_32}]},
+        "system_instruction": {"parts": [{"text": ""}]}
+    }))
+    .await;
+    let both_same = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [{"text": "abcd"}]}],
+        "systemInstruction": {"parts": [{"text": PROMPT_DELTA_32}]},
+        "system_instruction": {"parts": [{"text": PROMPT_DELTA_32}]}
+    }))
+    .await;
+
+    // Both aliases present ⇒ both counted (over-reserve), never under-count.
+    assert!(
+        both_same > single,
+        "distinct alias keys must each contribute when both are present"
+    );
+    assert_eq!(both_same - single, 8);
+}
+
+#[tokio::test]
+async fn prompt_estimate_excludes_multimodal_bytes_while_counting_text_siblings() {
+    // Vision request with Responses instructions: image bytes stay excluded,
+    // but instructions + input text still reserve.
+    let huge_b64 = "A".repeat(800_000);
+    let reserved = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "instructions": PROMPT_DELTA_32,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "abcd"},
+                {"type": "input_image", "image_url": format!("data:image/jpeg;base64,{huge_b64}")}
+            ]
+        }]
+    }))
+    .await;
+
+    assert!(
+        reserved > 0 && reserved < 100,
+        "multimodal binary must be excluded while text siblings still reserve; got {reserved}"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_excludes_binary_payload_leaves_but_counts_siblings() {
+    // Recognized multimodal leaves exclude only the URL/base64 payload; member
+    // names and unexpected textual siblings still reserve. A top-level `prompt`
+    // data URL (not a multimodal leaf) also counts — the old path-independent
+    // skip would hide both.
+    let huge_b64 = "A".repeat(200_000);
+    let empty_siblings = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd"},
+            {"type": "image_url", "image_url": {
+                "url": format!("data:image/png;base64,{huge_b64}"),
+                "description": ""
+            }},
+            {"type": "input_audio", "input_audio": {
+                "data": huge_b64.clone(),
+                "transcript": ""
+            }}
+        ]}]
+    }))
+    .await;
+    let with_siblings = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd"},
+            {"type": "image_url", "image_url": {
+                "url": format!("data:image/png;base64,{huge_b64}"),
+                "description": PROMPT_DELTA_32
+            }},
+            {"type": "input_audio", "input_audio": {
+                "data": huge_b64.clone(),
+                "transcript": PROMPT_DELTA_32
+            }}
+        ]}]
+    }))
+    .await;
+
+    assert_eq!(
+        with_siblings - empty_siblings,
+        16,
+        "description+transcript siblings must reserve ceil(64/4)=16; \
+         whole-object binary skips yield delta 0"
+    );
+    assert!(
+        empty_siblings < 120,
+        "binary payloads must stay excluded; got {empty_siblings}"
+    );
+
+    // Collision-shaped / text-field data URL must count (old walk → delta 0).
+    let empty_prompt = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "prompt": "data:text/plain,"
+    }))
+    .await;
+    let data_prompt = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "prompt": format!("data:text/plain,{PROMPT_DELTA_32}")
+    }))
+    .await;
+    assert_eq!(
+        data_prompt - empty_prompt,
+        8,
+        "data: URL outside a multimodal leaf must count at full width"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_excludes_binary_source_but_counts_text_document_source() {
+    let huge_b64 = "C".repeat(100_000);
+    let messages = json!([{"role": "user", "content": [{"type": "text", "text": "abcd"}]}]);
+    let binary_no_sibling = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": huge_b64.clone(),
+                    "description": ""
+                }
+            }]
+        }]
+    }))
+    .await;
+    let binary_with_sibling = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": huge_b64,
+                    "description": PROMPT_DELTA_32
+                }
+            }]
+        }]
+    }))
+    .await;
+    assert!(
+        binary_no_sibling < 80,
+        "binary Anthropic source payload must stay excluded; got {binary_no_sibling}"
+    );
+    assert_eq!(
+        binary_with_sibling - binary_no_sibling,
+        8,
+        "unexpected textual sibling under a real Anthropic binary source must \
+         reserve ceil(32/4)=8; whole-subtree skips yield delta 0"
+    );
+
+    let text_source_empty = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": messages.clone(),
+        "document": {
+            "source": {
+                "type": "text",
+                "media_type": "text/plain",
+                "data": ""
+            }
+        }
+    }))
+    .await;
+    let text_source = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": messages,
+        "document": {
+            "source": {
+                "type": "text",
+                "media_type": "text/plain",
+                "data": PROMPT_DELTA_32
+            }
+        }
+    }))
+    .await;
+
+    assert_eq!(
+        text_source - text_source_empty,
+        8,
+        "text document source prose must reserve ceil(32/4)=8"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_excludes_token_cap_member_names() {
+    // Exact-path token-cap keys are control fields: neither their names nor
+    // numeric values enter the prompt estimate. Baselines keep the same
+    // container keys so only the excluded numeric fields differ.
+    let base = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "generationConfig": {"temperature": 0},
+        "parameters": {"temperature": 0},
+        "textGenerationConfig": {"temperature": 0}
+    }))
+    .await;
+    let with_caps = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "max_completion_tokens": 999999,
+        "max_output_tokens": 999999,
+        "max_new_tokens": 999999,
+        "maxOutputTokens": 999999,
+        "maxTokens": 999999,
+        "max_tokens_to_sample": 999999,
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 999999},
+        "parameters": {"temperature": 0, "max_new_tokens": 999999},
+        "textGenerationConfig": {"temperature": 0, "maxTokenCount": 999999}
+    }))
+    .await;
+
+    assert_eq!(
+        with_caps, base,
+        "exact-path token-cap member names must not change the prompt reservation"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_tool_schema_property_named_max_tokens() {
+    // Root review: name-only TOKEN_CAP_KEYS skips hid billed schema subtrees
+    // under `parameters.properties.max_tokens`. A schema-shaped object must
+    // reserve its description; a numeric top-level cap must still be excluded.
+    let empty_desc = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "max_tokens": {
+                            "type": "integer",
+                            "description": ""
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+    let with_desc = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "max_tokens": {
+                            "type": "integer",
+                            "description": PROMPT_DELTA_32
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+
+    assert_eq!(
+        with_desc - empty_desc,
+        8,
+        "schema property max_tokens description must reserve ceil(32/4)=8; \
+         name-only skips yield delta 0"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_tool_schema_properties_named_binary_reserved_keys() {
+    // Root review: name-only BINARY_CONTENT_KEYS skips hid schema properties
+    // named `image_url` / `input_audio`. Schema-shaped objects must reserve
+    // their descriptions; real multimodal payloads must stay excluded.
+    let empty_desc = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "image_url": {
+                            "type": "string",
+                            "description": ""
+                        },
+                        "input_audio": {
+                            "type": "string",
+                            "description": ""
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+    let with_desc = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "image_url": {
+                            "type": "string",
+                            "description": PROMPT_DELTA_32
+                        },
+                        "input_audio": {
+                            "type": "string",
+                            "description": PROMPT_DELTA_32
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+
+    assert_eq!(
+        with_desc - empty_desc,
+        16,
+        "schema properties image_url+input_audio descriptions must reserve \
+         ceil(64/4)=16; name-only skips yield delta 0"
+    );
+
+    // Real vision payload under the same spelling must remain excluded.
+    let huge_b64 = "A".repeat(200_000);
+    let with_real_image = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd"},
+            {"type": "image_url", "image_url": {
+                "url": format!("data:image/png;base64,{huge_b64}")
+            }}
+        ]}]
+    }))
+    .await;
+    assert!(
+        with_real_image < 80,
+        "real image_url data-URL payload must stay excluded; got {with_real_image}"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_schema_shaped_source_with_type_string() {
+    // Root review: treating every non-`type:"text"` `source` as binary discarded
+    // ordinary schema objects such as `{"type":"string","description":"..."}`.
+    let empty_desc = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": ""
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+    let with_desc = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": PROMPT_DELTA_32
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+
+    assert_eq!(
+        with_desc - empty_desc,
+        8,
+        "schema source type:string description must reserve ceil(32/4)=8; \
+         blanket non-text source skips yield delta 0"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_data_url_instructions_literal() {
+    // Reproduction: OpenAI Responses `instructions` holding a valid
+    // `data:text/plain,<literal>` is billed prompt text. Path-independent
+    // `is_data_url` exclusion (09514f4) counted it as zero.
+    // Keep the `data:text/plain,` prefix on both sides so only the 32-char
+    // payload contributes → exact ceil(32/4)=8 token delta.
+    let empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "input": "abcd",
+        "instructions": "data:text/plain,"
+    }))
+    .await;
+    let with = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "input": "abcd",
+        "instructions": format!("data:text/plain,{PROMPT_DELTA_32}")
+    }))
+    .await;
+
+    assert_eq!(
+        with - empty,
+        8,
+        "data:text/plain instructions literal must produce exact ceil(32/4)=8 delta"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_nested_numeric_caps_outside_exact_paths() {
+    // Direct numeric members with reserved spellings at an unrelated nested path
+    // are billed; recognized root / provider-container caps stay symmetrically
+    // present and excluded. Path-independent TOKEN_CAP_KEYS (09514f4) skipped
+    // any-depth Numbers under those names → delta 0. Changing a nested object
+    // property's `default` does not exercise the collision (09514f4 already
+    // counted object-shaped values under those keys).
+    let empty_nested = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "generationConfig": {"maxOutputTokens": 999999},
+        "metadata": {
+            "max_tokens": 0,
+            "maxOutputTokens": 0
+        }
+    }))
+    .await;
+    let nested_caps = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "generationConfig": {"maxOutputTokens": 999999},
+        "metadata": {
+            "max_tokens": 10000,
+            "maxOutputTokens": 10000
+        }
+    }))
+    .await;
+
+    // Two nested numbers: `0` (1 digit) → `10000` (5 digits) = +4 chars each →
+    // +8 chars → ceil(8/4)=2 tokens. Any-depth numeric skips yield delta 0.
+    assert_eq!(
+        nested_caps - empty_nested,
+        2,
+        "nested metadata numeric max_tokens/maxOutputTokens must contribute; \
+         exact-path caps remain excluded"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_collision_shaped_source_outside_content_block() {
+    // `source:{type:"url", description:<long>}` outside a real Anthropic content
+    // block must count. Old any-depth binary-source skip hid the description.
+    let empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "metadata": {
+            "source": {
+                "type": "url",
+                "description": ""
+            }
+        }
+    }))
+    .await;
+    let with = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "metadata": {
+            "source": {
+                "type": "url",
+                "description": PROMPT_DELTA_32
+            }
+        }
+    }))
+    .await;
+
+    assert_eq!(
+        with - empty,
+        8,
+        "collision-shaped source outside a content block must reserve ceil(32/4)=8"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_collision_shaped_binary_keys_outside_content_parts() {
+    // Long alphanumeric / prose values placed *directly* under reserved
+    // multimodal spellings outside content parts must count. Old any-depth
+    // BINARY_CONTENT_KEYS + base64 heuristic (09514f4) skipped those members
+    // entirely → delta 0. Nested schema `default` changes do not exercise the
+    // collision (09514f4 already counted object-shaped schema properties).
+    let long_alnum = "A".repeat(64); // above MIN_BASE64_PAYLOAD_LEN, alphabet-only
+    let empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "metadata": {
+            "image_url": "",
+            "inline_data": ""
+        }
+    }))
+    .await;
+    let with = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "metadata": {
+            "image_url": long_alnum.clone(),
+            "inline_data": long_alnum
+        }
+    }))
+    .await;
+
+    assert_eq!(
+        with - empty,
+        (64u64 * 2).div_ceil(4),
+        "collision-shaped image_url/inline_data strings outside content parts must count"
+    );
+
+    // Real Gemini inline_data leaf stays excluded; unexpected sibling counts.
+    let huge = "B".repeat(100_000);
+    let gemini_empty = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [
+            {"text": "abcd"},
+            {"inline_data": {"mime_type": "image/png", "data": huge.clone(), "note": ""}}
+        ]}]
+    }))
+    .await;
+    let gemini_sibling = prompt_tokens_reserved(json!({
+        "model": "gemini-2.0-flash",
+        "contents": [{"role": "user", "parts": [
+            {"text": "abcd"},
+            {"inline_data": {
+                "mime_type": "image/png",
+                "data": huge,
+                "note": PROMPT_DELTA_32
+            }}
+        ]}]
+    }))
+    .await;
+    assert!(
+        gemini_empty < 120,
+        "real Gemini inline_data payload must stay excluded; got {gemini_empty}"
+    );
+    assert_eq!(
+        gemini_sibling - gemini_empty,
+        8,
+        "textual sibling under real Gemini inline_data must reserve ceil(32/4)=8"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_wrong_family_content_part_binary_collisions() {
+    // Provider-agnostic ContentPart exclusion (179d) skipped reserved binary
+    // keys without checking part `type` / family. Wrong-family collisions must
+    // count fail-closed; legitimate shapes stay leaf-only excluded.
+    let long_alnum = "A".repeat(64);
+    let huge = "B".repeat(100_000);
+
+    // OpenAI/Anthropic text part + image_url long alnum / URL must count.
+    let text_img_empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd", "image_url": ""}
+        ]}]
+    }))
+    .await;
+    let text_img = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd", "image_url": long_alnum.clone()}
+        ]}]
+    }))
+    .await;
+    assert_eq!(
+        text_img - text_img_empty,
+        16,
+        "text part image_url alphanumeric collision must reserve ceil(64/4)=16"
+    );
+
+    let text_url_empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd", "image_url": "https://example.com/"}
+        ]}]
+    }))
+    .await;
+    let text_url = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd",
+             "image_url": format!("https://example.com/{PROMPT_DELTA_32}")}
+        ]}]
+    }))
+    .await;
+    assert_eq!(
+        text_url - text_url_empty,
+        8,
+        "text part image_url URL collision must reserve ceil(32/4)=8"
+    );
+
+    // Text part with Anthropic-shaped binary source must count the data leaf.
+    let text_src_empty = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "text",
+            "text": "abcd",
+            "source": {"type": "base64", "media_type": "image/png", "data": ""}
+        }]}]
+    }))
+    .await;
+    let text_src = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "text",
+            "text": "abcd",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": PROMPT_DELTA_32
+            }
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        text_src - text_src_empty,
+        8,
+        "text part source.data must count; only image/document blocks exclude"
+    );
+
+    // inline_data on an OpenAI message part (wrong family) must count.
+    let oa_inline_empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [{
+            "type": "text",
+            "text": "abcd",
+            "inline_data": {"mime_type": "image/png", "data": ""}
+        }]}]
+    }))
+    .await;
+    let oa_inline = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [{
+            "type": "text",
+            "text": "abcd",
+            "inline_data": {"mime_type": "image/png", "data": long_alnum.clone()}
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        oa_inline - oa_inline_empty,
+        16,
+        "OpenAI message-part inline_data must count (Gemini contents.parts only)"
+    );
+
+    // Legitimate OpenAI Chat image_url part stays bounded; sibling counts.
+    let real_img_empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd"},
+            {"type": "image_url", "image_url": {
+                "url": format!("data:image/png;base64,{huge}"),
+                "caption": ""
+            }}
+        ]}]
+    }))
+    .await;
+    let real_img = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "abcd"},
+            {"type": "image_url", "image_url": {
+                "url": format!("data:image/png;base64,{huge}"),
+                "caption": PROMPT_DELTA_32
+            }}
+        ]}]
+    }))
+    .await;
+    assert!(
+        real_img_empty < 120,
+        "real OpenAI image_url payload must stay excluded; got {real_img_empty}"
+    );
+    assert_eq!(real_img - real_img_empty, 8);
+
+    // Legitimate Responses input_image stays bounded.
+    let resp_empty = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "abcd"},
+                {"type": "input_image", "image_url": format!("data:image/png;base64,{huge}"),
+                 "detail": ""}
+            ]
+        }]
+    }))
+    .await;
+    let resp = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "abcd"},
+                {"type": "input_image", "image_url": format!("data:image/png;base64,{huge}"),
+                 "detail": PROMPT_DELTA_32}
+            ]
+        }]
+    }))
+    .await;
+    assert!(
+        resp_empty < 120,
+        "real Responses input_image payload must stay excluded; got {resp_empty}"
+    );
+    assert_eq!(resp - resp_empty, 8);
+
+    // Legitimate Anthropic image source stays bounded; sibling counts.
+    let anth_empty = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": huge.clone(),
+                "note": ""
+            }
+        }]}]
+    }))
+    .await;
+    let anth = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": huge,
+                "note": PROMPT_DELTA_32
+            }
+        }]}]
+    }))
+    .await;
+    assert!(
+        anth_empty < 120,
+        "real Anthropic image source payload must stay excluded; got {anth_empty}"
+    );
+    assert_eq!(anth - anth_empty, 8);
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_malformed_anthropic_source_payload_leaves() {
+    // Anthropic `source` leaves share the OpenAI/Responses/Gemini payload-shape
+    // gate: a block that declares a binary `source.type` but whose leaf carries
+    // prose (no `data:` / `http(s)` prefix, not base64-shaped) is MALFORMED and
+    // must count fail-closed, so a reserved spelling alone cannot drop unbounded
+    // billed text. Baselines keep the same keys so each delta isolates the value.
+    let prose = "not a payload just ordinary text"; // 32 chars; spaces => not base64
+    assert_eq!(prose.chars().count(), 32);
+
+    // `type: "base64"` with prose at `data` must count at full width.
+    let b64_empty = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": ""}
+        }]}]
+    }))
+    .await;
+    let b64_prose = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": prose}
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        b64_prose - b64_empty,
+        8,
+        "prose under a base64-declared Anthropic source must reserve ceil(32/4)=8"
+    );
+
+    // `type: "url"` with prose at `url` must count at full width.
+    let url_empty = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "url", "url": ""}
+        }]}]
+    }))
+    .await;
+    let url_prose = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "url", "url": prose}
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        url_prose - url_empty,
+        8,
+        "prose under a url-declared Anthropic source must reserve ceil(32/4)=8"
+    );
+
+    // `type: "file"` with prose at `file_id` / `data` / `url` must count.
+    let file_empty = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "document",
+            "source": {"type": "file", "file_id": "", "data": "", "url": ""}
+        }]}]
+    }))
+    .await;
+    let file_prose = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "document",
+            "source": {"type": "file", "file_id": prose, "data": prose, "url": prose}
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        file_prose - file_empty,
+        24,
+        "prose under a file-declared Anthropic source must reserve ceil(96/4)=24"
+    );
+
+    // Genuine binary payloads at the same leaves stay excluded: growing them by
+    // 32 chars must not move the reservation at all.
+    let real_b64_short = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(100_000)}
+        }]}]
+    }))
+    .await;
+    let real_b64_long = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(100_032)}
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        real_b64_long, real_b64_short,
+        "real base64 Anthropic source payloads must stay excluded"
+    );
+    assert!(
+        real_b64_short < 80,
+        "real base64 Anthropic source payload must stay excluded; got {real_b64_short}"
+    );
+
+    let real_url_short = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "url", "url": "https://e.test/"}
+        }]}]
+    }))
+    .await;
+    let real_url_long = prompt_tokens_reserved(json!({
+        "model": "claude-3",
+        "messages": [{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "url", "url": format!("https://e.test/{PROMPT_DELTA_32}")}
+        }]}]
+    }))
+    .await;
+    assert_eq!(
+        real_url_long, real_url_short,
+        "real https Anthropic source URLs must stay excluded"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_non_u64_token_caps_at_exact_paths() {
+    // Exclusion shares requested_completion_tokens' as_u64 contract: negative and
+    // fractional numbers at exact cap paths are not recognized controls and must
+    // count fail-closed (name + literal). Unsigned caps remain excluded.
+    let short = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": -1,
+        "max_completion_tokens": -1
+    }))
+    .await;
+    let long = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": -10001,
+        "max_completion_tokens": -10001
+    }))
+    .await;
+    // Two literals: "-1" (2) → "-10001" (6) = +4 chars each → +8 → 2 tokens.
+    // Any-Number exclusion (179d) yielded delta 0.
+    assert_eq!(
+        long - short,
+        2,
+        "negative exact-path caps must count at literal width"
+    );
+
+    let frac_short = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "generationConfig": {"maxOutputTokens": -1.5},
+        "parameters": {"max_new_tokens": -1.5}
+    }))
+    .await;
+    let frac_long = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "generationConfig": {"maxOutputTokens": -10001.5},
+        "parameters": {"max_new_tokens": -10001.5}
+    }))
+    .await;
+    // "-1.5" (4) → "-10001.5" (8) = +4 chars each → +8 → 2 tokens.
+    assert_eq!(
+        frac_long - frac_short,
+        2,
+        "fractional exact-path caps must count at literal width"
+    );
+
+    // Unsigned controls at the same paths stay fully excluded (name + value).
+    let base = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "generationConfig": {"temperature": 0},
+        "parameters": {"temperature": 0}
+    }))
+    .await;
+    let with_u64 = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "generationConfig": {"temperature": 0, "maxOutputTokens": 999999},
+        "parameters": {"temperature": 0, "max_new_tokens": 999999}
+    }))
+    .await;
+    assert_eq!(
+        with_u64, base,
+        "unsigned exact-path caps must remain excluded from the prompt estimate"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_schema_scalar_literals_without_token_cap_overcharge() {
+    // Schema numbers/bools/`null` appear in the serialized prompt; omitting them
+    // at scale under-reserves. Count JSON literal widths, but keep numeric
+    // token-cap controls excluded.
+    //
+    // Eight enum integers: `0` (1 digit) vs `10000` (5 digits) → +4 chars each
+    // → +32 chars total → exactly ceil(32/4)=8 tokens regardless of baseline
+    // remainder. Name-only / scalar-ignoring walks yield delta 0.
+    let short_enum = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "n": {
+                            "type": "integer",
+                            "enum": [0, 0, 0, 0, 0, 0, 0, 0]
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }]
+    }))
+    .await;
+    let long_enum = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 999999,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "n": {
+                            "type": "integer",
+                            "enum": [10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000]
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }]
+    }))
+    .await;
+
+    assert_eq!(
+        long_enum - short_enum,
+        8,
+        "schema numeric enum literal width must reserve ceil(32/4)=8; \
+         ignored scalars yield delta 0"
+    );
+
+    // Bool literals: `false` (5) vs `true` (4) across eight defaults → +8 chars
+    // → exactly 2 tokens.
+    let all_true = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 42,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "boolean", "default": true},
+                        "b": {"type": "boolean", "default": true},
+                        "c": {"type": "boolean", "default": true},
+                        "d": {"type": "boolean", "default": true},
+                        "e": {"type": "boolean", "default": true},
+                        "f": {"type": "boolean", "default": true},
+                        "g": {"type": "boolean", "default": true},
+                        "h": {"type": "boolean", "default": true}
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+    let all_false = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "max_tokens": 42,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "boolean", "default": false},
+                        "b": {"type": "boolean", "default": false},
+                        "c": {"type": "boolean", "default": false},
+                        "d": {"type": "boolean", "default": false},
+                        "e": {"type": "boolean", "default": false},
+                        "f": {"type": "boolean", "default": false},
+                        "g": {"type": "boolean", "default": false},
+                        "h": {"type": "boolean", "default": false}
+                    }
+                }
+            }
+        }]
+    }))
+    .await;
+
+    assert_eq!(
+        all_false - all_true,
+        2,
+        "eight false vs true defaults must reserve ceil(8/4)=2 from literal width"
+    );
+
+    // Numeric top-level caps in the bodies above must stay excluded (finite
+    // estimates; unbounded cap digits would dominate if counted).
+    assert!(
+        long_enum < 200,
+        "scalar counting must not reintroduce token-cap overcharge; got {long_enum}"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_reserved_name_schema_requests_cannot_oversubscribe() {
+    // Long descriptions under schema properties that reuse reserved spellings
+    // (`max_tokens`, `image_url`, `source`) must reserve enough that concurrent
+    // twins cannot both fit — name-only exclusion would admit both.
+    let desc = "D".repeat(600); // 600 chars -> 150 tokens from one description alone
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 200,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 999999,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "max_tokens": {
+                            "type": "integer",
+                            "description": desc.clone()
+                        },
+                        "image_url": {
+                            "type": "string",
+                            "description": "x"
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "y"
+                        }
+                    }
+                }
+            }
+        }]
+    });
+
+    let make_ctx = || {
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            serde_json::to_string(&body).unwrap(),
+        );
+        ctx
+    };
+
+    let mut ctx_a = make_ctx();
+    let mut ctx_b = make_ctx();
+    let mut headers_a = HashMap::new();
+    let mut headers_b = HashMap::new();
+
+    let (result_a, result_b) = tokio::join!(
+        plugin.before_proxy(&mut ctx_a, &mut headers_a),
+        plugin.before_proxy(&mut ctx_b, &mut headers_b)
+    );
+
+    let allowed = u8::from(matches!(&result_a, PluginResult::Continue))
+        + u8::from(matches!(&result_b, PluginResult::Continue));
+    let rejected = u8::from(matches!(&result_a, PluginResult::Reject { .. }))
+        + u8::from(matches!(&result_b, PluginResult::Reject { .. }));
+
+    assert_eq!(
+        allowed, 1,
+        "only one reserved-name schema-heavy reservation should fit"
+    );
+    assert_eq!(
+        rejected, 1,
+        "the second reserved-name schema-heavy request must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_sibling_heavy_requests_cannot_oversubscribe_on_omitted_instructions() {
+    // Reproduction-shaped: tiny input + large instructions must reserve enough
+    // that a second concurrent twin cannot also fit in a tight budget.
+    let instructions = "X".repeat(400); // 400 chars -> 100 prompt tokens
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 120,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let body = json!({
+        "model": "gpt-4o",
+        "input": "hi",
+        "instructions": instructions
+    });
+
+    let make_ctx = || {
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            serde_json::to_string(&body).unwrap(),
+        );
+        ctx
+    };
+
+    let mut ctx_a = make_ctx();
+    let mut ctx_b = make_ctx();
+    let mut headers_a = HashMap::new();
+    let mut headers_b = HashMap::new();
+
+    let (result_a, result_b) = tokio::join!(
+        plugin.before_proxy(&mut ctx_a, &mut headers_a),
+        plugin.before_proxy(&mut ctx_b, &mut headers_b)
+    );
+
+    let allowed = u8::from(matches!(&result_a, PluginResult::Continue))
+        + u8::from(matches!(&result_b, PluginResult::Continue));
+    let rejected = u8::from(matches!(&result_a, PluginResult::Reject { .. }))
+        + u8::from(matches!(&result_b, PluginResult::Reject { .. }));
+
+    // If instructions were omitted, each request would reserve ~1 token and both
+    // would fit. Fail-closed whole-body counting makes only one fit.
+    assert_eq!(allowed, 1, "only one sibling-heavy reservation should fit");
+    assert_eq!(
+        rejected, 1,
+        "the second sibling-heavy request must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_schema_property_heavy_requests_cannot_oversubscribe() {
+    // Long nested schema property names alone must reserve enough that two
+    // concurrent twins cannot both fit — proves member-name accounting is live
+    // on the admission path (string-value-only walks would admit both).
+    let prop = "P".repeat(600); // 600-char property name -> 150 tokens from the name alone
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 200,
+            "window_seconds": 60,
+            "count_mode": "prompt_tokens",
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        prop: {"type": "string"}
+                    }
+                }
+            }
+        }]
+    });
+
+    let make_ctx = || {
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            serde_json::to_string(&body).unwrap(),
+        );
+        ctx
+    };
+
+    let mut ctx_a = make_ctx();
+    let mut ctx_b = make_ctx();
+    let mut headers_a = HashMap::new();
+    let mut headers_b = HashMap::new();
+
+    let (result_a, result_b) = tokio::join!(
+        plugin.before_proxy(&mut ctx_a, &mut headers_a),
+        plugin.before_proxy(&mut ctx_b, &mut headers_b)
+    );
+
+    let allowed = u8::from(matches!(&result_a, PluginResult::Continue))
+        + u8::from(matches!(&result_b, PluginResult::Continue));
+    let rejected = u8::from(matches!(&result_a, PluginResult::Reject { .. }))
+        + u8::from(matches!(&result_b, PluginResult::Reject { .. }));
+
+    assert_eq!(allowed, 1, "only one schema-heavy reservation should fit");
+    assert_eq!(
+        rejected, 1,
+        "the second schema-heavy request must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn prompt_estimate_counts_unknown_textual_sibling_alongside_recognized_field() {
+    // GHSA-2r5g-438w-85hr root finding: a non-empty recognized prompt field must
+    // not hide provider-native billed text under an unknown top-level sibling.
+    // Baseline keeps the sibling key so the delta isolates the 32-char value.
+    let recognized_only = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "provider_native_prompt_extension": ""
+    }))
+    .await;
+    let with_unknown = prompt_tokens_reserved(json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "abcd"}],
+        "provider_native_prompt_extension": PROMPT_DELTA_32
+    }))
+    .await;
+
+    assert!(
+        with_unknown > recognized_only,
+        "unknown textual sibling must increase the reservation when a recognized \
+         field is already non-empty (got {with_unknown}, recognized-only {recognized_only})"
+    );
+    assert_eq!(
+        with_unknown - recognized_only,
+        8,
+        "unknown sibling delta must be exactly ceil(32/4)=8 tokens"
     );
 }
 
@@ -3957,23 +5626,23 @@ async fn federation_usageless_response_kept_when_guard_rejects() {
 // Azure's "On Your Data" / extensions API attaches a per-data-source system
 // instruction (`data_sources[].parameters.role_information`, or the legacy
 // camelCase `dataSources[].parameters.roleInformation`). That text is sent to the
-// model and billed as input but is not part of `messages`/`system`/etc., so the
-// pre-reservation prompt estimate must add it. These tests drive the public
-// `before_proxy` surface in `prompt_tokens` mode and read the reserved estimate,
-// asserting the delta equals exactly the instruction text (and nothing else).
+// model and billed as input. The whole-body walk counts string values and member
+// names once alongside `messages` (no separate add path — that would double-count).
+// These tests drive the public `before_proxy` surface in `prompt_tokens` mode and
+// compare a same-shape baseline (empty instruction key) against the filled
+// instruction so the reserved delta equals the instruction text.
 
-/// A minimal Azure chat-completions request. The `messages` content is `"abcd"`
-/// (4 chars); together with the `"user"` role value the recognized prompt fields
-/// total a multiple of 4 characters. Because `div_ceil(4)` distributes over a
-/// base that is a multiple of 4, the reserved-token delta after adding
-/// `role_information` is exactly `ceil(instruction_chars / 4)` — independent of
-/// the exact base count — which keeps the assertions below robust.
+/// A minimal Azure chat-completions request used by the delta comparisons below.
 fn azure_base_messages() -> serde_json::Value {
     json!({
         "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": "abcd"}]
     })
 }
+
+/// A 32-character instruction keeps token deltas exact under `div_ceil(4)`
+/// regardless of the baseline's remainder.
+const AZURE_INSTRUCTION_32: &str = "0123456789abcdef0123456789abcdef";
 
 /// Reserved prompt-token estimate for `body` under a `prompt_tokens`-mode limiter
 /// with a budget far above any test request, so the reservation always succeeds
@@ -4008,22 +5677,24 @@ async fn azure_reserved(body: serde_json::Value) -> u64 {
 #[tokio::test]
 async fn prompt_estimate_counts_azure_on_your_data_role_information() {
     // Current chat-completions data plane: snake_case `data_sources` /
-    // `role_information`. The instruction must be counted, while the surrounding
-    // endpoint / index / key fields (which are NOT prompt input) must not be — the
-    // delta equals exactly the instruction text.
-    let instruction = "You are a helpful assistant answering only from the indexed docs.";
-    let reserved_base = azure_reserved(azure_base_messages()).await;
-
-    let mut with = azure_base_messages();
-    with["data_sources"] = json!([{
+    // `role_information`. Baseline already carries an empty instruction key so
+    // the delta isolates the instruction text (endpoint/index/key strings and
+    // the member name cancel out).
+    let instruction = AZURE_INSTRUCTION_32;
+    let mut baseline = azure_base_messages();
+    baseline["data_sources"] = json!([{
         "type": "azure_search",
         "parameters": {
             "endpoint": "https://example.search.windows.net",
             "index_name": "contoso-products-index-name-not-prompt-input",
             "authentication": {"type": "api_key", "key": "super-secret-key-not-prompt-input"},
-            "role_information": instruction
+            "role_information": ""
         }
     }]);
+    let reserved_base = azure_reserved(baseline.clone()).await;
+
+    let mut with = baseline;
+    with["data_sources"][0]["parameters"]["role_information"] = json!(instruction);
     let reserved_with = azure_reserved(with).await;
 
     let instruction_tokens = (instruction.chars().count() as u64).div_ceil(4);
@@ -4034,8 +5705,7 @@ async fn prompt_estimate_counts_azure_on_your_data_role_information() {
     assert_eq!(
         reserved_with - reserved_base,
         instruction_tokens,
-        "only the role_information text should be added; endpoint/index/key fields \
-         are not prompt input and must be excluded"
+        "role_information must be counted once; delta isolates the instruction text"
     );
 }
 
@@ -4043,19 +5713,21 @@ async fn prompt_estimate_counts_azure_on_your_data_role_information() {
 async fn prompt_estimate_counts_azure_extensions_api_role_information_camelcase() {
     // The original extensions API used camelCase for BOTH the outer array
     // (`dataSources`) and the inner field (`roleInformation`); both casings must be
-    // recognized.
-    let instruction = "Answer in formal English and cite the source document id.";
-    let reserved_base = azure_reserved(azure_base_messages()).await;
-
-    let mut with = azure_base_messages();
-    with["dataSources"] = json!([{
+    // recognized by the whole-body walk.
+    let instruction = AZURE_INSTRUCTION_32;
+    let mut baseline = azure_base_messages();
+    baseline["dataSources"] = json!([{
         "type": "AzureCognitiveSearch",
         "parameters": {
             "endpoint": "https://example.search.windows.net",
             "indexName": "contoso-index",
-            "roleInformation": instruction
+            "roleInformation": ""
         }
     }]);
+    let reserved_base = azure_reserved(baseline.clone()).await;
+
+    let mut with = baseline;
+    with["dataSources"][0]["parameters"]["roleInformation"] = json!(instruction);
     let reserved_with = azure_reserved(with).await;
 
     let instruction_tokens = (instruction.chars().count() as u64).div_ceil(4);
@@ -4065,22 +5737,22 @@ async fn prompt_estimate_counts_azure_extensions_api_role_information_camelcase(
 
 #[tokio::test]
 async fn prompt_estimate_does_not_short_circuit_on_empty_role_information() {
-    // `Value::as_str("")` is `Some("")` (not `None`), so an `or_else`-style lookup
-    // that stops at the first present key would be fooled by an empty
-    // `role_information` decoy and never count a real `roleInformation` sibling.
-    // Both inner casings must be summed independently. (Both keys on one source is
-    // a synthetic, defensive shape — real requests carry one casing.)
-    let instruction = "Stay strictly within the retrieved enterprise knowledge base.";
-    let reserved_base = azure_reserved(azure_base_messages()).await;
-
-    let mut with = azure_base_messages();
-    with["data_sources"] = json!([{
+    // Distinct Azure role-information casings are distinct JSON keys, so an empty
+    // `role_information` decoy cannot hide a real `roleInformation` sibling under
+    // the whole-body walk (each string value / member name is visited independently).
+    let instruction = AZURE_INSTRUCTION_32;
+    let mut baseline = azure_base_messages();
+    baseline["data_sources"] = json!([{
         "type": "azure_search",
         "parameters": {
             "role_information": "",
-            "roleInformation": instruction
+            "roleInformation": ""
         }
     }]);
+    let reserved_base = azure_reserved(baseline.clone()).await;
+
+    let mut with = baseline;
+    with["data_sources"][0]["parameters"]["roleInformation"] = json!(instruction);
     let reserved_with = azure_reserved(with).await;
 
     let instruction_tokens = (instruction.chars().count() as u64).div_ceil(4);
@@ -4096,23 +5768,24 @@ async fn prompt_estimate_does_not_short_circuit_on_empty_role_information() {
 async fn prompt_estimate_counts_whitespace_role_information_without_hiding_sibling() {
     // Whitespace is literal prompt input (sent and billed), so a whitespace-only
     // value is counted as its characters rather than trimmed away — and, like the
-    // empty-string case, it must not short-circuit a real sibling in the other
-    // casing.
+    // empty-string case, it must not hide a real sibling in the other casing.
     let whitespace = "   "; // 3 chars: neither None nor empty.
-    let instruction = "Respond concisely.";
-    let reserved_base = azure_reserved(azure_base_messages()).await;
-
-    let mut with = azure_base_messages();
-    with["data_sources"] = json!([{
+    let instruction = AZURE_INSTRUCTION_32;
+    let mut baseline = azure_base_messages();
+    baseline["data_sources"] = json!([{
         "type": "azure_search",
         "parameters": {
             "role_information": whitespace,
-            "roleInformation": instruction
+            "roleInformation": ""
         }
     }]);
+    let reserved_base = azure_reserved(baseline.clone()).await;
+
+    let mut with = baseline;
+    with["data_sources"][0]["parameters"]["roleInformation"] = json!(instruction);
     let reserved_with = azure_reserved(with).await;
 
-    let added_chars = (whitespace.chars().count() + instruction.chars().count()) as u64;
+    let added_chars = instruction.chars().count() as u64;
     assert!(
         reserved_with > reserved_base,
         "the real instruction must be counted alongside a whitespace decoy"
@@ -4122,28 +5795,28 @@ async fn prompt_estimate_counts_whitespace_role_information_without_hiding_sibli
 
 #[tokio::test]
 async fn prompt_estimate_counts_role_information_on_non_first_data_source() {
-    // The instruction can live on any data source, not just the first; the estimate
-    // must enumerate every entry in the array.
-    let instruction = "Prefer the most recently updated document when sources conflict.";
-    let reserved_base = azure_reserved(azure_base_messages()).await;
-
-    let mut with = azure_base_messages();
-    with["data_sources"] = json!([
-        // First source carries no role_information (only connection fields).
+    // The instruction can live on any data source, not just the first; the
+    // whole-body walk enumerates every entry in the array.
+    let instruction = AZURE_INSTRUCTION_32;
+    let mut baseline = azure_base_messages();
+    baseline["data_sources"] = json!([
         {
             "type": "azure_search",
             "parameters": {"endpoint": "https://a.search.windows.net", "index_name": "first"}
         },
-        // The instruction is on the SECOND source.
         {
             "type": "azure_search",
             "parameters": {
                 "endpoint": "https://b.search.windows.net",
                 "index_name": "second",
-                "role_information": instruction
+                "role_information": ""
             }
         }
     ]);
+    let reserved_base = azure_reserved(baseline.clone()).await;
+
+    let mut with = baseline;
+    with["data_sources"][1]["parameters"]["role_information"] = json!(instruction);
     let reserved_with = azure_reserved(with).await;
 
     let instruction_tokens = (instruction.chars().count() as u64).div_ceil(4);
@@ -4155,21 +5828,18 @@ async fn prompt_estimate_counts_role_information_on_non_first_data_source() {
 }
 
 #[tokio::test]
-async fn prompt_estimate_preserves_whole_body_fallback_prompt_with_role_information() {
-    // Regression guard (Codex P2 on #1942): fields like TGI/HuggingFace `inputs`
-    // are AI markers but are NOT summed by the recognized-field pass, so their
-    // prompt text is captured only by the zero-char whole-body fallback. Counting
-    // `role_information` must NOT make the recognized-field total nonzero and
-    // short-circuit that fallback — doing so would drop the real `inputs` prompt
-    // and reserve only the short instruction.
-    let inputs = "a".repeat(400); // real prompt text, counted only via the fallback
+async fn prompt_estimate_counts_inputs_prompt_with_role_information() {
+    // TGI/HuggingFace `inputs` and Azure `role_information` are both string values
+    // under the whole-body walk. Adding role_information must not drop or replace
+    // the `inputs` prompt — both contribute, and neither is double-counted.
+    let inputs = "a".repeat(400);
     let instruction = "Be terse.";
 
     let mut body = json!({ "inputs": inputs });
     let reserved_inputs_only = azure_reserved(body.clone()).await;
     assert!(
         reserved_inputs_only > 0,
-        "the `inputs` prompt must be counted via the whole-body fallback"
+        "the `inputs` prompt must be counted by the whole-body walk"
     );
 
     body["data_sources"] = json!([{
@@ -4178,12 +5848,9 @@ async fn prompt_estimate_preserves_whole_body_fallback_prompt_with_role_informat
     }]);
     let reserved_with_role = azure_reserved(body).await;
 
-    // The fallback still walks the whole body, so the full `inputs` prompt remains
-    // counted (now alongside the instruction) — the estimate must not collapse to
-    // just the instruction.
     assert!(
         reserved_with_role >= reserved_inputs_only,
-        "role_information must not drop the fallback-counted `inputs` prompt \
+        "role_information must not drop the `inputs` prompt \
          (got {reserved_with_role}, inputs-only was {reserved_inputs_only})"
     );
 }

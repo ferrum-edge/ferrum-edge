@@ -14,12 +14,38 @@
 //!   same channel implementations without depending on `proxy_alerts`.
 //! - **Per-`(rule, proxy, channel)` cooldown** prevents repeated dispatches
 //!   without suppressing unrelated proxies that share a global/group rule.
-//! - **Per-`(rule, proxy)` recovery state machine** dispatches a one-shot
-//!   `Resolve` event once a rule's window stays below threshold for the
-//!   configured `resolved_window_seconds`.
+//!   Cooldown is armed at dispatch admission and released if delivery fails
+//!   or is abandoned, so a failed send does not silently consume the window.
+//! - **Pending delivery seats**: Trigger/Resolve commit
+//!   `PendingTrigger` / `PendingResolve` when a send is admitted; state moves
+//!   to `Active` / `Healthy` only after a successful settle (or rolls back on
+//!   failure so the next sample can retry).
+//! - **Compensating Trigger after an uncertain Resolve**: a Resolve that is
+//!   already externally in flight cannot be unsent, and retiring its local
+//!   future is not a rollback. If the rule breaches again in that window the
+//!   incident parks in `ResolveInFlightRebreached` (no notification — a Trigger
+//!   emitted now could overtake the Resolve on the wire), and the Resolve's
+//!   settle — success, failure, or abandonment alike — converges to
+//!   `CompensatingTrigger`. The next breaching sample then re-alerts through
+//!   the ordinary cooldown gate, so a possibly-delivered Resolve can never
+//!   leave a genuinely breached incident silently suppressed. If the rule is no
+//!   longer breaching by then, the Resolve was accurate and the state returns
+//!   to `Healthy` with no phantom alert.
+//! - **Best-effort endpoint delivery**: bounded backpressure/failure paths can
+//!   produce zero copies, while transport timeouts, post-write connection
+//!   errors, and cancellation after bytes left the process are all reported as
+//!   failure/abandonment even though the endpoint may have acted on the send.
+//!   Retries and compensating Triggers can therefore duplicate an alert at the
+//!   receiver. See the delivery contract in `src/notifications/dispatch.rs`
+//!   and `docs/notifications.md`.
 //! - **Bounded-concurrency dispatch**: `tokio::Semaphore`. When exhausted,
 //!   alerts are dropped with a `warn!` rather than queued — alert storms
 //!   during a partial channel outage should be visible, not buffered.
+//! - **Classified retries**: transient transport/HTTP failures retry inside
+//!   the same task with jittered bounded backoff while holding the permit.
+//! - **Generation drain**: each instance owns a [`DispatchGeneration`];
+//!   reload/`Drop` cancels admission, and tasks participate in the process
+//!   observability delivery shutdown budget.
 //! - **Quiet hours**: optional UTC time-of-day windows where `Trigger`
 //!   alerts are suppressed (without consuming the cooldown gate). `Resolve`
 //!   events still fire so operators don't miss recovery during off hours.
@@ -41,7 +67,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use arc_swap::ArcSwap;
@@ -51,6 +77,8 @@ use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
+use crate::notifications::dispatch::{DeliveryCallback, DeliveryRetryPolicy};
+use crate::notifications::generation::{DispatchGeneration, DispatchSettle};
 use crate::notifications::{EventAction, NotificationChannel};
 use crate::plugins::utils::http_client::PluginHttpClient;
 
@@ -80,6 +108,8 @@ const LIFECYCLE_KEEP_FLOOR_MS: u64 = 3_600_000;
 /// before any lifecycle write.
 pub const UNARMED_PROXY_LIFECYCLE_GENERATION: u64 = 0;
 
+static NEXT_DISPATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 pub struct ProxyAlerts {
     rules: Arc<Vec<Rule>>,
     channel_by_id: Arc<HashMap<u32, Arc<NotificationChannel>>>,
@@ -96,6 +126,11 @@ pub struct ProxyAlerts {
     /// ArcSwap snapshot and never takes this lock.
     retention_lock: Arc<Mutex<()>>,
     dispatch_sem: Arc<Semaphore>,
+    /// Per-instance dispatch generation: closed and cancelled on Drop so
+    /// reload retires in-flight sends without leaking them into the next
+    /// plugin incarnation.
+    dispatch_generation: Arc<DispatchGeneration>,
+    delivery_retry: DeliveryRetryPolicy,
     http_client: PluginHttpClient,
     enabled: AtomicBool,
     quiet_hours: Arc<Vec<QuietHourWindow>>,
@@ -150,6 +185,8 @@ impl ProxyAlerts {
         );
 
         let dispatch_sem = Arc::new(Semaphore::new(parsed.max_concurrent_dispatches));
+        let dispatch_generation =
+            DispatchGeneration::new(NEXT_DISPATCH_GENERATION.fetch_add(1, Ordering::Relaxed));
 
         Ok(Self {
             rules: parsed.rules,
@@ -160,6 +197,8 @@ impl ProxyAlerts {
             active_proxy_generations,
             retention_lock,
             dispatch_sem,
+            dispatch_generation,
+            delivery_retry: parsed.delivery_retry,
             http_client,
             enabled: AtomicBool::new(parsed.enabled),
             quiet_hours: Arc::new(parsed.quiet_hours),
@@ -240,6 +279,10 @@ impl ProxyAlerts {
         let _ = self
             .recovery
             .observe(0, proxy_id, true, 5_000, 1, generation);
+        // observe now lands on PendingTrigger; commit Active for seeders that
+        // need a fully-delivered incident (plugin-cache retention tests).
+        self.recovery
+            .settle_trigger_success(0, proxy_id, generation, 1, 1);
     }
 
     /// Whether this instance currently holds lifecycle state for `proxy_id`
@@ -281,6 +324,8 @@ impl ProxyAlerts {
         let _ = self
             .recovery
             .observe(0, proxy_id, true, 5_000, 1, generation);
+        self.recovery
+            .settle_trigger_success(0, proxy_id, generation, 1, 1);
     }
 
     /// Run the ownership portion of the background lifecycle sweep without
@@ -433,7 +478,10 @@ impl ProxyAlerts {
         );
         let Some(event_action) = lifecycle_event_action(outcome) else {
             if non_event_outcome_needs_commit(outcome, previous_state, recovery_ms) {
-                self.recovery.observe(
+                // Commit the non-event transition, but if evaluate→observe
+                // raced into an event-reserving seat (no dispatch was admitted
+                // on this path), roll that exact reservation back immediately.
+                let committed = self.recovery.observe(
                     rule.id(),
                     proxy_id,
                     observation.breach,
@@ -441,19 +489,28 @@ impl ProxyAlerts {
                     now_ms,
                     ownership_generation,
                 );
+                self.recovery.rollback_unadmitted_reservation(
+                    rule.id(),
+                    proxy_id,
+                    ownership_generation,
+                    committed,
+                    now_ms,
+                );
             }
             return;
         };
         if event_action == EventAction::Trigger && in_quiet {
             return;
         }
-        let mut dispatches: Option<Vec<(Arc<NotificationChannel>, OwnedSemaphorePermit)>> = None;
+        let mut dispatches: Option<Vec<(Arc<NotificationChannel>, u32, OwnedSemaphorePermit)>> =
+            None;
         let mut cooldown_suppressed = false;
         for &channel_id in &rule.common().channel_ids {
             let Some(channel) = self.channel_by_id.get(&channel_id) else {
                 continue;
             };
-            let Some(permit) = self.try_acquire_dispatch_permit(channel.name()) else {
+            let Some(permit) = self.try_acquire_dispatch_permit(channel.name(), channel.kind())
+            else {
                 continue;
             };
             let cooldown_ok = match event_action {
@@ -473,17 +530,26 @@ impl ProxyAlerts {
             }
             dispatches
                 .get_or_insert_with(Vec::new)
-                .push((Arc::clone(channel), permit));
+                .push((Arc::clone(channel), channel_id, permit));
         }
         let Some(dispatches) = dispatches else {
             if cooldown_suppressed && matches!(outcome, LifecycleOutcome::StillActive) {
-                self.recovery.observe(
+                // Same class of race as the non-event commit path: observe may
+                // reserve Trigger/Resolve without an admitted delivery.
+                let committed = self.recovery.observe(
                     rule.id(),
                     proxy_id,
                     observation.breach,
                     recovery_ms,
                     now_ms,
                     ownership_generation,
+                );
+                self.recovery.rollback_unadmitted_reservation(
+                    rule.id(),
+                    proxy_id,
+                    ownership_generation,
+                    committed,
+                    now_ms,
                 );
             }
             return;
@@ -497,29 +563,85 @@ impl ProxyAlerts {
             ownership_generation,
         );
         if lifecycle_event_action(committed_outcome) != Some(event_action) {
+            // State raced; release cooldowns we just armed and drop permits.
+            if event_action != EventAction::Resolve {
+                for (_, channel_id, _) in &dispatches {
+                    self.cooldowns.release(
+                        rule.id(),
+                        proxy_id,
+                        *channel_id,
+                        ownership_generation,
+                        now_ms,
+                    );
+                }
+            }
+            // `observe` may have committed a different event reservation than
+            // the one evaluated above. No delivery is admitted for that
+            // mismatched event, so roll its exact token back as well.
+            self.recovery.rollback_unadmitted_reservation(
+                rule.id(),
+                proxy_id,
+                ownership_generation,
+                committed_outcome,
+                now_ms,
+            );
             return;
         }
+        let (left_threshold_at_ms, recovery_reserved_at_ms) =
+            match self
+                .recovery
+                .current_state(rule.id(), proxy_id, ownership_generation)
+            {
+                Some(RuleState::PendingResolve {
+                    left_threshold_at_ms,
+                    reserved_at_ms,
+                }) => (left_threshold_at_ms, reserved_at_ms),
+                Some(RuleState::PendingTrigger { reserved_at_ms }) => (now_ms, reserved_at_ms),
+                _ => (now_ms, now_ms),
+            };
         let notification = render::build_notification(rule, observation, sample, event_action, now);
         let extras = render::build_webhook_vars(rule, observation, sample, event_action, now);
         let notification = Arc::new(notification);
         let extras = Arc::new(extras);
-        for (channel, permit) in dispatches {
+        let pending = Arc::new(PendingDeliveryFanout {
+            remaining: AtomicUsize::new(dispatches.len()),
+            any_success: AtomicBool::new(false),
+            event_action,
+            rule_id: rule.id(),
+            proxy_id: proxy_id.to_string(),
+            ownership_generation,
+            fired_at_ms: now_ms,
+            left_threshold_at_ms,
+            recovery_reserved_at_ms,
+            cooldown_reserved_at_ms: now_ms,
+            cooldowns: Arc::clone(&self.cooldowns),
+            recovery: Arc::clone(&self.recovery),
+        });
+        for (channel, channel_id, permit) in dispatches {
             self.spawn_dispatch(
                 channel,
+                channel_id,
                 Arc::clone(&notification),
                 Arc::clone(&extras),
                 permit,
+                Arc::clone(&pending),
             );
         }
     }
 
-    fn try_acquire_dispatch_permit(&self, channel_name: &str) -> Option<OwnedSemaphorePermit> {
+    fn try_acquire_dispatch_permit(
+        &self,
+        channel_name: &str,
+        channel_type: &'static str,
+    ) -> Option<OwnedSemaphorePermit> {
         match Arc::clone(&self.dispatch_sem).try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
+                crate::notifications::metrics::global().record_backpressure_dropped(channel_type);
                 warn!(
                     plugin = "proxy_alerts",
                     channel = %channel_name,
+                    channel_type,
                     "notification dispatch backpressure: dropping alert"
                 );
                 None
@@ -530,30 +652,222 @@ impl ProxyAlerts {
     fn spawn_dispatch(
         &self,
         channel: Arc<NotificationChannel>,
+        channel_id: u32,
         notification: Arc<crate::notifications::Notification>,
         extras: Arc<HashMap<String, String>>,
         permit: OwnedSemaphorePermit,
+        pending: Arc<PendingDeliveryFanout>,
     ) {
+        let generation = Arc::clone(&self.dispatch_generation);
+        let retry = self.delivery_retry;
         let http = self.http_client.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = channel
-                .dispatch_with_vars(&notification, &extras, &http)
-                .await
-            {
-                warn!(
-                    plugin = "proxy_alerts",
-                    channel = %channel.name(),
-                    error = %e,
-                    "notification dispatch failed"
-                );
+        // Re-insert the already-acquired permit by transferring ownership into
+        // the spawned task via the dispatch helper's permit parameter. We
+        // already hold `permit`; dispatch_one would try_acquire again. Run the
+        // retry loop directly instead.
+        let on_settle: DeliveryCallback = Arc::new({
+            let pending = Arc::clone(&pending);
+            move |settle| {
+                pending.on_channel_settle(channel_id, settle);
             }
         });
+        let channel_type = channel.kind();
+        let spawned = generation.spawn(channel_type, Some(on_settle), {
+            let channel = Arc::clone(&channel);
+            let generation = Arc::clone(&generation);
+            async move {
+                crate::notifications::dispatch::run_with_retries(
+                    channel,
+                    notification,
+                    extras,
+                    http,
+                    permit,
+                    retry,
+                    &generation,
+                    "proxy_alerts",
+                )
+                .await
+            }
+        });
+        if !spawned {
+            warn!(
+                plugin = "proxy_alerts",
+                channel = %channel.name(),
+                channel_type,
+                "notification dispatch rejected by delivery generation or shutdown registry"
+            );
+        }
+    }
+
+    /// Cancel admission for this instance's dispatch generation (test hook).
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    pub fn cancel_dispatch_generation_for_test(&self) {
+        self.dispatch_generation.cancel();
+    }
+
+    /// Borrow this instance's dispatch generation so a deterministic external
+    /// test can observe retirement and drain *after* the plugin itself has been
+    /// dropped (the reload boundary this contract is about).
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    pub fn dispatch_generation_for_test(&self) -> Arc<DispatchGeneration> {
+        Arc::clone(&self.dispatch_generation)
+    }
+
+    /// Borrow this instance's recovery gate so a deterministic external test can
+    /// assert producer state settled after the plugin was dropped.
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    pub fn recovery_gate_for_test(&self) -> Arc<RecoveryGate> {
+        Arc::clone(&self.recovery)
+    }
+
+    /// In-flight dispatch count for this instance generation.
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    pub fn dispatch_in_flight_for_test(&self) -> usize {
+        self.dispatch_generation.in_flight()
+    }
+
+    /// Current recovery state for deterministic external delivery tests.
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    pub fn recovery_state_for_test(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+    ) -> Option<RuleState> {
+        self.recovery
+            .current_state(rule_id, proxy_id, ownership_generation)
+    }
+
+    /// Try to reserve one cooldown seat for deterministic external tests.
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_acquire_cooldown_for_test(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        channel_id: u32,
+        cooldown_ms: u64,
+        now_ms: u64,
+        ownership_generation: u64,
+    ) -> bool {
+        self.cooldowns.try_acquire(
+            rule_id,
+            proxy_id,
+            channel_id,
+            cooldown_ms,
+            now_ms,
+            ownership_generation,
+        )
+    }
+}
+
+/// Coordinates fan-out settle across every channel admitted for one lifecycle
+/// event so Trigger/Resolve state commits only after a defined delivery
+/// outcome.
+struct PendingDeliveryFanout {
+    remaining: AtomicUsize,
+    any_success: AtomicBool,
+    event_action: EventAction,
+    rule_id: u32,
+    proxy_id: String,
+    ownership_generation: u64,
+    fired_at_ms: u64,
+    left_threshold_at_ms: u64,
+    recovery_reserved_at_ms: u64,
+    cooldown_reserved_at_ms: u64,
+    cooldowns: Arc<CooldownGate>,
+    recovery: Arc<RecoveryGate>,
+}
+
+impl PendingDeliveryFanout {
+    fn on_channel_settle(&self, channel_id: u32, settle: DispatchSettle) {
+        let success = matches!(settle, DispatchSettle::Succeeded);
+        if success {
+            self.any_success.store(true, Ordering::Release);
+        } else if self.event_action != EventAction::Resolve {
+            // Failed Trigger/StillActive must not keep the cooldown seat.
+            self.cooldowns.release(
+                self.rule_id,
+                &self.proxy_id,
+                channel_id,
+                self.ownership_generation,
+                self.cooldown_reserved_at_ms,
+            );
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        // Last channel settled: commit or roll back incident state.
+        match self.event_action {
+            EventAction::Resolve => {
+                if self.any_success.load(Ordering::Acquire) {
+                    self.recovery.settle_resolve_success(
+                        self.rule_id,
+                        &self.proxy_id,
+                        self.ownership_generation,
+                        self.recovery_reserved_at_ms,
+                    );
+                } else {
+                    self.recovery.settle_resolve_failure(
+                        self.rule_id,
+                        &self.proxy_id,
+                        self.ownership_generation,
+                        self.left_threshold_at_ms,
+                        self.recovery_reserved_at_ms,
+                    );
+                }
+            }
+            EventAction::Trigger | EventAction::Info => {
+                // StillActive re-triggers leave Active in place; only the
+                // initial PendingTrigger path needs settle. settle_* no-ops
+                // when state is already Active.
+                if self.any_success.load(Ordering::Acquire) {
+                    self.recovery.settle_trigger_success(
+                        self.rule_id,
+                        &self.proxy_id,
+                        self.ownership_generation,
+                        self.recovery_reserved_at_ms,
+                        self.fired_at_ms,
+                    );
+                } else {
+                    self.recovery.settle_trigger_failure(
+                        self.rule_id,
+                        &self.proxy_id,
+                        self.ownership_generation,
+                        self.recovery_reserved_at_ms,
+                    );
+                }
+            }
+        }
     }
 }
 
 impl Drop for ProxyAlerts {
     fn drop(&mut self) {
+        // Stop admitting and cooperatively cancel in-flight deliveries so a
+        // reload cannot keep sending through retired credentials/endpoints.
+        // Tasks observe the cancel flag between attempts and settle as
+        // abandoned; the global observability registry still owns hard-abort
+        // on process-shutdown deadline expiry.
+        self.dispatch_generation.cancel();
         if let Some(handle) = self.eviction_handle.take() {
             handle.abort();
         }
@@ -656,6 +970,11 @@ fn non_event_outcome_needs_commit(
         (LifecycleOutcome::EnteringRecovery | LifecycleOutcome::Reactivate, _) => true,
         (LifecycleOutcome::Quiet, Some(RuleState::Active { .. })) => true,
         (LifecycleOutcome::Quiet, Some(RuleState::Recovering { .. })) if recovery_ms == 0 => true,
+        // A rule that owes a compensating Trigger but is no longer breaching
+        // must commit its return to Healthy, otherwise the possibly-delivered
+        // Resolve would keep an unnecessary compensating seat resident and the
+        // row would never become evictable.
+        (LifecycleOutcome::Quiet, Some(RuleState::CompensatingTrigger { .. })) => true,
         _ => false,
     }
 }
@@ -870,6 +1189,7 @@ mod tests {
     async fn failed_channel_dispatch_releases_permit() {
         let cfg = json!({
             "max_concurrent_dispatches": 1,
+            "max_delivery_retries": 0,
             "channels": {
                 "c": { "type": "webhook", "url": "http://127.0.0.1:1/alert", "body_template": "x" }
             },
@@ -907,6 +1227,7 @@ mod tests {
     async fn dispatch_backpressure_does_not_activate_unsent_trigger() {
         let cfg = json!({
             "max_concurrent_dispatches": 1,
+            "max_delivery_retries": 0,
             "channels": {
                 "c": { "type": "webhook", "url": "http://127.0.0.1/alert", "body_template": "x" }
             },
@@ -940,12 +1261,36 @@ mod tests {
 
         drop(held_permit);
         plugin.log(&summary).await;
+        // Admission commits PendingTrigger; a failed channel send rolls back
+        // to Healthy rather than silently marking Active.
         assert!(matches!(
             plugin
                 .recovery
                 .current_state(0, "ferrum|p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
-            Some(RuleState::Active { .. })
+            Some(RuleState::PendingTrigger { .. }) | Some(RuleState::Healthy) | None
         ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match plugin.recovery.current_state(
+                    0,
+                    "ferrum|p1",
+                    UNARMED_PROXY_LIFECYCLE_GENERATION,
+                ) {
+                    Some(RuleState::PendingTrigger { .. }) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    other => {
+                        assert!(
+                            matches!(other, None | Some(RuleState::Healthy)),
+                            "failed delivery must not leave a permanently Active incident: {other:?}"
+                        );
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("pending trigger should settle");
     }
 
     #[tokio::test]
@@ -995,6 +1340,7 @@ mod tests {
     async fn dispatch_backpressure_does_not_resolve_unsent_recovery() {
         let cfg = json!({
             "max_concurrent_dispatches": 1,
+            "max_delivery_retries": 0,
             "channels": {
                 "c": { "type": "webhook", "url": "http://127.0.0.1/alert", "body_template": "x" }
             },
@@ -1014,6 +1360,13 @@ mod tests {
             5_000,
             1,
             UNARMED_PROXY_LIFECYCLE_GENERATION,
+        );
+        plugin.recovery.settle_trigger_success(
+            0,
+            "ferrum|p1",
+            UNARMED_PROXY_LIFECYCLE_GENERATION,
+            1,
+            1,
         );
         plugin.recovery.observe(
             0,
@@ -1081,11 +1434,24 @@ mod tests {
             chrono::Utc::now(),
             false,
         );
-        assert_eq!(
-            plugin
-                .recovery
-                .current_state(0, owner_key, UNARMED_PROXY_LIFECYCLE_GENERATION),
-            Some(RuleState::Healthy)
-        );
+        // Admit PendingResolve; the unreachable webhook fails and rolls back to
+        // Recovering so a later healthy sample can retry Resolve.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match plugin.recovery.current_state(
+                    0,
+                    owner_key,
+                    UNARMED_PROXY_LIFECYCLE_GENERATION,
+                ) {
+                    Some(RuleState::PendingResolve { .. }) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Some(RuleState::Recovering { .. }) => break,
+                    other => panic!("unexpected resolve settle state: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("failed resolve must roll back to Recovering");
     }
 }

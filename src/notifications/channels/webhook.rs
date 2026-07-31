@@ -17,8 +17,8 @@ use super::super::templating::{
     render_template, render_template_json_string_escaped, validate_template,
 };
 use super::{
-    finalize_dispatch_response, redacted_endpoint_url, resolve_optional_string,
-    validate_notification_url,
+    finalize_dispatch_response_classified, redacted_endpoint_url, resolve_optional_string,
+    transport_failure, validate_notification_url,
 };
 
 /// Template variable names the webhook channel projects from a generic
@@ -179,7 +179,27 @@ impl WebhookChannel {
         extras: &HashMap<String, String>,
         http: &PluginHttpClient,
     ) -> Result<(), String> {
-        let body = self.render_body_with_vars(notification, extras)?;
+        match self
+            .dispatch_with_vars_classified(notification, extras, http)
+            .await
+        {
+            crate::notifications::outcome::DeliveryAttempt::Success => Ok(()),
+            crate::notifications::outcome::DeliveryAttempt::Failed { message, .. } => Err(message),
+        }
+    }
+
+    pub async fn dispatch_with_vars_classified(
+        &self,
+        notification: &Notification,
+        extras: &HashMap<String, String>,
+        http: &PluginHttpClient,
+    ) -> crate::notifications::outcome::DeliveryAttempt {
+        use crate::notifications::outcome::{DeliveryAttempt, FailureClass};
+
+        let body = match self.render_body_with_vars(notification, extras) {
+            Ok(body) => body,
+            Err(message) => return DeliveryAttempt::failed(FailureClass::Permanent, message),
+        };
         let mut req = match self.method {
             HttpMethod::Post => http.get().post(self.url.as_ref()),
             HttpMethod::Put => http.get().put(self.url.as_ref()),
@@ -190,11 +210,14 @@ impl WebhookChannel {
         }
         req = req.body(body);
         let redacted_url = redacted_endpoint_url(&self.url);
-        let resp = http
-            .execute_redacted(req, "notification_webhook", &redacted_url)
+        let resp = match http
+            .execute_with_redacted_url(req, "notification_webhook", &redacted_url)
             .await
-            .map_err(|e| format!("webhook dispatch failed: {e}"))?;
-        finalize_dispatch_response(resp, "webhook", &redacted_url).await
+        {
+            Ok(response) => response,
+            Err(error) => return transport_failure("webhook", &error, &redacted_url),
+        };
+        finalize_dispatch_response_classified(resp, "webhook", &redacted_url).await
     }
 
     pub async fn dispatch(
