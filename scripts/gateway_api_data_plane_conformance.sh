@@ -94,6 +94,9 @@ deploy_control_plane() {
   done
   kubectl create namespace "$CP_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
   create_frontend_tls_secret
+  # FERRUM_K8S_WATCH_IDLE_RELIST_SECS is deliberately far below the production
+  # default (300): the black-box probes below give up after 120s, so a lab
+  # window of 20s is what makes watch-staleness recovery observable here.
   helm upgrade --install ferrum "$ROOT_DIR/charts/ferrum-mesh" \
     --namespace "$CP_NAMESPACE" \
     --set image.repository=ferrum-edge \

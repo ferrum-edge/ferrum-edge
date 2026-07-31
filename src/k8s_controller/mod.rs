@@ -63,11 +63,12 @@ pub struct K8sControllerConfig {
     pub mesh_sidecar_ingress_enforced: bool,
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
-    /// `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`. Rebuild a watch scope's reflector
-    /// from an authoritative list when it has delivered no event for this long;
-    /// `0` disables it. This is the only bound on a silently stalled watch —
-    /// `full_sync_interval_secs` re-reconciles from the same reflector store,
-    /// so it cannot recover objects the store never received.
+    /// `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`, already clamped to
+    /// `0..=86_400` by the env parser. Rebuild a watch scope's reflector from
+    /// an authoritative list when it has delivered no event for this long; `0`
+    /// disables it. This is the only bound on a watch that stalls without
+    /// failing — `full_sync_interval_secs` re-reconciles from the same
+    /// reflector store, so it cannot recover objects the store never received.
     pub watch_idle_relist_secs: u64,
     pub kubeconfig_path: Option<String>,
 }
@@ -617,8 +618,8 @@ pub async fn start_k8s_controller(
     if relist_policy.idle_window.is_none() {
         warn!(
             "FERRUM_K8S_WATCH_IDLE_RELIST_SECS=0 disables watch-staleness recovery: a watch \
-             whose connection dies silently will keep serving its last-known objects until the \
-             control plane restarts"
+             that stops delivering without failing will keep serving its last-known objects \
+             until the control plane restarts"
         );
     }
 

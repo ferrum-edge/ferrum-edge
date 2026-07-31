@@ -7,9 +7,12 @@ pub struct ControllerMetrics {
     pub last_reconcile_duration_ms: AtomicU64,
     /// Reflector generations restarted because a watch scope produced no event
     /// for the configured idle window (`FERRUM_K8S_WATCH_IDLE_RELIST_SECS`), or
-    /// because a replacement generation never finished its initial list. A
-    /// steadily climbing value on a busy cluster means watch deliveries are
-    /// being lost somewhere between the API server and the reflector.
+    /// because a replacement generation never finished its initial list.
+    ///
+    /// A quiet scope relists on every window even when it is perfectly healthy
+    /// — bookmarks never reach us, so idleness is not evidence of a fault — so
+    /// this counter measures relist *rate*, not error rate. What is diagnostic
+    /// is a scope that relists while the cluster is known to be changing.
     pub watch_idle_relists: AtomicU64,
 }
 

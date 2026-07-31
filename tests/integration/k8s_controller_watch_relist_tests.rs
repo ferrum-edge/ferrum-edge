@@ -1,14 +1,17 @@
 //! Recovery from a silently stale Kubernetes watch.
 //!
 //! A kube-rs `watcher` reports an error only when the watch *fails*. A watch
-//! whose connection is black-holed (no FIN, no RST, no GOAWAY) never fails: the
-//! task stays alive, the reflector store keeps serving whatever it held when
+//! that stops delivering without failing never surfaces anything: the task
+//! stays alive, the reflector store keeps serving whatever it held when
 //! delivery stopped, and every object created from then on is simply absent
-//! from every reconcile snapshot. That is what a Gateway API conformance run
-//! saw — four TCPRoutes existed in the cluster while the controller reconciled
-//! happily against a store that never received them — and
+//! from every reconcile snapshot. A Gateway API conformance run produced
+//! exactly that signature — four TCPRoutes existed in the cluster while the
+//! controller reconciled happily against a store that never received them, with
+//! no watcher error, restart, or status write for 120s — and
 //! `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` could not help, because it
-//! re-reconciles that same stale store rather than re-listing Kubernetes.
+//! re-reconciles that same stale store rather than re-listing Kubernetes. The
+//! artifact does not say where the event stream was lost, so these tests pin
+//! the symptom (no event for a whole window) and the recovery, not a cause.
 //!
 //! These tests drive the production watcher task
 //! (`k8s_controller::watcher::run_watcher_generations`) over scripted reflector
@@ -20,21 +23,35 @@
 
 use std::time::Duration;
 
-use ferrum_edge::_test_support::{K8sWatchScopeForTest, k8s_watch_scope_for_test};
+use ferrum_edge::_test_support::{
+    K8sWatchScopeForTest, k8s_watch_idle_relist_jitter_millis as jitter_millis,
+    k8s_watch_scope_for_test,
+};
 use kube::runtime::watcher::Event;
 use tokio::sync::watch;
 
 const GROUP: &str = "gateway.networking.k8s.io";
 const VERSION: &str = "v1alpha2";
+/// What the harness composes from `GROUP`/`VERSION`, and what the watcher hashes
+/// for the per-scope jitter.
+const API_VERSION: &str = "gateway.networking.k8s.io/v1alpha2";
 const KIND: &str = "TCPRoute";
 const PLURAL: &str = "tcproutes";
 const NAMESPACE: &str = "gateway-conformance-infra";
 const SCOPE: &str = "namespace:gateway-conformance-infra";
 const IDLE_RELIST_SECS: u64 = 60;
 
-/// Long enough to cross the idle window plus its deterministic per-scope jitter,
-/// which is bounded by a quarter of the window.
+/// Long enough to cross the idle window plus its per-scope jitter for ANY
+/// jitter value: the offset is bounded by a quarter of the window, so twice the
+/// window always crosses the deadline. The jitter carries a per-process random
+/// seed, so no test may depend on a particular offset.
 const PAST_IDLE_WINDOW: Duration = Duration::from_secs(IDLE_RELIST_SECS * 2);
+
+/// Event cadence for a scope that is deliberately busy. Strictly inside the
+/// *minimum* idle deadline: that deadline is `last_event + IDLE_RELIST_SECS +
+/// jitter` with `jitter >= 0`, so an event every half-window can never reach it
+/// whatever the process seed produced.
+const BUSY_EVENT_CADENCE: Duration = Duration::from_secs(IDLE_RELIST_SECS / 2);
 
 /// Short enough that it can never reach an idle deadline. Under `start_paused`
 /// this just lets the watcher task run to its next suspension point.
@@ -203,7 +220,9 @@ async fn relist_retires_objects_deleted_while_the_watch_was_stale() {
 /// A busy scope keeps its generation: events reset the idle deadline, so a
 /// healthy watch never pays for a relist it does not need. Only generation 0 is
 /// scripted here, so a relist would move the scope to a permanently silent
-/// stream and the last update below would never land.
+/// stream and the last update below would never land. The event cadence is
+/// strictly inside the minimum idle deadline, so this holds for every jitter
+/// value while total elapsed time crosses two whole windows.
 #[tokio::test(start_paused = true)]
 async fn a_scope_that_keeps_delivering_events_is_never_relisted() {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -212,7 +231,7 @@ async fn a_scope_that_keeps_delivering_events_is_never_relisted() {
 
     list(&harness, 0, &["blackbox-tcp-main"]);
     for _ in 0..4 {
-        tokio::time::sleep(Duration::from_secs(IDLE_RELIST_SECS / 2)).await;
+        tokio::time::sleep(BUSY_EVENT_CADENCE).await;
         apply(&harness, 0, "blackbox-tcp-main");
     }
     apply(&harness, 0, "blackbox-tcp-late");
@@ -252,8 +271,8 @@ async fn idle_relist_can_be_disabled() {
     watcher.await.expect("watcher task");
 }
 
-/// A replacement generation that inherits the same black hole must not pin the
-/// scope to its last-known-good state forever: it is abandoned after the
+/// A replacement generation that inherits the same stalled path must not pin
+/// the scope to its last-known-good state forever: it is abandoned after the
 /// readiness timeout and another one is started, still make-before-break.
 #[tokio::test(start_paused = true)]
 async fn a_replacement_that_never_lists_is_retried_without_losing_the_last_good_store() {
@@ -263,7 +282,7 @@ async fn a_replacement_that_never_lists_is_retried_without_losing_the_last_good_
 
     list(&harness, 0, &["blackbox-tcp-main"]);
     // Generation 1 starts one idle window (plus jitter) from here and never
-    // receives a single event: it inherits the same dead connection.
+    // receives a single event: it inherits the same stalled path.
     tokio::time::sleep(PAST_IDLE_WINDOW).await;
 
     // The readiness timeout is two idle windows, so generation 1 is abandoned
@@ -285,6 +304,47 @@ async fn a_replacement_that_never_lists_is_retried_without_losing_the_last_good_
 
     let _ = shutdown_tx.send(true);
     watcher.await.expect("watcher task");
+}
+
+/// The per-scope jitter is a bounded offset, never a value a caller may pin.
+///
+/// It carries a per-process random seed so that control-plane replicas watching
+/// the same scopes do not issue the same scope's list in the same instant, so
+/// this asserts only what the watcher relies on: it stays inside a quarter of
+/// the window (which is what keeps `PAST_IDLE_WINDOW` sufficient), it is zero
+/// when relisting is disabled, it is stable within one process, and it survives
+/// the largest window the env parser can produce without overflowing.
+#[test]
+fn idle_relist_jitter_is_bounded_and_stable_within_the_process() {
+    let quarter_window_ms = IDLE_RELIST_SECS * 1000 / 4;
+    for kind in ["TCPRoute", "HTTPRoute", "ReferenceGrant"] {
+        let jitter = jitter_millis(API_VERSION, kind, SCOPE, IDLE_RELIST_SECS);
+        assert!(
+            jitter < quarter_window_ms,
+            "{kind} jitter {jitter}ms must stay inside a quarter of the window \
+             ({quarter_window_ms}ms)"
+        );
+        assert_eq!(
+            jitter,
+            jitter_millis(API_VERSION, kind, SCOPE, IDLE_RELIST_SECS),
+            "a scope's offset must not wander between iterations within one process"
+        );
+    }
+
+    assert_eq!(
+        jitter_millis(API_VERSION, KIND, SCOPE, 0),
+        0,
+        "a disabled idle relist has no deadline to offset"
+    );
+
+    // The env parser clamps the window to 86_400s; the largest admissible
+    // window must still produce a bounded offset rather than overflowing the
+    // millisecond conversion or the doubling behind the readiness timeout.
+    const MAX_WINDOW_SECS: u64 = 86_400;
+    assert!(
+        jitter_millis(API_VERSION, KIND, SCOPE, MAX_WINDOW_SECS) < MAX_WINDOW_SECS * 1000 / 4,
+        "the maximum admissible window must still produce a bounded offset"
+    );
 }
 
 /// Task ownership is unchanged by relisting: the watcher still observes the

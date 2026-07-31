@@ -435,15 +435,41 @@ pub(crate) struct WatchTarget {
     pub watcher_label: &'static str,
 }
 
+/// Documented opt-out for `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`: no idle relist.
+pub const K8S_WATCH_IDLE_RELIST_SECS_MIN: u64 = 0;
+
+/// Upper bound for `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` (24 hours).
+///
+/// The parser clamps to this, which is what keeps every duration derived from
+/// the window inside its own range: [`RelistPolicy::readiness_timeout`]
+/// multiplies it by two, the watcher adds it to a [`tokio::time::Instant`], and
+/// the jitter converts a quarter of it to milliseconds. An unbounded `u64` from
+/// the environment would expose all three to an overflow panic at startup.
+pub const K8S_WATCH_IDLE_RELIST_SECS_MAX: u64 = 86_400;
+
+/// Default idle-relist window.
+///
+/// Bookmarks are consumed inside kube-rs, so a healthy but quiet scope is
+/// indistinguishable from a stalled one and *will* relist on every window. A
+/// controller watching three namespaces runs on the order of 39 scope watchers
+/// (about 69 with Istio and core resources enabled), and the count grows with
+/// the namespace count — so the window is a per-scope full-list rate against
+/// the API server, not just a recovery bound. Five minutes keeps that load
+/// modest while still bounding staleness well below an operator's patience.
+pub const K8S_WATCH_IDLE_RELIST_SECS_DEFAULT: u64 = 300;
+
 /// When a watcher rebuilds its reflector from an authoritative list.
 ///
 /// A kube-rs `watcher` surfaces an error only when the watch *fails*. A watch
-/// whose underlying connection is silently black-holed (no FIN, no RST, no
-/// HTTP/2 GOAWAY) never fails: the task stays alive, the reflector store keeps
-/// serving whatever it held when delivery stopped, and objects created in
-/// Kubernetes from then on are simply absent from every reconcile snapshot.
-/// `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` does not help — it re-reconciles from
-/// the same stale store — so this is the only bound on that blindness.
+/// that stops delivering without failing — a silently stalled or black-holed
+/// connection, where no FIN, RST, or HTTP/2 GOAWAY ever arrives — leaves the
+/// task alive, the reflector store serving whatever it held when delivery
+/// stopped, and objects created in Kubernetes from then on absent from every
+/// reconcile snapshot. `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` does not help — it
+/// re-reconciles from the same stale store — so this is the only bound on that
+/// blindness. The recovery is deliberately cause-agnostic: it is driven by the
+/// observable symptom (no event for a whole window), not by any particular
+/// diagnosis of where the stream was lost.
 #[derive(Clone, Copy)]
 pub(crate) struct RelistPolicy {
     /// Rebuild the reflector when the scope has produced no event for this
@@ -456,13 +482,17 @@ pub(crate) struct RelistPolicy {
     pub idle_window: Option<Duration>,
     /// How long a replacement generation may take to finish its initial list
     /// before it is abandoned and another one is started. Without this, a
-    /// replacement that inherits the same black hole would leave the scope
+    /// replacement that inherited the same stalled path would leave the scope
     /// pinned to its last-known-good state forever.
     pub readiness_timeout: Duration,
 }
 
 impl RelistPolicy {
     pub(crate) fn from_idle_secs(idle_relist_secs: u64) -> Self {
+        // The parser clamps to `K8S_WATCH_IDLE_RELIST_SECS_MAX`; clamp again
+        // here so a direct caller (tests, future call sites) can never build a
+        // window whose doubling below would overflow.
+        let idle_relist_secs = idle_relist_secs.min(K8S_WATCH_IDLE_RELIST_SECS_MAX);
         let idle_window = (idle_relist_secs > 0).then(|| Duration::from_secs(idle_relist_secs));
         // Two idle windows, floored, so a replacement gets a generous but
         // bounded chance to list before it is retried.
@@ -481,29 +511,59 @@ impl RelistPolicy {
 /// generation is ever started).
 const MIN_RELIST_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Deterministic per-scope offset added to the idle deadline so that watchers
-/// which went quiet together (typically all of them, right after startup) do
-/// not relist in the same tick. Spreads over the first quarter of the window.
+/// One random seed per controller process, folded into every scope's jitter.
 ///
-/// Deliberately hash-derived rather than random: two processes with the same
-/// watch set stagger identically, and tests are reproducible.
-fn idle_relist_jitter(target: &WatchTarget, idle_window: Option<Duration>) -> Duration {
+/// Without it the offset would be a pure function of the watched triple, so
+/// every control-plane replica would compute the *same* offset for the same
+/// scope and issue its full list in the same instant — the thundering herd the
+/// jitter exists to prevent, just moved from "all scopes on one replica" to
+/// "one scope on all replicas". `RandomState` is the standard library's own
+/// per-instance random seed, so this needs no new dependency and no RNG crate.
+fn process_relist_jitter_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SEED.get_or_init(|| {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(0);
+        hasher.finish()
+    })
+}
+
+/// Bounded per-scope offset added to the idle deadline so that watchers which
+/// went quiet together (typically all of them, right after startup) do not
+/// relist in the same tick. Spreads over the first quarter of the window.
+///
+/// Stable *within* a process — a scope's deadline must not wander between
+/// iterations — but seeded per process by [`process_relist_jitter_seed`], so
+/// replicas of the same control plane stagger independently. Callers must
+/// therefore never assume a particular offset; only that it is in
+/// `0..window/4`.
+pub(crate) fn idle_relist_jitter(
+    api_version: &str,
+    kind: &str,
+    scope: &str,
+    idle_window: Option<Duration>,
+) -> Duration {
     let Some(window) = idle_window else {
         return Duration::ZERO;
     };
-    let spread = window.as_millis() as u64 / 4;
+    // The window is clamped to `K8S_WATCH_IDLE_RELIST_SECS_MAX`, so a quarter
+    // of it in milliseconds is far inside `u64`.
+    let spread = (window.as_millis() / 4) as u64;
     if spread == 0 {
         return Duration::ZERO;
     }
-    // FNV-1a, so the offset is stable across processes and releases (unlike
-    // `DefaultHasher`, which is seeded per process).
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    // FNV-1a over the watched triple, offset-basis-mixed with the process seed:
+    // distinct scopes land on distinct offsets, distinct processes on distinct
+    // sets of offsets.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325 ^ process_relist_jitter_seed();
     for part in [
-        target.api_version.as_bytes(),
+        api_version.as_bytes(),
         "|".as_bytes(),
-        target.kind.as_bytes(),
+        kind.as_bytes(),
         "|".as_bytes(),
-        target.scope.as_bytes(),
+        scope.as_bytes(),
     ] {
         for byte in part {
             hash ^= u64::from(*byte);
@@ -549,7 +609,12 @@ pub(crate) async fn run_watcher_generations<S, F>(
     F: FnMut(reflector::store::Writer<DynamicObject>) -> S,
     S: Stream<Item = Result<watcher::Event<DynamicObject>, watcher::Error>>,
 {
-    let jitter = idle_relist_jitter(&target, policy.idle_window);
+    let jitter = idle_relist_jitter(
+        &target.api_version,
+        &target.kind,
+        &target.scope,
+        policy.idle_window,
+    );
     let mut initial_writer = Some(initial_writer);
 
     loop {

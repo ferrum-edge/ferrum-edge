@@ -6222,6 +6222,25 @@ pub mod _test_support {
         }
     }
 
+    /// The bounded per-scope idle-relist offset for one watch scope, in
+    /// milliseconds.
+    ///
+    /// Exposed so tests can assert its BOUNDS and its stability within one
+    /// process. The offset carries a per-process random seed (so control-plane
+    /// replicas do not relist the same scope in the same instant), so no test
+    /// may assert a particular value.
+    pub fn k8s_watch_idle_relist_jitter_millis(
+        api_version: &str,
+        kind: &str,
+        scope: &str,
+        idle_relist_secs: u64,
+    ) -> u64 {
+        use crate::k8s_controller::watcher::{RelistPolicy, idle_relist_jitter};
+
+        let window = RelistPolicy::from_idle_secs(idle_relist_secs).idle_window;
+        idle_relist_jitter(api_version, kind, scope, window).as_millis() as u64
+    }
+
     /// Build a watch scope with `generations` scripted reflector generations and
     /// return it alongside the production watcher task future.
     ///
