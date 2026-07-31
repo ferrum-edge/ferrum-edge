@@ -356,7 +356,8 @@ struct ReferenceGrantAllowQuery<'a> {
 impl<'a> ReferenceGrantPermissionIndex<'a> {
     fn ingest(&mut self, grant: &'a K8sObject) {
         // Same whole-object parser as canonical `collect_reference_grant`: any
-        // malformed present from/to entry grants nothing from this object.
+        // malformed present from/to entry grants nothing from this object
+        // (including malformed from when `to` is absent/non-array).
         let Ok(permissions) = parse_reference_grant_permissions(grant) else {
             return;
         };
@@ -635,7 +636,6 @@ pub fn plan_gateway_api_status_updates_budgeted(
         let status = desired_status_for_object(
             object,
             &DesiredStatusForObject {
-                objects,
                 indexes: &indexes,
                 status_context: &status_context,
                 translation_result,
@@ -672,7 +672,6 @@ pub fn plan_gateway_api_status_updates_budgeted(
 /// References only — no hot-path clones of the snapshot, indexes, or
 /// translation reuse result (#2397).
 struct DesiredStatusForObject<'a> {
-    objects: &'a [K8sObject],
     indexes: &'a GatewayApiStatusIndexes<'a>,
     status_context: &'a GatewayApiStatusContext,
     translation_result: Result<&'a K8sTranslation, &'a K8sTranslateError>,
@@ -688,14 +687,12 @@ fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_
 
     match object.kind.as_str() {
         "Gateway" => gateway_status(
-            ctx.objects,
             object,
             ctx.indexes,
             ctx.translation_result,
             ctx.status_context,
         ),
         "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => route_status(
-            ctx.objects,
             object,
             ctx.indexes,
             ctx.translation_result,
@@ -773,7 +770,6 @@ impl ListenerReferenceStatus {
 }
 
 fn gateway_reference_status(
-    objects: &[K8sObject],
     gateway: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> ListenerReferenceStatus {
@@ -783,13 +779,12 @@ fn gateway_reference_status(
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|listener| listener_reference_status(objects, gateway, listener, indexes))
+        .map(|listener| listener_reference_status(gateway, listener, indexes))
         .find(|status| !status.resolved)
         .unwrap_or(ListenerReferenceStatus::RESOLVED)
 }
 
 fn listener_reference_status(
-    objects: &[K8sObject],
     gateway: &K8sObject,
     listener: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
@@ -844,7 +839,7 @@ fn listener_reference_status(
     }
 
     if listener_is_terminating_tls(listener)
-        && gateway_has_multiple_distinct_tls_certificate_refs(objects, gateway, indexes)
+        && gateway_has_multiple_distinct_tls_certificate_refs(gateway, indexes)
     {
         return ListenerReferenceStatus::UNSUPPORTED_CERTIFICATE_REFS;
     }
@@ -868,7 +863,6 @@ fn listener_is_terminating_tls(listener: &Value) -> bool {
 }
 
 fn gateway_has_multiple_distinct_tls_certificate_refs(
-    objects: &[K8sObject],
     gateway: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
@@ -880,7 +874,7 @@ fn gateway_has_multiple_distinct_tls_certificate_refs(
         .iter()
         .filter(|listener| listener_is_terminating_tls(listener))
         .flat_map(|listener| {
-            listener_tls_certificate_ref_identities(objects, gateway, listener, indexes)
+            listener_tls_certificate_ref_identities(gateway, listener, indexes)
         })
     {
         if selected
@@ -895,7 +889,6 @@ fn gateway_has_multiple_distinct_tls_certificate_refs(
 }
 
 fn listener_tls_certificate_ref_identities(
-    _objects: &[K8sObject],
     gateway: &K8sObject,
     listener: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
@@ -963,13 +956,12 @@ fn reference_grant_allows_secret_indexed(
 }
 
 fn gateway_status(
-    objects: &[K8sObject],
     object: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
     result: Result<&crate::config_sources::k8s::K8sTranslation, &K8sTranslateError>,
     status_context: &GatewayApiStatusContext,
 ) -> Value {
-    let references = gateway_reference_status(objects, object, indexes);
+    let references = gateway_reference_status(object, indexes);
     let (accepted, materialized, resolved_refs, programmed, message) = match result {
         Ok(translation) => {
             let materialized = gateway_programmed(object, &translation.config);
@@ -1069,7 +1061,6 @@ fn gateway_status(
     ensure_status_object(&mut status).insert(
         "listeners".to_string(),
         Value::Array(gateway_listener_statuses(
-            objects,
             object,
             indexes,
             result.ok().map(|translation| &translation.config),
@@ -1093,7 +1084,6 @@ fn gateway_status_address(address: &str) -> Value {
 }
 
 fn gateway_listener_statuses(
-    objects: &[K8sObject],
     gateway: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
     config: Option<&GatewayConfig>,
@@ -1107,7 +1097,7 @@ fn gateway_listener_statuses(
         .into_iter()
         .flatten()
         .map(|listener| {
-            let references = listener_reference_status(objects, gateway, listener, indexes);
+            let references = listener_reference_status(gateway, listener, indexes);
             let listener_name = listener
                 .get("name")
                 .and_then(Value::as_str)
@@ -1533,7 +1523,6 @@ fn merge_status_conditions(status: &mut Value, owned_types: &[&str], desired: Ve
 }
 
 fn route_status(
-    objects: &[K8sObject],
     object: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
     result: Result<&crate::config_sources::k8s::K8sTranslation, &K8sTranslateError>,
@@ -1558,7 +1547,7 @@ fn route_status(
             Ok(_) => {
                 let programmed = !materialized_parent_refs.is_empty();
                 let unresolved_refs_reason =
-                    route_unresolved_backend_ref_reason(objects, object, indexes);
+                    route_unresolved_backend_ref_reason(object, indexes);
                 let resolved_refs = unresolved_refs_reason.is_none();
                 let resolved_refs_reason = unresolved_refs_reason.unwrap_or("ResolvedRefs");
                 (
@@ -1651,14 +1640,14 @@ fn route_status(
             .map(|conflict| route_conflict_message(conflict));
         let not_allowed_by_listener = accepted
             && !all_parent_matches_conflicted
-            && route_parent_ref_not_allowed_by_listener(objects, object, parent_ref, indexes);
+            && route_parent_ref_not_allowed_by_listener(object, parent_ref, indexes);
         let no_matching_parent = accepted
             && !not_allowed_by_listener
-            && !route_parent_ref_has_matching_parent(objects, object, parent_ref, indexes);
+            && !route_parent_ref_has_matching_parent(object, parent_ref, indexes);
         let no_matching_listener_hostname = accepted
             && !no_matching_parent
             && !not_allowed_by_listener
-            && !route_parent_ref_has_matching_listener(objects, object, parent_ref, indexes);
+            && !route_parent_ref_has_matching_listener(object, parent_ref, indexes);
         let accepted_for_parent = accepted
             && !all_parent_matches_conflicted
             && !not_allowed_by_listener
@@ -2280,7 +2269,6 @@ fn parent_ref_targets_gateway(route: &K8sObject, parent_ref: &Value, gateway: &K
 }
 
 fn route_parent_ref_has_matching_listener(
-    _objects: &[K8sObject],
     route: &K8sObject,
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
@@ -2313,7 +2301,6 @@ fn route_parent_ref_has_matching_listener(
 }
 
 fn route_parent_ref_not_allowed_by_listener(
-    _objects: &[K8sObject],
     route: &K8sObject,
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
@@ -2354,7 +2341,6 @@ fn route_parent_ref_not_allowed_by_listener(
 }
 
 fn route_parent_ref_has_matching_parent(
-    _objects: &[K8sObject],
     route: &K8sObject,
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
@@ -2513,7 +2499,6 @@ fn gateway_listener_programmed(
 }
 
 fn route_unresolved_backend_ref_reason(
-    _objects: &[K8sObject],
     route: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> Option<&'static str> {

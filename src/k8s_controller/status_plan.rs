@@ -4,8 +4,13 @@
 //! status-bearing object and only then truncated writes to 256. That bounded
 //! API traffic but not CPU or allocation. Callers select a deterministic
 //! rotating window *before* expensive per-object translation/status work so
-//! the same cap bounds both, and every eligible resource eventually rotates
-//! into the window.
+//! the same cap bounds both.
+//!
+//! All eligible Gateway API status kinds (including GatewayClass and Gateway)
+//! share this deterministic window — planning itself, especially attached-route
+//! counts, can be expensive — so every candidate enters the window within at
+//! most `ceil(eligible_candidates / limit)` successful planning/patch rounds
+//! for a stable candidate set.
 
 /// Default per-reconcile status planning / write budget (Gateway API).
 pub const DEFAULT_STATUS_PLAN_WORK_BUDGET: usize = 256;
@@ -80,11 +85,16 @@ pub fn select_fair_work_window(candidate_len: usize, budget: StatusPlanBudget) -
 }
 
 /// Iterate `candidates` in fair-window order (wraps at the end of the slice).
+///
+/// Clamps `take` to `candidates.len()` so a manually constructed inconsistent
+/// [`FairWorkWindow`] (for example `take > 0` with an empty slice, or
+/// `take > len`) cannot panic on modulo-by-zero or walk past the slice.
 pub fn fair_work_window_iter<T>(
     candidates: &[T],
     window: FairWorkWindow,
 ) -> impl Iterator<Item = (usize, &T)> + '_ {
-    (0..window.take).map(move |offset| {
+    let take = window.take.min(candidates.len());
+    (0..take).map(move |offset| {
         let index = (window.start + offset) % candidates.len();
         (index, &candidates[index])
     })
@@ -173,5 +183,29 @@ mod tests {
             .map(|(_, item)| *item)
             .collect();
         assert_eq!(ordered, vec![7, 8, 9, 0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn inconsistent_empty_or_oversized_window_iter_does_not_panic() {
+        let empty: [&str; 0] = [];
+        let inconsistent_empty = FairWorkWindow {
+            start: 3,
+            take: 5,
+            next_cursor: 8,
+        };
+        assert!(fair_work_window_iter(&empty, inconsistent_empty)
+            .collect::<Vec<_>>()
+            .is_empty());
+
+        let items = ["a", "b", "c"];
+        let oversized = FairWorkWindow {
+            start: 1,
+            take: 10,
+            next_cursor: 11,
+        };
+        let ordered: Vec<&str> = fair_work_window_iter(&items, oversized)
+            .map(|(_, item)| *item)
+            .collect();
+        assert_eq!(ordered, vec!["b", "c", "a"]);
     }
 }

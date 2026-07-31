@@ -226,7 +226,10 @@ fn reference_grant_optional_to_name(to: &Value) -> Result<Option<&str>, Referenc
 
 /// Parse ReferenceGrant permissions with whole-object fail-closed semantics.
 ///
-/// - Missing/non-array top-level `from` or `to` → `Ok([])` (no permissions).
+/// - Missing/non-array top-level `from` → `Ok([])` (no permissions).
+/// - Present `from[]` entries are validated first; a malformed present `from`
+///   entry returns `Err` even when top-level `to` is missing/non-array.
+/// - Valid `from` with missing/non-array `to` → `Ok([])` (authorizes nothing).
 /// - Every present from/to entry requires explicit string `namespace`/`group`/
 ///   `kind` (from) and `group`/`kind` (to); absent `to.name` is the valid
 ///   wildcard; present non-string `to.name` is invalid.
@@ -238,11 +241,11 @@ pub(crate) fn parse_reference_grant_permissions<'a>(
     let Some(from_entries) = object.spec.get("from").and_then(Value::as_array) else {
         return Ok(Vec::new());
     };
-    let Some(to_entries) = object.spec.get("to").and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
 
-    let mut permissions = Vec::new();
+    // Validate every present from[] entry before consulting `to`, matching the
+    // pre-shared-parser collect loop: a malformed from must fail closed even
+    // when `to` is absent or non-array.
+    let mut validated_from = Vec::with_capacity(from_entries.len());
     for from in from_entries {
         let from_namespace = reference_grant_required_string(
             from,
@@ -259,6 +262,15 @@ pub(crate) fn parse_reference_grant_permissions<'a>(
             "kind",
             "ReferenceGrant spec.from[].kind is required",
         )?;
+        validated_from.push((from_namespace, from_group, from_kind));
+    }
+
+    let Some(to_entries) = object.spec.get("to").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    let mut permissions = Vec::new();
+    for (from_namespace, from_group, from_kind) in validated_from {
         for to in to_entries {
             let to_kind = reference_grant_required_string(
                 to,

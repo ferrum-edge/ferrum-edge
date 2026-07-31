@@ -888,12 +888,16 @@ async fn patch_gateway_api_statuses(
         translation_reuse,
         StatusPlanBudget::new(GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP, cursor),
     );
-    metrics.gateway_api_status_plan_cursor.store(
-        outcome.next_cursor as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
     let updates = outcome.updates;
+    // Advance the cursor when planning succeeds with an empty write set (fairness
+    // must progress) or after a successful patch batch. Patch errors and batch
+    // timeouts leave the prior cursor so the same bounded window retries on the
+    // next serialized reconcile (#2397).
     if updates.is_empty() {
+        metrics.gateway_api_status_plan_cursor.store(
+            outcome.next_cursor as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         return;
     }
     if outcome.eligible_candidates > GATEWAY_API_STATUS_UPDATES_PER_RECONCILE_CAP {
@@ -910,19 +914,26 @@ async fn patch_gateway_api_statuses(
     let updates_len = updates.len();
     match await_status_patch_batch(writer.patch_updates(updates), STATUS_PATCH_BATCH_TIMEOUT).await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            metrics.gateway_api_status_plan_cursor.store(
+                outcome.next_cursor as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         Ok(Err(error)) => {
             warn!(
                 error = %error,
                 updates = updates_len,
-                "Failed to patch Gateway API status"
+                cursor,
+                "Failed to patch Gateway API status; leaving status-plan cursor unchanged to retry this window"
             );
         }
         Err(_) => {
             warn!(
                 updates = updates_len,
                 timeout_secs = STATUS_PATCH_BATCH_TIMEOUT.as_secs(),
-                "Gateway API status patch batch timed out; unfinished updates will retry on a later reconcile"
+                cursor,
+                "Gateway API status patch batch timed out; leaving status-plan cursor unchanged so this window retries on a later reconcile"
             );
         }
     }

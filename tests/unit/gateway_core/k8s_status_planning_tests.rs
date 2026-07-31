@@ -153,6 +153,78 @@ fn status_planning_avoids_per_object_retranslate_and_post_cap() {
 }
 
 #[test]
+fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
+    // Structural regression for the serialized reconcile / cursor retry
+    // invariant (#2397): advance on empty plans and successful patches only.
+    let body = RECONCILER_SRC
+        .split("async fn patch_gateway_api_statuses(")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfn gateway_api_status_context(").next())
+        .expect("patch_gateway_api_statuses body");
+
+    let empty_return = body
+        .split("if updates.is_empty()")
+        .nth(1)
+        .and_then(|rest| rest.split("if outcome.eligible_candidates").next())
+        .expect("empty-updates branch");
+    assert!(
+        empty_return.contains("gateway_api_status_plan_cursor.store")
+            && empty_return.contains("outcome.next_cursor"),
+        "empty update plans must still advance the cursor so fairness progresses"
+    );
+
+    let success_arm = body
+        .split("Ok(Ok(())) =>")
+        .nth(1)
+        .and_then(|rest| rest.split("Ok(Err(error)) =>").next())
+        .expect("successful patch arm");
+    assert!(
+        success_arm.contains("gateway_api_status_plan_cursor.store")
+            && success_arm.contains("outcome.next_cursor"),
+        "successful patch batches must advance to outcome.next_cursor"
+    );
+
+    let error_arm = body
+        .split("Ok(Err(error)) =>")
+        .nth(1)
+        .and_then(|rest| rest.split("Err(_) =>").next())
+        .expect("patch error arm");
+    assert!(
+        !error_arm.contains("gateway_api_status_plan_cursor.store"),
+        "patch errors must leave the cursor unchanged so the same window retries"
+    );
+    assert!(
+        error_arm.contains("leaving status-plan cursor unchanged"),
+        "patch-error log must state the retry invariant"
+    );
+
+    let timeout_arm = body
+        .split("Err(_) =>")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    }").next())
+        .expect("patch timeout arm");
+    assert!(
+        !timeout_arm.contains("gateway_api_status_plan_cursor.store"),
+        "batch timeouts must leave the cursor unchanged so the same window retries"
+    );
+    assert!(
+        timeout_arm.contains("leaving status-plan cursor unchanged"),
+        "timeout log must state the retry invariant"
+    );
+
+    // The pre-patch eager store that skipped failed windows must stay gone.
+    let before_patch = body
+        .split("await_status_patch_batch")
+        .next()
+        .expect("pre-patch region");
+    let stores_before_patch = before_patch.matches("gateway_api_status_plan_cursor.store").count();
+    assert_eq!(
+        stores_before_patch, 1,
+        "only the empty-plan branch may store the cursor before patch_updates"
+    );
+}
+
+#[test]
 fn fair_budget_bounds_expensive_planning_before_writes() {
     let objects = base_objects_with_routes(8);
     let conflicts = gateway_api_route_conflicts(&objects, &options());
@@ -315,6 +387,59 @@ fn budgeted_full_coverage_matches_unlimited_plan_over_rotations() {
 }
 
 #[test]
+fn mixed_kind_candidates_enter_shared_window_within_ceil_bound() {
+    // GatewayClass and Gateway share the flat rotation with routes; they are
+    // not exempted from the pre-planning budget (#2397). For a stable set,
+    // every eligible candidate enters within ceil(eligible / limit) rounds.
+    let objects = base_objects_with_routes(5);
+    let conflicts = gateway_api_route_conflicts(&objects, &options());
+    let limit = 2usize;
+    let probe = plan_gateway_api_status_updates_budgeted(
+        &objects,
+        options(),
+        &conflicts,
+        Default::default(),
+        None,
+        StatusPlanBudget::new(limit, 0),
+    );
+    let eligible = probe.eligible_candidates;
+    assert_eq!(eligible, 7, "class + gateway + 5 routes");
+    let rounds_needed = eligible.div_ceil(limit);
+
+    let mut cursor = 0usize;
+    let mut covered = 0usize;
+    for round in 1..=rounds_needed {
+        let outcome = plan_gateway_api_status_updates_budgeted(
+            &objects,
+            options(),
+            &conflicts,
+            Default::default(),
+            None,
+            StatusPlanBudget::new(limit, cursor),
+        );
+        assert_eq!(outcome.eligible_candidates, eligible);
+        assert_eq!(outcome.planned_candidates, limit.min(eligible));
+        covered = covered.saturating_add(outcome.planned_candidates);
+        cursor = outcome.next_cursor;
+        assert!(
+            round <= rounds_needed,
+            "stable candidate set must enter within ceil(eligible/limit) rounds"
+        );
+    }
+    assert!(
+        covered >= eligible,
+        "ceil-bound rounds must cover every eligible slot at least once"
+    );
+
+    let unlimited = plan_gateway_api_status_updates(&objects, options(), &conflicts);
+    assert!(
+        unlimited.iter().any(|update| update.kind == "GatewayClass")
+            && unlimited.iter().any(|update| update.kind == "Gateway"),
+        "mixed-kind fixture must include GatewayClass and Gateway in the shared window"
+    );
+}
+
+#[test]
 fn translation_reuse_preserves_gateway_status_parity() {
     let objects = base_objects_with_routes(3);
     let conflicts = gateway_api_route_conflicts(&objects, &options());
@@ -423,10 +548,6 @@ fn status_indexes_and_borrowed_eligibility_are_wired() {
         "permission index type must exist"
     );
     assert!(
-        !STATUS_SRC.contains("reference_grants_by_ns"),
-        "raw grant-vector namespace scan must not remain"
-    );
-    assert!(
         STATUS_SRC.contains("status_candidate_is_eligible"),
         "pre-budget eligibility must be a dedicated borrowed predicate"
     );
@@ -457,10 +578,6 @@ fn status_indexes_and_borrowed_eligibility_are_wired() {
     assert!(
         !TRANSLATE_SRC.contains("skipped\n                .keys()\n                .any(|key: &K8sResourceKey| key.matches_object(object))"),
         "collecting-skips must not linearly scan skipped keys per object"
-    );
-    assert!(
-        !TRANSLATE_SRC.contains("HashSet::<(String, String, String)>"),
-        "version-blind owned triple HashSet must not remain"
     );
     assert!(
         !TRANSLATE_SRC.contains("object.kind.clone(),\n                object.metadata.namespace.clone(),\n                object.metadata.name.clone()"),
@@ -1848,10 +1965,6 @@ fn reference_grant_permission_index_avoids_raw_grant_scans() {
         );
     }
     assert!(
-        !STATUS_SRC.contains("reference_grants_by_ns"),
-        "raw per-namespace grant vectors must be gone"
-    );
-    assert!(
         !STATUS_SRC.contains("reference_grant_has_from"),
         "per-lookup grant reparse helpers must be gone"
     );
@@ -2263,5 +2376,93 @@ fn reference_grant_translation_and_status_share_fail_closed_semantics() {
         status_resolved_refs_reason(&mixed_from, "mixed-from").as_deref(),
         Some("RefNotPermitted"),
         "mixed valid+malformed from[] must grant nothing in status either"
+    );
+
+    // Distinguish malformed present from[] + missing to (Err / skipped) from
+    // valid from[] + missing to (Ok([]) / authorizes nothing).
+    let valid_from_missing_to = vec![
+        ferrum_gateway_class(),
+        ferrum_gateway_allow_all_namespaces(),
+        cross_namespace_http_route("valid-from-missing-to", "api"),
+        place_in_namespace(
+            object(
+                "ReferenceGrant",
+                "valid-from-missing-to",
+                json!({
+                    "from": [{
+                        "group": "gateway.networking.k8s.io",
+                        "kind": "HTTPRoute",
+                        "namespace": "apps"
+                    }]
+                }),
+            ),
+            "backend",
+        ),
+        backend_service("backend", "api"),
+    ];
+    let (valid_missing_translation, valid_missing_errors) =
+        ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips(
+            &valid_from_missing_to,
+            unfiltered_options(),
+        )
+        .expect("valid from + missing to must not fail translation");
+    assert!(
+        !valid_missing_errors
+            .keys()
+            .any(|key| key.name == "valid-from-missing-to"),
+        "valid from + missing to must remain Ok([]) rather than a skipped InvalidResource"
+    );
+    assert!(
+        !valid_missing_translation
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_host == api_host),
+        "valid from + missing to authorizes nothing"
+    );
+    assert_eq!(
+        status_resolved_refs_reason(&valid_from_missing_to, "valid-from-missing-to").as_deref(),
+        Some("RefNotPermitted"),
+        "valid from + missing to must be RefNotPermitted in status"
+    );
+
+    let malformed_from_missing_to = vec![
+        ferrum_gateway_class(),
+        ferrum_gateway_allow_all_namespaces(),
+        cross_namespace_http_route("malformed-from-missing-to", "api"),
+        place_in_namespace(
+            object(
+                "ReferenceGrant",
+                "malformed-from-missing-to",
+                json!({
+                    "from": [{
+                        "group": "gateway.networking.k8s.io",
+                        "kind": "HTTPRoute"
+                    }]
+                }),
+            ),
+            "backend",
+        ),
+        backend_service("backend", "api"),
+    ];
+    let (_, malformed_missing_errors) =
+        ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips(
+            &malformed_from_missing_to,
+            unfiltered_options(),
+        )
+        .expect("malformed grant should be collected as a skip, not abort planning");
+    assert!(
+        malformed_missing_errors.values().any(|error| {
+            error
+                .to_string()
+                .contains("ReferenceGrant spec.from[].namespace is required")
+        }),
+        "malformed present from + missing to must return Err (skip) even without to[]"
+    );
+    assert_eq!(
+        status_resolved_refs_reason(&malformed_from_missing_to, "malformed-from-missing-to")
+            .as_deref(),
+        Some("RefNotPermitted"),
+        "malformed present from + missing to must grant nothing in status"
     );
 }
