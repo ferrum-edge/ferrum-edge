@@ -22307,10 +22307,20 @@ components:
             InvokeModelWithResponseStream / ConverseStream) are both decoded in
             flight. The AWS framing's prelude and whole-message CRC-32
             checksums and its bounded header block are validated before any
-            payload is trusted, and only `:event-type: chunk` /
-            `:event-type: metadata` event frames may mint usage. Provider token
-            sums use checked arithmetic: an overflowing or malformed usage
-            record yields no total and the response is settled as unmetered by
+            payload is trusted. A frame declaring none of `:message-type`,
+            `:event-type`, and `:exception-type` keeps the bare-JSON
+            compatibility path; once any of them is present, usage is
+            authoritative only when `:message-type` is exactly `event`,
+            `:event-type` is exactly `chunk` or `metadata`, and no
+            `:exception-type` is set. A reserved header encoded with a
+            non-STRING value type, or declared twice, is ambiguous framing and
+            fails closed rather than being ignored as absent. Damage detection
+            is ordering-sensitive in both formats: an undecodable candidate
+            record after the last authoritative cumulative usage record
+            invalidates that older snapshot for settlement until a later valid
+            authoritative record recovers it. Provider token sums use checked
+            arithmetic: an overflowing or malformed usage record yields no
+            total and the response is settled as unmetered by
             `on_unmetered_response`, never as a saturated count.
         on_unmetered_response:
           type: string

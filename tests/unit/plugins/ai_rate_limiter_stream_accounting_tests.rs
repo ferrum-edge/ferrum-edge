@@ -865,6 +865,402 @@ fn truncated_event_stream_is_malformed_not_usage_free() {
     assert!(scanner.authoritative_usage().is_none());
 }
 
+/// Encode one AWS event-stream header with an explicit value type.
+///
+/// `value` is the raw on-wire value encoding: nothing for the boolean types,
+/// the fixed-width bytes for the numeric/timestamp/UUID types, and a
+/// [`length_prefixed_value`] blob for `BYTE_ARRAY` (6) and `STRING` (7).
+fn typed_header(name: &str, value_type: u8, value: &[u8]) -> Vec<u8> {
+    let mut header = Vec::new();
+    header.push(u8::try_from(name.len()).unwrap());
+    header.extend_from_slice(name.as_bytes());
+    header.push(value_type);
+    header.extend_from_slice(value);
+    header
+}
+
+/// The 16-bit big-endian length prefix and bytes of a `BYTE_ARRAY`/`STRING`
+/// header value.
+fn length_prefixed_value(bytes: &[u8]) -> Vec<u8> {
+    let mut value = u16::try_from(bytes.len()).unwrap().to_be_bytes().to_vec();
+    value.extend_from_slice(bytes);
+    value
+}
+
+/// A canonical `ConverseStream` `metadata` frame reporting one usage record.
+fn bedrock_metadata_usage_frame(input: u64, output: u64) -> Vec<u8> {
+    let total = input + output;
+    let payload = serde_json::to_vec(&json!({
+        "usage": {"inputTokens": input, "outputTokens": output, "totalTokens": total}
+    }))
+    .unwrap();
+    let headers = bedrock_event_headers("metadata");
+    event_stream_frame(&headers, &payload)
+}
+
+/// A canonical `InvokeModelWithResponseStream` `chunk` frame wrapping `inner`
+/// as the documented base64 `bytes` envelope.
+fn bedrock_chunk_frame(inner: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(inner);
+    let envelope = serde_json::to_vec(&json!({ "bytes": encoded })).unwrap();
+    let headers = bedrock_event_headers("chunk");
+    event_stream_frame(&headers, &envelope)
+}
+
+/// Once a frame declares ANY reserved header it is speaking the Bedrock
+/// vocabulary, so a *partial* declaration is ambiguous rather than permissive.
+/// Usage is authoritative only for the fully specified documented shape:
+/// `:message-type` exactly `event`, `:event-type` exactly `chunk`/`metadata`,
+/// and no `:exception-type`. Everything short of that must stay unmetered —
+/// while remaining well-framed, so it is not damage either.
+#[test]
+fn partial_reserved_event_stream_headers_never_mint_usage() {
+    let usage_shaped = serde_json::to_vec(&json!({
+        "usage": {"inputTokens": 999, "outputTokens": 999, "totalTokens": 1998}
+    }))
+    .unwrap();
+
+    // `:event-type` with no `:message-type`: nothing asserts this frame is an
+    // `event` rather than an exception or an error frame.
+    let metadata_only = string_header(":event-type", "metadata");
+    let chunk_only = string_header(":event-type", "chunk");
+
+    // `:message-type: event` with no `:event-type`: nothing names a
+    // usage-bearing kind.
+    let event_only = string_header(":message-type", "event");
+
+    // An `:exception-type` disqualifies the frame however it is framed.
+    let exception_only = string_header(":exception-type", "throttling");
+    let mut event_and_exception = string_header(":message-type", "event");
+    event_and_exception.extend_from_slice(&string_header(":exception-type", "t"));
+    let mut full_and_exception = string_header(":message-type", "event");
+    full_and_exception.extend_from_slice(&string_header(":event-type", "metadata"));
+    full_and_exception.extend_from_slice(&string_header(":exception-type", "t"));
+
+    // A non-`event` message type is never a usage authority, whatever the
+    // event type claims.
+    let mut exception_kind = string_header(":message-type", "exception");
+    exception_kind.extend_from_slice(&string_header(":event-type", "metadata"));
+    let mut error_kind = string_header(":message-type", "error");
+    error_kind.extend_from_slice(&string_header(":event-type", "chunk"));
+
+    // The comparisons are exact: no case folding, no empty-value fallback, and
+    // no unknown-kind fallback.
+    let mut folded_message = string_header(":message-type", "Event");
+    folded_message.extend_from_slice(&string_header(":event-type", "metadata"));
+    let mut folded_event = string_header(":message-type", "event");
+    folded_event.extend_from_slice(&string_header(":event-type", "Metadata"));
+    let mut empty_message = string_header(":message-type", "");
+    empty_message.extend_from_slice(&string_header(":event-type", "metadata"));
+    let mut empty_event = string_header(":message-type", "event");
+    empty_event.extend_from_slice(&string_header(":event-type", ""));
+    let mut unknown_event = string_header(":message-type", "event");
+    unknown_event.extend_from_slice(&string_header(":event-type", "usage"));
+
+    for (label, headers) in [
+        (":event-type metadata alone", metadata_only),
+        (":event-type chunk alone", chunk_only),
+        (":message-type event alone", event_only),
+        (":exception-type alone", exception_only),
+        ("event + exception-type", event_and_exception),
+        ("event + metadata + exception", full_and_exception),
+        ("exception message-type", exception_kind),
+        ("error message-type", error_kind),
+        ("case-mismatched message-type", folded_message),
+        ("case-mismatched event-type", folded_event),
+        ("empty message-type", empty_message),
+        ("empty event-type", empty_event),
+        ("unknown event-type", unknown_event),
+    ] {
+        let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+        scanner.observe(&event_stream_frame(&headers, &usage_shaped));
+        scanner.finish();
+        assert!(
+            scanner.authoritative_usage().is_none(),
+            "{label}: a partial reserved-header declaration must never mint usage"
+        );
+        assert!(
+            !scanner.malformed(),
+            "{label}: the framing itself is intact, so the frame is not a damaged candidate"
+        );
+    }
+}
+
+/// A reserved header is documented as a `STRING`. Encoded with any other AWS
+/// header value type its meaning is ambiguous, so it must fail the scan closed
+/// rather than being walked past as if the header were absent — otherwise a
+/// wrong-typed `:message-type`/`:event-type` would fall through to the
+/// headerless compatibility path and mint usage.
+#[test]
+fn wrong_typed_reserved_event_stream_headers_fail_closed() {
+    let usage_shaped = serde_json::to_vec(&json!({
+        "usage": {"inputTokens": 999, "outputTokens": 999, "totalTokens": 1998}
+    }))
+    .unwrap();
+
+    let bool_message = typed_header(":message-type", 0, &[]);
+    let bool_event = typed_header(":event-type", 1, &[]);
+    let byte_event = typed_header(":event-type", 2, &[7]);
+    let short_message = typed_header(":message-type", 3, &[0, 1]);
+    let int_event = typed_header(":event-type", 4, &[0, 0, 0, 1]);
+    let long_event = typed_header(":event-type", 5, &[0; 8]);
+    let exception_value = length_prefixed_value(b"throttlingException");
+    let bytes_exception = typed_header(":exception-type", 6, &exception_value);
+    let timestamp_event = typed_header(":event-type", 8, &[0; 8]);
+    let uuid_event = typed_header(":event-type", 9, &[0; 16]);
+
+    // A wrong-typed occurrence followed by a valid duplicate: the ambiguous
+    // header is refused before the later well-formed one can be read, so
+    // ordering cannot be used to smuggle a usable declaration past it.
+    let mut wrong_then_valid = typed_header(":event-type", 4, &[0, 0, 0, 1]);
+    wrong_then_valid.extend_from_slice(&string_header(":event-type", "metadata"));
+    wrong_then_valid.extend_from_slice(&string_header(":message-type", "event"));
+
+    // And the mirror image: a valid declaration followed by a wrong-typed
+    // duplicate is equally ambiguous.
+    let mut valid_then_wrong = string_header(":event-type", "metadata");
+    let wrong_typed_event = typed_header(":event-type", 4, &[0, 0, 0, 1]);
+    valid_then_wrong.extend_from_slice(&wrong_typed_event);
+    valid_then_wrong.extend_from_slice(&string_header(":message-type", "event"));
+
+    // A duplicate STRING declaration stays fail-closed as before.
+    let mut duplicate_message = string_header(":message-type", "event");
+    duplicate_message.extend_from_slice(&string_header(":message-type", "event"));
+    duplicate_message.extend_from_slice(&string_header(":event-type", "metadata"));
+
+    for (label, headers) in [
+        (":message-type as BOOL_TRUE", bool_message),
+        (":event-type as BOOL_FALSE", bool_event),
+        (":event-type as BYTE", byte_event),
+        (":message-type as SHORT", short_message),
+        (":event-type as INTEGER", int_event),
+        (":event-type as LONG", long_event),
+        (":exception-type as BYTE_ARRAY", bytes_exception),
+        (":event-type as TIMESTAMP", timestamp_event),
+        (":event-type as UUID", uuid_event),
+        ("wrong-typed then valid duplicate", wrong_then_valid),
+        ("valid then wrong-typed duplicate", valid_then_wrong),
+        ("duplicate STRING :message-type", duplicate_message),
+    ] {
+        let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+        scanner.observe(&event_stream_frame(&headers, &usage_shaped));
+        scanner.finish();
+        assert!(
+            scanner.malformed(),
+            "{label}: an ambiguous reserved header must fail the scan closed"
+        );
+        assert!(
+            scanner.authoritative_usage().is_none(),
+            "{label}: no usage may be minted from an ambiguous reserved header"
+        );
+    }
+}
+
+/// All nine documented AWS header value types are still walked in full for
+/// NON-reserved headers, so a frame carrying operator/service metadata beside
+/// its reserved headers is metered normally — and an undefined value type on a
+/// non-reserved header still fails closed, because its width is unknown.
+#[test]
+fn every_defined_header_value_type_is_walked_for_non_reserved_headers() {
+    let payload = serde_json::to_vec(&json!({
+        "usage": {"inputTokens": 12, "outputTokens": 34, "totalTokens": 46}
+    }))
+    .unwrap();
+
+    let mut headers = Vec::new();
+    headers.extend(typed_header("x-bool-true", 0, &[]));
+    headers.extend(typed_header("x-bool-false", 1, &[]));
+    headers.extend(typed_header("x-byte", 2, &[7]));
+    headers.extend(typed_header("x-short", 3, &[0, 9]));
+    headers.extend(typed_header("x-int", 4, &[0, 0, 0, 9]));
+    headers.extend(typed_header("x-long", 5, &[0; 8]));
+    let opaque = length_prefixed_value(b"opaque\x00\xff");
+    headers.extend(typed_header("x-bytes", 6, &opaque));
+    let text = length_prefixed_value(b"text");
+    headers.extend(typed_header("x-string", 7, &text));
+    headers.extend(typed_header("x-timestamp", 8, &[0; 8]));
+    headers.extend(typed_header("x-uuid", 9, &[0; 16]));
+    headers.extend(bedrock_event_headers("metadata"));
+
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&event_stream_frame(&headers, &payload));
+    scanner.finish();
+    assert_eq!(
+        scanner
+            .authoritative_usage()
+            .and_then(|usage| usage.total_for_mode("total_tokens")),
+        Some(46),
+        "every defined value type must be walkable without losing the frame"
+    );
+    assert!(!scanner.malformed());
+
+    // An undefined value type on a non-reserved header has an unknown width, so
+    // nothing after it can be located.
+    let mut unknown = typed_header("x-mystery", 0x5a, &[]);
+    unknown.extend(bedrock_event_headers("metadata"));
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&event_stream_frame(&unknown, &payload));
+    scanner.finish();
+    assert!(scanner.malformed());
+    assert!(scanner.authoritative_usage().is_none());
+}
+
+/// A frame that declares NONE of the reserved headers keeps the documented
+/// compatibility path, including one that carries only non-reserved headers.
+#[test]
+fn headerless_event_stream_frames_keep_the_compatibility_path() {
+    let payload = serde_json::to_vec(&json!({
+        "usage": {"inputTokens": 12, "outputTokens": 34, "totalTokens": 46}
+    }))
+    .unwrap();
+
+    let mut non_reserved = string_header(":content-type", "application/json");
+    non_reserved.extend_from_slice(&string_header("x-amzn-requestid", "abc"));
+
+    for (label, headers) in [
+        ("no header block at all", Vec::new()),
+        ("only non-reserved headers", non_reserved),
+    ] {
+        let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+        scanner.observe(&event_stream_frame(&headers, &payload));
+        scanner.finish();
+        assert_eq!(
+            scanner
+                .authoritative_usage()
+                .and_then(|usage| usage.total_for_mode("total_tokens")),
+            Some(46),
+            "{label}: a frame with no reserved headers stays meterable"
+        );
+        assert!(!scanner.malformed(), "{label}");
+    }
+}
+
+/// The AWS path applies the same ordering-safe invariant as SSE: an undecodable
+/// candidate AFTER the last authoritative usage record invalidates that older
+/// snapshot for settlement, so a Bedrock stream whose tail was corrupted can no
+/// longer be charged against the counts it reported earlier.
+#[test]
+fn event_stream_damage_after_usage_fails_closed() {
+    const UNREADABLE_USAGE: &[u8] = br#"{"usage":{"inputTokens":"lots"}}"#;
+    const NO_USAGE: &[u8] = br#"{"metrics":{"latencyMs":12}}"#;
+    const BAD_METRICS: &str = r#"{"amazon-bedrock-invocationMetrics":{"in":"17"}}"#;
+
+    let chunk_headers = bedrock_event_headers("chunk");
+    let metadata_headers = bedrock_event_headers("metadata");
+
+    let non_json = event_stream_frame(&chunk_headers, b"not json at all");
+    let non_object = event_stream_frame(&chunk_headers, b"[1,2,3]");
+    let empty = event_stream_frame(&chunk_headers, b"");
+    let truncated_inner = bedrock_chunk_frame(r#"{"type":"content_block_"#);
+    let scalar_inner = bedrock_chunk_frame("42");
+    let unreadable_usage = event_stream_frame(&metadata_headers, UNREADABLE_USAGE);
+    let no_usage = event_stream_frame(&metadata_headers, NO_USAGE);
+    let unreadable_metrics = bedrock_chunk_frame(BAD_METRICS);
+
+    for (label, damaging) in [
+        ("non-JSON chunk payload", non_json),
+        ("non-object chunk payload", non_object),
+        ("empty chunk payload", empty),
+        ("truncated inner document", truncated_inner),
+        ("non-object inner document", scalar_inner),
+        ("metadata with unreadable usage", unreadable_usage),
+        ("metadata with no usage at all", no_usage),
+        ("unreadable invocation metrics", unreadable_metrics),
+    ] {
+        let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+        scanner.observe(&bedrock_metadata_usage_frame(12, 34));
+        assert!(!scanner.malformed(), "{label}: the stream is clean so far");
+        assert_eq!(
+            scanner
+                .authoritative_usage()
+                .and_then(|usage| usage.total_for_mode("total_tokens")),
+            Some(46),
+            "{label}: the earlier snapshot was recorded"
+        );
+
+        scanner.observe(&damaging);
+        scanner.finish();
+        assert!(
+            scanner.malformed(),
+            "{label}: a damaged candidate after the last usage record must fail closed"
+        );
+    }
+}
+
+/// The mirror-image ordering DOES recover while the framing itself stayed
+/// intact: a later valid authoritative cumulative usage record restates the
+/// provider's complete counts, so the earlier undecodable candidate no longer
+/// hides anything.
+#[test]
+fn event_stream_damage_before_usage_recovers() {
+    let chunk_headers = bedrock_event_headers("chunk");
+    let non_json = event_stream_frame(&chunk_headers, b"not json at all");
+    let truncated_inner = bedrock_chunk_frame(r#"{"type":"content_block_"#);
+
+    for (label, damaging) in [
+        ("non-JSON chunk payload", non_json),
+        ("truncated inner document", truncated_inner),
+    ] {
+        let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+        scanner.observe(&damaging);
+        assert!(
+            scanner.malformed(),
+            "{label}: the undecodable candidate damages the scan immediately"
+        );
+
+        scanner.observe(&bedrock_metadata_usage_frame(12, 34));
+        scanner.finish();
+        assert!(
+            !scanner.malformed(),
+            "{label}: a later authoritative cumulative record recovers the scan"
+        );
+        assert_eq!(
+            scanner
+                .authoritative_usage()
+                .and_then(|usage| usage.total_for_mode("total_tokens")),
+            Some(46)
+        );
+    }
+}
+
+/// Ordinary provider content must be told apart from a malformed candidate. A
+/// well-framed non-usage event and a `chunk` that simply carries model text —
+/// before AND after the usage record — are the normal Bedrock stream shape and
+/// must never damage the scan.
+#[test]
+fn well_framed_non_usage_event_stream_content_is_not_damaging() {
+    let start = bedrock_chunk_frame(r#"{"type":"message_start"}"#);
+    let delta = bedrock_chunk_frame(r#"{"type":"content_block_delta"}"#);
+    let stop = bedrock_chunk_frame(r#"{"type":"content_block_stop"}"#);
+    let delta_headers = bedrock_event_headers("contentBlockDelta");
+    let content = event_stream_frame(&delta_headers, br#"{"delta":{"t":"Hi"}}"#);
+    let stop_headers = bedrock_event_headers("messageStop");
+    let message_stop = event_stream_frame(&stop_headers, br#"{"stopReason":"end"}"#);
+    let usage = bedrock_metadata_usage_frame(12, 34);
+
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&start);
+    scanner.observe(&delta);
+    scanner.observe(&content);
+    scanner.observe(&usage);
+    // Content after the usage record is still content, not tail damage.
+    scanner.observe(&stop);
+    scanner.observe(&message_stop);
+    scanner.finish();
+
+    assert!(
+        !scanner.malformed(),
+        "ordinary content events are not damaged candidates"
+    );
+    assert_eq!(
+        scanner
+            .authoritative_usage()
+            .and_then(|usage| usage.total_for_mode("total_tokens")),
+        Some(46)
+    );
+}
+
 /// Malformed JSON inside otherwise well-formed SSE lines is skipped without
 /// poisoning the scan: a later valid usage event is still extracted.
 #[test]
@@ -1031,6 +1427,86 @@ async fn stream_damaged_after_usage_takes_the_unmetered_posture() {
         observed_usage_of(&plugin).await,
         reserved,
         "the earlier snapshot must not be charged for a stream damaged after it"
+    );
+}
+
+/// End to end for the AWS framing: a Bedrock stream is charged against the
+/// window through the full plugin lifecycle, and every framing byte reaches the
+/// client unchanged.
+#[tokio::test]
+async fn bedrock_stream_charges_actual_usage_end_to_end() {
+    let plugin: Arc<dyn Plugin> = Arc::new(ip_limiter(10_000));
+    let mut ctx = ai_request_ctx(200, "bedrock please");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let frame = bedrock_metadata_usage_frame(12, 34);
+    let chunks: [&[u8]; 1] = [&frame];
+    let forwarded = stream_response(
+        &plugin,
+        &mut ctx,
+        "application/vnd.amazon.eventstream",
+        &chunks,
+        BodyOutcome::success(frame.len() as u64),
+    )
+    .await;
+
+    assert_eq!(
+        forwarded, frame,
+        "the AWS event-stream framing is forwarded byte for byte"
+    );
+    assert_eq!(
+        observed_usage_of(&plugin).await,
+        46,
+        "the provider's authoritative ConverseStream usage must replace the estimate"
+    );
+}
+
+/// End to end for the AWS ordering invariant: a Bedrock stream whose tail is a
+/// recognized usage-bearing frame the scanner could not decode must take the
+/// unmetered posture rather than charging the snapshot the earlier frame
+/// reported — and the damaged bytes still reach the client untouched.
+#[tokio::test]
+async fn bedrock_stream_damaged_after_usage_takes_the_unmetered_posture() {
+    let plugin: Arc<dyn Plugin> = Arc::new(limiter(json!({
+        "token_limit": 10_000,
+        "window_seconds": 60,
+        "limit_by": "ip",
+        "expose_headers": true,
+        "on_unmetered_response": "charge_estimate"
+    })));
+    let mut ctx = ai_request_ctx(200, "damage my bedrock tail");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = observed_usage_of(&plugin).await;
+    assert!(reserved > 0);
+    assert_ne!(
+        reserved, 46,
+        "the estimate must differ from the snapshot the damaged stream carries"
+    );
+
+    let usage_frame = bedrock_metadata_usage_frame(12, 34);
+    let chunk_headers = bedrock_event_headers("chunk");
+    let damaged_frame = event_stream_frame(&chunk_headers, b"not a json document");
+    let chunks: [&[u8]; 2] = [&usage_frame, &damaged_frame];
+    let expected: Vec<u8> = chunks.concat();
+    let forwarded = stream_response(
+        &plugin,
+        &mut ctx,
+        "application/vnd.amazon.eventstream",
+        &chunks,
+        BodyOutcome::success(expected.len() as u64),
+    )
+    .await;
+
+    assert_eq!(
+        forwarded, expected,
+        "damage changes accounting, never the bytes the client receives"
+    );
+    assert_eq!(
+        observed_usage_of(&plugin).await,
+        reserved,
+        "the earlier Bedrock snapshot must not be charged for a stream damaged after it"
     );
 }
 

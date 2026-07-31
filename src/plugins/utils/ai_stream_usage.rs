@@ -38,13 +38,13 @@
 //! saturated one.
 //!
 //! Damage is reported separately by [`StreamUsageScanner::malformed`], and it is
-//! deliberately ordering-sensitive. A candidate record the scanner could not
-//! decode marks the stream damaged; only a later explicit authoritative usage
-//! record clears that mark, because such a record restates the provider's
-//! complete cumulative counts and therefore proves nothing the damage hid is
-//! still missing. Damage *after* the last authoritative usage record is never
-//! cleared, so a stream whose tail was corrupted or truncated can never present
-//! as a clean terminal stream and charge the older snapshot.
+//! deliberately ordering-sensitive in *both* formats. A candidate record the
+//! scanner could not decode marks the stream damaged; only a later explicit
+//! authoritative usage record clears that mark, because such a record restates
+//! the provider's complete cumulative counts and therefore proves nothing the
+//! damage hid is still missing. Damage *after* the last authoritative usage
+//! record is never cleared, so a stream whose tail was corrupted or truncated
+//! can never present as a clean terminal stream and charge the older snapshot.
 //!
 //! ## Integrity of the AWS framing
 //!
@@ -53,6 +53,26 @@
 //! prelude bytes and one over the complete message except its own trailing
 //! checksum — are therefore verified here before any declared length is honored
 //! or any payload is trusted, and a mismatch fails the scan closed.
+//!
+//! The bounded header block is then walked in full. A frame that declares *none*
+//! of the reserved headers keeps the documented compatibility path for provider
+//! variants that frame a bare JSON payload. Once any of `:message-type`,
+//! `:event-type`, or `:exception-type` is present the frame speaks that
+//! vocabulary, and usage is authoritative only for the fully specified shape:
+//! `:message-type` exactly `event`, `:event-type` exactly `chunk` or `metadata`,
+//! and no `:exception-type`. A reserved header encoded with a non-`STRING` value
+//! type, or declared twice, is ambiguous framing and fails closed rather than
+//! being ignored as absent.
+//!
+//! Within a frame that *is* allowed to carry usage, the payload is a usage
+//! candidate, so the same ordering-safe invariant applies: a payload (or an
+//! explicit base64 `bytes` envelope's inner document) that is not a decodable
+//! JSON object, and a usage container whose fields cannot be read as counts,
+//! invalidate any older snapshot for settlement until a later valid
+//! authoritative record recovers it. An ordinary `chunk` carrying model content
+//! and no usage container is *not* damage; a `metadata` event that reported no
+//! usage is, because that event kind exists to report it. CRC, prelude, header,
+//! oversize, and base64 framing failures remain hard malformed/halted instead.
 
 use serde_json::Value;
 
@@ -106,15 +126,33 @@ const EVENT_STREAM_EXCEPTION_TYPE_HEADER: &str = ":exception-type";
 /// and `error` frames are terminal failures, not usage authorities.
 const EVENT_STREAM_EVENT_MESSAGE_TYPE: &str = "event";
 
+/// `InvokeModelWithResponseStream`'s model event, whose terminal frame carries
+/// `amazon-bedrock-invocationMetrics` inside the base64 `bytes` envelope. Every
+/// other frame of that API is an ordinary content chunk.
+const EVENT_STREAM_CHUNK_EVENT_TYPE: &str = "chunk";
+
+/// `ConverseStream`'s terminal accounting event, whose payload carries `usage`.
+/// Unlike `chunk`, a `metadata` event exists to report usage, so one that
+/// reports none is a damaged candidate rather than ordinary content.
+const EVENT_STREAM_METADATA_EVENT_TYPE: &str = "metadata";
+
 /// Bedrock event kinds whose payload documents a usage container.
-///
-/// * `chunk` — `InvokeModelWithResponseStream`, whose terminal chunk carries
-///   `amazon-bedrock-invocationMetrics` inside the base64 `bytes` envelope.
-/// * `metadata` — `ConverseStream`, whose `metadata` event carries `usage`.
 ///
 /// Every other modelled event (`messageStart`, `contentBlockDelta`,
 /// `messageStop`, …) is content framing and must never mint usage.
-const USAGE_BEARING_EVENT_TYPES: [&str; 2] = ["chunk", "metadata"];
+const USAGE_BEARING_EVENT_TYPES: [&str; 2] = [
+    EVENT_STREAM_CHUNK_EVENT_TYPE,
+    EVENT_STREAM_METADATA_EVENT_TYPE,
+];
+
+/// The AWS event-stream header value type for a UTF-8 string (`STRING`). Every
+/// reserved header this scanner reads is documented as a string, so one encoded
+/// with any other type is malformed rather than merely unrecognized.
+const EVENT_STREAM_STRING_VALUE_TYPE: u8 = 7;
+
+/// The AWS event-stream header value type for opaque bytes (`BYTE_ARRAY`). It
+/// shares the string encoding's 16-bit length prefix.
+const EVENT_STREAM_BYTE_ARRAY_VALUE_TYPE: u8 = 6;
 
 /// CRC-32 (IEEE, the algorithm the AWS event-stream framing specifies) of a
 /// byte range, using the hardware-assisted implementation so verification stays
@@ -141,29 +179,54 @@ struct EventStreamHeaders<'a> {
 }
 
 impl EventStreamHeaders<'_> {
+    /// Whether the frame declared any of the reserved headers at all.
+    fn declares_reserved_vocabulary(&self) -> bool {
+        self.message_type.is_some() || self.event_type.is_some() || self.exception_type.is_some()
+    }
+
     /// Whether this frame's kind permits its payload to be read as an
     /// authoritative usage record.
     ///
-    /// Absent reserved headers stay permissive on purpose: several supported
-    /// provider variants frame a bare JSON payload without the Bedrock reserved
-    /// header vocabulary, and refusing those would silently unmeter them. A
-    /// header that *is* present must name a kind this scanner recognizes as
-    /// usage-bearing.
+    /// A frame that declares *none* of the reserved headers keeps the
+    /// documented compatibility path: several supported provider variants frame
+    /// a bare JSON payload without the Bedrock reserved header vocabulary at
+    /// all, and refusing those would silently unmeter them.
+    ///
+    /// Once *any* reserved header is present the frame is speaking that
+    /// vocabulary, and a partial declaration is ambiguous rather than
+    /// permissive. Usage is then authoritative only for the fully specified,
+    /// documented usage-bearing shape: `:message-type` exactly `event`,
+    /// `:event-type` exactly `chunk` or `metadata`, and no `:exception-type`.
+    /// A missing `:message-type` or missing `:event-type` therefore fails
+    /// closed, as do exception, error, content, and unknown event kinds.
     fn may_carry_usage(&self) -> bool {
+        if !self.declares_reserved_vocabulary() {
+            return true;
+        }
         if self.exception_type.is_some() {
             return false;
         }
-        if self
-            .message_type
-            .is_some_and(|kind| kind != EVENT_STREAM_EVENT_MESSAGE_TYPE)
-        {
+        if self.message_type != Some(EVENT_STREAM_EVENT_MESSAGE_TYPE) {
             return false;
         }
-        match self.event_type {
-            Some(kind) => USAGE_BEARING_EVENT_TYPES.contains(&kind),
-            None => true,
-        }
+        matches!(self.event_type, Some(kind) if USAGE_BEARING_EVENT_TYPES.contains(&kind))
     }
+
+    /// Whether this frame is the `ConverseStream` accounting event.
+    fn is_metadata_event(&self) -> bool {
+        self.event_type == Some(EVENT_STREAM_METADATA_EVENT_TYPE)
+    }
+}
+
+/// Whether a header name is one of the reserved headers whose value decides
+/// whether the frame may mint usage.
+fn is_reserved_header_name(name: &str) -> bool {
+    matches!(
+        name,
+        EVENT_STREAM_MESSAGE_TYPE_HEADER
+            | EVENT_STREAM_EVENT_TYPE_HEADER
+            | EVENT_STREAM_EXCEPTION_TYPE_HEADER
+    )
 }
 
 /// Walk one complete AWS event-stream header block, returning the reserved
@@ -172,8 +235,10 @@ impl EventStreamHeaders<'_> {
 /// Returns `None` for any block that cannot be walked exactly to its end: a
 /// zero-length or non-UTF-8 header name, an unknown value type (whose width is
 /// unknown, so nothing after it can be located), a length that runs past the
-/// block, or a repeated reserved header (which would make the frame's kind
-/// ambiguous). Every bound is checked, so a hostile block can only fail closed.
+/// block, a reserved header encoded with a non-`STRING` value type (its meaning
+/// is then ambiguous, and silently ignoring it would let a partial declaration
+/// mint usage), or a repeated reserved header. Every bound is checked, so a
+/// hostile block can only fail closed.
 fn parse_event_stream_headers(bytes: &[u8]) -> Option<EventStreamHeaders<'_>> {
     let mut headers = EventStreamHeaders::default();
     let mut cursor = 0usize;
@@ -190,6 +255,19 @@ fn parse_event_stream_headers(bytes: &[u8]) -> Option<EventStreamHeaders<'_>> {
         let value_type = *bytes.get(cursor)?;
         cursor = cursor.checked_add(1)?;
 
+        // Every reserved header is documented as a `STRING`. Encoded as a bool,
+        // an integer, a byte array, a timestamp, or a UUID its value is not the
+        // kind name this scanner has to compare against, so the frame's kind is
+        // ambiguous. Failing closed here — rather than walking past it as if the
+        // header were absent — is what stops a wrong-typed `:message-type` or
+        // `:event-type` from falling through to the headerless compatibility
+        // path and minting usage. It also settles the duplicate case for every
+        // type and order: the first wrong-typed occurrence already refuses the
+        // block, so a valid duplicate behind it can never be read.
+        if is_reserved_header_name(name) && value_type != EVENT_STREAM_STRING_VALUE_TYPE {
+            return None;
+        }
+
         // Value widths are the documented AWS event-stream header value types:
         // 0/1 BOOL_TRUE/BOOL_FALSE (no bytes), 2 BYTE, 3 SHORT, 4 INTEGER,
         // 5 LONG, 6 BYTE_ARRAY, 7 STRING, 8 TIMESTAMP, 9 UUID.
@@ -201,14 +279,14 @@ fn parse_event_stream_headers(bytes: &[u8]) -> Option<EventStreamHeaders<'_>> {
             5 => 8,
             8 => 8,
             9 => 16,
-            6 | 7 => {
+            EVENT_STREAM_BYTE_ARRAY_VALUE_TYPE | EVENT_STREAM_STRING_VALUE_TYPE => {
                 // Length-prefixed: a 16-bit big-endian length then the bytes.
                 let declared = bytes.get(cursor..cursor.checked_add(2)?)?;
                 let value_length = usize::from(u16::from_be_bytes([declared[0], declared[1]]));
                 cursor = cursor.checked_add(2)?;
                 let value = bytes.get(cursor..cursor.checked_add(value_length)?)?;
                 cursor = cursor.checked_add(value_length)?;
-                if value_type == 7 {
+                if value_type == EVENT_STREAM_STRING_VALUE_TYPE {
                     let slot = match name {
                         EVENT_STREAM_MESSAGE_TYPE_HEADER => Some(&mut headers.message_type),
                         EVENT_STREAM_EVENT_TYPE_HEADER => Some(&mut headers.event_type),
@@ -300,7 +378,10 @@ pub struct StreamUsageScanner {
     /// clean "provider reported nothing". Once set it is never cleared.
     malformed: bool,
     /// Set when a *candidate* record could not be decoded — a non-UTF-8 `data:`
-    /// line, a data record that is not a JSON object, or a truncated tail.
+    /// line, a data record that is not a JSON object, a truncated tail, or a
+    /// usage-bearing AWS event frame whose payload (or `bytes` envelope's inner
+    /// document) is not a decodable JSON object or whose usage container held no
+    /// readable count.
     ///
     /// Unlike [`Self::malformed`] this is cleared by a later explicit
     /// authoritative usage record, because such a record restates the
@@ -511,14 +592,17 @@ impl StreamUsageScanner {
         self.merge(extracted);
     }
 
-    fn merge(&mut self, extracted: AiTokenUsage) {
+    /// Record one extracted usage snapshot, returning whether it was an
+    /// authoritative cumulative usage record (and therefore cleared outstanding
+    /// candidate damage).
+    fn merge(&mut self, extracted: AiTokenUsage) -> bool {
         if extracted.prompt_tokens.is_none()
             && extracted.completion_tokens.is_none()
             && extracted.total_tokens.is_none()
         {
             // Not a usage-bearing event. Never record an authoritative
             // snapshot for it.
-            return;
+            return false;
         }
         match &mut self.usage {
             Some(current) => current.merge_cumulative(extracted),
@@ -529,6 +613,7 @@ impl StreamUsageScanner {
         // restates everything a skipped record could have carried. Damage that
         // arrives *after* this point is never cleared.
         self.damaged_since_usage = false;
+        true
     }
 
     // ---- AWS event stream ----------------------------------------------
@@ -652,21 +737,45 @@ impl StreamUsageScanner {
             return;
         };
         if !headers.may_carry_usage() {
-            // A well-framed exception/error frame or a content event
-            // (`messageStart`, `contentBlockDelta`, …). Framing is intact, so
-            // keep scanning, but nothing here may mint authoritative usage.
+            // A well-framed exception/error frame, a content event
+            // (`messageStart`, `contentBlockDelta`, …), an unknown event kind,
+            // or an incomplete reserved-header declaration. Framing is intact,
+            // so keep scanning, but nothing here may mint authoritative usage
+            // and nothing here is a usage candidate that could have been
+            // damaged.
             return;
         }
 
-        if payload.is_empty() {
-            return;
-        }
-        let Ok(json) = serde_json::from_slice::<Value>(payload) else {
-            // A non-JSON payload (for example a raw content chunk) is simply
-            // not a usage record. Framing is still intact, so keep scanning.
-            return;
+        // This frame's headers say it is one of the two usage-bearing kinds (or
+        // it is the headerless compatibility shape), so its payload IS a usage
+        // candidate. A payload that cannot be decoded is therefore exactly the
+        // ordering-sensitive damage the SSE path already models: it may have
+        // been the provider's terminal restatement, so any older snapshot stops
+        // being settleable until a later valid authoritative record recovers it.
+        let outcome = if payload.is_empty() {
+            EventPayloadOutcome::Damaged
+        } else {
+            match serde_json::from_slice::<Value>(payload) {
+                // Every supported provider event is a JSON object.
+                Ok(json) if json.is_object() => self.consume_bedrock_payload(&json, true),
+                Ok(_) | Err(_) => EventPayloadOutcome::Damaged,
+            }
         };
-        self.consume_bedrock_payload(&json, true);
+
+        match outcome {
+            // `merge` already cleared any outstanding damage.
+            EventPayloadOutcome::Usage => {}
+            // An ordinary `chunk` carrying model content and no usage container
+            // is the normal case for `InvokeModelWithResponseStream` and is not
+            // damage. A `metadata` event exists to report usage, so one that
+            // reported none is a candidate this scanner could not read.
+            EventPayloadOutcome::Content => {
+                if headers.is_metadata_event() {
+                    self.damaged_since_usage = true;
+                }
+            }
+            EventPayloadOutcome::Damaged => self.damaged_since_usage = true,
+        }
     }
 
     /// Extract Bedrock usage from one decoded event payload.
@@ -677,11 +786,26 @@ impl StreamUsageScanner {
     /// instead emits a `metadata` event whose payload carries `usage` directly.
     /// `unwrap_envelope` is false on the recursive call so a hostile payload
     /// cannot drive unbounded nesting.
-    fn consume_bedrock_payload(&mut self, json: &Value, unwrap_envelope: bool) {
-        if let Some(metrics) = json.get("amazon-bedrock-invocationMetrics") {
+    ///
+    /// The returned [`EventPayloadOutcome`] tells the frame layer whether this
+    /// payload produced an authoritative record, was ordinary provider content,
+    /// or was a candidate the scanner could not read.
+    fn consume_bedrock_payload(
+        &mut self,
+        json: &Value,
+        unwrap_envelope: bool,
+    ) -> EventPayloadOutcome {
+        let mut recorded_usage = false;
+        let mut damaged = false;
+
+        let metrics = json.get("amazon-bedrock-invocationMetrics");
+        if let Some(metrics) = metrics {
             let prompt = metrics.get("inputTokenCount").and_then(Value::as_u64);
             let completion = metrics.get("outputTokenCount").and_then(Value::as_u64);
-            self.merge(AiTokenUsage {
+            // An explicit metrics container whose fields are absent, negative,
+            // fractional, or otherwise not readable as counts is ambiguous, not
+            // content: it is the terminal accounting record, unreadable.
+            if self.merge(AiTokenUsage {
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 total_tokens: match (prompt, completion) {
@@ -692,7 +816,11 @@ impl StreamUsageScanner {
                 // Deliberately unlabelled: see `consume_bedrock_payload`'s note
                 // on why event-stream snapshots carry no provider tag.
                 provider: None,
-            });
+            }) {
+                recorded_usage = true;
+            } else {
+                damaged = true;
+            }
         }
 
         // ConverseStream `metadata` events, and any other payload carrying a
@@ -716,27 +844,88 @@ impl StreamUsageScanner {
         self.detected_provider.get_or_insert(provider);
         let mut extracted = extract_response_usage(json, provider);
         extracted.provider = None;
-        self.merge(extracted);
+        if self.merge(extracted) {
+            recorded_usage = true;
+        } else if metrics.is_none() && declares_usage_container(json) {
+            // A usage-shaped payload whose container produced no readable count
+            // is a usage record this scanner could not decode. (Skipped when an
+            // `amazon-bedrock-invocationMetrics` container was present, because
+            // that container was already judged above and a valid one must not
+            // be second-guessed by an unrelated vocabulary.)
+            damaged = true;
+        }
 
         if !unwrap_envelope {
-            return;
+            return EventPayloadOutcome::resolve(recorded_usage, damaged);
         }
         let Some(encoded) = json.get("bytes").and_then(Value::as_str) else {
-            return;
+            return EventPayloadOutcome::resolve(recorded_usage, damaged);
         };
+        // An oversized or non-base64 envelope is framing this scanner cannot
+        // reconstruct at all, so it stays a hard malformed scan rather than
+        // ordering-sensitive damage.
         if encoded.len() > MAX_EVENT_STREAM_MESSAGE_BYTES {
             self.malformed = true;
-            return;
+            return EventPayloadOutcome::Damaged;
         }
         use base64::Engine as _;
         let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
             // An undecodable envelope could have carried the terminal metrics.
             self.malformed = true;
-            return;
+            return EventPayloadOutcome::Damaged;
         };
-        let Ok(inner) = serde_json::from_slice::<Value>(&decoded) else {
-            return;
-        };
-        self.consume_bedrock_payload(&inner, false);
+        // The envelope decoded, so its contents WERE a usage candidate. Inner
+        // bytes that are not a JSON object are a candidate record this scanner
+        // could not read — ordering-sensitive damage, not a silent skip.
+        match serde_json::from_slice::<Value>(&decoded) {
+            Ok(inner) if inner.is_object() => match self.consume_bedrock_payload(&inner, false) {
+                EventPayloadOutcome::Usage => recorded_usage = true,
+                EventPayloadOutcome::Damaged => damaged = true,
+                EventPayloadOutcome::Content => {}
+            },
+            Ok(_) | Err(_) => damaged = true,
+        }
+        EventPayloadOutcome::resolve(recorded_usage, damaged)
     }
+}
+
+/// How one decoded AWS event payload settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventPayloadOutcome {
+    /// An authoritative usage record was extracted.
+    Usage,
+    /// Ordinary provider content that declared no usage container.
+    Content,
+    /// A usage candidate the scanner could not decode, or a usage container
+    /// whose fields could not be read as counts.
+    Damaged,
+}
+
+impl EventPayloadOutcome {
+    /// Damage wins over a usage record found in the same payload: if one
+    /// container of a frame was unreadable, the frame cannot prove it restated
+    /// everything the provider reported.
+    fn resolve(recorded_usage: bool, damaged: bool) -> Self {
+        match (damaged, recorded_usage) {
+            (true, _) => Self::Damaged,
+            (false, true) => Self::Usage,
+            (false, false) => Self::Content,
+        }
+    }
+}
+
+/// Whether a decoded payload declares an explicit provider usage container.
+///
+/// This distinguishes ordinary provider content — a model text delta, a
+/// `messageStop`, an envelope with nothing else in it — from a record that
+/// announced usage but whose fields could not be read as counts. Only the
+/// latter is damage.
+fn declares_usage_container(json: &Value) -> bool {
+    json.get("usage").is_some()
+        || json.get("usageMetadata").is_some()
+        || json.get("inputTextTokenCount").is_some()
+        || json
+            .get("meta")
+            .and_then(|meta| meta.get("tokens"))
+            .is_some()
 }
