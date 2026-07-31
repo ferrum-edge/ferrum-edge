@@ -16,11 +16,14 @@
 //! * a fixed-cardinality **category** — a compiled-in `&'static str` chosen by
 //!   the rejecting code path, never derived from payload bytes;
 //! * an optional bounded **location** — a JSON Pointer whose segments are
-//!   either array indices or member names the *configured schema* itself
-//!   declares (see [`SafeFieldNames`]); every other segment collapses to
+//!   either a fixed numeric-shape marker or member names the *configured
+//!   schema* itself declares as JSON object properties (see
+//!   [`SafeFieldNames`]); every other segment collapses to
 //!   [`REDACTED_SEGMENT`];
 //! * an optional **keyword** — the failing JSON Schema keyword, accepted only
-//!   when it is an ASCII-alphanumeric token.
+//!   when it is on the explicit allowlist of supported diagnostic vocabulary
+//!   tokens ([`SAFE_KEYWORDS`]); anything else collapses to
+//!   [`UNKNOWN_KEYWORD`].
 //!
 //! Nothing here accepts an instance value, so there is no code path that can
 //! leak one and no "raw detail" escape hatch to misconfigure. Truncation is
@@ -46,8 +49,17 @@ pub const MAX_LOCATION_SEGMENTS: usize = 8;
 /// Maximum characters retained in a rendered location.
 pub const MAX_LOCATION_CHARS: usize = 96;
 
-/// Maximum characters a single retained path segment may have.
+/// Maximum characters a single retained (unescaped) path segment may have.
 pub const MAX_SEGMENT_CHARS: usize = 48;
+
+/// Maximum bytes accepted from a raw JSON Pointer segment before unescape.
+///
+/// JSON Pointer `~0` / `~1` escapes shrink (two bytes → one char), so the
+/// unescaped form is never longer than the raw form. Doubling
+/// [`MAX_SEGMENT_CHARS`] therefore bounds both the allocation and the
+/// worst-case escaped spelling of a declared name that still fits after
+/// unescape.
+pub const MAX_RAW_SEGMENT_CHARS: usize = MAX_SEGMENT_CHARS * 2;
 
 /// Maximum characters retained from a schema-derived keyword token.
 pub const MAX_KEYWORD_CHARS: usize = 32;
@@ -55,20 +67,95 @@ pub const MAX_KEYWORD_CHARS: usize = 32;
 /// Placeholder for a path segment that could originate from payload bytes.
 pub const REDACTED_SEGMENT: &str = "~";
 
+/// Fixed marker for a JSON Pointer segment whose text is all ASCII digits.
+///
+/// JSON Pointer alone does not prove the container is an array: an
+/// attacker-controlled object member named `"0"` is indistinguishable from a
+/// true array index. Digits are therefore never echoed.
+pub const NUMERIC_SEGMENT: &str = "#";
+
 /// Marker appended when a location was cut short by the segment budget.
 pub const TRUNCATED_LOCATION_MARKER: &str = "/...";
 
 /// Rendered location for a failure at the document root.
 pub const ROOT_LOCATION: &str = "(root)";
 
-/// Keyword reported when the failing keyword is not a plain ASCII token.
-pub const UNKNOWN_KEYWORD: &str = "schema";
+/// Keyword reported when the failing token is absent or not allowlisted.
+pub const UNKNOWN_KEYWORD: &str = "UNKNOWN_KEYWORD";
 
 /// Depth budget for the declared-name walk over a configured schema.
 const MAX_SCHEMA_WALK_DEPTH: usize = 24;
 
 /// Cap on how many declared names are retained per compiled schema.
 const MAX_DECLARED_NAMES: usize = 2048;
+
+/// Explicit allowlist of JSON Schema keywords that may appear in a diagnostic.
+///
+/// Drawn from the Draft 7 / Draft 2020-12 vocabularies Ferrum compiles. A short
+/// all-alphanumeric custom keyword, `$defs` / `definitions` map key, or any
+/// other schema-derived token is *not* in this set and collapses to
+/// [`UNKNOWN_KEYWORD`].
+pub const SAFE_KEYWORDS: &[&str] = &[
+    "$anchor",
+    "$dynamicAnchor",
+    "$dynamicRef",
+    "$id",
+    "$recursiveAnchor",
+    "$recursiveRef",
+    "$ref",
+    "$schema",
+    "$vocabulary",
+    "additionalItems",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "const",
+    "contains",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+    "default",
+    "definitions",
+    "dependentRequired",
+    "dependentSchemas",
+    "deprecated",
+    "description",
+    "else",
+    "enum",
+    "examples",
+    "exclusiveMaximum",
+    "exclusiveMinimum",
+    "format",
+    "if",
+    "items",
+    "maxContains",
+    "maximum",
+    "maxItems",
+    "maxLength",
+    "maxProperties",
+    "minContains",
+    "minimum",
+    "minItems",
+    "minLength",
+    "minProperties",
+    "multipleOf",
+    "not",
+    "oneOf",
+    "pattern",
+    "patternProperties",
+    "prefixItems",
+    "properties",
+    "propertyNames",
+    "readOnly",
+    "required",
+    "then",
+    "title",
+    "type",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "uniqueItems",
+    "writeOnly",
+];
 
 /// Subschema-bearing keywords whose value is itself a schema.
 const SUBSCHEMA_KEYWORDS: &[&str] = &[
@@ -91,7 +178,9 @@ const SCHEMA_ARRAY_KEYWORDS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems
 
 /// Keywords whose value is a map of name -> schema. Their keys are declared
 /// member names for `properties` / `dependentSchemas` and opaque regexes for
-/// `patternProperties`, so only the first two contribute names.
+/// `patternProperties`, so only the first two contribute names. `$defs` /
+/// `definitions` keys are schema identifiers, not JSON instance member names,
+/// and are never collected.
 const SCHEMA_MAP_KEYWORDS: &[&str] = &[
     "$defs",
     "definitions",
@@ -109,6 +198,11 @@ const SCHEMA_MAP_KEYWORDS: &[&str] = &[
 /// arbitrary JSON member, an XML local name, a form or multipart field name —
 /// is attacker- or backend-chosen and is replaced by [`REDACTED_SEGMENT`].
 ///
+/// Only JSON object member names (`properties`, `required`,
+/// `dependentRequired`, `dependentSchemas`) are collected. Configured
+/// `xml.name` values are deliberately excluded: they are wire/payload names,
+/// and echoing them contradicts the advisory's prohibition on raw XML names.
+///
 /// The walk is bounded in both depth and retained names so a large configured
 /// schema cannot make construction expensive or the set unbounded.
 #[derive(Debug, Default, Clone)]
@@ -117,7 +211,7 @@ pub struct SafeFieldNames {
 }
 
 impl SafeFieldNames {
-    /// Collect every member name the schema declares, bounded.
+    /// Collect every JSON member name the schema declares, bounded.
     pub fn from_schema(schema: &Value) -> Self {
         let mut names = HashSet::new();
         collect_declared_names(schema, &mut names, 0);
@@ -148,14 +242,7 @@ fn collect_declared_names(schema: &Value, out: &mut HashSet<String>, depth: usiz
     }
     // `enum` / `const` members are instance values, never member names, and are
     // deliberately not collected here — see the module docs.
-    if let Some(xml_name) = object
-        .get("xml")
-        .and_then(Value::as_object)
-        .and_then(|xml| xml.get("name"))
-        .and_then(Value::as_str)
-    {
-        insert_name(out, xml_name);
-    }
+    // `xml.name` is a wire/payload name and is never collected.
     if let Some(Value::Object(dependent)) = object.get("dependentRequired") {
         for (name, values) in dependent {
             insert_name(out, name);
@@ -213,10 +300,11 @@ fn insert_name(out: &mut HashSet<String>, name: &str) {
 
 /// Render a JSON Pointer as a bounded, payload-free location.
 ///
-/// Array indices survive verbatim (they describe shape, not content). Object
-/// member names survive only when `names` declares them. Depth, segment count,
-/// and total length are all capped, so neither a deeply nested hostile document
-/// nor a long hostile member name can grow the diagnostic.
+/// Digits render as [`NUMERIC_SEGMENT`] (JSON Pointer does not prove array
+/// shape). Object member names survive only when `names` declares them. Raw
+/// segments over [`MAX_RAW_SEGMENT_CHARS`] are redacted before unescape so a
+/// hostile key cannot force an unbounded allocation on the error path. Depth,
+/// segment count, and total length are all capped.
 pub fn safe_location(pointer: &str, names: &SafeFieldNames) -> String {
     if pointer.is_empty() {
         return ROOT_LOCATION.to_string();
@@ -229,20 +317,13 @@ pub fn safe_location(pointer: &str, names: &SafeFieldNames) -> String {
             truncated = true;
             break;
         }
-        let segment = unescape_pointer_segment(raw);
-        // An array index describes shape, not content, so it survives; a
-        // member name survives only when the configured schema declares it.
-        let rendered: &str = if is_array_index(&segment) || names.allows(&segment) {
-            &segment
-        } else {
-            REDACTED_SEGMENT
-        };
+        let rendered = render_pointer_segment(raw, names);
         if out.len() + 1 + rendered.len() > MAX_LOCATION_CHARS {
             truncated = true;
             break;
         }
         out.push('/');
-        out.push_str(rendered);
+        out.push_str(&rendered);
         emitted += 1;
     }
     if out.is_empty() {
@@ -254,7 +335,26 @@ pub fn safe_location(pointer: &str, names: &SafeFieldNames) -> String {
     out
 }
 
-fn is_array_index(segment: &str) -> bool {
+fn render_pointer_segment(raw: &str, names: &SafeFieldNames) -> String {
+    // Reject over-budget raw segments before allocating an unescaped copy.
+    // Escapes only shrink, so this also bounds the post-unescape length.
+    if raw.is_empty() || raw.len() > MAX_RAW_SEGMENT_CHARS {
+        return REDACTED_SEGMENT.to_string();
+    }
+    let segment = unescape_pointer_segment(raw);
+    if segment.len() > MAX_SEGMENT_CHARS {
+        return REDACTED_SEGMENT.to_string();
+    }
+    if is_numeric_segment(&segment) {
+        return NUMERIC_SEGMENT.to_string();
+    }
+    if names.allows(&segment) {
+        return segment;
+    }
+    REDACTED_SEGMENT.to_string()
+}
+
+fn is_numeric_segment(segment: &str) -> bool {
     !segment.is_empty() && segment.len() <= 10 && segment.bytes().all(|byte| byte.is_ascii_digit())
 }
 
@@ -284,25 +384,24 @@ fn unescape_pointer_segment(segment: &str) -> String {
 
 /// Reduce a `jsonschema` schema path to the failing keyword token.
 ///
-/// The schema path is operator-controlled, but it can carry `$ref` and `$id`
-/// fragments an imported document chose. Only the trailing ASCII-alphanumeric
-/// keyword token is retained, so the rendered value is drawn from the finite
-/// JSON Schema vocabulary.
-pub fn safe_keyword(schema_path: &str) -> &str {
+/// The schema path is operator-controlled, but it can carry `$defs` /
+/// `definitions` names, `$ref` fragments, and other imported schema text. Only
+/// a trailing token that matches the explicit [`SAFE_KEYWORDS`] allowlist is
+/// retained.
+pub fn safe_keyword(schema_path: &str) -> &'static str {
     let candidate = schema_path
         .rsplit('/')
         .find(|segment| !segment.is_empty())
-        .unwrap_or(UNKNOWN_KEYWORD);
-    if candidate.len() <= MAX_KEYWORD_CHARS
-        && !candidate.is_empty()
-        && candidate
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'$')
-    {
-        candidate
-    } else {
-        UNKNOWN_KEYWORD
+        .unwrap_or("");
+    if candidate.is_empty() || candidate.len() > MAX_KEYWORD_CHARS {
+        return UNKNOWN_KEYWORD;
     }
+    for keyword in SAFE_KEYWORDS {
+        if *keyword == candidate {
+            return keyword;
+        }
+    }
+    UNKNOWN_KEYWORD
 }
 
 /// Apply the compiled-in size ceiling to an assembled diagnostic.
@@ -365,9 +464,9 @@ pub fn xml_error_category(error: &roxmltree::Error) -> &'static str {
 
 /// Assemble the canonical schema-violation diagnostic.
 ///
-/// `category` is a compiled-in message, `location` a [`safe_location`] result,
-/// and `keyword` a [`safe_keyword`] result. No argument may carry payload
-/// bytes.
-pub fn schema_violation_detail(category: &str, location: &str, keyword: &str) -> String {
+/// `category` is a compiled-in `&'static str` message, `location` a
+/// [`safe_location`] result, and `keyword` a [`safe_keyword`] result. No
+/// argument may carry payload bytes.
+pub fn schema_violation_detail(category: &'static str, location: &str, keyword: &str) -> String {
     bound_detail(&format!("{category} at {location} (keyword '{keyword}')"))
 }

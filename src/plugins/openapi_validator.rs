@@ -13,9 +13,12 @@
 //! `openapi_validator.response_error` metadata entries that every configured
 //! logging plugin exports. Both are therefore built under the contract in
 //! [`super::utils::validation_diagnostics`]: a compiled-in category, an
-//! operator-controlled schema path, and — request side only — a bounded
+//! allowlisted JSON Schema keyword, and — request side only — a bounded
 //! instance location whose object-member segments survive only when the
-//! configured schema declares them.
+//! configured schema declares them as JSON property names. Numeric pointer
+//! segments render as a fixed marker; raw schema paths (including `$defs`
+//! names), configured XML names/namespaces, and hostile content-coding tokens
+//! are never emitted.
 //!
 //! No conversion helper below formats a rejected scalar, a payload-chosen JSON
 //! / XML / form / multipart member name, an `roxmltree` parse token, or a
@@ -42,7 +45,7 @@ use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::utils::validation_diagnostics::{
     MAX_DIAGNOSTIC_CHARS, SafeFieldNames, bound_detail, safe_keyword, safe_location,
-    xml_error_category,
+    schema_violation_detail, xml_error_category,
 };
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
@@ -928,7 +931,7 @@ impl OpenapiValidator {
     ///
     /// Every `detail` reaching this function is payload-free by construction
     /// (`GHSA-5p2h-fq6q-gwh9`): callers assemble it from compiled-in categories,
-    /// operator-controlled schema paths, and [`safe_location`] output. That
+    /// allowlisted JSON Schema keywords, and [`safe_location`] output. That
     /// matters because the same string lands in two places with different
     /// audiences — the client-visible problem body and the
     /// `openapi_validator.request_error` / `.response_error` metadata entries,
@@ -2424,6 +2427,11 @@ fn decode_body<'a>(
     // at layers × max so a stacked chain cannot bypass the per-layer ceiling
     // while still failing closed on amplification across the full list.
     let max_cumulative_bytes = max_body_bytes.saturating_mul(MAX_CONTENT_CODINGS);
+    // The shared decoder's errors can echo a hostile coding token. Collapse to
+    // a fixed category at this plugin boundary so neither the request problem
+    // body nor transaction metadata can reproduce it (`GHSA-5p2h-fq6q-gwh9`).
+    // Response conversion already has a coarser outer collapse; request must
+    // be safe here too. The shared utility stays detailed for other plugins.
     decode_content_encoding(
         header_value(headers, "content-encoding"),
         body,
@@ -2434,6 +2442,7 @@ fn decode_body<'a>(
             max_amplification_ratio: 0,
         },
     )
+    .map_err(|_| "Content-Encoding could not be decoded".to_string())
 }
 
 enum SchemaInstance {
@@ -2566,16 +2575,10 @@ fn xml_body_to_value(
     let root_namespace_matches =
         expected_namespace.is_none_or(|namespace| root.tag_name().namespace() == Some(namespace));
     if !root_local_matches || !root_namespace_matches {
-        // Only the schema-declared expectation is reported. The actual root
-        // element name and namespace URI come from the inspected document and
-        // are never echoed.
-        let expectation = match (expected_root, expected_namespace) {
-            (Some(name), Some(ns)) => format!("xml.name '{name}' in namespace '{ns}'"),
-            (Some(name), None) => format!("xml.name '{name}'"),
-            (None, Some(ns)) => format!("xml.namespace '{ns}'"),
-            (None, None) => "the schema XML metadata".to_string(),
-        };
-        return Err(format!("XML root element does not match {expectation}"));
+        // Disclose neither the document's actual root name/namespace nor the
+        // configured xml.name / xml.namespace expectation
+        // (`GHSA-5p2h-fq6q-gwh9`). Matching still uses the schema metadata.
+        return Err("XML root element does not match the configured schema".to_string());
     }
     xml_node_to_value(root, schema, conversion)
 }
@@ -5569,28 +5572,33 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
 /// copy the caller's own credentials into every configured logging sink
 /// (`GHSA-5p2h-fq6q-gwh9`). The `ValidationError` is therefore never rendered.
 ///
-/// Both sides emit a fixed category plus the operator/schema-controlled
-/// `schema_path()`. The request side additionally carries a bounded instance
-/// location whose object-member segments survive only when the configured
-/// schema declares them, which keeps the useful "which declared field" signal
-/// without echoing a hostile member name. The response side stays coarser
-/// because describing an upstream body's shape back to the client is itself a
-/// disclosure.
+/// Both sides emit a fixed category plus an allowlisted keyword. Raw
+/// `schema_path()` text — including `$defs` names, `$ref` fragments, and other
+/// imported schema identifiers — is never copied into the diagnostic. The
+/// request side additionally carries a bounded instance location whose object
+/// member segments survive only when the configured schema declares them as
+/// JSON properties; numeric pointer segments render as a fixed marker. The
+/// response side stays coarser because describing an upstream body's shape back
+/// to the client is itself a disclosure.
 fn format_schema_error(
     error: &jsonschema::ValidationError<'_>,
     side: ValidationSide,
     safe_names: &SafeFieldNames,
 ) -> String {
-    let schema_path = bound_detail(&error.schema_path().to_string());
-    if side == ValidationSide::Response {
-        return bound_detail(&format!(
-            "response body does not satisfy the response schema at {schema_path}"
-        ));
+    let keyword = safe_keyword(&error.schema_path().to_string());
+    match side {
+        ValidationSide::Request => {
+            let location = safe_location(&error.instance_path().to_string(), safe_names);
+            schema_violation_detail(
+                "request body does not satisfy the request schema",
+                &location,
+                keyword,
+            )
+        }
+        ValidationSide::Response => bound_detail(&format!(
+            "response body does not satisfy the response schema (keyword '{keyword}')"
+        )),
     }
-    let location = safe_location(&error.instance_path().to_string(), safe_names);
-    bound_detail(&format!(
-        "request body does not satisfy the request schema at {schema_path} (instance {location})"
-    ))
 }
 
 /// Apply the operator's diagnostic cap, itself clamped to the compiled-in

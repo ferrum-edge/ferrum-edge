@@ -3579,12 +3579,10 @@ async fn content_encoding_chains_decode_in_reverse_application_order() {
             .await,
         Some(400),
     );
-    let error = request_error(&ctx).unwrap_or_default();
-    assert!(
-        error.contains("decompression failed")
-            || error.contains("truncated")
-            || error.contains("trailing"),
-        "wrong chain order must surface a decode error, got {error:?}"
+    assert_eq!(
+        request_error(&ctx),
+        Some("Content-Encoding could not be decoded"),
+        "request-side decode failures must use the fixed category"
     );
 }
 
@@ -3605,12 +3603,10 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
                 .await,
             Some(400),
         );
-        let error = request_error(&ctx).unwrap_or_default();
-        assert!(
-            error.contains("empty coding")
-                || error.contains("not a valid HTTP token")
-                || error.contains("unsupported parameters"),
-            "malformed `{encoding}` must be clear, got {error:?}"
+        assert_eq!(
+            request_error(&ctx),
+            Some("Content-Encoding could not be decoded"),
+            "malformed `{encoding}` must collapse to the fixed decode category"
         );
     }
 
@@ -3621,11 +3617,10 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
             .await,
         Some(400),
     );
-    assert!(
-        request_error(&ctx)
-            .unwrap_or_default()
-            .contains("not a valid HTTP token"),
-        "non-token member must be rejected clearly, got {:?}",
+    assert_eq!(
+        request_error(&ctx),
+        Some("Content-Encoding could not be decoded"),
+        "non-token member must collapse to the fixed decode category, got {:?}",
         request_error(&ctx)
     );
 
@@ -3638,7 +3633,11 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
     );
     assert_eq!(
         request_error(&ctx),
-        Some("unsupported content-encoding 'deflate'")
+        Some("Content-Encoding could not be decoded")
+    );
+    assert!(
+        !request_error(&ctx).unwrap_or_default().contains("deflate"),
+        "hostile coding tokens must not appear in request diagnostics"
     );
 
     let mut ctx = post_ctx("/items");
@@ -3688,9 +3687,10 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
             .await,
         Some(400),
     );
-    assert!(
-        request_error(&ctx).is_some_and(|error| error.contains("brotli")),
-        "corrupt outer brotli must fail, got {:?}",
+    assert_eq!(
+        request_error(&ctx),
+        Some("Content-Encoding could not be decoded"),
+        "corrupt outer brotli must fail with the fixed decode category, got {:?}",
         request_error(&ctx)
     );
 
@@ -3708,9 +3708,10 @@ async fn content_encoding_malformed_unsupported_and_corrupt_fail_closed() {
             .await,
         Some(400),
     );
-    assert!(
-        request_error(&ctx).is_some_and(|error| error.contains("gzip")),
-        "corrupt inner gzip must fail after outer decode, got {:?}",
+    assert_eq!(
+        request_error(&ctx),
+        Some("Content-Encoding could not be decoded"),
+        "corrupt inner gzip must fail with the fixed decode category, got {:?}",
         request_error(&ctx)
     );
 
@@ -3805,11 +3806,10 @@ async fn content_encoding_respects_max_body_bytes_on_raw_and_each_layer() {
             .await,
         Some(400),
     );
-    assert!(
-        request_error(&ctx)
-            .unwrap_or_default()
-            .contains("exceeds 64 bytes"),
-        "single-layer expansion must honor max_body_bytes, got {:?}",
+    assert_eq!(
+        request_error(&ctx),
+        Some("Content-Encoding could not be decoded"),
+        "single-layer expansion must honor max_body_bytes via the fixed decode category, got {:?}",
         request_error(&ctx)
     );
 
@@ -3828,11 +3828,10 @@ async fn content_encoding_respects_max_body_bytes_on_raw_and_each_layer() {
             .await,
         Some(400),
     );
-    assert!(
-        request_error(&ctx)
-            .unwrap_or_default()
-            .contains("exceeds 64 bytes"),
-        "chained expansion must honor max_body_bytes per layer, got {:?}",
+    assert_eq!(
+        request_error(&ctx),
+        Some("Content-Encoding could not be decoded"),
+        "chained expansion must honor max_body_bytes via the fixed decode category, got {:?}",
         request_error(&ctx)
     );
 
@@ -7564,12 +7563,16 @@ async fn response_validation_errors_do_not_echo_backend_values() {
         "backend response content must not land in transaction logs: {detail}"
     );
     assert!(
-        detail.contains("response body does not satisfy the response schema at"),
+        detail.contains("response body does not satisfy the response schema"),
         "unexpected detail: {detail}"
     );
     assert!(
+        !detail.contains(" at /$") && !detail.contains(" at /properties"),
+        "raw schema paths must not appear: {detail}"
+    );
+    assert!(
         detail.contains("properties") || detail.contains("type"),
-        "schema location evidence must remain: {detail}"
+        "allowlisted keyword evidence must remain: {detail}"
     );
 }
 
@@ -7615,12 +7618,12 @@ async fn response_schema_errors_do_not_echo_backend_property_names() {
         "backend JSON property names must not land in transaction logs: {detail}"
     );
     assert!(
-        detail.contains("response body does not satisfy the response schema at"),
+        detail.contains("response body does not satisfy the response schema"),
         "unexpected detail: {detail}"
     );
     assert!(
         detail.contains("additionalProperties"),
-        "operator/schema location evidence must remain: {detail}"
+        "allowlisted keyword evidence must remain: {detail}"
     );
 }
 

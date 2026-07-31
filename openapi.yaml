@@ -19607,9 +19607,11 @@ components:
             cap is min(error_truncate_chars, 256). This is not a
             confidentiality control. Diagnostics are payload-free by
             construction and never contain the rejected instance value, an
-            expected enum/const constant, a raw schema-library or XML-parser
-            rendering, a backend Content-Type, the request target, or a
-            payload-chosen JSON/XML/form/multipart member name.
+            expected enum/const constant, a raw schema path or schema-library
+            / XML-parser rendering, a configured XML name or namespace, a
+            hostile Content-Encoding coding token, a backend Content-Type, the
+            request target, or a payload-chosen JSON/XML/form/multipart member
+            name.
 
     OpenapiValidatorJsonSchema:
       type: [object, boolean]

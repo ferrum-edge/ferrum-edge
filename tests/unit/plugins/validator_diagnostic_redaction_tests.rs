@@ -22,8 +22,9 @@
 use ferrum_edge::plugins::body_validator::BodyValidator;
 use ferrum_edge::plugins::openapi_validator::OpenapiValidator;
 use ferrum_edge::plugins::utils::validation_diagnostics::{
-    MAX_DIAGNOSTIC_CHARS, REDACTED_SEGMENT, ROOT_LOCATION, SafeFieldNames, bound_detail,
-    safe_keyword, safe_location,
+    MAX_DIAGNOSTIC_CHARS, MAX_RAW_SEGMENT_CHARS, MAX_SEGMENT_CHARS, NUMERIC_SEGMENT,
+    REDACTED_SEGMENT, ROOT_LOCATION, SafeFieldNames, UNKNOWN_KEYWORD, bound_detail, safe_keyword,
+    safe_location,
 };
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::{Value, json};
@@ -279,6 +280,7 @@ async fn body_validator_response_xml_error_is_a_category_not_a_token() {
 
 fn openapi_request_plugin(schema: Value, content_type: &str) -> OpenapiValidator {
     OpenapiValidator::new(&json!({
+        "schema_draft": "draft2020-12",
         "operations": [{
             "method": "POST",
             "path_template": "/items",
@@ -291,6 +293,7 @@ fn openapi_request_plugin(schema: Value, content_type: &str) -> OpenapiValidator
 
 fn openapi_response_plugin(schema: Value, content_type: &str) -> OpenapiValidator {
     OpenapiValidator::new(&json!({
+        "schema_draft": "draft2020-12",
         "operations": [{
             "method": "POST",
             "path_template": "/items",
@@ -348,17 +351,21 @@ async fn openapi_request_schema_failure_keeps_declared_path_only() {
     assert_eq!(status, 400);
     assert_no_disclosure(&detail, &metadata, CANARY);
     assert!(
-        metadata.contains("request body does not satisfy the request schema at"),
+        metadata.contains("request body does not satisfy the request schema"),
         "{metadata}"
     );
     assert!(
         metadata.contains("/token"),
         "a schema-declared field path is safe and must survive: {metadata}"
     );
+    assert!(
+        metadata.contains("pattern"),
+        "allowlisted keyword must survive: {metadata}"
+    );
 }
 
 #[tokio::test]
-async fn openapi_request_nested_array_failure_keeps_indices() {
+async fn openapi_request_nested_array_failure_uses_numeric_marker() {
     let plugin = openapi_request_plugin(
         json!({
             "type": "object",
@@ -380,8 +387,12 @@ async fn openapi_request_nested_array_failure_keeps_indices() {
     assert_eq!(status, 400);
     assert_no_disclosure(&detail, &metadata, CANARY);
     assert!(
-        metadata.contains("/rows/1/count"),
-        "indices and declared names describe shape, not content: {metadata}"
+        metadata.contains(&format!("/rows/{NUMERIC_SEGMENT}/count")),
+        "numeric pointer segments must render as the fixed marker: {metadata}"
+    );
+    assert!(
+        !metadata.contains("/rows/1/"),
+        "raw digits must never appear in the location: {metadata}"
     );
 }
 
@@ -439,10 +450,10 @@ async fn openapi_request_multipart_hides_part_name_and_value() {
 }
 
 #[tokio::test]
-async fn openapi_request_xml_root_mismatch_hides_document_names() {
+async fn openapi_request_xml_root_mismatch_hides_document_and_configured_names() {
     let schema = json!({
         "type": "object",
-        "xml": {"name": "order"},
+        "xml": {"name": "order", "namespace": "urn:qzvx-ns-canary"},
         "properties": {"id": {"type": "integer"}}
     });
     let plugin = openapi_request_plugin(schema, XML);
@@ -452,9 +463,11 @@ async fn openapi_request_xml_root_mismatch_hides_document_names() {
     assert_eq!(status, 400);
     assert_no_disclosure(&detail, &metadata, CANARY);
     assert_no_disclosure(&detail, &metadata, HOSTILE_MEMBER);
+    assert_no_disclosure(&detail, &metadata, "order");
+    assert_no_disclosure(&detail, &metadata, "urn:qzvx-ns-canary");
     assert!(
-        metadata.contains("xml.name 'order'"),
-        "the operator-declared expectation is safe: {metadata}"
+        metadata.contains("XML root element does not match the configured schema"),
+        "fixed category must survive: {metadata}"
     );
 }
 
@@ -505,8 +518,12 @@ async fn openapi_response_schema_failure_hides_value_and_shape() {
     assert_eq!(status, 502);
     assert_no_disclosure(&detail, &metadata, CANARY);
     assert!(
-        metadata.contains("response body does not satisfy the response schema at"),
+        metadata.contains("response body does not satisfy the response schema"),
         "{metadata}"
+    );
+    assert!(
+        !metadata.contains("sessionToken"),
+        "response diagnostics must not describe upstream structure: {metadata}"
     );
 }
 
@@ -525,10 +542,10 @@ async fn openapi_response_conversion_failure_hides_upstream_bytes() {
 }
 
 #[tokio::test]
-async fn openapi_response_xml_conversion_failure_hides_upstream_names() {
+async fn openapi_response_xml_conversion_failure_hides_upstream_and_configured_names() {
     let schema = json!({
         "type": "object",
-        "xml": {"name": "order"},
+        "xml": {"name": "order", "namespace": "urn:qzvx-ns-canary"},
         "properties": {"id": {"type": "integer"}}
     });
     let plugin = openapi_response_plugin(schema, XML);
@@ -538,6 +555,8 @@ async fn openapi_response_xml_conversion_failure_hides_upstream_names() {
     assert_eq!(status, 502);
     assert_no_disclosure(&detail, &metadata, CANARY);
     assert_no_disclosure(&detail, &metadata, HOSTILE_MEMBER);
+    assert_no_disclosure(&detail, &metadata, "order");
+    assert_no_disclosure(&detail, &metadata, "urn:qzvx-ns-canary");
 }
 
 #[tokio::test]
@@ -580,7 +599,7 @@ async fn openapi_response_diagnostic_is_bounded_whatever_the_config_says() {
 // ───────────────────────── diagnostic primitives ────────────────────────────
 
 #[test]
-fn safe_location_keeps_declared_names_and_indices_only() {
+fn safe_location_keeps_declared_names_and_numeric_markers_only() {
     let names = SafeFieldNames::from_schema(&json!({
         "type": "object",
         "properties": {
@@ -596,12 +615,25 @@ fn safe_location_keeps_declared_names_and_indices_only() {
     let redacted = format!("/{REDACTED_SEGMENT}");
 
     assert_eq!(safe_location("", &names), ROOT_LOCATION);
-    assert_eq!(safe_location("/rows/2/count", &names), "/rows/2/count");
+    assert_eq!(
+        safe_location("/rows/2/count", &names),
+        format!("/rows/{NUMERIC_SEGMENT}/count")
+    );
     let hostile = safe_location(&format!("/{HOSTILE_MEMBER}"), &names);
     assert_eq!(hostile, redacted);
     // Pointer escapes are decoded before classification, so `~1` cannot
     // smuggle a separator into the rendered location.
     assert_eq!(safe_location("/a~1b", &names), redacted);
+    // A numeric object-member spelling is indistinguishable from an array
+    // index under JSON Pointer alone, so digits never survive.
+    assert_eq!(
+        safe_location(&format!("/{HOSTILE_MEMBER}/9"), &names),
+        format!("/{REDACTED_SEGMENT}/{NUMERIC_SEGMENT}")
+    );
+    assert!(
+        !safe_location("/rows/2/count", &names).contains('2'),
+        "raw digits must never be emitted"
+    );
 }
 
 #[test]
@@ -617,25 +649,63 @@ fn safe_location_bounds_depth_and_total_length() {
 }
 
 #[test]
-fn safe_keyword_accepts_only_vocabulary_tokens() {
-    assert_eq!(safe_keyword("/properties/token/pattern"), "pattern");
-    assert_eq!(safe_keyword("/additionalProperties"), "additionalProperties");
-    assert_eq!(safe_keyword(""), "schema");
-    // A fragment carrying payload-shaped text is not a keyword.
-    assert_eq!(safe_keyword(&format!("/x/{CANARY} leak")), "schema");
+fn safe_location_redacts_oversized_raw_segment_before_unescape() {
+    let names = SafeFieldNames::default();
+    // Larger than MAX_RAW_SEGMENT_CHARS so unescape never runs.
+    let huge = format!("/{}", "z".repeat(MAX_RAW_SEGMENT_CHARS + 8));
+    let rendered = safe_location(&huge, &names);
+    assert_eq!(rendered, format!("/{REDACTED_SEGMENT}"));
+    assert!(rendered.len() < 16, "oversized segment must stay bounded: {rendered}");
+    // Escaped spelling that would expand past the unescaped budget after a
+    // would-be unescape is also rejected on the raw ceiling first.
+    let escaped = format!("/{}", "~0".repeat(MAX_SEGMENT_CHARS + 1));
+    assert!(escaped.len() > MAX_RAW_SEGMENT_CHARS);
+    assert_eq!(
+        safe_location(&escaped, &names),
+        format!("/{REDACTED_SEGMENT}")
+    );
 }
 
 #[test]
-fn safe_field_names_never_collect_instance_values() {
+fn safe_keyword_accepts_only_allowlisted_vocabulary_tokens() {
+    assert_eq!(safe_keyword("/properties/token/pattern"), "pattern");
+    assert_eq!(safe_keyword("/additionalProperties"), "additionalProperties");
+    assert_eq!(safe_keyword(""), UNKNOWN_KEYWORD);
+    // A fragment carrying payload-shaped text is not a keyword.
+    assert_eq!(
+        safe_keyword(&format!("/x/{CANARY} leak")),
+        UNKNOWN_KEYWORD
+    );
+    // Short all-alphanumeric custom / canary tokens must not pass the
+    // allowlist just because they look like vocabulary.
+    assert_eq!(safe_keyword("/qzvxcanary9f3a"), UNKNOWN_KEYWORD);
+    assert_eq!(safe_keyword(&format!("/{CANARY}")), UNKNOWN_KEYWORD);
+    // `$defs` map keys are schema identifiers, not diagnostic keywords.
+    assert_eq!(
+        safe_keyword(&format!("/$defs/{CANARY}/type")),
+        "type"
+    );
+}
+
+#[test]
+fn safe_field_names_never_collect_instance_values_or_xml_names() {
     let names = SafeFieldNames::from_schema(&json!({
         "type": "object",
-        "properties": {"mode": {"enum": [CANARY], "const": CANARY}},
-        "required": ["mode"]
+        "xml": {"name": CANARY},
+        "properties": {
+            "mode": {"enum": [CANARY], "const": CANARY, "xml": {"name": "wireModeCanary"}}
+        },
+        "required": ["mode"],
+        "$defs": {CANARY: {"type": "string"}}
     }));
     assert!(names.allows("mode"));
     assert!(
         !names.allows(CANARY),
-        "enum/const members are instance values, never declared names"
+        "enum/const members and $defs keys are never declared JSON member names"
+    );
+    assert!(
+        !names.allows("wireModeCanary"),
+        "xml.name must not be inserted into SafeFieldNames"
     );
 }
 
@@ -645,4 +715,126 @@ fn bound_detail_caps_on_char_boundaries() {
     let bounded = bound_detail(&long);
     assert_eq!(bounded.chars().count(), MAX_DIAGNOSTIC_CHARS);
     assert_eq!(bound_detail("short"), "short");
+}
+
+// ───────────────────────── root-review canary coverage ──────────────────────
+
+#[tokio::test]
+async fn body_validator_missing_required_xml_hides_configured_name_on_request() {
+    let plugin = body_validator_with(json!({
+        "required_xml_elements": [CANARY],
+        "content_types": ["application/xml"]
+    }));
+    let (status, detail) = bv_request_reject(&plugin, XML, b"<other/>").await;
+
+    assert_eq!(status, 400);
+    assert_no_disclosure(&detail, "", CANARY);
+    assert!(
+        detail.contains("Missing required XML element"),
+        "fixed category must survive: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn body_validator_missing_required_xml_hides_configured_name_on_response() {
+    let plugin = body_validator_with(json!({
+        "response_required_xml_elements": [CANARY],
+        "response_content_types": ["application/xml"]
+    }));
+    let (status, detail, metadata) = bv_response_reject(&plugin, XML, b"<other/>").await;
+
+    assert_eq!(status, 502);
+    assert_no_disclosure(&detail, &metadata, CANARY);
+    assert!(
+        detail.contains("Missing required XML element"),
+        "fixed category must survive: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn openapi_request_content_encoding_hides_coding_token() {
+    let plugin = openapi_request_plugin(
+        json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}}
+        }),
+        JSON,
+    );
+    let coding = format!("qzvx{CANARY}");
+    let mut headers = headers_with(JSON);
+    headers.insert("content-encoding".into(), coding.clone());
+    let mut ctx = post_ctx("/items");
+    ctx.headers = headers.clone();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, br#"{"ok":true}"#)
+        .await;
+    let (status, detail) = reject_parts(&result);
+    let metadata = metadata_surfaces(&ctx);
+
+    assert_eq!(status, 400);
+    assert_no_disclosure(&detail, &metadata, CANARY);
+    assert_no_disclosure(&detail, &metadata, &coding);
+    assert!(
+        detail.contains("Content-Encoding could not be decoded")
+            || metadata.contains("Content-Encoding could not be decoded"),
+        "fixed decode category must survive: detail={detail} metadata={metadata}"
+    );
+}
+
+#[tokio::test]
+async fn openapi_request_schema_path_defs_canary_is_not_disclosed() {
+    let defs_name = format!("QzvxDefs{CANARY}");
+    let mut schema = json!({
+        "type": "object",
+        "required": ["token"],
+        "properties": {
+            "token": {"$ref": format!("#/$defs/{defs_name}")}
+        },
+        "$defs": {}
+    });
+    schema["$defs"][defs_name.as_str()] = json!({"type": "string", "pattern": "^redacted$"});
+    let plugin = openapi_request_plugin(schema, JSON);
+    let body = format!(r#"{{"token":"{CANARY}"}}"#);
+    let (status, detail, metadata) = oa_request_reject(&plugin, JSON, body.as_bytes()).await;
+
+    assert_eq!(status, 400);
+    assert_no_disclosure(&detail, &metadata, CANARY);
+    assert_no_disclosure(&detail, &metadata, &defs_name);
+    assert!(
+        metadata.contains("request body does not satisfy the request schema"),
+        "{metadata}"
+    );
+    assert!(
+        metadata.contains("pattern") || metadata.contains(UNKNOWN_KEYWORD),
+        "safe keyword category must survive: {metadata}"
+    );
+}
+
+#[tokio::test]
+async fn openapi_response_schema_path_defs_canary_is_not_disclosed() {
+    let defs_name = format!("QzvxDefs{CANARY}");
+    let mut schema = json!({
+        "type": "object",
+        "required": ["token"],
+        "properties": {
+            "token": {"$ref": format!("#/$defs/{defs_name}")}
+        },
+        "$defs": {}
+    });
+    schema["$defs"][defs_name.as_str()] = json!({"type": "string", "pattern": "^redacted$"});
+    let plugin = openapi_response_plugin(schema, JSON);
+    let body = format!(r#"{{"token":"{CANARY}"}}"#);
+    let (status, detail, metadata) = oa_response_reject(&plugin, JSON, body.as_bytes()).await;
+
+    assert_eq!(status, 502);
+    assert_no_disclosure(&detail, &metadata, CANARY);
+    assert_no_disclosure(&detail, &metadata, &defs_name);
+    assert!(
+        metadata.contains("response body does not satisfy the response schema"),
+        "{metadata}"
+    );
+    assert!(
+        !metadata.contains("/$defs/"),
+        "raw schema paths must not appear: {metadata}"
+    );
 }

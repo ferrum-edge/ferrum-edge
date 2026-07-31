@@ -25,12 +25,14 @@
 //! body and are re-emitted to internal tracing verbatim, so they are built
 //! under the contract in [`super::utils::validation_diagnostics`]: a
 //! compiled-in category, a bounded instance location whose object-member
-//! segments survive only when the configured schema declares them, and a
-//! keyword drawn from the JSON Schema vocabulary. No rejected instance value,
-//! expected constant, `roxmltree` parse token, or `prost` decode rendering is
-//! formatted into them (`GHSA-5p2h-fq6q-gwh9`). Response-side details stay
-//! coarser still, since describing an upstream body's shape back to the client
-//! is itself a disclosure.
+//! segments survive only when the configured schema declares them as JSON
+//! property names (numeric pointer segments render as a fixed marker; raw XML
+//! names are never collected), and an allowlisted JSON Schema keyword. No
+//! rejected instance value, expected constant, configured XML name, raw schema
+//! path, `roxmltree` parse token, or `prost` decode rendering is formatted into
+//! them (`GHSA-5p2h-fq6q-gwh9`). Response-side details stay coarser still, since
+//! describing an upstream body's shape back to the client is itself a
+//! disclosure.
 
 use async_trait::async_trait;
 use flate2::read::GzDecoder;
@@ -638,9 +640,11 @@ impl BodyValidator {
             }
         }
 
-        for (idx, element) in required_xml_elements.iter().enumerate() {
+        for (idx, _) in required_xml_elements.iter().enumerate() {
             if !required_found[idx] {
-                return Err(format!("Missing required XML element: {}", element.display));
+                // Never echo a configured XML local name or Clark notation —
+                // those are schema/payload constants (`GHSA-5p2h-fq6q-gwh9`).
+                return Err("Missing required XML element".to_string());
             }
         }
 
@@ -1334,17 +1338,19 @@ fn unescape_json_pointer_segment(segment: &str) -> Cow<'_, str> {
 /// Client-visible message for a compiled-schema violation.
 ///
 /// The rejected instance value is never included, in either direction. Request
-/// failures carry a bounded instance location plus the failing keyword so a
+/// failures carry a bounded instance location plus an allowlisted keyword so a
 /// caller can fix its own payload; response failures stay coarse so an upstream
-/// body's shape is not described back to the client.
+/// body's shape is not described back to the client. Raw schema paths (including
+/// `$defs` names and `$ref` fragments) are never emitted.
 ///
-/// The location is rendered by [`safe_location`]: array indices survive, and
-/// object member names survive only when the *configured schema* declares them.
-/// A hostile member name — which `jsonschema` places in the instance path for
-/// `propertyNames`, `patternProperties`, `additionalProperties`, and nested
-/// `required` failures — is replaced with a placeholder rather than echoed,
-/// and depth, segment count, and total length are all capped
-/// (`GHSA-5p2h-fq6q-gwh9`).
+/// The location is rendered by [`safe_location`]: numeric pointer segments
+/// become a fixed marker (JSON Pointer alone does not prove array shape), and
+/// object member names survive only when the *configured schema* declares them
+/// as JSON properties. A hostile member name — which `jsonschema` places in the
+/// instance path for `propertyNames`, `patternProperties`,
+/// `additionalProperties`, and nested `required` failures — is replaced with a
+/// placeholder rather than echoed, and depth, segment count, and total length
+/// are all capped (`GHSA-5p2h-fq6q-gwh9`).
 fn schema_violation_message(
     error: &jsonschema::ValidationError<'_>,
     direction: Direction,
@@ -1370,8 +1376,10 @@ fn schema_violation_message(
 /// in any namespace, or Clark notation (`{http://example.com/ns}item`), which
 /// requires both the expanded namespace URI and the local name to match. A
 /// literal `{}local` requires the element to be in no namespace.
+///
+/// The configured spelling is retained only for matching; diagnostics never
+/// echo it (`GHSA-5p2h-fq6q-gwh9`).
 struct RequiredXmlElement {
-    display: String,
     namespace: Option<String>,
     local: String,
 }
@@ -1417,11 +1425,7 @@ fn parse_required_xml_elements(
                 "body_validator: '{field}' entry at index {index} has an invalid local element name"
             ));
         }
-        parsed.push(RequiredXmlElement {
-            display: entry,
-            namespace,
-            local,
-        });
+        parsed.push(RequiredXmlElement { namespace, local });
     }
     Ok(parsed)
 }
