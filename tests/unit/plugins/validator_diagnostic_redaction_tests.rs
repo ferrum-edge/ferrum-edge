@@ -23,8 +23,8 @@ use ferrum_edge::plugins::body_validator::BodyValidator;
 use ferrum_edge::plugins::openapi_validator::OpenapiValidator;
 use ferrum_edge::plugins::utils::validation_diagnostics::{
     MAX_DIAGNOSTIC_CHARS, MAX_RAW_SEGMENT_CHARS, MAX_SEGMENT_CHARS, NUMERIC_SEGMENT,
-    REDACTED_SEGMENT, ROOT_LOCATION, SafeFieldNames, UNKNOWN_KEYWORD, bound_detail, safe_keyword,
-    safe_location,
+    REDACTED_SEGMENT, ROOT_LOCATION, TRUNCATED_LOCATION_MARKER, SafeFieldNames, UNKNOWN_KEYWORD,
+    bound_detail, safe_keyword, safe_location, xml_error_category,
 };
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
 use serde_json::{Value, json};
@@ -842,5 +842,316 @@ async fn openapi_response_schema_path_defs_canary_is_not_disclosed() {
     assert!(
         !metadata.contains("/$defs/"),
         "raw schema paths must not appear: {metadata}"
+    );
+}
+
+// ───────────────────────── validation_diagnostics depth ─────────────────────
+
+#[test]
+fn safe_location_without_json_pointer_prefix_returns_root() {
+    let names = SafeFieldNames::default();
+    assert_eq!(
+        safe_location("payloadSegmentCanary", &names),
+        ROOT_LOCATION,
+        "non-pointer input must not echo payload text"
+    );
+}
+
+#[test]
+fn safe_location_malformed_escapes_never_echo_attacker_tokens() {
+    let names = SafeFieldNames::from_schema(&json!({
+        "type": "object",
+        "properties": {"a~b": {"type": "string"}}
+    }));
+    assert_eq!(safe_location("/a~0b", &names), "/a~b");
+    let hostile_escape = format!("/~2{CANARY}");
+    let rendered = safe_location(&hostile_escape, &names);
+    assert_no_disclosure(&rendered, "", CANARY);
+    assert_eq!(rendered, format!("/{REDACTED_SEGMENT}"));
+    assert_eq!(
+        safe_location("/trailing~", &names),
+        format!("/{REDACTED_SEGMENT}"),
+        "a dangling escape must not leak raw pointer bytes"
+    );
+}
+
+#[test]
+fn safe_location_redacts_post_unescape_oversized_segments() {
+    let names = SafeFieldNames::default();
+    let oversized = "z".repeat(MAX_SEGMENT_CHARS + 1);
+    assert_eq!(
+        safe_location(&format!("/{oversized}"), &names),
+        format!("/{REDACTED_SEGMENT}")
+    );
+}
+
+#[test]
+fn safe_location_truncates_on_total_character_budget() {
+    let first = "a".repeat(MAX_SEGMENT_CHARS);
+    let second = "b".repeat(MAX_SEGMENT_CHARS);
+    let names = SafeFieldNames::from_schema(&json!({
+        "type": "object",
+        "properties": {
+            (first.clone()): {"type": "string"},
+            (second.clone()): {"type": "string"}
+        }
+    }));
+    let rendered = safe_location(&format!("/{first}/{second}"), &names);
+    assert!(
+        rendered.ends_with(TRUNCATED_LOCATION_MARKER),
+        "location must stay within the compiled-in character ceiling: {rendered}"
+    );
+    assert!(
+        rendered.chars().count() <= 96 + TRUNCATED_LOCATION_MARKER.len(),
+        "rendered location grew without bound: {rendered}"
+    );
+}
+
+#[test]
+fn safe_field_names_collects_dependent_and_composed_schema_names() {
+    let names = SafeFieldNames::from_schema(&json!({
+        "type": "object",
+        "dependentRequired": {
+            "whenPresent": ["alsoRequired", "peerRequired"]
+        },
+        "dependentSchemas": {
+            "schemaTrigger": {
+                "properties": {"schemaSibling": {"type": "string"}}
+            }
+        },
+        "allOf": [{
+            "properties": {"allOfField": {"type": "string"}}
+        }],
+        "properties": {
+            "whenPresent": {"type": "string"},
+            "alsoRequired": {"type": "string"},
+            "peerRequired": {"type": "string"},
+            "schemaTrigger": {"type": "string"}
+        }
+    }));
+    for declared in [
+        "whenPresent",
+        "alsoRequired",
+        "peerRequired",
+        "schemaTrigger",
+        "schemaSibling",
+        "allOfField",
+    ] {
+        assert!(
+            names.allows(declared),
+            "schema-declared member {declared:?} must survive collection"
+        );
+    }
+}
+
+#[test]
+fn safe_field_names_collects_draft7_tuple_item_properties() {
+    let names = SafeFieldNames::from_schema(&json!({
+        "type": "array",
+        "items": [
+            {"type": "string"},
+            {
+                "type": "object",
+                "properties": {"tupleItemField": {"type": "integer"}}
+            }
+        ]
+    }));
+    assert!(names.allows("tupleItemField"));
+}
+
+#[test]
+fn safe_field_names_skips_oversized_required_names_and_deep_leaves() {
+    let oversized = "n".repeat(MAX_SEGMENT_CHARS + 1);
+    let shallow = SafeFieldNames::from_schema(&json!({"required": [oversized.clone()]}));
+    assert!(
+        !shallow.allows(&oversized),
+        "names longer than the segment ceiling must never be echoed"
+    );
+
+    fn nested(depth: usize) -> Value {
+        if depth == 0 {
+            return json!({
+                "type": "object",
+                "properties": {"deepLeaf": {"type": "string"}}
+            });
+        }
+        json!({
+            "type": "object",
+            "properties": {"inner": nested(depth - 1)}
+        })
+    }
+    let deep = SafeFieldNames::from_schema(&nested(30));
+    assert!(
+        !deep.allows("deepLeaf"),
+        "names beyond the schema walk budget must not be collected"
+    );
+    assert!(deep.allows("inner"), "shallow declared names must still survive");
+}
+
+#[test]
+fn xml_error_category_maps_representative_variants_to_fixed_text() {
+    use roxmltree::{Error as XmlError, TextPos};
+
+    let pos = TextPos::new(1, 1);
+    let cases: &[(&str, XmlError)] = &[
+        (
+            "entity references expand recursively",
+            XmlError::EntityReferenceLoop(pos),
+        ),
+        ("document has no root element", XmlError::NoRootNode),
+        (
+            "document exceeds the parser node budget",
+            XmlError::NodesLimitReached,
+        ),
+        (
+            "element has too many attributes",
+            XmlError::AttributesLimitReached,
+        ),
+        (
+            "document declares too many namespaces",
+            XmlError::NamespacesLimitReached,
+        ),
+        (
+            "XML declaration is misplaced or duplicated",
+            XmlError::UnexpectedDeclaration(pos),
+        ),
+        (
+            "document type declaration is not permitted",
+            XmlError::DtdDetected,
+        ),
+        (
+            "element or attribute name is not a valid XML name",
+            XmlError::InvalidName(pos),
+        ),
+        (
+            "document contains a character XML does not allow",
+            XmlError::NonXmlChar('\u{fffe}', pos),
+        ),
+        (
+            "unexpected character in markup",
+            XmlError::InvalidChar(b'<', b'>', pos),
+        ),
+        (
+            "unexpected character in markup",
+            XmlError::InvalidChar2("tag", b'!', pos),
+        ),
+        (
+            "unexpected token in markup",
+            XmlError::InvalidString("token", pos),
+        ),
+        (
+            "document ended before markup was complete",
+            XmlError::UnexpectedEndOfStream,
+        ),
+    ];
+    for (expected, error) in cases {
+        let category = xml_error_category(error);
+        assert_eq!(category, *expected, "unexpected mapping for {error:?}");
+        assert_no_disclosure(category, "", CANARY);
+        assert!(
+            !category.contains("TextPos"),
+            "category must not echo parser coordinates: {category}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn openapi_request_dependent_required_keeps_declared_path_only() {
+    let plugin = openapi_request_plugin(
+        json!({
+            "type": "object",
+            "properties": {
+                "whenPresent": {"type": "string"},
+                "alsoRequired": {"type": "string"}
+            },
+            "dependentRequired": {
+                "whenPresent": ["alsoRequired"]
+            }
+        }),
+        JSON,
+    );
+    let body = format!(r#"{{"whenPresent":"{CANARY}"}}"#);
+    let (status, detail, metadata) = oa_request_reject(&plugin, JSON, body.as_bytes()).await;
+
+    assert_eq!(status, 400);
+    assert_no_disclosure(&detail, &metadata, CANARY);
+    assert!(
+        metadata.contains("/alsoRequired"),
+        "dependentRequired child name is schema-declared: {metadata}"
+    );
+    assert!(
+        metadata.contains("dependentRequired") || metadata.contains(UNKNOWN_KEYWORD),
+        "allowlisted keyword must survive: {metadata}"
+    );
+}
+
+#[tokio::test]
+async fn openapi_request_tuple_items_failure_uses_declared_path() {
+    let plugin = openapi_request_plugin(
+        json!({
+            "type": "array",
+            "items": [
+                {"type": "string"},
+                {
+                    "type": "object",
+                    "properties": {"tupleItemField": {"type": "integer"}}
+                }
+            ]
+        }),
+        JSON,
+    );
+    let body = format!(r#"["ok", {{"tupleItemField":"{CANARY}"}}]"#);
+    let (status, detail, metadata) = oa_request_reject(&plugin, JSON, body.as_bytes()).await;
+
+    assert_eq!(status, 400);
+    assert_no_disclosure(&detail, &metadata, CANARY);
+    assert!(
+        metadata.contains(&format!("/{NUMERIC_SEGMENT}/tupleItemField")),
+        "tuple item index must use the numeric marker: {metadata}"
+    );
+    assert!(
+        metadata.contains("/tupleItemField"),
+        "schema-declared tuple property must survive: {metadata}"
+    );
+}
+
+#[tokio::test]
+async fn body_validator_request_xml_category_withholds_markup_bytes() {
+    let plugin = body_validator_with(json!({
+        "validate_xml": true,
+        "content_types": ["application/xml"]
+    }));
+    let body = format!("<root><id>{CANARY}</id></unclosed>");
+    let (status, detail) = bv_request_reject(&plugin, XML, body.as_bytes()).await;
+
+    assert_eq!(status, 400);
+    assert_no_disclosure(&detail, "", CANARY);
+    assert!(
+        detail.contains("element tags are not balanced")
+            || detail.contains("document ended before markup was complete"),
+        "malformed XML must surface only a fixed category: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn openapi_request_xml_dtd_is_a_fixed_category_not_a_declaration() {
+    let plugin = openapi_request_plugin(
+        json!({
+            "type": "object",
+            "properties": {"id": {"type": "integer"}}
+        }),
+        XML,
+    );
+    let body = format!(
+        "<!DOCTYPE {HOSTILE_MEMBER}><root><id>{CANARY}</id></root>"
+    );
+    let (status, detail, metadata) = oa_request_reject(&plugin, XML, body.as_bytes()).await;
+
+    assert_eq!(status, 400);
+    assert_no_disclosure(&detail, &metadata, CANARY);
+    assert_no_disclosure(&detail, &metadata, HOSTILE_MEMBER);
+    assert!(
+        metadata.contains("document type declaration is not permitted"),
+        "DTD rejection must stay value-free: {metadata}"
     );
 }
