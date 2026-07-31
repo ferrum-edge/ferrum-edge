@@ -1801,7 +1801,7 @@ impl KafkaLogging {
                 move |batch| {
                     let state = Arc::clone(&state);
                     let topic = topic.clone();
-                    async move { send_batch(&state, &topic, batch) }
+                    async move { send_batch(&state, &topic, &batch) }
                 }
             },
         );
@@ -2136,7 +2136,7 @@ pub(crate) fn probe_downstream_lease_ownership_for_test(
         byte_budget: Arc::clone(&byte_budget),
         finalized: AtomicBool::new(false),
     });
-    let _ = send_batch(&state, "ferrum-edge-downstream-ownership-probe", batch);
+    let _ = send_batch(&state, "ferrum-edge-downstream-ownership-probe", &batch);
     let instance_after_send = byte_budget.used();
     let ceiling_after_send = ceiling.used();
 
@@ -2550,7 +2550,7 @@ impl Plugin for KafkaLogging {
 fn send_batch(
     state: &Arc<KafkaProducerState>,
     topic: &str,
-    batch: Arc<[KafkaRecord]>,
+    batch: &[KafkaRecord],
 ) -> Result<(), String> {
     for record in batch.iter() {
         // `ThreadedProducer::send` is the non-blocking local-queue admission
@@ -2567,11 +2567,11 @@ fn send_batch(
         // per-instance budget and the process-wide ceiling, and
         // `KafkaDeliveryContext::delivery` performs the single release.
         //
-        // The shared logger passes an `Arc<[KafkaRecord]>` (single attempt for
-        // this sink). Cloning the lease Arc transfers accounting into the
-        // opaque without deep-cloning payload/key strings; dropping `batch`
-        // after admission releases Ferrum's handle while librdkafka retains
-        // its clone through delivery.
+        // The shared logger Arc-shares one `Arc<Vec<KafkaRecord>>` across the
+        // single attempt this sink configures. Cloning the lease Arc transfers
+        // accounting into the opaque without deep-cloning payload/key strings;
+        // dropping the shared batch after admission releases Ferrum's handle
+        // while librdkafka retains its clone through delivery.
         let lease = Arc::clone(&record.lease);
         let enqueue_error = match record.key.as_deref() {
             Some(key) => state

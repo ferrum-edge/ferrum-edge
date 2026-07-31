@@ -183,7 +183,7 @@ impl<T: Send + 'static> Drop for BatchingLoggerPermit<T> {
 
 /// Terminal failure handoff. Receives the same immutable shared batch every
 /// flush attempt used — never a deep-cloned `Vec<T>` of owned records.
-type FailedBatchHook<T> = Arc<dyn Fn(Arc<[T]>, String) + Send + Sync>;
+type FailedBatchHook<T> = Arc<dyn Fn(Arc<Vec<T>>, String) + Send + Sync>;
 /// Overflow handoff. Returns `true` only when the hook actually accepted
 /// ownership of the item (durable diversion, intentional shed, or equivalent).
 /// Returning `false` means the item was not accepted; callers must not treat
@@ -265,7 +265,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// publication). Dropping an uncommitted logger cancels the worker with no
     /// flush side effects.
     ///
-    /// `flush` is called with a non-empty shared `Arc<[T]>` whenever the batch
+    /// `flush` is called with a non-empty shared `Arc<Vec<T>>` whenever the batch
     /// is full OR the flush interval has elapsed with at least one buffered
     /// entry. Every retry attempt and the optional failed-batch hook receive
     /// another cheap `Arc` clone of that same immutable payload — records are
@@ -277,7 +277,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// flush drops the shared batch immediately (no post-success retention).
     pub fn spawn<F, Fut>(cfg: BatchConfig, flush: F) -> Self
     where
-        F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<Vec<T>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         Self::spawn_with_hooks(cfg, LoggerHooks::default(), flush)
@@ -287,7 +287,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// failed batches or overflow entries instead of dropping them.
     pub fn spawn_with_hooks<F, Fut>(cfg: BatchConfig, hooks: LoggerHooks<T>, flush: F) -> Self
     where
-        F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<Vec<T>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         let (commit_tx, commit_rx) = watch::channel(false);
@@ -305,7 +305,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
         flush: F,
     ) -> Self
     where
-        F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<Vec<T>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         let batch_size = cfg.batch_size.clamp(1, MAX_BATCH_SIZE);
@@ -652,7 +652,7 @@ impl<T: Send + 'static> DeferredBatchingLogger<T> {
         flush: F,
     ) -> Result<(), String>
     where
-        F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<Vec<T>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         if self.logger.get().is_some() {
@@ -689,7 +689,7 @@ impl<T: Send + 'static> DeferredBatchingLogger<T> {
         flush: F,
     ) -> Result<(), String>
     where
-        F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<Vec<T>>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         self.start_with_hooks(plugin_name, cfg, LoggerHooks::default(), flush)
@@ -922,7 +922,7 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
     on_failed_batch: Option<FailedBatchHook<T>>,
 ) where
     T: Send + 'static,
-    F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
+    F: Fn(Arc<Vec<T>>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), String>> + Send + 'static,
 {
     let mut buffer = Vec::with_capacity(cfg.batch_size);
@@ -1000,7 +1000,7 @@ async fn flush_with_retry<T, F, Fut>(
     on_failed_batch: Option<&FailedBatchHook<T>>,
 ) where
     T: Send + 'static,
-    F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
+    F: Fn(Arc<Vec<T>>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), String>> + Send + 'static,
 {
     let attempts = cfg.retry.max_attempts.max(1);
@@ -1008,7 +1008,7 @@ async fn flush_with_retry<T, F, Fut>(
     // One immutable shared payload for every attempt and the optional
     // failed-batch hook. `Arc::clone` only bumps a refcount — no deep copy of
     // owned records, and no transient byte-lease gap for retry copies.
-    let batch: Arc<[T]> = Arc::from(batch);
+    let batch = Arc::new(batch);
 
     for attempt in 1..=attempts {
         let attempt_batch = Arc::clone(&batch);

@@ -695,7 +695,7 @@ fn connect_gateway_pool_lazy() -> Result<GatewayAuditStore, String> {
 async fn insert_batch(
     pool: &AnyPool,
     dialect: AuditSqlDialect,
-    batch: Arc<[AuditRecord]>,
+    batch: Arc<Vec<AuditRecord>>,
 ) -> Result<(), String> {
     if batch.is_empty() {
         return Ok(());

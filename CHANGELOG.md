@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Shared `BatchingLogger` flush/retry/fallback now Arc-shares one immutable
-  batch payload (`Arc<[T]>`) across every delivery attempt and the optional
+  batch payload (`Arc<Vec<T>>`) across every delivery attempt and the optional
   failed-batch hook instead of deep-cloning owned records on each non-final
   attempt (#3029). Sink flush closures borrow or Arc-clone that handle; byte
   leases stay charged for the shared records' lifetime and release when the

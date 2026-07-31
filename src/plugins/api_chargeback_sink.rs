@@ -1610,7 +1610,7 @@ struct QueuedChargeEvent {
 }
 
 enum SpoolJob {
-    Events(Arc<[QueuedChargeEvent]>),
+    Events(Arc<Vec<QueuedChargeEvent>>),
     /// Snapshot cardinality/byte overflow charges. On durable write success the
     /// worker advances the overflow-spooled counters; on write/cancellation
     /// failure it re-stages the exact events into the accumulator's bounded
@@ -1750,7 +1750,7 @@ struct SpoolDelivery {
 }
 
 impl SpoolDelivery {
-    fn try_enqueue(&self, events: Arc<[QueuedChargeEvent]>, _reason: &'static str) -> bool {
+    fn try_enqueue(&self, events: Arc<Vec<QueuedChargeEvent>>, _reason: &'static str) -> bool {
         if events.is_empty() {
             return true;
         }
@@ -1835,10 +1835,11 @@ impl SpoolDelivery {
                         job.restage();
                         Ok(())
                     }
-                    SpoolJob::Events(events) => Err(match Arc::try_unwrap(events) {
-                        Ok(boxed) => boxed.into_vec(),
-                        Err(shared) => shared.iter().cloned().collect(),
-                    }),
+                    SpoolJob::Events(_) => {
+                        unreachable!(
+                            "try_enqueue_snapshot_overflow only enqueues SnapshotOverflow"
+                        );
+                    }
                 }
             }
         }
@@ -1893,7 +1894,7 @@ fn start_spool_delivery(
                     match job {
                         Some(SpoolJob::Events(queued_events)) => {
                             let event_count = queued_events.len();
-                            let Ok(boxed) = Arc::try_unwrap(queued_events) else {
+                            let Ok(queued_events) = Arc::try_unwrap(queued_events) else {
                                 // The spool channel moves the Arc; another
                                 // strong handle means an unexpected retain.
                                 // Refuse to deep-clone ChargeEvent records
@@ -1907,8 +1908,7 @@ fn start_spool_delivery(
                                     .fetch_sub(event_count, Ordering::Relaxed);
                                 continue;
                             };
-                            let (events, leases): (Vec<_>, Vec<_>) = boxed
-                                .into_vec()
+                            let (events, leases): (Vec<_>, Vec<_>) = queued_events
                                 .into_iter()
                                 .map(|queued| (queued.event, queued.lease))
                                 .unzip();
@@ -2843,7 +2843,7 @@ impl ApiChargebackSink {
                     invalidate_status_cache();
                     return true;
                 }
-                let accepted = overflow_enqueue.try_enqueue(Arc::from(vec![queued]), reason);
+                let accepted = overflow_enqueue.try_enqueue(Arc::new(vec![queued]), reason);
                 if accepted && reason == "queue high water" {
                     overflow_metrics
                         .queue_high_water_diversions_total
@@ -2854,7 +2854,7 @@ impl ApiChargebackSink {
             }) as Arc<dyn Fn(QueuedChargeEvent, &'static str) -> bool + Send + Sync>
         });
         let hooks = LoggerHooks {
-            on_failed_batch: Some(Arc::new(move |batch: Arc<[QueuedChargeEvent]>, error| {
+            on_failed_batch: Some(Arc::new(move |batch: Arc<Vec<QueuedChargeEvent>>, error| {
                 if snapshot_events_are_pre_spooled {
                     return;
                 }
@@ -2902,7 +2902,7 @@ impl ApiChargebackSink {
             commit_rx,
             {
                 let flush_config = flush_config.clone();
-                move |batch: Arc<[QueuedChargeEvent]>| {
+                move |batch: Arc<Vec<QueuedChargeEvent>>| {
                     let flush_config = flush_config.clone();
                     async move { send_batch(&flush_config, &batch).await }
                 }

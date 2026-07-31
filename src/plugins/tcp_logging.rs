@@ -982,7 +982,7 @@ mod tests {
         ];
 
         let started = tokio::time::Instant::now();
-        let stalled_err = match send_batch(&stalled_cfg, &writer, batch).await {
+        let stalled_err = match send_batch(&stalled_cfg, &writer, &batch).await {
             Ok(()) => panic!("write against a non-reading peer must time out"),
             Err(error) => error,
         };
@@ -1020,7 +1020,7 @@ mod tests {
                 .expect("small test payload must serialize"),
         ];
         must(
-            send_batch(&healthy_cfg, &writer, small_batch).await,
+            send_batch(&healthy_cfg, &writer, &small_batch).await,
             "healthy collector must accept the reconnecting send",
         );
         let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())

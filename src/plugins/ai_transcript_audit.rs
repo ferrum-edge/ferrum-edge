@@ -235,7 +235,7 @@ pub const JSON_WORST_CASE_EXPANSION: usize = 6;
 /// one byte to each of two retained copies covers `[` + commas + `]`.
 pub const RECORD_BATCH_FRAMING_BYTES: usize = 1;
 /// Fixed delivery-state allowance for the queue item, its shared `Bytes`
-/// allocation, the shared `Arc<[QueuedAuditRecord]>` batch handle, and lease
+/// allocation, the shared `Arc<Vec<QueuedAuditRecord>>` batch handle, and lease
 /// handles. Attacker-shaped content is charged exactly in addition to this
 /// allowance.
 pub const RECORD_DELIVERY_OVERHEAD_BYTES: usize = 128;
@@ -1241,7 +1241,7 @@ struct AuditRecord {
 ///
 /// `Bytes` keeps the queued payload immutable and cheap to share. The shared
 /// logger hands every flush attempt and the failed-batch hook an `Arc` clone of
-/// the same batch slice — never a deep clone of attacker-shaped strings/maps/
+/// the same shared batch — never a deep clone of attacker-shaped strings/maps/
 /// vectors. The lease remains live across queueing, exact-capacity batch
 /// assembly, the HTTP request, retries, and the failed-batch hook.
 #[derive(Clone)]
@@ -3469,7 +3469,7 @@ impl Plugin for AiTranscriptAudit {
         let healthy = Arc::clone(&self.sink_healthy);
         let hooks = LoggerHooks {
             on_failed_batch: Some(Arc::new(
-                move |_batch: Arc<[QueuedAuditRecord]>, _error: String| {
+                move |_batch: Arc<Vec<QueuedAuditRecord>>, _error: String| {
                     healthy.store(false, Ordering::Relaxed);
                 },
             )),
@@ -4560,7 +4560,7 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: &[QueuedAuditRecord]) -> Resul
     // Keep every entry lease alive until the request body and acknowledgement
     // are finished. Releasing earlier would let new queue admissions consume
     // the bytes while reqwest still retains the contiguous batch. The shared
-    // logger also retains the master `Arc<[QueuedAuditRecord]>` across retries;
+    // logger also retains the master `Arc<Vec<QueuedAuditRecord>>` across retries;
     // this attempt's borrow ends with the function.
     let _ = batch;
     result
