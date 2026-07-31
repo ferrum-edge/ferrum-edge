@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Kubernetes controller watch scopes now rebuild their reflector from an
+  authoritative list when they go idle past `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
+  (default `300`, `0` disables, clamped to `0`–`86400`). kube-rs raises an
+  error only when a watch *fails*, so a watch that stops delivering without
+  failing leaves the task alive while its reflector serves a permanently stale
+  object set and every later Gateway API / Istio resource stays invisible to
+  reconciles; `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` cannot recover it because it
+  re-reconciles that same store. A Gateway API conformance run captured that
+  signature — the TCPRoute `v1alpha2` scope initialized, four TCPRoutes existed
+  in the cluster, the sibling ReferenceGrant watcher kept receiving events, the
+  controller stayed alive and kept reconciling, and the TCPRoute store stayed
+  frozen with no watcher error, restart, or status write for 120s. That is
+  consistent with a silently stalled or black-holed watch; the artifact carries
+  no transport-level evidence of where the event stream was lost, so the
+  recovery is deliberately cause-agnostic and bounds any no-event stall. The
+  replacement generation is swapped in make-before-break — the previous store
+  keeps serving until the replacement reports `InitDone` — so a relist never
+  looks like a mass deletion, and a replacement that never finishes listing is
+  itself abandoned and retried without blanking the scope. Because bookmarks
+  are consumed inside kube-rs, a healthy quiet scope is indistinguishable from
+  a stalled one and relists on every window, so the window doubles as the
+  per-scope full-list rate against the API server; each scope's deadline
+  carries a bounded offset seeded per process, so neither the scopes on one
+  replica nor the replicas of one scope list in lockstep. Watcher task
+  ownership, the stream-end deregistration contract, and the CRD reprobe loop
+  are unchanged.
+
 - API-spec YAML ingestion now expands anchors and aliases through a bounded
   libyaml event graph (node, depth, alias-reference, expanded-byte, and work
   budgets) with cycle / undefined-alias / duplicate-anchor /
@@ -45,6 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Shared `BatchingLogger` flush/retry/fallback now Arc-shares one immutable
+  batch payload (`Arc<Vec<T>>`) across every delivery attempt and the optional
+  failed-batch hook instead of deep-cloning owned records on each non-final
+  attempt (#3029). Sink flush closures borrow or Arc-clone that handle; byte
+  leases stay charged for the shared records' lifetime and release when the
+  last Arc drops after success, terminal discard, or fallback ownership
+  transfer.
 - `proxy_alerts` / notification delivery now expose bounded-cardinality
   Prometheus delivery metrics (`attempted` / `succeeded` /
   `failed_transient` / `failed_permanent` / `backpressure_dropped` /

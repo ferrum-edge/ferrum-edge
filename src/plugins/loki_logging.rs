@@ -1124,7 +1124,7 @@ impl Plugin for LokiLogging {
         self.logger
             .start("loki_logging", self.batch_config, move |batch| {
                 let flush_config = flush_config.clone();
-                async move { send_batch(&flush_config, batch).await }
+                async move { send_batch(&flush_config, &batch).await }
             })
     }
 
@@ -1352,9 +1352,9 @@ fn next_loki_timestamp_ns(last_timestamp_ns: &AtomicU64) -> Result<String, Strin
 }
 
 /// Send a batch of entries to Loki.
-async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), String> {
+async fn send_batch(cfg: &LokiFlushConfig, batch: &[LokiEntry]) -> Result<(), String> {
     let entry_count = batch.len();
-    let (payload, content_encoding) = match build_loki_body(cfg, &batch) {
+    let (payload, content_encoding) = match build_loki_body(cfg, batch) {
         Ok(body) => body,
         Err(error) => {
             // Fixed-label, sampled loss accounting: under a saturated ceiling
@@ -1365,11 +1365,10 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), 
             return Ok(());
         }
     };
-    // The reserved payload is now the only representation delivery needs, so the
-    // queued entries release their leases here instead of at the end of the
-    // retry loop. Peak retention is the queue plus one bounded payload, never
-    // the queue plus a payload plus per-attempt copies.
-    drop(batch);
+    // The reserved payload is now the only per-attempt attacker-shaped
+    // representation. Queued entries remain under the shared logger's Arc
+    // across BatchingLogger retries; this borrow ends with the attempt.
+    let _ = batch;
     let attempts = cfg.retry.max_attempts.max(1);
 
     for attempt in 1..=attempts {

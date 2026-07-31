@@ -425,7 +425,7 @@ async fn try_send_batch_threshold_triggers_flush() {
             let notify = Arc::clone(&notify_clone);
             let flushed = Arc::clone(&flushed_clone);
             async move {
-                flushed.lock().unwrap().push(batch);
+                flushed.lock().unwrap().push(batch.to_vec());
                 notify.notify_one();
                 Ok(())
             }
@@ -453,7 +453,7 @@ async fn reserved_slot_excludes_concurrent_reservation_until_send() {
             let notify = Arc::clone(&notify_clone);
             let flushed = Arc::clone(&flushed_clone);
             async move {
-                flushed.lock().unwrap().push(batch);
+                flushed.lock().unwrap().push(batch.to_vec());
                 notify.notify_one();
                 Ok(())
             }
@@ -476,7 +476,7 @@ async fn reserved_slot_excludes_concurrent_reservation_until_send() {
 async fn dropping_unused_reservation_releases_capacity() {
     let logger = BatchingLogger::spawn(
         test_logger_config("batching_logger_reserve_drop", 1, 1),
-        move |_batch: Vec<u32>| async move { Ok(()) },
+        move |_batch: Arc<Vec<u32>>| async move { Ok(()) },
     );
 
     logger.commit();
@@ -504,7 +504,7 @@ async fn oversized_batch_size_is_capped_before_flush_loop() {
             retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
             plugin_name: "batching_logger_capped",
         },
-        move |batch: Vec<usize>| {
+        move |batch: Arc<Vec<usize>>| {
             let notify = Arc::clone(&notify_clone);
             let flushed_len = Arc::clone(&flushed_len_clone);
             async move {
@@ -540,7 +540,7 @@ async fn interval_timer_flushes_partial_batch() {
             let notify = Arc::clone(&notify_clone);
             let flushed = Arc::clone(&flushed_clone);
             async move {
-                flushed.lock().unwrap().push(batch);
+                flushed.lock().unwrap().push(batch.to_vec());
                 notify.notify_one();
                 Ok(())
             }
@@ -564,11 +564,11 @@ async fn retry_policy_retries_failed_flushes() {
 
     let logger = BatchingLogger::spawn(
         test_logger_config("batching_logger_retry", 1, 8),
-        move |batch: Vec<u32>| {
+        move |batch: Arc<Vec<u32>>| {
             let attempts = Arc::clone(&attempts_clone);
             let notify = Arc::clone(&notify_clone);
             async move {
-                assert_eq!(batch, vec![9]);
+                assert_eq!(batch.as_ref(), &[9]);
                 let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if attempt == 3 {
                     notify.notify_one();
@@ -605,7 +605,7 @@ async fn exhausted_retries_log_and_drop_batch() {
 
         let logger = BatchingLogger::spawn(
             test_logger_config("batching_logger_exhausted", 1, 8),
-            move |_batch: Vec<u32>| {
+            move |_batch: Arc<Vec<u32>>| {
                 let notify = Arc::clone(&notify_clone);
                 async move {
                     notify.notify_one();
@@ -639,7 +639,7 @@ async fn dropping_logger_drains_remaining_entries() {
             let notify = Arc::clone(&notify_clone);
             let flushed = Arc::clone(&flushed_clone);
             async move {
-                flushed.lock().unwrap().push(batch);
+                flushed.lock().unwrap().push(batch.to_vec());
                 notify.notify_one();
                 Ok(())
             }
@@ -669,7 +669,7 @@ async fn full_channel_warns_once_per_rate_limit_window() {
     {
         let logger = BatchingLogger::spawn(
             test_logger_config("batching_logger_drop", 10, 1),
-            move |_batch: Vec<u32>| async move {
+            move |_batch: Arc<Vec<u32>>| async move {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 Ok(())
             },
@@ -712,7 +712,7 @@ async fn high_water_hook_fires_without_overflow_hook() {
             high_watermark_percent: 1,
             ..LoggerHooks::default()
         },
-        move |_batch: Vec<u32>| async move {
+        move |_batch: Arc<Vec<u32>>| async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             Ok(())
         },
@@ -747,7 +747,7 @@ async fn without_overflow_hook_high_water_still_uses_full_capacity() {
             high_watermark_percent: 80,
             ..LoggerHooks::default()
         },
-        move |_batch: Vec<u32>| async move {
+        move |_batch: Arc<Vec<u32>>| async move {
             // Hold the flush worker so the bounded channel stays occupied.
             tokio::time::sleep(Duration::from_secs(60)).await;
             Ok(())
@@ -820,7 +820,7 @@ async fn try_send_outcome_distinguishes_accepted_vs_rejected_overflow() {
             high_watermark_percent: 1,
             ..LoggerHooks::default()
         },
-        move |_batch: Vec<u32>| async move {
+        move |_batch: Arc<Vec<u32>>| async move {
             tokio::time::sleep(Duration::from_secs(60)).await;
             Ok(())
         },
@@ -861,7 +861,7 @@ async fn try_send_outcome_distinguishes_buffer_full_from_worker_unavailable() {
             plugin_name: "batching_logger_full_vs_unavailable",
         },
         LoggerHooks::default(),
-        move |_batch: Vec<u32>| async move {
+        move |_batch: Arc<Vec<u32>>| async move {
             tokio::time::sleep(Duration::from_secs(60)).await;
             Ok(())
         },
@@ -877,7 +877,7 @@ async fn try_send_outcome_distinguishes_buffer_full_from_worker_unavailable() {
 
     let mut closed = BatchingLogger::spawn(
         test_logger_config("batching_logger_unavailable_outcome", 10, 1),
-        |_batch: Vec<u32>| async move { Ok(()) },
+        |_batch: Arc<Vec<u32>>| async move { Ok(()) },
     );
     closed.commit();
     assert!(closed.close_and_await().await);
@@ -892,14 +892,22 @@ async fn try_send_outcome_distinguishes_buffer_full_from_worker_unavailable() {
     );
 }
 
+/// Owned record with attacker-shaped payload bytes. `Clone` increments
+/// `clone_count` so tests can prove the shared logger never deep-copies
+/// records across retry/fallback paths.
 struct CloneTracked {
     value: u32,
+    payload: String,
     clone_count: Arc<AtomicUsize>,
 }
 
 impl CloneTracked {
-    fn new(value: u32, clone_count: Arc<AtomicUsize>) -> Self {
-        Self { value, clone_count }
+    fn new(value: u32, payload_bytes: usize, clone_count: Arc<AtomicUsize>) -> Self {
+        Self {
+            value,
+            payload: "x".repeat(payload_bytes),
+            clone_count,
+        }
     }
 }
 
@@ -908,13 +916,14 @@ impl Clone for CloneTracked {
         self.clone_count.fetch_add(1, Ordering::Relaxed);
         Self {
             value: self.value,
+            payload: self.payload.clone(),
             clone_count: Arc::clone(&self.clone_count),
         }
     }
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn single_attempt_flush_reuses_owned_batch_without_clone() {
+async fn single_attempt_flush_shares_arc_batch_without_record_clone() {
     let clone_count = Arc::new(AtomicUsize::new(0));
     let notify = Arc::new(Notify::new());
     let notify_clone = Arc::clone(&notify);
@@ -925,12 +934,13 @@ async fn single_attempt_flush_reuses_owned_batch_without_clone() {
             retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
             ..test_logger_config("batching_logger_single_attempt", 1, 8)
         },
-        move |batch: Vec<CloneTracked>| {
+        move |batch: Arc<Vec<CloneTracked>>| {
             let notify = Arc::clone(&notify_clone);
             let clone_count = Arc::clone(&clone_count_for_flush);
             async move {
                 assert_eq!(batch.len(), 1);
                 assert_eq!(batch[0].value, 11);
+                assert_eq!(batch[0].payload.len(), 64 * 1024);
                 assert_eq!(clone_count.load(Ordering::Relaxed), 0);
                 notify.notify_one();
                 Ok(())
@@ -940,28 +950,36 @@ async fn single_attempt_flush_reuses_owned_batch_without_clone() {
 
     logger.commit();
 
-    logger.try_send(CloneTracked::new(11, Arc::clone(&clone_count)));
+    logger.try_send(CloneTracked::new(11, 64 * 1024, Arc::clone(&clone_count)));
 
     wait_for_flush(&notify).await;
     assert_eq!(clone_count.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn retries_clone_only_before_final_attempt() {
+async fn retries_share_one_arc_batch_without_record_clones() {
     let clone_count = Arc::new(AtomicUsize::new(0));
     let attempts = Arc::new(AtomicUsize::new(0));
+    let batch_ptrs = Arc::new(Mutex::new(Vec::<usize>::new()));
     let notify = Arc::new(Notify::new());
     let notify_clone = Arc::clone(&notify);
     let attempts_clone = Arc::clone(&attempts);
+    let batch_ptrs_clone = Arc::clone(&batch_ptrs);
 
     let logger = BatchingLogger::spawn(
-        test_logger_config("batching_logger_clone_retries", 1, 8),
-        move |batch: Vec<CloneTracked>| {
+        test_logger_config("batching_logger_arc_retries", 1, 8),
+        move |batch: Arc<Vec<CloneTracked>>| {
             let notify = Arc::clone(&notify_clone);
             let attempts = Arc::clone(&attempts_clone);
+            let batch_ptrs = Arc::clone(&batch_ptrs_clone);
             async move {
                 assert_eq!(batch.len(), 1);
                 assert_eq!(batch[0].value, 22);
+                assert_eq!(batch[0].payload.len(), 128 * 1024);
+                batch_ptrs
+                    .lock()
+                    .unwrap()
+                    .push(Arc::as_ptr(&batch) as usize);
                 let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
                 if attempt == 3 {
                     notify.notify_one();
@@ -975,11 +993,186 @@ async fn retries_clone_only_before_final_attempt() {
 
     logger.commit();
 
-    logger.try_send(CloneTracked::new(22, Arc::clone(&clone_count)));
+    logger.try_send(CloneTracked::new(22, 128 * 1024, Arc::clone(&clone_count)));
 
     wait_for_flush(&notify).await;
     assert_eq!(attempts.load(Ordering::Relaxed), 3);
-    assert_eq!(clone_count.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        clone_count.load(Ordering::Relaxed),
+        0,
+        "retry must Arc-share the batch; records must not be deep-cloned"
+    );
+    let ptrs = batch_ptrs.lock().unwrap().clone();
+    assert_eq!(ptrs.len(), 3);
+    assert!(
+        ptrs.iter().all(|ptr| *ptr == ptrs[0]),
+        "every attempt must observe the same Arc<Vec<T>> allocation"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn large_multi_record_batch_retries_without_record_clones() {
+    let clone_count = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    let notify_clone = Arc::clone(&notify);
+    let attempts_clone = Arc::clone(&attempts);
+
+    let logger = BatchingLogger::spawn(
+        BatchConfig {
+            batch_size: 4,
+            ..test_logger_config("batching_logger_large_batch_retries", 4, 16)
+        },
+        move |batch: Arc<Vec<CloneTracked>>| {
+            let notify = Arc::clone(&notify_clone);
+            let attempts = Arc::clone(&attempts_clone);
+            async move {
+                assert_eq!(batch.len(), 4);
+                assert!(batch.iter().all(|record| record.payload.len() == 32 * 1024));
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                if attempt == 2 {
+                    notify.notify_one();
+                    Ok(())
+                } else {
+                    Err(format!("attempt {attempt} failed"))
+                }
+            }
+        },
+    );
+
+    logger.commit();
+
+    for value in 1..=4 {
+        assert!(logger.try_send(CloneTracked::new(
+            value,
+            32 * 1024,
+            Arc::clone(&clone_count)
+        )));
+    }
+
+    wait_for_flush(&notify).await;
+    assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    assert_eq!(clone_count.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_failure_without_fallback_discards_shared_batch_without_clones() {
+    let clone_count = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    let notify_clone = Arc::clone(&notify);
+    let attempts_clone = Arc::clone(&attempts);
+
+    let logger = BatchingLogger::spawn(
+        test_logger_config("batching_logger_terminal_no_fallback", 1, 8),
+        move |_batch: Arc<Vec<CloneTracked>>| {
+            let notify = Arc::clone(&notify_clone);
+            let attempts = Arc::clone(&attempts_clone);
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                if attempt == 3 {
+                    notify.notify_one();
+                }
+                Err(format!("attempt {attempt} failed"))
+            }
+        },
+    );
+
+    logger.commit();
+    logger.try_send(CloneTracked::new(7, 48 * 1024, Arc::clone(&clone_count)));
+    wait_for_flush(&notify).await;
+    // Allow the final warn/drop path to settle after the last attempt notifies.
+    tokio::task::yield_now().await;
+    assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    assert_eq!(clone_count.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_failure_with_fallback_receives_shared_batch_without_clones() {
+    let clone_count = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let fallback_ptr = Arc::new(Mutex::new(None::<usize>));
+    let attempt_ptrs = Arc::new(Mutex::new(Vec::<usize>::new()));
+    let notify = Arc::new(Notify::new());
+    let attempts_clone = Arc::clone(&attempts);
+    let attempt_ptrs_clone = Arc::clone(&attempt_ptrs);
+    let fallback_ptr_hook = Arc::clone(&fallback_ptr);
+    let clone_count_hook = Arc::clone(&clone_count);
+    let notify_hook = Arc::clone(&notify);
+
+    let logger = BatchingLogger::spawn_with_hooks(
+        test_logger_config("batching_logger_terminal_fallback", 1, 8),
+        LoggerHooks {
+            on_failed_batch: Some(Arc::new(move |batch: Arc<Vec<CloneTracked>>, error| {
+                assert!(error.contains("attempt 3 failed"));
+                assert_eq!(batch.len(), 1);
+                assert_eq!(batch[0].value, 42);
+                assert_eq!(batch[0].payload.len(), 96 * 1024);
+                *fallback_ptr_hook.lock().unwrap() = Some(Arc::as_ptr(&batch) as usize);
+                assert_eq!(clone_count_hook.load(Ordering::Relaxed), 0);
+                notify_hook.notify_one();
+            })),
+            ..LoggerHooks::default()
+        },
+        move |batch: Arc<Vec<CloneTracked>>| {
+            let attempts = Arc::clone(&attempts_clone);
+            let attempt_ptrs = Arc::clone(&attempt_ptrs_clone);
+            async move {
+                attempt_ptrs
+                    .lock()
+                    .unwrap()
+                    .push(Arc::as_ptr(&batch) as usize);
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                Err(format!("attempt {attempt} failed"))
+            }
+        },
+    );
+
+    logger.commit();
+    logger.try_send(CloneTracked::new(42, 96 * 1024, Arc::clone(&clone_count)));
+    wait_for_flush(&notify).await;
+
+    assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    assert_eq!(clone_count.load(Ordering::Relaxed), 0);
+    let ptrs = attempt_ptrs.lock().unwrap().clone();
+    let fallback = fallback_ptr.lock().unwrap().expect("fallback must run");
+    assert_eq!(ptrs.len(), 3);
+    assert!(ptrs.iter().all(|ptr| *ptr == fallback));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn close_after_commit_drains_shared_batch_without_record_clones() {
+    let clone_count = Arc::new(AtomicUsize::new(0));
+    let flushed = Arc::new(AtomicUsize::new(0));
+    let flushed_clone = Arc::clone(&flushed);
+
+    let mut logger = BatchingLogger::spawn(
+        BatchConfig {
+            batch_size: 10,
+            flush_interval: Duration::from_secs(60),
+            ..test_logger_config("batching_logger_close_shared_batch", 10, 8)
+        },
+        move |batch: Arc<Vec<CloneTracked>>| {
+            let flushed = Arc::clone(&flushed_clone);
+            async move {
+                assert_eq!(batch.len(), 2);
+                assert!(batch.iter().all(|record| record.payload.len() == 16 * 1024));
+                flushed.fetch_add(batch.len(), Ordering::SeqCst);
+                Ok(())
+            }
+        },
+    );
+
+    logger.commit();
+    assert!(logger.try_send(CloneTracked::new(1, 16 * 1024, Arc::clone(&clone_count))));
+    assert!(logger.try_send(CloneTracked::new(2, 16 * 1024, Arc::clone(&clone_count))));
+
+    let closed = timeout(Duration::from_secs(1), logger.close_and_await())
+        .await
+        .expect("close must drain without hanging");
+    assert!(closed);
+    assert_eq!(flushed.load(Ordering::SeqCst), 2);
+    assert_eq!(clone_count.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -1033,7 +1226,7 @@ async fn batching_logger_close_and_await_aborts_when_uncommitted() {
     let flushed_cb = Arc::clone(&flushed);
     let mut logger = BatchingLogger::spawn(
         test_logger_config("batching_logger_uncommitted_close", 1, 8),
-        move |batch: Vec<u32>| {
+        move |batch: Arc<Vec<u32>>| {
             flushed_cb.fetch_add(batch.len(), Ordering::SeqCst);
             async move { Ok(()) }
         },
@@ -1057,7 +1250,7 @@ async fn committed_close_drains_with_published_handle_still_alive() {
     let flushed_cb = Arc::clone(&flushed);
     let mut logger = BatchingLogger::spawn(
         test_logger_config("batching_logger_structured_close", 10, 8),
-        move |batch: Vec<u32>| {
+        move |batch: Arc<Vec<u32>>| {
             flushed_cb.fetch_add(batch.len(), Ordering::SeqCst);
             async move { Ok(()) }
         },

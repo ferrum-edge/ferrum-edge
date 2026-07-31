@@ -17,10 +17,10 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     encode_spool_bytes_without_ratio_padding_for_tests, new_ulid,
     probe_charge_body_materialization_for_tests,
     probe_charge_body_materialization_with_projection_for_tests,
-    probe_compact_recovery_retry_for_tests, render_prometheus, render_status_json,
-    replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
-    replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
-    serialize_json_each_row_projected, set_spool_write_hook_for_tests,
+    probe_compact_recovery_retry_for_tests, probe_shared_spool_batch_clone_for_tests,
+    render_prometheus, render_status_json, replay_spool_once_for_tests,
+    replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
+    serialize_json_each_row, serialize_json_each_row_projected, set_spool_write_hook_for_tests,
     spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
     spool_decompression_limit_for_tests, spool_index_entry_bytes_for_tests,
     spool_replay_peak_bytes_for_tests, spool_split_worklist_max_entries_for_tests,
@@ -7254,6 +7254,103 @@ fn compact_snapshot_recovery_owns_its_reservation_and_restores_deltas_on_a_faile
         after_drop, 0,
         "dropping the recovery releases its reservation exactly once"
     );
+}
+
+/// Shared-owner `SpoolJob::Events` recovery (#3029): when the delivery worker
+/// cannot take unique ownership of the failed-batch Arc, it must reserve the
+/// duplicate ChargeEvent payload against the process ceiling before cloning,
+/// hold that reservation through the blocking write, and release it afterward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn shared_spool_batch_clone_reserves_duplicate_bytes_until_write_completes() {
+    let spool_ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let clone_ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let spool = Arc::new(ceiling_spool(&temp, spool_ceiling));
+    let events = vec![sample_event("shared-clone-admit")];
+
+    let probe =
+        probe_shared_spool_batch_clone_for_tests(Arc::clone(&spool), events, clone_ceiling).await;
+
+    assert!(probe.clone_bytes > 0);
+    let held = probe
+        .ceiling_used_while_clone_held
+        .expect("BeforeWrite must observe the clone reservation");
+    assert!(
+        held >= probe
+            .ceiling_used_baseline
+            .saturating_add(probe.clone_bytes),
+        "clone reservation must charge the injected ceiling before the duplicate \
+         payload is written; baseline={} held={} clone_bytes={}",
+        probe.ceiling_used_baseline,
+        held,
+        probe.clone_bytes
+    );
+    assert_eq!(
+        probe.ceiling_used_after, probe.ceiling_used_baseline,
+        "clone reservation must release exactly once after the blocking write"
+    );
+    assert_eq!(
+        probe.jobs_written, 1,
+        "admitted shared clone must write once"
+    );
+    assert_eq!(
+        probe.jobs_lost, 0,
+        "admitted shared clone must not count as loss"
+    );
+    assert_eq!(
+        probe.durable_owned_files, 1,
+        "admitted shared clone must leave one durable spool artifact"
+    );
+    assert_eq!(
+        spool_ceiling.used(),
+        0,
+        "spool artifact reservations release after the write completes"
+    );
+    assert_eq!(
+        clone_ceiling.used(),
+        0,
+        "the isolated clone ceiling must return to zero"
+    );
+}
+
+/// Shared-owner recovery must fail closed when its clone ceiling cannot admit
+/// the duplicate payload: no durable write, one spool-job loss, no lasting charge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn shared_spool_batch_clone_refuses_with_an_isolated_saturated_ceiling() {
+    let spool_ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let clone_ceiling = leaked_chargeback_test_ceiling(1);
+    let temp = tempfile::tempdir().unwrap();
+    let spool = Arc::new(ceiling_spool(&temp, spool_ceiling));
+    let events = vec![sample_event("shared-clone-refuse")];
+
+    let probe =
+        probe_shared_spool_batch_clone_for_tests(Arc::clone(&spool), events, clone_ceiling).await;
+
+    assert!(probe.clone_bytes > 0);
+    assert!(
+        probe.ceiling_used_while_clone_held.is_none(),
+        "refused clone must never reach the spool write hook"
+    );
+    assert_eq!(
+        probe.jobs_written, 0,
+        "ceiling refusal must not produce a durable write"
+    );
+    assert_eq!(
+        probe.jobs_lost, 1,
+        "ceiling refusal must record exactly one spool job loss"
+    );
+    assert_eq!(
+        probe.durable_owned_files, 0,
+        "ceiling refusal must leave no owned spool artifacts"
+    );
+    assert_eq!(
+        probe.ceiling_used_after, probe.ceiling_used_baseline,
+        "a refused clone must not leave a lasting injected-ceiling charge"
+    );
+    assert_eq!(clone_ceiling.used(), 0);
+    assert_eq!(spool_ceiling.used(), 0);
 }
 
 #[test]
