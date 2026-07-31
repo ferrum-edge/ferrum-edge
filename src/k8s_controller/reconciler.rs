@@ -19,14 +19,13 @@ use crate::grpc::mesh_server::{MeshConfigBroadcast, MeshGrpcServer};
 use crate::identity::spiffe::TrustDomain;
 use crate::k8s_controller::ControllerTaskRegistry;
 use crate::k8s_controller::istio_status::{
-    IstioStatusWriter, plan_istio_status_updates, plan_istio_status_updates_budgeted,
+    IstioStatusWriter, plan_istio_status_updates_budgeted,
 };
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
 use crate::k8s_controller::status::{
     GatewayApiStatusContext, GatewayApiStatusWriter, StatusTranslationReuse,
     gateway_api_data_plane_service_ready, plan_gateway_api_status_updates_budgeted,
-    plan_gateway_api_status_updates_with_context,
 };
 use crate::k8s_controller::status_plan::{DEFAULT_STATUS_PLAN_WORK_BUDGET, StatusPlanBudget};
 use crate::k8s_controller::watcher::namespaces_with_istio_root;
@@ -744,16 +743,16 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         // (see [`shared_status_objects_snapshot`]). Deployments that don't
         // watch Gateway API / Istio CRDs (the default) pay zero per-
         // reconcile move cost.
-        run_status_patchers(
-            ctx.gateway_status_writer,
-            ctx.istio_status_writer,
+        run_status_patchers(StatusPatchersRequest {
+            gateway_writer: ctx.gateway_status_writer,
+            istio_writer: ctx.istio_status_writer,
             objects,
-            &options,
-            Some(&translation.route_conflicts),
+            options: &options,
+            route_conflicts: Some(&translation.route_conflicts),
             gateway_api_status_context,
-            Some(&status_reuse),
-            &ctx.metrics,
-        )
+            translation_reuse: Some(&status_reuse),
+            metrics: &ctx.metrics,
+        })
         .await;
         let elapsed = start.elapsed();
         ctx.metrics.last_reconcile_duration_ms.store(
@@ -764,16 +763,16 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     };
 
     // Same shared-snapshot contract as the no-change branch above.
-    run_status_patchers(
-        ctx.gateway_status_writer,
-        ctx.istio_status_writer,
+    run_status_patchers(StatusPatchersRequest {
+        gateway_writer: ctx.gateway_status_writer,
+        istio_writer: ctx.istio_status_writer,
         objects,
-        &options,
-        Some(&translation.route_conflicts),
+        options: &options,
+        route_conflicts: Some(&translation.route_conflicts),
         gateway_api_status_context,
-        Some(&status_reuse),
-        &ctx.metrics,
-    )
+        translation_reuse: Some(&status_reuse),
+        metrics: &ctx.metrics,
+    })
     .await;
 
     let elapsed = start.elapsed();
@@ -817,6 +816,18 @@ pub(crate) fn shared_status_objects_snapshot(
     Some(Arc::<[K8sObject]>::from(objects))
 }
 
+/// Inputs for one reconcile's Gateway API / Istio status patch dispatch.
+struct StatusPatchersRequest<'a> {
+    gateway_writer: Option<GatewayApiStatusWriter>,
+    istio_writer: Option<IstioStatusWriter>,
+    objects: Vec<K8sObject>,
+    options: &'a K8sTranslationOptions,
+    route_conflicts: Option<&'a [crate::config_sources::k8s::GatewayApiRouteConflict]>,
+    gateway_api_status_context: GatewayApiStatusContext,
+    translation_reuse: Option<&'a StatusTranslationReuse>,
+    metrics: &'a ControllerMetrics,
+}
+
 /// Dispatch to whichever status patchers are configured.
 ///
 /// Both writers observe the same immutable object generation
@@ -825,16 +836,17 @@ pub(crate) fn shared_status_objects_snapshot(
 /// handling. Writers are taken by value so they can be moved into the helper
 /// futures (required for `tokio::spawn`'s HRTB Send check — see the
 /// `Send is not general enough` history in `spawn_reconcile_loop`).
-async fn run_status_patchers(
-    gateway_writer: Option<GatewayApiStatusWriter>,
-    istio_writer: Option<IstioStatusWriter>,
-    objects: Vec<K8sObject>,
-    options: &K8sTranslationOptions,
-    route_conflicts: Option<&[crate::config_sources::k8s::GatewayApiRouteConflict]>,
-    gateway_api_status_context: GatewayApiStatusContext,
-    translation_reuse: Option<&StatusTranslationReuse>,
-    metrics: &ControllerMetrics,
-) {
+async fn run_status_patchers(request: StatusPatchersRequest<'_>) {
+    let StatusPatchersRequest {
+        gateway_writer,
+        istio_writer,
+        objects,
+        options,
+        route_conflicts,
+        gateway_api_status_context,
+        translation_reuse,
+        metrics,
+    } = request;
     let Some(snapshot) =
         shared_status_objects_snapshot(objects, gateway_writer.is_some(), istio_writer.is_some())
     else {
@@ -938,7 +950,7 @@ fn gateway_api_status_context(
 }
 
 /// T2-B: emit `status.conditions[]` patches for the Istio CRDs supported
-/// by [`plan_istio_status_updates`]. No-op when the writer wasn't built
+/// by [`crate::k8s_controller::istio_status::plan_istio_status_updates`]. No-op when the writer wasn't built
 /// (Istio CRD watching is off, or kube client unavailable) or when the
 /// plan is empty (no supported Istio CRDs in the snapshot). Failures
 /// are logged and never abort reconcile. Shares the same immutable
@@ -1262,6 +1274,59 @@ fn canonical_json_sort_key(value: &Value) -> String {
     }
 }
 
+fn translate_with_skip_retries(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+    metrics: &ControllerMetrics,
+) -> Option<(
+    K8sTranslation,
+    std::collections::HashMap<crate::config_sources::k8s::K8sResourceKey, K8sTranslateError>,
+)> {
+    let outcome = translate_k8s_objects_collecting_skips(objects, options);
+    if let Some((_, ref errors)) = outcome {
+        let skipped = errors.len() as u64;
+        if skipped > 0 {
+            metrics
+                .errors
+                .fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
+            for error in errors.values() {
+                log_skipped_resource(error);
+            }
+        }
+    } else {
+        metrics
+            .errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        error!("K8s translation failed repeatedly on the same resource");
+    }
+    outcome
+}
+
+fn log_skipped_resource(error: &K8sTranslateError) {
+    match error {
+        K8sTranslateError::Unsupported(resource) => {
+            warn!(
+                kind = resource.kind,
+                namespace = resource.namespace,
+                name = resource.name,
+                reason = resource.reason,
+                "Unsupported K8s resource skipped"
+            );
+        }
+        K8sTranslateError::InvalidResource {
+            kind,
+            namespace,
+            name,
+            message,
+        } => {
+            warn!(
+                kind,
+                namespace, name, message, "Invalid K8s resource, skipping"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1270,7 +1335,9 @@ mod tests {
     };
     use crate::config_sources::k8s::{K8sMetadata, K8sObject};
     use crate::identity::spiffe::SpiffeId;
+    use crate::k8s_controller::istio_status::plan_istio_status_updates;
     use crate::k8s_controller::resource_store::CrdResourceStore;
+    use crate::k8s_controller::status::plan_gateway_api_status_updates_with_context;
     use crate::modes::mesh::config::{
         MeshConfig, MeshPolicy, MeshService, PolicyScope, Workload, WorkloadRef, WorkloadSelector,
     };
@@ -2402,58 +2469,5 @@ mod tests {
             ready,
             "timed-out readiness should continue with available stores"
         );
-    }
-}
-
-fn translate_with_skip_retries(
-    objects: &[K8sObject],
-    options: K8sTranslationOptions,
-    metrics: &ControllerMetrics,
-) -> Option<(
-    K8sTranslation,
-    std::collections::HashMap<crate::config_sources::k8s::K8sResourceKey, K8sTranslateError>,
-)> {
-    let outcome = translate_k8s_objects_collecting_skips(objects, options);
-    if let Some((_, ref errors)) = outcome {
-        let skipped = errors.len() as u64;
-        if skipped > 0 {
-            metrics
-                .errors
-                .fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
-            for error in errors.values() {
-                log_skipped_resource(error);
-            }
-        }
-    } else {
-        metrics
-            .errors
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        error!("K8s translation failed repeatedly on the same resource");
-    }
-    outcome
-}
-
-fn log_skipped_resource(error: &K8sTranslateError) {
-    match error {
-        K8sTranslateError::Unsupported(resource) => {
-            warn!(
-                kind = resource.kind,
-                namespace = resource.namespace,
-                name = resource.name,
-                reason = resource.reason,
-                "Unsupported K8s resource skipped"
-            );
-        }
-        K8sTranslateError::InvalidResource {
-            kind,
-            namespace,
-            name,
-            message,
-        } => {
-            warn!(
-                kind,
-                namespace, name, message, "Invalid K8s resource, skipping"
-            );
-        }
     }
 }
