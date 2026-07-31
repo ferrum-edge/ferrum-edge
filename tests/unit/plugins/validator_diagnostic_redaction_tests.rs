@@ -1079,8 +1079,12 @@ async fn openapi_request_dependent_required_keeps_declared_path_only() {
     assert_eq!(status, 400);
     assert_no_disclosure(&detail, &metadata, CANARY);
     assert!(
-        metadata.contains("/alsoRequired"),
-        "dependentRequired child name is schema-declared: {metadata}"
+        metadata.contains(ROOT_LOCATION),
+        "missing dependent member failures report the containing object: {metadata}"
+    );
+    assert!(
+        !metadata.contains("/alsoRequired"),
+        "a missing dependent member must not appear as an instance path: {metadata}"
     );
     assert!(
         metadata.contains("dependentRequired") || metadata.contains(UNKNOWN_KEYWORD),
@@ -1093,7 +1097,7 @@ async fn openapi_request_tuple_items_failure_uses_declared_path() {
     let plugin = openapi_request_plugin(
         json!({
             "type": "array",
-            "items": [
+            "prefixItems": [
                 {"type": "string"},
                 {
                     "type": "object",
