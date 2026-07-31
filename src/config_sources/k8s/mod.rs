@@ -1035,6 +1035,68 @@ where
     Ok(acc.finish())
 }
 
+/// O(1)-average skipped-object membership that preserves
+/// [`K8sResourceKey::matches_object`] without cloning per candidate (#2397).
+///
+/// Exact `(api_version, kind, namespace, name)` keys match only that version;
+/// a versionless (empty `api_version`) key matches any API version for the
+/// same kind/namespace/name. Nested `String`-keyed maps accept borrowed
+/// `&str` lookups via `Borrow<str>`.
+struct SkippedObjectIdentities {
+    /// Non-empty api_version: kind → namespace → name → api_versions
+    exact: HashMap<String, HashMap<String, HashMap<String, HashSet<String>>>>,
+    /// Empty api_version: kind → namespace → names
+    versionless: HashMap<String, HashMap<String, HashSet<String>>>,
+}
+
+impl SkippedObjectIdentities {
+    fn new() -> Self {
+        Self {
+            exact: HashMap::new(),
+            versionless: HashMap::new(),
+        }
+    }
+
+    fn insert_key(&mut self, key: &K8sResourceKey) {
+        if key.api_version.is_empty() {
+            self.versionless
+                .entry(key.kind.clone())
+                .or_default()
+                .entry(key.namespace.clone())
+                .or_default()
+                .insert(key.name.clone());
+        } else {
+            self.exact
+                .entry(key.kind.clone())
+                .or_default()
+                .entry(key.namespace.clone())
+                .or_default()
+                .entry(key.name.clone())
+                .or_default()
+                .insert(key.api_version.clone());
+        }
+    }
+
+    fn contains_object(&self, object: &K8sObject) -> bool {
+        let kind = object.kind.as_str();
+        let namespace = object.metadata.namespace.as_str();
+        let name = object.metadata.name.as_str();
+        if self
+            .versionless
+            .get(kind)
+            .and_then(|by_ns| by_ns.get(namespace))
+            .is_some_and(|names| names.contains(name))
+        {
+            return true;
+        }
+        self.exact
+            .get(kind)
+            .and_then(|by_ns| by_ns.get(namespace))
+            .and_then(|by_name| by_name.get(name))
+            .is_some_and(|versions| versions.contains(object.api_version.as_str()))
+    }
+}
+
 /// Translate the snapshot while collecting per-object failures that were
 /// skipped so a later object could succeed.
 ///
@@ -1048,15 +1110,11 @@ pub fn translate_k8s_objects_collecting_skips(
     let mut skipped = std::collections::HashMap::new();
     // Identity membership for the include filter — O(1) average, never
     // `skipped.keys().any(matches_object)` which is O(objects × errors) (#2397).
-    let mut skipped_identities = std::collections::HashSet::<(String, String, String)>::new();
+    let mut skipped_identities = SkippedObjectIdentities::new();
 
     loop {
         let translation = translate_k8s_objects_with_filter(objects, options.clone(), |object| {
-            !skipped_identities.contains(&(
-                object.kind.clone(),
-                object.metadata.namespace.clone(),
-                object.metadata.name.clone(),
-            ))
+            !skipped_identities.contains_object(object)
         });
 
         match translation {
@@ -1064,30 +1122,34 @@ pub fn translate_k8s_objects_collecting_skips(
             Err(error) => {
                 let key = objects
                     .iter()
-                    .find(|object| match &error {
-                        K8sTranslateError::Unsupported(resource) => {
-                            object.kind == resource.kind
-                                && object.metadata.namespace == resource.namespace
-                                && object.metadata.name == resource.name
+                    .find(|object| {
+                        // Prefer an object that is not already skipped so an
+                        // exact-version sibling can still be identified after
+                        // its peer was filtered out (#2397).
+                        if skipped_identities.contains_object(object) {
+                            return false;
                         }
-                        K8sTranslateError::InvalidResource {
-                            kind,
-                            namespace,
-                            name,
-                            ..
-                        } => {
-                            object.kind == *kind
-                                && object.metadata.namespace == *namespace
-                                && object.metadata.name == *name
+                        match &error {
+                            K8sTranslateError::Unsupported(resource) => {
+                                object.kind == resource.kind
+                                    && object.metadata.namespace == resource.namespace
+                                    && object.metadata.name == resource.name
+                            }
+                            K8sTranslateError::InvalidResource {
+                                kind,
+                                namespace,
+                                name,
+                                ..
+                            } => {
+                                object.kind == *kind
+                                    && object.metadata.namespace == *namespace
+                                    && object.metadata.name == *name
+                            }
                         }
                     })
                     .map(K8sResourceKey::from_object)
                     .unwrap_or_else(|| K8sResourceKey::from_error(&error));
-                skipped_identities.insert((
-                    key.kind.clone(),
-                    key.namespace.clone(),
-                    key.name.clone(),
-                ));
+                skipped_identities.insert_key(&key);
                 if skipped.insert(key, error).is_some() {
                     return None;
                 }

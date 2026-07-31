@@ -290,6 +290,124 @@ impl StatusTranslationReuse {
     }
 }
 
+/// Named-or-wildcard allow set for one ReferenceGrant `(from × to kind)` cell.
+///
+/// Built once per reconcile; lookups are allocation-free (#2397).
+struct ReferenceGrantNameAllow<'a> {
+    wildcard: bool,
+    names: HashSet<&'a str>,
+}
+
+impl<'a> Default for ReferenceGrantNameAllow<'a> {
+    fn default() -> Self {
+        Self {
+            wildcard: false,
+            names: HashSet::new(),
+        }
+    }
+}
+
+impl<'a> ReferenceGrantNameAllow<'a> {
+    fn insert(&mut self, to_name: Option<&'a str>) {
+        match to_name {
+            None => {
+                self.wildcard = true;
+                self.names.clear();
+            }
+            Some(name) if !self.wildcard => {
+                self.names.insert(name);
+            }
+            Some(_) => {}
+        }
+    }
+
+    fn allows(&self, to_name: Option<&str>) -> bool {
+        if self.wildcard {
+            return true;
+        }
+        to_name.is_some_and(|name| self.names.contains(name))
+    }
+}
+
+/// Immutable per-reconcile ReferenceGrant permission index.
+///
+/// Every valid `from × to` combination is recorded once under the grant's
+/// target namespace. Lookups are O(1)-average and borrow `&str` keys — never
+/// scan or reparse grant objects per certificate/backend reference (#2397).
+struct ReferenceGrantPermissionIndex<'a> {
+    /// to_namespace → (from_ns, from_group, from_kind) → (to_group, to_kind) → names
+    entries: HashMap<
+        &'a str,
+        HashMap<
+            (&'a str, &'a str, &'a str),
+            HashMap<(&'a str, &'a str), ReferenceGrantNameAllow<'a>>,
+        >,
+    >,
+}
+
+impl<'a> Default for ReferenceGrantPermissionIndex<'a> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<'a> ReferenceGrantPermissionIndex<'a> {
+    fn ingest(&mut self, grant: &'a K8sObject) {
+        let to_namespace = grant.metadata.namespace.as_str();
+        let Some(from_entries) = grant.spec.get("from").and_then(Value::as_array) else {
+            return;
+        };
+        let Some(to_entries) = grant.spec.get("to").and_then(Value::as_array) else {
+            return;
+        };
+        for from in from_entries {
+            let Some(from_namespace) = from.get("namespace").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(from_kind) = from.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            let from_group = from.get("group").and_then(Value::as_str).unwrap_or_default();
+            for to in to_entries {
+                let Some(to_kind) = to.get("kind").and_then(Value::as_str) else {
+                    continue;
+                };
+                let to_group = to.get("group").and_then(Value::as_str).unwrap_or_default();
+                // Missing / non-string `name` is wildcard — same as the prior
+                // `is_none_or` scan semantics.
+                let to_name = to.get("name").and_then(Value::as_str);
+                self.entries
+                    .entry(to_namespace)
+                    .or_default()
+                    .entry((from_namespace, from_group, from_kind))
+                    .or_default()
+                    .entry((to_group, to_kind))
+                    .or_default()
+                    .insert(to_name);
+            }
+        }
+    }
+
+    fn allows(
+        &self,
+        from_namespace: &str,
+        from_group: &str,
+        from_kind: &str,
+        to_namespace: &str,
+        to_group: &str,
+        to_kind: &str,
+        to_name: Option<&str>,
+    ) -> bool {
+        self.entries
+            .get(to_namespace)
+            .and_then(|by_from| by_from.get(&(from_namespace, from_group, from_kind)))
+            .and_then(|by_to| by_to.get(&(to_group, to_kind)))
+            .is_some_and(|allow| allow.allows(to_name))
+    }
+}
+
 /// Immutable per-reconcile indexes for Gateway API status planning.
 struct GatewayApiStatusIndexes<'a> {
     gateway_classes_by_name: HashMap<&'a str, &'a K8sObject>,
@@ -302,7 +420,8 @@ struct GatewayApiStatusIndexes<'a> {
     /// Built once so attachedRoutes and listener evaluation never rescan the
     /// full snapshot per listener (#2397).
     routes_by_gateway: HashMap<(&'a str, &'a str), Vec<&'a K8sObject>>,
-    reference_grants_by_ns: HashMap<&'a str, Vec<&'a K8sObject>>,
+    /// Precomputed ReferenceGrant from×to permissions (not raw grant vectors).
+    reference_grant_permissions: ReferenceGrantPermissionIndex<'a>,
     has_any_service: bool,
     conflicts_by_loser: HashMap<K8sResourceKey, Vec<&'a GatewayApiRouteConflict>>,
 }
@@ -315,7 +434,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
         let mut services_by_ns_name = HashMap::new();
         let mut namespaces_by_name = HashMap::new();
         let mut routes_by_gateway: HashMap<(&str, &str), Vec<&K8sObject>> = HashMap::new();
-        let mut reference_grants_by_ns: HashMap<&str, Vec<&K8sObject>> = HashMap::new();
+        let mut reference_grant_permissions = ReferenceGrantPermissionIndex::default();
         let mut has_any_service = false;
 
         for object in objects {
@@ -355,10 +474,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
                     namespaces_by_name.insert(object.metadata.name.as_str(), object);
                 }
                 "ReferenceGrant" => {
-                    reference_grants_by_ns
-                        .entry(object.metadata.namespace.as_str())
-                        .or_default()
-                        .push(object);
+                    reference_grant_permissions.ingest(object);
                 }
                 "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => {
                     let mut seen_parents = HashSet::new();
@@ -405,7 +521,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
             services_by_ns_name,
             namespaces_by_name,
             routes_by_gateway,
-            reference_grants_by_ns,
+            reference_grant_permissions,
             has_any_service,
             conflicts_by_loser,
         }
@@ -840,49 +956,15 @@ fn reference_grant_allows_secret_indexed(
     to_namespace: &str,
     secret_name: &str,
 ) -> bool {
-    indexes
-        .reference_grants_by_ns
-        .get(to_namespace)
-        .into_iter()
-        .flatten()
-        .any(|grant| {
-            reference_grant_has_from(grant, from_namespace)
-                && reference_grant_has_secret_to(grant, secret_name)
-        })
-}
-
-fn reference_grant_has_from(grant: &K8sObject, from_namespace: &str) -> bool {
-    grant
-        .spec
-        .get("from")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|from| {
-            from.get("group")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                == "gateway.networking.k8s.io"
-                && from.get("kind").and_then(Value::as_str) == Some("Gateway")
-                && from.get("namespace").and_then(Value::as_str) == Some(from_namespace)
-        })
-}
-
-fn reference_grant_has_secret_to(grant: &K8sObject, secret_name: &str) -> bool {
-    grant
-        .spec
-        .get("to")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|to| {
-            to.get("group").and_then(Value::as_str).unwrap_or_default() == ""
-                && to.get("kind").and_then(Value::as_str) == Some("Secret")
-                && to
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_none_or(|name| name == secret_name)
-        })
+    indexes.reference_grant_permissions.allows(
+        from_namespace,
+        "gateway.networking.k8s.io",
+        "Gateway",
+        to_namespace,
+        "",
+        "Secret",
+        Some(secret_name),
+    )
 }
 
 fn gateway_status(
@@ -2530,55 +2612,15 @@ fn reference_grant_allows_backend_ref(
     to_kind: &str,
     to_name: Option<&str>,
 ) -> bool {
-    indexes
-        .reference_grants_by_ns
-        .get(to_namespace)
-        .into_iter()
-        .flatten()
-        .any(|grant| {
-            reference_grant_has_route_from(grant, route)
-                && reference_grant_has_backend_to(grant, to_group, to_kind, to_name)
-        })
-}
-
-fn reference_grant_has_route_from(grant: &K8sObject, route: &K8sObject) -> bool {
-    grant
-        .spec
-        .get("from")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|from| {
-            from.get("group")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                == api_group(&route.api_version)
-                && from.get("kind").and_then(Value::as_str) == Some(route.kind.as_str())
-                && from.get("namespace").and_then(Value::as_str)
-                    == Some(route.metadata.namespace.as_str())
-        })
-}
-
-fn reference_grant_has_backend_to(
-    grant: &K8sObject,
-    to_group: &str,
-    to_kind: &str,
-    to_name: Option<&str>,
-) -> bool {
-    grant
-        .spec
-        .get("to")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .any(|to| {
-            to.get("group").and_then(Value::as_str).unwrap_or_default() == to_group
-                && to.get("kind").and_then(Value::as_str) == Some(to_kind)
-                && to
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_none_or(|name| Some(name) == to_name)
-        })
+    indexes.reference_grant_permissions.allows(
+        route.metadata.namespace.as_str(),
+        api_group(&route.api_version),
+        route.kind.as_str(),
+        to_namespace,
+        to_group,
+        to_kind,
+        to_name,
+    )
 }
 
 fn api_group(api_version: &str) -> &str {
