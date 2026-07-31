@@ -20,8 +20,6 @@ use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
 };
 
-pub use crate::k8s_controller::status_plan::DEFAULT_STATUS_PLAN_WORK_BUDGET;
-
 pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 /// Stable server-side-apply owner shared by every Ferrum controller replica.
 /// Using the Gateway API controller name keeps ownership stable across restarts

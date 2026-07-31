@@ -885,7 +885,7 @@ fn multiple_gateways_and_listeners_attached_routes_stay_scoped() {
     assert_eq!(attached_b, Some(2), "edge-b sees route-b and route-both");
 }
 
-fn condition_status(status: &Value, condition_type: &str) -> Option<&str> {
+fn condition_status<'a>(status: &'a Value, condition_type: &str) -> Option<&'a str> {
     status
         .pointer("/parents/0/conditions")
         .or_else(|| status.pointer("/listeners/0/conditions"))
@@ -897,7 +897,7 @@ fn condition_status(status: &Value, condition_type: &str) -> Option<&str> {
         .and_then(|condition| condition.get("status").and_then(Value::as_str))
 }
 
-fn condition_reason(status: &Value, condition_type: &str) -> Option<&str> {
+fn condition_reason<'a>(status: &'a Value, condition_type: &str) -> Option<&'a str> {
     status
         .pointer("/parents/0/conditions")
         .or_else(|| status.pointer("/listeners/0/conditions"))
