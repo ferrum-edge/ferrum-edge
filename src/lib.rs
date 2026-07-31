@@ -6247,6 +6247,7 @@ pub mod _test_support {
     /// Generation 0's store is pre-registered exactly as `start_crd_watchers`
     /// registers it. Streams past `generations` never yield and never end, so a
     /// test cannot accidentally trip the stream-end deregistration path.
+    #[allow(clippy::too_many_arguments)]
     pub fn k8s_watch_scope_for_test(
         group: &str,
         version: &str,
