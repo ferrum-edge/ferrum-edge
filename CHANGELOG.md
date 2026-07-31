@@ -45,6 +45,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `body_validator` and `openapi_validator` validation diagnostics no longer
+  disclose the rejected representation (GHSA-5p2h-fq6q-gwh9). Both plugins used
+  to format the offending instance value — or a payload-chosen JSON, XML, form,
+  or multipart member name — into the string returned in the client-visible
+  reject / problem body and stored in `openapi_validator.request_error` /
+  `openapi_validator.response_error`, which every configured logging plugin
+  exports. On the response side that republished exactly the upstream
+  representation validation exists to withhold, letting a client that can
+  trigger an invalid backend response read back a token, credential, or PII
+  field; on the request side it copied caller credentials into gateway
+  telemetry and every downstream sink. Diagnostics are now assembled under a
+  centralized construction contract
+  (`plugins::utils::validation_diagnostics`): a compiled-in failure category, the
+  operator-controlled JSON Schema path, and — request side only — a bounded
+  instance location. Array indices in that location survive verbatim; an object
+  member name survives only when the *configured schema declares it*, and every
+  other segment renders as `~`, so a hostile member name is replaced rather
+  than sanitized after the fact. Segment count, segment length, and total
+  diagnostic length are capped by compiled-in constants. No production path
+  formats a rejected value, an expected `enum` / `const` constant, a raw
+  `jsonschema` / `roxmltree` / `prost` rendering, a backend `Content-Type`, or
+  the request target, so there is nothing left for truncation to protect and no
+  raw-detail escape hatch in configuration or tracing. Response-side conversion
+  and decode failures collapse further, to a single fixed sentence, because
+  even the class of failure describes an upstream representation the client was
+  never entitled to observe. `error_truncate_chars` is retained as a size bound
+  and now only narrows (`min(configured, 256)`). JSON, XML, form, multipart,
+  protobuf, and gRPC validation decisions, statuses, and fail-closed behavior
+  are unchanged; `openapi_validator`'s unknown-operation detail no longer
+  interpolates the request method and target.
+
 - Irreversible request egress no longer precedes request-body transformation or
   final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
   `serverless_function` previously ran their external dispatch in

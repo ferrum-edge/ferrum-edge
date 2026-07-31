@@ -5,6 +5,24 @@
 //! compact schema type/shape metadata are compiled at plugin construction time;
 //! request-time work is limited to operation matching, optional decompression,
 //! media-type parsing, O(1) conversion metadata lookups, and schema validation.
+//!
+//! # Diagnostic confidentiality
+//!
+//! Violation details are written to two places with different audiences: the
+//! client-visible problem body, and the `openapi_validator.request_error` /
+//! `openapi_validator.response_error` metadata entries that every configured
+//! logging plugin exports. Both are therefore built under the contract in
+//! [`super::utils::validation_diagnostics`]: a compiled-in category, an
+//! operator-controlled schema path, and — request side only — a bounded
+//! instance location whose object-member segments survive only when the
+//! configured schema declares them.
+//!
+//! No conversion helper below formats a rejected scalar, a payload-chosen JSON
+//! / XML / form / multipart member name, an `roxmltree` parse token, or a
+//! `jsonschema` `Display` rendering into its error string
+//! (`GHSA-5p2h-fq6q-gwh9`). `error_truncate_chars` bounds the size of the
+//! result; it is not what makes it safe, and it cannot be raised into a
+//! disclosure.
 
 use ahash::AHashMap;
 use async_trait::async_trait;
@@ -22,6 +40,10 @@ use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
+use super::utils::validation_diagnostics::{
+    MAX_DIAGNOSTIC_CHARS, SafeFieldNames, bound_detail, safe_keyword, safe_location,
+    xml_error_category,
+};
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -42,6 +64,38 @@ const CONTRACT_PHASE_KEY: &str = "openapi_validator.request_contract_phase";
 /// Config key for the media-refusal status. Named once so the parse site stays
 /// inside the line budget.
 const UNSUPPORTED_MEDIA_STATUS_KEY: &str = "unsupported_media_type_status_code";
+/// Fixed-cardinality XML conversion diagnostics.
+///
+/// None of these echoes a document-derived element name, attribute name, or
+/// namespace URI: those are payload bytes, and this string is copied into both
+/// the client-visible problem body and the exported transaction metadata
+/// (`GHSA-5p2h-fq6q-gwh9`).
+const XML_ATTRIBUTE_COLLISION_DETAIL: &str =
+    "XML attribute collides with a modeled property name but does not match its modeled XML construct or namespace";
+const XML_ELEMENT_COLLISION_DETAIL: &str =
+    "XML element collides with a modeled property name but does not match its modeled XML construct or namespace";
+const XML_DUPLICATE_ATTRIBUTE_DETAIL: &str =
+    "XML attributes sharing a local name cannot be represented unambiguously";
+const XML_ATTRIBUTE_ELEMENT_CONFLICT_DETAIL: &str =
+    "XML attribute and element sharing a local name cannot be represented unambiguously";
+const XML_NAMESPACE_CONFLICT_DETAIL: &str =
+    "XML elements sharing a local name across namespaces cannot be represented unambiguously";
+/// Fixed-cardinality multipart / scalar conversion diagnostics. Neither the
+/// rejected value nor the payload-chosen part name is interpolated.
+const MULTIPART_DISPOSITION_TYPE_DETAIL: &str =
+    "Malformed multipart part: Content-Disposition type must be form-data";
+const MULTIPART_FIELD_NOT_UTF8_DETAIL: &str = "Multipart field is not UTF-8";
+const COMPOSED_SCALAR_CONVERSION_DETAIL: &str =
+    "No compatible composed-schema scalar conversion for the supplied value";
+const SCALAR_CONVERSION_DETAIL: &str = "Unsupported scalar conversion for the supplied value";
+/// Fixed-cardinality detail for the unknown-operation class.
+///
+/// The request method and target are deliberately not interpolated: the detail
+/// is copied into `RequestContext.metadata` for every logging sink, and a
+/// request target can carry a credential in a path segment
+/// (`GHSA-5p2h-fq6q-gwh9`). Loggers already record the method and path in their
+/// own dedicated summary fields.
+const UNMATCHED_OPERATION_DETAIL: &str = "No OpenAPI operation matched this request";
 /// Fixed-cardinality media-refusal diagnostics. Neither echoes the received
 /// `Content-Type` nor any byte of the rejected body.
 const UNDECLARED_MEDIA_DETAIL: &str = "Request Content-Type is not declared for this operation";
@@ -205,6 +259,10 @@ struct MediaValidator {
     conversion: ConversionPlan,
     /// Per-property OpenAPI Encoding Objects for form-urlencoded / multipart.
     encoding: AHashMap<String, PropertyEncoding>,
+    /// Member names declared by this media entry's schema. Only these may be
+    /// rendered into a violation location; every other instance-path segment is
+    /// payload-derived and is redacted (`GHSA-5p2h-fq6q-gwh9`).
+    safe_names: SafeFieldNames,
 }
 
 #[derive(Default)]
@@ -402,6 +460,9 @@ struct EncodingHeaderValidator {
     content_media_type: Option<String>,
     /// Conversion plan for structured `content` decoding (JSON/XML/text/…).
     conversion: ConversionPlan,
+    /// Declared member names for safe violation locations
+    /// (`GHSA-5p2h-fq6q-gwh9`).
+    safe_names: SafeFieldNames,
 }
 
 /// Hostile-input caps for multipart parsing (RFC 2046 / RFC 7578).
@@ -673,6 +734,10 @@ impl OpenapiValidator {
         let error_content_type = optional_string_from_object(error_response, "content_type")?
             .unwrap_or_else(|| "application/problem+json".to_string());
         validate_concrete_media_type(&error_content_type, "error_response.content_type")?;
+        // Accepted for compatibility, but only ever narrows: the effective cap
+        // is `min(configured, MAX_DIAGNOSTIC_CHARS)`. Raising it can no longer
+        // widen a disclosure, because diagnostics carry no payload bytes to
+        // reveal (`GHSA-5p2h-fq6q-gwh9`).
         let error_truncate_chars =
             optional_usize(object, "error_truncate_chars")?.unwrap_or(DEFAULT_ERROR_TRUNCATE_CHARS);
 
@@ -860,6 +925,15 @@ impl OpenapiValidator {
     /// class that is not a schema failure (currently only "no declared media
     /// type covers this representation" → 415). `None` keeps the configured
     /// per-side status.
+    ///
+    /// Every `detail` reaching this function is payload-free by construction
+    /// (`GHSA-5p2h-fq6q-gwh9`): callers assemble it from compiled-in categories,
+    /// operator-controlled schema paths, and [`safe_location`] output. That
+    /// matters because the same string lands in two places with different
+    /// audiences — the client-visible problem body and the
+    /// `openapi_validator.request_error` / `.response_error` metadata entries,
+    /// which every configured logging plugin exports. `truncate_chars` bounds
+    /// the size; it is not what makes the value safe.
     fn handle_violation_with_status(
         &self,
         ctx: &mut RequestContext,
@@ -1023,11 +1097,7 @@ impl OpenapiValidator {
                     ctx,
                     ValidationSide::Request,
                     None,
-                    format!(
-                        "No OpenAPI operation matched {} {}",
-                        ctx.method.as_str(),
-                        ctx.path.as_str()
-                    ),
+                    UNMATCHED_OPERATION_DETAIL.to_string(),
                 );
             }
             self.mark_skip(ctx, "no_match");
@@ -1154,11 +1224,7 @@ impl Plugin for OpenapiValidator {
                 ctx,
                 ValidationSide::Request,
                 None,
-                format!(
-                    "No OpenAPI operation matched {} {}",
-                    ctx.method.as_str(),
-                    ctx.path.as_str()
-                ),
+                UNMATCHED_OPERATION_DETAIL.to_string(),
             ),
             None => {
                 self.mark_skip(ctx, "no_match");
@@ -1338,11 +1404,7 @@ impl Plugin for OpenapiValidator {
                     ctx,
                     ValidationSide::Response,
                     None,
-                    format!(
-                        "No OpenAPI operation matched {} {}",
-                        ctx.method.as_str(),
-                        ctx.path.as_str()
-                    ),
+                    UNMATCHED_OPERATION_DETAIL.to_string(),
                 );
             }
             self.mark_skip(ctx, "no_match");
@@ -1814,11 +1876,13 @@ fn compile_media_validator(
     let schema = Arc::new(schema.clone());
     let conversion = ConversionPlan::compile(schema.as_ref(), schema_draft)?;
     let encoding = parse_encoding_map(encoding, media_type, schema.as_ref(), schema_draft)?;
+    let safe_names = SafeFieldNames::from_schema(schema.as_ref());
     Ok(MediaValidator {
         schema,
         validator,
         conversion,
         encoding,
+        safe_names,
     })
 }
 
@@ -2310,6 +2374,7 @@ fn parse_property_encoding(
                     validator,
                     content_media_type,
                     conversion,
+                    safe_names: SafeFieldNames::from_schema(schema_value),
                 },
             );
         }
@@ -2410,10 +2475,13 @@ fn validate_media_body(
     .map_err(|error| match side {
         ValidationSide::Request => error,
         ValidationSide::Response => {
-            // Conversion errors can contain backend-controlled scalar,
-            // multipart, XML, or header values. Schema failures below have a
-            // structured safe formatter; conversion failures deliberately
-            // expose no backend bytes.
+            // Every conversion helper is now payload-free by construction
+            // (`GHSA-5p2h-fq6q-gwh9`), so this collapse is no longer the
+            // confidentiality mechanism. It is retained as a second, coarser
+            // response-side boundary: the *class* of a decode failure still
+            // describes the shape of an upstream representation the client was
+            // never entitled to observe, and a future helper that regresses
+            // cannot reach the client through this path.
             "Response body could not be safely decoded or converted for schema validation"
                 .to_string()
         }
@@ -2422,7 +2490,7 @@ fn validate_media_body(
         SchemaInstance::Value(instance) => validator
             .validator
             .validate(&instance)
-            .map_err(|error| format_schema_error(&error, side)),
+            .map_err(|error| format_schema_error(&error, side, &validator.safe_names)),
         SchemaInstance::BinaryLengthOnly => Ok(()),
     }
 }
@@ -2486,8 +2554,11 @@ fn xml_body_to_value(
     schema: &Value,
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
-    let doc =
-        roxmltree::Document::parse(body).map_err(|error| format!("Invalid XML body: {error}"))?;
+    // The `roxmltree` error rendering quotes the offending source token, so it
+    // is reduced to a fixed well-formedness category before it can reach a
+    // client body or transaction metadata (`GHSA-5p2h-fq6q-gwh9`).
+    let doc = roxmltree::Document::parse(body)
+        .map_err(|error| format!("Invalid XML body: {}", xml_error_category(&error)))?;
     let root = doc.root_element();
     let expected_root = xml_name(schema, None);
     let expected_namespace = xml_namespace(schema);
@@ -2495,26 +2566,16 @@ fn xml_body_to_value(
     let root_namespace_matches =
         expected_namespace.is_none_or(|namespace| root.tag_name().namespace() == Some(namespace));
     if !root_local_matches || !root_namespace_matches {
-        return Err(match (expected_root, expected_namespace) {
-            (Some(local), Some(namespace)) => format!(
-                "XML root element '{}{}' does not match schema xml.name '{}' in namespace '{}'",
-                xml_namespace_display(root.tag_name().namespace()),
-                root.tag_name().name(),
-                local,
-                namespace
-            ),
-            (Some(local), None) => format!(
-                "XML root element '{}' does not match schema xml.name '{}'",
-                root.tag_name().name(),
-                local
-            ),
-            (None, Some(namespace)) => format!(
-                "XML root namespace '{}' does not match schema xml.namespace '{}'",
-                root.tag_name().namespace().unwrap_or(""),
-                namespace
-            ),
-            (None, None) => "XML root metadata did not match the schema".to_string(),
-        });
+        // Only the schema-declared expectation is reported. The actual root
+        // element name and namespace URI come from the inspected document and
+        // are never echoed.
+        let expectation = match (expected_root, expected_namespace) {
+            (Some(name), Some(ns)) => format!("xml.name '{name}' in namespace '{ns}'"),
+            (Some(name), None) => format!("xml.name '{name}'"),
+            (None, Some(ns)) => format!("xml.namespace '{ns}'"),
+            (None, None) => "the schema XML metadata".to_string(),
+        };
+        return Err(format!("XML root element does not match {expectation}"));
     }
     xml_node_to_value(root, schema, conversion)
 }
@@ -2603,10 +2664,7 @@ fn xml_node_to_value(
                 continue;
             }
             if modeled_names.reserves_json_key(attr.name()) {
-                return Err(format!(
-                    "XML attribute '{}' collides with a modeled property name but does not match its modeled XML construct or namespace",
-                    attr.name()
-                ));
+                return Err(XML_ATTRIBUTE_COLLISION_DETAIL.to_string());
             }
             let member_schema = conversion
                 .pattern_property_schema(object_schema, attr.name())
@@ -2617,10 +2675,7 @@ fn xml_node_to_value(
             };
             additional_attribute_locals.insert(attr.name().to_string());
             if out.insert(attr.name().to_string(), value).is_some() {
-                return Err(format!(
-                    "XML attributes sharing local name '{}' cannot be represented unambiguously",
-                    attr.name()
-                ));
+                return Err(XML_DUPLICATE_ATTRIBUTE_DETAIL.to_string());
             }
         }
         for child in node.children().filter(roxmltree::Node::is_element) {
@@ -2629,21 +2684,15 @@ fn xml_node_to_value(
             }
             let name = child.tag_name().name();
             if modeled_names.reserves_json_key(name) {
-                return Err(format!(
-                    "XML element '{name}' collides with a modeled property name but does not match its modeled XML construct or namespace"
-                ));
+                return Err(XML_ELEMENT_COLLISION_DETAIL.to_string());
             }
             if additional_attribute_locals.contains(name) {
-                return Err(format!(
-                    "XML attribute and element sharing local name '{name}' cannot be represented unambiguously"
-                ));
+                return Err(XML_ATTRIBUTE_ELEMENT_CONFLICT_DETAIL.to_string());
             }
             let namespace = child.tag_name().namespace();
             if let Some(previous_namespace) = additional_element_names.get(name) {
                 if previous_namespace.as_deref() != namespace {
-                    return Err(format!(
-                        "XML elements sharing local name '{name}' across namespaces cannot be represented unambiguously"
-                    ));
+                    return Err(XML_NAMESPACE_CONFLICT_DETAIL.to_string());
                 }
             } else {
                 additional_element_names.insert(name.to_string(), namespace.map(str::to_string));
@@ -2780,10 +2829,7 @@ fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Result<Value, Str
             )
             .is_some()
         {
-            return Err(format!(
-                "XML attributes sharing local name '{}' cannot be represented unambiguously",
-                attr.name()
-            ));
+            return Err(XML_DUPLICATE_ATTRIBUTE_DETAIL.to_string());
         }
     }
     let children: Vec<_> = node
@@ -2804,16 +2850,12 @@ fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Result<Value, Str
     for child in children {
         let local = child.tag_name().name();
         if attribute_locals.contains(local) {
-            return Err(format!(
-                "XML attribute and element sharing local name '{local}' cannot be represented unambiguously"
-            ));
+            return Err(XML_ATTRIBUTE_ELEMENT_CONFLICT_DETAIL.to_string());
         }
         let namespace = child.tag_name().namespace();
         if let Some(previous_namespace) = element_names.get(local) {
             if previous_namespace.as_deref() != namespace {
-                return Err(format!(
-                    "XML elements sharing local name '{local}' across namespaces cannot be represented unambiguously"
-                ));
+                return Err(XML_NAMESPACE_CONFLICT_DETAIL.to_string());
             }
         } else {
             element_names.insert(local.to_string(), namespace.map(str::to_string));
@@ -3045,9 +3087,7 @@ fn parse_multipart_parts(body: &[u8], boundary: &str) -> Result<Vec<MultipartPar
         };
         let (disposition_type, params) = parse_header_type_and_params(disposition)?;
         if !disposition_type.eq_ignore_ascii_case("form-data") {
-            return Err(format!(
-                "Malformed multipart part: Content-Disposition type must be form-data (got '{disposition_type}')"
-            ));
+            return Err(MULTIPART_DISPOSITION_TYPE_DETAIL.to_string());
         }
         let Some(name) = params
             .get("name")
@@ -3383,9 +3423,7 @@ fn object_tokens_to_value(
             return Err("Serialized object property contains an empty key".to_string());
         }
         if out.contains_key(&key) {
-            return Err(format!(
-                "Serialized object property contains duplicate key '{key}'"
-            ));
+            return Err("Serialized object property contains a duplicate key".to_string());
         }
         let child_schema = properties.get(&key).unwrap_or(&Value::Null);
         out.insert(
@@ -3684,9 +3722,8 @@ fn multipart_parts_to_schema_object(
             let joined = values
                 .iter()
                 .map(|part| {
-                    std::str::from_utf8(&part.body).map_err(|error| {
-                        format!("Multipart field '{}' is not UTF-8: {error}", part.name)
-                    })
+                    std::str::from_utf8(&part.body)
+                        .map_err(|_| MULTIPART_FIELD_NOT_UTF8_DETAIL.to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?
                 .join(match property_encoding.map(|enc| enc.style) {
@@ -3837,7 +3874,7 @@ fn serialized_multipart_object_to_value(
         );
     }
     let text = std::str::from_utf8(&values[0].body)
-        .map_err(|error| format!("Multipart field '{}' is not UTF-8: {error}", values[0].name))?;
+        .map_err(|_| MULTIPART_FIELD_NOT_UTF8_DETAIL.to_string())?;
     object_tokens_to_value(split_decoded_style_value(text, style), schema, conversion)
 }
 
@@ -3866,9 +3903,8 @@ fn multipart_values_to_schema_value(
         let joined = values
             .iter()
             .map(|part| {
-                std::str::from_utf8(&part.body).map_err(|error| {
-                    format!("Multipart field '{}' is not UTF-8: {error}", part.name)
-                })
+                std::str::from_utf8(&part.body)
+                    .map_err(|_| MULTIPART_FIELD_NOT_UTF8_DETAIL.to_string())
             })
             .collect::<Result<Vec<_>, _>>()?
             .join(match encoding.map(|enc| enc.style) {
@@ -3879,12 +3915,10 @@ fn multipart_values_to_schema_value(
         return values_to_schema_value(&[joined], schema, encoding, conversion);
     }
     if values.len() != 1 {
-        let field = values
-            .first()
-            .map(|part| part.name.as_str())
-            .unwrap_or("field");
+        // The multipart `name` parameter is payload-derived, so only the
+        // repetition count is reported (`GHSA-5p2h-fq6q-gwh9`).
         return Err(format!(
-            "Multipart field '{field}' occurs {} times but the schema expects a scalar",
+            "Multipart field occurs {} times but the schema expects a scalar",
             values.len()
         ));
     }
@@ -3942,6 +3976,10 @@ fn multipart_part_to_schema_value(
     encoding: Option<&PropertyEncoding>,
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
+    // Every diagnostic below names the *declared* encoding header, which is
+    // operator-controlled, and never `part.name` — a multipart `name` parameter
+    // is chosen by whoever produced the body (`GHSA-5p2h-fq6q-gwh9`). The
+    // enclosing property is already reported by the caller's own location.
     if let Some(encoding) = encoding {
         if let Some(expected) = &encoding.content_type {
             let actual = part
@@ -3952,8 +3990,7 @@ fn multipart_part_to_schema_value(
                 .unwrap_or("text/plain");
             if !content_type_matches_encoding(actual, expected) {
                 return Err(format!(
-                    "Multipart field '{}' content type '{actual}' does not match encoding contentType '{expected}'",
-                    part.name
+                    "Multipart field content type does not match encoding contentType '{expected}'"
                 ));
             }
         }
@@ -3961,16 +3998,14 @@ fn multipart_part_to_schema_value(
             let Some(header_value) = part.headers.get(header_name) else {
                 if header_validator.required {
                     return Err(format!(
-                        "Multipart field '{}' is missing required encoding header '{header_name}'",
-                        part.name
+                        "Multipart field is missing required encoding header '{header_name}'"
                     ));
                 }
                 continue;
             };
             if header_value.len() > MAX_MULTIPART_HEADER_BYTES {
                 return Err(format!(
-                    "Multipart field '{}' header '{header_name}' exceeds {MAX_MULTIPART_HEADER_BYTES} bytes",
-                    part.name
+                    "Multipart field header '{header_name}' exceeds {MAX_MULTIPART_HEADER_BYTES} bytes"
                 ));
             }
             let converted = if let Some(media_type) = &header_validator.content_media_type {
@@ -3982,8 +4017,7 @@ fn multipart_part_to_schema_value(
                 )
                 .map_err(|error| {
                     format!(
-                        "Multipart field '{}' header '{header_name}' failed content decoding: {error}",
-                        part.name
+                        "Multipart field header '{header_name}' failed content decoding: {error}"
                     )
                 })?
             } else {
@@ -3999,9 +4033,14 @@ fn multipart_part_to_schema_value(
                 .validator
                 .validate(&converted)
                 .map_err(|error| {
+                    let schema_path = error.schema_path().to_string();
+                    let keyword = safe_keyword(&schema_path);
+                    let location = safe_location(
+                        &error.instance_path().to_string(),
+                        &header_validator.safe_names,
+                    );
                     format!(
-                        "Multipart field '{}' header '{header_name}' failed validation: {error}",
-                        part.name
+                        "Multipart field header '{header_name}' failed validation at {location} (keyword '{keyword}')"
                     )
                 })?;
         }
@@ -4022,19 +4061,14 @@ fn multipart_part_to_schema_value(
                 // bounded fragment that is never the whole body another plugin
                 // re-screens, so it could only evict useful entries.
                 if let Some(reason) = screen_json_ambiguity(&part.body, None) {
-                    return Err(format!("Multipart field '{}': {reason}", part.name));
+                    return Err(format!("Multipart field: {reason}"));
                 }
-                return serde_json::from_slice(&part.body).map_err(|error| {
-                    format!(
-                        "Multipart field '{}' contains invalid JSON: {error}",
-                        part.name
-                    )
-                });
+                return serde_json::from_slice(&part.body)
+                    .map_err(|error| format!("Multipart field contains invalid JSON: {error}"));
             }
             if is_xml_media_type(&media_type) {
-                let text = std::str::from_utf8(&part.body).map_err(|error| {
-                    format!("Multipart field '{}' is not UTF-8 XML: {error}", part.name)
-                })?;
+                let text = std::str::from_utf8(&part.body)
+                    .map_err(|_| "Multipart field is not UTF-8 XML".to_string())?;
                 return xml_body_to_value(text, schema, conversion);
             }
         }
@@ -4068,7 +4102,7 @@ fn multipart_part_to_schema_value(
         return binary_to_schema_value(&part.body, schema);
     }
     let text = std::str::from_utf8(&part.body)
-        .map_err(|error| format!("Multipart field '{}' is not UTF-8: {error}", part.name))?;
+        .map_err(|_| MULTIPART_FIELD_NOT_UTF8_DETAIL.to_string())?;
     if let Some(encoding) = encoding.filter(|enc| conversion.accepts_array(schema) && !enc.explode)
     {
         return values_to_schema_value(&[text.to_string()], schema, Some(encoding), conversion);
@@ -4209,9 +4243,7 @@ fn scalar_to_schema_value_with_types(
         {
             return Ok(candidate);
         }
-        return Err(format!(
-            "No compatible composed-schema scalar conversion for '{value}'"
-        ));
+        return Err(COMPOSED_SCALAR_CONVERSION_DETAIL.to_string());
     }
 
     let multi = types.len() > 1;
@@ -4242,22 +4274,22 @@ fn scalar_to_schema_value_with_types(
     if types.contains(ScalarType::String) {
         return Ok(Value::String(value.to_string()));
     }
-    Err(last_error.unwrap_or_else(|| format!("Unsupported scalar conversion for '{value}'")))
+    Err(last_error.unwrap_or_else(|| SCALAR_CONVERSION_DETAIL.to_string()))
 }
 
 fn parse_integer_value(value: &str) -> Result<Value, String> {
     let parsed = value
         .parse::<i64>()
-        .map_err(|error| format!("Invalid integer value '{value}': {error}"))?;
+        .map_err(|_| "Invalid integer value".to_string())?;
     Ok(Value::Number(serde_json::Number::from(parsed)))
 }
 
 fn parse_number_value(value: &str) -> Result<Value, String> {
     let parsed = value
         .parse::<f64>()
-        .map_err(|error| format!("Invalid number value '{value}': {error}"))?;
+        .map_err(|_| "Invalid number value".to_string())?;
     let number = serde_json::Number::from_f64(parsed)
-        .ok_or_else(|| format!("Invalid finite number value '{value}'"))?;
+        .ok_or_else(|| "Invalid finite number value".to_string())?;
     Ok(Value::Number(number))
 }
 
@@ -4277,7 +4309,7 @@ fn parse_boolean_value(value: &str) -> Result<Value, String> {
     {
         return Ok(Value::Bool(false));
     }
-    Err(format!("Invalid boolean value '{value}'"))
+    Err("Invalid boolean value".to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4915,10 +4947,10 @@ fn parse_header_type_and_params(
         }
         let decoded = decode_header_param_value(raw_value.trim())?;
         if decoded.value.len() > MAX_MULTIPART_PARAM_BYTES {
-            return Err(format!("Header parameter '{key}' exceeds size limit"));
+            return Err("Header parameter exceeds size limit".to_string());
         }
-        if params.insert(key.clone(), decoded).is_some() {
-            return Err(format!("Duplicate header parameter '{key}'"));
+        if params.insert(key, decoded).is_some() {
+            return Err("Duplicate header parameter".to_string());
         }
     }
     Ok((type_token, params))
@@ -5512,17 +5544,10 @@ fn child_elements_matching_fail_closed<'a>(
         // Reachable only when `namespace` is Some and the URI differs (or is
         // absent): local-name-only schemas accept any URI via the match above.
         return Err(format!(
-            "XML element '{local}' uses a local name reserved for a namespace-qualified modeled {role} but does not match the required expanded name"
+            "XML element uses a local name reserved for a namespace-qualified modeled {role} but does not match the required expanded name"
         ));
     }
     Ok(matched)
-}
-
-fn xml_namespace_display(namespace: Option<&str>) -> String {
-    match namespace {
-        Some(namespace) => format!("{{{namespace}}}"),
-        None => String::new(),
-    }
 }
 
 fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
@@ -5536,29 +5561,46 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
 
 /// Render a schema violation for metadata and the problem body.
 ///
-/// Response-side details are redacted: the `jsonschema` message embeds the
-/// offending instance value, and JSON Pointer object-key segments in the
-/// instance path are derived from backend JSON property names. Neither may
-/// cross the client boundary or land in transaction logs. Response failures
-/// therefore emit only a fixed generic message plus the operator/schema-
-/// controlled `schema_path()`. Request-side details keep the full message
-/// because the instance is the caller's own submitted body.
-fn format_schema_error(error: &jsonschema::ValidationError<'_>, side: ValidationSide) -> String {
+/// `jsonschema`'s own `Display` embeds the offending instance value, and JSON
+/// Pointer object-key segments in the instance path are derived from payload
+/// member names. Neither may cross the client boundary or land in transaction
+/// logs, on *either* side: a response detail would republish the upstream
+/// representation this validator exists to withhold, and a request detail would
+/// copy the caller's own credentials into every configured logging sink
+/// (`GHSA-5p2h-fq6q-gwh9`). The `ValidationError` is therefore never rendered.
+///
+/// Both sides emit a fixed category plus the operator/schema-controlled
+/// `schema_path()`. The request side additionally carries a bounded instance
+/// location whose object-member segments survive only when the configured
+/// schema declares them, which keeps the useful "which declared field" signal
+/// without echoing a hostile member name. The response side stays coarser
+/// because describing an upstream body's shape back to the client is itself a
+/// disclosure.
+fn format_schema_error(
+    error: &jsonschema::ValidationError<'_>,
+    side: ValidationSide,
+    safe_names: &SafeFieldNames,
+) -> String {
+    let schema_path = bound_detail(&error.schema_path().to_string());
     if side == ValidationSide::Response {
-        return format!(
-            "response body does not satisfy the response schema at {}",
-            error.schema_path()
-        );
+        return bound_detail(&format!(
+            "response body does not satisfy the response schema at {schema_path}"
+        ));
     }
-    let path = error.instance_path().to_string();
-    if path.is_empty() {
-        error.to_string()
-    } else {
-        format!("{path}: {error}")
-    }
+    let location = safe_location(&error.instance_path().to_string(), safe_names);
+    bound_detail(&format!(
+        "request body does not satisfy the request schema at {schema_path} (instance {location})"
+    ))
 }
 
+/// Apply the operator's diagnostic cap, itself clamped to the compiled-in
+/// [`MAX_DIAGNOSTIC_CHARS`] ceiling.
+///
+/// This is a resource bound only. Confidentiality comes from the construction
+/// contract above, so raising `error_truncate_chars` can no longer widen a
+/// disclosure — there is nothing sensitive left for it to reveal.
 fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let max_chars = max_chars.min(MAX_DIAGNOSTIC_CHARS);
     if value.chars().count() <= max_chars {
         return value.to_string();
     }

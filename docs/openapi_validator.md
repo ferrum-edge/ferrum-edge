@@ -244,9 +244,42 @@ Validation outcomes are written to transaction metadata for all logging plugins:
 | `openapi_validator.matched_operation` | Example: `POST /orders/{id}` |
 | `openapi_validator.skip_reason` | `no_match`, `bypass_path`, `bypass_consumer`, `bypass_header`, `bypass_method`, `content_type`, `content_type_out_of_scope`, `no_schema`, `no_response_content`, or `no_body_expected` |
 | `openapi_validator.request_contract_phase` | `client` (decided pre-transform over the original client body) or `backend_final` (fallback over the final backend-visible body) |
-| `openapi_validator.request_error` | Truncated request validation error |
-| `openapi_validator.response_error` | Truncated response validation error |
+| `openapi_validator.request_error` | Bounded, payload-free request validation diagnostic |
+| `openapi_validator.response_error` | Bounded, payload-free response validation diagnostic |
 | `openapi_validator.action` | `rejected_request`, `rejected_response`, `logged_request_mismatch`, or `logged_response_mismatch` |
+
+## Diagnostic confidentiality
+
+Both metadata entries above and the client-visible problem `detail` carry the
+*same* string, and every configured logging plugin exports the metadata. That
+string is therefore assembled from a fixed vocabulary and never from payload
+bytes (advisory `GHSA-5p2h-fq6q-gwh9`):
+
+- a compiled-in failure category (`request body does not satisfy the request
+  schema at ...`, `Invalid integer value`, `Malformed multipart part: ...`, and
+  the rest of the fixed set);
+- the operator-controlled JSON Schema path (`schema_path`), which describes the
+  configured policy rather than the inspected document;
+- request side only, a bounded instance location such as `/rows/1/count`. Array
+  indices survive verbatim. An object member name survives only when the
+  configured schema declares it; any other member name — a hostile JSON key, an
+  XML local name, a form or multipart field name — is rendered as `~`. Segment
+  count, segment length, and total location length are all capped, and a
+  location cut short ends in `/...`.
+
+Nothing else is rendered. In particular the plugin never emits the rejected
+instance value, an `enum` / `const` constant the schema expects, a raw
+`jsonschema` message, a raw `roxmltree` parse token, a backend `Content-Type`,
+or the request target. Response-side diagnostics are coarser still: a
+conversion or decode failure collapses to a single fixed sentence, because even
+the *class* of failure describes an upstream representation the client was
+never entitled to observe.
+
+`error_truncate_chars` remains accepted, but it is only a size bound and it can
+only narrow: the effective cap is `min(error_truncate_chars, 256)`. Raising it
+cannot widen a disclosure, because there is no payload content left for it to
+reveal. There is no raw-diagnostic escape hatch, in configuration or in
+tracing.
 
 ## Overrides
 

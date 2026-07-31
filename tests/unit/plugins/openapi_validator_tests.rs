@@ -497,7 +497,10 @@ async fn unknown_operation_is_rejected_before_proxy() {
         ctx.metadata
             .get("openapi_validator.request_error")
             .map(String::as_str),
-        Some("No OpenAPI operation matched POST /missing")
+        // The request target is not interpolated: this detail is exported by
+        // every logging sink and a path segment can carry a credential
+        // (GHSA-5p2h-fq6q-gwh9).
+        Some("No OpenAPI operation matched this request")
     );
 }
 

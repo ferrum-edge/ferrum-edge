@@ -47,6 +47,7 @@ pub mod tcp_endpoint;
 pub mod token_extract;
 pub mod transformer_gate;
 pub mod udp_endpoint;
+pub mod validation_diagnostics;
 
 pub use batching_logger::{
     BatchConfig, BatchingLogger, BatchingLoggerHandle, BatchingLoggerPermit,

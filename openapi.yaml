@@ -19600,7 +19600,16 @@ components:
           type: integer
           format: uint64
           default: 1024
-          description: Maximum validation-error characters written to metadata and problem bodies.
+          description: >
+            Size bound on the validation diagnostic written to
+            openapi_validator.request_error / openapi_validator.response_error
+            metadata and to the problem body. Only ever narrows: the effective
+            cap is min(error_truncate_chars, 256). This is not a
+            confidentiality control. Diagnostics are payload-free by
+            construction and never contain the rejected instance value, an
+            expected enum/const constant, a raw schema-library or XML-parser
+            rendering, a backend Content-Type, the request target, or a
+            payload-chosen JSON/XML/form/multipart member name.
 
     OpenapiValidatorJsonSchema:
       type: [object, boolean]
