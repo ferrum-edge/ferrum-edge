@@ -2053,7 +2053,10 @@ fn reference_grant_translation_and_status_share_fail_closed_semantics() {
         ferrum_gateway_class(),
         ferrum_gateway(),
         cross_namespace_http_route("named-ok", "api"),
-        backend_service_grant("named", json!({ "group": "", "kind": "Service", "name": "api" })),
+        backend_service_grant(
+            "named",
+            json!({ "group": "", "kind": "Service", "name": "api" }),
+        ),
         backend_service("backend", "api"),
     ];
     assert!(

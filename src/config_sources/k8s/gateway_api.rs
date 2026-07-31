@@ -214,9 +214,7 @@ fn reference_grant_required_string<'a>(
 /// - absent → `Ok(None)` (Gateway API wildcard)
 /// - string → `Ok(Some(name))` (named grant)
 /// - present non-string → `Err` (must never become wildcard)
-fn reference_grant_optional_to_name(
-    to: &Value,
-) -> Result<Option<&str>, ReferenceGrantParseError> {
+fn reference_grant_optional_to_name(to: &Value) -> Result<Option<&str>, ReferenceGrantParseError> {
     match to.get("name") {
         None => Ok(None),
         Some(Value::String(name)) => Ok(Some(name.as_str())),
