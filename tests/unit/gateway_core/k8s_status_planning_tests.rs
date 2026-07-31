@@ -378,9 +378,13 @@ fn budgeted_full_coverage_matches_unlimited_plan_over_rotations() {
     assert_eq!(seen.len(), unlimited.len());
     for update in &unlimited {
         let key = (update.kind.clone(), update.name.clone());
+        let expected = status_without_last_transition_time(&update.status);
+        let actual = seen
+            .get(&key)
+            .map(status_without_last_transition_time);
         assert_eq!(
-            seen.get(&key),
-            Some(&update.status),
+            actual.as_ref(),
+            Some(&expected),
             "status parity mismatch for {}/{}",
             update.kind,
             update.name
@@ -1024,6 +1028,31 @@ fn multiple_gateways_and_listeners_attached_routes_stay_scoped() {
     assert_eq!(attached_a_http, Some(1), "sectionName scopes route-a only");
     assert_eq!(attached_a_alt, Some(1), "sectionName scopes route-both alt");
     assert_eq!(attached_b, Some(2), "edge-b sees route-b and route-both");
+}
+
+/// Recursively drop `lastTransitionTime` from cloned status JSON for parity asserts.
+/// Transition timestamps are wall-clock-derived per plan invocation and are not
+/// part of budgeted-vs-unlimited semantic equivalence.
+fn status_without_last_transition_time(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut normalized = serde_json::Map::with_capacity(map.len());
+            for (key, child) in map {
+                if key == "lastTransitionTime" {
+                    continue;
+                }
+                normalized.insert(key.clone(), status_without_last_transition_time(child));
+            }
+            Value::Object(normalized)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(status_without_last_transition_time)
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 fn condition_status<'a>(status: &'a Value, condition_type: &str) -> Option<&'a str> {
