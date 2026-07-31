@@ -8706,6 +8706,143 @@ pub fn probe_compact_recovery_retry_for_tests(
     Ok((retained_bytes, held, pending, ceiling.used()))
 }
 
+/// Outcome of [`probe_shared_spool_batch_clone_for_tests`].
+///
+/// External tests assert the shared-owner `SpoolJob::Events` recovery: a
+/// duplicate ChargeEvent payload is reserved against the process ceiling before
+/// cloning, held through the blocking write, released on completion, or refused
+/// without writing when the ceiling cannot admit the clone.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct SharedSpoolBatchCloneProbe {
+    pub clone_bytes: usize,
+    pub process_used_baseline: usize,
+    /// Process-ceiling used while BeforeWrite ran with the clone reservation
+    /// still held. `None` when the ceiling refused the clone.
+    pub process_used_while_clone_held: Option<usize>,
+    pub process_used_after: usize,
+    pub jobs_written: u64,
+    pub jobs_lost: u64,
+    pub durable_owned_files: usize,
+}
+
+/// Drive one shared-owner `SpoolJob::Events` recovery through the live delivery
+/// worker.
+///
+/// The probe retains an extra `Arc` handle so `Arc::try_unwrap` fails — the
+/// exceptional path that reserves before cloning. When `refuse_clone` is true
+/// the process ceiling is saturated first so admission fails closed.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn probe_shared_spool_batch_clone_for_tests(
+    spool: Arc<SpoolManager>,
+    events: Vec<ChargeEvent>,
+    refuse_clone: bool,
+) -> SharedSpoolBatchCloneProbe {
+    let clone_bytes = events
+        .iter()
+        .map(charge_event_retained_bytes)
+        .fold(0usize, usize::saturating_add);
+
+    let budget = ByteBudget::new(
+        PLUGIN_NAME,
+        MAX_CHARGE_EVENT_BYTES.saturating_mul(events.len().max(1)),
+    );
+    let mut queued = Vec::with_capacity(events.len());
+    for event in events {
+        let retained = charge_event_retained_bytes(&event);
+        let lease = budget
+            .try_acquire(retained)
+            .expect("shared spool clone probe must lease queued events");
+        queued.push(QueuedChargeEvent { event, lease });
+    }
+    let shared = Arc::new(queued);
+    // Retain a second handle for the whole probe so try_unwrap takes the Err path.
+    let retained_handle = Arc::clone(&shared);
+
+    let process_used_baseline = process_ceiling().used();
+    let ceiling_saturator = if refuse_clone {
+        let room = process_ceiling()
+            .max()
+            .saturating_sub(process_ceiling().used());
+        ProcessByteReservation::try_acquire(room)
+    } else {
+        None
+    };
+
+    let held_sample = Arc::new(AtomicUsize::new(usize::MAX));
+    let hook_root = spool.namespace_root_for_tests().to_path_buf();
+    if !refuse_clone {
+        let sample = Arc::clone(&held_sample);
+        set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
+            if point != SpoolWriteHookPoint::BeforeWrite {
+                return;
+            }
+            if !namespace_root.starts_with(&hook_root) {
+                return;
+            }
+            // clone_reservation is still live inside spawn_blocking until after
+            // write_events returns, so BeforeWrite observes the charged clone.
+            sample.store(process_ceiling().used(), Ordering::SeqCst);
+        })));
+    }
+
+    let metrics = Arc::new(SinkMetrics::default());
+    let (commit_tx, commit_rx) = watch::channel(false);
+    let delivery = start_spool_delivery(Arc::clone(&spool), Arc::clone(&metrics), 8, commit_rx);
+    let _ = commit_tx.send(true);
+
+    assert!(
+        delivery.try_enqueue(shared, "shared spool clone probe"),
+        "{PLUGIN_NAME}: shared spool clone probe failed to enqueue"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while delivery.pending_jobs() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{PLUGIN_NAME}: shared spool clone probe timed out waiting for delivery"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    set_spool_write_hook_for_tests(None);
+    // Drop the refusal saturator before sampling "after" so a refused clone is
+    // proven not to leave its own lasting process-ceiling charge.
+    drop(ceiling_saturator);
+    let process_used_after = process_ceiling().used();
+    let process_used_while_clone_held = {
+        let sampled = held_sample.load(Ordering::SeqCst);
+        if sampled == usize::MAX {
+            None
+        } else {
+            Some(sampled)
+        }
+    };
+    let jobs_written = metrics.spool_jobs_written_total.load(Ordering::Relaxed);
+    let jobs_lost = metrics.spool_jobs_lost_total.load(Ordering::Relaxed);
+    let durable_owned_files = spool
+        .list_owned_spool_files_for_tests()
+        .expect("shared spool clone probe must list owned files")
+        .len();
+
+    delivery.worker.abort();
+    // Keep the retained handle alive through abort so strong_count stayed > 1
+    // for the entire worker recovery window.
+    drop(retained_handle);
+
+    SharedSpoolBatchCloneProbe {
+        clone_bytes,
+        process_used_baseline,
+        process_used_while_clone_held,
+        process_used_after,
+        jobs_written,
+        jobs_lost,
+        durable_owned_files,
+    }
+}
+
 /// Opaque compact-recovery handle for deterministic external concurrency tests.
 #[doc(hidden)]
 #[allow(dead_code)]

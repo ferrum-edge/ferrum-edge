@@ -94,14 +94,37 @@ fn start_gateway_in_file_mode(
         .expect("Failed to start gateway binary")
 }
 
-async fn wait_for_gateway(admin_port: u16) -> bool {
+/// Readiness requires admin `/health` *and* a reachable proxy listener while
+/// the same child is still alive. Admin can become healthy before the proxy
+/// accept loop binds; returning on health alone races the first proxy request
+/// into `ECONNREFUSED`.
+async fn wait_for_gateway(
+    admin_port: u16,
+    proxy_port: u16,
+    child: &mut std::process::Child,
+) -> bool {
     let client = reqwest::Client::new();
     let health_url = format!("http://127.0.0.1:{}/health", admin_port);
 
     for _ in 0..60 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
+        if child.try_wait().ok().flatten().is_some() {
+            return false;
+        }
+
+        let admin_ready = match client.get(&health_url).send().await {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        };
+        let proxy_ready = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+            .await
+            .is_ok();
+
+        if admin_ready && proxy_ready {
+            // Re-check liveness: a child can exit after the probes succeed if a
+            // later bind failed, leaving the probed ports owned by nobody.
+            if child.try_wait().ok().flatten().is_some() {
+                return false;
+            }
             return true;
         }
         sleep(Duration::from_millis(250)).await;
@@ -126,7 +149,7 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 
         let mut child = start_gateway_in_file_mode(config_path, proxy_port, admin_port);
 
-        if wait_for_gateway(admin_port).await {
+        if wait_for_gateway(admin_port, proxy_port, &mut child).await {
             return (child, proxy_port, admin_port);
         }
 
