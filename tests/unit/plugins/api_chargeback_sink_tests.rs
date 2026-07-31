@@ -7264,27 +7264,31 @@ fn compact_snapshot_recovery_owns_its_reservation_and_restores_deltas_on_a_faile
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn shared_spool_batch_clone_reserves_duplicate_bytes_until_write_completes() {
-    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let spool_ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let clone_ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
     let temp = tempfile::tempdir().unwrap();
-    let spool = Arc::new(ceiling_spool(&temp, ceiling));
+    let spool = Arc::new(ceiling_spool(&temp, spool_ceiling));
     let events = vec![sample_event("shared-clone-admit")];
 
-    let probe = probe_shared_spool_batch_clone_for_tests(Arc::clone(&spool), events, false).await;
+    let probe =
+        probe_shared_spool_batch_clone_for_tests(Arc::clone(&spool), events, clone_ceiling).await;
 
     assert!(probe.clone_bytes > 0);
     let held = probe
-        .process_used_while_clone_held
+        .ceiling_used_while_clone_held
         .expect("BeforeWrite must observe the clone reservation");
     assert!(
-        held >= probe.process_used_baseline.saturating_add(probe.clone_bytes),
-        "clone reservation must charge the process ceiling before the duplicate \
+        held >= probe
+            .ceiling_used_baseline
+            .saturating_add(probe.clone_bytes),
+        "clone reservation must charge the injected ceiling before the duplicate \
          payload is written; baseline={} held={} clone_bytes={}",
-        probe.process_used_baseline,
+        probe.ceiling_used_baseline,
         held,
         probe.clone_bytes
     );
     assert_eq!(
-        probe.process_used_after, probe.process_used_baseline,
+        probe.ceiling_used_after, probe.ceiling_used_baseline,
         "clone reservation must release exactly once after the blocking write"
     );
     assert_eq!(probe.jobs_written, 1, "admitted shared clone must write once");
@@ -7294,27 +7298,34 @@ async fn shared_spool_batch_clone_reserves_duplicate_bytes_until_write_completes
         "admitted shared clone must leave one durable spool artifact"
     );
     assert_eq!(
-        ceiling.used(),
+        spool_ceiling.used(),
         0,
         "spool artifact reservations release after the write completes"
     );
+    assert_eq!(
+        clone_ceiling.used(),
+        0,
+        "the isolated clone ceiling must return to zero"
+    );
 }
 
-/// Shared-owner recovery must fail closed when the process ceiling cannot admit
+/// Shared-owner recovery must fail closed when its clone ceiling cannot admit
 /// the duplicate payload: no durable write, one spool-job loss, no lasting charge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
-async fn shared_spool_batch_clone_refuses_when_process_ceiling_is_saturated() {
-    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+async fn shared_spool_batch_clone_refuses_with_an_isolated_saturated_ceiling() {
+    let spool_ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let clone_ceiling = leaked_chargeback_test_ceiling(1);
     let temp = tempfile::tempdir().unwrap();
-    let spool = Arc::new(ceiling_spool(&temp, ceiling));
+    let spool = Arc::new(ceiling_spool(&temp, spool_ceiling));
     let events = vec![sample_event("shared-clone-refuse")];
 
-    let probe = probe_shared_spool_batch_clone_for_tests(Arc::clone(&spool), events, true).await;
+    let probe =
+        probe_shared_spool_batch_clone_for_tests(Arc::clone(&spool), events, clone_ceiling).await;
 
     assert!(probe.clone_bytes > 0);
     assert!(
-        probe.process_used_while_clone_held.is_none(),
+        probe.ceiling_used_while_clone_held.is_none(),
         "refused clone must never reach the spool write hook"
     );
     assert_eq!(
@@ -7330,9 +7341,11 @@ async fn shared_spool_batch_clone_refuses_when_process_ceiling_is_saturated() {
         "ceiling refusal must leave no owned spool artifacts"
     );
     assert_eq!(
-        probe.process_used_after, probe.process_used_baseline,
-        "a refused clone must not leave a lasting process-ceiling charge"
+        probe.ceiling_used_after, probe.ceiling_used_baseline,
+        "a refused clone must not leave a lasting injected-ceiling charge"
     );
+    assert_eq!(clone_ceiling.used(), 0);
+    assert_eq!(spool_ceiling.used(), 0);
 }
 
 #[test]

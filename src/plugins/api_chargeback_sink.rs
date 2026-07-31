@@ -1848,6 +1848,26 @@ fn start_spool_delivery(
     capacity: usize,
     commit_rx: watch::Receiver<bool>,
 ) -> Arc<SpoolDelivery> {
+    start_spool_delivery_with_clone_ceiling(
+        spool,
+        metrics,
+        capacity,
+        commit_rx,
+        process_ceiling(),
+    )
+}
+
+/// Internal constructor with an explicit ceiling for the exceptional
+/// shared-`Arc` clone. Production always passes [`process_ceiling`]; external
+/// tests pass an isolated leaked ceiling so refusal coverage cannot consume the
+/// process-global admission budget used by concurrently running tests.
+fn start_spool_delivery_with_clone_ceiling(
+    spool: Arc<SpoolManager>,
+    metrics: Arc<SinkMetrics>,
+    capacity: usize,
+    commit_rx: watch::Receiver<bool>,
+    clone_ceiling: &'static RetainedByteCeiling,
+) -> Arc<SpoolDelivery> {
     let capacity = capacity.clamp(1, MAX_BUFFER_CAPACITY);
     let (sender, mut receiver) = mpsc::channel(capacity);
     let pending_jobs = Arc::new(AtomicUsize::new(0));
@@ -1900,9 +1920,7 @@ fn start_spool_delivery(
                                         .iter()
                                         .map(|queued| charge_event_retained_bytes(&queued.event))
                                         .fold(0usize, usize::saturating_add);
-                                    let Some(reservation) =
-                                        ProcessByteReservation::try_acquire(bytes)
-                                    else {
+                                    let Some(reservation) = clone_ceiling.try_acquire(bytes) else {
                                         metrics_for_worker.record_spool_job_loss(
                                             event_count as u64,
                                             "shared spool batch clone refused by the retained-byte ceiling",
@@ -8709,19 +8727,20 @@ pub fn probe_compact_recovery_retry_for_tests(
 /// Outcome of [`probe_shared_spool_batch_clone_for_tests`].
 ///
 /// External tests assert the shared-owner `SpoolJob::Events` recovery: a
-/// duplicate ChargeEvent payload is reserved against the process ceiling before
-/// cloning, held through the blocking write, released on completion, or refused
-/// without writing when the ceiling cannot admit the clone.
+/// duplicate ChargeEvent payload is reserved against the injected ceiling
+/// before cloning, held through the blocking write, released on completion, or
+/// refused without writing when the ceiling cannot admit the clone. Production
+/// injects the process ceiling.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct SharedSpoolBatchCloneProbe {
     pub clone_bytes: usize,
-    pub process_used_baseline: usize,
-    /// Process-ceiling used while BeforeWrite ran with the clone reservation
+    pub ceiling_used_baseline: usize,
+    /// Injected-ceiling usage while BeforeWrite ran with the clone reservation
     /// still held. `None` when the ceiling refused the clone.
-    pub process_used_while_clone_held: Option<usize>,
-    pub process_used_after: usize,
+    pub ceiling_used_while_clone_held: Option<usize>,
+    pub ceiling_used_after: usize,
     pub jobs_written: u64,
     pub jobs_lost: u64,
     pub durable_owned_files: usize,
@@ -8731,14 +8750,15 @@ pub struct SharedSpoolBatchCloneProbe {
 /// worker.
 ///
 /// The probe retains an extra `Arc` handle so `Arc::try_unwrap` fails — the
-/// exceptional path that reserves before cloning. When `refuse_clone` is true
-/// the process ceiling is saturated first so admission fails closed.
+/// exceptional path that reserves before cloning. `clone_ceiling` is injected
+/// into the real delivery worker, allowing external tests to exercise both
+/// admission and refusal without perturbing the process-global ceiling.
 #[doc(hidden)]
 #[allow(dead_code)]
 pub async fn probe_shared_spool_batch_clone_for_tests(
     spool: Arc<SpoolManager>,
     events: Vec<ChargeEvent>,
-    refuse_clone: bool,
+    clone_ceiling: &'static RetainedByteCeiling,
 ) -> SharedSpoolBatchCloneProbe {
     let clone_bytes = events
         .iter()
@@ -8761,36 +8781,39 @@ pub async fn probe_shared_spool_batch_clone_for_tests(
     // Retain a second handle for the whole probe so try_unwrap takes the Err path.
     let retained_handle = Arc::clone(&shared);
 
-    let process_used_baseline = process_ceiling().used();
-    let ceiling_saturator = if refuse_clone {
-        let room = process_ceiling()
-            .max()
-            .saturating_sub(process_ceiling().used());
-        ProcessByteReservation::try_acquire(room)
-    } else {
-        None
-    };
+    let ceiling_used_baseline = clone_ceiling.used();
 
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            set_spool_write_hook_for_tests(None);
+        }
+    }
+    let _clear_hook = ClearHook;
     let held_sample = Arc::new(AtomicUsize::new(usize::MAX));
     let hook_root = spool.namespace_root_for_tests().to_path_buf();
-    if !refuse_clone {
-        let sample = Arc::clone(&held_sample);
-        set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
-            if point != SpoolWriteHookPoint::BeforeWrite {
-                return;
-            }
-            if !namespace_root.starts_with(&hook_root) {
-                return;
-            }
-            // clone_reservation is still live inside spawn_blocking until after
-            // write_events returns, so BeforeWrite observes the charged clone.
-            sample.store(process_ceiling().used(), Ordering::SeqCst);
-        })));
-    }
+    let sample = Arc::clone(&held_sample);
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
+        if point != SpoolWriteHookPoint::BeforeWrite {
+            return;
+        }
+        if !namespace_root.starts_with(&hook_root) {
+            return;
+        }
+        // clone_reservation is still live inside spawn_blocking until after
+        // write_events returns, so BeforeWrite observes the charged clone.
+        sample.store(clone_ceiling.used(), Ordering::SeqCst);
+    })));
 
     let metrics = Arc::new(SinkMetrics::default());
     let (commit_tx, commit_rx) = watch::channel(false);
-    let delivery = start_spool_delivery(Arc::clone(&spool), Arc::clone(&metrics), 8, commit_rx);
+    let delivery = start_spool_delivery_with_clone_ceiling(
+        Arc::clone(&spool),
+        Arc::clone(&metrics),
+        8,
+        commit_rx,
+        clone_ceiling,
+    );
     let _ = commit_tx.send(true);
 
     assert!(
@@ -8807,12 +8830,8 @@ pub async fn probe_shared_spool_batch_clone_for_tests(
         tokio::task::yield_now().await;
     }
 
-    set_spool_write_hook_for_tests(None);
-    // Drop the refusal saturator before sampling "after" so a refused clone is
-    // proven not to leave its own lasting process-ceiling charge.
-    drop(ceiling_saturator);
-    let process_used_after = process_ceiling().used();
-    let process_used_while_clone_held = {
+    let ceiling_used_after = clone_ceiling.used();
+    let ceiling_used_while_clone_held = {
         let sampled = held_sample.load(Ordering::SeqCst);
         if sampled == usize::MAX {
             None
@@ -8834,9 +8853,9 @@ pub async fn probe_shared_spool_batch_clone_for_tests(
 
     SharedSpoolBatchCloneProbe {
         clone_bytes,
-        process_used_baseline,
-        process_used_while_clone_held,
-        process_used_after,
+        ceiling_used_baseline,
+        ceiling_used_while_clone_held,
+        ceiling_used_after,
         jobs_written,
         jobs_lost,
         durable_owned_files,
