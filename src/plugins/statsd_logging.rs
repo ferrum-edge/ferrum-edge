@@ -1334,7 +1334,7 @@ async fn send_batch(
     }
 
     let result = if let Some(socket) = socket.as_ref() {
-        send_packed_entries(socket, &batch).await
+        send_packed_entries(socket, batch).await
     } else {
         Err("statsd_logging: UDP socket unavailable after initialization".to_string())
     };

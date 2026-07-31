@@ -908,7 +908,7 @@ async fn send_batch(
     }
 
     let result = match sender.as_ref() {
-        Some(active_sender) => deliver_batch(cfg, active_sender, &batch).await,
+        Some(active_sender) => deliver_batch(cfg, active_sender, batch).await,
         None => Err(UdpDeliveryError::transport(
             "udp_logging: sender unavailable after initialization".to_string(),
         )),
