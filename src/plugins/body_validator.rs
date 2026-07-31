@@ -574,7 +574,11 @@ impl BodyValidator {
                 parsed.sort_all_objects();
             }
             if let Err(error) = schema.validator.validate(&parsed) {
-                return Err(schema_violation_message(&error, direction, &schema.safe_names));
+                return Err(schema_violation_message(
+                    &error,
+                    direction,
+                    &schema.safe_names,
+                ));
             }
         }
 

@@ -73,10 +73,8 @@ const UNSUPPORTED_MEDIA_STATUS_KEY: &str = "unsupported_media_type_status_code";
 /// namespace URI: those are payload bytes, and this string is copied into both
 /// the client-visible problem body and the exported transaction metadata
 /// (`GHSA-5p2h-fq6q-gwh9`).
-const XML_ATTRIBUTE_COLLISION_DETAIL: &str =
-    "XML attribute collides with a modeled property name but does not match its modeled XML construct or namespace";
-const XML_ELEMENT_COLLISION_DETAIL: &str =
-    "XML element collides with a modeled property name but does not match its modeled XML construct or namespace";
+const XML_ATTRIBUTE_COLLISION_DETAIL: &str = "XML attribute collides with a modeled property name but does not match its modeled XML construct or namespace";
+const XML_ELEMENT_COLLISION_DETAIL: &str = "XML element collides with a modeled property name but does not match its modeled XML construct or namespace";
 const XML_DUPLICATE_ATTRIBUTE_DETAIL: &str =
     "XML attributes sharing a local name cannot be represented unambiguously";
 const XML_ATTRIBUTE_ELEMENT_CONFLICT_DETAIL: &str =
@@ -4101,8 +4099,8 @@ fn multipart_part_to_schema_value(
     if schema_format(schema) == Some("binary") || part.filename.is_some() {
         return binary_to_schema_value(&part.body, schema);
     }
-    let text = std::str::from_utf8(&part.body)
-        .map_err(|_| MULTIPART_FIELD_NOT_UTF8_DETAIL.to_string())?;
+    let text =
+        std::str::from_utf8(&part.body).map_err(|_| MULTIPART_FIELD_NOT_UTF8_DETAIL.to_string())?;
     if let Some(encoding) = encoding.filter(|enc| conversion.accepts_array(schema) && !enc.explode)
     {
         return values_to_schema_value(&[text.to_string()], schema, Some(encoding), conversion);

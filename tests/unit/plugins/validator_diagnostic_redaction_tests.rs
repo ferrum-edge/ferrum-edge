@@ -661,7 +661,10 @@ fn safe_location_redacts_oversized_raw_segment_before_unescape() {
     let huge = format!("/{}", "z".repeat(MAX_RAW_SEGMENT_CHARS + 8));
     let rendered = safe_location(&huge, &names);
     assert_eq!(rendered, format!("/{REDACTED_SEGMENT}"));
-    assert!(rendered.len() < 16, "oversized segment must stay bounded: {rendered}");
+    assert!(
+        rendered.len() < 16,
+        "oversized segment must stay bounded: {rendered}"
+    );
     // Escaped spelling that would expand past the unescaped budget after a
     // would-be unescape is also rejected on the raw ceiling first.
     let escaped = format!("/{}", "~0".repeat(MAX_SEGMENT_CHARS + 1));
@@ -675,22 +678,19 @@ fn safe_location_redacts_oversized_raw_segment_before_unescape() {
 #[test]
 fn safe_keyword_accepts_only_allowlisted_vocabulary_tokens() {
     assert_eq!(safe_keyword("/properties/token/pattern"), "pattern");
-    assert_eq!(safe_keyword("/additionalProperties"), "additionalProperties");
+    assert_eq!(
+        safe_keyword("/additionalProperties"),
+        "additionalProperties"
+    );
     assert_eq!(safe_keyword(""), UNKNOWN_KEYWORD);
     // A fragment carrying payload-shaped text is not a keyword.
-    assert_eq!(
-        safe_keyword(&format!("/x/{CANARY} leak")),
-        UNKNOWN_KEYWORD
-    );
+    assert_eq!(safe_keyword(&format!("/x/{CANARY} leak")), UNKNOWN_KEYWORD);
     // Short all-alphanumeric custom / canary tokens must not pass the
     // allowlist just because they look like vocabulary.
     assert_eq!(safe_keyword("/qzvxcanary9f3a"), UNKNOWN_KEYWORD);
     assert_eq!(safe_keyword(&format!("/{CANARY}")), UNKNOWN_KEYWORD);
     // `$defs` map keys are schema identifiers, not diagnostic keywords.
-    assert_eq!(
-        safe_keyword(&format!("/$defs/{CANARY}/type")),
-        "type"
-    );
+    assert_eq!(safe_keyword(&format!("/$defs/{CANARY}/type")), "type");
 }
 
 #[test]
