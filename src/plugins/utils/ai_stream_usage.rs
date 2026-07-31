@@ -33,7 +33,26 @@
 //! yielded at least one numeric field. Malformed framing, an oversized event, a
 //! truncated tail, or a stream that simply never reported usage all leave it
 //! `None`, which is what lets the caller apply its configured unmetered posture
-//! exactly once instead of silently charging zero.
+//! exactly once instead of silently charging zero. All token arithmetic here is
+//! *checked*: a sum that would overflow `u64` yields no total rather than a
+//! saturated one.
+//!
+//! Damage is reported separately by [`StreamUsageScanner::malformed`], and it is
+//! deliberately ordering-sensitive. A candidate record the scanner could not
+//! decode marks the stream damaged; only a later explicit authoritative usage
+//! record clears that mark, because such a record restates the provider's
+//! complete cumulative counts and therefore proves nothing the damage hid is
+//! still missing. Damage *after* the last authoritative usage record is never
+//! cleared, so a stream whose tail was corrupted or truncated can never present
+//! as a clean terminal stream and charge the older snapshot.
+//!
+//! ## Integrity of the AWS framing
+//!
+//! `application/vnd.amazon.eventstream` is HTTP *body* framing, not something the
+//! HTTP transport validates. Its two documented CRC-32s — one over the eight
+//! prelude bytes and one over the complete message except its own trailing
+//! checksum — are therefore verified here before any declared length is honored
+//! or any payload is trusted, and a mismatch fails the scan closed.
 
 use serde_json::Value;
 
@@ -64,8 +83,161 @@ const EVENT_STREAM_OVERHEAD_BYTES: usize = 16;
 /// declared message length is known.
 const EVENT_STREAM_PRELUDE_BYTES: usize = 12;
 
+/// Bytes of the prelude that the prelude CRC-32 covers: the total length and
+/// the headers length, but not the checksum itself.
+const EVENT_STREAM_PRELUDE_CHECKED_BYTES: usize = 8;
+
+/// Width of each of the two AWS event-stream CRC-32 fields.
+const EVENT_STREAM_CRC_BYTES: usize = 4;
+
 /// The documented Bedrock streaming media type.
 const AWS_EVENT_STREAM_CONTENT_TYPE: &str = "application/vnd.amazon.eventstream";
+
+/// Reserved AWS event-stream header naming the frame's kind.
+const EVENT_STREAM_MESSAGE_TYPE_HEADER: &str = ":message-type";
+
+/// Reserved AWS event-stream header naming the modelled event within a frame.
+const EVENT_STREAM_EVENT_TYPE_HEADER: &str = ":event-type";
+
+/// Reserved AWS event-stream header naming a modelled service exception.
+const EVENT_STREAM_EXCEPTION_TYPE_HEADER: &str = ":exception-type";
+
+/// The only `:message-type` that carries a modelled response event; `exception`
+/// and `error` frames are terminal failures, not usage authorities.
+const EVENT_STREAM_EVENT_MESSAGE_TYPE: &str = "event";
+
+/// Bedrock event kinds whose payload documents a usage container.
+///
+/// * `chunk` — `InvokeModelWithResponseStream`, whose terminal chunk carries
+///   `amazon-bedrock-invocationMetrics` inside the base64 `bytes` envelope.
+/// * `metadata` — `ConverseStream`, whose `metadata` event carries `usage`.
+///
+/// Every other modelled event (`messageStart`, `contentBlockDelta`,
+/// `messageStop`, …) is content framing and must never mint usage.
+const USAGE_BEARING_EVENT_TYPES: [&str; 2] = ["chunk", "metadata"];
+
+/// CRC-32 (IEEE, the algorithm the AWS event-stream framing specifies) of a
+/// byte range, using the hardware-assisted implementation so verification stays
+/// off the slow path for large messages.
+fn event_stream_crc32(bytes: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(bytes);
+    hasher.finalize()
+}
+
+fn be_u32(bytes: &[u8]) -> Option<u32> {
+    let bytes: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+    Some(u32::from_be_bytes(bytes))
+}
+
+/// The reserved AWS event-stream headers this scanner needs in order to decide
+/// whether a frame may mint usage. Non-reserved headers are walked (so the block
+/// is fully validated) but not retained.
+#[derive(Debug, Default)]
+struct EventStreamHeaders<'a> {
+    message_type: Option<&'a str>,
+    event_type: Option<&'a str>,
+    exception_type: Option<&'a str>,
+}
+
+impl EventStreamHeaders<'_> {
+    /// Whether this frame's kind permits its payload to be read as an
+    /// authoritative usage record.
+    ///
+    /// Absent reserved headers stay permissive on purpose: several supported
+    /// provider variants frame a bare JSON payload without the Bedrock reserved
+    /// header vocabulary, and refusing those would silently unmeter them. A
+    /// header that *is* present must name a kind this scanner recognizes as
+    /// usage-bearing.
+    fn may_carry_usage(&self) -> bool {
+        if self.exception_type.is_some() {
+            return false;
+        }
+        if self
+            .message_type
+            .is_some_and(|kind| kind != EVENT_STREAM_EVENT_MESSAGE_TYPE)
+        {
+            return false;
+        }
+        match self.event_type {
+            Some(kind) => USAGE_BEARING_EVENT_TYPES.contains(&kind),
+            None => true,
+        }
+    }
+}
+
+/// Walk one complete AWS event-stream header block, returning the reserved
+/// headers it declared.
+///
+/// Returns `None` for any block that cannot be walked exactly to its end: a
+/// zero-length or non-UTF-8 header name, an unknown value type (whose width is
+/// unknown, so nothing after it can be located), a length that runs past the
+/// block, or a repeated reserved header (which would make the frame's kind
+/// ambiguous). Every bound is checked, so a hostile block can only fail closed.
+fn parse_event_stream_headers(bytes: &[u8]) -> Option<EventStreamHeaders<'_>> {
+    let mut headers = EventStreamHeaders::default();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let name_length = usize::from(*bytes.get(cursor)?);
+        cursor = cursor.checked_add(1)?;
+        if name_length == 0 {
+            return None;
+        }
+        let name = bytes.get(cursor..cursor.checked_add(name_length)?)?;
+        let name = std::str::from_utf8(name).ok()?;
+        cursor = cursor.checked_add(name_length)?;
+
+        let value_type = *bytes.get(cursor)?;
+        cursor = cursor.checked_add(1)?;
+
+        // Value widths are the documented AWS event-stream header value types:
+        // 0/1 BOOL_TRUE/BOOL_FALSE (no bytes), 2 BYTE, 3 SHORT, 4 INTEGER,
+        // 5 LONG, 6 BYTE_ARRAY, 7 STRING, 8 TIMESTAMP, 9 UUID.
+        let fixed_width = match value_type {
+            0 | 1 => 0usize,
+            2 => 1,
+            3 => 2,
+            4 => 4,
+            5 => 8,
+            8 => 8,
+            9 => 16,
+            6 | 7 => {
+                // Length-prefixed: a 16-bit big-endian length then the bytes.
+                let declared = bytes.get(cursor..cursor.checked_add(2)?)?;
+                let value_length = usize::from(u16::from_be_bytes([declared[0], declared[1]]));
+                cursor = cursor.checked_add(2)?;
+                let value = bytes.get(cursor..cursor.checked_add(value_length)?)?;
+                cursor = cursor.checked_add(value_length)?;
+                if value_type == 7 {
+                    let slot = match name {
+                        EVENT_STREAM_MESSAGE_TYPE_HEADER => Some(&mut headers.message_type),
+                        EVENT_STREAM_EVENT_TYPE_HEADER => Some(&mut headers.event_type),
+                        EVENT_STREAM_EXCEPTION_TYPE_HEADER => Some(&mut headers.exception_type),
+                        _ => None,
+                    };
+                    if let Some(slot) = slot {
+                        // A repeated reserved header makes the frame's kind
+                        // ambiguous, so it is damaged framing.
+                        if slot.is_some() {
+                            return None;
+                        }
+                        *slot = Some(std::str::from_utf8(value).ok()?);
+                    }
+                }
+                continue;
+            }
+            // An undefined value type has an unknown width, so nothing after it
+            // can be located.
+            _ => return None,
+        };
+        let value_end = cursor.checked_add(fixed_width)?;
+        if value_end > bytes.len() {
+            return None;
+        }
+        cursor = value_end;
+    }
+    Some(headers)
+}
 
 /// True for the AWS event-stream media type, ignoring parameters and case.
 pub fn is_aws_event_stream_content_type(content_type: &str) -> bool {
@@ -125,8 +297,17 @@ pub struct StreamUsageScanner {
     detected_provider: Option<AiProvider>,
     /// Set when framing/reassembly failed in a way that could have hidden a
     /// usage record. Fail-closed callers must not treat such a stream as a
-    /// clean "provider reported nothing".
+    /// clean "provider reported nothing". Once set it is never cleared.
     malformed: bool,
+    /// Set when a *candidate* record could not be decoded — a non-UTF-8 `data:`
+    /// line, a data record that is not a JSON object, or a truncated tail.
+    ///
+    /// Unlike [`Self::malformed`] this is cleared by a later explicit
+    /// authoritative usage record, because such a record restates the
+    /// provider's complete cumulative counts. Damage that is still outstanding
+    /// at end of stream is reported as malformed, so syntax damage *after* the
+    /// last usage snapshot can never be settled as a clean terminal stream.
+    damaged_since_usage: bool,
     /// Set once framing is unrecoverable; no further bytes are parsed.
     halted: bool,
 }
@@ -146,6 +327,7 @@ impl StreamUsageScanner {
             usage: None,
             detected_provider: None,
             malformed: false,
+            damaged_since_usage: false,
             halted: false,
         }
     }
@@ -159,9 +341,10 @@ impl StreamUsageScanner {
         self.usage.as_ref()
     }
 
-    /// Whether framing was damaged or exceeded a bound while scanning.
+    /// Whether framing was damaged, exceeded a bound, or left an undecodable
+    /// candidate record outstanding after the last authoritative usage record.
     pub fn malformed(&self) -> bool {
-        self.malformed
+        self.malformed || self.damaged_since_usage
     }
 
     /// Observe the next chunk of response bytes. The chunk is not retained.
@@ -255,22 +438,42 @@ impl StreamUsageScanner {
     }
 
     fn consume_sse_line(&mut self, line: &[u8]) {
-        let Ok(line) = std::str::from_utf8(line) else {
-            // Non-UTF-8 in a text/event-stream line cannot be a provider usage
-            // record; the bytes still reach the client unchanged.
+        let Ok(text) = std::str::from_utf8(line) else {
+            // `text/event-stream` is UTF-8 by definition. A `data:` line that
+            // is not is a candidate record this scanner cannot decode, so it
+            // damages the scan rather than being silently skipped — the usage
+            // event it would have carried is now unaccounted for. Bytes on any
+            // other line are not a candidate at all, and every byte still
+            // reaches the client unchanged either way.
+            if line.starts_with(b"data:") {
+                self.damaged_since_usage = true;
+            }
             return;
         };
-        let data = if let Some(rest) = line.strip_prefix("data:") {
-            rest.trim()
-        } else {
+        let Some(rest) = text.strip_prefix("data:") else {
+            // Comments (`: keep-alive`), `event:`, `id:`, `retry:`, blank event
+            // separators, and any other SSE field are not usage candidates.
             return;
         };
+        let data = rest.trim();
         if data.is_empty() || data == "[DONE]" {
+            // An empty data record and the OpenAI sentinel are ordinary,
+            // well-formed stream syntax.
             return;
         }
         let Ok(json) = serde_json::from_str::<Value>(data) else {
+            // A non-empty data record that is not JSON is either damaged or
+            // truncated. Either way it could have been the terminal usage
+            // event, so the stream is no longer provably clean.
+            self.damaged_since_usage = true;
             return;
         };
+        if !json.is_object() {
+            // Every supported provider stream event is a JSON object. A scalar
+            // or array is not the provider event shape this scanner decodes.
+            self.damaged_since_usage = true;
+            return;
+        }
         self.consume_event_json(&json);
     }
 
@@ -321,6 +524,11 @@ impl StreamUsageScanner {
             Some(current) => current.merge_cumulative(extracted),
             None => self.usage = Some(extracted),
         }
+        // An explicit authoritative usage record supersedes earlier candidate
+        // damage: supported providers report cumulative counts, so this record
+        // restates everything a skipped record could have carried. Damage that
+        // arrives *after* this point is never cleared.
+        self.damaged_since_usage = false;
     }
 
     // ---- AWS event stream ----------------------------------------------
@@ -367,19 +575,19 @@ impl StreamUsageScanner {
 
     /// Validate and return the declared total message length from a buffered
     /// prelude, or `None` when the framing is unusable.
+    ///
+    /// The prelude CRC-32 is verified here — before the declared length is
+    /// honored — so a corrupted or forged length can never drive reassembly.
     fn declared_message_length(&self) -> Option<usize> {
-        let total_length = u32::from_be_bytes([
-            *self.buffer.first()?,
-            *self.buffer.get(1)?,
-            *self.buffer.get(2)?,
-            *self.buffer.get(3)?,
-        ]) as usize;
-        let headers_length = u32::from_be_bytes([
-            *self.buffer.get(4)?,
-            *self.buffer.get(5)?,
-            *self.buffer.get(6)?,
-            *self.buffer.get(7)?,
-        ]) as usize;
+        let total_length = be_u32(self.buffer.get(..4)?)? as usize;
+        let headers_length = be_u32(self.buffer.get(4..8)?)? as usize;
+        let declared_crc = be_u32(self.buffer.get(8..EVENT_STREAM_PRELUDE_BYTES)?)?;
+
+        // The prelude checksum covers exactly the two length fields.
+        let checked = self.buffer.get(..EVENT_STREAM_PRELUDE_CHECKED_BYTES)?;
+        if event_stream_crc32(checked) != declared_crc {
+            return None;
+        }
 
         // A message must at least cover its own framing, must fit the retained
         // bound, and its headers must fit inside it. Any violation means the
@@ -400,23 +608,56 @@ impl StreamUsageScanner {
     }
 
     fn consume_event_stream_message(&mut self, message: &[u8], total_length: usize) {
-        let headers_length = match message.get(4..8) {
-            Some(bytes) => u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize,
-            None => {
-                self.halt_malformed();
-                return;
-            }
+        // The message CRC-32 covers everything from the first prelude byte up to
+        // (but excluding) the checksum itself. Verify it before reading headers
+        // or payload: without it nothing in this frame is trustworthy, and the
+        // HTTP transport does not check application framing.
+        let checked_end = total_length.saturating_sub(EVENT_STREAM_CRC_BYTES);
+        let Some(checked) = message.get(..checked_end) else {
+            self.halt_malformed();
+            return;
         };
-        let payload_start = EVENT_STREAM_PRELUDE_BYTES.saturating_add(headers_length);
-        let payload_end = total_length.saturating_sub(4);
-        if payload_start > payload_end {
+        let Some(declared_crc) = message.get(checked_end..total_length).and_then(be_u32) else {
+            self.halt_malformed();
+            return;
+        };
+        if event_stream_crc32(checked) != declared_crc {
             self.halt_malformed();
             return;
         }
-        let Some(payload) = message.get(payload_start..payload_end) else {
+
+        let Some(headers_length) = message.get(4..8).and_then(be_u32) else {
             self.halt_malformed();
             return;
         };
+        let payload_start = EVENT_STREAM_PRELUDE_BYTES.saturating_add(headers_length as usize);
+        if payload_start > checked_end {
+            self.halt_malformed();
+            return;
+        }
+        let Some(header_block) = message.get(EVENT_STREAM_PRELUDE_BYTES..payload_start) else {
+            self.halt_malformed();
+            return;
+        };
+        let Some(payload) = message.get(payload_start..checked_end) else {
+            self.halt_malformed();
+            return;
+        };
+
+        // A header block that cannot be walked exactly to its end is damaged
+        // framing, not merely an unrecognized frame: the payload boundary the
+        // prelude declared is no longer corroborated by anything.
+        let Some(headers) = parse_event_stream_headers(header_block) else {
+            self.halt_malformed();
+            return;
+        };
+        if !headers.may_carry_usage() {
+            // A well-framed exception/error frame or a content event
+            // (`messageStart`, `contentBlockDelta`, …). Framing is intact, so
+            // keep scanning, but nothing here may mint authoritative usage.
+            return;
+        }
+
         if payload.is_empty() {
             return;
         }

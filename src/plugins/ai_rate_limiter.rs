@@ -732,6 +732,17 @@ impl AiRateLimiter {
         self.load_reservation(ctx).ai_request
     }
 
+    /// Whether THIS instance deferred classification of a compressed request
+    /// body to its `on_final_request_body` pass. The deferral used to be a
+    /// shared `ctx.metadata` marker; it is instance-scoped now
+    /// (GHSA-wh4p-pmxm-3784), so co-located limiters each defer and classify
+    /// independently. Not a production API.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub fn deferred_compressed_classification_for_test(&self, ctx: &RequestContext) -> bool {
+        self.load_reservation(ctx).deferred_compressed_classification
+    }
+
     /// The `on_unmetered_response` action THIS instance applied, if any. Not a
     /// production API.
     #[doc(hidden)]

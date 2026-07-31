@@ -60,10 +60,7 @@ fn ai_request_ctx(max_tokens: u64, prompt: &str) -> RequestContext {
 
 fn sse_headers() -> HashMap<String, String> {
     let mut headers = HashMap::new();
-    headers.insert(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    );
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
     headers
 }
 
@@ -456,20 +453,70 @@ fn bedrock_event_stream_content_type_is_recognized() {
     assert_eq!(StreamUsageFormat::for_content_type("application/json"), None);
 }
 
-/// Build one AWS event-stream message with an empty header block.
+/// CRC-32 (IEEE) — the algorithm the AWS event-stream framing specifies for
+/// both its prelude and its whole-message checksum.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(bytes);
+    hasher.finalize()
+}
+
+/// Encode one AWS event-stream STRING header (value type `7`).
+fn string_header(name: &str, value: &str) -> Vec<u8> {
+    let mut header = Vec::new();
+    header.push(u8::try_from(name.len()).unwrap());
+    header.extend_from_slice(name.as_bytes());
+    header.push(7);
+    header.extend_from_slice(&u16::try_from(value.len()).unwrap().to_be_bytes());
+    header.extend_from_slice(value.as_bytes());
+    header
+}
+
+/// The documented Bedrock reserved header block for one modelled event.
+fn bedrock_event_headers(event_type: &str) -> Vec<u8> {
+    let mut headers = string_header(":event-type", event_type);
+    headers.extend_from_slice(&string_header(":content-type", "application/json"));
+    headers.extend_from_slice(&string_header(":message-type", "event"));
+    headers
+}
+
+/// A correctly checksummed 12-byte prelude for an arbitrary declared layout.
 ///
-/// Layout: total length (u32 BE), headers length (u32 BE), prelude CRC (u32),
-/// headers, payload, message CRC (u32). CRCs are not validated by the scanner
-/// (the transport already did), so they are zero-filled here.
-fn event_stream_message(payload: &[u8]) -> Vec<u8> {
-    let total = 16 + payload.len();
-    let mut message = Vec::with_capacity(total);
-    message.extend_from_slice(&(total as u32).to_be_bytes());
-    message.extend_from_slice(&0u32.to_be_bytes()); // headers length
-    message.extend_from_slice(&0u32.to_be_bytes()); // prelude CRC
+/// Used by the negative framing tests so they exercise the *length* validation
+/// rather than tripping the prelude CRC first.
+fn event_stream_prelude(total_length: u32, headers_length: u32) -> Vec<u8> {
+    let mut prelude = Vec::with_capacity(12);
+    prelude.extend_from_slice(&total_length.to_be_bytes());
+    prelude.extend_from_slice(&headers_length.to_be_bytes());
+    let checksum = crc32(&prelude);
+    prelude.extend_from_slice(&checksum.to_be_bytes());
+    prelude
+}
+
+/// Build one complete, correctly checksummed AWS event-stream message.
+///
+/// Layout: total length (u32 BE), headers length (u32 BE), prelude CRC-32 over
+/// those eight bytes, the header block, the payload, and a message CRC-32 over
+/// everything preceding it. Both checksums are real: the scanner verifies them,
+/// because `application/vnd.amazon.eventstream` is application framing that no
+/// HTTP transport validates.
+fn event_stream_frame(headers: &[u8], payload: &[u8]) -> Vec<u8> {
+    let total = 16 + headers.len() + payload.len();
+    let mut message = event_stream_prelude(
+        u32::try_from(total).unwrap(),
+        u32::try_from(headers.len()).unwrap(),
+    );
+    message.extend_from_slice(headers);
     message.extend_from_slice(payload);
-    message.extend_from_slice(&0u32.to_be_bytes()); // message CRC
+    let checksum = crc32(&message);
+    message.extend_from_slice(&checksum.to_be_bytes());
     message
+}
+
+/// A message with no header block at all — the shape a provider variant that
+/// frames a bare JSON payload emits. Absent reserved headers stay meterable.
+fn event_stream_message(payload: &[u8]) -> Vec<u8> {
+    event_stream_frame(&[], payload)
 }
 
 /// Bedrock `InvokeModelWithResponseStream` wraps each model chunk as a base64
@@ -550,37 +597,251 @@ fn event_stream_messages_reassemble_across_chunk_boundaries() {
 /// for it or reporting a clean usage-free stream.
 #[test]
 fn oversized_or_impossible_event_stream_framing_fails_closed() {
+    // Each prelude below carries a VALID prelude CRC, so the rejection proves
+    // the length validation and not merely the checksum.
+
     // Declared total length below the framing overhead.
     let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
-    let mut bogus = Vec::new();
-    bogus.extend_from_slice(&4u32.to_be_bytes());
-    bogus.extend_from_slice(&0u32.to_be_bytes());
-    bogus.extend_from_slice(&0u32.to_be_bytes());
-    scanner.observe(&bogus);
+    scanner.observe(&event_stream_prelude(4, 0));
     scanner.finish();
     assert!(scanner.malformed());
     assert!(scanner.authoritative_usage().is_none());
 
     // Declared total length far above the retained bound.
     let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
-    let mut huge = Vec::new();
-    huge.extend_from_slice(&u32::MAX.to_be_bytes());
-    huge.extend_from_slice(&0u32.to_be_bytes());
-    huge.extend_from_slice(&0u32.to_be_bytes());
-    scanner.observe(&huge);
+    scanner.observe(&event_stream_prelude(u32::MAX, 0));
     scanner.finish();
     assert!(scanner.malformed());
     assert!(scanner.authoritative_usage().is_none());
 
     // Headers longer than the message that contains them.
     let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
-    let mut inconsistent = Vec::new();
-    inconsistent.extend_from_slice(&32u32.to_be_bytes());
-    inconsistent.extend_from_slice(&1024u32.to_be_bytes());
-    inconsistent.extend_from_slice(&0u32.to_be_bytes());
-    scanner.observe(&inconsistent);
+    scanner.observe(&event_stream_prelude(32, 1024));
     scanner.finish();
     assert!(scanner.malformed());
+}
+
+/// The prelude CRC-32 covers the two declared lengths. A corrupted prelude must
+/// be refused BEFORE its declared length is honored, so a forged length can
+/// never drive reassembly.
+#[test]
+fn event_stream_prelude_crc_mismatch_fails_closed() {
+    let payload = serde_json::to_vec(&json!({
+        "usage": {"inputTokens": 5, "outputTokens": 7, "totalTokens": 12}
+    }))
+    .unwrap();
+    let mut message = event_stream_frame(&bedrock_event_headers("metadata"), &payload);
+
+    // Flip one bit inside the prelude checksum.
+    message[11] ^= 0x01;
+
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&message);
+    scanner.finish();
+
+    assert!(
+        scanner.malformed(),
+        "a prelude CRC mismatch must mark the scan malformed"
+    );
+    assert!(
+        scanner.authoritative_usage().is_none(),
+        "usage behind a corrupted prelude is never authoritative"
+    );
+}
+
+/// The message CRC-32 covers the complete message except its own checksum.
+/// Corruption anywhere in the headers or payload must fail the scan closed even
+/// though the prelude still validates.
+#[test]
+fn event_stream_message_crc_mismatch_fails_closed() {
+    let payload = serde_json::to_vec(&json!({
+        "usage": {"inputTokens": 5, "outputTokens": 7, "totalTokens": 12}
+    }))
+    .unwrap();
+    let headers = bedrock_event_headers("metadata");
+
+    // Corrupt a payload byte: the prelude (lengths) is untouched and still
+    // checksums correctly, so only the message CRC can catch this.
+    let mut corrupted_payload = event_stream_frame(&headers, &payload);
+    let payload_start = 12 + headers.len();
+    corrupted_payload[payload_start] ^= 0x20;
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&corrupted_payload);
+    scanner.finish();
+    assert!(
+        scanner.malformed(),
+        "a payload byte flip must be caught by the message CRC"
+    );
+    assert!(scanner.authoritative_usage().is_none());
+
+    // Corrupt the trailing checksum itself.
+    let mut corrupted_crc = event_stream_frame(&headers, &payload);
+    let last = corrupted_crc.len() - 1;
+    corrupted_crc[last] ^= 0x01;
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&corrupted_crc);
+    scanner.finish();
+    assert!(scanner.malformed());
+    assert!(scanner.authoritative_usage().is_none());
+}
+
+/// The canonical wire headers of both metered Bedrock event kinds are accepted:
+/// `InvokeModelWithResponseStream`'s `chunk` and `ConverseStream`'s `metadata`.
+#[test]
+fn canonical_bedrock_event_headers_are_accepted() {
+    use base64::Engine as _;
+    let inner = json!({
+        "type": "message_stop",
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 17, "outputTokenCount": 83}
+    });
+    let encoded = base64::engine::general_purpose::STANDARD.encode(inner.to_string());
+    let envelope = serde_json::to_vec(&json!({ "bytes": encoded })).unwrap();
+
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&event_stream_frame(
+        &bedrock_event_headers("chunk"),
+        &envelope,
+    ));
+    scanner.finish();
+    assert_eq!(
+        scanner
+            .authoritative_usage()
+            .and_then(|usage| usage.total_for_mode("total_tokens")),
+        Some(100),
+        "an `:event-type: chunk` frame is a usage authority"
+    );
+    assert!(!scanner.malformed());
+
+    let metadata = serde_json::to_vec(&json!({
+        "usage": {"inputTokens": 12, "outputTokens": 34, "totalTokens": 46}
+    }))
+    .unwrap();
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&event_stream_frame(
+        &bedrock_event_headers("metadata"),
+        &metadata,
+    ));
+    scanner.finish();
+    assert_eq!(
+        scanner
+            .authoritative_usage()
+            .and_then(|usage| usage.total_for_mode("total_tokens")),
+        Some(46),
+        "an `:event-type: metadata` frame is a usage authority"
+    );
+    assert!(!scanner.malformed());
+}
+
+/// A frame that is well-framed but is NOT one of the usage-bearing event kinds
+/// must not mint usage, even when its payload is usage-shaped. Framing is
+/// intact, so the scan itself stays clean.
+#[test]
+fn non_usage_bedrock_event_types_do_not_mint_usage() {
+    let usage_shaped = serde_json::to_vec(&json!({
+        "usage": {"inputTokens": 999, "outputTokens": 999, "totalTokens": 1998}
+    }))
+    .unwrap();
+
+    for event_type in [
+        "contentBlockDelta",
+        "messageStart",
+        "messageStop",
+        "totally-unknown",
+    ] {
+        let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+        scanner.observe(&event_stream_frame(
+            &bedrock_event_headers(event_type),
+            &usage_shaped,
+        ));
+        scanner.finish();
+        assert!(
+            scanner.authoritative_usage().is_none(),
+            "`{event_type}` must never mint authoritative usage"
+        );
+        assert!(
+            !scanner.malformed(),
+            "`{event_type}` is well-framed, so the scan is not damaged"
+        );
+    }
+}
+
+/// Exception and error frames terminate a Bedrock stream in failure. Their
+/// payload is an error document, never a usage authority.
+#[test]
+fn bedrock_exception_frames_do_not_mint_usage() {
+    let usage_shaped = serde_json::to_vec(&json!({
+        "message": "throttled",
+        "usage": {"inputTokens": 999, "outputTokens": 999, "totalTokens": 1998}
+    }))
+    .unwrap();
+
+    let mut exception = string_header(":message-type", "exception");
+    exception.extend_from_slice(&string_header(":exception-type", "throttlingException"));
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&event_stream_frame(&exception, &usage_shaped));
+    scanner.finish();
+    assert!(scanner.authoritative_usage().is_none());
+
+    let error = string_header(":message-type", "error");
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&event_stream_frame(&error, &usage_shaped));
+    scanner.finish();
+    assert!(
+        scanner.authoritative_usage().is_none(),
+        "an `error` message-type is not an event"
+    );
+}
+
+/// A header block that cannot be walked exactly to its end is damaged framing:
+/// the payload boundary the prelude declared is no longer corroborated, so the
+/// scan fails closed rather than reading the bytes behind it.
+#[test]
+fn malformed_event_stream_headers_fail_closed() {
+    let usage = serde_json::to_vec(&json!({
+        "usage": {"inputTokens": 5, "outputTokens": 7, "totalTokens": 12}
+    }))
+    .unwrap();
+
+    // A declared string length that runs past the end of the header block.
+    let mut overrun = string_header(":event-type", "metadata");
+    let value_length_at = overrun.len() - 8 - 2;
+    overrun[value_length_at] = 0xff;
+
+    // A header value type the framing does not define, so nothing after it can
+    // be located.
+    let unknown_type = {
+        let mut header = Vec::new();
+        header.push(11u8);
+        header.extend_from_slice(b":event-type");
+        header.push(0x5a);
+        header
+    };
+
+    // A zero-length header name.
+    let empty_name = vec![0u8, 7u8, 0u8, 0u8];
+
+    // The same reserved header twice with conflicting values.
+    let mut duplicated = string_header(":event-type", "metadata");
+    duplicated.extend_from_slice(&string_header(":event-type", "contentBlockDelta"));
+
+    for (label, headers) in [
+        ("string length overrun", overrun),
+        ("unknown value type", unknown_type),
+        ("empty header name", empty_name),
+        ("duplicate reserved header", duplicated),
+    ] {
+        let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+        scanner.observe(&event_stream_frame(&headers, &usage));
+        scanner.finish();
+        assert!(
+            scanner.malformed(),
+            "{label}: a header block that cannot be walked must fail closed"
+        );
+        assert!(
+            scanner.authoritative_usage().is_none(),
+            "{label}: no usage may be minted from a damaged header block"
+        );
+    }
 }
 
 /// A truncated event stream — the terminal usage message never fully arrived —
@@ -623,6 +884,153 @@ fn malformed_sse_payloads_do_not_block_a_later_usage_event() {
             .authoritative_usage()
             .and_then(|usage| usage.total_for_mode("total_tokens")),
         Some(7)
+    );
+    assert!(
+        !scanner.malformed(),
+        "a later authoritative cumulative usage record restates the counts an \
+         undecodable earlier record could have carried, so the scan recovers"
+    );
+}
+
+/// The mirror-image ordering must NOT recover. Syntax damage *after* the last
+/// authoritative usage record means the provider may have restated its counts in
+/// a record the scanner could not read, so the earlier snapshot can no longer be
+/// settled as a clean terminal stream.
+#[test]
+fn sse_damage_after_a_usage_record_fails_closed() {
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::Sse, None);
+    scanner.observe(
+        br#"data: {"object":"chat.completion.chunk","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}
+"#,
+    );
+    assert!(!scanner.malformed(), "the stream is clean at this point");
+
+    scanner.observe(b"data: {\"object\":\"chat.completion.chunk\",\"usage\":{\"prompt_\n");
+    scanner.finish();
+
+    assert!(
+        scanner.malformed(),
+        "damaged candidate data after the last usage record must fail closed"
+    );
+}
+
+/// A `data:` payload that is truncated at end of stream (no terminating newline,
+/// no closing brace) is the same fail-closed case: the terminal usage record
+/// never fully arrived.
+#[test]
+fn truncated_trailing_sse_data_fails_closed() {
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::Sse, None);
+    scanner.observe(b"data: {\"object\":\"chat.completion.chunk\",\"usage\":{\"total_tok");
+    scanner.finish();
+
+    assert!(scanner.malformed());
+    assert!(scanner.authoritative_usage().is_none());
+}
+
+/// A `data:` line whose bytes are not valid UTF-8 cannot be decoded as the
+/// provider event it claims to be, so it damages the scan. `text/event-stream`
+/// is UTF-8 by definition; a non-UTF-8 record is not something to skip quietly.
+#[test]
+fn non_utf8_sse_candidate_data_fails_closed() {
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::Sse, None);
+    scanner.observe(
+        br#"data: {"object":"chat.completion.chunk","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}
+"#,
+    );
+    let mut line = b"data: ".to_vec();
+    line.extend_from_slice(&[0xff, 0xfe, 0x80]);
+    line.push(b'\n');
+    scanner.observe(&line);
+    scanner.finish();
+
+    assert!(
+        scanner.malformed(),
+        "non-UTF-8 candidate data must fail closed"
+    );
+}
+
+/// A data record that parses as JSON but is not an object is not the provider
+/// event shape either.
+#[test]
+fn non_object_sse_data_fails_closed() {
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::Sse, None);
+    scanner.observe(b"data: 12345\n");
+    scanner.finish();
+    assert!(scanner.malformed());
+
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::Sse, None);
+    scanner.observe(b"data: [1,2,3]\n");
+    scanner.finish();
+    assert!(scanner.malformed());
+}
+
+/// Ordinary SSE syntax must never poison the scan: comments, keep-alives, other
+/// field names, blank event separators, empty data records, `[DONE]`, and
+/// non-UTF-8 bytes on a line that is not a `data:` candidate.
+#[test]
+fn ordinary_sse_syntax_does_not_poison_the_scan() {
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::Sse, None);
+    scanner.observe(b": keep-alive\n");
+    scanner.observe(b"event: message\n");
+    scanner.observe(b"id: 42\n");
+    scanner.observe(b"retry: 1000\n");
+    scanner.observe(b"\n");
+    scanner.observe(b"data:\n");
+    scanner.observe(b"data: \n");
+    scanner.observe(b"data: [DONE]\n");
+    scanner.observe(&[b':', b' ', 0xff, 0xfe, b'\n']);
+    scanner.finish();
+
+    assert!(
+        !scanner.malformed(),
+        "well-formed SSE syntax that carries no usage is a clean usage-free stream"
+    );
+    assert!(scanner.authoritative_usage().is_none());
+}
+
+/// End to end: a stream whose tail is damaged after a valid usage snapshot must
+/// take the unmetered posture rather than charging the earlier snapshot.
+#[tokio::test]
+async fn stream_damaged_after_usage_takes_the_unmetered_posture() {
+    let plugin: Arc<dyn Plugin> = Arc::new(limiter(json!({
+        "token_limit": 10_000,
+        "window_seconds": 60,
+        "limit_by": "ip",
+        "expose_headers": true,
+        "on_unmetered_response": "charge_estimate"
+    })));
+    let mut ctx = ai_request_ctx(200, "damage my tail");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = observed_usage_of(&plugin).await;
+    assert!(reserved > 0);
+    assert_ne!(
+        reserved, 100,
+        "the estimate must differ from the snapshot the damaged stream carries"
+    );
+
+    let chunks: [&[u8]; 2] = [
+        b"data: {\"object\":\"chat.completion.chunk\",\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":60,\"total_tokens\":100}}\n\n",
+        b"data: {\"object\":\"chat.completion.chu\n\n",
+    ];
+    let expected: Vec<u8> = chunks.concat();
+    let forwarded = stream_response(
+        &plugin,
+        &mut ctx,
+        "text/event-stream",
+        &chunks,
+        BodyOutcome::success(expected.len() as u64),
+    )
+    .await;
+
+    assert_eq!(
+        forwarded, expected,
+        "damage changes accounting, never the bytes the client receives"
+    );
+    assert_eq!(
+        observed_usage_of(&plugin).await,
+        reserved,
+        "the earlier snapshot must not be charged for a stream damaged after it"
     );
 }
 

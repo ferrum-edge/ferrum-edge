@@ -69,19 +69,61 @@ async fn test_plugin_name_and_priority() {
     // the plugin must not advertise (and must not be attachable to) native gRPC.
     assert_eq!(plugin.supported_protocols(), &[ProxyProtocol::Http]);
     assert!(!plugin.supported_protocols().contains(&ProxyProtocol::Grpc));
+    // The plugin still declares the cache-level upper bound, so a proxy that
+    // carries it keeps the capability to buffer a response body.
     assert!(plugin.requires_response_body_buffering());
-    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "application/json")));
-    assert!(plugin.should_buffer_response_body(&ctx_with_content_type(
-        "POST",
-        "multipart/form-data; boundary=abc"
-    )));
-    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "text/plain")));
-    assert!(plugin.should_buffer_response_body(&ctx_without_content_type("POST")));
-    // Spec change (PR #956 / commit 55a59396): the POST-only buffering
-    // shortcut was a security bypass — non-POST AI responses (e.g. GET
-    // chat history endpoints) would skip token-budget accounting. The
-    // plugin now buffers every method when it's active.
-    assert!(plugin.should_buffer_response_body(&ctx_with_content_type("GET", "application/json")));
+
+    // GHSA-q2r2-6r7h-f69x narrowed the PER-REQUEST predicate. It used to return
+    // `true` unconditionally, which pinned every response on the proxy — SSE
+    // model streams included — onto the buffered path. It is now gated on this
+    // instance having something to reconcile: a request it classified as an AI
+    // call, or one it took a reservation against. A context that never went
+    // through `before_proxy` has neither.
+    //
+    // This supersedes the PR #956 / commit 55a59396 spec note about buffering
+    // every method: the limiter only ever charges a request whose JSON body it
+    // classified as an LLM call (`json_looks_like_ai_request`), which requires a
+    // POST body, so buffering a bodyless GET bought no accounting coverage
+    // while costing a buffered copy of every response on a shared proxy.
+    for ctx in [
+        ctx_with_content_type("POST", "application/json"),
+        ctx_with_content_type("POST", "multipart/form-data; boundary=abc"),
+        ctx_with_content_type("POST", "text/plain"),
+        ctx_without_content_type("POST"),
+        ctx_with_content_type("GET", "application/json"),
+    ] {
+        assert!(
+            !plugin.should_buffer_response_body(&ctx),
+            "an unclassified, unreserved request has no body for this limiter to meter"
+        );
+    }
+
+    // An admitted AI call DOES still take the buffered extraction path.
+    let mut admitted = ai_request_ctx(120, "buffer me");
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut admitted, &mut headers).await);
+    assert!(
+        plugin.should_buffer_response_body(&admitted),
+        "an admitted AI request still needs the pre-header buffering upper bound"
+    );
+    assert!(
+        plugin.should_buffer_response_body_for_content_type(
+            &admitted,
+            Some("application/json"),
+            200,
+            &HashMap::new(),
+        ),
+        "an ordinary JSON provider response keeps the buffered extraction path"
+    );
+    assert!(
+        !plugin.should_buffer_response_body_for_content_type(
+            &admitted,
+            Some("text/event-stream"),
+            200,
+            &HashMap::new(),
+        ),
+        "GHSA-q2r2-6r7h-f69x: an SSE model stream must never be buffered"
+    );
 }
 
 // ─── Basic flow ─────────────────────────────────────────────────────────
@@ -1319,8 +1361,7 @@ async fn compressed_decompressed_ai_request_classified_in_on_final() {
         "Case A must DEFER classification, never mark in before_proxy"
     );
     assert!(
-        ctx.metadata
-            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        plugin.deferred_compressed_classification_for_test(&ctx),
         "before_proxy must set the deferred-classification marker for Case A"
     );
 
@@ -1340,8 +1381,7 @@ async fn compressed_decompressed_ai_request_classified_in_on_final() {
         "on_final must mark the decompressed AI request"
     );
     assert!(
-        !ctx.metadata
-            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        !plugin.deferred_compressed_classification_for_test(&ctx),
         "on_final must consume the deferred marker"
     );
 
@@ -1382,8 +1422,7 @@ async fn compressed_decompressed_non_ai_request_not_marked() {
     let mut headers = json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert!(
-        ctx.metadata
-            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        plugin.deferred_compressed_classification_for_test(&ctx),
         "before_proxy defers compressed POST JSON to on_final"
     );
 
@@ -1436,8 +1475,7 @@ async fn spoofed_original_encoding_header_without_compression_still_reserves() {
          x-ferrum-original-content-encoding header"
     );
     assert!(
-        !ctx.metadata
-            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        !plugin.deferred_compressed_classification_for_test(&ctx),
         "a forged client header must not trigger the deferred path"
     );
 }
@@ -1473,8 +1511,7 @@ async fn compressed_framed_grpc_json_not_marked() {
         "a framed gRPC body must not be marked an AI candidate"
     );
     assert!(
-        !ctx.metadata
-            .contains_key("ai_ratelimit_deferred_compressed_classify"),
+        !plugin.deferred_compressed_classification_for_test(&ctx),
         "a framed gRPC body must not be deferred"
     );
 

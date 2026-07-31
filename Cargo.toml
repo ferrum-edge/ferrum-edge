@@ -182,6 +182,11 @@ prost-reflect = "0.16"
 brotli = "8"
 flate2 = "1"
 zstd = "0.13"
+# AWS event-stream (Bedrock `application/vnd.amazon.eventstream`) prelude and
+# message CRC-32 verification on the streaming accounting path. Already in the
+# graph through `flate2`; taken as a direct dependency so the hardware-assisted
+# implementation is used instead of a bit-at-a-time CRC in a hot loop.
+crc32fast = "1"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

@@ -22305,7 +22305,13 @@ components:
             Anthropic, Cohere v2, Gemini `usageMetadata`, native TGI) and
             `application/vnd.amazon.eventstream` (Bedrock
             InvokeModelWithResponseStream / ConverseStream) are both decoded in
-            flight.
+            flight. The AWS framing's prelude and whole-message CRC-32
+            checksums and its bounded header block are validated before any
+            payload is trusted, and only `:event-type: chunk` /
+            `:event-type: metadata` event frames may mint usage. Provider token
+            sums use checked arithmetic: an overflowing or malformed usage
+            record yields no total and the response is settled as unmetered by
+            `on_unmetered_response`, never as a saturated count.
         on_unmetered_response:
           type: string
           enum: [reject, charge_estimate, warn]
