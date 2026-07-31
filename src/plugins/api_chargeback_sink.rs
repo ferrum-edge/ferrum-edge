@@ -1791,9 +1791,10 @@ impl SpoolDelivery {
 
     /// Enqueue snapshot overflow events for durable async spooling. The bounded
     /// queue owns compression/write/fsync and preserves the byte leases until
-    /// the blocking write finishes. Admission refusal returns the exact events
-    /// to the caller; after delivery ownership begins, a full/closed queue or
-    /// worker teardown re-stages them before releasing that ownership.
+    /// the blocking write finishes. Admission or queue-capacity refusal returns
+    /// the exact events to the caller before delivery ownership begins. Once a
+    /// reserved slot accepts the job, worker teardown re-stages it before
+    /// releasing that ownership.
     fn try_enqueue_snapshot_overflow(
         &self,
         events: Vec<QueuedChargeEvent>,
@@ -1807,6 +1808,16 @@ impl SpoolDelivery {
         let Some(_admission) = self.worker.try_admit() else {
             return Err(events);
         };
+        // Reserve the typed channel slot before constructing or transferring
+        // the SnapshotOverflow job. A failed `try_send(SpoolJob)` returned a
+        // mixed enum and forced an "impossible" production panic arm for the
+        // sibling Events variant. Keeping the exact Vec here until a permit is
+        // secured both removes that panic and lets a full/closed queue return
+        // the original charged events to the caller without cloning.
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(_) => return Err(events),
+        };
         accumulator.begin_overflow_delivery();
         self.pending_jobs.fetch_add(1, Ordering::Relaxed);
         self.pending_events
@@ -1819,30 +1830,11 @@ impl SpoolDelivery {
             Arc::clone(&self.pending_jobs),
             Arc::clone(&self.pending_events),
         );
-        match self.sender.try_send(SpoolJob::SnapshotOverflow(job)) {
-            Ok(()) => {
-                self.metrics
-                    .spool_jobs_enqueued_total
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(error) => {
-                match error.into_inner() {
-                    SpoolJob::SnapshotOverflow(mut job) => {
-                        // Stage back while this job still owns the lifecycle's
-                        // delivery count. Drop releases ownership only after the
-                        // accumulator mutation is complete.
-                        job.restage();
-                        Ok(())
-                    }
-                    SpoolJob::Events(_) => {
-                        unreachable!(
-                            "try_enqueue_snapshot_overflow only enqueues SnapshotOverflow"
-                        );
-                    }
-                }
-            }
-        }
+        permit.send(SpoolJob::SnapshotOverflow(job));
+        self.metrics
+            .spool_jobs_enqueued_total
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn pending_jobs(&self) -> usize {
@@ -1894,19 +1886,35 @@ fn start_spool_delivery(
                     match job {
                         Some(SpoolJob::Events(queued_events)) => {
                             let event_count = queued_events.len();
-                            let Ok(queued_events) = Arc::try_unwrap(queued_events) else {
-                                // The spool channel moves the Arc; another
-                                // strong handle means an unexpected retain.
-                                // Refuse to deep-clone ChargeEvent records
-                                // outside the byte budget.
-                                metrics_for_worker.record_spool_job_loss(
-                                    event_count as u64,
-                                    "spool batch retained by an unexpected shared handle",
-                                );
-                                pending_jobs_for_loop.fetch_sub(1, Ordering::Relaxed);
-                                pending_events_for_loop
-                                    .fetch_sub(event_count, Ordering::Relaxed);
-                                continue;
+                            // The failed-batch handoff normally transfers the
+                            // logger's final Arc, so this unwrap is zero-copy.
+                            // If a future caller retains another handle, recover
+                            // without an unaccounted deep clone: reserve the
+                            // duplicate ChargeEvent payload first and keep that
+                            // reservation through the blocking write.
+                            let mut clone_reservation: Option<ProcessByteReservation> = None;
+                            let queued_events = match Arc::try_unwrap(queued_events) {
+                                Ok(queued_events) => queued_events,
+                                Err(shared) => {
+                                    let bytes = shared
+                                        .iter()
+                                        .map(|queued| charge_event_retained_bytes(&queued.event))
+                                        .fold(0usize, usize::saturating_add);
+                                    let Some(reservation) =
+                                        ProcessByteReservation::try_acquire(bytes)
+                                    else {
+                                        metrics_for_worker.record_spool_job_loss(
+                                            event_count as u64,
+                                            "shared spool batch clone refused by the retained-byte ceiling",
+                                        );
+                                        pending_jobs_for_loop.fetch_sub(1, Ordering::Relaxed);
+                                        pending_events_for_loop
+                                            .fetch_sub(event_count, Ordering::Relaxed);
+                                        continue;
+                                    };
+                                    clone_reservation = Some(reservation);
+                                    shared.as_ref().clone()
+                                }
                             };
                             let (events, leases): (Vec<_>, Vec<_>) = queued_events
                                 .into_iter()
@@ -1920,6 +1928,7 @@ fn start_spool_delivery(
                                 // blocking write finishes, even if its async
                                 // waiter is cancelled during a timed-out drain.
                                 drop(leases);
+                                drop(clone_reservation);
                                 result
                             })
                             .await;
@@ -11180,15 +11189,14 @@ fn spool_snapshot_overflow_event(lifecycle: &SnapshotLifecycle, event: ChargeEve
                         lifecycle.generation,
                     ) {
                         Ok(()) => {
-                            // Either the delivery worker owns the job (durable
-                            // counters advance after write) or a full/closed
-                            // queue already restaged under delivery ownership.
+                            // The delivery worker owns the job; durable counters
+                            // advance only after the write completes.
                             invalidate_status_cache();
                             return;
                         }
-                        // Admission refused (worker closing): recover the event
-                        // (the lease drops here, releasing its export-queue byte
-                        // reservation) and fall through to bounded staging.
+                        // Admission or queue-capacity refused: recover the event
+                        // (the lease drops here, releasing its export-queue
+                        // byte reservation) and fall through to bounded staging.
                         Err(mut returned) => match returned.pop() {
                             Some(queued) => queued.event,
                             None => return,
