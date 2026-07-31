@@ -339,6 +339,41 @@ impl K8sResourceKey {
             name: object.metadata.name.clone(),
         }
     }
+
+    /// Identity of the resource that caused a translation failure.
+    ///
+    /// `Unsupported` errors do not carry an API version; status planning keys
+    /// off kind/namespace/name only in that case (empty `api_version`).
+    pub fn from_error(error: &K8sTranslateError) -> Self {
+        match error {
+            K8sTranslateError::Unsupported(resource) => Self {
+                api_version: String::new(),
+                kind: resource.kind.clone(),
+                namespace: resource.namespace.clone(),
+                name: resource.name.clone(),
+            },
+            K8sTranslateError::InvalidResource {
+                kind,
+                namespace,
+                name,
+                ..
+            } => Self {
+                api_version: String::new(),
+                kind: kind.clone(),
+                namespace: namespace.clone(),
+                name: name.clone(),
+            },
+        }
+    }
+
+    /// Match against a live object when the key may have been built from a
+    /// translation error (empty `api_version`).
+    pub fn matches_object(&self, object: &K8sObject) -> bool {
+        self.kind == object.kind
+            && self.namespace == object.metadata.namespace
+            && self.name == object.metadata.name
+            && (self.api_version.is_empty() || self.api_version == object.api_version)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -790,9 +825,15 @@ pub fn gateway_api_route_conflict_keys_with_context(
     options: &K8sTranslationOptions,
     object: &K8sObject,
 ) -> Vec<GatewayApiRouteConflictKey> {
-    let mut acc = K8sAccumulator::new(options.clone());
-    collect_gateway_api_status_context(objects, &mut acc);
+    let acc = gateway_api_status_conflict_context(objects, options.clone());
     gateway_api::route_conflict_keys_for_acc(object, Some(&acc))
+}
+
+pub(crate) fn gateway_api_route_conflict_keys_with_acc(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+) -> Vec<GatewayApiRouteConflictKey> {
+    gateway_api::route_conflict_keys_for_acc(object, Some(acc))
 }
 
 fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumulator) {
@@ -826,6 +867,19 @@ fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumu
     }
 }
 
+/// Build the Gateway API status-context accumulator once per reconcile/plan.
+///
+/// Status planning reuses this for every route conflict-key lookup instead of
+/// rescanning the snapshot three times per route (#2397).
+pub(crate) fn gateway_api_status_conflict_context(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+) -> K8sAccumulator {
+    let mut acc = K8sAccumulator::new(options);
+    collect_gateway_api_status_context(objects, &mut acc);
+    acc
+}
+
 pub(crate) fn translate_k8s_objects_with_filter<F>(
     objects: &[K8sObject],
     options: K8sTranslationOptions,
@@ -834,18 +888,11 @@ pub(crate) fn translate_k8s_objects_with_filter<F>(
 where
     F: Fn(&K8sObject) -> bool,
 {
-    // Performance follow-up: each K8sObject carries the entire `spec`/`status`
-    // `serde_json::Value` (HTTPRoute/VirtualService specs can be tens of KB).
-    // Cloning every included object once per reconcile is bounded by reconcile
-    // cadence (~30s on the CP) but unnecessary — every downstream consumer
-    // borrows immutably. Migrating this to `Vec<&K8sObject>` requires
-    // `gateway_api::route_conflicts` (and any future `&[K8sObject]` consumers)
-    // to take `&[&K8sObject]`; left as a follow-up to keep this slice focused.
-    let included_objects: Vec<K8sObject> = objects
-        .iter()
-        .filter(|object| include(object))
-        .cloned()
-        .collect();
+    // Borrow included objects in place. Each `K8sObject` carries arbitrary-size
+    // `spec`/`status` JSON; deep-cloning the filtered set once per translate
+    // (and historically once per status object) dominated large-cluster
+    // reconciles. Downstream collectors only need `&K8sObject`.
+    let included_objects: Vec<&K8sObject> = objects.iter().filter(|object| include(object)).collect();
     let mut acc = K8sAccumulator::new(options);
 
     for object in &included_objects {
@@ -897,7 +944,7 @@ where
     }
 
     let gateway_api_route_conflicts =
-        gateway_api::route_conflicts(&included_objects, &acc.options, Some(&acc));
+        gateway_api::route_conflicts(included_objects.iter().copied(), &acc.options, Some(&acc));
     for conflict in &gateway_api_route_conflicts {
         // GRPCRoute method / header predicates now carry their own conflict
         // signature (see `gateway_api::grpc_route_match_signature`), so two
@@ -986,6 +1033,57 @@ where
     }
 
     Ok(acc.finish())
+}
+
+/// Translate the snapshot while collecting per-object failures that were
+/// skipped so a later object could succeed.
+///
+/// Used by the reconciler and by Gateway API / Istio status planning so status
+/// writers can reuse one materialization (plus the skip errors) instead of
+/// retranslating a filtered snapshot once per status-bearing object (#2397).
+pub fn translate_k8s_objects_collecting_skips(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+) -> Option<(K8sTranslation, std::collections::HashMap<K8sResourceKey, K8sTranslateError>)> {
+    let mut skipped = std::collections::HashMap::new();
+
+    loop {
+        let translation = translate_k8s_objects_with_filter(objects, options.clone(), |object| {
+            !skipped
+                .keys()
+                .any(|key: &K8sResourceKey| key.matches_object(object))
+        });
+
+        match translation {
+            Ok(translation) => return Some((translation, skipped)),
+            Err(error) => {
+                let key = objects
+                    .iter()
+                    .find(|object| match &error {
+                        K8sTranslateError::Unsupported(resource) => {
+                            object.kind == resource.kind
+                                && object.metadata.namespace == resource.namespace
+                                && object.metadata.name == resource.name
+                        }
+                        K8sTranslateError::InvalidResource {
+                            kind,
+                            namespace,
+                            name,
+                            ..
+                        } => {
+                            object.kind == *kind
+                                && object.metadata.namespace == *namespace
+                                && object.metadata.name == *name
+                        }
+                    })
+                    .map(K8sResourceKey::from_object)
+                    .unwrap_or_else(|| K8sResourceKey::from_error(&error));
+                if skipped.insert(key, error).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 fn includes_object_namespace(options: &K8sTranslationOptions, object: &K8sObject) -> bool {

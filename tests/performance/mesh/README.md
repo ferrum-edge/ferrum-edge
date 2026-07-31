@@ -36,6 +36,7 @@ cargo bench --bench slice_apply -- "workloads/1000"
 | `ip_restriction` | One or four `ip_restriction` instances evaluating a 10,000-rule miss or final-interval match | Guards the allocation-free indexed lookup promised by issue #2322 across supported multiple-instance composition. |
 | `slice_apply` | `MeshSlice::from_gateway_config(&GatewayConfig, MeshSliceRequest)` over N workloads | Slice build cost dominates the latency budget when an xDS / native CP pushes a fresh slice; this is the cold-path that runs under the ArcSwap apply. |
 | `xds_translation` | `xds::translator::translate_mesh_slice_to_snapshot(&MeshSlice)` over N workloads | Control-plane translation cost shared by every connected DP; the snapshot cache dedupes by content fingerprint downstream of this call. |
+| `gateway_api_status_planning` | `plan_gateway_api_status_updates_budgeted` over 1k and 10k HTTPRoutes with the production 256 work budget | Guards #2397: status planning must stay bounded by the fair work window rather than O(routes × snapshot) per-object retranslation. |
 
 Most benches parameterise over input size: typically `[10, 100, 1_000, 10_000]`
 for in-process traversals and `[100, 1_000, 5_000]` for slice / translation

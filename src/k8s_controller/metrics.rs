@@ -5,6 +5,10 @@ pub struct ControllerMetrics {
     pub full_syncs: AtomicU64,
     pub errors: AtomicU64,
     pub last_reconcile_duration_ms: AtomicU64,
+    /// Rotating Gateway API status-plan cursor (#2397). Advanced after each
+    /// budgeted planning pass so every eligible resource eventually enters the
+    /// fair work window.
+    pub gateway_api_status_plan_cursor: AtomicU64,
 }
 
 impl Default for ControllerMetrics {
@@ -20,6 +24,7 @@ impl ControllerMetrics {
             full_syncs: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             last_reconcile_duration_ms: AtomicU64::new(0),
+            gateway_api_status_plan_cursor: AtomicU64::new(0),
         }
     }
 

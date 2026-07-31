@@ -58,6 +58,10 @@ harness = false
 name = "ai_semantic_cache_cleanup"
 harness = false
 
+[[bench]]
+name = "gateway_api_status_planning"
+harness = false
+
 [profile.dev]
 opt-level = 0
 debug = true

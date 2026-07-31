@@ -888,8 +888,8 @@ fn metadata_key<'a>(object: &'a K8sObject, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn route_conflicts(
-    objects: &[K8sObject],
+pub(crate) fn route_conflicts<'a>(
+    objects: impl IntoIterator<Item = &'a K8sObject>,
     options: &K8sTranslationOptions,
     acc: Option<&K8sAccumulator>,
 ) -> Vec<GatewayApiRouteConflict> {
@@ -900,7 +900,7 @@ pub(crate) fn route_conflicts(
     let mut route_entries: Vec<CrossKindRouteEntry> = Vec::new();
 
     for object in objects
-        .iter()
+        .into_iter()
         .filter(|object| super::includes_object_namespace(options, object))
         .filter(|object| matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute"))
     {

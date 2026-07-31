@@ -51,6 +51,10 @@ fn run_status_patchers_shares_arc_slice_not_per_writer_to_vec() {
         RECONCILER_SRC.contains("objects: Arc<[K8sObject]>"),
         "both patch helpers must accept Arc<[K8sObject]> rather than owned Vec"
     );
+    assert!(
+        RECONCILER_SRC.contains("plan_gateway_api_status_updates_budgeted"),
+        "reconciler must use budgeted Gateway API status planning (#2397)"
+    );
 }
 
 #[test]

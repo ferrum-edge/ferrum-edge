@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Gateway API and Istio status planning now build immutable per-reconcile
+  indexes, reuse the primary translation/materialization (plus skip errors)
+  instead of retranslating a filtered snapshot once per status object, borrow
+  included `K8sObject` values rather than deep-cloning `spec`/`status` JSON, and
+  apply a fair deterministic 256-candidate work budget *before* expensive
+  per-object status work so the cap bounds CPU as well as API writes (#2397).
+  A rotating cursor ensures every eligible resource eventually makes progress.
+  Fail-closed validation and status parity for every supported Istio/Gateway
+  resource are preserved.
+
 ### Added
 
 - API-spec YAML ingestion now expands anchors and aliases through a bounded

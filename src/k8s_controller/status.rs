@@ -2,19 +2,25 @@ use futures_util::StreamExt;
 use kube::Client;
 use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
 use crate::config::types::GatewayConfig;
 use crate::config_sources::k8s::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiMaterializedRouteParent, GatewayApiRouteConflict,
-    GatewayApiRouteConflictKey, K8sObject, K8sResourceKey, K8sTranslateError,
-    K8sTranslationOptions, gateway_api_route_conflict_keys_with_context,
-    namespace_selector_matches, parse_gateway_listener_allowed_route_namespaces,
-    secret_object_is_valid_tls_certificate, translate_k8s_objects_with_filter,
-    validate_gateway_listener_allowed_routes,
+    GatewayApiRouteConflictKey, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
+    K8sTranslationOptions, gateway_api_route_conflict_keys_with_acc,
+    gateway_api_status_conflict_context, namespace_selector_matches,
+    parse_gateway_listener_allowed_route_namespaces, secret_object_is_valid_tls_certificate,
+    translate_k8s_objects_collecting_skips, validate_gateway_listener_allowed_routes,
 };
+use crate::k8s_controller::status_plan::{
+    StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
+};
+
+pub use crate::k8s_controller::status_plan::DEFAULT_STATUS_PLAN_WORK_BUDGET;
 
 pub const FERRUM_GATEWAY_CONTROLLER_NAME: &str = "ferrum.io/gateway-controller";
 /// Stable server-side-apply owner shared by every Ferrum controller replica.
@@ -222,6 +228,162 @@ fn route_status_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(base_ms.saturating_sub(base_ms / 4) + jitter_ms)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GatewayApiStatusPlanOutcome {
+    pub updates: Vec<GatewayApiStatusUpdate>,
+    /// Cursor to persist so the next reconcile rotates the fair window.
+    pub next_cursor: usize,
+    /// Eligible managed status-bearing objects before the work budget.
+    pub eligible_candidates: usize,
+    /// Candidates that received expensive status computation this pass.
+    pub planned_candidates: usize,
+}
+
+/// Optional primary-translate reuse for status planning (#2397).
+///
+/// When present, planners avoid a second full materialization and map
+/// per-object accept/reject from the skip errors collected while producing
+/// the primary translation.
+#[derive(Debug, Clone)]
+pub struct StatusTranslationReuse {
+    pub translation: Arc<K8sTranslation>,
+    pub errors: Arc<HashMap<K8sResourceKey, K8sTranslateError>>,
+}
+
+impl StatusTranslationReuse {
+    pub fn from_owned(
+        translation: K8sTranslation,
+        errors: HashMap<K8sResourceKey, K8sTranslateError>,
+    ) -> Self {
+        Self {
+            translation: Arc::new(translation),
+            errors: Arc::new(errors),
+        }
+    }
+
+    pub fn result_for<'a>(
+        &'a self,
+        object: &K8sObject,
+    ) -> Result<&'a K8sTranslation, &'a K8sTranslateError> {
+        if let Some(error) = self
+            .errors
+            .iter()
+            .find(|(key, _)| key.matches_object(object))
+            .map(|(_, error)| error)
+        {
+            Err(error)
+        } else {
+            Ok(self.translation.as_ref())
+        }
+    }
+}
+
+/// Immutable per-reconcile indexes for Gateway API status planning.
+struct GatewayApiStatusIndexes<'a> {
+    gateway_classes_by_name: HashMap<&'a str, &'a K8sObject>,
+    gateways_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
+    managed_gateways: HashSet<(&'a str, &'a str)>,
+    secrets_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
+    services_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
+    reference_grants_by_ns: HashMap<&'a str, Vec<&'a K8sObject>>,
+    has_any_service: bool,
+    conflicts_by_loser: HashMap<K8sResourceKey, Vec<&'a GatewayApiRouteConflict>>,
+}
+
+impl<'a> GatewayApiStatusIndexes<'a> {
+    fn build(objects: &'a [K8sObject], route_conflicts: &'a [GatewayApiRouteConflict]) -> Self {
+        let mut gateway_classes_by_name = HashMap::new();
+        let mut gateways_by_ns_name = HashMap::new();
+        let mut secrets_by_ns_name = HashMap::new();
+        let mut services_by_ns_name = HashMap::new();
+        let mut reference_grants_by_ns: HashMap<&str, Vec<&K8sObject>> = HashMap::new();
+        let mut has_any_service = false;
+
+        for object in objects {
+            match object.kind.as_str() {
+                "GatewayClass" => {
+                    gateway_classes_by_name.insert(object.metadata.name.as_str(), object);
+                }
+                "Gateway" => {
+                    gateways_by_ns_name.insert(
+                        (
+                            object.metadata.namespace.as_str(),
+                            object.metadata.name.as_str(),
+                        ),
+                        object,
+                    );
+                }
+                "Secret" => {
+                    secrets_by_ns_name.insert(
+                        (
+                            object.metadata.namespace.as_str(),
+                            object.metadata.name.as_str(),
+                        ),
+                        object,
+                    );
+                }
+                "Service" => {
+                    has_any_service = true;
+                    services_by_ns_name.insert(
+                        (
+                            object.metadata.namespace.as_str(),
+                            object.metadata.name.as_str(),
+                        ),
+                        object,
+                    );
+                }
+                "ReferenceGrant" => {
+                    reference_grants_by_ns
+                        .entry(object.metadata.namespace.as_str())
+                        .or_default()
+                        .push(object);
+                }
+                _ => {}
+            }
+        }
+
+        let mut managed_gateways = HashSet::new();
+        for ((namespace, name), gateway) in &gateways_by_ns_name {
+            if gateway_is_managed_by_ferrum_indexed(gateway, &gateway_classes_by_name) {
+                managed_gateways.insert((*namespace, *name));
+            }
+        }
+
+        let mut conflicts_by_loser: HashMap<K8sResourceKey, Vec<&GatewayApiRouteConflict>> =
+            HashMap::new();
+        for conflict in route_conflicts {
+            conflicts_by_loser
+                .entry(conflict.loser.clone())
+                .or_default()
+                .push(conflict);
+        }
+
+        Self {
+            gateway_classes_by_name,
+            gateways_by_ns_name,
+            managed_gateways,
+            secrets_by_ns_name,
+            services_by_ns_name,
+            reference_grants_by_ns,
+            has_any_service,
+            conflicts_by_loser,
+        }
+    }
+}
+
+fn gateway_is_managed_by_ferrum_indexed(
+    gateway: &K8sObject,
+    gateway_classes_by_name: &HashMap<&str, &K8sObject>,
+) -> bool {
+    let Some(class_name) = gateway.spec.get("gatewayClassName").and_then(Value::as_str) else {
+        return false;
+    };
+    if let Some(class) = gateway_classes_by_name.get(class_name) {
+        return gateway_class_is_managed_by_ferrum(class);
+    }
+    class_name == DEFAULT_FERRUM_GATEWAY_CLASS_NAME
+}
+
 pub fn plan_gateway_api_status_updates(
     objects: &[K8sObject],
     options: K8sTranslationOptions,
@@ -241,76 +403,146 @@ pub fn plan_gateway_api_status_updates_with_context(
     route_conflicts: &[GatewayApiRouteConflict],
     status_context: GatewayApiStatusContext,
 ) -> Vec<GatewayApiStatusUpdate> {
-    objects
+    plan_gateway_api_status_updates_budgeted(
+        objects,
+        options,
+        route_conflicts,
+        status_context,
+        None,
+        StatusPlanBudget::unlimited(0),
+    )
+    .updates
+}
+
+/// Plan Gateway API status updates with shared indexes, translation reuse, and
+/// a fair work budget applied *before* expensive per-object computation.
+pub fn plan_gateway_api_status_updates_budgeted(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+    route_conflicts: &[GatewayApiRouteConflict],
+    status_context: GatewayApiStatusContext,
+    translation_reuse: Option<&StatusTranslationReuse>,
+    budget: StatusPlanBudget,
+) -> GatewayApiStatusPlanOutcome {
+    let indexes = GatewayApiStatusIndexes::build(objects, route_conflicts);
+    let conflict_context = gateway_api_status_conflict_context(objects, options.clone());
+
+    let owned_reuse;
+    let reuse = match translation_reuse {
+        Some(reuse) => reuse,
+        None => {
+            let Some((translation, errors)) =
+                translate_k8s_objects_collecting_skips(objects, options.clone())
+            else {
+                return GatewayApiStatusPlanOutcome {
+                    updates: Vec::new(),
+                    next_cursor: budget.cursor,
+                    eligible_candidates: 0,
+                    planned_candidates: 0,
+                };
+            };
+            owned_reuse = StatusTranslationReuse::from_owned(translation, errors);
+            &owned_reuse
+        }
+    };
+
+    let mut eligible: Vec<&K8sObject> = objects
         .iter()
         .filter(|object| is_status_kind(&object.kind))
-        .filter_map(|object| {
-            let managed_parent_refs = if matches!(
-                object.kind.as_str(),
-                "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
-            ) {
-                managed_route_parent_refs(objects, object)
+        .filter(|object| {
+            let managed_parent_refs = if route_status_kind(&object.kind) {
+                managed_route_parent_refs_indexed(object, &indexes)
             } else {
                 Vec::new()
             };
-            if !status_target_is_managed_by_ferrum(objects, object, &managed_parent_refs) {
-                return None;
-            }
-            let resource_key = K8sResourceKey::from_object(object);
-            let managed_parent_ref_keys: HashSet<String> = managed_parent_refs
-                .iter()
-                .map(|parent_ref| route_parent_ref_key(object, parent_ref))
-                .collect();
-            let object_conflicts: Vec<&GatewayApiRouteConflict> = route_conflicts
-                .iter()
-                .filter(|conflict| {
-                    conflict.loser == resource_key
-                        && (managed_parent_ref_keys.is_empty()
-                            || managed_parent_ref_keys.contains(&conflict.key.parent_ref))
-                })
-                .collect();
-            let route_keys = if matches!(
-                object.kind.as_str(),
-                "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
-            ) {
-                gateway_api_route_conflict_keys_with_context(objects, &options, object)
-                    .into_iter()
-                    .filter(|key| managed_parent_ref_keys.contains(&key.parent_ref))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let status = desired_status_for_object(
-                objects,
-                object,
-                options.clone(),
-                &status_context,
-                &object_conflicts,
-                &route_keys,
-                &managed_parent_refs,
-            );
-            if status == object.status {
-                return None;
-            }
-            Some(GatewayApiStatusUpdate {
-                api_version: object.api_version.clone(),
-                kind: object.kind.clone(),
-                namespace: object.metadata.namespace.clone(),
-                name: object.metadata.name.clone(),
-                status,
-                patch_gateway_addresses: object.kind == "Gateway"
-                    && status_context.status_address.is_some(),
-                patch_gateway_listeners: object.kind == "Gateway",
-            })
+            status_target_is_managed_by_ferrum_indexed(object, &managed_parent_refs, &indexes)
         })
-        .collect()
+        .collect();
+    eligible.sort_by(|left, right| {
+        (
+            left.kind.as_str(),
+            left.metadata.namespace.as_str(),
+            left.metadata.name.as_str(),
+        )
+            .cmp(&(
+                right.kind.as_str(),
+                right.metadata.namespace.as_str(),
+                right.metadata.name.as_str(),
+            ))
+    });
+
+    let window = select_fair_work_window(eligible.len(), budget);
+    let mut updates = Vec::new();
+    for (_, object) in fair_work_window_iter(&eligible, window) {
+        let managed_parent_refs = if route_status_kind(&object.kind) {
+            managed_route_parent_refs_indexed(object, &indexes)
+        } else {
+            Vec::new()
+        };
+        let resource_key = K8sResourceKey::from_object(object);
+        let managed_parent_ref_keys: HashSet<String> = managed_parent_refs
+            .iter()
+            .map(|parent_ref| route_parent_ref_key(object, parent_ref))
+            .collect();
+        let object_conflicts: Vec<&GatewayApiRouteConflict> = indexes
+            .conflicts_by_loser
+            .get(&resource_key)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|conflict| {
+                managed_parent_ref_keys.is_empty()
+                    || managed_parent_ref_keys.contains(&conflict.key.parent_ref)
+            })
+            .collect();
+        let route_keys = if route_status_kind(&object.kind) {
+            gateway_api_route_conflict_keys_with_acc(object, &conflict_context)
+                .into_iter()
+                .filter(|key| managed_parent_ref_keys.contains(&key.parent_ref))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let translation_result = reuse.result_for(object);
+        let status = desired_status_for_object(
+            objects,
+            object,
+            &indexes,
+            &status_context,
+            translation_result,
+            &object_conflicts,
+            &route_keys,
+            &managed_parent_refs,
+        );
+        if status == object.status {
+            continue;
+        }
+        updates.push(GatewayApiStatusUpdate {
+            api_version: object.api_version.clone(),
+            kind: object.kind.clone(),
+            namespace: object.metadata.namespace.clone(),
+            name: object.metadata.name.clone(),
+            status,
+            patch_gateway_addresses: object.kind == "Gateway"
+                && status_context.status_address.is_some(),
+            patch_gateway_listeners: object.kind == "Gateway",
+        });
+    }
+
+    GatewayApiStatusPlanOutcome {
+        updates,
+        next_cursor: window.next_cursor,
+        eligible_candidates: eligible.len(),
+        planned_candidates: window.take,
+    }
 }
 
 fn desired_status_for_object(
     objects: &[K8sObject],
     object: &K8sObject,
-    options: K8sTranslationOptions,
+    indexes: &GatewayApiStatusIndexes<'_>,
     status_context: &GatewayApiStatusContext,
+    translation_result: Result<&K8sTranslation, &K8sTranslateError>,
     route_conflicts: &[&GatewayApiRouteConflict],
     route_keys: &[GatewayApiRouteConflictKey],
     managed_parent_refs: &[Value],
@@ -319,22 +551,13 @@ fn desired_status_for_object(
         return gateway_class_status(object);
     }
 
-    let result = translate_k8s_objects_with_filter(objects, options, |candidate| {
-        same_resource(candidate, object)
-            || candidate.kind == "ReferenceGrant"
-            || candidate.kind == "GatewayClass"
-            || candidate.kind == "Gateway"
-            || candidate.kind == "Namespace"
-            || candidate.kind == "Service"
-            || candidate.kind == "Secret"
-    });
-
     match object.kind.as_str() {
-        "Gateway" => gateway_status(objects, object, result.as_ref(), status_context),
+        "Gateway" => gateway_status(objects, object, indexes, translation_result, status_context),
         "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => route_status(
             objects,
             object,
-            result.as_ref(),
+            indexes,
+            translation_result,
             managed_parent_refs,
             route_conflicts,
             route_keys,
@@ -408,14 +631,18 @@ impl ListenerReferenceStatus {
     };
 }
 
-fn gateway_reference_status(objects: &[K8sObject], gateway: &K8sObject) -> ListenerReferenceStatus {
+fn gateway_reference_status(
+    objects: &[K8sObject],
+    gateway: &K8sObject,
+    indexes: &GatewayApiStatusIndexes<'_>,
+) -> ListenerReferenceStatus {
     gateway
         .spec
         .get("listeners")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|listener| listener_reference_status(objects, gateway, listener))
+        .map(|listener| listener_reference_status(objects, gateway, listener, indexes))
         .find(|status| !status.resolved)
         .unwrap_or(ListenerReferenceStatus::RESOLVED)
 }
@@ -424,6 +651,7 @@ fn listener_reference_status(
     objects: &[K8sObject],
     gateway: &K8sObject,
     listener: &Value,
+    indexes: &GatewayApiStatusIndexes<'_>,
 ) -> ListenerReferenceStatus {
     let certificate_refs = listener
         .get("tls")
@@ -457,15 +685,16 @@ fn listener_reference_status(
             .and_then(Value::as_str)
             .unwrap_or(&gateway.metadata.namespace);
         if namespace != gateway.metadata.namespace
-            && !reference_grant_allows_secret(objects, &gateway.metadata.namespace, namespace, name)
+            && !reference_grant_allows_secret_indexed(
+                indexes,
+                &gateway.metadata.namespace,
+                namespace,
+                name,
+            )
         {
             return ListenerReferenceStatus::REF_NOT_PERMITTED;
         }
-        let Some(secret) = objects.iter().find(|object| {
-            object.kind == "Secret"
-                && object.metadata.namespace == namespace
-                && object.metadata.name == name
-        }) else {
+        let Some(secret) = indexes.secrets_by_ns_name.get(&(namespace, name)).copied() else {
             return ListenerReferenceStatus::INVALID_CERTIFICATE_REF;
         };
         if !secret_object_is_valid_tls_certificate(secret) {
@@ -474,7 +703,7 @@ fn listener_reference_status(
     }
 
     if listener_is_terminating_tls(listener)
-        && gateway_has_multiple_distinct_tls_certificate_refs(objects, gateway)
+        && gateway_has_multiple_distinct_tls_certificate_refs(objects, gateway, indexes)
     {
         return ListenerReferenceStatus::UNSUPPORTED_CERTIFICATE_REFS;
     }
@@ -500,6 +729,7 @@ fn listener_is_terminating_tls(listener: &Value) -> bool {
 fn gateway_has_multiple_distinct_tls_certificate_refs(
     objects: &[K8sObject],
     gateway: &K8sObject,
+    indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
     let Some(listeners) = gateway.spec.get("listeners").and_then(Value::as_array) else {
         return false;
@@ -508,7 +738,9 @@ fn gateway_has_multiple_distinct_tls_certificate_refs(
     for identity in listeners
         .iter()
         .filter(|listener| listener_is_terminating_tls(listener))
-        .flat_map(|listener| listener_tls_certificate_ref_identities(objects, gateway, listener))
+        .flat_map(|listener| {
+            listener_tls_certificate_ref_identities(objects, gateway, listener, indexes)
+        })
     {
         if selected
             .as_ref()
@@ -522,9 +754,10 @@ fn gateway_has_multiple_distinct_tls_certificate_refs(
 }
 
 fn listener_tls_certificate_ref_identities(
-    objects: &[K8sObject],
+    _objects: &[K8sObject],
     gateway: &K8sObject,
     listener: &Value,
+    indexes: &GatewayApiStatusIndexes<'_>,
 ) -> Vec<(String, String)> {
     listener
         .get("tls")
@@ -550,8 +783,8 @@ fn listener_tls_certificate_ref_identities(
                 .and_then(Value::as_str)
                 .unwrap_or(&gateway.metadata.namespace);
             if namespace != gateway.metadata.namespace
-                && !reference_grant_allows_secret(
-                    objects,
+                && !reference_grant_allows_secret_indexed(
+                    indexes,
                     &gateway.metadata.namespace,
                     namespace,
                     name,
@@ -559,28 +792,24 @@ fn listener_tls_certificate_ref_identities(
             {
                 return None;
             }
-            let secret = objects.iter().find(|object| {
-                object.kind == "Secret"
-                    && object.metadata.namespace == namespace
-                    && object.metadata.name == name
-            })?;
+            let secret = indexes.secrets_by_ns_name.get(&(namespace, name)).copied()?;
             secret_object_is_valid_tls_certificate(secret)
                 .then(|| (namespace.to_string(), name.to_string()))
         })
         .collect()
 }
 
-fn reference_grant_allows_secret(
-    objects: &[K8sObject],
+fn reference_grant_allows_secret_indexed(
+    indexes: &GatewayApiStatusIndexes<'_>,
     from_namespace: &str,
     to_namespace: &str,
     secret_name: &str,
 ) -> bool {
-    objects
-        .iter()
-        .filter(|object| {
-            object.kind == "ReferenceGrant" && object.metadata.namespace == to_namespace
-        })
+    indexes
+        .reference_grants_by_ns
+        .get(to_namespace)
+        .into_iter()
+        .flatten()
         .any(|grant| {
             reference_grant_has_from(grant, from_namespace)
                 && reference_grant_has_secret_to(grant, secret_name)
@@ -624,10 +853,11 @@ fn reference_grant_has_secret_to(grant: &K8sObject, secret_name: &str) -> bool {
 fn gateway_status(
     objects: &[K8sObject],
     object: &K8sObject,
+    indexes: &GatewayApiStatusIndexes<'_>,
     result: Result<&crate::config_sources::k8s::K8sTranslation, &K8sTranslateError>,
     status_context: &GatewayApiStatusContext,
 ) -> Value {
-    let references = gateway_reference_status(objects, object);
+    let references = gateway_reference_status(objects, object, indexes);
     let (accepted, materialized, resolved_refs, programmed, message) = match result {
         Ok(translation) => {
             let materialized = gateway_programmed(object, &translation.config);
@@ -729,6 +959,7 @@ fn gateway_status(
         Value::Array(gateway_listener_statuses(
             objects,
             object,
+            indexes,
             result.ok().map(|translation| &translation.config),
             accepted,
             status_context.data_plane_ready,
@@ -752,6 +983,7 @@ fn gateway_status_address(address: &str) -> Value {
 fn gateway_listener_statuses(
     objects: &[K8sObject],
     gateway: &K8sObject,
+    indexes: &GatewayApiStatusIndexes<'_>,
     config: Option<&GatewayConfig>,
     gateway_accepted: bool,
     data_plane_ready: bool,
@@ -763,7 +995,7 @@ fn gateway_listener_statuses(
         .into_iter()
         .flatten()
         .map(|listener| {
-            let references = listener_reference_status(objects, gateway, listener);
+            let references = listener_reference_status(objects, gateway, listener, indexes);
             let listener_name = listener
                 .get("name")
                 .and_then(Value::as_str)
@@ -1187,6 +1419,7 @@ fn merge_status_conditions(status: &mut Value, owned_types: &[&str], desired: Ve
 fn route_status(
     objects: &[K8sObject],
     object: &K8sObject,
+    indexes: &GatewayApiStatusIndexes<'_>,
     result: Result<&crate::config_sources::k8s::K8sTranslation, &K8sTranslateError>,
     managed_parent_refs: &[Value],
     route_conflicts: &[&GatewayApiRouteConflict],
@@ -1208,7 +1441,8 @@ fn route_status(
         match result {
             Ok(_) => {
                 let programmed = !materialized_parent_refs.is_empty();
-                let unresolved_refs_reason = route_unresolved_backend_ref_reason(objects, object);
+                let unresolved_refs_reason =
+                    route_unresolved_backend_ref_reason(objects, object, indexes);
                 let resolved_refs = unresolved_refs_reason.is_none();
                 let resolved_refs_reason = unresolved_refs_reason.unwrap_or("ResolvedRefs");
                 (
@@ -1301,14 +1535,14 @@ fn route_status(
             .map(|conflict| route_conflict_message(conflict));
         let not_allowed_by_listener = accepted
             && !all_parent_matches_conflicted
-            && route_parent_ref_not_allowed_by_listener(objects, object, parent_ref);
+            && route_parent_ref_not_allowed_by_listener(objects, object, parent_ref, indexes);
         let no_matching_parent = accepted
             && !not_allowed_by_listener
-            && !route_parent_ref_has_matching_parent(objects, object, parent_ref);
+            && !route_parent_ref_has_matching_parent(objects, object, parent_ref, indexes);
         let no_matching_listener_hostname = accepted
             && !no_matching_parent
             && !not_allowed_by_listener
-            && !route_parent_ref_has_matching_listener(objects, object, parent_ref);
+            && !route_parent_ref_has_matching_listener(objects, object, parent_ref, indexes);
         let accepted_for_parent = accepted
             && !all_parent_matches_conflicted
             && !not_allowed_by_listener
@@ -1852,14 +2086,16 @@ fn route_parent_refs(object: &K8sObject) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn status_target_is_managed_by_ferrum(
-    objects: &[K8sObject],
+fn status_target_is_managed_by_ferrum_indexed(
     object: &K8sObject,
     managed_parent_refs: &[Value],
+    indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
     match object.kind.as_str() {
         "GatewayClass" => gateway_class_is_managed_by_ferrum(object),
-        "Gateway" => gateway_is_managed_by_ferrum(objects, object),
+        "Gateway" => indexes
+            .managed_gateways
+            .contains(&(object.metadata.namespace.as_str(), object.metadata.name.as_str())),
         "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => {
             !managed_parent_refs.is_empty() || has_ferrum_parent_status(&object.status)
         }
@@ -1867,29 +2103,20 @@ fn status_target_is_managed_by_ferrum(
     }
 }
 
-fn gateway_is_managed_by_ferrum(objects: &[K8sObject], gateway: &K8sObject) -> bool {
-    let Some(class_name) = gateway.spec.get("gatewayClassName").and_then(Value::as_str) else {
-        return false;
-    };
-    for object in objects {
-        if object.kind == "GatewayClass" && object.metadata.name == class_name {
-            return gateway_class_is_managed_by_ferrum(object);
-        }
-    }
-    class_name == DEFAULT_FERRUM_GATEWAY_CLASS_NAME
-}
-
-fn managed_route_parent_refs(objects: &[K8sObject], route: &K8sObject) -> Vec<Value> {
+fn managed_route_parent_refs_indexed(
+    route: &K8sObject,
+    indexes: &GatewayApiStatusIndexes<'_>,
+) -> Vec<Value> {
     route_parent_refs(route)
         .into_iter()
-        .filter(|parent_ref| parent_ref_targets_managed_gateway(objects, route, parent_ref))
+        .filter(|parent_ref| parent_ref_targets_managed_gateway_indexed(route, parent_ref, indexes))
         .collect()
 }
 
-fn parent_ref_targets_managed_gateway(
-    objects: &[K8sObject],
+fn parent_ref_targets_managed_gateway_indexed(
     route: &K8sObject,
     parent_ref: &Value,
+    indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
     let group = parent_ref
         .get("group")
@@ -1909,12 +2136,7 @@ fn parent_ref_targets_managed_gateway(
         .get("namespace")
         .and_then(Value::as_str)
         .unwrap_or(&route.metadata.namespace);
-    objects.iter().any(|object| {
-        object.kind == "Gateway"
-            && object.metadata.namespace == namespace
-            && object.metadata.name == name
-            && gateway_is_managed_by_ferrum(objects, object)
-    })
+    indexes.managed_gateways.contains(&(namespace, name))
 }
 
 fn parent_ref_targets_gateway(route: &K8sObject, parent_ref: &Value, gateway: &K8sObject) -> bool {
@@ -1943,12 +2165,21 @@ fn route_parent_ref_has_matching_listener(
     objects: &[K8sObject],
     route: &K8sObject,
     parent_ref: &Value,
+    indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
-    let Some(gateway) = objects.iter().find(|object| {
-        object.kind == "Gateway" && parent_ref_targets_gateway(route, parent_ref, object)
-    }) else {
+    let namespace = parent_ref
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(&route.metadata.namespace);
+    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
         return true;
     };
+    let Some(gateway) = indexes.gateways_by_ns_name.get(&(namespace, name)).copied() else {
+        return true;
+    };
+    if !parent_ref_targets_gateway(route, parent_ref, gateway) {
+        return true;
+    }
     gateway
         .spec
         .get("listeners")
@@ -1967,12 +2198,21 @@ fn route_parent_ref_not_allowed_by_listener(
     objects: &[K8sObject],
     route: &K8sObject,
     parent_ref: &Value,
+    indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
-    let Some(gateway) = objects.iter().find(|object| {
-        object.kind == "Gateway" && parent_ref_targets_gateway(route, parent_ref, object)
-    }) else {
+    let namespace = parent_ref
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(&route.metadata.namespace);
+    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
         return false;
     };
+    let Some(gateway) = indexes.gateways_by_ns_name.get(&(namespace, name)).copied() else {
+        return false;
+    };
+    if !parent_ref_targets_gateway(route, parent_ref, gateway) {
+        return false;
+    }
 
     let mut saw_matching_listener = false;
     for listener in gateway
@@ -1999,12 +2239,21 @@ fn route_parent_ref_has_matching_parent(
     objects: &[K8sObject],
     route: &K8sObject,
     parent_ref: &Value,
+    indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
-    let Some(gateway) = objects.iter().find(|object| {
-        object.kind == "Gateway" && parent_ref_targets_gateway(route, parent_ref, object)
-    }) else {
+    let namespace = parent_ref
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(&route.metadata.namespace);
+    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
         return false;
     };
+    let Some(gateway) = indexes.gateways_by_ns_name.get(&(namespace, name)).copied() else {
+        return false;
+    };
+    if !parent_ref_targets_gateway(route, parent_ref, gateway) {
+        return false;
+    }
     gateway
         .spec
         .get("listeners")
@@ -2148,8 +2397,9 @@ fn gateway_listener_programmed(
 fn route_unresolved_backend_ref_reason(
     objects: &[K8sObject],
     route: &K8sObject,
+    indexes: &GatewayApiStatusIndexes<'_>,
 ) -> Option<&'static str> {
-    let services_observed = objects.iter().any(|object| object.kind == "Service");
+    let services_observed = indexes.has_any_service;
     for backend_ref in route
         .spec
         .get("rules")
@@ -2192,7 +2442,10 @@ fn route_unresolved_backend_ref_reason(
             return Some("RefNotPermitted");
         }
         if services_observed && let Some(backend_name) = backend_name {
-            if !service_exists(objects, backend_namespace, backend_name) {
+            if !indexes
+                .services_by_ns_name
+                .contains_key(&(backend_namespace, backend_name))
+            {
                 return Some("BackendNotFound");
             }
             let backend_port = backend_ref
@@ -2200,7 +2453,7 @@ fn route_unresolved_backend_ref_reason(
                 .and_then(Value::as_u64)
                 .and_then(|port| u16::try_from(port).ok())
                 .unwrap_or(if route.kind == "GRPCRoute" { 50051 } else { 80 });
-            if !service_has_port(objects, backend_namespace, backend_name, backend_port) {
+            if !service_has_port_indexed(indexes, backend_namespace, backend_name, backend_port) {
                 return Some("BackendNotFound");
             }
         }
@@ -2209,22 +2462,15 @@ fn route_unresolved_backend_ref_reason(
     None
 }
 
-fn service_exists(objects: &[K8sObject], namespace: &str, name: &str) -> bool {
-    objects.iter().any(|object| {
-        object.kind == "Service"
-            && object.metadata.namespace == namespace
-            && object.metadata.name == name
-    })
-}
-
-fn service_has_port(objects: &[K8sObject], namespace: &str, name: &str, port: u16) -> bool {
-    objects
-        .iter()
-        .find(|object| {
-            object.kind == "Service"
-                && object.metadata.namespace == namespace
-                && object.metadata.name == name
-        })
+fn service_has_port_indexed(
+    indexes: &GatewayApiStatusIndexes<'_>,
+    namespace: &str,
+    name: &str,
+    port: u16,
+) -> bool {
+    indexes
+        .services_by_ns_name
+        .get(&(namespace, name))
         .and_then(|service| service.spec.get("ports"))
         .and_then(Value::as_array)
         .into_iter()
@@ -2343,13 +2589,6 @@ fn error_is_parent_ref_no_matching(error: &K8sTranslateError) -> bool {
         }
         K8sTranslateError::Unsupported(_) => false,
     }
-}
-
-fn same_resource(left: &K8sObject, right: &K8sObject) -> bool {
-    left.api_version == right.api_version
-        && left.kind == right.kind
-        && left.metadata.namespace == right.metadata.namespace
-        && left.metadata.name == right.metadata.name
 }
 
 fn is_status_kind(kind: &str) -> bool {
