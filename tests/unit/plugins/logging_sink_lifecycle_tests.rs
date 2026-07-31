@@ -800,10 +800,7 @@ async fn deferred_batching_logger_leaves_no_worker_when_never_started() {
                 started_cb.fetch_add(1, Ordering::SeqCst);
                 let seen_cb = Arc::clone(&seen_cb);
                 async move {
-                    seen_cb
-                        .lock()
-                        .expect("lock")
-                        .extend(batch.iter().copied());
+                    seen_cb.lock().expect("lock").extend(batch.iter().copied());
                     Ok(())
                 }
             },
