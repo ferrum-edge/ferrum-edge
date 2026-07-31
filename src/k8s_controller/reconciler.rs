@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::types::GatewayConfig;
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
-    translate_k8s_objects_collecting_skips, translate_k8s_objects_with_filter,
+    translate_k8s_objects_collecting_skips,
 };
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry, NamespaceBroadcasts};
 use crate::grpc::mesh_registry::MeshNodeRegistry;

@@ -170,7 +170,7 @@ mod tests {
         );
         let items: Vec<usize> = (0..10).collect();
         let ordered: Vec<usize> = fair_work_window_iter(&items, window)
-            .map(|(_, item)| **item)
+            .map(|(_, item)| *item)
             .collect();
         assert_eq!(ordered, vec![7, 8, 9, 0, 1, 2, 3, 4, 5, 6]);
     }
