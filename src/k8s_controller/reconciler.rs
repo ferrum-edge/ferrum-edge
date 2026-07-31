@@ -18,9 +18,7 @@ use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::grpc::mesh_server::{MeshConfigBroadcast, MeshGrpcServer};
 use crate::identity::spiffe::TrustDomain;
 use crate::k8s_controller::ControllerTaskRegistry;
-use crate::k8s_controller::istio_status::{
-    IstioStatusWriter, plan_istio_status_updates_budgeted,
-};
+use crate::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_updates_budgeted};
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
 use crate::k8s_controller::status::{

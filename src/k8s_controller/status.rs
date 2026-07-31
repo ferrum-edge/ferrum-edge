@@ -414,11 +414,7 @@ impl<'a> ReferenceGrantPermissionIndex<'a> {
         self.entries
             .get(query.to_namespace)
             .and_then(|by_from| {
-                by_from.get(&(
-                    query.from_namespace,
-                    query.from_group,
-                    query.from_kind,
-                ))
+                by_from.get(&(query.from_namespace, query.from_group, query.from_kind))
             })
             .and_then(|by_to| by_to.get(&(query.to_group, query.to_kind)))
             .is_some_and(|allow| allow.allows(query.to_name))
@@ -713,9 +709,9 @@ struct DesiredStatusForObject<'a> {
     indexes: &'a GatewayApiStatusIndexes<'a>,
     status_context: &'a GatewayApiStatusContext,
     translation_result: Result<&'a K8sTranslation, &'a K8sTranslateError>,
-    route_conflicts: &'a [&GatewayApiRouteConflict],
+    route_conflicts: &'a [&'a GatewayApiRouteConflict],
     route_keys: &'a [GatewayApiRouteConflictKey],
-    managed_parent_refs: &'a [&Value],
+    managed_parent_refs: &'a [&'a Value],
 }
 
 fn desired_status_for_object(object: &K8sObject, ctx: &DesiredStatusForObject<'_>) -> Value {
