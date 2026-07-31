@@ -189,6 +189,7 @@ async fn open_holding_get(
         "expected first request to be admitted, got {status_line:?}"
     );
 
+    let mut chunked = false;
     loop {
         let mut line = String::new();
         tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
@@ -198,6 +199,32 @@ async fn open_holding_get(
         if line == "\r\n" || line == "\n" || line.is_empty() {
             break;
         }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            chunked = value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("chunked"));
+        }
+    }
+
+    if chunked {
+        let mut chunk_size_line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            reader.read_line(&mut chunk_size_line),
+        )
+        .await
+        .expect("chunk-size timeout")
+        .expect("read chunk size");
+        let chunk_size = chunk_size_line
+            .trim()
+            .split_once(';')
+            .map_or(chunk_size_line.trim(), |(size, _)| size);
+        assert!(
+            usize::from_str_radix(chunk_size, 16).is_ok_and(|size| size > 0),
+            "expected a non-empty first response chunk, got {chunk_size_line:?}"
+        );
     }
 
     let mut first_body_byte = [0u8; 1];

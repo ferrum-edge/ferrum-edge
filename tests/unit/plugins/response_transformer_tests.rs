@@ -972,6 +972,58 @@ async fn test_response_transformer_rejects_invalid_header_new_key() {
     assert!(err.contains("valid HTTP header name"), "got: {err}");
 }
 
+#[tokio::test]
+async fn test_response_transformer_rejects_protocol_managed_add_update_and_rename_destinations() {
+    for (operation, name) in [
+        ("add", "Connection"),
+        ("update", "CONTENT-LENGTH"),
+        ("add", "Transfer-Encoding"),
+        ("update", "trailer"),
+        ("add", "Upgrade"),
+        ("update", "Keep-Alive"),
+        ("add", "proxy-connection"),
+        ("update", "TE"),
+        ("add", "Proxy-Authenticate"),
+    ] {
+        let err = ResponseTransformer::new(&json!({
+            "rules": [{
+                "operation": operation,
+                "target": "header",
+                "key": name,
+                "value": "1",
+            }]
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("expected rejection for {operation} {name}"));
+        assert!(
+            err.contains("protocol-managed"),
+            "{operation} {name}: {err}"
+        );
+    }
+
+    let rename_err = ResponseTransformer::new(&json!({
+        "rules": [{
+            "operation": "rename",
+            "target": "header",
+            "key": "x-framing",
+            "new_key": "Transfer-Encoding"
+        }]
+    }))
+    .err()
+    .expect("rename to Transfer-Encoding must be rejected");
+    assert!(rename_err.contains("protocol-managed"), "got: {rename_err}");
+
+    // remove of protocol-managed names remains allowed (harmless after origin strip).
+    ResponseTransformer::new(&json!({
+        "rules": [{
+            "operation": "remove",
+            "target": "header",
+            "key": "Connection"
+        }]
+    }))
+    .expect("remove Connection must remain allowed");
+}
+
 // ── JSON null value preservation on body rules ───────────────────────────
 
 #[tokio::test]

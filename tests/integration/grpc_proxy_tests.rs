@@ -3168,7 +3168,12 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     };
     let mut security_headers = security_headers_plugin("grpc-web-security-headers");
     security_headers.config["override_existing"] = serde_json::json!(true);
-    security_headers.config["set"]["Content-Length"] = serde_json::json!("1");
+    // This used to author `set: { Content-Length: "1" }` to prove the
+    // transport-owned length wins over a policy replay. `security_headers.set`
+    // now refuses protocol-managed framing destinations at CONSTRUCTION, so the
+    // hostile config is unrepresentable and the plugin would fail to load. The
+    // length assertion below still holds: the transformed gRPC-Web body length
+    // is what reaches the client.
     security_headers.config["remove"] = serde_json::json!(["Set-Cookie", "X-Powered-By"]);
     let state = create_test_proxy_state_with_plugins(
         vec![proxy],
@@ -3939,18 +3944,10 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    let mut gateway_error_security = security_headers_plugin("grpc-web-backend-error-security");
-    gateway_error_security.config["set"] = serde_json::json!({
-        "X-Security-Policy": "gateway-enforced",
-        "Connection": "close",
-        "Keep-Alive": "timeout=5",
-        "Proxy-Authenticate": "Basic realm=hostile",
-        "Proxy-Connection": "close",
-        "TE": "trailers",
-        "Trailer": "x-hostile",
-        "Transfer-Encoding": "chunked",
-        "Upgrade": "h2c"
-    });
+    // Protocol-managed `security_headers.set` destinations now fail closed at
+    // construction and have dedicated exhaustive coverage. Keep this fixture
+    // admissible so it reaches the gRPC-Web gateway-error behavior under test.
+    let gateway_error_security = security_headers_plugin("grpc-web-backend-error-security");
     let state =
         create_test_proxy_state_with_plugins(vec![proxy], vec![plugin, gateway_error_security]);
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;

@@ -13,9 +13,16 @@
 //!
 //! - **3-attempt retry** with fresh ports + fresh temp dir each attempt,
 //!   killing any surviving child before retrying.
-//! - **`Stdio::null()`** on stdin/stdout/stderr. Piped stdout without
+//!   Callers that pin `FERRUM_PROXY_HTTP_PORT` / `FERRUM_ADMIN_HTTP_PORT` via
+//!   [`.env`](TestGatewayBuilder::env) keep that fixed value across attempts,
+//!   so a bind-drop-rebind reservation outside the harness defeats the retry.
+//!   Prefer letting the harness allocate and reading [`TestGateway::proxy_port`]
+//!   after a successful spawn unless a coordinated fixed port is required.
+//! - **`Stdio::null()`** on stdin/stdout/stderr unless
+//!   [`TestGatewayBuilder::capture_output`] is enabled. Piped stdout without
 //!   reading causes pipe-buffer deadlock; see CLAUDE.md "Functional test
-//!   subprocess rule".
+//!   subprocess rule". Failed attempts that capture output append a
+//!   secret-scrubbed, size-bounded snapshot to the error.
 //! - **Backend/echo listeners held** — this struct only owns the gateway's
 //!   own listen ports. Echo servers in `echo_servers.rs` keep their listener.
 //! - **`Drop` cleans up the child** so a panic in a test cannot leave a zombie
@@ -321,6 +328,21 @@ impl TestGateway {
             combined.push_str(&stdout);
         }
         Ok(combined)
+    }
+
+    /// Secret-scrubbed, size-bounded view of captured child output for failure
+    /// diagnostics. Never includes the raw JWT secret, observability token, or
+    /// basic-auth HMAC material held by this gateway.
+    pub fn diagnostic_captured_output(&self) -> String {
+        let raw = self.read_combined_captured_output().unwrap_or_default();
+        scrub_gateway_capture_for_diagnostics(
+            &raw,
+            &[
+                self.jwt_secret.as_str(),
+                self.observability_token.as_str(),
+                self.basic_auth_hmac_secret.as_str(),
+            ],
+        )
     }
 
     /// Poll [`read_combined_captured_output`](Self::read_combined_captured_output)
@@ -824,7 +846,7 @@ impl TestGatewayBuilder {
                 if should_verify_admin_auth
                     && let Err(e) = gw.wait_for_admin_auth(self.health_timeout).await
                 {
-                    let combined_logs = gw.read_combined_captured_output().unwrap_or_default();
+                    let combined_logs = gw.diagnostic_captured_output();
                     gw.shutdown();
                     if combined_logs.is_empty() {
                         return Err(e);
@@ -836,7 +858,7 @@ impl TestGatewayBuilder {
                 Ok(gw)
             }
             Err(e) => {
-                let combined_logs = gw.read_combined_captured_output().unwrap_or_default();
+                let combined_logs = gw.diagnostic_captured_output();
                 // Clean up the failed child so the retry loop starts fresh.
                 gw.shutdown();
                 if combined_logs.is_empty() {
@@ -1514,4 +1536,61 @@ pub fn ensure_gateway_built() -> Result<(), Box<dyn std::error::Error + Send + S
         Ok(()) => Ok(()),
         Err(msg) => Err(msg.clone().into()),
     }
+}
+
+/// Maximum bytes of captured gateway output retained in spawn-failure errors.
+const GATEWAY_CAPTURE_DIAGNOSTIC_MAX_BYTES: usize = 16 * 1024;
+
+/// Scrub secrets and bound captured gateway logs for harness failure diagnostics.
+///
+/// Replaces every provided non-empty secret (empty strings are skipped because
+/// replacing them would corrupt the entire capture), redacts URL userinfo
+/// (`scheme://user:pass@host`), and keeps only the trailing
+/// `GATEWAY_CAPTURE_DIAGNOSTIC_MAX_BYTES` so hosted CI stays actionable without
+/// dumping unbounded child output.
+pub fn scrub_gateway_capture_for_diagnostics(raw: &str, secrets: &[&str]) -> String {
+    let mut text = raw.to_string();
+    for secret in secrets {
+        if !secret.is_empty() {
+            text = text.replace(secret, "***");
+        }
+    }
+    text = scrub_url_userinfo_in_text(&text);
+    truncate_utf8_suffix(&text, GATEWAY_CAPTURE_DIAGNOSTIC_MAX_BYTES)
+}
+
+fn scrub_url_userinfo_in_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme_rel) = rest.find("://") {
+        let after_scheme = scheme_rel + 3;
+        out.push_str(&rest[..after_scheme]);
+        let tail = &rest[after_scheme..];
+        match tail.find('@') {
+            Some(at_rel)
+                if !tail[..at_rel].is_empty()
+                    && !tail[..at_rel].contains('/')
+                    && !tail[..at_rel].contains(|c: char| c.is_whitespace()) =>
+            {
+                out.push_str("***");
+                rest = &tail[at_rel..];
+            }
+            _ => {
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn truncate_utf8_suffix(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut start = text.len() - max_bytes;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…[truncated]…\n{}", &text[start..])
 }

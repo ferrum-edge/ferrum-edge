@@ -14,6 +14,49 @@ use super::plugin_utils::{create_test_context, normalize_compressed_request_for_
 /// SDK's credential chain, so the two suites must serialize against each other.
 use crate::unit::env_lock::ENV_LOCK as ENV_MUTEX;
 
+/// Test shim for the finalized-request-egress phase.
+///
+/// The plugin no longer has a `before_proxy` hook: it dispatches in the
+/// finalized-request-egress phase over an immutable backend-visible snapshot
+/// (GHSA-4vr5-4wm3-x5xv). These tests stage that representation on the context
+/// exactly as the proxy would, so the shim derives the finalized body from the
+/// staged buffer and folds the backend header overlay back into the mutable
+/// header map the tests inspect.
+#[allow(async_fn_in_trait)]
+trait FinalizedEgressTestExt {
+    async fn finalized_egress(
+        &self,
+        ctx: &mut ferrum_edge::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult;
+}
+
+impl<T: Plugin + ?Sized> FinalizedEgressTestExt for T {
+    async fn finalized_egress(
+        &self,
+        ctx: &mut ferrum_edge::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        let body: Vec<u8> = ctx
+            .request_body_bytes
+            .as_ref()
+            .map(|body| body.to_vec())
+            .or_else(|| {
+                ctx.metadata
+                    .get("request_body")
+                    .map(|body| body.as_bytes().to_vec())
+            })
+            .unwrap_or_default();
+        let mut overlay = HashMap::new();
+        let snapshot = headers.clone();
+        let result = self
+            .dispatch_finalized_request_egress(ctx, &snapshot, &body, &mut overlay)
+            .await;
+        headers.extend(overlay);
+        result
+    }
+}
+
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
 }
@@ -57,6 +100,42 @@ fn test_supported_protocols() {
     .unwrap();
 
     assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
+}
+
+/// A `pre_proxy` function publishes backend-visible request headers through the
+/// finalized-request-egress overlay, which lands even later than the
+/// `before_proxy` write it replaced. The capability must keep reporting that
+/// mutation so the `request_deduplication` / `response_caching` ordering gates
+/// still fire, and so runtime construction agrees with the pure candidate view
+/// in `plugin_cache::ServerlessSecurityCompositionPlugin`.
+#[test]
+fn pre_proxy_mode_still_reports_backend_visible_header_mutation() {
+    let pre_proxy = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://my-func.azurewebsites.net/api/transform"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert!(
+        pre_proxy.modifies_request_headers(),
+        "pre_proxy injects backend request headers through the finalized-egress overlay"
+    );
+
+    let terminate = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "mode": "terminate",
+            "function_url": "https://my-func.azurewebsites.net/api/transform"
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert!(
+        !terminate.modifies_request_headers(),
+        "terminate answers the client and never reaches a backend request"
+    );
 }
 
 #[test]
@@ -806,7 +885,7 @@ fn test_terminate_mode() {
 }
 
 #[test]
-fn test_pre_proxy_mode_modifies_headers() {
+fn test_pre_proxy_mode_uses_finalized_header_overlay() {
     let plugin = ServerlessFunction::new(
         &json!({
             "provider": "azure_functions",
@@ -817,7 +896,11 @@ fn test_pre_proxy_mode_modifies_headers() {
     )
     .unwrap();
 
-    assert!(plugin.modifies_request_headers());
+    assert!(
+        plugin.modifies_request_headers(),
+        "pre_proxy must advertise its finalized backend-header overlay to replay/cache ordering"
+    );
+    assert!(plugin.dispatches_finalized_request_egress());
 }
 
 // ---------------------------------------------------------------------------
@@ -889,8 +972,12 @@ fn test_default_mode_is_pre_proxy() {
     )
     .unwrap();
 
-    // Default mode is pre_proxy which modifies request headers
-    assert!(plugin.modifies_request_headers());
+    // Default mode is pre_proxy, dispatched through finalized request egress.
+    assert!(
+        plugin.modifies_request_headers(),
+        "the default pre_proxy mode must publish its backend-visible header mutation capability"
+    );
+    assert!(plugin.dispatches_finalized_request_egress());
 }
 
 #[test]
@@ -926,7 +1013,7 @@ async fn test_before_proxy_error_reject_mode() {
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     match result {
         PluginResult::Reject { status_code, .. } => {
             assert_eq!(status_code, 503);
@@ -951,7 +1038,7 @@ async fn test_before_proxy_error_continue_mode() {
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     match result {
         PluginResult::Continue => {
             assert_eq!(
@@ -992,7 +1079,7 @@ async fn test_terminate_mode_rejects_grpc_web_requests() {
         "application/grpc-web+proto".to_string(),
     );
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     match result {
         PluginResult::Reject {
             status_code, body, ..
@@ -1032,7 +1119,7 @@ async fn test_terminate_mode_rejects_translated_grpc_web_requests() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/grpc".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     match result {
         PluginResult::Reject {
             status_code, body, ..
@@ -1085,7 +1172,8 @@ async fn test_terminate_mode_frames_native_grpc_unary_response() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/grpc".to_string());
 
-    let (reject_body, reject_headers) = match plugin.before_proxy(&mut ctx, &mut headers).await {
+    let (reject_body, reject_headers) = match plugin.finalized_egress(&mut ctx, &mut headers).await
+    {
         PluginResult::RejectBinary {
             status_code,
             body,
@@ -1174,7 +1262,7 @@ async fn test_terminate_mode_native_grpc_malformed_contract_fails_closed() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/grpc".to_string());
 
-    match plugin.before_proxy(&mut ctx, &mut headers).await {
+    match plugin.finalized_egress(&mut ctx, &mut headers).await {
         PluginResult::Reject {
             status_code, body, ..
         } => {
@@ -1698,7 +1786,7 @@ async fn test_terminate_mode_status_only_grpc_response_is_trailers_only() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/grpc".to_string());
 
-    match plugin.before_proxy(&mut ctx, &mut headers).await {
+    match plugin.finalized_egress(&mut ctx, &mut headers).await {
         PluginResult::RejectBinary { body, headers, .. } => {
             assert!(body.is_empty(), "status-only contract frames no DATA");
             assert_eq!(headers.get("grpc-status").map(String::as_str), Some("5"));
@@ -2478,7 +2566,7 @@ async fn test_terminate_mode_over_budget_trailers_never_receive_framed_provenanc
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/grpc".to_string());
 
-    match plugin.before_proxy(&mut ctx, &mut headers).await {
+    match plugin.finalized_egress(&mut ctx, &mut headers).await {
         PluginResult::Reject {
             status_code, body, ..
         } => {
@@ -2851,7 +2939,7 @@ async fn test_terminate_mode_ignores_rewritten_content_type_on_plain_request() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/grpc".to_string());
 
-    match plugin.before_proxy(&mut ctx, &mut headers).await {
+    match plugin.finalized_egress(&mut ctx, &mut headers).await {
         PluginResult::RejectBinary { body, headers, .. } => {
             assert!(
                 !headers.contains_key("grpc-status"),
@@ -2917,7 +3005,7 @@ async fn test_terminate_mode_uses_stamped_grpc_flavor_despite_header_rewrite() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    match plugin.before_proxy(&mut ctx, &mut headers).await {
+    match plugin.finalized_egress(&mut ctx, &mut headers).await {
         PluginResult::RejectBinary {
             status_code,
             body,
@@ -3049,7 +3137,7 @@ async fn test_terminate_mode_returns_function_response_as_reject_binary() {
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
 
-    match plugin.before_proxy(&mut ctx, &mut headers).await {
+    match plugin.finalized_egress(&mut ctx, &mut headers).await {
         PluginResult::RejectBinary {
             status_code,
             body,
@@ -3109,7 +3197,7 @@ async fn test_forward_headers_never_resurrect_stripped_client_values() {
     // Effective view after an auth plugin sanitized its owned destination and
     // stripped the credential it consumed.
     let mut headers = HashMap::from([("x-request-id".to_string(), "req-1".to_string())]);
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = plugin.finalized_egress(&mut ctx, &mut headers).await;
 
     let requests = server.received_requests().await.expect("recorded requests");
     assert_eq!(requests.len(), 1, "the function must have been invoked");
@@ -3159,7 +3247,7 @@ async fn test_terminate_rejects_out_of_range_function_status() {
     .unwrap();
     let mut ctx = create_test_context();
 
-    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+    match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
         PluginResult::Reject {
             status_code, body, ..
         } => {
@@ -3211,7 +3299,7 @@ async fn test_pre_proxy_redirect_is_not_approval_and_is_not_followed() {
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
 
-    match plugin.before_proxy(&mut ctx, &mut headers).await {
+    match plugin.finalized_egress(&mut ctx, &mut headers).await {
         PluginResult::Reject {
             status_code, body, ..
         } => {
@@ -3252,7 +3340,7 @@ async fn test_pre_proxy_redirect_continue_records_only_scoped_diagnostics() {
     let mut ctx = create_test_context();
 
     assert!(matches!(
-        plugin.before_proxy(&mut ctx, &mut HashMap::new()).await,
+        plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await,
         PluginResult::Continue
     ));
     assert_eq!(
@@ -3294,7 +3382,7 @@ async fn test_pre_proxy_4xx_and_5xx_use_configured_final_error_status() {
         .unwrap();
         let mut ctx = create_test_context();
 
-        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
             PluginResult::Reject {
                 status_code, body, ..
             } => {
@@ -3346,7 +3434,7 @@ async fn test_terminate_forwards_safe_headers_and_preserves_repeated_cookies() {
     .unwrap();
     let mut ctx = create_test_context();
 
-    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+    match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
         PluginResult::RejectBinary {
             status_code,
             body,
@@ -3758,7 +3846,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         .unwrap();
         let mut ctx = create_test_context();
 
-        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
             PluginResult::RejectBinary { headers, .. } => {
                 if should_strip {
                     assert!(
@@ -3886,7 +3974,7 @@ async fn test_terminate_strips_unsafe_url_headers_for_root_function_destination(
         .unwrap();
         let mut ctx = create_test_context();
 
-        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
             PluginResult::RejectBinary { headers, .. } => {
                 if should_strip {
                     assert!(
@@ -4113,7 +4201,7 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
         .unwrap();
         let mut ctx = create_test_context();
 
-        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
             PluginResult::RejectBinary { headers, .. } => {
                 if should_strip {
                     assert!(
@@ -4165,7 +4253,7 @@ async fn test_terminate_rejects_repeated_singleton_url_headers() {
         .unwrap();
         let mut ctx = create_test_context();
 
-        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
             PluginResult::RejectBinary { headers, .. } => assert!(
                 !headers.contains_key(header),
                 "repeated singleton {header} survived: {headers:?}"
@@ -4218,7 +4306,7 @@ async fn test_terminate_revalidates_combined_link_headers() {
         .unwrap();
         let mut ctx = create_test_context();
 
-        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
             PluginResult::RejectBinary { headers, .. } => {
                 if should_strip {
                     assert!(
@@ -4264,7 +4352,7 @@ async fn test_terminate_preserves_head_no_body_semantics() {
     let mut ctx = create_test_context();
     ctx.method = "HEAD".to_string();
 
-    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+    match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
         PluginResult::RejectBinary {
             status_code,
             body,
@@ -4312,7 +4400,7 @@ async fn test_terminate_strips_body_from_no_content_statuses() {
         .unwrap();
 
         match plugin
-            .before_proxy(&mut create_test_context(), &mut HashMap::new())
+            .finalized_egress(&mut create_test_context(), &mut HashMap::new())
             .await
         {
             PluginResult::RejectBinary {
@@ -4362,7 +4450,7 @@ async fn test_forward_body_is_binary_safe_for_non_post_methods() {
     ctx.request_body_bytes = Some(Bytes::from_static(&[0xff, 0x00, 0x41]));
 
     assert!(matches!(
-        plugin.before_proxy(&mut ctx, &mut HashMap::new()).await,
+        plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await,
         PluginResult::Continue
     ));
     let requests = server.received_requests().await.unwrap();
@@ -4403,7 +4491,7 @@ async fn test_forward_body_preserves_exact_bytes_and_active_content_type() {
     transformed_headers.insert("content-type".to_string(), "application/json".to_string());
     assert!(matches!(
         plugin
-            .before_proxy(&mut text_ctx, &mut transformed_headers)
+            .finalized_egress(&mut text_ctx, &mut transformed_headers)
             .await,
         PluginResult::Continue
     ));
@@ -4419,7 +4507,7 @@ async fn test_forward_body_preserves_exact_bytes_and_active_content_type() {
     transformed_headers.insert("content-type".to_string(), "text/plain".to_string());
     assert!(matches!(
         plugin
-            .before_proxy(&mut json_ctx, &mut transformed_headers)
+            .finalized_egress(&mut json_ctx, &mut transformed_headers)
             .await,
         PluginResult::Continue
     ));
@@ -4469,7 +4557,7 @@ async fn configured_decompression_exposes_plaintext_before_serverless_dispatch()
         )
         .await;
         assert!(matches!(
-            plugin.before_proxy(&mut ctx, &mut headers).await,
+            plugin.finalized_egress(&mut ctx, &mut headers).await,
             PluginResult::Continue
         ));
     }
@@ -4510,7 +4598,7 @@ async fn test_encoded_or_unavailable_body_fails_before_external_egress() {
     let mut active_headers = std::mem::take(&mut encoded_ctx.headers);
     active_headers.insert("content-encoding".to_string(), "gzip".to_string());
     match plugin
-        .before_proxy(&mut encoded_ctx, &mut active_headers)
+        .finalized_egress(&mut encoded_ctx, &mut active_headers)
         .await
     {
         PluginResult::Reject { body, .. } => {
@@ -4522,7 +4610,7 @@ async fn test_encoded_or_unavailable_body_fails_before_external_egress() {
     let mut unavailable_ctx = create_test_context();
     unavailable_ctx.method = "POST".to_string();
     match plugin
-        .before_proxy(&mut unavailable_ctx, &mut HashMap::new())
+        .finalized_egress(&mut unavailable_ctx, &mut HashMap::new())
         .await
     {
         PluginResult::Reject { body, .. } => {
@@ -4569,7 +4657,7 @@ async fn test_original_content_encoding_marker_fails_before_external_egress() {
         ORIGIN_ENCODED_REQUEST_METADATA_KEY.to_string(),
         "true".to_string(),
     );
-    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+    match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
         PluginResult::Reject { body, .. } => {
             assert!(body.contains("encoded_request_body_unsupported"));
         }
@@ -4618,7 +4706,7 @@ async fn test_query_transform_is_forwarded_in_function_payload() {
         "true".to_string(),
     );
 
-    let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "canonical outbound query must be forwardable, got {result:?}"
@@ -4675,7 +4763,7 @@ async fn test_ambiguous_query_fails_before_external_egress() {
     ] {
         let mut ctx = create_test_context();
         ctx.set_raw_query_string(raw_query.to_string());
-        match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+        match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
             PluginResult::Reject { body, .. } => assert!(body.contains(expected_code)),
             other => panic!("query={raw_query} must fail closed, got {other:?}"),
         }
@@ -4686,7 +4774,7 @@ async fn test_ambiguous_query_fails_before_external_egress() {
         .query_params
         .insert("role".to_string(), "admin".to_string());
     match plugin
-        .before_proxy(&mut materialized_only, &mut HashMap::new())
+        .finalized_egress(&mut materialized_only, &mut HashMap::new())
         .await
     {
         PluginResult::Reject { body, .. } => assert!(body.contains("raw_query_unavailable")),
@@ -4718,7 +4806,7 @@ async fn test_unambiguous_query_is_decoded_once_for_function_payload() {
     ctx.set_raw_query_string("name=alice%20bob&literal=%2B".to_string());
 
     assert!(matches!(
-        plugin.before_proxy(&mut ctx, &mut HashMap::new()).await,
+        plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await,
         PluginResult::Continue
     ));
     let requests = server.received_requests().await.unwrap();
@@ -4757,7 +4845,7 @@ async fn test_query_forwarding_omits_only_credentials_marked_for_backend_strippi
     );
 
     assert!(matches!(
-        plugin.before_proxy(&mut ctx, &mut HashMap::new()).await,
+        plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await,
         PluginResult::Continue
     ));
     let requests = server.received_requests().await.unwrap();
@@ -4792,7 +4880,7 @@ async fn test_query_forwarding_omits_only_credentials_marked_for_backend_strippi
         "true".to_string(),
     );
     match plugin
-        .before_proxy(&mut duplicate_ctx, &mut HashMap::new())
+        .finalized_egress(&mut duplicate_ctx, &mut HashMap::new())
         .await
     {
         PluginResult::Reject { body, .. } => {
@@ -4808,7 +4896,7 @@ async fn test_query_forwarding_omits_only_credentials_marked_for_backend_strippi
         "true".to_string(),
     );
     match plugin
-        .before_proxy(&mut invalid_encoding_ctx, &mut HashMap::new())
+        .finalized_egress(&mut invalid_encoding_ctx, &mut HashMap::new())
         .await
     {
         PluginResult::Reject { body, .. } => {
@@ -4834,7 +4922,7 @@ async fn test_secret_bearing_url_never_reaches_client_or_metadata() {
     .unwrap();
     let mut ctx = create_test_context();
 
-    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
+    match plugin.finalized_egress(&mut ctx, &mut HashMap::new()).await {
         PluginResult::Reject { body, .. } => {
             assert!(!body.contains(secret), "secret leaked to client: {body}");
             assert!(body.contains("invocation_failed"));
@@ -4869,7 +4957,7 @@ async fn test_pre_proxy_mode_allows_grpc_requests() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/grpc".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     // Should NOT get the gRPC rejection — should proceed to invoke (and fail with continue)
     match result {
         PluginResult::Continue => {
@@ -4918,7 +5006,7 @@ async fn test_aws_lambda_function_error_does_not_leak_response_body_in_reject_de
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
 
-    match plugin.before_proxy(&mut ctx, &mut headers).await {
+    match plugin.finalized_egress(&mut ctx, &mut headers).await {
         PluginResult::Reject {
             status_code, body, ..
         } => {
@@ -5055,7 +5143,7 @@ async fn test_skips_ai_stream_router_claimed_provider_requests() {
     );
 
     assert!(matches!(
-        plugin.before_proxy(&mut ctx, &mut headers).await,
+        plugin.finalized_egress(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
     assert!(
@@ -5346,7 +5434,7 @@ async fn test_terminate_mode_rejects_oversized_response_body() {
     // bounded read fires and the error is surfaced as a Reject.
     let mut headers = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     match result {
         PluginResult::Reject {
             status_code, body, ..
@@ -5389,7 +5477,7 @@ async fn test_pre_proxy_continue_on_oversized_response_body() {
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     match result {
         PluginResult::Continue => {
             let error_class = ctx
@@ -5433,7 +5521,7 @@ async fn test_pre_proxy_succeeds_when_response_body_within_limit() {
     let mut ctx = create_test_context();
     let mut headers = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     match result {
         PluginResult::Continue => {
             // pre_proxy success: the function's headers should be injected.
@@ -5454,4 +5542,186 @@ fn create_test_aws_config() -> serde_json::Value {
         "secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
         "function_name": "my-function"
     })
+}
+
+// ---------------------------------------------------------------------------
+// Finalized-request-egress phase (GHSA-4vr5-4wm3-x5xv)
+// ---------------------------------------------------------------------------
+
+/// The plugin must declare the finalized-egress phase and must NOT declare the
+/// pre-finalization egress capability. The second half is what composition
+/// admission keys on: a plugin that still egresses from `before_proxy` cannot
+/// share a chain with a transformer or a final request-policy validator.
+#[test]
+fn test_serverless_declares_finalized_egress_phase_not_pre_finalization_egress() {
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://my-func.azurewebsites.net/api/transform",
+            "forward_body": true
+        }),
+        default_client(),
+    )
+    .unwrap();
+    assert!(plugin.dispatches_finalized_request_egress());
+    assert!(!plugin.egresses_request_body_before_finalization());
+}
+
+/// The advisory's first reproduction scenario: a `request_transformer` removes a
+/// sensitive JSON field, and the function must receive the transformed
+/// representation. The pre-transform body is still staged on the context the way
+/// the proxy stages it; consuming it instead of the finalized parameter is the
+/// disclosure this advisory describes.
+#[tokio::test]
+async fn test_finalized_egress_forwards_transformed_body_not_pretransform_metadata() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "pre_proxy",
+            "forward_body": true,
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let pre_transform = br#"{"ssn":"123-45-6789","keep":"yes"}"#;
+    let finalized = br#"{"keep":"yes"}"#;
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    // Exactly what the proxy stages before transforms run.
+    ctx.request_body_bytes = Some(Bytes::from_static(pre_transform));
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8_lossy(pre_transform).into_owned(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let mut overlay = HashMap::new();
+    let result = plugin
+        .dispatch_finalized_request_egress(&mut ctx, &headers, finalized, &mut overlay)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the function must be invoked exactly once"
+    );
+    let payload: Value = serde_json::from_slice(&requests[0].body).expect("JSON payload");
+    assert_eq!(
+        payload.get("body").and_then(Value::as_str),
+        Some("{\"keep\":\"yes\"}"),
+        "the function must receive the finalized backend-visible body"
+    );
+    let raw = String::from_utf8_lossy(&requests[0].body);
+    assert!(
+        !raw.contains("123-45-6789"),
+        "the pre-transform value the operator redacted must never cross the boundary"
+    );
+}
+
+/// A `pre_proxy` function's header injections are published through the backend
+/// header overlay. The finalized snapshot the function consumed — the exact
+/// representation policy accepted and the backend receives — stays untouched.
+#[tokio::test]
+async fn test_pre_proxy_header_injection_uses_backend_overlay_not_the_snapshot() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"headers":{"x-decision":"allow"}}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "pre_proxy",
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    let headers: HashMap<String, String> = HashMap::new();
+    let mut overlay = HashMap::new();
+    let result = plugin
+        .dispatch_finalized_request_egress(&mut ctx, &headers, b"", &mut overlay)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(overlay.get("x-decision").map(String::as_str), Some("allow"));
+    assert!(
+        headers.is_empty(),
+        "the finalized snapshot must remain immutable"
+    );
+}
+
+/// Body forwarding is fail-closed when the gateway never collected a body for a
+/// request that may carry one: the function must not be invoked on a silently
+/// truncated payload.
+#[tokio::test]
+async fn test_forward_body_fails_closed_when_no_body_was_collected() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "pre_proxy",
+            "forward_body": true,
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.request_body_bytes = None;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("content-length".to_string(), "34".to_string());
+
+    let mut overlay = HashMap::new();
+    let result = plugin
+        .dispatch_finalized_request_egress(&mut ctx, &headers, b"", &mut overlay)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "governed input must fail closed, got {result:?}"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty(),
+        "no function may be contacted when the governed representation is unavailable"
+    );
 }

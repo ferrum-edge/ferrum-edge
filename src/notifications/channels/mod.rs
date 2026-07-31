@@ -15,9 +15,11 @@ use url::Url;
 
 use crate::plugins::utils::http_client::PluginHttpClient;
 use crate::plugins::utils::response_body::{BoundedReadError, measure_response_body_bounded};
+use crate::retry::{ErrorClass, classify_reqwest_error};
 use crate::util::unknown_keys::{near_miss_for_missing_key, reject_unknown_keys};
 
 use super::notification::Notification;
+use super::outcome::{DeliveryAttempt, FailureClass, http_status_failure};
 
 pub mod discord;
 pub mod email;
@@ -135,12 +137,58 @@ impl NotificationChannel {
         extras: &HashMap<String, String>,
         http: &PluginHttpClient,
     ) -> Result<(), String> {
+        match self.dispatch_classified(notification, extras, http).await {
+            DeliveryAttempt::Success => Ok(()),
+            DeliveryAttempt::Failed { message, .. } => Err(message),
+        }
+    }
+
+    /// Classified dispatch used by the retrying delivery runner.
+    pub async fn dispatch_classified(
+        &self,
+        notification: &Notification,
+        extras: &HashMap<String, String>,
+        http: &PluginHttpClient,
+    ) -> DeliveryAttempt {
         match self {
-            Self::Slack(c) => c.dispatch(notification, http).await,
-            Self::Teams(c) => c.dispatch(notification, http).await,
-            Self::Discord(c) => c.dispatch(notification, http).await,
-            Self::Webhook(c) => c.dispatch_with_vars(notification, extras, http).await,
-            Self::Email(c) => c.dispatch_with_vars(notification, extras, http).await,
+            Self::Slack(c) => {
+                let payload = c.build_payload(notification);
+                dispatch_json_payload_classified(
+                    c.webhook_url(),
+                    "slack",
+                    "notification_slack",
+                    &payload,
+                    http,
+                )
+                .await
+            }
+            Self::Teams(c) => {
+                let payload = c.build_payload(notification);
+                dispatch_json_payload_classified(
+                    c.webhook_url(),
+                    "teams",
+                    "notification_teams",
+                    &payload,
+                    http,
+                )
+                .await
+            }
+            Self::Discord(c) => {
+                let payload = c.build_payload(notification);
+                dispatch_json_payload_classified(
+                    c.webhook_url(),
+                    "discord",
+                    "notification_discord",
+                    &payload,
+                    http,
+                )
+                .await
+            }
+            Self::Webhook(c) => {
+                c.dispatch_with_vars_classified(notification, extras, http)
+                    .await
+            }
+            Self::Email(c) => c.dispatch_classified(notification, extras, http).await,
         }
     }
 }
@@ -348,13 +396,49 @@ pub(super) async fn dispatch_json_payload(
     payload: &Value,
     http: &PluginHttpClient,
 ) -> Result<(), String> {
+    match dispatch_json_payload_classified(webhook_url, channel, client_label, payload, http).await
+    {
+        DeliveryAttempt::Success => Ok(()),
+        DeliveryAttempt::Failed { message, .. } => Err(message),
+    }
+}
+
+pub(super) async fn dispatch_json_payload_classified(
+    webhook_url: &str,
+    channel: &'static str,
+    client_label: &'static str,
+    payload: &Value,
+    http: &PluginHttpClient,
+) -> DeliveryAttempt {
     let redacted_url = redacted_endpoint_url(webhook_url);
     let req = http.get().post(webhook_url).json(payload);
-    let resp = http
-        .execute_redacted(req, client_label, &redacted_url)
+    let resp = match http
+        .execute_with_redacted_url(req, client_label, &redacted_url)
         .await
-        .map_err(|e| format!("{channel} dispatch failed: {e}"))?;
-    finalize_dispatch_response(resp, channel, &redacted_url).await
+    {
+        Ok(resp) => resp,
+        Err(error) => return transport_failure(channel, &error, &redacted_url),
+    };
+    finalize_dispatch_response_classified(resp, channel, &redacted_url).await
+}
+
+pub(super) fn transport_failure(
+    channel: &str,
+    error: &reqwest::Error,
+    redacted_url: &str,
+) -> DeliveryAttempt {
+    let error_class = classify_reqwest_error(error);
+    let class = if error.is_builder() || error_class == ErrorClass::DispatchPolicyRejected {
+        FailureClass::Permanent
+    } else {
+        FailureClass::Transient
+    };
+    // Never render `reqwest::Error`: its Display includes the complete request
+    // URL, whose path/query commonly contains webhook credentials.
+    DeliveryAttempt::failed(
+        class,
+        format!("{channel} dispatch failed ({error_class}) calling {redacted_url}"),
+    )
 }
 
 async fn drain_response_body_redacted(
@@ -377,10 +461,10 @@ async fn drain_response_body_redacted(
         ));
     }
 
-    // Reached only from `finalize_dispatch_response` after a 2xx status check,
-    // so this is the size-bounded drain on a successful response: it measures
-    // chunk lengths and discards the bytes, never buffering anything we will
-    // not inspect.
+    // Reached only from `finalize_dispatch_response_classified` after a 2xx
+    // status check, so this is the size-bounded drain on a successful response:
+    // it measures chunk lengths and discards the bytes, never buffering
+    // anything we will not inspect.
     measure_response_body_bounded(resp, RESPONSE_BODY_DRAIN_LIMIT_BYTES)
         .await
         .map(|_| ())
@@ -400,23 +484,26 @@ async fn drain_response_body_redacted(
         })
 }
 
-pub(super) async fn finalize_dispatch_response(
+pub(super) async fn finalize_dispatch_response_classified(
     resp: reqwest::Response,
     channel: &str,
     redacted_url: &str,
-) -> Result<(), String> {
+) -> DeliveryAttempt {
     let status = resp.status();
     if !status.is_success() {
         // Keep non-success diagnostics status-only. Notification endpoint URLs
         // often contain credentials, and response bodies are untrusted and not
         // needed to identify a failed send.
-        return Err(format!(
-            "{channel} dispatch returned non-success status {status} from {redacted_url}"
-        ));
+        return http_status_failure(channel, status, redacted_url);
     }
     // A 2xx with an abusive response body is still a dispatch failure: success
     // status does not buy an endpoint permission to make us read forever.
-    drain_response_body_redacted(resp, channel, redacted_url).await
+    // Oversized / drain failures after a committed 2xx are permanent (the
+    // peer accepted the notification; retrying would duplicate the alert).
+    match drain_response_body_redacted(resp, channel, redacted_url).await {
+        Ok(()) => DeliveryAttempt::Success,
+        Err(message) => DeliveryAttempt::failed(FailureClass::Permanent, message),
+    }
 }
 
 fn reqwest_error_class(error: &reqwest::Error) -> &'static str {

@@ -20,6 +20,12 @@
 //!   (same complete syntax accepted at H1/H2/H3 emission), including
 //!   rejection of non-CR/LF forbidden control bytes.
 //! - Header keys are pre-lowercased.
+//! - Protocol-managed hop-by-hop and framing destinations (`Connection`,
+//!   `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`,
+//!   `Transfer-Encoding`, `Upgrade`, `Content-Length`) are rejected for
+//!   `add`/`update` and as rename destinations. `remove` of those names remains
+//!   allowed. The gateway's final client-wire sanitizer derives `Content-Length`
+//!   and strips connection/framing fields after every mutable response hook.
 //!
 //! ## Per-rule overrides from `mesh_route_dispatch`
 //!
@@ -548,6 +554,42 @@ impl ResponseTransformer {
                             "response_transformer: rule[{idx}]: header 'value' must be a valid HTTP HeaderValue"
                         )
                     })?;
+                }
+
+                // Protocol-managed framing / connection-control destinations are
+                // owned by the final client-wire sanitizer. Reject add/update of
+                // those keys and rename *to* those keys so a later instance or a
+                // backend-controlled rename source cannot reintroduce them after
+                // origin hop-by-hop strip. `remove` remains allowed.
+                match operation {
+                    HeaderOp::Add | HeaderOp::Update => {
+                        if crate::proxy::headers::is_protocol_managed_plugin_response_destination(
+                            &key,
+                        ) {
+                            return Err(format!(
+                                "response_transformer: rule[{idx}]: header '{op_str}' destination \
+                                 '{key}' is protocol-managed (hop-by-hop or framing) and cannot be \
+                                 configured; the gateway derives Content-Length and strips \
+                                 Connection/Transfer-Encoding/Trailer/Upgrade at the final \
+                                 response boundary"
+                            ));
+                        }
+                    }
+                    HeaderOp::Rename => {
+                        if let Some(ref dest) = new_key
+                            && crate::proxy::headers::is_protocol_managed_plugin_response_destination(
+                                dest,
+                            )
+                        {
+                            return Err(format!(
+                                "response_transformer: rule[{idx}]: rename destination '{dest}' is \
+                                 protocol-managed (hop-by-hop or framing) and cannot be configured; \
+                                 a backend-controlled source value must not become Connection, \
+                                 Transfer-Encoding, Trailer, Upgrade, or Content-Length"
+                            ));
+                        }
+                    }
+                    HeaderOp::Remove => {}
                 }
 
                 header_rules.push(HeaderRule {

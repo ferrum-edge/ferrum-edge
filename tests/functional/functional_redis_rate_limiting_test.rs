@@ -443,16 +443,20 @@ impl RedisRateLimitHarness {
 // Helpers
 // ============================================================================
 
-async fn spawn_file_gateway(
-    config: String,
-    proxy_port: u16,
-    extra_env: Vec<(String, String)>,
-) -> TestGateway {
+async fn spawn_file_gateway(config: String, extra_env: Vec<(String, String)>) -> TestGateway {
+    // Do not pin FERRUM_PROXY_HTTP_PORT here. The harness allocates a fresh
+    // proxy port on every spawn attempt; a caller-reserved bind-drop-rebind
+    // port stays fixed across retries and turns the retry loop into a TOCTOU
+    // port race. Tests must read `gateway.proxy_port` after a successful spawn.
     let mut builder = TestGateway::builder()
         .mode_file(config)
         .log_level("debug")
-        .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string());
+        .capture_output();
     for (key, value) in extra_env {
+        assert!(
+            key != "FERRUM_PROXY_HTTP_PORT" && key != "FERRUM_ADMIN_HTTP_PORT",
+            "spawn_file_gateway must not pin {key}; let the harness allocate and read the effective port after spawn"
+        );
         builder = builder.env(key, value);
     }
     builder
@@ -1464,31 +1468,18 @@ plugin_configs:
         )
     };
 
-    let port1 = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let port2 = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-
     let mut gw1 = spawn_file_gateway(
         config(&unique_prefix),
-        port1,
         vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
     )
     .await;
     let mut gw2 = spawn_file_gateway(
         config(&unique_prefix),
-        port2,
         vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
     )
     .await;
+    let port1 = gw1.proxy_port;
+    let port2 = gw2.proxy_port;
 
     let client = reqwest::Client::new();
     let request_body = r#"{"model":"test","messages":[{"role":"user","content":"hi"}]}"#;
@@ -1809,12 +1800,6 @@ async fn test_ws_rate_limiting_redis_centralized() {
         drop(l);
         p
     };
-    let gateway_port = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
 
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
     sleep(Duration::from_millis(300)).await;
@@ -1853,12 +1838,11 @@ plugin_configs:
     );
     let mut gateway = spawn_file_gateway(
         config,
-        gateway_port,
         vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
     )
     .await;
 
-    let url = format!("ws://127.0.0.1:{}/ws-redis", gateway_port);
+    let url = format!("ws://127.0.0.1:{}/ws-redis", gateway.proxy_port);
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("Failed to connect WebSocket");
@@ -1935,18 +1919,6 @@ async fn test_ws_rate_limiting_redis_namespaces_instance_connections() {
         drop(l);
         p
     };
-    let port1 = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let port2 = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
 
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
     sleep(Duration::from_millis(300)).await;
@@ -1986,13 +1958,11 @@ plugin_configs:
 
     let mut gw1 = spawn_file_gateway(
         config(&unique_prefix),
-        port1,
         vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
     )
     .await;
     let mut gw2 = spawn_file_gateway(
         config(&unique_prefix),
-        port2,
         vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
     )
     .await;
@@ -2000,8 +1970,8 @@ plugin_configs:
     delete_redis_keys_by_prefix(&unique_prefix).await;
     sleep(Duration::from_millis(200)).await;
 
-    let url1 = format!("ws://127.0.0.1:{}/ws-shared", port1);
-    let url2 = format!("ws://127.0.0.1:{}/ws-shared", port2);
+    let url1 = format!("ws://127.0.0.1:{}/ws-shared", gw1.proxy_port);
+    let url2 = format!("ws://127.0.0.1:{}/ws-shared", gw2.proxy_port);
     let (mut ws1, _) = tokio_tungstenite::connect_async(&url1)
         .await
         .expect("Failed to connect WebSocket to gateway 1");
@@ -2101,32 +2071,20 @@ plugin_configs:
         )
     };
 
-    // Allocate ports for two gateway instances
-    let port1 = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let port2 = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-
+    // Allocate two gateway instances with harness-managed proxy ports so each
+    // spawn attempt can retry on a fresh port rather than a dropped reservation.
     let mut gw1 = spawn_file_gateway(
         config(&unique_prefix),
-        port1,
         vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
     )
     .await;
     let mut gw2 = spawn_file_gateway(
         config(&unique_prefix),
-        port2,
         vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
     )
     .await;
+    let port1 = gw1.proxy_port;
+    let port2 = gw2.proxy_port;
 
     let client = reqwest::Client::new();
 
@@ -2445,31 +2403,18 @@ plugin_configs:
         )
     };
 
-    let port1 = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let port2 = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-
     let mut gw1 = spawn_file_gateway(
         config(&unique_prefix),
-        port1,
         vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
     )
     .await;
     let mut gw2 = spawn_file_gateway(
         config(&unique_prefix),
-        port2,
         vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
     )
     .await;
+    let port1 = gw1.proxy_port;
+    let port2 = gw2.proxy_port;
 
     delete_redis_keys_by_prefix(&unique_prefix).await;
     sleep(Duration::from_millis(200)).await;
@@ -2760,21 +2705,15 @@ plugin_configs:
 "#
     );
 
-    let port = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        port
-    };
     let mut gateway = spawn_file_gateway(
         config,
-        port,
         vec![
             ("RUST_LOG".to_string(), "ferrum_edge=debug".to_string()),
             ("FERRUM_NAMESPACE".to_string(), namespace.clone()),
         ],
     )
     .await;
+    let port = gateway.proxy_port;
     sleep(Duration::from_millis(200)).await;
 
     let client = reqwest::Client::new();
@@ -2886,22 +2825,15 @@ plugin_configs:
 "#
     );
 
-    let port = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-
     let mut gw = spawn_file_gateway(
         config,
-        port,
         vec![
             ("RUST_LOG".to_string(), "ferrum_edge=debug".to_string()),
             ("FERRUM_NAMESPACE".to_string(), namespace.clone()),
         ],
     )
     .await;
+    let port = gw.proxy_port;
 
     sleep(Duration::from_millis(200)).await;
 
@@ -3054,19 +2986,12 @@ plugin_configs:
 "#
     );
 
-    let port = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-
     let mut gw = spawn_file_gateway(
         config,
-        port,
         vec![("RUST_LOG".to_string(), "ferrum_edge=debug".to_string())],
     )
     .await;
+    let port = gw.proxy_port;
 
     sleep(Duration::from_millis(200)).await;
 
@@ -3220,23 +3145,8 @@ plugin_configs:
         )
     };
 
-    // Ephemeral ports for both gateways.
-    let port_a = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-    let port_b = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let p = l.local_addr().unwrap().port();
-        drop(l);
-        p
-    };
-
     let mut gw_a = spawn_file_gateway(
         config(&ns_a),
-        port_a,
         vec![
             ("FERRUM_NAMESPACE".to_string(), ns_a.clone()),
             ("RUST_LOG".to_string(), "error".to_string()),
@@ -3245,13 +3155,14 @@ plugin_configs:
     .await;
     let mut gw_b = spawn_file_gateway(
         config(&ns_b),
-        port_b,
         vec![
             ("FERRUM_NAMESPACE".to_string(), ns_b.clone()),
             ("RUST_LOG".to_string(), "error".to_string()),
         ],
     )
     .await;
+    let port_a = gw_a.proxy_port;
+    let port_b = gw_b.proxy_port;
 
     let client = reqwest::Client::new();
 
@@ -3308,4 +3219,42 @@ plugin_configs:
     gw_a.shutdown();
     gw_b.shutdown();
     println!("test_rate_limiting_redis_namespace_key_prefix_isolation PASSED");
+}
+
+/// Drift guard: `spawn_file_gateway` must not pin a caller-reserved proxy port.
+/// Pinning `FERRUM_PROXY_HTTP_PORT` across `TestGateway` retries reuses a
+/// bind-drop-rebind reservation and turns every retry into the same TOCTOU
+/// failure that flaked
+/// `test_request_deduplication_redis_distinct_header_instances_complete_independently`.
+#[test]
+fn spawn_file_gateway_lets_harness_allocate_proxy_port_each_attempt() {
+    const SOURCE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/functional/functional_redis_rate_limiting_test.rs"
+    ));
+    let start = SOURCE
+        .find("async fn spawn_file_gateway(")
+        .expect("spawn_file_gateway helper must exist");
+    let helper = &SOURCE[start..];
+    let end = helper
+        .find("\nasync fn ")
+        .expect("spawn_file_gateway must be followed by another async fn");
+    let helper = &helper[..end];
+
+    assert!(
+        !helper.contains(".env(\"FERRUM_PROXY_HTTP_PORT\""),
+        "spawn_file_gateway must not pin FERRUM_PROXY_HTTP_PORT; harness retries need a fresh proxy port"
+    );
+    assert!(
+        !helper.contains("proxy_port: u16"),
+        "spawn_file_gateway must not take a fixed proxy_port argument"
+    );
+    assert!(
+        helper.contains("capture_output()"),
+        "spawn_file_gateway must capture child output so startup failures are diagnosable in hosted CI"
+    );
+    assert!(
+        helper.contains("FERRUM_PROXY_HTTP_PORT") && helper.contains("must not pin"),
+        "spawn_file_gateway must refuse sticky proxy-port overrides from extra_env"
+    );
 }

@@ -1529,6 +1529,22 @@ fn cooldown_gate_releases_after_window() {
 }
 
 #[test]
+fn stale_cooldown_release_cannot_clear_a_newer_reservation() {
+    let gate = CooldownGate::new();
+    assert!(gate.try_acquire(1, "p1", 10, 10, 100, 0));
+    assert!(gate.try_acquire(1, "p1", 10, 10, 111, 0));
+
+    gate.release(1, "p1", 10, 0, 100);
+    assert!(
+        !gate.try_acquire(1, "p1", 10, 10, 112, 0),
+        "an old delivery settle must not clear the newer cooldown seat"
+    );
+
+    gate.release(1, "p1", 10, 0, 111);
+    assert!(gate.try_acquire(1, "p1", 10, 10, 112, 0));
+}
+
+#[test]
 fn cooldown_gate_rebases_backward_jump_and_tracks_new_epoch() {
     let gate = CooldownGate::new();
     assert!(gate.try_acquire(1, "p1", 10, 60_000, 100_000, 0));
@@ -1559,6 +1575,13 @@ fn recovery_healthy_to_active_emits_trigger() {
     let gate = RecoveryGate::new();
     let outcome = gate.observe(1, "p", true, 60_000, 1_000, 0);
     assert_eq!(outcome, LifecycleOutcome::Trigger);
+    assert!(matches!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::PendingTrigger {
+            reserved_at_ms: 1_000
+        })
+    ));
+    gate.settle_trigger_success(1, "p", 0, 1_000, 1_000);
     assert_eq!(
         gate.current_state(1, "p", 0),
         Some(RuleState::Active { fired_at_ms: 1_000 })
@@ -1569,6 +1592,7 @@ fn recovery_healthy_to_active_emits_trigger() {
 fn recovery_active_to_active_returns_still_active() {
     let gate = RecoveryGate::new();
     gate.observe(1, "p", true, 60_000, 1_000, 0);
+    gate.settle_trigger_success(1, "p", 0, 1_000, 1_000);
     let outcome = gate.observe(1, "p", true, 60_000, 2_000, 0);
     assert_eq!(outcome, LifecycleOutcome::StillActive);
 }
@@ -1577,6 +1601,7 @@ fn recovery_active_to_active_returns_still_active() {
 fn recovery_active_to_recovering_then_resolve() {
     let gate = RecoveryGate::new();
     gate.observe(1, "p", true, 60_000, 1_000, 0);
+    gate.settle_trigger_success(1, "p", 0, 1_000, 1_000);
     let entering = gate.observe(1, "p", false, 60_000, 2_000, 0);
     assert_eq!(entering, LifecycleOutcome::EnteringRecovery);
     // Same call within recovery window: still quiet.
@@ -1587,6 +1612,118 @@ fn recovery_active_to_recovering_then_resolve() {
     // 62_000.
     let resolve = gate.observe(1, "p", false, 60_000, 62_000, 0);
     assert_eq!(resolve, LifecycleOutcome::Resolve);
+    assert!(matches!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::PendingResolve { .. })
+    ));
+    gate.settle_resolve_success(1, "p", 0, 62_000);
+    assert_eq!(gate.current_state(1, "p", 0), Some(RuleState::Healthy));
+}
+
+#[test]
+fn stale_resolve_settle_cannot_commit_a_newer_pending_resolve() {
+    let gate = RecoveryGate::new();
+
+    // First incident: Trigger → Active → recovery → PendingResolve.
+    assert_eq!(
+        gate.observe(1, "p", true, 60_000, 1_000, 0),
+        LifecycleOutcome::Trigger
+    );
+    gate.settle_trigger_success(1, "p", 0, 1_000, 1_000);
+    assert_eq!(
+        gate.observe(1, "p", false, 60_000, 2_000, 0),
+        LifecycleOutcome::EnteringRecovery
+    );
+    assert_eq!(
+        gate.observe(1, "p", false, 60_000, 62_000, 0),
+        LifecycleOutcome::Resolve
+    );
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::PendingResolve {
+            left_threshold_at_ms: 2_000,
+            reserved_at_ms: 62_000,
+        })
+    );
+    let old_resolve_token = 62_000u64;
+
+    // Re-breach parks in ResolveInFlightRebreached; further samples stay Quiet
+    // until that externally in-flight Resolve settles.
+    assert_eq!(
+        gate.observe(1, "p", true, 60_000, 62_001, 0),
+        LifecycleOutcome::Reactivate
+    );
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::ResolveInFlightRebreached {
+            resolve_reserved_at_ms: 62_000,
+            rebreached_at_ms: 62_001,
+        })
+    );
+    assert_eq!(
+        gate.observe(1, "p", false, 60_000, 62_002, 0),
+        LifecycleOutcome::Quiet
+    );
+
+    // Settle the first Resolve → compensating-trigger path.
+    gate.settle_resolve_success(1, "p", 0, old_resolve_token);
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::CompensatingTrigger {
+            rebreached_at_ms: 62_001
+        })
+    );
+
+    // Compensating Trigger → Active.
+    assert_eq!(
+        gate.observe(1, "p", true, 60_000, 63_000, 0),
+        LifecycleOutcome::Trigger
+    );
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::PendingTrigger {
+            reserved_at_ms: 63_000
+        })
+    );
+    gate.settle_trigger_success(1, "p", 0, 63_000, 63_000);
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::Active {
+            fired_at_ms: 63_000
+        })
+    );
+
+    // Second recovery cycle reserves a newer PendingResolve with a distinct token.
+    assert_eq!(
+        gate.observe(1, "p", false, 60_000, 64_000, 0),
+        LifecycleOutcome::EnteringRecovery
+    );
+    assert_eq!(
+        gate.observe(1, "p", false, 60_000, 124_000, 0),
+        LifecycleOutcome::Resolve
+    );
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::PendingResolve {
+            left_threshold_at_ms: 64_000,
+            reserved_at_ms: 124_000,
+        })
+    );
+    let newer_resolve_token = 124_000u64;
+
+    // Old Resolve settle token must not commit the replacement reservation.
+    gate.settle_resolve_success(1, "p", 0, old_resolve_token);
+    assert_eq!(
+        gate.current_state(1, "p", 0),
+        Some(RuleState::PendingResolve {
+            left_threshold_at_ms: 64_000,
+            reserved_at_ms: 124_000,
+        }),
+        "the old delivery must not settle a replacement reservation"
+    );
+
+    // Matching newer token still commits Healthy.
+    gate.settle_resolve_success(1, "p", 0, newer_resolve_token);
     assert_eq!(gate.current_state(1, "p", 0), Some(RuleState::Healthy));
 }
 
@@ -1594,6 +1731,7 @@ fn recovery_active_to_recovering_then_resolve() {
 fn recovery_rebases_backward_jump_before_resolving() {
     let gate = RecoveryGate::new();
     gate.observe(1, "p", true, 60_000, 100_000, 0);
+    gate.settle_trigger_success(1, "p", 0, 100_000, 100_000);
     gate.observe(1, "p", false, 60_000, 110_000, 0);
 
     assert_eq!(
@@ -1615,7 +1753,8 @@ fn recovery_rebases_backward_jump_before_resolving() {
 #[test]
 fn recovery_recovering_to_active_when_breach_returns_during_window() {
     let gate = RecoveryGate::new();
-    gate.observe(1, "p", true, 60_000, 1_000, 0); // Active
+    gate.observe(1, "p", true, 60_000, 1_000, 0); // PendingTrigger
+    gate.settle_trigger_success(1, "p", 0, 1_000, 1_000); // Active
     gate.observe(1, "p", false, 60_000, 2_000, 0); // Recovering
     let reactivate = gate.observe(1, "p", true, 60_000, 3_000, 0);
     assert_eq!(reactivate, LifecycleOutcome::Reactivate);
@@ -1629,6 +1768,7 @@ fn recovery_recovering_to_active_when_breach_returns_during_window() {
 fn recovery_disabled_when_recovery_ms_is_zero() {
     let gate = RecoveryGate::new();
     gate.observe(1, "p", true, 0, 1_000, 0);
+    gate.settle_trigger_success(1, "p", 0, 1_000, 1_000);
     let below = gate.observe(1, "p", false, 0, 2_000, 0);
     assert_eq!(below, LifecycleOutcome::Quiet);
     assert_eq!(gate.current_state(1, "p", 0), Some(RuleState::Healthy));
@@ -1654,7 +1794,9 @@ fn cooldown_retain_proxies_drops_removed_proxy_rows() {
 fn recovery_retain_proxies_drops_removed_proxy_rows() {
     let gate = RecoveryGate::new();
     gate.observe(1, "gone", true, 60_000, 1_000, 0);
+    gate.settle_trigger_success(1, "gone", 0, 1_000, 1_000);
     gate.observe(1, "keep", true, 60_000, 1_000, 0);
+    gate.settle_trigger_success(1, "keep", 0, 1_000, 1_000);
     gate.retain_proxies(&std::collections::HashMap::from([("keep", 0)]));
     assert_eq!(gate.current_state(1, "gone", 0), None);
     assert!(matches!(
@@ -1703,7 +1845,9 @@ fn window_evict_stale_drops_future_record_after_backward_jump() {
 fn recovery_evict_resolved_drops_only_healthy_rows() {
     let gate = RecoveryGate::new();
     gate.observe(1, "active", true, 60_000, 1_000, 0);
+    gate.settle_trigger_success(1, "active", 0, 1_000, 1_000);
     gate.observe(1, "resolved", true, 60_000, 1_000, 0);
+    gate.settle_trigger_success(1, "resolved", 0, 1_000, 1_000);
     gate.observe(1, "resolved", false, 0, 2_000, 0); // Active → Healthy when recovery_ms=0
     assert_eq!(
         gate.current_state(1, "resolved", 0),
@@ -2512,6 +2656,7 @@ fn grpc_status_count_trigger_and_resolve_via_recovery_gate() {
         gate.observe(1, "grpc-p", true, 60_000, 1_000, 0),
         LifecycleOutcome::Trigger
     );
+    gate.settle_trigger_success(1, "grpc-p", 0, 1_000, 1_000);
     // Still active while above threshold.
     assert_eq!(
         gate.observe(1, "grpc-p", true, 60_000, 2_000, 0),

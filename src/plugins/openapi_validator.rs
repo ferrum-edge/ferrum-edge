@@ -34,6 +34,19 @@ const MAX_CONTENT_CODINGS: usize = 4;
 /// decisions per instance so sibling instances cannot cross-apply a bypass
 /// decision (see finding #17).
 const SKIP_REASON_KEY: &str = "openapi_validator.skip_reason";
+/// Public, stable metadata key recording WHICH representation the request
+/// contract was decided over. `client` is the documented pre-transform client
+/// contract; `backend_final` is the post-transform fallback that only runs when
+/// the request never reached the client-contract phase (`GHSA-896v-jx23-9g6p`).
+const CONTRACT_PHASE_KEY: &str = "openapi_validator.request_contract_phase";
+/// Config key for the media-refusal status. Named once so the parse site stays
+/// inside the line budget.
+const UNSUPPORTED_MEDIA_STATUS_KEY: &str = "unsupported_media_type_status_code";
+/// Fixed-cardinality media-refusal diagnostics. Neither echoes the received
+/// `Content-Type` nor any byte of the rejected body.
+const UNDECLARED_MEDIA_DETAIL: &str = "Request Content-Type is not declared for this operation";
+const MISSING_MEDIA_DETAIL: &str =
+    "Request body has no Content-Type and no declared media type applies";
 static INSTANCE_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 /// Error prefix shared by every construction diagnostic.
@@ -74,6 +87,7 @@ const BYPASS_KEYS: &[&str] = &["paths", "methods", "consumers", "header_present"
 const ERROR_RESPONSE_KEYS: &[&str] = &[
     "request_status_code",
     "response_status_code",
+    UNSUPPORTED_MEDIA_STATUS_KEY,
     "content_type",
 ];
 /// Alternate single-schema request-body form.
@@ -135,6 +149,41 @@ enum SchemaDraft {
 enum ValidationSide {
     Request,
     Response,
+}
+
+/// Which representation a request-contract decision was taken over.
+///
+/// The two are deliberately distinct lifecycle phases, not two spellings of one
+/// check. `Client` is the documented contract: the original client bytes after
+/// gateway-owned `Content-Encoding` decoding and before any transform. `Backend`
+/// is the pre-existing final-body hook, retained as a fallback when this
+/// validator did not select over the pristine client view but can select over
+/// the effective backend-visible view — an operation match or bypass state that
+/// only materializes after a `before_proxy` route override or request
+/// header/target rewrite. Disabling that fallback would be a silent downgrade
+/// for those post-rewrite selections. Unknown-operation admission
+/// (`fail_on_unknown_operation`) is rejected in `before_proxy` so it is not
+/// reordered ahead of unrelated `before_proxy` hooks; the client phase
+/// deliberately leaves unmatched operations undecided for that reason.
+///
+/// An HBONE CONNECT tunnel is NOT one of those paths. This plugin governs plain
+/// HTTP request bodies; a CONNECT tunnel's bytes are not a request body, the
+/// proxy skips request-body buffering for HBONE entirely, and it short-circuits
+/// into `handle_hbone_request` immediately after `before_proxy` — before any
+/// final-request-body hook — so neither phase ever observes tunnel bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestContractPhase {
+    Client,
+    Backend,
+}
+
+impl RequestContractPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Backend => "backend_final",
+        }
+    }
 }
 
 struct OperationEntry {
@@ -469,6 +518,10 @@ pub struct OpenapiValidator {
     response_content_types: Vec<String>,
     ops_by_method: AHashMap<String, OperationBucket>,
     has_any_request_schema: bool,
+    /// At least one operation declares `request_required`. Presence enforcement
+    /// is independent of any declared media type, so a document that declares a
+    /// required body with an empty content map still has to buffer.
+    has_any_required_request_body: bool,
     has_any_response_schema: bool,
     bypass_paths: Option<RegexSet>,
     bypass_methods: HashSet<String>,
@@ -476,6 +529,12 @@ pub struct OpenapiValidator {
     bypass_header_present: HashMap<String, Option<String>>,
     request_error_status: u16,
     response_error_status: u16,
+    /// Status for a nonempty client representation that no declared media entry
+    /// of the matched operation covers. Protocol-appropriate 415 by default,
+    /// kept distinct from `request_error_status` so an operator who remapped
+    /// schema failures does not also remap media-type refusals
+    /// (`GHSA-6p78-6x8c-9g9x`).
+    request_unsupported_media_status: u16,
     error_content_type: String,
     error_truncate_chars: usize,
 }
@@ -529,10 +588,12 @@ impl OpenapiValidator {
 
         let mut grouped_ops: AHashMap<String, Vec<(String, OperationEntry)>> = AHashMap::new();
         let mut has_any_request_schema = false;
+        let mut has_any_required_request_body = false;
         let mut has_any_response_schema = false;
         for (index, operation) in operations.iter().enumerate() {
             let parsed = parse_operation(operation, index, schema_draft)?;
             has_any_request_schema |= parsed.entry.has_request_schema();
+            has_any_required_request_body |= parsed.entry.request_required;
             has_any_response_schema |= parsed.entry.has_response_schema();
             grouped_ops
                 .entry(parsed.method)
@@ -560,7 +621,11 @@ impl OpenapiValidator {
                 },
             );
         }
-        if !has_any_request_schema && !has_any_response_schema && !fail_on_unknown_operation {
+        if !has_any_request_schema
+            && !has_any_required_request_body
+            && !has_any_response_schema
+            && !fail_on_unknown_operation
+        {
             return Err(
                 "openapi_validator: no validation rules configured -- provide request or response schemas"
                     .to_string(),
@@ -597,8 +662,14 @@ impl OpenapiValidator {
             optional_u16_from_object(error_response, "request_status_code")?.unwrap_or(400);
         let response_error_status =
             optional_u16_from_object(error_response, "response_status_code")?.unwrap_or(502);
+        let request_unsupported_media_status =
+            optional_u16_from_object(error_response, UNSUPPORTED_MEDIA_STATUS_KEY)?.unwrap_or(415);
         validate_status(request_error_status, "error_response.request_status_code")?;
         validate_status(response_error_status, "error_response.response_status_code")?;
+        validate_status(
+            request_unsupported_media_status,
+            "error_response.unsupported_media_type_status_code",
+        )?;
         let error_content_type = optional_string_from_object(error_response, "content_type")?
             .unwrap_or_else(|| "application/problem+json".to_string());
         validate_concrete_media_type(&error_content_type, "error_response.content_type")?;
@@ -617,6 +688,7 @@ impl OpenapiValidator {
             response_content_types,
             ops_by_method,
             has_any_request_schema,
+            has_any_required_request_body,
             has_any_response_schema,
             bypass_paths,
             bypass_methods,
@@ -624,6 +696,7 @@ impl OpenapiValidator {
             bypass_header_present,
             request_error_status,
             response_error_status,
+            request_unsupported_media_status,
             error_content_type,
             error_truncate_chars,
         })
@@ -780,6 +853,21 @@ impl OpenapiValidator {
         operation_label: Option<&str>,
         detail: String,
     ) -> PluginResult {
+        self.handle_violation_with_status(ctx, side, operation_label, detail, None)
+    }
+
+    /// `status_override` selects a protocol-appropriate status for a violation
+    /// class that is not a schema failure (currently only "no declared media
+    /// type covers this representation" → 415). `None` keeps the configured
+    /// per-side status.
+    fn handle_violation_with_status(
+        &self,
+        ctx: &mut RequestContext,
+        side: ValidationSide,
+        operation_label: Option<&str>,
+        detail: String,
+        status_override: Option<u16>,
+    ) -> PluginResult {
         self.mark_mode(ctx);
         if let Some(label) = operation_label {
             ctx.metadata.insert(
@@ -799,12 +887,12 @@ impl OpenapiValidator {
             EnforcementMode::Block => {
                 let (status_code, action, title) = match side {
                     ValidationSide::Request => (
-                        self.request_error_status,
+                        status_override.unwrap_or(self.request_error_status),
                         "rejected_request",
                         "Request body validation failed",
                     ),
                     ValidationSide::Response => (
-                        self.response_error_status,
+                        status_override.unwrap_or(self.response_error_status),
                         "rejected_response",
                         "Response body validation failed",
                     ),
@@ -874,6 +962,147 @@ impl OpenapiValidator {
         }
         validator_for_content_type(&operation.request_validators, content_type)
     }
+
+    /// Whether this operation carries anything for the request contract to
+    /// enforce: a declared media schema, or a declared presence requirement.
+    fn operation_has_request_contract(operation: &OperationEntry) -> bool {
+        operation.has_request_schema() || operation.request_required
+    }
+
+    /// Record that THIS instance took its request-contract decision in the
+    /// client phase, so its backend-final fallback stays inert. Keyed by the
+    /// process-unique instance ID: sibling instances never share the entry.
+    fn mark_decided(&self, ctx: &mut RequestContext, phase: RequestContractPhase) {
+        if phase == RequestContractPhase::Client {
+            ctx.openapi_validator_client_contract_enforced
+                .insert(self.instance_id);
+        }
+    }
+
+    /// The single request-contract decision, shared by the client-contract phase
+    /// and the backend-final fallback so the two can never diverge.
+    ///
+    /// Fail-closed rules, all independent of anything a client can simply omit:
+    ///
+    /// - an empty body for a `request_required` operation is a violation;
+    /// - a NONEMPTY body that no declared media entry of the operation covers is
+    ///   an unsupported-media violation (415 by default) rather than a silent
+    ///   continue — including when the body was buffered because some *other*
+    ///   plugin voted for it (`GHSA-6p78-6x8c-9g9x`);
+    /// - a declared media entry that the operator excluded from
+    ///   `request_content_types` is an explicit inspection opt-out and records
+    ///   `content_type_out_of_scope` instead of failing closed.
+    ///
+    /// Diagnostics for the media-refusal class are fixed-cardinality: they never
+    /// echo the received `Content-Type` or any byte of the rejected body.
+    fn enforce_request_contract(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        phase: RequestContractPhase,
+    ) -> PluginResult {
+        if !self.requires_request_body_buffering() {
+            return PluginResult::Continue;
+        }
+        if let Some(reason) = self.bypass_reason_for_headers(ctx, headers) {
+            self.mark_decided(ctx, phase);
+            self.mark_skip(ctx, reason);
+            return PluginResult::Continue;
+        }
+        let Some(operation) = self.operation_for_context(ctx) else {
+            if phase == RequestContractPhase::Client {
+                // Unknown-operation admission belongs to `before_proxy`, which
+                // runs immediately after this phase. Deciding it here as well
+                // would move that rejection ahead of unrelated `before_proxy`
+                // hooks and leave the backend fallback with nothing to do.
+                return PluginResult::Continue;
+            }
+            if self.fail_on_unknown_operation {
+                return self.handle_violation(
+                    ctx,
+                    ValidationSide::Request,
+                    None,
+                    format!(
+                        "No OpenAPI operation matched {} {}",
+                        ctx.method.as_str(),
+                        ctx.path.as_str()
+                    ),
+                );
+            }
+            self.mark_skip(ctx, "no_match");
+            return PluginResult::Continue;
+        };
+        // The shared runner is activated when at least one effective plugin
+        // instance selected the client-contract phase. A sibling instance can
+        // still match a response-only operation on this request. That sibling
+        // has taken no request-contract decision and must remain eligible for
+        // the backend-final fallback if a later before_proxy rewrite selects
+        // one of its request-contract operations.
+        if !Self::operation_has_request_contract(operation) {
+            return PluginResult::Continue;
+        }
+        self.mark_decided(ctx, phase);
+        self.mark_operation_entry(ctx, operation);
+        ctx.metadata
+            .insert(CONTRACT_PHASE_KEY.to_string(), phase.as_str().to_string());
+        if body.is_empty() {
+            return if operation.request_required {
+                self.handle_violation(
+                    ctx,
+                    ValidationSide::Request,
+                    Some(&operation.operation_label),
+                    "Required request body is missing".to_string(),
+                )
+            } else {
+                PluginResult::Continue
+            };
+        }
+        if !operation.has_request_schema() {
+            // Presence-only declaration: a nonempty body satisfies it and the
+            // document declares no media entry to select.
+            return PluginResult::Continue;
+        }
+        let content_type = header_value(headers, "content-type");
+        if validator_for_content_type(&operation.request_validators, content_type).is_none() {
+            return self.handle_violation_with_status(
+                ctx,
+                ValidationSide::Request,
+                Some(&operation.operation_label),
+                if content_type.is_some() {
+                    UNDECLARED_MEDIA_DETAIL.to_string()
+                } else {
+                    MISSING_MEDIA_DETAIL.to_string()
+                },
+                Some(self.request_unsupported_media_status),
+            );
+        }
+        let Some(validator) = self.request_validator(operation, content_type) else {
+            // Declared by the document but excluded from the configured
+            // inspection scope: an explicit operator opt-out, not a bypass a
+            // client can choose.
+            self.mark_skip(ctx, "content_type_out_of_scope");
+            return PluginResult::Continue;
+        };
+        let result = validate_media_body(
+            headers,
+            body,
+            content_type,
+            validator,
+            self.max_body_bytes,
+            ValidationSide::Request,
+            Some(&mut ctx.json_scan_memo),
+        );
+        match result {
+            Ok(()) => PluginResult::Continue,
+            Err(error) => self.handle_violation(
+                ctx,
+                ValidationSide::Request,
+                Some(&operation.operation_label),
+                error,
+            ),
+        }
+    }
 }
 
 #[async_trait]
@@ -884,6 +1113,19 @@ impl Plugin for OpenapiValidator {
 
     fn priority(&self) -> u16 {
         super::priority::OPENAPI_VALIDATOR
+    }
+
+    /// The request contract is normally decided in
+    /// `validate_client_request_body_contract`, over the original client
+    /// representation (`GHSA-896v-jx23-9g6p`). This declaration is about the
+    /// phase that remains: `on_final_request_body` is still a backend-contract
+    /// fallback that can reject the exact backend-visible representation when
+    /// this instance did not decide in the client phase, and the response side
+    /// always decides over the final body. Composition admission therefore
+    /// still refuses to pair this plugin with one that egresses the request
+    /// before finalization (GHSA-4vr5-4wm3-x5xv).
+    fn enforces_finalized_request_policy(&self) -> bool {
+        true
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -926,30 +1168,53 @@ impl Plugin for OpenapiValidator {
     }
 
     fn requires_request_body_buffering(&self) -> bool {
-        self.active() && self.validate_request && self.has_any_request_schema
+        self.active()
+            && self.validate_request
+            && (self.has_any_request_schema || self.has_any_required_request_body)
     }
 
+    /// The client contract is decided before `before_proxy`, so the buffer has
+    /// to exist by then (`GHSA-896v-jx23-9g6p`).
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.requires_request_body_buffering()
+    }
+
+    fn validates_client_request_body_contract(&self) -> bool {
+        self.requires_request_body_buffering()
+    }
+
+    /// Every body hook here takes `&[u8]`; nothing reads
+    /// `ctx.metadata["request_body"]`. Pulling the pre-`before_proxy` buffer
+    /// forward must not start retaining a second full UTF-8 copy of every
+    /// validated request body.
+    fn needs_request_body_text(&self) -> bool {
+        false
+    }
+
+    /// Buffering is selected from the matched operation alone.
+    ///
+    /// It deliberately does NOT consult the received `Content-Type` and does not
+    /// exclude methods by name: a client that omits, misspells, or mismatches a
+    /// representation hint would otherwise vote this validator out of the
+    /// request and make every declared constraint inert
+    /// (`GHSA-6p78-6x8c-9g9x`). Whatever the imported document declares for an
+    /// operation is enforced for that operation, and the bytes retained stay
+    /// bounded by Ferrum's global/route request-body ceilings.
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        if !self.requires_request_body_buffering()
-            || matches!(ctx.method.as_str(), "GET" | "HEAD" | "OPTIONS")
-            || self.bypass_reason(ctx).is_some()
-        {
+        if !self.requires_request_body_buffering() || self.bypass_reason(ctx).is_some() {
             return false;
         }
-        let Some(operation) = self.operation_for_context(ctx) else {
-            return false;
-        };
-        if !operation.has_request_schema() {
-            return false;
-        }
-        if operation.request_required {
-            // Presence is independent of representation selection. Buffering is
-            // required to distinguish an actually empty chunked body from a
-            // non-empty body whose Content-Type is absent or out of scope.
-            return true;
-        }
-        let content_type = header_value(&ctx.headers, "content-type");
-        self.request_validator(operation, content_type).is_some()
+        self.operation_for_context(ctx)
+            .is_some_and(Self::operation_has_request_contract)
+    }
+
+    async fn validate_client_request_body_contract(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.enforce_request_contract(ctx, headers, body, RequestContractPhase::Client)
     }
 
     fn needs_final_request_body_context(&self) -> bool {
@@ -962,65 +1227,16 @@ impl Plugin for OpenapiValidator {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.requires_request_body_buffering() {
+        if ctx
+            .openapi_validator_client_contract_enforced
+            .contains(&self.instance_id)
+        {
+            // This instance already decided the contract over the original
+            // client representation. Deciding again here would validate
+            // gateway-synthesized data and double-charge the rejection.
             return PluginResult::Continue;
         }
-        if let Some(reason) = self.bypass_reason_for_headers(ctx, headers) {
-            self.mark_skip(ctx, reason);
-            return PluginResult::Continue;
-        }
-        let Some(operation) = self.operation_for_context(ctx) else {
-            if self.fail_on_unknown_operation {
-                return self.handle_violation(
-                    ctx,
-                    ValidationSide::Request,
-                    None,
-                    format!(
-                        "No OpenAPI operation matched {} {}",
-                        ctx.method.as_str(),
-                        ctx.path.as_str()
-                    ),
-                );
-            }
-            self.mark_skip(ctx, "no_match");
-            return PluginResult::Continue;
-        };
-        self.mark_operation_entry(ctx, operation);
-        if body.is_empty() {
-            return if operation.request_required {
-                self.handle_violation(
-                    ctx,
-                    ValidationSide::Request,
-                    Some(&operation.operation_label),
-                    "Required request body is missing".to_string(),
-                )
-            } else {
-                PluginResult::Continue
-            };
-        }
-        let content_type = header_value(headers, "content-type");
-        let Some(validator) = self.request_validator(operation, content_type) else {
-            self.mark_skip(ctx, "content_type");
-            return PluginResult::Continue;
-        };
-        let result = validate_media_body(
-            headers,
-            body,
-            content_type,
-            validator,
-            self.max_body_bytes,
-            ValidationSide::Request,
-            Some(&mut ctx.json_scan_memo),
-        );
-        match result {
-            Ok(()) => PluginResult::Continue,
-            Err(error) => self.handle_violation(
-                ctx,
-                ValidationSide::Request,
-                Some(&operation.operation_label),
-                error,
-            ),
-        }
+        self.enforce_request_contract(ctx, headers, body, RequestContractPhase::Backend)
     }
 
     fn requires_response_body_buffering(&self) -> bool {

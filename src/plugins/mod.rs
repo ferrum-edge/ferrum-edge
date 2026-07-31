@@ -3,20 +3,32 @@
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
 //! `normalize_buffered_request_body_before_before_proxy` →
+//! `validate_client_request_body_contract` →
 //! `before_proxy` → backend-path policy enforcement →
 //! deferred routing-header hooks → remaining deferred `before_proxy` hooks →
 //! `transform_request_body` →
-//! `on_final_request_body` → `backend_admission` → `after_proxy` →
+//! `on_final_request_body` → `dispatch_finalized_request_egress` →
+//! `backend_admission` → `after_proxy` →
 //! `normalize_response_body` → `on_response_body` →
 //! `transform_response_body` → `on_final_response_body` →
 //! `on_response_committed` (buffered responses only) →
 //! `on_response_stream_terminated` (streamed responses only) → `log` →
 //! `on_ws_frame`.
 //!
-//! `backend_admission` runs last on the request side — after request-body
-//! transforms and `on_final_request_body`, immediately before the backend
-//! dispatch — so a rejected admission still skips the actual upstream call but
-//! not the body hooks that precede it.
+//! `dispatch_finalized_request_egress` is irreversible outbound request egress
+//! (`request_mirror`, `serverless_function`, `ai_federation`) after every
+//! `on_final_request_body` hook accepted the request (`GHSA-4vr5-4wm3-x5xv`).
+//! `backend_admission` runs last on the request side — after that egress phase,
+//! immediately before the backend dispatch — so a rejected admission still skips
+//! the actual upstream call but not the body or egress hooks that precede it.
+//!
+//! `validate_client_request_body_contract` is the CLIENT-contract phase and is
+//! deliberately distinct from `on_final_request_body`, which is the
+//! backend-contract phase. It observes the original client representation after
+//! gateway-owned normalization (bounded `Content-Encoding` decoding) but before
+//! any `before_proxy` or `transform_request_body` hook can add, remove, rename,
+//! coerce, or replace fields, so a declared client contract cannot be satisfied
+//! by gateway-synthesized data (`GHSA-896v-jx23-9g6p`).
 //!
 //! Each plugin declares which protocols it supports via `supported_protocols()`.
 //! The `PluginCache` pre-filters plugins per protocol at config reload time
@@ -2156,6 +2168,17 @@ pub struct RequestContext {
     /// final body hooks. Kept out of public metadata so per-instance state does
     /// not leak into transaction logs.
     pub(crate) openapi_validator_matches: HashMap<usize, (String, String)>,
+    /// OpenAPI validator instances whose CLIENT-contract decision has already
+    /// been made on the original client representation in
+    /// `validate_client_request_body_contract`.
+    ///
+    /// Keyed by process-unique validator instance ID so sibling instances on one
+    /// proxy can never consume each other's decision, and so the backend-side
+    /// `on_final_request_body` hook of an instance that already decided does not
+    /// validate, reject, or log the same request a second time over transformed
+    /// bytes (`GHSA-896v-jx23-9g6p`). Kept out of public metadata: it is
+    /// per-instance lifecycle bookkeeping, not observability.
+    pub(crate) openapi_validator_client_contract_enforced: HashSet<usize>,
     /// Per-`ai_tool_governor`-instance internal correlation markers staged between
     /// `on_response_body` / `transform_response_body` and the
     /// `on_final_response_body` re-check. Kept out of public `metadata` so this
@@ -2713,6 +2736,13 @@ pub struct RequestContext {
     /// default inbound routes (which authorize on the container/backend port,
     /// matching Istio inbound authz) and for all non-ingress traffic.
     pub mesh_inbound_listener_authz_port: Option<u16>,
+    /// Set exactly once by `run_finalized_request_egress_hooks` when the
+    /// finalized-request-egress phase has run for this request. The phase is
+    /// reachable from several dispatch ladders (H1/H2 terminal preparation,
+    /// H1/H2 ordinary preparation, the native-gRPC branch, and the H3 terminal
+    /// preparation); this flag keeps an irreversible external side effect
+    /// exactly-once across all of them.
+    pub finalized_request_egress_dispatched: bool,
 }
 
 /// Return an identity only when it contains a meaningful non-whitespace value.
@@ -2793,6 +2823,7 @@ impl RequestContext {
             ai_semantic_cache_embeddings: HashMap::new(),
             ai_semantic_cache_scope_keys: HashMap::new(),
             openapi_validator_matches: HashMap::new(),
+            openapi_validator_client_contract_enforced: HashSet::new(),
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_response_guard_replay_redactions: HashSet::new(),
             ai_tool_governor_replay_redactions: HashSet::new(),
@@ -2878,6 +2909,7 @@ impl RequestContext {
             orig_dst: None,
             mesh_outbound_destination_authz_port: None,
             mesh_inbound_listener_authz_port: None,
+            finalized_request_egress_dispatched: false,
         }
     }
 
@@ -3709,6 +3741,9 @@ impl RequestContext {
             ai_semantic_cache_embeddings: self.ai_semantic_cache_embeddings.clone(),
             ai_semantic_cache_scope_keys: self.ai_semantic_cache_scope_keys.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
+            openapi_validator_client_contract_enforced: self
+                .openapi_validator_client_contract_enforced
+                .clone(),
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
             ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
@@ -3830,6 +3865,13 @@ impl RequestContext {
             orig_dst: self.orig_dst,
             mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
+            // The finalized-request-egress phase always runs against the REAL
+            // request context (mirror admission leases, mirror result
+            // receivers, and serverless terminate provenance all live there and
+            // are deliberately not copied back from this compatibility clone).
+            // Carrying the flag keeps a hook that reads it on this clone
+            // consistent with the live request.
+            finalized_request_egress_dispatched: self.finalized_request_egress_dispatched,
         }
     }
 
@@ -4628,10 +4670,9 @@ impl RequestContext {
     ///
     /// Read-only and idempotent: `should_buffer_request_body` is evaluated
     /// several times per request and must never advance the sampler or acquire
-    /// capacity itself. It also keeps answering `true` after `before_proxy`
-    /// consumed the lease, because the proxy re-evaluates that predicate after
-    /// `before_proxy` and must not conclude the already-buffered body was never
-    /// required.
+    /// capacity itself. It also keeps answering `true` after finalized request
+    /// egress consumed the lease, preserving the stable per-request admission
+    /// decision for any later observer.
     pub(crate) fn request_mirror_body_admitted(&self, instance_id: u64) -> bool {
         self.request_mirror_admissions.body_admitted(instance_id)
     }
@@ -4639,8 +4680,8 @@ impl RequestContext {
     /// Take one instance's staged admission, transferring ownership of its
     /// permit and retained-byte lease to the caller. Returns `None` when the
     /// `authorize` phase never ran for this instance (direct plugin invocation
-    /// in tests), which keeps `before_proxy` self-sufficient. A repeated take
-    /// yields the consumed marker, never a second lease.
+    /// in tests), which keeps finalized request egress self-sufficient. A
+    /// repeated take yields the consumed marker, never a second lease.
     pub(crate) fn take_request_mirror_admission(
         &mut self,
         instance_id: u64,
@@ -6608,8 +6649,10 @@ pub mod priority {
     ///   rejection in its body transform and enforces it in its final hook. A
     ///   cache hit ordered ahead of that hook would return a retained response
     ///   for a request the gateway had already decided to refuse;
-    /// * **before 4060** — `ai_federation` performs provider I/O from its own
-    ///   final hook, so the lookup must precede it or a hit saves nothing.
+    /// * **before 4060** — `ai_federation` performs provider I/O in the
+    ///   unconditional finalized-request-egress phase after the complete final
+    ///   hook pass. The lookup must remain the earlier final-body decision so a
+    ///   hit short-circuits before that later external side effect.
     pub const AI_SEMANTIC_CACHE: u16 = 4057;
     pub const AI_FEDERATION: u16 = 4060;
     pub const AI_RESPONSE_GUARD: u16 = 4075;
@@ -6901,12 +6944,16 @@ pub trait Plugin: Send + Sync {
         PluginResult::Continue
     }
 
-    /// Returns `true` if this plugin may modify outgoing request headers
-    /// during the `before_proxy` phase. The gateway uses this hint to skip
-    /// cloning the header map when no plugin needs to modify it.
+    /// Returns `true` if this plugin may change backend-visible request
+    /// headers at or after its effective priority. The gateway uses this
+    /// capability both for replay/cache ordering admission and to decide
+    /// whether the `before_proxy` header map needs cloning.
     ///
-    /// Default is `false`. Override in plugins that insert, remove, or
-    /// modify headers in `before_proxy`.
+    /// Plugins that insert, remove, or modify headers during `before_proxy`
+    /// must return `true`. A plugin that publishes a later backend-header
+    /// overlay must also return `true` so earlier replay/cache plugins cannot
+    /// bind a request before its final backend-visible headers exist; the
+    /// resulting conservative clone is an accepted cost.
     fn modifies_request_headers(&self) -> bool {
         false
     }
@@ -6936,8 +6983,79 @@ pub trait Plugin: Send + Sync {
     /// and final-body policy hooks run. Cache validation rejects a same-protocol
     /// transformer in that chain so policy cannot govern different bytes than
     /// the backend receives.
+    ///
+    /// Built-in egress plugins no longer do this: they declare
+    /// [`dispatches_finalized_request_egress`] instead and run in the
+    /// finalized-request-egress phase. The capability is retained because a
+    /// registered custom plugin may still egress from `before_proxy`, and
+    /// composition admission must keep failing that chain closed.
     fn egresses_request_body_before_finalization(&self) -> bool {
         false
+    }
+
+    /// Returns `true` when this plugin's enforcement decision is taken in the
+    /// final request-body phase (`on_final_request_body*`) over the exact
+    /// backend-visible representation. This includes protocol framing and
+    /// integrity validation, WAF/OpenAPI/body/size policy, AI request
+    /// guardrails, and mandatory audit admission.
+    ///
+    /// Composition admission uses this to refuse an HTTP/gRPC request-body
+    /// protocol chain in which a plugin egresses BEFORE finalization
+    /// (`egresses_request_body_before_finalization`) alongside a validator that
+    /// only decides afterwards — the operator would otherwise be promised a
+    /// fail-closed body policy that a mirror, function, or provider had already
+    /// bypassed. TCP/UDP stream protocols are outside this body-lifecycle gate.
+    fn enforces_finalized_request_policy(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin performs irreversible outbound request
+    /// egress — or any other external side effect that cannot be retracted —
+    /// and must therefore observe the exact backend-visible request
+    /// representation (GHSA-4vr5-4wm3-x5xv).
+    ///
+    /// The gateway calls [`dispatch_finalized_request_egress`] for these
+    /// plugins, in configured priority order, only after request-body
+    /// collection, canonical `transform_request_body` rewrites, and every
+    /// `on_final_request_body` policy hook have accepted that representation.
+    /// A plugin declaring this must not perform any part of that egress from
+    /// `before_proxy`: the built-in egress plugins have no `before_proxy` hook
+    /// at all, precisely so the earlier phase cannot be reintroduced by
+    /// accident.
+    fn dispatches_finalized_request_egress(&self) -> bool {
+        false
+    }
+
+    /// Irreversible outbound request egress over the finalized representation.
+    ///
+    /// `headers` and `body` are an immutable snapshot of the finalized request:
+    /// request-body transforms have run, and every applicable final
+    /// request-policy hook (WAF body rules, OpenAPI request schema, body
+    /// validation, the post-transform request-size ceiling) has already accepted
+    /// these bytes. The body is exactly what the backend would receive. The
+    /// header map is the finalized pre-egress baseline; a `pre_proxy` function
+    /// may subsequently add the explicitly supported backend header overlay
+    /// described below. Consuming any pre-transform body source such as
+    /// `ctx.metadata["request_body"]` reintroduces the advisory.
+    ///
+    /// A plugin that must add request headers for the primary backend (the
+    /// `serverless_function` `pre_proxy` contract) writes them into
+    /// `backend_header_overlay` rather than mutating the snapshot. The proxy
+    /// merges that overlay into the outbound header map after the phase and
+    /// re-applies gateway-owned assertion and egress-baggage policy, so an
+    /// externally supplied header can never impersonate a gateway assertion or
+    /// re-add a stripped baggage key.
+    ///
+    /// Returning a rejection terminates the request with that representation;
+    /// this is how `serverless_function` `terminate` mode answers the client.
+    async fn dispatch_finalized_request_egress(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+        _backend_header_overlay: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Continue
     }
 
     /// Returns `true` when this plugin can execute an external side effect and
@@ -7003,6 +7121,46 @@ pub trait Plugin: Send + Sync {
         _ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
         _body: &mut Vec<u8>,
+    ) -> PluginResult {
+        PluginResult::Continue
+    }
+
+    /// Returns `true` when this plugin enforces a CLIENT-facing request-body
+    /// contract that must be decided over the original client representation.
+    ///
+    /// A plugin that opts in also has to declare
+    /// [`Plugin::requires_request_body_before_before_proxy`] so the pre-
+    /// `before_proxy` buffer actually exists. That is not documentation-only:
+    /// `plugin_cache::validate_plugin_security_composition` rejects a plugin
+    /// that declares this capability without it at admission and at every cache
+    /// construction, because the phase runs only over that buffer and the
+    /// declared contract would otherwise be silently inert. The plugin must also
+    /// select buffering in
+    /// [`Plugin::should_buffer_request_body`] from request properties it
+    /// controls — never from an attacker-supplied representation hint such as a
+    /// `Content-Type` it may simply omit (`GHSA-6p78-6x8c-9g9x`).
+    fn validates_client_request_body_contract(&self) -> bool {
+        false
+    }
+
+    /// Decide the client-facing request contract over the ORIGINAL client body.
+    ///
+    /// The proxy invokes this only for plugins that return `true` from
+    /// [`Plugin::validates_client_request_body_contract`], after the pre-
+    /// `before_proxy` buffer and its gateway-owned normalization
+    /// (bounded `Content-Encoding` decoding) and before any `before_proxy` or
+    /// `transform_request_body` hook can reshape the body. `headers` and `body`
+    /// are read-only here: this is an admission decision, not a rewrite point.
+    ///
+    /// This phase is deliberately distinct from `on_final_request_body`, which
+    /// sees the final backend-visible representation. A plugin that decides here
+    /// must not also decide, reject, or log the same request in the final hook
+    /// (`GHSA-896v-jx23-9g6p`).
+    async fn validate_client_request_body_contract(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
     ) -> PluginResult {
         PluginResult::Continue
     }

@@ -86,6 +86,42 @@ fn headers_with_content_type(ct: &str) -> hyper::HeaderMap {
     headers
 }
 
+/// Test-only initial-header policy used to exercise protocol boundary defenses
+/// with names that production policy constructors reject at admission.
+struct SyntheticInitialHeaderPolicy {
+    names: Vec<String>,
+    values: HashMap<String, String>,
+}
+
+impl SyntheticInitialHeaderPolicy {
+    fn new(values: &[(&str, &str)]) -> Self {
+        let values: HashMap<String, String> = values
+            .iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), (*value).to_string()))
+            .collect();
+        let names = values.keys().cloned().collect();
+        Self { names, values }
+    }
+}
+
+impl Plugin for SyntheticInitialHeaderPolicy {
+    fn name(&self) -> &str {
+        "synthetic_initial_header_policy"
+    }
+
+    fn is_initial_response_header_policy(&self) -> bool {
+        true
+    }
+
+    fn apply_initial_response_header_policy(&self, response_headers: &mut HashMap<String, String>) {
+        response_headers.extend(self.values.clone());
+    }
+
+    fn initial_response_header_policy_names(&self) -> &[String] {
+        &self.names
+    }
+}
+
 #[test]
 fn native_grpc_strips_raw_geo_assertion_before_authoritative_merge() {
     let mut raw_headers = hyper::HeaderMap::new();
@@ -527,21 +563,15 @@ fn test_grpc_error_response_resource_exhausted() {
 
 #[test]
 fn grpc_error_policy_preserves_gateway_terminal_and_transport_authority() {
-    let policy: Arc<dyn Plugin> = Arc::new(
-        SecurityHeaders::new(&json!({
-            "set": {
-                "X-Synthetic-Policy": "enforced",
-                "Content-Type": "text/plain",
-                "Content-Length": "999",
-                "Transfer-Encoding": "chunked",
-                "Grpc-Status": "0",
-                "Grpc-Message": "policy override",
-                "Grpc-Status-Details-Bin": "hostile"
-            },
-            "remove": []
-        }))
-        .unwrap(),
-    );
+    let policy: Arc<dyn Plugin> = Arc::new(SyntheticInitialHeaderPolicy::new(&[
+        ("x-synthetic-policy", "enforced"),
+        ("content-type", "text/plain"),
+        ("content-length", "999"),
+        ("transfer-encoding", "chunked"),
+        ("grpc-status", "0"),
+        ("grpc-message", "policy override"),
+        ("grpc-status-details-bin", "hostile"),
+    ]));
 
     let response = grpc_proxy::build_grpc_error_response_with_policy(
         grpc_proxy::grpc_status::UNAVAILABLE,
@@ -606,6 +636,48 @@ fn grpc_web_reject_finalizer_preserves_synthesized_status_without_terminal_overr
         assert!(trailer.contains("grpc-status: 14\r\n"));
         assert!(trailer.contains("grpc-message: backend unavailable\r\n"));
     }
+}
+
+#[test]
+fn grpc_web_reject_finalizer_strips_connection_nominated_extensions() {
+    let mut response = ferrum_edge::plugins::grpc_web::error_response_for_content_type(
+        "application/grpc-web+proto",
+        14,
+        "backend unavailable",
+    );
+    let finalized_headers = HashMap::from([
+        (
+            "Connection".to_string(),
+            "keep-alive, X-Policy-Hop".to_string(),
+        ),
+        ("X-Policy-Hop".to_string(), "must-not-leak".to_string()),
+        ("x-end-to-end".to_string(), "preserved".to_string()),
+    ]);
+
+    ferrum_edge::_test_support::finalize_grpc_web_error_response_headers(
+        &mut response,
+        &[],
+        Some(&finalized_headers),
+    );
+
+    for removed in ["connection", "keep-alive", "x-policy-hop"] {
+        assert!(
+            !response
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(removed)),
+            "{removed} crossed the generated gRPC-Web error boundary"
+        );
+    }
+    assert_eq!(
+        response.headers.get("x-end-to-end").map(String::as_str),
+        Some("preserved")
+    );
+    let expected_content_length = response.body.len().to_string();
+    assert_eq!(
+        response.headers.get("content-length"),
+        Some(&expected_content_length)
+    );
 }
 
 #[test]
@@ -1639,15 +1711,10 @@ fn body_transform_removal_beats_policy_when_backend_sent_a_trailer_copy() {
 
 #[test]
 fn buffered_policy_overlay_preserves_transform_owned_content_length() {
-    let policy: Arc<dyn Plugin> = Arc::new(
-        SecurityHeaders::new(&json!({
-            "set": {
-                "Content-Length": "1",
-                "X-Policy": "gateway-policy"
-            }
-        }))
-        .unwrap(),
-    );
+    let policy: Arc<dyn Plugin> = Arc::new(SyntheticInitialHeaderPolicy::new(&[
+        ("content-length", "1"),
+        ("x-policy", "gateway-policy"),
+    ]));
     let initial_headers = HashMap::new();
     let mut merged_headers = HashMap::new();
     let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(

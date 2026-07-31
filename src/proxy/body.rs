@@ -3825,12 +3825,19 @@ fn h3_read_progress(read_timeout_ms: u64) -> Option<Arc<H3ReadProgress>> {
     (read_timeout_ms > 0).then(|| Arc::new(H3ReadProgress::default()))
 }
 
+/// `completeness_content_length` is the backend's declared length, used ONLY by
+/// [`H3FrameSource`] to tell a complete body followed by a graceful QUIC close
+/// from a truncation. `advertised_content_length` is what the body may expose as
+/// an exact `Body::size_hint()`, which hyper turns back into a wire
+/// `Content-Length` when the header is absent — so an ordinary streamed response
+/// passes `None` there even though the completeness gate still gets the value.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn coalescing_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
     method: Arc<str>,
     status: u16,
-    content_length: Option<u64>,
+    completeness_content_length: Option<u64>,
+    advertised_content_length: Option<u64>,
     coalesce_min_bytes: usize,
     coalesce_max_bytes: usize,
     flush_interval: Duration,
@@ -3842,7 +3849,7 @@ pub(crate) fn coalescing_h3_body(
         recv_stream,
         method,
         status,
-        content_length,
+        completeness_content_length,
         progress.clone(),
     )
     .with_trailer_governor(trailer_governor);
@@ -3856,7 +3863,7 @@ pub(crate) fn coalescing_h3_body(
         source,
         target_bytes,
         buffer_capacity,
-        content_length,
+        advertised_content_length,
         Some(h3_effective_flush_interval(flush_interval, read_timeout_ms)),
     );
     match progress {
@@ -3869,13 +3876,20 @@ pub(crate) fn coalescing_h3_body(
     }
 }
 
+/// `completeness_content_length` is the backend's declared length, used ONLY by
+/// [`H3FrameSource`] to tell a complete body followed by a graceful QUIC close
+/// from a truncation. `advertised_content_length` is what the body may expose as
+/// an exact `Body::size_hint()`, which hyper turns back into a wire
+/// `Content-Length` when the header is absent — so an ordinary streamed response
+/// passes `None` there even though the completeness gate still gets the value.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn size_limited_streaming_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
     max_bytes: usize,
     method: Arc<str>,
     status: u16,
-    content_length: Option<u64>,
+    completeness_content_length: Option<u64>,
+    advertised_content_length: Option<u64>,
     coalesce_min_bytes: usize,
     coalesce_max_bytes: usize,
     flush_interval: Duration,
@@ -3887,7 +3901,7 @@ pub(crate) fn size_limited_streaming_h3_body(
         recv_stream,
         method,
         status,
-        content_length,
+        completeness_content_length,
         progress.clone(),
     )
     .with_trailer_governor(trailer_governor);
@@ -3902,7 +3916,7 @@ pub(crate) fn size_limited_streaming_h3_body(
         limited,
         target_bytes,
         buffer_capacity,
-        content_length,
+        advertised_content_length,
         Some(h3_effective_flush_interval(flush_interval, read_timeout_ms)),
     );
     match progress {
@@ -3915,11 +3929,19 @@ pub(crate) fn size_limited_streaming_h3_body(
     }
 }
 
+/// `completeness_content_length` is the backend's declared length, used ONLY by
+/// [`H3FrameSource`] to tell a complete body followed by a graceful QUIC close
+/// from a truncation. `advertised_content_length` is what the body may expose as
+/// an exact `Body::size_hint()`, which hyper turns back into a wire
+/// `Content-Length` when the header is absent — so an ordinary streamed response
+/// passes `None` there even though the completeness gate still gets the value.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn direct_streaming_h3_body(
     recv_stream: crate::http3::client::H3RequestStream,
     method: Arc<str>,
     status: u16,
-    content_length: Option<u64>,
+    completeness_content_length: Option<u64>,
+    advertised_content_length: Option<u64>,
     read_timeout_ms: u64,
     trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
@@ -3928,13 +3950,13 @@ pub(crate) fn direct_streaming_h3_body(
         recv_stream,
         method,
         status,
-        content_length,
+        completeness_content_length,
         progress.clone(),
     )
     .with_trailer_governor(trailer_governor);
     let body = DirectH3Body {
         source,
-        content_length,
+        content_length: advertised_content_length,
     };
     match progress {
         Some(p) => ProxyBody::streaming(Box::pin(IdleReadTimeoutBody::with_progress(

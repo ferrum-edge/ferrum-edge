@@ -17,7 +17,8 @@
 
 use crate::common::{
     ConsumerBuilder, GatewayConfigBuilder, PluginConfigBuilder, ProxyBuilder, TestGateway,
-    probe_gateway_identity, spawn_http_echo, spawn_http_identifying,
+    probe_gateway_identity, scrub_gateway_capture_for_diagnostics, spawn_http_echo,
+    spawn_http_identifying,
 };
 use serde_json::json;
 use std::time::Duration;
@@ -425,5 +426,67 @@ async fn test_harness_identity_distinguishes_two_real_gateways() {
         resp.status().as_u16(),
         401,
         "a sibling gateway's admin JWT must be rejected"
+    );
+}
+
+/// Captured-output diagnostics must scrub secrets and URL userinfo, and stay
+/// bounded, so failed spawn attempts remain actionable in hosted CI without
+/// leaking credentials.
+#[test]
+fn harness_capture_diagnostics_scrub_secrets_and_bound_output() {
+    let jwt_secret = "harness-jwt-secret-value-0123456789";
+    let observability = "harness-obs-token-value-ABCDEFGH";
+    let short_hmac = "xy";
+
+    let sensitive = format!(
+        "startup failed redis_url=redis://user:s3cret@127.0.0.1:6379/0 \
+         jwt={jwt_secret} token={observability} hmac={short_hmac}"
+    );
+    let scrubbed_sensitive =
+        scrub_gateway_capture_for_diagnostics(&sensitive, &[jwt_secret, observability, short_hmac]);
+
+    assert!(
+        !scrubbed_sensitive.contains(jwt_secret),
+        "JWT secret must not appear in diagnostics: {scrubbed_sensitive}"
+    );
+    assert!(
+        !scrubbed_sensitive.contains(observability),
+        "observability token must not appear in diagnostics: {scrubbed_sensitive}"
+    );
+    assert!(
+        !scrubbed_sensitive.contains(short_hmac),
+        "short caller-provided secret must not appear in diagnostics: {scrubbed_sensitive}"
+    );
+    assert!(
+        !scrubbed_sensitive.contains("user:s3cret@"),
+        "Redis URL userinfo must be redacted: {scrubbed_sensitive}"
+    );
+    assert!(
+        scrubbed_sensitive.contains("redis://***@127.0.0.1:6379/0"),
+        "credential-bearing Redis URL should retain a redacted host form: {scrubbed_sensitive}"
+    );
+
+    let oversized = format!("{}{}", "x".repeat(20_000), sensitive);
+    let scrubbed_oversized =
+        scrub_gateway_capture_for_diagnostics(&oversized, &[jwt_secret, observability, short_hmac]);
+    assert!(
+        scrubbed_oversized.starts_with("…[truncated]…\n"),
+        "oversized capture must be truncated from the front: {}",
+        &scrubbed_oversized[..scrubbed_oversized.len().min(32)]
+    );
+    assert!(
+        scrubbed_oversized.len() <= 16 * 1024 + "…[truncated]…\n".len(),
+        "diagnostic capture must stay bounded, got {} bytes",
+        scrubbed_oversized.len()
+    );
+    assert!(
+        scrubbed_oversized.contains("redis://***@127.0.0.1:6379/0"),
+        "trailing diagnostic content must survive truncation: {scrubbed_oversized}"
+    );
+    assert!(
+        !scrubbed_oversized.contains(jwt_secret)
+            && !scrubbed_oversized.contains(short_hmac)
+            && !scrubbed_oversized.contains("user:s3cret@"),
+        "truncated diagnostics must still scrub secrets: {scrubbed_oversized}"
     );
 }

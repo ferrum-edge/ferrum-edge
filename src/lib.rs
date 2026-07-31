@@ -279,6 +279,16 @@ pub mod _test_support {
         )
     }
 
+    /// The exact effective-chain security-composition validator every plugin
+    /// cache construction and every admin candidate admission runs. Exposed so
+    /// tests can drive it with a synthetic capability plugin that no built-in
+    /// can express.
+    pub fn validate_plugin_security_composition_for_test(
+        plugins: &[Arc<dyn Plugin>],
+    ) -> Result<(), String> {
+        crate::plugin_cache::validate_plugin_security_composition(plugins)
+    }
+
     pub fn validate_correlation_id_composition_for_test(
         plugins: &[Arc<dyn Plugin>],
     ) -> Result<(), String> {
@@ -4243,6 +4253,12 @@ pub mod _test_support {
         );
     }
 
+    pub fn strip_websocket_transport_managed_response_headers(
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::strip_websocket_transport_managed_response_header_map(headers);
+    }
+
     pub async fn run_h3_reject_response_committed_hooks(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -4300,6 +4316,7 @@ pub mod _test_support {
         pub body: bytes::Bytes,
         pub grpc_status: Option<u32>,
         pub grpc_message: Option<String>,
+        pub failed_websocket_handshake: bool,
         pub grpc_trailers: HashMap<String, String>,
     }
 
@@ -4388,6 +4405,7 @@ pub mod _test_support {
                 .get("grpc_status")
                 .and_then(|value| value.parse().ok()),
             grpc_message: ctx.metadata.get("grpc_message").cloned(),
+            failed_websocket_handshake: false,
             grpc_trailers: HashMap::new(),
         }
     }
@@ -4424,6 +4442,7 @@ pub mod _test_support {
                 .get("grpc_status")
                 .and_then(|value| value.parse().ok()),
             grpc_message: ctx.metadata.get("grpc_message").cloned(),
+            failed_websocket_handshake: false,
             grpc_trailers: HashMap::new(),
         }
     }
@@ -4866,6 +4885,7 @@ pub mod _test_support {
                 body: normalized.body,
                 grpc_status: normalized.grpc_status,
                 grpc_message: normalized.grpc_message,
+                failed_websocket_handshake: normalized.failed_websocket_handshake,
                 grpc_trailers: normalized.grpc_trailers,
             },
             grpc_web_error,
@@ -5003,6 +5023,27 @@ pub mod _test_support {
         .await
     }
 
+    /// Drive the client-request-contract phase exactly as both protocol
+    /// handlers do, so external tests can compose it with real transformers
+    /// instead of re-deriving the ordering.
+    pub async fn apply_client_request_contract_validation_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        body: &[u8],
+    ) -> crate::plugins::PluginResult {
+        crate::proxy::apply_client_request_contract_validation(plugins, ctx, body).await
+    }
+
+    /// `true` when the pre-`before_proxy` requirements this request computes
+    /// include a client-contract decision.
+    pub fn client_request_contract_phase_selected_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::proxy::request_body_requirements_before_before_proxy(plugins, ctx)
+            .validates_client_contract
+    }
+
     pub fn extract_grpc_reject_message(body: &[u8]) -> Option<String> {
         crate::proxy::extract_grpc_reject_message(body)
     }
@@ -5029,8 +5070,125 @@ pub mod _test_support {
             body: normalized.body,
             grpc_status: normalized.grpc_status,
             grpc_message: normalized.grpc_message,
+            failed_websocket_handshake: normalized.failed_websocket_handshake,
             grpc_trailers: normalized.grpc_trailers,
         }
+    }
+
+    /// Build the wire response parts for a normalized reject through the
+    /// production H1/H2 builder. Used to prove that ExactBody length repair
+    /// publishes an authoritative `Content-Length` on both ordinary HTTP rejects
+    /// and failed WebSocket handshakes, and that the failed handshake stays a
+    /// valid HTTP/1.1-or-newer non-upgrade response.
+    pub fn build_normalized_reject_wire_parts_for_test(
+        status: StatusCode,
+        body: &[u8],
+        headers: HashMap<String, String>,
+        failed_websocket_handshake: bool,
+    ) -> http::response::Parts {
+        build_normalized_reject_wire_parts_with_method_for_test(
+            "GET",
+            status,
+            body,
+            headers,
+            failed_websocket_handshake,
+        )
+    }
+
+    /// Same builder, with the trusted request method that drives the
+    /// [`crate::proxy::headers::RejectBodyDisposition`] signal. `HEAD` keeps the
+    /// representation length established by the synthetic-response preparation
+    /// contract; every other method makes the final body slice authoritative.
+    pub fn build_normalized_reject_wire_parts_with_method_for_test(
+        method: &str,
+        status: StatusCode,
+        body: &[u8],
+        headers: HashMap<String, String>,
+        failed_websocket_handshake: bool,
+    ) -> http::response::Parts {
+        let reject = crate::proxy::NormalizedRejectResponse {
+            http_status: status,
+            headers,
+            body: bytes::Bytes::copy_from_slice(body),
+            grpc_status: None,
+            grpc_message: None,
+            failed_websocket_handshake,
+            body_disposition: crate::proxy::headers::RejectBodyDisposition::for_request(
+                method,
+                status.as_u16(),
+            ),
+            grpc_trailers: HashMap::new(),
+        };
+        crate::proxy::build_response_from_normalized_reject(reject)
+            .into_parts()
+            .0
+    }
+
+    /// Normalize a reject for a native gRPC request and build the wire parts
+    /// through the production H1/H2 builder, so the trailers-only branch is the
+    /// one under test (not the plain-HTTP branch).
+    pub fn build_grpc_trailers_only_reject_wire_parts_for_test(
+        status: StatusCode,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) -> http::response::Parts {
+        let reject = crate::proxy::normalize_reject_response(
+            status,
+            bytes::Bytes::copy_from_slice(body),
+            headers,
+            true,
+        );
+        crate::proxy::build_response_from_normalized_reject(reject)
+            .into_parts()
+            .0
+    }
+
+    /// Drive the production reject wire path with an already-shared `Bytes`
+    /// payload, returning the wire parts alongside the body pointer the
+    /// normalizer produced. Lets a test pin the two guarantees that meet on a
+    /// cached synthetic reject: the retained allocation is handed onward without
+    /// a per-hit copy, *and* the gateway still derives an authoritative
+    /// `Content-Length` instead of trusting a plugin-authored one.
+    pub fn build_reject_wire_parts_from_shared_bytes_for_test(
+        method: &str,
+        status: StatusCode,
+        body: bytes::Bytes,
+        headers: &HashMap<String, String>,
+    ) -> (http::response::Parts, usize) {
+        let mut normalized = crate::proxy::normalize_reject_response(status, body, headers, false);
+        normalized.body_disposition =
+            crate::proxy::headers::RejectBodyDisposition::for_request(method, status.as_u16());
+        let observed_body_ptr = normalized.body.as_ptr() as usize;
+        (
+            crate::proxy::build_response_from_normalized_reject(normalized)
+                .into_parts()
+                .0,
+            observed_body_ptr,
+        )
+    }
+
+    /// Run the shared synthetic-response wire preparation contract exactly as
+    /// the reject finalizer does, then build the wire parts. Proves the two
+    /// halves agree: preparation establishes the `HEAD` representation length
+    /// and empties the body; the builder preserves only that length.
+    pub fn prepare_and_build_normalized_reject_wire_parts_for_test(
+        method: &str,
+        status: StatusCode,
+        body: &[u8],
+        mut headers: HashMap<String, String>,
+    ) -> http::response::Parts {
+        let mut body = body.to_vec();
+        if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+            method,
+            status.as_u16(),
+            &mut headers,
+            body.len(),
+        ) {
+            body = Vec::new();
+        }
+        build_normalized_reject_wire_parts_with_method_for_test(
+            method, status, &body, headers, false,
+        )
     }
 
     /// Stamp the request-scoped provenance that `serverless_function` sets when
@@ -5141,6 +5299,7 @@ pub mod _test_support {
             body: normalized.body,
             grpc_status: normalized.grpc_status,
             grpc_message: normalized.grpc_message,
+            failed_websocket_handshake: normalized.failed_websocket_handshake,
             grpc_trailers: normalized.grpc_trailers,
         }
     }
@@ -5219,6 +5378,8 @@ pub mod _test_support {
             body: normalized.body.clone(),
             grpc_status: normalized.grpc_status,
             grpc_message: normalized.grpc_message.clone(),
+            failed_websocket_handshake: normalized.failed_websocket_handshake,
+            body_disposition: crate::proxy::headers::RejectBodyDisposition::default(),
             grpc_trailers: normalized.grpc_trailers.clone(),
         };
         crate::proxy::framed_unary_reject_parts(&production).map(|(_, t)| t.clone())

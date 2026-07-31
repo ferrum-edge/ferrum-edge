@@ -174,7 +174,66 @@ dispatch(
 );
 ```
 
-`dispatch` is fire-and-forget: each channel send runs on its own `tokio::spawn` under the supplied semaphore. When permits are exhausted alerts are dropped with a `warn!` rather than queued — alert storms during a partial channel outage should be visible, not buffered. Each caller owns its own `Semaphore` so dispatch budgets do not interact across subsystems.
+`dispatch` is fire-and-forget: each channel send runs on a detached task admitted through the process observability delivery registry under the supplied semaphore. When permits are exhausted alerts are dropped with a `warn!` (and `ferrum_notification_delivery_backpressure_dropped_total`) rather than queued — alert storms during a partial channel outage should be visible, not buffered. Each caller owns its own `Semaphore` so dispatch budgets do not interact across subsystems.
+
+Transient transport/HTTP failures (408/429/5xx, connect/timeout) retry inside the same task with a bounded, jittered backoff while holding the permit. Permanent failures (other 4xx, egress denials) fail immediately. Process shutdown drains in-flight sends under the shared observability budget; sends still outstanding when that deadline expires are hard-aborted and increment `ferrum_notification_delivery_abandoned_at_deadline_total{channel_type=…}`.
+
+Retiring a generation (reload / `Drop`) cancels its sends promptly: the in-flight transport call and the backoff between attempts are both raced against the cancel signal, with cancellation deliberately given priority, so an endpoint that accepts a connection and then stalls cannot pin a retired generation until the 60s HTTP client timeout. Cancellation is a **commit boundary, not an undo** — bytes already written may still reach and be acted on by the endpoint, and Ferrum reports that send as abandoned regardless. What it does guarantee is that a retired generation cannot commit `Succeeded`, `FailedTransient`, or `FailedPermanent`; cannot schedule another retry or invoke a success/failure completion outcome; and settles exactly once as `Abandoned`, with the exactly-once settlement edge invoking the producer callback once with `Abandoned` to roll back reserved/pending producer state.
+
+### Delivery metrics (bounded cardinality)
+
+Authenticated `/metrics` exports these families, labeled only by the fixed `channel_type` set (`slack` / `teams` / `discord` / `webhook` / `email`) — never by operator channel name:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `ferrum_notification_delivery_attempted_total` | counter | Tasks whose registry-owned delivery body started executing (one count per delivery task, not per retry). Advances at body start — before any channel transport call — so an admit-then-cancel race can increment it with no bytes on the wire. |
+| `ferrum_notification_delivery_succeeded_total` | counter | Final success (after retries) |
+| `ferrum_notification_delivery_failed_transient_total` | counter | Exhausted retries on transient failures |
+| `ferrum_notification_delivery_failed_permanent_total` | counter | Permanent failures |
+| `ferrum_notification_delivery_backpressure_dropped_total` | counter | Semaphore exhaustion drops (delivery body never started) |
+| `ferrum_notification_delivery_rejected_total` | counter | Rejected before the delivery body started, by `reason` |
+| `ferrum_notification_delivery_abandoned_total` | counter | Delivery body started but settled with no committed outcome, by `reason` (transport may or may not have been polled) |
+| `ferrum_notification_delivery_abandoned_at_deadline_total` | counter | Hard-aborted at the global shutdown drain deadline |
+| `ferrum_notification_delivery_in_flight` | gauge | Currently executing sends (including backoff) |
+
+Two families carry a second label, `reason`. Its values are compiled-in discriminants — never a channel name, endpoint URL, or peer-supplied string — so total cardinality stays at 5 × 2 and 5 × 3 series respectively:
+
+| Family | `reason` | Meaning |
+|--------|----------|---------|
+| `rejected_total` | `generation_closed` | The producer stopped admitting (reload / plugin `Drop`) before the dispatch task was created. |
+| `rejected_total` | `registry_rejected` | The process delivery registry refused the task (shutting down, or `FERRUM_LOG_DELIVERY_MAX_TASKS` exhausted). |
+| `abandoned_total` | `generation_retired` | Reload / `Drop` cancelled a delivery after its body started (before, during, or between transport calls). |
+| `abandoned_total` | `shutdown_deadline` | Hard-aborted when the global observability drain deadline expired. |
+| `abandoned_total` | `task_dropped` | The dispatch task was dropped without settling for any other reason. |
+
+`abandoned_at_deadline_total` is exactly the `shutdown_deadline` slice of `abandoned_total`, kept as its own family because it is the signal operators page on. Nothing else increments it: an earlier revision charged reload retirement, registry rejection and dropped tasks to it as well, which made the metric operationally false.
+
+The accounting identity, per `channel_type`, is:
+
+```text
+attempted == succeeded + failed_transient + failed_permanent
+           + sum(abandoned_total) + in_flight
+```
+
+`backpressure_dropped_total` and `rejected_total` sit deliberately outside it: the delivery body never started, so counting them as attempts would understate the delivery success ratio. Every one of those paths still invokes the producer's settle callback exactly once, so reserved cooldown / pending incident state is always rolled back.
+
+`attempted` is deliberately a **body-start** counter, not a transport-start counter. Moving the marker to the first channel call would open a window where a hard shutdown abort could drop a running task before `attempted` advanced and misclassify it as `registry_rejected`. The body-start boundary keeps hard-deadline classification, the accounting identity, and pre-body rejection visibility coherent.
+
+### Best-effort delivery can produce zero, one, or multiple copies
+
+Delivery is bounded and non-durable. Backpressure, permanent failure, or an exhausted retry budget can produce **zero** endpoint copies, while uncertain transport/cancellation boundaries can produce duplicates. Ferrum therefore guarantees neither at-most-once nor at-least-once endpoint delivery; settlement is exactly-once only in Ferrum's own accounting. Three boundaries are indistinguishable from inside the process:
+
+1. **Transport timeout** — the peer may have received and acted on the request; only the response was lost. Classified transient and retried.
+2. **Connection error after the request was written** — a reset or early EOF carries no proof the peer did not process the body. Classified transient and retried.
+3. **Cancellation after bytes left the process** — reload retirement and the shutdown-deadline abort drop the in-flight transport future, which cannot unsend anything. The send is reported `Abandoned` and producer state is rolled back, so the same logical alert may be dispatched again later.
+
+Conversely, a 2xx followed by a response-body drain failure is classified **permanent** for the mirror-image reason: the peer already committed, so retrying would only duplicate.
+
+Operator expectations for webhook and email consumers:
+
+- Make the receiver idempotent, or tolerant of duplicates. Retries inside one admitted task reuse the same notification (including `fired_at`), but rollback followed by a later re-admission creates a new timestamp and Ferrum does not emit a cross-admission idempotency key. For incident-level deduplication, derive a receiver-owned stable business key/window from rule + proxy + `event_action`; do not rely on `fired_at` alone across re-admission.
+- Treat `abandoned_total{reason="shutdown_deadline"}` and `{reason="generation_retired"}` as **delivery state unknown**, not as "definitely not delivered".
+- Setting `max_delivery_retries: 0` narrows duplicate windows 1 and 2, at the cost of dropping recoverable transient failures. It cannot close window 3.
 
 ## Reusing the layer from a non-plugin caller
 

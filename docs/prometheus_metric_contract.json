@@ -1812,6 +1812,116 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_notification_delivery_abandoned_at_deadline_total",
+    "type": "counter",
+    "help": "Notification deliveries hard-aborted because the global observability shutdown drain deadline expired; the shutdown_deadline slice of ferrum_notification_delivery_abandoned_total.",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_abandoned_total",
+    "type": "counter",
+    "help": "Notification delivery tasks whose body started executing but settled without a committed outcome, by fixed reason (generation_retired = producer reload/Drop, shutdown_deadline = hard abort at the global drain deadline, task_dropped = dispatch task dropped without settling).",
+    "labels": [
+      "channel_type",
+      "reason"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_attempted_total",
+    "type": "counter",
+    "help": "Notification delivery tasks whose registry-owned delivery body started executing (counted once per admitted task, not once per bounded retry; may advance before any channel transport call).",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_backpressure_dropped_total",
+    "type": "counter",
+    "help": "Notification deliveries dropped because the bounded dispatch semaphore was exhausted.",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_failed_permanent_total",
+    "type": "counter",
+    "help": "Notification deliveries that failed with a permanent (non-retryable) outcome.",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_failed_transient_total",
+    "type": "counter",
+    "help": "Notification deliveries that exhausted retries on transient transport/HTTP failures.",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_in_flight",
+    "type": "gauge",
+    "help": "Notification deliveries currently executing (including bounded retry backoff).",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_rejected_total",
+    "type": "counter",
+    "help": "Notification deliveries rejected before the registry-owned delivery body started, by fixed reason (generation_closed = producer reload/Drop closed admission, registry_rejected = process delivery registry refused the task).",
+    "labels": [
+      "channel_type",
+      "reason"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_notification_delivery_succeeded_total",
+    "type": "counter",
+    "help": "Notification deliveries that completed successfully (after any bounded retries).",
+    "labels": [
+      "channel_type"
+    ],
+    "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_observability_batch_materialization_fallbacks_total",
     "type": "counter",
     "help": "Batches delivered complete but in a degraded representation, such as uncompressed because the compressed copy could not be reserved. No record loss.",

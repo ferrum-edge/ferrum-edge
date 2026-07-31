@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_proxy};
 
@@ -6710,6 +6711,7 @@ fn explicit_null_fixed_fields_are_rejected_instead_of_selecting_defaults() {
         "error_response": {
             "request_status_code": 400,
             "response_status_code": 502,
+            "unsupported_media_type_status_code": 415,
             "content_type": "application/problem+json"
         },
         "error_truncate_chars": 1024,
@@ -6750,6 +6752,7 @@ fn explicit_null_fixed_fields_are_rejected_instead_of_selecting_defaults() {
         "/bypass/header_present",
         "/error_response/request_status_code",
         "/error_response/response_status_code",
+        "/error_response/unsupported_media_type_status_code",
         "/error_response/content_type",
     ] {
         let mut config = base.clone();
@@ -8057,6 +8060,745 @@ async fn malformed_request_bodies_keep_invalid_json_handling() {
         assert!(
             !detail.contains("duplicate object member names"),
             "malformed body must not be reported as ambiguity: {detail}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client request contract (GHSA-6p78-6x8c-9g9x, GHSA-896v-jx23-9g6p)
+//
+// Two invariants are under test here:
+//   1. buffering and enforcement are selected from the matched operation, never
+//      from a `Content-Type` the client can omit or mismatch;
+//   2. the contract is decided over the ORIGINAL client body, in its own
+//      lifecycle phase, before any request-body transformer runs.
+// ---------------------------------------------------------------------------
+
+use ferrum_edge::_test_support::{
+    apply_client_request_contract_validation_for_test,
+    client_request_contract_phase_selected_for_test,
+};
+use ferrum_edge::plugins::request_transformer::RequestTransformer;
+
+/// Required `client_attestation` is exactly the advisory's reproduction: a
+/// property a backend-compatibility transform is configured to inject.
+fn attestation_config(mode: &str) -> Value {
+    json!({
+        "enforcement_mode": mode,
+        "schema_draft": "draft7",
+        "operations": [{
+            "method": "POST",
+            "path_template": "/orders",
+            "path_regex": "^/orders$",
+            "request_required": true,
+            "request_body": {
+                "content": {
+                    "application/json": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["id", "client_attestation"],
+                        "properties": {
+                            "id": {"type": "string"},
+                            "client_attestation": {"type": "string"},
+                            "count": {"type": "integer"}
+                        }
+                    }
+                }
+            }
+        }]
+    })
+}
+
+fn orders_ctx() -> RequestContext {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/orders".into());
+    ctx.headers = json_headers();
+    ctx
+}
+
+fn attestation_transformer() -> RequestTransformer {
+    RequestTransformer::new(&json!({
+        "rules": [{
+            "target": "body",
+            "operation": "add",
+            "key": "client_attestation",
+            "value": "gateway-synthesized"
+        }]
+    }))
+    .expect("transformer config")
+}
+
+fn contract_phase(ctx: &RequestContext) -> Option<&str> {
+    ctx.metadata
+        .get("openapi_validator.request_contract_phase")
+        .map(String::as_str)
+}
+
+fn skip_reason(ctx: &RequestContext) -> Option<&str> {
+    ctx.metadata
+        .get("openapi_validator.skip_reason")
+        .map(String::as_str)
+}
+
+struct UnselectedClientContract {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Plugin for UnselectedClientContract {
+    fn name(&self) -> &str {
+        "unselected_client_contract"
+    }
+
+    fn validates_client_request_body_contract(&self) -> bool {
+        true
+    }
+
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        true
+    }
+
+    fn should_buffer_request_body(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
+    async fn validate_client_request_body_contract(
+        &self,
+        _ctx: &mut RequestContext,
+        _headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        PluginResult::Continue
+    }
+}
+
+#[tokio::test]
+async fn buffering_ignores_the_received_content_type() {
+    let plugin = OpenapiValidator::new(&attestation_config("block")).unwrap();
+
+    // Absent, misspelled, and undeclared content types all still buffer: the
+    // matched operation is the only input to the decision.
+    for headers in [
+        HashMap::new(),
+        content_type_headers("application/cbor"),
+        content_type_headers("appliction/json"),
+        content_type_headers("text/plain"),
+        json_headers(),
+    ] {
+        let mut ctx = orders_ctx();
+        ctx.headers = headers.clone();
+        assert!(
+            plugin.should_buffer_request_body(&ctx),
+            "a matched operation with a request schema must buffer regardless of {headers:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn optional_body_without_a_content_type_is_no_longer_skipped() {
+    // `request_required` is absent here: the pre-fix gate skipped buffering
+    // whenever the received type did not resolve, which made every declared
+    // constraint inert for a client that simply omitted Content-Type.
+    let plugin = OpenapiValidator::new(&json!({
+        "enforcement_mode": "block",
+        "schema_draft": "draft7",
+        "operations": [{
+            "method": "POST",
+            "path_template": "/orders",
+            "path_regex": "^/orders$",
+            "request_body": {
+                "content": {"application/json": {"type": "object", "required": ["id"]}}
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = orders_ctx();
+    ctx.headers.clear();
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert_reject(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &HashMap::new(), br#"{"nope":1}"#)
+            .await,
+        Some(415),
+    );
+}
+
+#[tokio::test]
+async fn unrecognized_nonempty_representation_fails_closed_with_415() {
+    let plugin = OpenapiValidator::new(&attestation_config("block")).unwrap();
+
+    for headers in [HashMap::new(), content_type_headers("application/cbor")] {
+        let mut ctx = orders_ctx();
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .validate_client_request_body_contract(&mut ctx, &headers, b"\x01\x02\x03")
+                .await,
+            Some(415),
+        );
+        let detail = request_error(&ctx).expect("media refusal recorded");
+        assert!(
+            !detail.contains("cbor") && !detail.contains("\u{1}"),
+            "media refusal must not echo the received type or body bytes: {detail}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn another_plugins_buffering_vote_cannot_silently_continue() {
+    // No client-contract phase ran (the marker is unset), so this is exactly the
+    // "some other plugin buffered the body" path. It must still fail closed
+    // rather than record a skip and continue.
+    let plugin = OpenapiValidator::new(&attestation_config("block")).unwrap();
+    let headers = content_type_headers("application/cbor");
+    let mut ctx = orders_ctx();
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, b"\x01\x02")
+            .await,
+        Some(415),
+    );
+    assert_eq!(contract_phase(&ctx), Some("backend_final"));
+}
+
+#[tokio::test]
+async fn required_empty_body_fails_closed_in_the_client_phase() {
+    let plugin = OpenapiValidator::new(&attestation_config("block")).unwrap();
+    let mut ctx = orders_ctx();
+    assert_reject(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), b"")
+            .await,
+        Some(400),
+    );
+    assert_eq!(
+        request_error(&ctx),
+        Some("Required request body is missing")
+    );
+    assert_eq!(contract_phase(&ctx), Some("client"));
+}
+
+#[tokio::test]
+async fn malformed_json_fails_closed_in_the_client_phase() {
+    let plugin = OpenapiValidator::new(&attestation_config("block")).unwrap();
+    let mut ctx = orders_ctx();
+    assert_reject(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), b"{\"id\":")
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn declared_wildcard_media_range_is_matched_and_validated() {
+    let plugin = OpenapiValidator::new(&json!({
+        "enforcement_mode": "block",
+        "schema_draft": "draft7",
+        "operations": [{
+            "method": "POST",
+            "path_template": "/orders",
+            "path_regex": "^/orders$",
+            "request_required": true,
+            "request_body": {
+                "content": {
+                    "application/*": {
+                        "type": "object",
+                        "required": ["id"],
+                        "properties": {"id": {"type": "string"}}
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    // An exact `application/json` body has no exact declaration, so the declared
+    // `application/*` range is what selects the schema.
+    let mut ctx = orders_ctx();
+    assert_continue(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), br#"{"id":"a"}"#)
+            .await,
+    );
+
+    let mut ctx = orders_ctx();
+    assert_reject(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), br#"{"id":7}"#)
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn exact_media_type_outranks_a_declared_wildcard() {
+    let plugin = OpenapiValidator::new(&json!({
+        "enforcement_mode": "block",
+        "schema_draft": "draft7",
+        "operations": [{
+            "method": "POST",
+            "path_template": "/orders",
+            "path_regex": "^/orders$",
+            "request_required": true,
+            "request_body": {
+                "content": {
+                    "application/json": {"type": "object", "required": ["exact"]},
+                    "application/*": {"type": "object", "required": ["wildcard"]}
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = orders_ctx();
+    assert_continue(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), br#"{"exact":1}"#)
+            .await,
+    );
+    let mut ctx = orders_ctx();
+    assert_reject(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), br#"{"wildcard":1}"#)
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn declared_media_excluded_from_scope_records_an_operator_opt_out() {
+    // The document declares the media type but the operator narrowed
+    // `request_content_types`. That is an explicit inspection opt-out, not a
+    // client-selectable bypass, so it records a distinct skip reason.
+    let plugin = OpenapiValidator::new(&json!({
+        "enforcement_mode": "block",
+        "schema_draft": "draft7",
+        "request_content_types": ["application/json"],
+        "operations": [{
+            "method": "POST",
+            "path_template": "/orders",
+            "path_regex": "^/orders$",
+            "request_body": {
+                "content": {"text/plain": {"type": "string", "maxLength": 1}}
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("text/plain");
+    let mut ctx = orders_ctx();
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &headers, b"far too long")
+            .await,
+    );
+    assert_eq!(skip_reason(&ctx), Some("content_type_out_of_scope"));
+}
+
+#[tokio::test]
+async fn body_bearing_get_with_a_declared_schema_is_enforced() {
+    // Method handling follows the imported document: if it declares a request
+    // body for an operation, Ferrum enforces that declaration rather than
+    // exempting the method by name.
+    let plugin = OpenapiValidator::new(&json!({
+        "enforcement_mode": "block",
+        "schema_draft": "draft7",
+        "operations": [{
+            "method": "GET",
+            "path_template": "/search",
+            "path_regex": "^/search$",
+            "request_required": true,
+            "request_body": {
+                "content": {"application/json": {"type": "object", "required": ["q"]}}
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/search".into());
+    ctx.headers = json_headers();
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert_reject(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), br#"{"other":1}"#)
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn unsupported_media_status_is_configurable_and_distinct() {
+    let mut config = attestation_config("block");
+    config["error_response"] = json!({
+        "request_status_code": 422,
+        "unsupported_media_type_status_code": 406
+    });
+    let plugin = OpenapiValidator::new(&config).unwrap();
+
+    let headers = content_type_headers("application/cbor");
+    let mut ctx = orders_ctx();
+    assert_reject(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &headers, b"\x01")
+            .await,
+        Some(406),
+    );
+
+    let mut ctx = orders_ctx();
+    assert_reject(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), b"")
+            .await,
+        Some(422),
+    );
+}
+
+// --- Pre-transform ordering (GHSA-896v-jx23-9g6p) --------------------------
+
+#[tokio::test]
+async fn transform_injected_field_cannot_satisfy_the_client_contract() {
+    let validator = OpenapiValidator::new(&attestation_config("block")).unwrap();
+    let transformer = attestation_transformer();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(validator), Arc::new(transformer)];
+
+    let mut ctx = orders_ctx();
+    assert!(
+        client_request_contract_phase_selected_for_test(&plugins, &ctx),
+        "the client-contract phase must be scheduled for this request"
+    );
+
+    // The client omitted `client_attestation`; the transform would add it.
+    let client_body = br#"{"id":"a"}"#.to_vec();
+    assert_reject(
+        apply_client_request_contract_validation_for_test(&plugins, &mut ctx, &client_body).await,
+        Some(400),
+    );
+    assert_eq!(contract_phase(&ctx), Some("client"));
+
+    // Sanity: the transform really does produce a schema-satisfying body, so the
+    // rejection above is the phase ordering and not a broken fixture.
+    let headers = json_headers();
+    let transformed =
+        ferrum_edge::_test_support::apply_request_body_plugins(&plugins, &headers, client_body)
+            .await;
+    let transformed: Value = serde_json::from_slice(&transformed).expect("transformed json");
+    assert_eq!(
+        transformed
+            .get("client_attestation")
+            .and_then(Value::as_str),
+        Some("gateway-synthesized")
+    );
+}
+
+#[tokio::test]
+async fn client_decision_is_not_re_taken_over_transformed_bytes() {
+    let plugin = OpenapiValidator::new(&attestation_config("block")).unwrap();
+    let mut ctx = orders_ctx();
+    let client_body = br#"{"id":"a","client_attestation":"real"}"#;
+    assert_continue(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), client_body)
+            .await,
+    );
+    assert_eq!(contract_phase(&ctx), Some("client"));
+
+    // A later transformer removed a required property and added a forbidden
+    // one. The client contract was already satisfied and must not be recharged
+    // against the backend representation.
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), br#"{"forbidden":true}"#)
+            .await,
+    );
+    assert_eq!(
+        contract_phase(&ctx),
+        Some("client"),
+        "the final hook must not restamp the phase for an instance that decided"
+    );
+    assert_eq!(
+        ctx.metadata.get("openapi_validator.action"),
+        None,
+        "a satisfied client contract must not record a rejection later"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_client_contract_is_not_charged_twice() {
+    let plugin = OpenapiValidator::new(&attestation_config("block")).unwrap();
+    let mut ctx = orders_ctx();
+    assert_reject(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), br#"{"id":"a"}"#)
+            .await,
+        Some(400),
+    );
+    ctx.metadata.remove("openapi_validator.action");
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), br#"{"id":"a"}"#)
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata.get("openapi_validator.action"),
+        None,
+        "the backend-final fallback must stay inert once this instance decided"
+    );
+}
+
+#[tokio::test]
+async fn sibling_instances_decide_independently() {
+    // Two instances on one proxy. Only the first runs the client phase; the
+    // second must still enforce its own contract in the fallback rather than
+    // consuming the first instance's decision.
+    let first = OpenapiValidator::new(&attestation_config("block")).unwrap();
+    let second = OpenapiValidator::new(&attestation_config("block")).unwrap();
+    let mut ctx = orders_ctx();
+    let good = br#"{"id":"a","client_attestation":"real"}"#;
+    assert_continue(
+        first
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), good)
+            .await,
+    );
+    assert_continue(
+        first
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), br#"{"bad":1}"#)
+            .await,
+    );
+    assert_reject(
+        second
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), br#"{"bad":1}"#)
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn response_only_sibling_keeps_its_backend_final_fallback_after_route_rewrite() {
+    let selected = Arc::new(OpenapiValidator::new(&attestation_config("block")).unwrap());
+    let fallback = Arc::new(
+        OpenapiValidator::new(&json!({
+            "enforcement_mode": "block",
+            "schema_draft": "draft7",
+            "operations": [
+                {
+                    "method": "POST",
+                    "path_template": "/orders",
+                    "path_regex": "^/orders$",
+                    "responses": {
+                        "200": {
+                            "content": {
+                                "application/json": {"type": "object"}
+                            }
+                        }
+                    }
+                },
+                {
+                    "method": "POST",
+                    "path_template": "/rewritten",
+                    "path_regex": "^/rewritten$",
+                    "request_required": true,
+                    "request_body": {
+                        "content": {
+                            "application/json": {
+                                "type": "object",
+                                "required": ["rewritten_contract"]
+                            }
+                        }
+                    }
+                }
+            ]
+        }))
+        .unwrap(),
+    );
+    let plugins: Vec<Arc<dyn Plugin>> = vec![selected, fallback.clone()];
+    let mut ctx = orders_ctx();
+    let headers = json_headers();
+
+    assert_continue(
+        apply_client_request_contract_validation_for_test(
+            &plugins,
+            &mut ctx,
+            br#"{"id":"a","client_attestation":"real"}"#,
+        )
+        .await,
+    );
+
+    // The second instance matched a response-only operation above, so it did
+    // not decide a client request contract. A later before_proxy route rewrite
+    // can still select one of its request-contract operations, and the final
+    // fallback must enforce that new match.
+    ctx.path = "/rewritten".to_string();
+    let mut rewritten_headers = headers.clone();
+    assert_continue(
+        fallback
+            .before_proxy(&mut ctx, &mut rewritten_headers)
+            .await,
+    );
+    assert_reject(
+        fallback
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &rewritten_headers,
+                br#"{"wrong":"shape"}"#,
+            )
+            .await,
+        Some(400),
+    );
+    assert_eq!(contract_phase(&ctx), Some("backend_final"));
+}
+
+#[tokio::test]
+async fn shared_runner_honors_each_instances_buffering_predicate() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(OpenapiValidator::new(&attestation_config("block")).unwrap()),
+        Arc::new(UnselectedClientContract {
+            calls: calls.clone(),
+        }),
+    ];
+    let mut ctx = orders_ctx();
+
+    assert_continue(
+        apply_client_request_contract_validation_for_test(
+            &plugins,
+            &mut ctx,
+            br#"{"id":"a","client_attestation":"real"}"#,
+        )
+        .await,
+    );
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "a sibling-selected phase must not invoke an instance whose own buffering predicate is false"
+    );
+}
+
+#[tokio::test]
+async fn log_only_records_the_client_decision_without_blocking() {
+    let plugin = OpenapiValidator::new(&attestation_config("log_only")).unwrap();
+    let mut ctx = orders_ctx();
+    assert_continue(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), br#"{"id":"a"}"#)
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.action")
+            .map(String::as_str),
+        Some("logged_request_mismatch")
+    );
+    assert_eq!(contract_phase(&ctx), Some("client"));
+
+    // Unsupported media is also log-only, not a 415.
+    let headers = content_type_headers("application/cbor");
+    let mut ctx = orders_ctx();
+    assert_continue(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &headers, b"\x01")
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn disabled_mode_never_enters_the_client_phase() {
+    let plugin = OpenapiValidator::new(&attestation_config("disabled")).unwrap();
+    let mut ctx = orders_ctx();
+    assert!(!plugin.validates_client_request_body_contract());
+    assert!(!plugin.requires_request_body_before_before_proxy());
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    assert_continue(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &json_headers(), br#"{"id":"a"}"#)
+            .await,
+    );
+    assert_eq!(contract_phase(&ctx), None);
+}
+
+#[tokio::test]
+async fn bypass_still_short_circuits_the_client_phase() {
+    let mut config = attestation_config("block");
+    config["bypass"] = json!({"header_present": {"x-bypass-validator": null}});
+    let plugin = OpenapiValidator::new(&config).unwrap();
+    let mut headers = json_headers();
+    headers.insert("x-bypass-validator".to_string(), "1".to_string());
+    let mut ctx = orders_ctx();
+    ctx.headers = headers.clone();
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    assert_continue(
+        plugin
+            .validate_client_request_body_contract(&mut ctx, &headers, br#"{"id":"a"}"#)
+            .await,
+    );
+    assert_eq!(skip_reason(&ctx), Some("bypass_header"));
+}
+
+#[tokio::test]
+async fn client_phase_sees_decoded_bytes_for_an_encoded_body() {
+    // The phase runs after gateway-owned normalization, and the validator still
+    // performs its own bounded `Content-Encoding` decode when no normalizer is
+    // configured. Neither is a general body transform.
+    let plugin = OpenapiValidator::new(&attestation_config("block")).unwrap();
+    let headers = encoding_headers("gzip");
+    let mut ctx = orders_ctx();
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .validate_client_request_body_contract(
+                &mut ctx,
+                &headers,
+                &gzip_bytes(br#"{"id":"a","client_attestation":"real"}"#),
+            )
+            .await,
+    );
+    let mut ctx = orders_ctx();
+    assert_reject(
+        plugin
+            .validate_client_request_body_contract(
+                &mut ctx,
+                &headers,
+                &gzip_bytes(br#"{"id":"a"}"#),
+            )
+            .await,
+        Some(400),
+    );
+}
+
+#[test]
+fn h1_h2_and_h3_run_the_same_client_contract_phase() {
+    // Behavioral coverage above drives the shared helper. Pin that both
+    // production frontends reach it, in the same place, so the client contract
+    // cannot silently apply to one protocol only.
+    let h1_h2 = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/server.rs");
+    for (name, source, before_proxy_anchor) in [
+        ("H1/H2", h1_h2, "// before_proxy hooks — clone headers when"),
+        (
+            "native H3",
+            h3,
+            "// before_proxy hooks — only clone headers if at least one",
+        ),
+    ] {
+        assert!(
+            source.contains("apply_client_request_contract_validation("),
+            "{name} must run the shared client-request-contract phase"
+        );
+        assert!(
+            source.contains("before_proxy_body_requirements.validates_client_contract"),
+            "{name} must gate the phase on the precomputed pre-before_proxy requirement"
+        );
+        // Use the last occurrence so the H1/H2 helper definition cannot make
+        // this ordering assertion pass without a real dispatch-site call.
+        let phase_at = source
+            .rfind("apply_client_request_contract_validation(")
+            .expect("client-contract phase call");
+        let before_proxy_at = source
+            .find(before_proxy_anchor)
+            .expect("before_proxy hook phase");
+        assert!(
+            phase_at < before_proxy_at,
+            "{name} must decide the client contract before the before_proxy hooks run"
         );
     }
 }

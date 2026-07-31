@@ -547,7 +547,7 @@ fn h3_cross_protocol_streaming_grpc_consumes_deadline_and_read_bounds() {
         .find("strip_content_length_for_streaming_grpc_deadline(")
         .expect("deadline-capable relay must strip Content-Length");
     let header_write = handler
-        .find("send_response_headers(")
+        .find("send_response_headers_with_framing(")
         .expect("streaming response header write");
     assert!(
         strip < header_write,
@@ -1571,9 +1571,9 @@ fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
     // Reconciliation runs after the LAST header phase and before the response
     // is built, so sticky-cookie injection and committed hooks are covered too.
     let reconcile = src
-        .split("        // Final hop-by-hop strip after after_proxy / committed hooks")
+        .split("        // Final protocol-aware strip after after_proxy / committed hooks")
         .nth(1)
-        .expect("buffered final header strip")
+        .expect("buffered final response-header sanitizer")
         .split("// Build and send buffered response")
         .next()
         .expect("bounded reconciliation region");
@@ -1597,9 +1597,13 @@ fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
     let reconcile_at = reconcile
         .find("reconcile_backend_trailers_with_response_policy(")
         .expect("buffered H3 reconciliation");
+    let sanitize_at = reconcile
+        .find("sanitize_client_response_headers_for_wire(&mut response_headers, framing);")
+        .expect("buffered H3 response-header sanitization");
     assert!(
-        strip_at < reconcile_at,
-        "buffered H3 must strip hop-by-hop trailer names before reconciling"
+        sanitize_at < strip_at && strip_at < reconcile_at,
+        "buffered H3 must sanitize final response headers, then strip hop-by-hop \
+         trailer names, before reconciling surviving trailers"
     );
     let forward_region = src
         .split("// Forward backend response trailers, if any (issue #1630).")

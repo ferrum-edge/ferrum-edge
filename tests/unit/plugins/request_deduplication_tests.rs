@@ -36,6 +36,36 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 
+/// Test shim for the finalized-request-egress phase (GHSA-4vr5-4wm3-x5xv).
+///
+/// `request_mirror` and `serverless_function` no longer have a `before_proxy`
+/// hook. They dispatch over an immutable backend-visible snapshot, so this
+/// derives the finalized body from the representation the test staged on the
+/// context and folds the backend header overlay back into the mutable map.
+async fn finalized_egress(
+    plugin: &dyn Plugin,
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    let body: Vec<u8> = ctx
+        .request_body_bytes
+        .as_ref()
+        .map(|body| body.to_vec())
+        .or_else(|| {
+            ctx.metadata
+                .get("request_body")
+                .map(|body| body.as_bytes().to_vec())
+        })
+        .unwrap_or_default();
+    let mut overlay = HashMap::new();
+    let snapshot = headers.clone();
+    let result = plugin
+        .dispatch_finalized_request_egress(ctx, &snapshot, &body, &mut overlay)
+        .await;
+    headers.extend(overlay);
+    result
+}
+
 /// Stand-in for the effective static response-presentation policy digest a real
 /// request copies from its plugin-cache view. Any fixed 32-byte value works:
 /// the plugin only ever compares it for equality.
@@ -2831,17 +2861,15 @@ async fn terminal_serverless_remote_502_is_stored_at_response_commit() {
         dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
         PluginResult::Continue
     ));
-    let (status, response_headers, body) = match serverless
-        .before_proxy(&mut first_ctx, &mut first_headers)
-        .await
-    {
-        PluginResult::RejectBinary {
-            status_code,
-            headers,
-            body,
-        } => (status_code, headers, body),
-        other => panic!("expected terminal serverless response, got {other:?}"),
-    };
+    let (status, response_headers, body) =
+        match finalized_egress(&serverless, &mut first_ctx, &mut first_headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("expected terminal serverless response, got {other:?}"),
+        };
     assert_eq!(status, 502);
     assert!(dedup.requires_response_committed_hook());
     dedup
@@ -2945,7 +2973,7 @@ async fn serverless_commit_straddling_a_policy_publication_publishes_a_durable_b
         PluginResult::Continue
     ));
     let (status, response_headers, body) =
-        match serverless.before_proxy(&mut ctx, &mut headers).await {
+        match finalized_egress(&serverless, &mut ctx, &mut headers).await {
             PluginResult::RejectBinary {
                 status_code,
                 headers,
@@ -3030,7 +3058,7 @@ async fn serverless_commit_without_provable_policy_publishes_a_durable_barrier()
         PluginResult::Continue
     ));
     let (status, response_headers, body) =
-        match serverless.before_proxy(&mut ctx, &mut headers).await {
+        match finalized_egress(&serverless, &mut ctx, &mut headers).await {
             PluginResult::RejectBinary {
                 status_code,
                 headers,
@@ -3101,7 +3129,7 @@ async fn serverless_commit_with_provable_policy_stays_replayable() {
         PluginResult::Continue
     ));
     let (status, response_headers, body) =
-        match serverless.before_proxy(&mut ctx, &mut headers).await {
+        match finalized_egress(&serverless, &mut ctx, &mut headers).await {
             PluginResult::RejectBinary {
                 status_code,
                 headers,
@@ -3176,7 +3204,7 @@ async fn terminal_serverless_completion_is_owned_by_every_dedup_instance() {
     }
 
     let (status, response_headers, body) =
-        match serverless.before_proxy(&mut ctx, &mut headers).await {
+        match finalized_egress(&serverless, &mut ctx, &mut headers).await {
             PluginResult::RejectBinary {
                 status_code,
                 headers,
@@ -3260,7 +3288,7 @@ async fn terminal_serverless_ambiguous_query_releases_every_dedup_owner() {
         ));
     }
     let (status, response_headers, body) =
-        match serverless.before_proxy(&mut ctx, &mut headers).await {
+        match finalized_egress(&serverless, &mut ctx, &mut headers).await {
             PluginResult::Reject {
                 status_code,
                 headers,
@@ -3313,7 +3341,7 @@ async fn terminal_serverless_encoded_body_releases_dedup_owner() {
         PluginResult::Continue
     ));
     let (status, response_headers, body) =
-        match serverless.before_proxy(&mut ctx, &mut headers).await {
+        match finalized_egress(&serverless, &mut ctx, &mut headers).await {
             PluginResult::Reject {
                 status_code,
                 headers,
@@ -3371,7 +3399,7 @@ async fn terminal_serverless_origin_encoded_marker_releases_dedup_owner() {
         PluginResult::Continue
     ));
     let (status, response_headers, body) =
-        match serverless.before_proxy(&mut ctx, &mut headers).await {
+        match finalized_egress(&serverless, &mut ctx, &mut headers).await {
             PluginResult::Reject {
                 status_code,
                 headers,
@@ -3417,7 +3445,7 @@ async fn terminal_serverless_ambiguous_query_releases_dedup_owner() {
         PluginResult::Continue
     ));
     let (status, response_headers, body) =
-        match serverless.before_proxy(&mut ctx, &mut headers).await {
+        match finalized_egress(&serverless, &mut ctx, &mut headers).await {
             PluginResult::Reject {
                 status_code,
                 headers,
@@ -3471,7 +3499,7 @@ async fn terminal_serverless_pre_wire_invocation_failure_releases_dedup_owner() 
         PluginResult::Continue
     ));
     let (status, response_headers, body) =
-        match serverless.before_proxy(&mut ctx, &mut headers).await {
+        match finalized_egress(&serverless, &mut ctx, &mut headers).await {
             PluginResult::Reject {
                 status_code,
                 headers,
@@ -3515,7 +3543,7 @@ async fn terminal_serverless_literal_ip_egress_denial_releases_dedup_owner() {
         PluginResult::Continue
     ));
     let (status, response_headers, body) =
-        match serverless.before_proxy(&mut ctx, &mut headers).await {
+        match finalized_egress(&serverless, &mut ctx, &mut headers).await {
             PluginResult::Reject {
                 status_code,
                 headers,
@@ -3569,17 +3597,15 @@ async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
         dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
         PluginResult::Continue
     ));
-    let (status, response_headers, body) = match serverless
-        .before_proxy(&mut first_ctx, &mut first_headers)
-        .await
-    {
-        PluginResult::RejectBinary {
-            status_code,
-            headers,
-            body,
-        } => (status_code, headers, body),
-        other => panic!("expected terminal serverless response, got {other:?}"),
-    };
+    let (status, response_headers, body) =
+        match finalized_egress(&serverless, &mut first_ctx, &mut first_headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("expected terminal serverless response, got {other:?}"),
+        };
 
     // A distinct active request saturates max_entries before the terminal
     // response publishes. The owned completion must remain replayable instead
@@ -3674,17 +3700,15 @@ async fn oversized_terminal_serverless_response_retains_inflight_protection() {
         dedup.before_proxy(&mut first_ctx, &mut first_headers).await,
         PluginResult::Continue
     ));
-    let (status, response_headers, body) = match serverless
-        .before_proxy(&mut first_ctx, &mut first_headers)
-        .await
-    {
-        PluginResult::RejectBinary {
-            status_code,
-            headers,
-            body,
-        } => (status_code, headers, body),
-        other => panic!("expected oversized terminal response, got {other:?}"),
-    };
+    let (status, response_headers, body) =
+        match finalized_egress(&serverless, &mut first_ctx, &mut first_headers).await {
+            PluginResult::RejectBinary {
+                status_code,
+                headers,
+                body,
+            } => (status_code, headers, body),
+            other => panic!("expected oversized terminal response, got {other:?}"),
+        };
     dedup
         .on_response_committed(&mut first_ctx, status, &response_headers, &body)
         .await;
@@ -3735,9 +3759,7 @@ async fn oversized_buffered_fallback_retains_uncertain_serverless_protection() {
         PluginResult::Continue
     ));
     assert!(matches!(
-        serverless
-            .before_proxy(&mut first_ctx, &mut first_headers)
-            .await,
+        finalized_egress(&serverless, &mut first_ctx, &mut first_headers).await,
         PluginResult::Continue
     ));
 
@@ -4362,7 +4384,7 @@ async fn test_streamed_fallback_retains_marker_after_uncertain_serverless_side_e
         PluginResult::Continue
     ));
     assert!(matches!(
-        serverless.before_proxy(&mut ctx, &mut headers).await,
+        finalized_egress(&serverless, &mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
 
@@ -4436,7 +4458,7 @@ async fn interrupted_stream_after_serverless_side_effect_publishes_durable_tombs
         PluginResult::Continue
     ));
     assert!(matches!(
-        serverless.before_proxy(&mut ctx, &mut headers).await,
+        finalized_egress(&serverless, &mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
 

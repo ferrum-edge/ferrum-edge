@@ -369,6 +369,11 @@ plugin_configs:
 }
 
 /// Write a YAML config with a gRPC proxy whose allowed_methods excludes POST.
+///
+/// Protocol-managed framing destinations are intentionally absent from
+/// `security_headers.set`: construction now rejects them, and that rejection is
+/// covered by the plugin unit tests. This fixture focuses on canonicalizing the
+/// remaining application headers into a trailers-only gRPC error.
 fn write_grpc_method_filter_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
@@ -393,8 +398,6 @@ plugin_configs:
       set:
         X-Synthetic-Policy: "enforced"
         Content-Type: "text/plain"
-        Content-Length: "999"
-        Transfer-Encoding: "chunked"
         Grpc-Status: "0"
         Grpc-Message: "policy override"
       remove: []
@@ -1395,9 +1398,17 @@ async fn test_grpc_early_rejects_use_grpc_error_shape() {
         headers2.get("content-type").map(String::as_str),
         Some("application/grpc")
     );
-    assert_ne!(
-        headers2.get("content-length").map(String::as_str),
-        Some("999")
+    // Trailers-only gRPC carries no DATA frames and gRPC never frames with
+    // Content-Length, so the final wire boundary removes the field outright —
+    // it neither preserves a policy-authored value nor invents `0`. Assert the
+    // absence rather than one sentinel value: `security_headers.set` can no
+    // longer author `Content-Length`, so a value-specific check would pass
+    // vacuously while a leaked backend length still slipped through.
+    assert!(
+        !headers2
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "trailers-only gRPC error must not advertise Content-Length; headers={headers2:?}"
     );
     assert!(!headers2.contains_key("transfer-encoding"));
 

@@ -463,6 +463,29 @@ fn compile_transform_field(
     }
     let context = format!("mesh_route_dispatch.rules[{rule_idx}].{field}");
     let parsed = parse_route_header_transforms(raw, &context)?;
+    // Response route overrides share the response_transformer write surface:
+    // reject protocol-managed destinations so a VirtualService header modifier
+    // cannot reintroduce Connection/Transfer-Encoding/Content-Length after the
+    // origin strip. Request transforms keep their existing contract.
+    if field == "response_transform" {
+        for (idx, rule) in parsed.iter().enumerate() {
+            match rule.operation {
+                crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Remove => {}
+                crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Add
+                | crate::plugins::utils::route_header_transform::RouteHeaderTransformOp::Update => {
+                    if crate::proxy::headers::is_protocol_managed_plugin_response_destination(
+                        &rule.key,
+                    ) {
+                        return Err(format!(
+                            "{context}[{idx}].key '{}' is protocol-managed (hop-by-hop or framing) \
+                             and cannot be a response_transform destination",
+                            rule.key
+                        ));
+                    }
+                }
+            }
+        }
+    }
     Ok(Some(Arc::new(parsed)))
 }
 

@@ -122,10 +122,10 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
-    GatewayOwnedResponseHeaders, PrePolicyResponseHeaders, ResponseTrailerGovernance,
-    TrailerSectionKind, apply_response_headers, has_client_response_hop_by_hop_headers,
+    ClientResponseFraming, GatewayOwnedResponseHeaders, PrePolicyResponseHeaders,
+    RejectBodyDisposition, ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
     is_backend_response_strip_header, parse_connection_listed_headers,
-    reconcile_streaming_backend_trailers, strip_client_response_hop_by_hop_headers,
+    reconcile_streaming_backend_trailers, sanitize_client_response_headers_for_wire,
     strip_response_hop_by_hop_trailers,
 };
 use crate::request_epoch::RequestEpoch;
@@ -427,6 +427,7 @@ where
                     &translated.headers,
                     backend_start,
                     bytes_sent,
+                    RejectBodyDisposition::WireBody,
                 )
                 .await?
             } else if matches!(flavor, HttpFlavor::Grpc) {
@@ -439,6 +440,7 @@ where
                     &normalized.headers,
                     backend_start,
                     bytes_sent,
+                    normalized.body_disposition,
                 )
                 .await?
             };
@@ -1401,6 +1403,7 @@ where
         &translated.headers,
         backend_start,
         bytes_sent,
+        RejectBodyDisposition::WireBody,
     );
     let mut outcome =
         match crate::http3::stream_util::await_terminal_response_write_before_deadline(
@@ -2660,6 +2663,7 @@ where
                 &translated.headers,
                 backend_start,
                 bytes_sent,
+                RejectBodyDisposition::WireBody,
             )
             .await?
         } else {
@@ -2670,6 +2674,7 @@ where
                 &normalized.headers,
                 backend_start,
                 bytes_sent,
+                normalized.body_disposition,
             )
             .await?
         };
@@ -2982,9 +2987,29 @@ where
             .await;
         }
 
+        // Buffered bridge response: `response_body` below IS the wire body, so
+        // publish its exact length instead of preserving whatever the backend or
+        // a plugin left on the map. `apply_buffered_plain_plugin_reject` installs
+        // the plugin's own reject header map verbatim, so without an exact
+        // derived length a plugin-authored `Content-Length` would reach the H3
+        // wire disagreeing with the DATA frames actually sent (malformed per
+        // RFC 9114 §4.1.2). `HEAD` selects `Head` framing so the backend
+        // representation length survives instead of being overwritten with `0`
+        // — same rule the native H3 buffered writer applies through the shared
+        // constructor.
+        let buffered_framing = ClientResponseFraming::for_buffered_response(
+            &ctx.method,
+            response_status,
+            response_body.len(),
+        );
         if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
             grpc_web_deadline_at,
-            send_response_headers(stream, response_status, &response_headers),
+            send_response_headers_with_framing(
+                stream,
+                response_status,
+                &response_headers,
+                buffered_framing,
+            ),
         )
         .await
         {
@@ -3164,15 +3189,19 @@ where
         None
     };
     // Strip Content-Length when inspecting — the inspector transforms the body, so
-    // the backend's declared length no longer matches what we send.
+    // the backend's declared length no longer matches what we send. Ordinary
+    // Streaming framing inside `send_response_headers` removes the field anyway;
+    // this case-insensitive omit additionally covers the `HEAD` case, where
+    // `Head` framing would otherwise preserve a representation length the
+    // inspector has invalidated.
     if response_inspector.is_some() {
-        response_headers.remove("content-length");
+        crate::proxy::headers::remove_content_length_header(&mut response_headers);
     }
 
     // Send response headers, then stream the body.
     if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
         grpc_web_deadline_at,
-        send_response_headers(stream, status, &response_headers),
+        send_response_headers(stream, &ctx.method, status, &response_headers),
     )
     .await
     {
@@ -3725,7 +3754,10 @@ where
         )
     });
     if grpc_web_initial_terminal_metadata.is_some() {
-        streaming.headers.remove("content-length");
+        // gRPC-Web translation reframes the body. Streaming framing removes the
+        // wire field; omit case-insensitively here so no later reader of this
+        // map treats the untranslated length as authoritative.
+        crate::proxy::headers::remove_content_length_header(&mut streaming.headers);
     }
 
     // The body relay may replace an empty backend stream with terminal
@@ -3738,7 +3770,17 @@ where
 
     if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
         streaming.grpc_deadline_at,
-        send_response_headers(stream, streaming.status, &streaming.headers),
+        // Native gRPC / gRPC-Web streaming over the H3 bridge: gRPC has no HEAD
+        // and never frames with Content-Length, so pass ordinary Streaming
+        // framing explicitly rather than deriving a HEAD exemption from the
+        // request method (a `HEAD` carrying `content-type: application/grpc`
+        // must not buy a preserved length on a gRPC response).
+        send_response_headers_with_framing(
+            stream,
+            streaming.status,
+            &streaming.headers,
+            ClientResponseFraming::Streaming,
+        ),
     )
     .await
     {
@@ -5309,16 +5351,37 @@ where
 
             let grpc_deadline_at = ctx.grpc_deadline_at();
             let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+            // Buffered bridge response: `response_body` below IS the wire body,
+            // so framing is derived from it rather than from which plugin phase
+            // produced the response. `apply_buffered_grpc_plugin_reject` replaces
+            // `response_headers` with `normalize_h3_grpc_reject` output, which
+            // copies every plugin-supplied field except content-type /
+            // grpc-status / grpc-message — without a body-derived decision a
+            // plugin-authored `Content-Length` would survive onto a
+            // trailers-only response that sends no DATA frames, which RFC 9114
+            // §4.1.2 makes malformed. Mirrors the main buffered gRPC path.
+            let grpc_framing =
+                ClientResponseFraming::for_buffered_grpc(response_status, response_body.len());
             let header_write = if terminal_gateway_deadline {
                 crate::http3::stream_util::await_terminal_response_write_before_deadline(
                     grpc_deadline_at,
-                    send_response_headers(stream, response_status, &response_headers),
+                    send_response_headers_with_framing(
+                        stream,
+                        response_status,
+                        &response_headers,
+                        grpc_framing,
+                    ),
                 )
                 .await
             } else {
                 crate::http3::stream_util::await_response_write_before_deadline(
                     grpc_deadline_at,
-                    send_response_headers(stream, response_status, &response_headers),
+                    send_response_headers_with_framing(
+                        stream,
+                        response_status,
+                        &response_headers,
+                        grpc_framing,
+                    ),
                 )
                 .await
             };
@@ -6902,8 +6965,17 @@ where
     super::server::drain_h3_request_body(stream, max_bytes).await
 }
 
+/// Streaming-framed response headers: the final body length is not known here,
+/// so `Content-Length` is removed unless the trusted request method makes the
+/// wire body empty by protocol (`HEAD`, where a valid representation length is
+/// preserved and an invalid one dropped). Buffered writers whose wire body is
+/// already in hand must use [`send_response_headers_with_framing`] instead.
+///
+/// `method` is the request method the bridge dispatched, never a response
+/// header: the HEAD exemption must not be purchasable by a backend or plugin.
 async fn send_response_headers<S>(
     stream: &mut RequestStream<S, Bytes>,
+    method: &str,
     status: u16,
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error>
@@ -6912,17 +6984,38 @@ where
     // accepts both the full bidi stream and a `split()` send half.
     S: SendStream<Bytes>,
 {
-    // Final hop-by-hop strip after after_proxy: connection-specific fields are
-    // malformed on HTTP/3 (RFC 9114 §4.2). Clone only when stripping is needed
-    // so the common clean map stays allocation-free on this path.
+    send_response_headers_with_framing(
+        stream,
+        status,
+        headers,
+        ClientResponseFraming::for_streaming_response(method, status),
+    )
+    .await
+}
+
+async fn send_response_headers_with_framing<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    status: u16,
+    headers: &HashMap<String, String>,
+    framing: ClientResponseFraming,
+) -> Result<(), anyhow::Error>
+where
+    // Send-only: emits `send_response` and nothing on the recv half, so it
+    // accepts both the full bidi stream and a `split()` send half.
+    S: SendStream<Bytes>,
+{
+    // Final protocol-aware strip after after_proxy: connection-specific fields
+    // are malformed on HTTP/3 (RFC 9114 §4.2). Clone only when sanitization is
+    // needed so the common clean map stays allocation-free on this path.
     let mut owned_headers;
-    let headers = if has_client_response_hop_by_hop_headers(headers) {
-        owned_headers = headers.clone();
-        strip_client_response_hop_by_hop_headers(&mut owned_headers);
-        &owned_headers
-    } else {
-        headers
-    };
+    let headers =
+        if crate::proxy::headers::needs_client_response_wire_sanitization(headers, framing) {
+            owned_headers = headers.clone();
+            sanitize_client_response_headers_for_wire(&mut owned_headers, framing);
+            &owned_headers
+        } else {
+            headers
+        };
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_builder = crate::proxy::headers::apply_response_headers(
         Response::builder().status(status_code),
@@ -7006,8 +7099,12 @@ pub(crate) fn normalize_reject_for_client(
     // Cross-protocol rejects run only after backend dispatch; `serverless_function`
     // terminate short-circuits in `before_proxy`, so framed unary provenance
     // never reaches this normalizer.
-    let normalized =
+    let mut normalized =
         crate::proxy::normalize_reject_response(status, body, headers, native_grpc || grpc_web);
+    // Single trusted chokepoint for the cross-protocol reject writers: derive
+    // the body-omission signal from the request method plus the gateway-selected
+    // status, never from the plugin-authored response header map.
+    normalized.body_disposition = RejectBodyDisposition::for_request(&ctx.method, status.as_u16());
     if native_grpc || grpc_web {
         apply_h3_grpc_reject_metadata(ctx, &normalized);
     }
@@ -7151,6 +7248,7 @@ where
             &translated.headers,
             backend_start,
             bytes_sent,
+            RejectBodyDisposition::WireBody,
         )
         .await;
     }
@@ -7161,6 +7259,7 @@ where
         &normalized.headers,
         backend_start,
         bytes_sent,
+        normalized.body_disposition,
     )
     .await
 }
@@ -7169,6 +7268,7 @@ where
 /// headers). Used when `after_proxy` or `on_final_request_body` returns
 /// `PluginResult::Reject` — the plugin's body/headers win over the
 /// backend's response.
+#[allow(clippy::too_many_arguments)]
 async fn write_reject_with_headers<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
@@ -7176,6 +7276,7 @@ async fn write_reject_with_headers<S>(
     headers: &HashMap<String, String>,
     backend_start: Instant,
     bytes_sent: u64,
+    disposition: RejectBodyDisposition,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -7188,10 +7289,12 @@ where
         backend_start,
         bytes_sent,
         true,
+        disposition,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_reject_with_headers_and_recv_halt<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
@@ -7200,12 +7303,19 @@ async fn write_reject_with_headers_and_recv_halt<S>(
     backend_start: Instant,
     bytes_sent: u64,
     halt_recv: bool,
+    disposition: RejectBodyDisposition,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
 {
     let mut headers = headers.clone();
-    strip_client_response_hop_by_hop_headers(&mut headers);
+    // Emptiness is not the discriminator: an ordinary empty HTTP reject has an
+    // authoritative length of exactly zero and must overwrite a plugin-authored
+    // `Content-Length`. Only the trusted `disposition` (HEAD / no-body status,
+    // derived from the request method) preserves the representation length that
+    // `prepare_synthetic_response_wire` established.
+    let framing = ClientResponseFraming::for_final_reject(status.as_u16(), body.len(), disposition);
+    sanitize_client_response_headers_for_wire(&mut headers, framing);
     let mut resp_builder = Response::builder().status(status);
     let mut has_content_type = false;
     for (k, v) in &headers {
@@ -7373,6 +7483,7 @@ where
                 backend_start,
                 bytes_sent,
                 false,
+                RejectBodyDisposition::WireBody,
             );
             return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
                 write,
@@ -7409,6 +7520,7 @@ where
             &translated.headers,
             backend_start,
             bytes_sent,
+            RejectBodyDisposition::WireBody,
         )
         .await
     } else if matches!(flavor, HttpFlavor::Grpc) {
@@ -7454,6 +7566,7 @@ where
             backend_start,
             bytes_sent,
             false,
+            normalized.body_disposition,
         );
         match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
             Ok(outcome) => Ok(outcome),
@@ -7486,6 +7599,7 @@ where
             &normalized.headers,
             backend_start,
             bytes_sent,
+            normalized.body_disposition,
         )
         .await
     }
@@ -7547,7 +7661,10 @@ where
         "cross-protocol gRPC rejects must be trailers-only"
     );
     let mut headers = reject.headers.clone();
-    strip_client_response_hop_by_hop_headers(&mut headers);
+    // Trailers-only framing: strips hop-by-hop / Connection-listed fields AND
+    // removes any `Content-Length` a plugin authored, so this cross-protocol
+    // writer stays on the same fail-closed boundary as the H1/H2 reject builder.
+    sanitize_client_response_headers_for_wire(&mut headers, ClientResponseFraming::TrailersOnly);
     if let Some(key) = headers
         .keys()
         .find(|name| name.eq_ignore_ascii_case("grpc-message"))
@@ -7821,6 +7938,7 @@ where
             backend_start,
             bytes_sent,
             halt_recv,
+            RejectBodyDisposition::WireBody,
         )
         .await;
     }
@@ -7892,7 +8010,7 @@ where
         &grpc_message,
         initial_response_header_policy_plugins,
     );
-    strip_client_response_hop_by_hop_headers(&mut headers);
+    sanitize_client_response_headers_for_wire(&mut headers, ClientResponseFraming::TrailersOnly);
     let resp = apply_response_headers(Response::builder().status(StatusCode::OK), &headers)
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC error response: {}", e))?;

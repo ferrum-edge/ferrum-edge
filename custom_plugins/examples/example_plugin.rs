@@ -5,8 +5,9 @@
 //!
 //! This plugin adds a custom `X-Custom-Gateway` header to every request
 //! before it is proxied to the backend, and echoes it back in the response.
-//! Optional `request_body_prefix`, `correlation_header_name`, and `protocol`
-//! fields demonstrate capability metadata used by core composition validation.
+//! Optional `request_body_prefix`, `correlation_header_name`, `protocol`, and
+//! `egresses_request_body_before_finalization` fields demonstrate capability
+//! metadata used by core composition validation.
 //!
 //! The `create_plugin` function at the bottom is the only required entry
 //! point. This file lives under `custom_plugins/examples/` and is compiled
@@ -30,6 +31,7 @@ pub struct ExamplePlugin {
     correlation_header_name: Option<String>,
     correlation_header_claim: Option<String>,
     supported_protocols: &'static [ProxyProtocol],
+    egresses_request_body_before_finalization: bool,
 }
 
 const DEFAULT_HEADER_VALUE: &str = "ferrum-custom";
@@ -44,10 +46,14 @@ impl ExamplePlugin {
         for key in config.keys() {
             if !matches!(
                 key.as_str(),
-                "header_value" | "request_body_prefix" | "correlation_header_name" | "protocol"
+                "header_value"
+                    | "request_body_prefix"
+                    | "correlation_header_name"
+                    | "protocol"
+                    | "egresses_request_body_before_finalization"
             ) {
                 return Err(format!(
-                    "example_plugin config contains unknown key '{key}'; expected only 'header_value', 'request_body_prefix', 'correlation_header_name', and 'protocol'"
+                    "example_plugin config contains unknown key '{key}'; expected only 'header_value', 'request_body_prefix', 'correlation_header_name', 'protocol', and 'egresses_request_body_before_finalization'"
                 ));
             }
         }
@@ -124,6 +130,17 @@ impl ExamplePlugin {
                 return Err("example_plugin.protocol must be a string when present".to_string());
             }
         };
+        let egresses_request_body_before_finalization =
+            match config.get("egresses_request_body_before_finalization") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => {
+                    return Err(
+                        "example_plugin.egresses_request_body_before_finalization must be a boolean when present"
+                            .to_string(),
+                    );
+                }
+            };
         Ok(Self {
             // Read configuration from the plugin's JSON config.
             // In the gateway config, this would look like:
@@ -133,6 +150,7 @@ impl ExamplePlugin {
             correlation_header_name,
             correlation_header_claim,
             supported_protocols,
+            egresses_request_body_before_finalization,
         })
     }
 }
@@ -179,6 +197,14 @@ impl Plugin for ExamplePlugin {
 
     fn modifies_request_body(&self) -> bool {
         self.request_body_prefix.is_some()
+    }
+
+    /// Pedagogical stand-in for a custom plugin that still egresses the buffered
+    /// request body from `before_proxy` before finalization. Core composition
+    /// admission must refuse same HTTP/gRPC-protocol final request-body policy
+    /// plugins.
+    fn egresses_request_body_before_finalization(&self) -> bool {
+        self.egresses_request_body_before_finalization
     }
 
     /// Called after a route matches and its allowed-method check succeeds.

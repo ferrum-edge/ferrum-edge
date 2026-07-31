@@ -65,7 +65,6 @@ struct PriorityOverridePlugin {
 /// must happen only where the data-plane plugin instance will execute.
 struct ServerlessSecurityCompositionPlugin {
     priority: u16,
-    forward_body: bool,
     terminate: bool,
 }
 
@@ -87,13 +86,111 @@ impl Plugin for ServerlessSecurityCompositionPlugin {
         !self.terminate
     }
 
+    /// `serverless_function` no longer egresses from `before_proxy`: body
+    /// forwarding happens in the finalized-request-egress phase
+    /// (GHSA-4vr5-4wm3-x5xv), so the pre-finalization capability is `false`
+    /// even when `forward_body` is set.
     fn egresses_request_body_before_finalization(&self) -> bool {
-        self.forward_body
+        false
+    }
+
+    fn dispatches_finalized_request_egress(&self) -> bool {
+        true
     }
 
     fn requires_prior_request_deduplication(&self) -> bool {
         self.terminate
     }
+}
+
+/// Pure capability view for built-in final request-body policy plugins whose
+/// full construction would compile expensive rule sets, schema packs, or
+/// remote-endpoint clients merely to learn static name/protocol/capability
+/// metadata for candidate admission (GHSA-4vr5-4wm3-x5xv).
+struct FinalizedRequestPolicyCompositionPlugin {
+    name: &'static str,
+    priority: u16,
+    protocols: &'static [ProxyProtocol],
+}
+
+#[async_trait]
+impl Plugin for FinalizedRequestPolicyCompositionPlugin {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+        self.protocols
+    }
+
+    fn enforces_finalized_request_policy(&self) -> bool {
+        true
+    }
+}
+
+/// Static inventory for [`FinalizedRequestPolicyCompositionPlugin`]. Keep this
+/// aligned with every built-in that overrides `enforces_finalized_request_policy()`
+/// to `true` and is *not* already constructed via
+/// [`SECURITY_COMPOSITION_PLUGIN_NAMES`] for other composition-relevant
+/// capabilities. A source-scan external test pins both inventories against
+/// production capability overrides so candidate/runtime admission parity cannot
+/// silently drift.
+struct FinalizedRequestPolicyCompositionSpec {
+    name: &'static str,
+    default_priority: u16,
+    protocols: &'static [ProxyProtocol],
+}
+
+const FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS: &[FinalizedRequestPolicyCompositionSpec] = &[
+    FinalizedRequestPolicyCompositionSpec {
+        name: "ai_semantic_firewall",
+        default_priority: crate::plugins::priority::AI_SEMANTIC_FIREWALL,
+        protocols: crate::plugins::HTTP_ONLY_PROTOCOLS,
+    },
+    FinalizedRequestPolicyCompositionSpec {
+        name: "ai_tool_governor",
+        default_priority: crate::plugins::priority::AI_TOOL_GOVERNOR,
+        protocols: crate::plugins::HTTP_ONLY_PROTOCOLS,
+    },
+    FinalizedRequestPolicyCompositionSpec {
+        name: "body_validator",
+        default_priority: crate::plugins::priority::BODY_VALIDATOR,
+        protocols: crate::plugins::HTTP_GRPC_PROTOCOLS,
+    },
+    FinalizedRequestPolicyCompositionSpec {
+        name: "openapi_validator",
+        default_priority: crate::plugins::priority::OPENAPI_VALIDATOR,
+        protocols: crate::plugins::HTTP_ONLY_PROTOCOLS,
+    },
+    FinalizedRequestPolicyCompositionSpec {
+        name: "request_size_limiting",
+        default_priority: crate::plugins::priority::REQUEST_SIZE_LIMITING,
+        protocols: crate::plugins::HTTP_GRPC_PROTOCOLS,
+    },
+    FinalizedRequestPolicyCompositionSpec {
+        name: "waf",
+        default_priority: crate::plugins::priority::WAF,
+        // Stream-enabled WAF expands to ALL_PROTOCOLS at runtime for separate
+        // stream inspection. The early-body-egress vs finalized-request-body
+        // policy gate is scoped to HTTP/gRPC request-body protocols, so a
+        // TCP/UDP-only early-egress claim cannot collide with that expansion.
+        // HTTP_FAMILY remains the cheap composition surface without compiling
+        // rule packs or parsing stream config; overlapping HTTP/gRPC
+        // collisions still fail closed.
+        protocols: crate::plugins::HTTP_FAMILY_PROTOCOLS,
+    },
+];
+
+fn finalized_request_policy_composition_spec(
+    plugin_name: &str,
+) -> Option<&'static FinalizedRequestPolicyCompositionSpec> {
+    FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS
+        .iter()
+        .find(|spec| spec.name == plugin_name)
 }
 
 /// Per-chain CORS wrapper. It avoids mutating a shared plugin instance when a
@@ -271,7 +368,29 @@ fn install_cors_finalizer(plugins: &mut Vec<Arc<dyn Plugin>>) -> Result<(), Stri
 
 /// Reject security-sensitive plugin compositions whose ordering or body view
 /// cannot preserve the configured enforcement contract.
-fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(), String> {
+pub(crate) fn validate_plugin_security_composition(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
+    // The client-request-contract phase runs only over the pre-`before_proxy`
+    // buffer. A plugin that claims to decide a client-facing body contract but
+    // does not also require that buffer would silently never be invoked, and its
+    // declared contract would be inert on every request
+    // (`GHSA-6p78-6x8c-9g9x` / `GHSA-896v-jx23-9g6p`). Reject the composition at
+    // admission/cache construction instead of composing an unsafe cache; the
+    // hot path stays free of this check.
+    if let Some(plugin) = plugins.iter().find(|plugin| {
+        plugin.validates_client_request_body_contract()
+            && !plugin.requires_request_body_before_before_proxy()
+    }) {
+        return Err(format!(
+            "plugin '{}' declares validates_client_request_body_contract() but not \
+             requires_request_body_before_before_proxy(); the client-request-contract phase \
+             runs only over the pre-before_proxy buffer, so the declared contract would never \
+             be enforced",
+            plugin.name()
+        ));
+    }
+
     for protocol in ALL_PROXY_PROTOCOLS {
         let identity_soap_count = plugins
             .iter()
@@ -315,19 +434,64 @@ fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(
             ));
         }
 
+        // A plugin that egresses the request body from `before_proxy` decides
+        // on a representation that is not yet the backend-visible one, and its
+        // side effect cannot be retracted by a later local rejection
+        // (GHSA-4vr5-4wm3-x5xv). Built-in egress plugins have moved to the
+        // finalized-request-egress phase and no longer report this capability;
+        // a registered custom plugin still can, and such a chain must fail
+        // closed rather than silently promise a redaction or a fail-closed
+        // validator that runs after the disclosure.
         if let Some(egress_plugin) = plugins
             .iter()
             .filter(|plugin| plugin.supported_protocols().contains(&protocol))
             .find(|plugin| plugin.egresses_request_body_before_finalization())
-            && let Some(transformer) = plugins
+        {
+            if let Some(transformer) = plugins
                 .iter()
                 .filter(|plugin| plugin.supported_protocols().contains(&protocol))
                 .find(|plugin| plugin.modifies_request_body())
-        {
+            {
+                return Err(format!(
+                    "request-body egress plugin '{}' cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; the external decision runs before body transformation and Ferrum will not let it govern bytes different from those sent to the backend",
+                    egress_plugin.name(),
+                    transformer.name(),
+                    protocol
+                ));
+            }
+            // Final request-body policy is an HTTP/gRPC request-body lifecycle
+            // contract. Plugins such as stream-enabled WAF may also advertise
+            // TCP/UDP for unrelated stream inspection; do not treat that
+            // advertisement as a body-policy collision with a TCP/UDP-only
+            // early-egress claim. Same-protocol HTTP and gRPC still fail closed.
+            if crate::plugins::HTTP_GRPC_PROTOCOLS.contains(&protocol)
+                && let Some(validator) = plugins
+                    .iter()
+                    .filter(|plugin| plugin.supported_protocols().contains(&protocol))
+                    .find(|plugin| plugin.enforces_finalized_request_policy())
+            {
+                return Err(format!(
+                    "request-body egress plugin '{}' cannot be combined with final request-body policy plugin '{}' for protocol {:?} on the same proxy; '{}' only decides after the external request has already been sent, so its rejection could not retract the disclosure or side effect",
+                    egress_plugin.name(),
+                    validator.name(),
+                    protocol,
+                    validator.name(),
+                ));
+            }
+        }
+
+        // A single plugin cannot both egress before finalization and claim the
+        // finalized-egress phase: the two contracts describe different
+        // representations, and admitting both would leave which one governs
+        // undefined.
+        if let Some(contradictory) = plugins.iter().find(|plugin| {
+            plugin.supported_protocols().contains(&protocol)
+                && plugin.egresses_request_body_before_finalization()
+                && plugin.dispatches_finalized_request_egress()
+        }) {
             return Err(format!(
-                "request-body egress plugin '{}' cannot be combined with request-body transformer '{}' for protocol {:?} on the same proxy; the external decision runs before body transformation and Ferrum will not let it govern bytes different from those sent to the backend",
-                egress_plugin.name(),
-                transformer.name(),
+                "plugin '{}' declares both egresses_request_body_before_finalization() and dispatches_finalized_request_egress() for protocol {:?}; exactly one request-egress phase must govern the representation it transmits",
+                contradictory.name(),
                 protocol
             ));
         }
@@ -600,6 +764,23 @@ impl Plugin for PriorityOverridePlugin {
     fn egresses_request_body_before_finalization(&self) -> bool {
         self.inner.egresses_request_body_before_finalization()
     }
+    fn enforces_finalized_request_policy(&self) -> bool {
+        self.inner.enforces_finalized_request_policy()
+    }
+    fn dispatches_finalized_request_egress(&self) -> bool {
+        self.inner.dispatches_finalized_request_egress()
+    }
+    async fn dispatch_finalized_request_egress(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+        backend_header_overlay: &mut std::collections::HashMap<String, String>,
+    ) -> PluginResult {
+        self.inner
+            .dispatch_finalized_request_egress(ctx, headers, body, backend_header_overlay)
+            .await
+    }
     fn requires_prior_request_deduplication(&self) -> bool {
         self.inner.requires_prior_request_deduplication()
     }
@@ -622,6 +803,19 @@ impl Plugin for PriorityOverridePlugin {
     ) -> PluginResult {
         self.inner
             .normalize_buffered_request_body_before_before_proxy(ctx, headers, body)
+            .await
+    }
+    fn validates_client_request_body_contract(&self) -> bool {
+        self.inner.validates_client_request_body_contract()
+    }
+    async fn validate_client_request_body_contract(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &std::collections::HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.inner
+            .validate_client_request_body_contract(ctx, headers, body)
             .await
     }
     fn requires_request_body_before_authenticate(&self) -> bool {
@@ -2936,6 +3130,15 @@ struct ProxyGroupPluginInstance {
 /// and `correlation_id_header_name()`). Registered custom plugins are also
 /// constructed because their capability is defined by their implementation
 /// rather than a core allowlist.
+///
+/// Built-ins that only need `enforces_finalized_request_policy()` for the
+/// early-egress composition gate are *not* listed here: they live in
+/// [`FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS`] and are admitted through a
+/// pure capability view so candidate writes do not compile expensive rule sets
+/// merely to learn static protocol/capability metadata. Plugins that both
+/// enforce finalized request policy *and* participate in another composition
+/// invariant (body/header mutation, auth sole-gate, etc.) remain here and are
+/// fully constructed.
 const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "a2a_gateway",
     "ai_prompt_compressor",
@@ -2972,6 +3175,7 @@ fn is_security_composition_candidate_plugin(
     custom_plugin_names: &[&str],
 ) -> bool {
     SECURITY_COMPOSITION_PLUGIN_NAMES.contains(&plugin_name)
+        || finalized_request_policy_composition_spec(plugin_name).is_some()
         || custom_plugin_names.contains(&plugin_name)
 }
 
@@ -3008,15 +3212,24 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             crate::plugins::serverless_function::security_composition_capabilities(
                 &plugin_config.config,
             )
-            .map(|(forward_body, terminate)| {
+            .map(|(_forward_body, terminate)| {
                 Some(Arc::new(ServerlessSecurityCompositionPlugin {
                     priority: plugin_config
                         .priority_override
                         .unwrap_or(crate::plugins::priority::SERVERLESS_FUNCTION),
-                    forward_body,
                     terminate,
                 }) as Arc<dyn Plugin>)
             })
+        } else if let Some(spec) =
+            finalized_request_policy_composition_spec(plugin_config.plugin_name.as_str())
+        {
+            Ok(Some(Arc::new(FinalizedRequestPolicyCompositionPlugin {
+                name: spec.name,
+                priority: plugin_config
+                    .priority_override
+                    .unwrap_or(spec.default_priority),
+                protocols: spec.protocols,
+            }) as Arc<dyn Plugin>))
         } else {
             try_create_plugin(
                 plugin_config,
@@ -3125,11 +3338,11 @@ fn remove_shadowed_global_plugin(
 }
 
 /// Cross-plugin composition candidate validation. The security composition
-/// candidate walker constructs every composition-relevant plugin once, except
-/// for the environment-bound serverless plugin whose static capability view is
-/// sufficient, and runs both the security-sensitive ordering/body-view
-/// invariants and the correlation-header invariants. This remains the single
-/// admission entrypoint for both concerns.
+/// candidate walker constructs every composition-relevant plugin once — using a
+/// pure capability view for environment-bound `serverless_function` and for
+/// expensive final request-body policy plugins — and runs both the
+/// security-sensitive ordering/body-view invariants and the correlation-header
+/// invariants. This remains the single admission entrypoint for both concerns.
 pub(crate) fn validate_plugin_composition_candidate(
     config: &GatewayConfig,
     http_client: &PluginHttpClient,
@@ -3155,24 +3368,24 @@ fn same_proxy_group_plugin_config(left: &PluginConfig, right: &PluginConfig) -> 
 /// Bitflags for per-protocol plugin capability checks. Avoids per-request
 /// `plugins.iter().any(|p| p.some_flag())` scans on the hot path.
 #[derive(Clone, Copy, Default)]
-pub struct PluginCapabilities(u16);
+pub struct PluginCapabilities(u32);
 
 impl PluginCapabilities {
-    pub const HAS_AUTH_PLUGINS: u16 = 1 << 0;
-    pub const MODIFIES_REQUEST_HEADERS: u16 = 1 << 1;
-    pub const MODIFIES_REQUEST_BODY: u16 = 1 << 2;
-    pub const HAS_BODY_BEFORE_BEFORE_PROXY: u16 = 1 << 3;
-    pub const NEEDS_REQUEST_BODY_BYTES: u16 = 1 << 4;
-    pub const HAS_BODY_BEFORE_AUTHENTICATE: u16 = 1 << 5;
-    pub const NEEDS_DECODED_QUERY_PARAMS: u16 = 1 << 6;
-    pub const NEEDS_FINAL_REQUEST_BODY_CONTEXT: u16 = 1 << 7;
-    pub const HAS_RESPONSE_COMMITTED_HOOK: u16 = 1 << 8;
-    pub const HAS_RESPONSE_STREAM_HOOKS: u16 = 1 << 9;
-    pub const HAS_BODY_BEFORE_AUTHORIZE: u16 = 1 << 10;
-    pub const HAS_BACKEND_PATH_PLUGINS: u16 = 1 << 11;
-    pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u16 = 1 << 12;
-    pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u16 = 1 << 13;
-    pub const NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY: u16 = 1 << 14;
+    pub const HAS_AUTH_PLUGINS: u32 = 1 << 0;
+    pub const MODIFIES_REQUEST_HEADERS: u32 = 1 << 1;
+    pub const MODIFIES_REQUEST_BODY: u32 = 1 << 2;
+    pub const HAS_BODY_BEFORE_BEFORE_PROXY: u32 = 1 << 3;
+    pub const NEEDS_REQUEST_BODY_BYTES: u32 = 1 << 4;
+    pub const HAS_BODY_BEFORE_AUTHENTICATE: u32 = 1 << 5;
+    pub const NEEDS_DECODED_QUERY_PARAMS: u32 = 1 << 6;
+    pub const NEEDS_FINAL_REQUEST_BODY_CONTEXT: u32 = 1 << 7;
+    pub const HAS_RESPONSE_COMMITTED_HOOK: u32 = 1 << 8;
+    pub const HAS_RESPONSE_STREAM_HOOKS: u32 = 1 << 9;
+    pub const HAS_BODY_BEFORE_AUTHORIZE: u32 = 1 << 10;
+    pub const HAS_BACKEND_PATH_PLUGINS: u32 = 1 << 11;
+    pub const HAS_DEFERRED_ROUTING_HEADER_HOOKS: u32 = 1 << 12;
+    pub const FINAL_BODY_BEFORE_BACKEND_DISPATCH: u32 = 1 << 13;
+    pub const NORMALIZES_BUFFERED_REQUEST_BODY_BEFORE_BEFORE_PROXY: u32 = 1 << 14;
     /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`, so
     /// buffered and streaming paths that forward backend trailers must fail
     /// closed and drop the whole trailer section rather than reconcile field by
@@ -3184,15 +3397,21 @@ impl PluginCapabilities {
     /// request paths must therefore read
     /// `PluginCacheRequestView::unbounded_response_trailer_policy_applies`
     /// rather than testing this bit directly.
-    ///
-    /// Bit 15 is the LAST bit of the `u16` backing store. A sixteenth flag must
-    /// widen `PluginCapabilities` (to `u32`) rather than shift further; `1 << 16`
-    /// would be a const-eval overflow, so the failure is a compile error, not a
-    /// silently dropped capability.
-    pub const UNBOUNDED_RESPONSE_TRAILER_POLICY: u16 = 1 << 15;
+    pub const UNBOUNDED_RESPONSE_TRAILER_POLICY: u32 = 1 << 15;
+    /// At least one plugin declared `dispatches_finalized_request_egress()`, so
+    /// the dispatch ladders must run the finalized-request-egress phase after
+    /// request-body finalization and before backend dispatch
+    /// (GHSA-4vr5-4wm3-x5xv). Chains without an egress plugin skip the phase
+    /// entirely — no extra scan, clone, or hook pass on the ordinary hot path.
+    pub const DISPATCHES_FINALIZED_REQUEST_EGRESS: u32 = 1 << 16;
+
+    // Bit 31 is the LAST bit of the `u32` backing store. A thirty-third flag
+    // must widen `PluginCapabilities` (to `u64`) rather than shift further;
+    // `1 << 32` would be a const-eval overflow, so the failure is a compile
+    // error, not a silently dropped capability.
 
     #[inline(always)]
-    pub fn has(self, flag: u16) -> bool {
+    pub fn has(self, flag: u32) -> bool {
         self.0 & flag != 0
     }
 }
@@ -3296,7 +3515,7 @@ pub struct PluginPhaseData {
 
 /// Build `PluginPhaseData` from a protocol-filtered plugin list.
 fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
-    let mut caps = 0u16;
+    let mut caps = 0u32;
     let mut auth = Vec::new();
     let mut grpc_deadline = Vec::new();
     let mut authorize = Vec::new();
@@ -3435,6 +3654,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.requires_final_request_body_before_backend_dispatch() {
             caps |= PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH;
+        }
+        if p.dispatches_finalized_request_egress() {
+            caps |= PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS;
         }
         if p.requires_response_committed_hook() {
             caps |= PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK;

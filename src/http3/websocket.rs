@@ -426,11 +426,13 @@ async fn send_h3_reject_body<S>(
     write_h3_finalized_reject_body(stream, status, body, headers).await;
 }
 
-/// Finalize a failed RFC 9220 handshake immediately before its HEADERS frame is
-/// built. Response hooks and policy overlays run before this boundary, so none
-/// can leak H1 Upgrade or WebSocket negotiation fields onto a non-upgrade H3
-/// response. Content-Type is seeded before those hooks run, so its absence here
-/// is an authoritative policy removal and must not be defaulted back.
+/// Finalize a failed RFC 9220 handshake before its framing is derived. Response
+/// hooks and policy overlays run before this boundary, so none can leak H1
+/// Upgrade, WebSocket negotiation fields, or a policy-authored `Content-Length`
+/// onto a non-upgrade H3 response. The gateway's own length repair runs *after*
+/// this, so the failed handshake still advertises an authoritative body length.
+/// Content-Type is seeded before those hooks run, so its absence here is an
+/// authoritative policy removal and must not be defaulted back.
 pub(crate) fn finalize_h3_websocket_reject_headers(headers: &mut HashMap<String, String>) {
     crate::proxy::strip_websocket_transport_managed_response_header_map(headers);
 }
@@ -452,7 +454,21 @@ async fn write_h3_finalized_reject_body<S>(
 ) where
     S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
 {
+    // Match the flavor-aware open-circuit reject writer: strip transport-owned
+    // handshake fields (and any policy-authored `Content-Length`) first, then
+    // sanitize so the gateway-derived body length is the only one that can
+    // reach the failed Extended CONNECT response.
     finalize_h3_websocket_reject_headers(&mut headers);
+    // A failed handshake is an ordinary HTTP error, so the body length is
+    // authoritative — including an authoritative zero, which must replace any
+    // plugin-authored `Content-Length`. Extended CONNECT is never `HEAD`, so
+    // there is no representation length to preserve here; a no-body status is
+    // handled inside the sanitizer.
+    let framing = crate::proxy::headers::ClientResponseFraming::ExactBody {
+        status: status.as_u16(),
+        len: body.len() as u64,
+    };
+    crate::proxy::headers::sanitize_client_response_headers_for_wire(&mut headers, framing);
     let builder =
         crate::proxy::headers::apply_response_headers(Response::builder().status(status), &headers);
     let resp = match builder.body(()) {

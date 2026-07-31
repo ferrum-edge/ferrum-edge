@@ -2066,6 +2066,7 @@ pub async fn handle_admin_request(
         let mut metrics_output = registry.render();
         metrics_output.push_str(&crate::logging::render_prometheus());
         metrics_output.push_str(&crate::observability_delivery::render_prometheus());
+        metrics_output.push_str(&crate::notifications::render_delivery_prometheus());
         metrics_output.push_str(&crate::plugins::kafka_logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
         // Append the active `__mesh_bpf_metrics` surface exactly once from the

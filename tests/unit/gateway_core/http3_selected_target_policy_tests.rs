@@ -782,8 +782,8 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
 
     // The terminal provider path shares one finalizer across three writable
     // rejection exits. Expand that shared boundary when comparing call sites,
-    // and exclude the separate final-body plugin rejection which commits before
-    // a non-plugin-aware sender.
+    // and exclude the separate final-body and finalized-egress plugin
+    // rejections, which commit before a non-plugin-aware sender.
     let shared_terminal_reject_sends = source
         .matches("let rejection = finalize_h3_terminal_body_read_rejection(")
         .count();
@@ -799,8 +799,8 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
         .matches("run_h3_reject_response_committed_hooks(")
         .count();
     assert_eq!(
-        non_plugin_terminal_boundaries, 1,
-        "the terminal final-body plugin rejection has its own committed boundary"
+        non_plugin_terminal_boundaries, 2,
+        "the final-body and finalized-egress plugin rejections each need a committed boundary"
     );
     let effective_plugin_committed_boundaries =
         committed_boundaries - shared_terminal_commit_definitions - non_plugin_terminal_boundaries

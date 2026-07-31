@@ -2731,6 +2731,10 @@ impl Plugin for GrpcWebPlugin {
         HTTP_GRPC_PROTOCOLS
     }
 
+    fn enforces_finalized_request_policy(&self) -> bool {
+        true
+    }
+
     fn modifies_request_headers(&self) -> bool {
         true
     }

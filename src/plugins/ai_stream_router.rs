@@ -1645,6 +1645,10 @@ impl Plugin for AiStreamRouter {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    fn enforces_finalized_request_policy(&self) -> bool {
+        true
+    }
+
     fn modifies_request_headers(&self) -> bool {
         // Claimed requests strip client auth and inject provider auth + host.
         self.enabled

@@ -2211,8 +2211,9 @@ async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
     );
     assert_eq!(mirror.config["mirror_port"].as_u64(), Some(9090));
 
-    // The emitted config builds into a real plugin instance, and a 100%
-    // mirror sets up a mirror result channel on the request context.
+    // The emitted config builds into a real plugin instance, and the
+    // finalized-request-egress phase for a 100% mirror sets up a mirror result
+    // channel on the request context.
     let plugin = create_plugin("request_mirror", &mirror.config)
         .expect("plugin builds")
         .expect("plugin is Some");
@@ -2223,9 +2224,13 @@ async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
     );
     // A matched_proxy is required so the mirror can derive its timeout budget.
     ctx.matched_proxy = Some(Arc::new(result.config.proxies[0].clone()));
-    let mut headers = HashMap::new();
-    let res = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let headers = HashMap::new();
+    let mut backend_header_overlay = HashMap::new();
+    let res = plugin
+        .dispatch_finalized_request_egress(&mut ctx, &headers, &[], &mut backend_header_overlay)
+        .await;
     assert!(matches!(res, PluginResult::Continue));
+    assert!(backend_header_overlay.is_empty());
     assert!(
         ctx.mirror_result_rxs.len() == 1,
         "a 100% mirror must arm the mirror result channel (request was mirrored)"

@@ -4991,11 +4991,15 @@ impl Plugin for AiFederation {
         true
     }
 
-    fn needs_final_request_body_context(&self) -> bool {
+    /// Keep the body-finalization boundary ahead of backend dispatch. Provider
+    /// I/O itself runs in `dispatch_finalized_request_egress`, after the entire
+    /// final request-body hook pass, so an operator priority override cannot
+    /// move it ahead of WAF/OpenAPI/body/size policy (GHSA-4vr5-4wm3-x5xv).
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
         true
     }
 
-    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
+    fn dispatches_finalized_request_egress(&self) -> bool {
         true
     }
 
@@ -5024,11 +5028,12 @@ impl Plugin for AiFederation {
         hostnames
     }
 
-    async fn on_final_request_body_with_context(
+    async fn dispatch_finalized_request_egress(
         &self,
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
         body: &[u8],
+        _backend_header_overlay: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Coordinate with `ai_stream_router` (priority 2984, runs first). When it
         // claims a streaming request, or explicitly passes one through because
@@ -5072,9 +5077,12 @@ impl Plugin for AiFederation {
             "true".to_string(),
         );
 
-        // Provider dispatch happens from the final-body hook so decompression,
-        // request transforms, and earlier AI policy hooks all inspect and
-        // produce the same representation that leaves the gateway.
+        // Provider dispatch happens only after the complete final-body hook pass
+        // so decompression, request transforms, and every final request policy
+        // inspect and accept the same representation that leaves the gateway.
+        // Keeping this out of `on_final_request_body_with_context` is
+        // load-bearing: `priority_override` may reorder that hook pass, while
+        // the finalized-egress phase is an unconditional later boundary.
         let body_str = match std::str::from_utf8(body) {
             Ok(value) if !value.is_empty() => value,
             _ => {

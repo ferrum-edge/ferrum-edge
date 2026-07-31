@@ -21,6 +21,8 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -37,14 +39,54 @@ async fn free_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+/// Per-path request witnesses for the mock gRPC echo backend.
+#[derive(Default)]
+struct GrpcEchoHits {
+    limited: AtomicUsize,
+    echo: AtomicUsize,
+    other: AtomicUsize,
+}
+
+impl GrpcEchoHits {
+    fn record(&self, path: &str) {
+        if path.ends_with("/Limited") {
+            self.limited.fetch_add(1, Ordering::SeqCst);
+        } else if path.ends_with("/Echo") {
+            self.echo.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.other.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn limited(&self) -> usize {
+        self.limited.load(Ordering::SeqCst)
+    }
+
+    fn echo(&self) -> usize {
+        self.echo.load(Ordering::SeqCst)
+    }
+}
+
 /// Start a mock gRPC backend that echoes headers and body.
 /// Also echoes grpc-timeout back as x-echo-grpc-timeout for deadline verification.
+///
+/// The listener is bound before return, so callers must not sleep for
+/// "backend readiness".
 async fn start_grpc_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
+    let (port, _hits, handle) = start_grpc_echo_backend_with_hits().await;
+    (port, handle)
+}
+
+/// Same as [`start_grpc_echo_backend`], plus non-vacuous per-method hit counters.
+async fn start_grpc_echo_backend_with_hits() -> (u16, Arc<GrpcEchoHits>, tokio::task::JoinHandle<()>)
+{
     let reservation = reserve_port()
         .await
         .expect("Failed to reserve gRPC echo backend port");
     let port = reservation.port;
     let listener = reservation.into_listener();
+    let hits = Arc::new(GrpcEchoHits::default());
+    let hits_accept = Arc::clone(&hits);
 
     let handle = tokio::spawn(async move {
         loop {
@@ -53,43 +95,48 @@ async fn start_grpc_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
                 Err(_) => break,
             };
             let _ = stream.set_nodelay(true);
+            let hits = Arc::clone(&hits_accept);
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 let builder = Http2ServerBuilder::new(TokioExecutor::new());
 
-                let service = service_fn(|req: Request<Incoming>| async move {
-                    let path = req.uri().path().to_string();
-                    let method = req.method().to_string();
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let hits = Arc::clone(&hits);
+                    async move {
+                        let path = req.uri().path().to_string();
+                        hits.record(&path);
+                        let method = req.method().to_string();
 
-                    // Echo grpc-timeout if present (for deadline plugin verification)
-                    let grpc_timeout = req
-                        .headers()
-                        .get("grpc-timeout")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
+                        // Echo grpc-timeout if present (for deadline plugin verification)
+                        let grpc_timeout = req
+                            .headers()
+                            .get("grpc-timeout")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
 
-                    let body_bytes = req
-                        .into_body()
-                        .collect()
-                        .await
-                        .map(|c| c.to_bytes())
-                        .unwrap_or_default();
+                        let body_bytes = req
+                            .into_body()
+                            .collect()
+                            .await
+                            .map(|c| c.to_bytes())
+                            .unwrap_or_default();
 
-                    let mut builder = Response::builder()
-                        .status(200)
-                        .header("content-type", "application/grpc")
-                        .header("grpc-status", "0")
-                        .header("grpc-message", "OK")
-                        .header("x-echo-path", &path)
-                        .header("x-echo-method", &method);
+                        let mut builder = Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "0")
+                            .header("grpc-message", "OK")
+                            .header("x-echo-path", &path)
+                            .header("x-echo-method", &method);
 
-                    if let Some(timeout) = grpc_timeout {
-                        builder = builder.header("x-echo-grpc-timeout", timeout);
+                        if let Some(timeout) = grpc_timeout {
+                            builder = builder.header("x-echo-grpc-timeout", timeout);
+                        }
+
+                        let response = builder.body(Full::new(body_bytes)).unwrap();
+                        Ok::<_, hyper::Error>(response)
                     }
-
-                    let response = builder.body(Full::new(body_bytes)).unwrap();
-                    Ok::<_, hyper::Error>(response)
                 });
 
                 if let Err(e) = builder.serve_connection(io, service).await
@@ -101,7 +148,7 @@ async fn start_grpc_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
         }
     });
 
-    (port, handle)
+    (port, hits, handle)
 }
 
 /// Build the gateway binary. Thin wrapper over the shared
@@ -120,16 +167,31 @@ fn gateway_binary_path() -> &'static str {
     }
 }
 
+fn mint_observability_token() -> String {
+    format!(
+        "ferrum-edge-grpc-plugins-probe-{}",
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
 fn start_gateway(
     config_path: &str,
     http_port: u16,
     admin_port: u16,
+    observability_token: &str,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let child = std::process::Command::new(gateway_binary_path())
         .env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
         .env("FERRUM_PROXY_HTTP_PORT", http_port.to_string())
         .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
+        // Ownership proof for this exact child (issue #3428 / #2132). Presenting
+        // this token unlocks the authenticated `/health` detail tier that no
+        // foreign gateway can answer. Disable pool warmup so backend-hit
+        // witnesses stay aligned with client traffic (HEAD / is also hostile to
+        // this h2c gRPC echo fixture).
+        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -189,32 +251,76 @@ async fn send_grpc_request(
     Ok((status, headers, body_bytes))
 }
 
-async fn wait_for_gateway(
+/// Prove *this* child owns its admin/proxy listeners before returning.
+///
+/// Bare unauthenticated `/health` + TCP accept is not identity (issue #2132):
+/// `free_port()` releases the reservation before the subprocess binds, so a
+/// parallel test can claim the proxy port while this child's admin is briefly
+/// up. File-mode proxy bind failure then exits the child, but a foreign TCP
+/// listener on the proxy port plus any `/health` success still looked "ready".
+///
+/// Barrier (same contract as `TestGateway` / `wait_for_owned_gateway`):
+/// 1. `Child::try_wait` around every probe — a dead child consumes the attempt.
+/// 2. Authenticated `/health` detail tier for this attempt's bearer token with
+///    `ready: true` (flips only after every listener bind, including proxy).
+/// 3. TCP connect to the proxy port after identity is proven.
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
     admin_port: u16,
+    observability_token: &str,
     gateway_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
+    const STARTUP_TIMEOUT_SECS: u64 = 30;
+    const PROBE_SLICE: Duration = Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
+    let addr = format!("127.0.0.1:{}", gateway_port);
 
-    for _ in 0..60 {
-        // Admin health alone is not enough: the proxy listener binds
-        // separately, and a parallel test can steal the freed proxy port
-        // between `free_port()`'s drop and the gateway's bind (the gateway
-        // fails silently with `Stdio::null()`). Require BOTH the admin
-        // health check and a successful TCP connect to the proxy port so a
-        // half-started gateway triggers the retry loop instead of a
-        // ConnectionRefused panic mid-test.
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-            && tokio::net::TcpStream::connect(("127.0.0.1", gateway_port))
-                .await
-                .is_ok()
-        {
-            return Ok(());
+    let mut last_observation = String::from("no response yet");
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "Gateway exited during startup with {status} \
+                 (last observation: {last_observation})"
+            )
+            .into());
         }
-        sleep(Duration::from_millis(250)).await;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "Gateway did not prove ownership of admin port {admin_port} within \
+                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
+            )
+            .into());
+        }
+        match crate::common::probe_gateway_identity(
+            admin_port,
+            observability_token,
+            remaining.min(PROBE_SLICE),
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(err) => last_observation = err.to_string(),
+        }
     }
-    Err("Gateway did not become healthy within 15 seconds".into())
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(format!("Gateway exited after reporting ready with {status}").into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Gateway port {gateway_port} did not accept TCP connections within \
+                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
+            )
+            .into());
+        }
+        match tokio::net::TcpStream::connect(&addr).await {
+            Ok(_) => return Ok(()),
+            Err(err) => last_observation = err.to_string(),
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
@@ -222,26 +328,30 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
         let admin_port = free_port().await;
+        let observability_token = mint_observability_token();
 
-        let mut child = match start_gateway(config_path, gateway_port, admin_port) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "Gateway spawn attempt {}/{} failed: {}",
-                    attempt, MAX_ATTEMPTS, e
-                );
-                if attempt < MAX_ATTEMPTS {
-                    sleep(Duration::from_secs(1)).await;
+        let mut child =
+            match start_gateway(config_path, gateway_port, admin_port, &observability_token) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "Gateway spawn attempt {}/{} failed: {}",
+                        attempt, MAX_ATTEMPTS, e
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
 
-        match wait_for_gateway(admin_port, gateway_port).await {
+        match wait_for_owned_gateway(&mut child, admin_port, &observability_token, gateway_port)
+            .await
+        {
             Ok(()) => return (child, gateway_port, admin_port),
             Err(e) => {
                 eprintln!(
-                    "Gateway health check attempt {}/{} failed: {}",
+                    "Gateway ownership check attempt {}/{} failed: {}",
                     attempt, MAX_ATTEMPTS, e
                 );
                 let _ = child.kill();
@@ -592,7 +702,6 @@ plugin_configs:
 #[tokio::test]
 async fn test_grpc_access_control_distinguishes_authorization_from_missing_identity() {
     let (backend_port, echo_handle) = start_grpc_echo_backend().await;
-    sleep(Duration::from_millis(300)).await;
 
     let private_key_pem = include_bytes!("../fixtures/test_rsa_private.pem");
     let public_key_pem = include_bytes!("../fixtures/test_rsa_public.pem");
@@ -657,7 +766,6 @@ async fn test_grpc_access_control_distinguishes_authorization_from_missing_ident
 #[tokio::test]
 async fn test_grpc_method_router_allow_list() {
     let (backend_port, echo_handle) = start_grpc_echo_backend().await;
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -716,7 +824,6 @@ async fn test_grpc_method_router_allow_list() {
 #[tokio::test]
 async fn test_grpc_method_router_deny_list() {
     let (backend_port, echo_handle) = start_grpc_echo_backend().await;
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -776,7 +883,6 @@ async fn test_grpc_method_router_deny_list() {
 #[tokio::test]
 async fn test_grpc_method_router_enforces_stripped_backend_method() {
     let (backend_port, echo_handle) = start_grpc_echo_backend().await;
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -815,7 +921,6 @@ async fn test_grpc_method_router_enforces_stripped_backend_method() {
 #[tokio::test]
 async fn test_grpc_method_router_enforces_mesh_rewritten_backend_method() {
     let (backend_port, echo_handle) = start_grpc_echo_backend().await;
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -843,8 +948,7 @@ async fn test_grpc_method_router_enforces_mesh_rewritten_backend_method() {
 #[ignore]
 #[tokio::test]
 async fn test_grpc_method_router_rate_limiting() {
-    let (backend_port, echo_handle) = start_grpc_echo_backend().await;
-    sleep(Duration::from_millis(300)).await;
+    let (backend_port, backend_hits, echo_handle) = start_grpc_echo_backend_with_hits().await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -856,7 +960,7 @@ async fn test_grpc_method_router_rate_limiting() {
 
     let gateway_addr = format!("127.0.0.1:{}", gateway_port);
 
-    // Send 3 requests (within limit) — all should succeed
+    // Send 3 requests (within limit) — all should succeed and reach the backend.
     for i in 0..3 {
         let (status, headers, _body) =
             send_grpc_request(&gateway_addr, "/my.EchoService/Limited", b"", &[])
@@ -870,9 +974,15 @@ async fn test_grpc_method_router_rate_limiting() {
             "Request {} within limit should succeed",
             i
         );
+        assert_eq!(
+            backend_hits.limited(),
+            i + 1,
+            "Request {} within limit must reach the owned backend",
+            i
+        );
     }
 
-    // 4th request should be rate-limited
+    // 4th request should be rate-limited before the backend.
     let (status, headers, body) =
         send_grpc_request(&gateway_addr, "/my.EchoService/Limited", b"", &[])
             .await
@@ -894,8 +1004,13 @@ async fn test_grpc_method_router_rate_limiting() {
             .is_some_and(|msg| msg.contains("Rate limit exceeded")),
         "Rate limit rejection should preserve the plugin message"
     );
+    assert_eq!(
+        backend_hits.limited(),
+        3,
+        "Rate-limited fourth call must not reach the backend"
+    );
 
-    // Non-rate-limited method should still work
+    // Non-rate-limited method should still work and reach the backend.
     let (status2, headers2, _body2) =
         send_grpc_request(&gateway_addr, "/my.EchoService/Echo", b"", &[])
             .await
@@ -910,6 +1025,16 @@ async fn test_grpc_method_router_rate_limiting() {
         Some("0"),
         "Non-limited method should succeed"
     );
+    assert_eq!(
+        backend_hits.echo(),
+        1,
+        "Non-limited method must reach the owned backend"
+    );
+    assert_eq!(
+        backend_hits.limited(),
+        3,
+        "Non-limited method must not increment the Limited witness"
+    );
 
     let _ = gateway.kill();
     let _ = gateway.wait();
@@ -922,7 +1047,6 @@ async fn test_grpc_method_router_rate_limiting() {
 #[tokio::test]
 async fn test_grpc_response_size_limiting_returns_grpc_error() {
     let (backend_port, echo_handle) = start_grpc_echo_backend().await;
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -973,7 +1097,6 @@ async fn test_grpc_response_size_limiting_returns_grpc_error() {
 #[tokio::test]
 async fn test_grpc_deadline_default_injection() {
     let (backend_port, echo_handle) = start_grpc_echo_backend().await;
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -1021,7 +1144,6 @@ async fn test_grpc_deadline_default_injection() {
 #[tokio::test]
 async fn test_grpc_deadline_passthrough() {
     let (backend_port, echo_handle) = start_grpc_echo_backend().await;
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -1063,7 +1185,6 @@ async fn test_grpc_deadline_passthrough() {
 #[tokio::test]
 async fn test_grpc_deadline_clamped_to_max() {
     let (backend_port, echo_handle) = start_grpc_echo_backend().await;
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");
@@ -1141,7 +1262,6 @@ async fn test_grpc_deadline_clamped_to_max() {
 #[tokio::test]
 async fn test_grpc_plugins_skip_non_grpc_requests() {
     let (backend_port, echo_handle) = start_grpc_echo_backend().await;
-    sleep(Duration::from_millis(300)).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let config_path = temp_dir.path().join("config.yaml");

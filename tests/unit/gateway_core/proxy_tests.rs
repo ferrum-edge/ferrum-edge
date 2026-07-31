@@ -537,9 +537,7 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
     for plugin_source in [
         include_str!("../../../src/plugins/fault_injection.rs"),
         include_str!("../../../src/plugins/grpc_deadline.rs"),
-        include_str!("../../../src/plugins/request_mirror.rs"),
         include_str!("../../../src/plugins/response_mock.rs"),
-        include_str!("../../../src/plugins/serverless_function.rs"),
         include_str!("../../../src/plugins/load_testing.rs"),
     ] {
         assert!(
@@ -548,10 +546,23 @@ fn test_side_effecting_before_proxy_hooks_run_after_backend_path_policy() {
         );
     }
 
-    let serverless = include_str!("../../../src/plugins/serverless_function.rs");
-    assert!(
-        serverless.contains("fn deferred_before_proxy_may_change_routing_headers(&self) -> bool")
-    );
+    // Irreversible built-in egress has no `before_proxy` hook and dispatches in
+    // the finalized-request-egress phase, which is strictly later than the
+    // backend-path policy gate and the complete final-body policy pass
+    // (GHSA-4vr5-4wm3-x5xv).
+    for plugin_source in [
+        include_str!("../../../src/plugins/request_mirror.rs"),
+        include_str!("../../../src/plugins/serverless_function.rs"),
+        include_str!("../../../src/plugins/ai_federation.rs"),
+    ] {
+        assert!(plugin_source.contains("fn dispatches_finalized_request_egress(&self) -> bool"));
+        assert!(plugin_source.contains("async fn dispatch_finalized_request_egress("));
+        assert!(!plugin_source.contains("    async fn before_proxy("));
+        assert!(
+            !plugin_source
+                .contains("fn defer_before_proxy_until_backend_path_resolved(&self) -> bool")
+        );
+    }
 }
 
 #[test]
@@ -2152,6 +2163,16 @@ fn streaming_grpc_deadline_removes_backend_content_length_before_headers_commit(
     strip_content_length_for_streaming_grpc_deadline_for_test(&mut deadline_headers, true);
     assert!(!deadline_headers.contains_key("content-length"));
 
+    // Mixed-case must also drop: Streaming sanitization would otherwise
+    // canonicalize a surviving variant onto the wire.
+    let mut mixed_case = HashMap::from([("Content-Length".to_string(), "128".to_string())]);
+    strip_content_length_for_streaming_grpc_deadline_for_test(&mut mixed_case, true);
+    assert!(
+        !mixed_case
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length"))
+    );
+
     let mut unbounded_headers = HashMap::from([("content-length".to_string(), "128".to_string())]);
     strip_content_length_for_streaming_grpc_deadline_for_test(&mut unbounded_headers, false);
     assert_eq!(
@@ -3116,6 +3137,397 @@ fn test_normalize_reject_response_converts_grpc_requests_to_trailers_only_errors
             .map(|s| s.as_str()),
         Some("5")
     );
+    assert!(!normalized.failed_websocket_handshake);
+}
+
+/// A failed WebSocket handshake is an ordinary HTTP response (RFC 6455 §4.2.2):
+/// transport-owned negotiation metadata must not survive, but the response keeps
+/// an authoritative gateway-derived `Content-Length`. Using an invalid HTTP
+/// version or an unframed body instead makes RFC 6455 clients fail the reject
+/// before they can observe its status.
+#[test]
+fn test_normalized_reject_builder_keeps_authoritative_length_and_drops_negotiation_fields() {
+    use ferrum_edge::_test_support::build_normalized_reject_wire_parts_for_test;
+
+    let body = br#"{"error":"forbidden"}"#;
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("upgrade".to_string(), "websocket".to_string()),
+        ("connection".to_string(), "Upgrade".to_string()),
+        (
+            "sec-websocket-accept".to_string(),
+            "policy-must-not-escape".to_string(),
+        ),
+        // Hostile / stale plugin-authored length: must be replaced, not trusted.
+        ("content-length".to_string(), "999999".to_string()),
+    ]);
+
+    let expected_content_length = body.len().to_string();
+    for failed_websocket_handshake in [false, true] {
+        let parts = build_normalized_reject_wire_parts_for_test(
+            StatusCode::FORBIDDEN,
+            body,
+            headers.clone(),
+            failed_websocket_handshake,
+        );
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
+        assert!(
+            parts.version >= http::Version::HTTP_11,
+            "reject must stay HTTP/1.1 or newer, got {:?} \
+             (failed_websocket_handshake={failed_websocket_handshake})",
+            parts.version
+        );
+        let wire = parts.headers;
+        assert_eq!(
+            wire.get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_content_length.as_str()),
+            "ExactBody repair must publish the real body length \
+             (failed_websocket_handshake={failed_websocket_handshake})"
+        );
+        assert!(wire.get(http::header::TRANSFER_ENCODING).is_none());
+        assert!(wire.get(http::header::UPGRADE).is_none());
+        assert!(wire.get(http::header::CONNECTION).is_none());
+        assert_eq!(
+            wire.get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "ordinary representation metadata must survive the boundary"
+        );
+    }
+
+    // `Sec-WebSocket-*` is transport-owned only on the typed WebSocket boundary;
+    // the ordinary HTTP reject path has no reason to special-case it.
+    let failed_ws =
+        build_normalized_reject_wire_parts_for_test(StatusCode::FORBIDDEN, body, headers, true)
+            .headers;
+    assert!(
+        failed_ws.get("sec-websocket-accept").is_none(),
+        "failed WebSocket rejects must not leak a policy-authored Sec-WebSocket-Accept"
+    );
+}
+
+/// The typed body-omission signal is derived from the request method + status
+/// only, and the framing selector never lets a claimed omission override real
+/// body bytes.
+#[test]
+fn test_reject_body_disposition_is_method_and_status_derived() {
+    use ferrum_edge::proxy::headers::{ClientResponseFraming, RejectBodyDisposition};
+
+    for method in ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+        assert_eq!(
+            RejectBodyDisposition::for_request(method, 403),
+            RejectBodyDisposition::WireBody,
+            "{method} 403 carries a wire body"
+        );
+    }
+    for method in ["HEAD", "head", "HeAd"] {
+        assert_eq!(
+            RejectBodyDisposition::for_request(method, 200),
+            RejectBodyDisposition::OmittedByProtocol,
+            "{method} omits body bytes"
+        );
+    }
+    for status in [100u16, 199, 204, 205, 304] {
+        assert_eq!(
+            RejectBodyDisposition::for_request("GET", status),
+            RejectBodyDisposition::OmittedByProtocol,
+            "status {status} forbids a body"
+        );
+    }
+
+    // Empty ordinary reject -> authoritative zero.
+    assert!(matches!(
+        ClientResponseFraming::for_final_reject(403, 0, RejectBodyDisposition::WireBody),
+        ClientResponseFraming::ExactBody { len: 0, .. }
+    ));
+    // Empty omitted-by-protocol reject -> preserve the representation length.
+    // `Head` is the ONLY framing that may keep one; ordinary `Streaming` now
+    // removes Content-Length outright, so selecting it here would silently drop
+    // a HEAD reject's representation length instead of preserving it.
+    assert!(matches!(
+        ClientResponseFraming::for_final_reject(200, 0, RejectBodyDisposition::OmittedByProtocol),
+        ClientResponseFraming::Head { .. }
+    ));
+    // Bytes about to be written always win over a claimed omission.
+    assert!(matches!(
+        ClientResponseFraming::for_final_reject(200, 21, RejectBodyDisposition::OmittedByProtocol),
+        ClientResponseFraming::ExactBody { len: 21, .. }
+    ));
+}
+
+/// ExactBody / Streaming wire sanitizer must not remove+reinsert an already
+/// canonical `content-length` on the common path (hot-path allocation invariant),
+/// while still repairing malformed / noncanonical spellings fail-closed.
+#[test]
+fn test_sanitize_client_response_preserves_canonical_content_length_storage() {
+    use ferrum_edge::proxy::headers::{
+        ClientResponseFraming, sanitize_client_response_headers_for_wire,
+    };
+    use std::collections::HashMap;
+
+    // ExactBody: single lowercase matching decimal — no mutation of the value.
+    let mut exact = HashMap::from([
+        ("content-length".to_string(), "42".to_string()),
+        ("x-ok".to_string(), "1".to_string()),
+    ]);
+    let exact_cl_ptr = exact.get("content-length").unwrap().as_ptr();
+    sanitize_client_response_headers_for_wire(
+        &mut exact,
+        ClientResponseFraming::ExactBody {
+            status: 200,
+            len: 42,
+        },
+    );
+    assert_eq!(exact.get("content-length").map(String::as_str), Some("42"));
+    assert_eq!(
+        exact.get("content-length").unwrap().as_ptr(),
+        exact_cl_ptr,
+        "ExactBody must preserve already-canonical Content-Length storage"
+    );
+
+    // ExactBody repair branches: mismatch, leading zeroes, whitespace, mixed-case.
+    for (key, value, expected) in [
+        ("content-length", "999", "4"),
+        ("content-length", "042", "42"),
+        ("content-length", "42 ", "42"),
+        ("Content-Length", "42", "42"),
+    ] {
+        let mut headers = HashMap::from([(key.to_string(), value.to_string())]);
+        let framing = ClientResponseFraming::ExactBody {
+            status: 200,
+            len: expected.parse().unwrap(),
+        };
+        sanitize_client_response_headers_for_wire(&mut headers, framing);
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some(expected),
+            "ExactBody must repair {key}: {value:?}"
+        );
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length") && name != "content-length"),
+            "ExactBody repair must leave only lowercase content-length"
+        );
+    }
+
+    // Head: single lowercase untrimmed parseable value — no mutation.
+    let mut head = HashMap::from([("content-length".to_string(), "42".to_string())]);
+    let head_cl_ptr = head.get("content-length").unwrap().as_ptr();
+    sanitize_client_response_headers_for_wire(
+        &mut head,
+        ClientResponseFraming::Head { status: 200 },
+    );
+    assert_eq!(head.get("content-length").map(String::as_str), Some("42"));
+    assert_eq!(
+        head.get("content-length").unwrap().as_ptr(),
+        head_cl_ptr,
+        "Head must preserve already-safe Content-Length storage"
+    );
+
+    // Head acceptance preserves leading zeroes (parseable) without rewrite.
+    let mut leading_zero = HashMap::from([("content-length".to_string(), "042".to_string())]);
+    let leading_ptr = leading_zero.get("content-length").unwrap().as_ptr();
+    sanitize_client_response_headers_for_wire(
+        &mut leading_zero,
+        ClientResponseFraming::Head { status: 200 },
+    );
+    assert_eq!(
+        leading_zero.get("content-length").map(String::as_str),
+        Some("042"),
+        "Head must not invent a stricter leading-zero policy"
+    );
+    assert_eq!(
+        leading_zero.get("content-length").unwrap().as_ptr(),
+        leading_ptr
+    );
+
+    // Head repair: invalid, whitespace-padded, mixed-case, duplicates.
+    let mut invalid = HashMap::from([("content-length".to_string(), "not-a-number".to_string())]);
+    sanitize_client_response_headers_for_wire(
+        &mut invalid,
+        ClientResponseFraming::Head { status: 200 },
+    );
+    assert!(!invalid.contains_key("content-length"));
+
+    let mut padded = HashMap::from([("content-length".to_string(), " 42 ".to_string())]);
+    sanitize_client_response_headers_for_wire(
+        &mut padded,
+        ClientResponseFraming::Head { status: 200 },
+    );
+    assert_eq!(padded.get("content-length").map(String::as_str), Some("42"));
+
+    let mut mixed = HashMap::from([("Content-Length".to_string(), "42".to_string())]);
+    sanitize_client_response_headers_for_wire(
+        &mut mixed,
+        ClientResponseFraming::Head { status: 200 },
+    );
+    assert_eq!(mixed.get("content-length").map(String::as_str), Some("42"));
+    assert!(!mixed.contains_key("Content-Length"));
+
+    let mut duplicates = HashMap::from([
+        ("content-length".to_string(), "42".to_string()),
+        ("Content-Length".to_string(), "42".to_string()),
+    ]);
+    sanitize_client_response_headers_for_wire(
+        &mut duplicates,
+        ClientResponseFraming::Head { status: 200 },
+    );
+    assert!(
+        !duplicates
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "duplicate Content-Length case variants must be stripped"
+    );
+}
+
+/// An *empty* ordinary reject is the residual the emptiness heuristic missed:
+/// zero is an authoritative length, so a plugin-authored `Content-Length: 999`
+/// must be replaced by canonical `0` rather than preserved as a streaming
+/// representation length. Covers the plain HTTP reject and the failed WebSocket
+/// handshake, which is also an ordinary HTTP error.
+#[test]
+fn test_normalized_reject_builder_replaces_hostile_length_on_empty_body() {
+    use ferrum_edge::_test_support::build_normalized_reject_wire_parts_with_method_for_test;
+
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), "999".to_string()),
+    ]);
+
+    for failed_websocket_handshake in [false, true] {
+        for method in ["GET", "POST", "DELETE"] {
+            let wire = build_normalized_reject_wire_parts_with_method_for_test(
+                method,
+                StatusCode::FORBIDDEN,
+                b"",
+                headers.clone(),
+                failed_websocket_handshake,
+            )
+            .headers;
+            assert_eq!(
+                wire.get(http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok()),
+                Some("0"),
+                "empty {method} reject must publish canonical 0 \
+                 (failed_websocket_handshake={failed_websocket_handshake})"
+            );
+            assert!(wire.get(http::header::TRANSFER_ENCODING).is_none());
+        }
+    }
+}
+
+/// `HEAD` is the case the empty-body heuristic was protecting: the trusted
+/// synthetic-response preparation contract empties the body but keeps the
+/// representation length a `GET` would have returned. That length — and only
+/// that length — must survive; a plugin-authored value is overwritten by the
+/// contract's own representation size beforehand.
+#[test]
+fn test_head_reject_preserves_representation_length_from_preparation_contract() {
+    use ferrum_edge::_test_support::prepare_and_build_normalized_reject_wire_parts_for_test;
+
+    let body = br#"{"error":"forbidden"}"#;
+    let representation_len = body.len().to_string();
+
+    let wire = prepare_and_build_normalized_reject_wire_parts_for_test(
+        "HEAD",
+        StatusCode::FORBIDDEN,
+        body,
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    )
+    .headers;
+    assert_eq!(
+        wire.get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(representation_len.as_str()),
+        "HEAD must keep the representation length a GET would have returned"
+    );
+
+    // The same trusted request, but a GET, publishes the real wire length.
+    let get_wire = prepare_and_build_normalized_reject_wire_parts_for_test(
+        "GET",
+        StatusCode::FORBIDDEN,
+        body,
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    )
+    .headers;
+    assert_eq!(
+        get_wire
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(representation_len.as_str())
+    );
+}
+
+/// Statuses that forbid a message body strip `Content-Length` outright, on both
+/// the preparation contract and the final builder, no matter what a response
+/// hook wrote.
+#[test]
+fn test_no_body_status_rejects_strip_plugin_authored_length() {
+    use ferrum_edge::_test_support::prepare_and_build_normalized_reject_wire_parts_for_test;
+
+    for status in [
+        StatusCode::CONTINUE,
+        StatusCode::NO_CONTENT,
+        StatusCode::RESET_CONTENT,
+        StatusCode::NOT_MODIFIED,
+    ] {
+        for method in ["GET", "HEAD"] {
+            let wire = prepare_and_build_normalized_reject_wire_parts_for_test(
+                method,
+                status,
+                b"",
+                HashMap::from([("content-length".to_string(), "999".to_string())]),
+            )
+            .headers;
+            assert!(
+                wire.get(http::header::CONTENT_LENGTH).is_none(),
+                "{method} {status} must not advertise a body length"
+            );
+        }
+    }
+}
+
+/// A native gRPC reject normalizes to a trailers-only response: HTTP 200 with
+/// terminal metadata in the header block and no body. It must keep streaming /
+/// trailer semantics — inventing `Content-Length: 0` there would break clients
+/// that expect a trailers-only frame sequence.
+#[test]
+fn test_native_grpc_trailers_only_reject_does_not_invent_zero_length() {
+    use ferrum_edge::_test_support::build_grpc_trailers_only_reject_wire_parts_for_test;
+
+    let headers = HashMap::from([
+        ("content-length".to_string(), "999".to_string()),
+        ("x-ratelimit-limit".to_string(), "5".to_string()),
+    ]);
+    let parts = build_grpc_trailers_only_reject_wire_parts_for_test(
+        StatusCode::FORBIDDEN,
+        br#"{"error":"forbidden"}"#,
+        &headers,
+    );
+
+    assert_eq!(parts.status, StatusCode::OK);
+    let wire = parts.headers;
+    assert!(
+        wire.get(http::header::CONTENT_LENGTH).is_none(),
+        "trailers-only gRPC must neither keep the hostile length nor invent 0"
+    );
+    assert!(wire.get(http::header::TRANSFER_ENCODING).is_none());
+    assert_eq!(
+        wire.get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/grpc")
+    );
+    assert_eq!(
+        wire.get("grpc-status").and_then(|v| v.to_str().ok()),
+        Some("7")
+    );
+    assert_eq!(
+        wire.get("x-ratelimit-limit").and_then(|v| v.to_str().ok()),
+        Some("5"),
+        "plugin metadata unrelated to framing must survive"
+    );
 }
 
 #[test]
@@ -3431,6 +3843,763 @@ fn streaming_grpc_web_adapters_honor_preserved_response_statuses() {
         "generic preserved statuses must retain native headers and body framing"
     );
 }
+/// GHSA-4vr5-4wm3-x5xv: irreversible outbound request egress must be its own
+/// phase, reachable only after request-body finalization.
+///
+/// Structural because the property is an ordering across two 10k+ line dispatch
+/// ladders that no single unit-level call can witness: at every site that runs
+/// `run_final_request_body_hooks`, the egress phase must run *after* it and only
+/// on `Continue`, and the no-buffering fallback must be gated so it cannot fire
+/// ahead of a finalization that is still to come.
+#[test]
+fn test_finalized_request_egress_runs_after_final_body_hooks_and_before_dispatch() {
+    let src = include_str!("../../../src/proxy/mod.rs");
+
+    // The dispatcher is exactly-once and refuses to run without a declared
+    // egress plugin, so an ordinary chain pays nothing.
+    let dispatcher = src
+        .split("pub(crate) async fn run_finalized_request_egress_hooks(")
+        .nth(1)
+        .expect("finalized-request-egress dispatcher must remain present")
+        .split("async fn run_finalized_request_egress_hooks_inner(")
+        .next()
+        .expect("dispatcher must remain bounded");
+    assert!(dispatcher.contains("if ctx.finalized_request_egress_dispatched {"));
+    assert!(dispatcher.contains("ctx.finalized_request_egress_dispatched = true;"));
+    assert!(dispatcher.contains("plugin.dispatches_finalized_request_egress()"));
+
+    let handler = src
+        .find("async fn handle_proxy_request_inner(")
+        .map(|start| &src[start..])
+        .expect("H1/H2 request handler must remain present");
+
+    // Every egress call site in the handler must be preceded by the final
+    // request-body hook pass, or be the explicitly gated no-buffering fallback.
+    let egress_sites: Vec<usize> = handler
+        .match_indices("run_finalized_request_egress_hooks(")
+        .map(|(index, _)| index)
+        .collect();
+    assert!(
+        egress_sites.len() >= 4,
+        "H1/H2 must reach the egress boundary from the terminal, ordinary, gRPC, \
+         and no-buffering sites; found {}",
+        egress_sites.len()
+    );
+    let first_final_hook = handler
+        .find("run_final_request_body_hooks(")
+        .expect("final request-body hooks must remain present");
+    assert!(
+        egress_sites[0] > first_final_hook,
+        "no egress site may precede the first final request-body hook pass"
+    );
+    assert!(
+        handler
+            .matches("finalized_request_rejection_phase(rejected_by_egress)")
+            .count()
+            >= 3,
+        "ordinary, terminal, and native-gRPC egress rejections must retain the \
+         finalized_request_egress transaction phase"
+    );
+
+    // The fallback site is the only one not preceded by a final-body hook pass.
+    // It must be exactly-once gated rather than gated on "this chain never
+    // buffers": a request that carries no body at all is left streaming by
+    // `buffer_request_body_for_before_proxy`, so the terminal preparation runs
+    // neither transforms nor final-body hooks for it and reaches no boundary of
+    // its own. Gating the fallback on `!requires_request_body_buffering` made the
+    // whole phase unreachable for a bodyless request on any buffering chain —
+    // e.g. a `GET` on a `request_mirror` proxy, whose `mirror_request_body`
+    // default requires buffering.
+    let fallback = handler
+        .find("&& !ctx.finalized_request_egress_dispatched")
+        .expect("the fallback egress site must remain exactly-once gated");
+    assert!(
+        handler[..fallback]
+            .rfind("DISPATCHES_FINALIZED_REQUEST_EGRESS")
+            .is_some_and(|capability| fallback - capability < 200),
+        "the fallback egress site must stay capability-gated"
+    );
+    assert!(
+        handler[fallback..]
+            .find("!(grpc_uses_native_dispatch && requires_request_body_buffering)")
+            .is_some_and(|offset| offset < 300),
+        "only a buffering request that will enter the native-gRPC branch may defer to \
+         that branch's own egress boundary; mesh fall-through requests must still be \
+         dispatched here when they carry no body (GHSA-4vr5-4wm3-x5xv)"
+    );
+
+    let mesh_fall_through = handler
+        .find("let grpc_mesh_fall_through")
+        .expect("mesh gRPC fall-through must be classified before terminal preparation");
+    let terminal = handler
+        .find("if final_body_before_backend_dispatch")
+        .expect("terminal body preparation must remain present");
+    assert!(
+        mesh_fall_through < terminal
+            && handler[mesh_fall_through..terminal].contains(
+                "grpc_uses_generic_dispatch\n            && requires_request_body_buffering",
+            ),
+        "every buffering gRPC request that will use generic dispatch must be pulled through \
+         transforms, final policy, and finalized-request egress before dispatch"
+    );
+
+    // A buffered request on an egress chain finalizes before backend dispatch
+    // rather than inside `proxy_to_backend`.
+    let helper = src
+        .split("pub(crate) fn final_request_body_requirements(")
+        .nth(1)
+        .expect("shared final-body applicability helper must remain present")
+        .split("pub(crate) fn request_body_requirements_before_authenticate(")
+        .next()
+        .expect("shared final-body applicability helper must remain bounded");
+    assert!(
+        helper.contains("terminal_dispatch |= has_finalized_request_egress && requires_buffering;")
+    );
+
+    // HTTP/3 reaches the same boundary after its own terminal finalization.
+    let h3 = include_str!("../../../src/http3/server.rs");
+    let h3_final_hook = h3
+        .find("let final_body_result = crate::proxy::run_final_request_body_hooks(")
+        .expect("H3 terminal final-body hooks must remain present");
+    let h3_egress = h3
+        .find("crate::proxy::run_finalized_request_egress_hooks(")
+        .expect("H3 must reach the finalized-request-egress boundary");
+    assert!(
+        h3_final_hook < h3_egress,
+        "H3 egress must run after the terminal final request-body hooks"
+    );
+
+    // Composition admission still fails closed for anything egressing earlier.
+    let cache = include_str!("../../../src/plugin_cache.rs");
+    assert!(cache.contains("plugin.enforces_finalized_request_policy()"));
+    assert!(cache.contains("plugin.dispatches_finalized_request_egress()"));
+
+    // Every built-in final request hook that can reject the backend-visible
+    // representation must advertise the composition marker. Otherwise a
+    // registered custom plugin could egress earlier and bypass that policy.
+    for policy_source in [
+        include_str!("../../../src/plugins/ai_prompt_compressor.rs"),
+        include_str!("../../../src/plugins/ai_prompt_shield.rs"),
+        include_str!("../../../src/plugins/ai_request_guard.rs"),
+        include_str!("../../../src/plugins/ai_semantic_firewall.rs"),
+        include_str!("../../../src/plugins/ai_stream_router.rs"),
+        include_str!("../../../src/plugins/ai_tool_governor.rs"),
+        include_str!("../../../src/plugins/ai_transcript_audit.rs"),
+        include_str!("../../../src/plugins/body_validator.rs"),
+        include_str!("../../../src/plugins/grpc_web.rs"),
+        include_str!("../../../src/plugins/openapi_validator.rs"),
+        include_str!("../../../src/plugins/request_size_limiting.rs"),
+        include_str!("../../../src/plugins/soap_ws_security.rs"),
+        include_str!("../../../src/plugins/waf/mod.rs"),
+    ] {
+        assert!(policy_source.contains("fn enforces_finalized_request_policy(&self) -> bool"));
+    }
+}
+
+/// `Content-Length` acceptance at the final wire boundary must be RFC 9110
+/// §8.6 `1*DIGIT`, not "whatever `u64::from_str` tolerates".
+///
+/// Rust's integer `FromStr` accepts a leading `+`, so a `Content-Length: +42`
+/// left on a streaming response map parses successfully and was therefore
+/// treated as an already-safe value: `needs_client_response_wire_sanitization`
+/// reported no work, the sanitizer preserved it verbatim, and the malformed
+/// field reached the client. On an H1 chain, one intermediary may read `+42` as
+/// `42`, another as `0`, and another may reject the message — the exact framing
+/// disagreement this boundary exists to remove.
+#[test]
+fn test_head_sanitizer_rejects_non_digit_content_length_spellings() {
+    use ferrum_edge::proxy::headers::{
+        ClientResponseFraming, needs_client_response_wire_sanitization,
+        sanitize_client_response_headers_for_wire,
+    };
+    use std::collections::HashMap;
+
+    // `Head` is the only framing that preserves a value at all, so it is the
+    // only one whose acceptance policy can be wrong in the "preserved a
+    // malformed spelling" direction.
+    let framing = ClientResponseFraming::Head { status: 200 };
+
+    // Signed, non-numeric, and overflowing spellings are all refused. A
+    // streaming body is framed by the protocol's own end-of-body signal, so
+    // dropping an unverifiable length is the safe repair.
+    for value in [
+        "+42",
+        "+0",
+        "-1",
+        "4 2",
+        "42abc",
+        "0x2a",
+        "",
+        // One past u64::MAX: all digits, but not representable, comparable, or
+        // repairable by the gateway.
+        "18446744073709551616",
+    ] {
+        let mut headers = HashMap::from([
+            ("content-length".to_string(), value.to_string()),
+            ("x-ok".to_string(), "1".to_string()),
+        ]);
+        assert!(
+            needs_client_response_wire_sanitization(&headers, framing),
+            "{value:?} must be reported as needing repair, or the H3 hot path \
+             skips sanitization entirely and publishes it verbatim"
+        );
+        sanitize_client_response_headers_for_wire(&mut headers, framing);
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length")),
+            "{value:?} is not a valid Content-Length and must not reach the wire"
+        );
+        assert_eq!(
+            headers.get("x-ok").map(String::as_str),
+            Some("1"),
+            "unrelated headers must survive the repair"
+        );
+    }
+
+    // Bare 1*DIGIT (including leading zeroes, which the grammar permits) stays
+    // untouched — the stricter check must not start rewriting valid backends.
+    for value in ["0", "42", "042", "18446744073709551615"] {
+        let mut headers = HashMap::from([("content-length".to_string(), value.to_string())]);
+        assert!(
+            !needs_client_response_wire_sanitization(&headers, framing),
+            "{value:?} is a valid Content-Length and must stay on the hot path"
+        );
+        sanitize_client_response_headers_for_wire(&mut headers, framing);
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some(value)
+        );
+    }
+
+    // A signed value under a mixed-case key must not be "repaired" into a
+    // canonical lowercase field carrying the same malformed number.
+    let mut mixed = HashMap::from([("Content-Length".to_string(), "+42".to_string())]);
+    sanitize_client_response_headers_for_wire(&mut mixed, framing);
+    assert!(
+        !mixed
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "case-repair must not rehome a non-1*DIGIT value onto the canonical key"
+    );
+}
+
+/// `ExactBody` must not accept a signed spelling as "already canonical" and
+/// skip the rewrite that publishes the authoritative length.
+#[test]
+fn test_exact_body_sanitizer_rewrites_signed_content_length() {
+    use ferrum_edge::proxy::headers::{
+        ClientResponseFraming, needs_client_response_wire_sanitization,
+        sanitize_client_response_headers_for_wire,
+    };
+    use std::collections::HashMap;
+
+    let framing = ClientResponseFraming::ExactBody {
+        status: 200,
+        len: 42,
+    };
+    let mut headers = HashMap::from([("content-length".to_string(), "+42".to_string())]);
+    assert!(needs_client_response_wire_sanitization(&headers, framing));
+    sanitize_client_response_headers_for_wire(&mut headers, framing);
+    assert_eq!(
+        headers.get("content-length").map(String::as_str),
+        Some("42"),
+        "ExactBody must publish the canonical decimal length it was given"
+    );
+}
+
+/// Buffered writers share one framing rule across H1/H2, native H3, and the H3
+/// cross-protocol bridge: the wire body is in hand, so its length is
+/// authoritative. `HEAD` is the sole exception — the representation length a
+/// `GET` would have returned must survive the empty wire body.
+#[test]
+fn test_buffered_response_framing_is_body_derived_except_head() {
+    use ferrum_edge::proxy::headers::ClientResponseFraming;
+
+    for method in ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+        assert!(
+            matches!(
+                ClientResponseFraming::for_buffered_response(method, 200, 21),
+                ClientResponseFraming::ExactBody { len: 21, .. }
+            ),
+            "{method} buffered response must publish its exact body length"
+        );
+        assert!(
+            matches!(
+                ClientResponseFraming::for_buffered_response(method, 403, 0),
+                ClientResponseFraming::ExactBody { len: 0, .. }
+            ),
+            "{method} empty buffered response must publish an authoritative zero"
+        );
+    }
+    for method in ["HEAD", "head", "HeAd"] {
+        assert!(
+            matches!(
+                ClientResponseFraming::for_buffered_response(method, 200, 0),
+                ClientResponseFraming::Head { .. }
+            ),
+            "{method} must preserve the backend representation length"
+        );
+    }
+}
+
+/// GHSA-xvr4 residual: an ordinary streamed non-HEAD response must not publish
+/// ANY `Content-Length` that survived the mutable response hooks — including a
+/// syntactically valid, lowercase, canonically spelled one.
+///
+/// This is the arm the earlier repair left open. Hop-by-hop stripping and the
+/// `ExactBody` overwrite covered the buffered writers, but the streaming arm
+/// preserved one valid value, and `security_headers.set` / `opa.deny_headers`
+/// could author exactly that. On a streamed body the gateway has not written the
+/// bytes yet, so it cannot verify the claim; publishing it lets one recipient on
+/// an HTTP/1.1 chain frame by the declared length while another frames by the
+/// protocol's own end-of-body signal.
+#[test]
+fn test_ordinary_streaming_framing_strips_every_content_length_spelling() {
+    use ferrum_edge::proxy::headers::{
+        ClientResponseFraming, needs_client_response_wire_sanitization,
+        sanitize_client_response_headers_for_wire,
+    };
+    use std::collections::HashMap;
+
+    let framing = ClientResponseFraming::Streaming;
+
+    // Every one of these is a *valid* wire spelling that the previous Streaming
+    // arm preserved verbatim.
+    for (key, value) in [
+        ("content-length", "0"),
+        ("content-length", "42"),
+        ("content-length", "042"),
+        ("content-length", "18446744073709551615"),
+        ("Content-Length", "42"),
+        ("CONTENT-LENGTH", "42"),
+    ] {
+        let mut headers = HashMap::from([
+            (key.to_string(), value.to_string()),
+            ("x-ok".to_string(), "1".to_string()),
+        ]);
+        assert!(
+            needs_client_response_wire_sanitization(&headers, framing),
+            "{key}: {value:?} must be reported as needing repair, or the H3 hot \
+             path skips sanitization and publishes it verbatim"
+        );
+        sanitize_client_response_headers_for_wire(&mut headers, framing);
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length")),
+            "ordinary streaming must not publish {key}: {value:?} — the gateway \
+             cannot verify it against bytes it has not written"
+        );
+        assert_eq!(
+            headers.get("x-ok").map(String::as_str),
+            Some("1"),
+            "unrelated headers must survive the strip"
+        );
+    }
+
+    // A clean map still needs no work, so the allocation-free hot path stays.
+    let clean = HashMap::from([("x-ok".to_string(), "1".to_string())]);
+    assert!(!needs_client_response_wire_sanitization(&clean, framing));
+
+    // Hop-by-hop stripping is unchanged and composes with the length strip.
+    let mut both = HashMap::from([
+        (
+            "connection".to_string(),
+            "keep-alive, x-internal".to_string(),
+        ),
+        ("x-internal".to_string(), "leak".to_string()),
+        ("transfer-encoding".to_string(), "chunked".to_string()),
+        ("content-length".to_string(), "42".to_string()),
+        ("x-ok".to_string(), "1".to_string()),
+    ]);
+    sanitize_client_response_headers_for_wire(&mut both, framing);
+    assert_eq!(both.len(), 1, "only the ordinary header may survive");
+    assert_eq!(both.get("x-ok").map(String::as_str), Some("1"));
+}
+
+#[test]
+fn websocket_transport_boundary_strips_connection_nominated_extensions() {
+    use ferrum_edge::_test_support::strip_websocket_transport_managed_response_headers;
+
+    let mut headers = HashMap::from([
+        (
+            "Connection".to_string(),
+            "Upgrade, X-Handshake-Hop".to_string(),
+        ),
+        ("X-Handshake-Hop".to_string(), "must-not-leak".to_string()),
+        (
+            "Sec-WebSocket-Protocol".to_string(),
+            "fabricated".to_string(),
+        ),
+        ("Content-Length".to_string(), "999".to_string()),
+        ("x-end-to-end".to_string(), "preserved".to_string()),
+    ]);
+
+    strip_websocket_transport_managed_response_headers(&mut headers);
+
+    for removed in [
+        "connection",
+        "upgrade",
+        "x-handshake-hop",
+        "sec-websocket-protocol",
+        "content-length",
+    ] {
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(removed)),
+            "{removed} crossed the WebSocket handshake boundary"
+        );
+    }
+    assert_eq!(
+        headers.get("x-end-to-end").map(String::as_str),
+        Some("preserved")
+    );
+}
+
+/// `HEAD` is the one exemption, and it is narrow: exactly one valid
+/// representation length survives, while invalid values, duplicate case
+/// variants, and no-body statuses are still stripped.
+#[test]
+fn test_head_framing_preserves_only_one_valid_representation_length() {
+    use ferrum_edge::proxy::headers::{
+        ClientResponseFraming, sanitize_client_response_headers_for_wire,
+    };
+    use std::collections::HashMap;
+
+    // Preserved: one valid value, canonicalized onto the lowercase key.
+    for (key, value, expected) in [
+        ("content-length", "1024", "1024"),
+        ("Content-Length", "1024", "1024"),
+        ("CONTENT-LENGTH", " 1024 ", "1024"),
+        ("content-length", "01024", "01024"),
+    ] {
+        let mut headers = HashMap::from([(key.to_string(), value.to_string())]);
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::Head { status: 200 },
+        );
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some(expected),
+            "HEAD must keep the representation length from {key}: {value:?}"
+        );
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length") && name != "content-length"),
+            "HEAD repair must leave only the canonical lowercase key"
+        );
+    }
+
+    // Dropped: ambiguous duplicates across case variants.
+    let mut duplicates = HashMap::from([
+        ("content-length".to_string(), "1024".to_string()),
+        ("Content-Length".to_string(), "1024".to_string()),
+    ]);
+    sanitize_client_response_headers_for_wire(
+        &mut duplicates,
+        ClientResponseFraming::Head { status: 200 },
+    );
+    assert!(
+        !duplicates
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "duplicate HEAD lengths are a HeaderMap duplicate field — fail closed"
+    );
+
+    // Dropped: spellings outside `1*DIGIT`.
+    for value in [
+        "+1024",
+        "-1",
+        "10 24",
+        "1024abc",
+        "",
+        "18446744073709551616",
+    ] {
+        let mut headers = HashMap::from([("content-length".to_string(), value.to_string())]);
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::Head { status: 200 },
+        );
+        assert!(
+            !headers.contains_key("content-length"),
+            "HEAD must drop the malformed spelling {value:?}"
+        );
+    }
+
+    // Dropped: statuses that forbid a body, even under HEAD framing.
+    for status in [100u16, 199, 204, 205, 304] {
+        let mut headers = HashMap::from([
+            ("content-length".to_string(), "1024".to_string()),
+            ("Content-Length".to_string(), "7".to_string()),
+        ]);
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::Head { status },
+        );
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length")),
+            "status {status} forbids a body, so no length may survive"
+        );
+    }
+}
+
+/// The ordinary-vs-HEAD distinction is a typed framing decision derived from the
+/// trusted request method — not a caller-supplied boolean, and never inferred
+/// from a response header a plugin or backend controls.
+#[test]
+fn test_streaming_response_framing_constructor_is_method_derived() {
+    use ferrum_edge::proxy::headers::ClientResponseFraming;
+
+    for method in ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"] {
+        assert!(
+            matches!(
+                ClientResponseFraming::for_streaming_response(method, 200),
+                ClientResponseFraming::Streaming
+            ),
+            "{method} streaming responses must strip Content-Length"
+        );
+    }
+    for method in ["HEAD", "head", "HeAd"] {
+        assert!(
+            matches!(
+                ClientResponseFraming::for_streaming_response(method, 200),
+                ClientResponseFraming::Head { status: 200 }
+            ),
+            "{method} must select Head framing regardless of case"
+        );
+    }
+}
+
+/// The gateway's own accounting capture must reproduce exactly what the wire
+/// boundary would have accepted, so removing the field from the wire cannot
+/// silently change H3 graceful-close classification or the direct-H2
+/// large-response coalescer bypass.
+#[test]
+fn test_preserved_response_content_length_matches_boundary_acceptance() {
+    use ferrum_edge::proxy::headers::preserved_response_content_length;
+    use std::collections::HashMap;
+
+    for (key, value, expected) in [
+        ("content-length", "0", Some(0u64)),
+        ("content-length", "42", Some(42)),
+        ("content-length", "042", Some(42)),
+        ("Content-Length", "42", Some(42)),
+        ("content-length", " 42 ", Some(42)),
+        ("content-length", "+42", None),
+        ("content-length", "-1", None),
+        ("content-length", "4 2", None),
+        ("content-length", "", None),
+        ("content-length", "18446744073709551616", None),
+    ] {
+        let headers = HashMap::from([(key.to_string(), value.to_string())]);
+        assert_eq!(
+            preserved_response_content_length(&headers, 200),
+            expected,
+            "{key}: {value:?}"
+        );
+    }
+
+    // Conflicting duplicates are a HeaderMap duplicate field — fail closed
+    // rather than picking whichever variant iteration reached first.
+    let duplicates = HashMap::from([
+        ("content-length".to_string(), "42".to_string()),
+        ("Content-Length".to_string(), "43".to_string()),
+    ]);
+    assert_eq!(preserved_response_content_length(&duplicates, 200), None);
+
+    // No-body statuses have no declared length to account for.
+    let headers = HashMap::from([("content-length".to_string(), "42".to_string())]);
+    for status in [100u16, 204, 205, 304] {
+        assert_eq!(
+            preserved_response_content_length(&headers, status),
+            None,
+            "status {status} forbids a body"
+        );
+    }
+
+    assert_eq!(
+        preserved_response_content_length(&HashMap::new(), 200),
+        None
+    );
+}
+
+/// A buffered gRPC response with no DATA frames is trailers-only regardless of
+/// which hook produced it, so `Content-Length` is removed rather than invented
+/// as `0` or preserved from a plugin-authored map.
+#[test]
+fn test_buffered_grpc_framing_is_trailers_only_on_empty_body() {
+    use ferrum_edge::proxy::headers::ClientResponseFraming;
+
+    assert!(matches!(
+        ClientResponseFraming::for_buffered_grpc(200, 0),
+        ClientResponseFraming::TrailersOnly
+    ));
+    assert!(matches!(
+        ClientResponseFraming::for_buffered_grpc(200, 17),
+        ClientResponseFraming::ExactBody { len: 17, .. }
+    ));
+}
+
+/// Regression: a plugin reject on the buffered gRPC path must not publish a
+/// plugin-authored `Content-Length` on a response that sends zero DATA frames.
+///
+/// `normalize_reject_response(.., is_grpc_request = true)` strips every case
+/// variant of protocol-managed `content-length`, empties the body for
+/// trailers-only framing, and leaves only the authoritative gRPC terminal
+/// metadata. Framing is derived from the final body, so every reject arm
+/// selects trailers-only for an empty body rather than streaming framing that
+/// would publish a surviving plugin length.
+#[test]
+fn test_buffered_grpc_plugin_reject_drops_plugin_authored_content_length() {
+    use ferrum_edge::_test_support::normalize_reject_response;
+    use ferrum_edge::proxy::headers::{
+        ClientResponseFraming, sanitize_client_response_headers_for_wire,
+    };
+    use std::collections::HashMap;
+
+    let plugin_reject_headers = HashMap::from([
+        ("content-length".to_string(), "999".to_string()),
+        ("Content-Length".to_string(), "31337".to_string()),
+        ("x-plugin".to_string(), "1".to_string()),
+    ]);
+    let normalized = normalize_reject_response(
+        StatusCode::FORBIDDEN,
+        br#"{"error":"denied"}"#,
+        &plugin_reject_headers,
+        true,
+    );
+
+    assert!(
+        normalized.body.is_empty(),
+        "a native gRPC reject normalizes to trailers-only with no DATA frames"
+    );
+    assert!(
+        !normalized
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "normalization must strip every plugin-authored Content-Length case variant"
+    );
+    assert_eq!(
+        normalized.headers.get("grpc-status").map(String::as_str),
+        Some("7")
+    );
+    assert_eq!(
+        normalized.headers.get("x-plugin").map(String::as_str),
+        Some("1")
+    );
+
+    let framing = ClientResponseFraming::for_buffered_grpc(
+        normalized.http_status.as_u16(),
+        normalized.body.len(),
+    );
+    assert!(
+        matches!(framing, ClientResponseFraming::TrailersOnly),
+        "an empty buffered gRPC body must select trailers-only framing"
+    );
+
+    // Feed explicit case variants directly so the wire sanitizer is exercised
+    // independently of reject normalization.
+    let mut raw_length_variants = HashMap::from([
+        ("content-length".to_string(), "999".to_string()),
+        ("Content-Length".to_string(), "31337".to_string()),
+        ("x-plugin".to_string(), "1".to_string()),
+    ]);
+    sanitize_client_response_headers_for_wire(&mut raw_length_variants, framing);
+    assert!(
+        !raw_length_variants
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "no Content-Length may reach a trailers-only gRPC response"
+    );
+    assert_eq!(
+        raw_length_variants.get("x-plugin").map(String::as_str),
+        Some("1")
+    );
+
+    // `Head` framing is the separate contract: it is the only arm that
+    // preserves one valid length, and buffered gRPC rejects must not select it
+    // for an empty body. Ordinary `Streaming` no longer preserves anything, so
+    // it is not a distinguishing counterexample here.
+    let mut head_headers = HashMap::from([("content-length".to_string(), "999".to_string())]);
+    sanitize_client_response_headers_for_wire(
+        &mut head_headers,
+        ClientResponseFraming::Head { status: 200 },
+    );
+    assert_eq!(
+        head_headers.get("content-length").map(String::as_str),
+        Some("999"),
+        "Head framing preserves the representation length, which buffered gRPC \
+         rejects must not select for an empty body"
+    );
+}
+
+/// GHSA-xvr4 header sealing and GHSA-5fp3 shared-`Bytes` delivery meet on the
+/// same rejection: a retained cached payload must be handed onward as one
+/// allocation while the gateway still publishes its own authoritative
+/// `Content-Length`. Pinning them together stops a later change from buying
+/// sharing back with a plugin-authored length, or fail-closed framing back with
+/// a per-hit copy of the cached body.
+#[test]
+fn test_shared_reject_bytes_keep_allocation_and_gateway_derived_content_length() {
+    use ferrum_edge::_test_support::build_reject_wire_parts_from_shared_bytes_for_test;
+    use http::StatusCode;
+
+    // Far past any inline-capacity threshold, so a copy shows up as an
+    // unmistakable pointer change rather than an allocator coincidence.
+    let cached = bytes::Bytes::from(vec![0x5cu8; 256 * 1024]);
+    let cached_ptr = cached.as_ptr() as usize;
+    // A plugin-authored length that disagrees with the payload actually sent.
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), "9".to_string()),
+    ]);
+
+    let (parts, observed_ptr) = build_reject_wire_parts_from_shared_bytes_for_test(
+        "GET",
+        StatusCode::FORBIDDEN,
+        cached.clone(),
+        &headers,
+    );
+
+    assert_eq!(
+        observed_ptr, cached_ptr,
+        "the final reject header boundary must not copy the shared cached body"
+    );
+    let expected = cached.len().to_string();
+    assert_eq!(
+        parts
+            .headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected.as_str()),
+        "the gateway must overwrite the plugin-authored length with the real one"
+    );
+
+    // HEAD: the synthetic-response contract has already emptied the wire body,
+    // so the declared representation length survives instead of collapsing to a
+    // misleading `0`.
+    let (head_parts, _) = build_reject_wire_parts_from_shared_bytes_for_test(
+        "HEAD",
+        StatusCode::OK,
+        bytes::Bytes::new(),
+        &HashMap::from([("content-length".to_string(), "4096".to_string())]),
+    );
+    assert_eq!(
+        head_parts
+            .headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+        Some("4096"),
+        "HEAD must keep the representation length the synthetic contract established"
+    );
+}
+
 #[test]
 fn reqwest_dispatch_fails_closed_when_proxy_ttl_dns_preflight_fails() {
     let source = include_str!("../../../src/proxy/mod.rs");

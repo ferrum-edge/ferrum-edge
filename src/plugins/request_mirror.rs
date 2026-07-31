@@ -9,11 +9,17 @@
 //!
 //! ## How it works
 //!
-//! During the `before_proxy` phase (after all request transforms), the plugin
+//! During the finalized-request-egress phase — after request-body transforms and
+//! after every `on_final_request_body` policy hook has accepted the
+//! backend-visible representation (advisory `GHSA-4vr5-4wm3-x5xv`) — the plugin
 //! captures the request method, path, query string, headers, and optionally the
 //! body, then spawns an async task to replay the request against the configured
 //! mirror destination. The main request proceeds immediately — mirror latency
-//! has zero impact on client response time.
+//! has zero impact on client response time. A request rejected by final
+//! request-body policy is therefore never mirrored, and the shadow destination
+//! never sees a field an operator configured `request_transformer` to remove or
+//! redact. Later backend-admission or transport failures can still occur after
+//! mirror dispatch.
 //!
 //! Multiple independent `request_mirror` instances on one proxy each dispatch
 //! and each push their own result receiver onto a per-request collection. A
@@ -95,10 +101,11 @@
 //! `backend_read_timeout_ms` therefore never disables the mirror deadline.
 //! Mirror response bodies are always drained under `max_response_body_bytes`
 //! and a short drain timeout so HTTP/1.1 keep-alive pools can reclaim sockets
-//! even when `Content-Length` is advertised. Retained request bodies share
-//! `bytes::Bytes` with the primary buffer and are admitted under both
-//! `max_in_flight` and a per-instance `max_retained_request_body_bytes` budget;
-//! leases release when the detached task ends.
+//! even when `Content-Length` is advertised. A finalized body is copied once
+//! into an owned `bytes::Bytes` for each selected mirror instance; that
+//! detached-task copy is admitted under both `max_in_flight` and a per-instance
+//! `max_retained_request_body_bytes` budget, and its lease releases when the
+//! task ends.
 //!
 //! ## Pre-buffer admission (advisory `GHSA-jv66-mq44-m9v3`)
 //!
@@ -139,11 +146,11 @@
 //!    ceiling without enforcing equality with `Content-Length`, and Hyper's H2
 //!    `Incoming` length is likewise not the Ferrum allocation bound. Charging
 //!    only an attacker-declared byte would let many concurrent tiny declarations
-//!    each allocate up to the ceiling before `before_proxy` reconciliation,
-//!    exceeding `max_retained_request_body_bytes`. `before_proxy` then reconciles
-//!    the reservation to the observed length, returning the surplus (down to
-//!    `0` for an empty body) to the aggregate budget exactly once. The tradeoff:
-//!    mirroring mostly-bodyless traffic at high concurrency wants
+//!    each allocate up to the ceiling before finalized-egress reconciliation,
+//!    exceeding `max_retained_request_body_bytes`. Finalized request egress then
+//!    reconciles the reservation to the observed length, returning the surplus
+//!    (down to `0` for an empty body) to the aggregate budget exactly once. The
+//!    tradeoff: mirroring mostly-bodyless traffic at high concurrency wants
 //!    `max_retained_request_body_bytes` sized against `max_in_flight ×
 //!    max_mirrored_request_body_bytes`, or a lower ceiling.
 //!    An undeclared (chunked) body larger than the ceiling is still rejected by
@@ -203,8 +210,8 @@
 //!
 //! Selection is evaluated once per eligible request, in the `authorize` phase
 //! for body-mirroring instances (so a sampled-out request never buffers) and in
-//! `before_proxy` otherwise. Either way each eligible request advances the
-//! phase exactly once.
+//! finalized request egress otherwise. Either way each eligible request
+//! advances the phase exactly once.
 //!
 //! - `0%` (threshold 0) never selects; the phase accumulator is not advanced.
 //! - `100%` (threshold 1000) always selects; the phase accumulator is not advanced.
@@ -622,8 +629,8 @@ impl MirrorBodyBudget {
 /// Held from pre-buffer admission (`authorize`) through body collection,
 /// dispatch, and the detached task's terminal outcome. Dropping the lease —
 /// on client cancellation, a body read error, a plugin rejection before
-/// `before_proxy`, a mirror timeout, or ordinary task completion — releases the
-/// reservation exactly once.
+/// finalized request egress, a mirror timeout, or ordinary task completion —
+/// releases the reservation exactly once.
 struct MirrorBodyLease {
     reserved: u64,
     budget: Arc<MirrorBodyBudget>,
@@ -637,7 +644,7 @@ impl MirrorBodyLease {
     /// body) is bounded by the same budget and returns `false` when it cannot
     /// be covered, so the mirror attempt is dropped instead of retaining
     /// unbudgeted bytes. Pre-buffer admission always reserves the full ceiling,
-    /// so the authorize → before_proxy path only shrinks.
+    /// so the authorize → finalized-egress path only shrinks.
     fn reconcile(&mut self, actual: u64) -> bool {
         if actual == self.reserved {
             return true;
@@ -662,7 +669,8 @@ impl Drop for MirrorBodyLease {
 }
 
 /// Pre-buffer admission decision for one `request_mirror` instance on one
-/// request, staged by the `authorize` phase and consumed by `before_proxy`.
+/// request, staged by the `authorize` phase and consumed by finalized request
+/// egress.
 pub(crate) struct RequestMirrorAdmission {
     instance_id: u64,
     state: MirrorAdmissionState,
@@ -679,17 +687,13 @@ enum MirrorAdmissionState {
         lease: MirrorBodyLease,
     },
     /// Selected but refused by `max_in_flight` or the aggregate byte budget.
-    /// The request stays streaming; `before_proxy` publishes the attributable
-    /// failure summary once the mirror target URL is known.
+    /// The request stays streaming; finalized request egress publishes the
+    /// attributable failure summary once the mirror target URL is known.
     Dropped(&'static str),
-    /// `before_proxy` already took this instance's decision and now owns (or
-    /// has released) the lease. The tombstone stays staged so
-    /// `should_buffer_request_body` keeps answering what it answered before the
-    /// body was collected: the proxy re-evaluates that predicate *after*
-    /// `before_proxy` (`final_request_body_requirements` on a header-transformed
-    /// request), and a mid-request flip from `true` to `false` would silently
-    /// re-derive `requires_request_body_buffering` — and with it transport
-    /// choices like HBONE eligibility — from a body that is already buffered.
+    /// Finalized request egress already took this instance's decision and now
+    /// owns (or has released) the lease. The tombstone prevents any duplicate
+    /// phase invocation from sampling, acquiring capacity, or dispatching a
+    /// second shadow request.
     Consumed { admitted: bool },
 }
 
@@ -699,8 +703,8 @@ impl RequestMirrorAdmission {
     }
 
     /// Whether this instance forced a request-body buffer for this request.
-    /// Stays `true` after `before_proxy` consumed the lease so the buffering
-    /// predicate is stable for the whole request.
+    /// Stays `true` after finalized request egress consumes the lease so the
+    /// predicate remains stable for the whole request.
     pub(crate) fn is_admitted(&self) -> bool {
         matches!(
             self.state,
@@ -1412,14 +1416,14 @@ impl RequestMirror {
     /// requiring equality with `Content-Length`, and Hyper's H2 `Incoming`
     /// length is not Ferrum's allocation bound — so charging only an
     /// attacker-declared byte would let many concurrent tiny declarations each
-    /// allocate up to the ceiling before `before_proxy` reconciliation,
+    /// allocate up to the ceiling before finalized-egress reconciliation,
     /// exceeding `max_retained_request_body_bytes`.
     ///
     /// Oversized declared lengths are skipped *before* this reservation (see
     /// [`Self::authorize`]). The tradeoff is accepted and bounded: a tiny or
-    /// bodyless request briefly holds the ceiling, and `before_proxy`
-    /// reconciliation returns the surplus (down to `0` for an empty body)
-    /// exactly once as soon as the observed length is known. Operators
+    /// bodyless request briefly holds the ceiling, and finalized request egress
+    /// returns the surplus (down to `0` for an empty body) exactly once as soon
+    /// as the observed length is known. Operators
     /// mirroring mostly-bodyless traffic at high concurrency should size
     /// `max_retained_request_body_bytes` against
     /// `max_in_flight × max_mirrored_request_body_bytes`, or lower the ceiling.
@@ -1791,6 +1795,11 @@ impl Plugin for RequestMirror {
         super::HTTP_GRPC_PROTOCOLS
     }
 
+    /// Keeps the admitted body collected on the early pre-`before_proxy` buffer
+    /// (the `GHSA-jv66-mq44-m9v3` admission design depends on that timing). The
+    /// mirror does not read it there: the bytes it replays come from the
+    /// finalized-request-egress phase parameter, after transforms and final
+    /// request policy.
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.body_admission_enabled()
     }
@@ -1807,8 +1816,12 @@ impl Plugin for RequestMirror {
         self.body_admission_enabled() && ctx.request_mirror_body_admitted(self.instance_id)
     }
 
+    /// The mirror reads the finalized body from the finalized-request-egress
+    /// phase parameter, never from `ctx.request_body_bytes` (which holds the
+    /// PRE-transform client body). Declining the context copy avoids a full-body
+    /// `Bytes::copy_from_slice` per request that nothing would read.
     fn needs_request_body_bytes(&self) -> bool {
-        self.body_admission_enabled()
+        false
     }
 
     /// The mirror replays raw bytes only. Declining the UTF-8 copy avoids
@@ -1847,8 +1860,8 @@ impl Plugin for RequestMirror {
     /// and a retained-byte reservation, stages a non-admitting decision and
     /// stays streaming.
     ///
-    /// The sampler advances here rather than in `before_proxy`. Requests
-    /// rejected before this hook do not advance it. A later custom or
+    /// The sampler advances here rather than in finalized request egress.
+    /// Requests rejected before this hook do not advance it. A later custom or
     /// priority-overridden authorization rejection can consume a sampling slot,
     /// as can a request later claimed by `ai_stream_router`; in both cases the
     /// permit and reservation are released without dispatching a mirror.
@@ -1891,14 +1904,30 @@ impl Plugin for RequestMirror {
         self.mirror_hostname.iter().cloned().collect()
     }
 
-    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
+    /// The mirror is dispatched in the finalized-request-egress phase, after
+    /// request-body transforms and every final request-policy hook have
+    /// accepted the backend-visible representation. A shadow destination
+    /// therefore never receives a field `request_transformer` was configured to
+    /// remove, and never receives a request that WAF, OpenAPI-schema, or
+    /// request-size policy goes on to reject (GHSA-4vr5-4wm3-x5xv).
+    fn dispatches_finalized_request_egress(&self) -> bool {
         true
     }
 
-    async fn before_proxy(
+    /// Dispatch the shadow request over the finalized representation.
+    ///
+    /// `headers` is the finalized pre-egress baseline and `body` is the exact
+    /// finalized body the primary backend receives. A preceding
+    /// `serverless_function` may publish a later backend-only header overlay, so
+    /// mirror headers deliberately need not include those injected fields. The
+    /// mirror never mutates the outbound request and publishes nothing into
+    /// `backend_header_overlay`.
+    async fn dispatch_finalized_request_egress(
         &self,
         ctx: &mut RequestContext,
-        headers: &mut HashMap<String, String>,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        _backend_header_overlay: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Take this instance's pre-buffer admission (staged by `authorize`)
         // exactly once. Dropping it here releases the permit and the retained
@@ -1920,8 +1949,8 @@ impl Plugin for RequestMirror {
         let staged_state = match staged_admission {
             Some(admission) => Some(admission.state),
             // No staged decision: this instance does not mirror bodies, is
-            // quantized to `percentage: 0`, or `before_proxy` was invoked
-            // directly without the authorize phase. Fall back to the
+            // quantized to `percentage: 0`, or finalized request egress was
+            // invoked directly without the authorize phase. Fall back to the
             // request-time sampler so behavior is unchanged for those paths.
             None => {
                 if !self.should_mirror() {
@@ -1936,8 +1965,9 @@ impl Plugin for RequestMirror {
             return PluginResult::Continue;
         }
         if matches!(staged_state, Some(MirrorAdmissionState::Consumed { .. })) {
-            // This instance already ran `before_proxy` for this request. Never
-            // dispatch, sample, or acquire capacity a second time.
+            // This instance already ran finalized request egress for this
+            // request. Never dispatch, sample, or acquire capacity a second
+            // time.
             return PluginResult::Continue;
         }
 
@@ -2055,14 +2085,13 @@ impl Plugin for RequestMirror {
             },
         };
 
-        // Share immutable body bytes with the primary buffer: one `Bytes`
-        // handle, no second `Vec`/`String` copy for the detached task.
+        // The finalized backend-visible body, not `ctx.request_body_bytes` /
+        // `ctx.metadata["request_body"]` — those hold the PRE-transform client
+        // body, and replaying them is exactly the disclosure this advisory
+        // describes. One `Bytes` allocation for the detached task; the primary
+        // buffer is untouched.
         let body_bytes: Option<Bytes> = if self.mirror_request_body {
-            ctx.request_body_bytes.clone().or_else(|| {
-                ctx.metadata
-                    .get("request_body")
-                    .map(|body| Bytes::copy_from_slice(body.as_bytes()))
-            })
+            Some(Bytes::copy_from_slice(body))
         } else {
             None
         };

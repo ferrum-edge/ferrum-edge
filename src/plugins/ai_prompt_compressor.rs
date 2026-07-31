@@ -1329,6 +1329,10 @@ impl Plugin for AiPromptCompressor {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    fn enforces_finalized_request_policy(&self) -> bool {
+        true
+    }
+
     fn modifies_request_body(&self) -> bool {
         true
     }

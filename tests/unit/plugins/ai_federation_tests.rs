@@ -26,8 +26,14 @@ async fn run_federation_final_body(
         .get("request_body")
         .cloned()
         .unwrap_or_default();
+    let mut backend_header_overlay = HashMap::new();
     plugin
-        .on_final_request_body_with_context(ctx, headers, body.as_bytes())
+        .dispatch_finalized_request_egress(
+            ctx,
+            headers,
+            body.as_bytes(),
+            &mut backend_header_overlay,
+        )
         .await
 }
 
@@ -72,8 +78,9 @@ fn test_plugin_metadata_and_warmup_hostnames() {
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(!plugin.requires_request_body_before_before_proxy());
     assert!(plugin.requires_request_body_buffering());
-    assert!(plugin.needs_final_request_body_context());
+    assert!(!plugin.needs_final_request_body_context());
     assert!(plugin.requires_final_request_body_before_backend_dispatch());
+    assert!(plugin.dispatches_finalized_request_egress());
     assert!(!plugin.requires_response_body_buffering());
     assert!(!plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
@@ -4027,8 +4034,24 @@ async fn provider_dispatch_uses_authoritative_final_transformed_body() {
     });
     let mut ctx = post_json_ctx(&stale);
     let final_bytes = serde_json::to_vec(&final_body).unwrap();
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), &final_bytes)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "the ordered final-body hook pass must never perform provider I/O, even if priority_override moves federation ahead of a policy plugin"
+    );
+    let mut backend_header_overlay = HashMap::new();
     let result = plugin
-        .on_final_request_body_with_context(&mut ctx, &json_headers(), &final_bytes)
+        .dispatch_finalized_request_egress(
+            &mut ctx,
+            &json_headers(),
+            &final_bytes,
+            &mut backend_header_overlay,
+        )
         .await;
     assert!(matches!(
         result,

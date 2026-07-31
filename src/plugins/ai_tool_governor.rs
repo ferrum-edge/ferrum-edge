@@ -2467,6 +2467,10 @@ impl Plugin for AiToolGovernor {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    fn enforces_finalized_request_policy(&self) -> bool {
+        true
+    }
+
     fn warmup_hostnames(&self) -> Vec<String> {
         self.engine
             .approval

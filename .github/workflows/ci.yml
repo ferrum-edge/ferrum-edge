@@ -1009,6 +1009,7 @@ jobs:
               functional_request_mirror_admission_test
               functional_request_mirror_query_parity_test
               functional_request_transformer_query_test
+              functional_openapi_client_contract_test
               functional_load_testing_replay_test
               functional_passthrough_test
               functional_sse_test
@@ -1062,6 +1063,7 @@ jobs:
               functional_policy_path_canonicalization_test
               functional_response_mock_grpc_exclusion_test
               functional_response_mock_semantics_test
+              functional_response_protocol_managed_headers_test
               functional_websocket_limits_test
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and

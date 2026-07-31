@@ -645,6 +645,143 @@ pub(crate) fn strip_response_hop_by_hop_trailers(trailers: &mut http::HeaderMap)
     }
 }
 
+/// Closed set of response header destinations that plugins must not configure
+/// as write targets. Framing (`content-length`, `transfer-encoding`,
+/// `trailer`) and connection control (`connection`, `upgrade`, …) are owned by
+/// the gateway's final protocol boundary, not by `response_transformer` /
+/// `response_mock` static rules.
+///
+/// `remove` of these names remains allowed (it is a no-op after origin strip).
+/// Rename sources may still name them so a rule can move a value *away* from a
+/// protocol-managed field; only the rename *destination* is rejected.
+pub const PROTOCOL_MANAGED_PLUGIN_RESPONSE_DESTINATION_NAMES: &[&str] = &[
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Case-insensitive membership in
+/// [`PROTOCOL_MANAGED_PLUGIN_RESPONSE_DESTINATION_NAMES`].
+#[inline]
+pub fn is_protocol_managed_plugin_response_destination(name: &str) -> bool {
+    let lower = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    };
+    PROTOCOL_MANAGED_PLUGIN_RESPONSE_DESTINATION_NAMES.contains(&lower.as_ref())
+}
+
+/// How the final client-wire boundary should derive `Content-Length`.
+///
+/// Hop-by-hop and Connection-listed fields are always stripped. Body framing
+/// is then repaired from this hint so a plugin cannot leave a stale or hostile
+/// length on the map after `after_proxy`.
+#[derive(Debug, Clone, Copy)]
+pub enum ClientResponseFraming {
+    /// Buffered / synthetic body whose wire length is known. Sets
+    /// `Content-Length` to `len` unless the status forbids a body (then
+    /// strips it). Not for `HEAD` — use [`Self::Head`] so a backend
+    /// representation length is preserved instead of inventing `0` from an
+    /// empty wire body.
+    ExactBody { status: u16, len: u64 },
+    /// Ordinary streaming response whose final wire length is unknown at header
+    /// time: `Content-Length` is removed outright.
+    ///
+    /// Nothing on this path can verify a length against the bytes that will
+    /// actually be written, so a value surviving `after_proxy` is an unverified
+    /// claim — and `security_headers.set`, `opa.deny_headers`, and any other
+    /// operator-configured response writer can author a *syntactically valid*
+    /// one. Preserving it would publish a framing lie: on an HTTP/1.1 chain a
+    /// recipient that believes the length and one that reads to the connection
+    /// close disagree about where the message ends, which is the request/response
+    /// desync primitive this boundary exists to remove.
+    ///
+    /// Removing it is safe on every protocol Ferrum speaks: HTTP/1.1 falls back
+    /// to chunked transfer-coding (or connection close), and HTTP/2 / HTTP/3
+    /// frame the body with END_STREAM / FIN. Only the trusted [`Self::Head`]
+    /// case may keep a representation length, and only because the gateway —
+    /// not a plugin — established that the response carries no body at all.
+    Streaming,
+    /// `HEAD`, or a gateway-selected status that forbids a message body: the
+    /// wire body is empty *by protocol*, so a surviving `Content-Length`
+    /// describes the representation a `GET` would have returned rather than the
+    /// bytes on the wire and cannot desync framing.
+    ///
+    /// Preserves one valid decimal `Content-Length` when the status may carry a
+    /// body, canonicalizes its key spelling, drops invalid values, and drops the
+    /// field entirely (including every case variant) when the status forbids a
+    /// body.
+    ///
+    /// This variant is chosen STRUCTURALLY — from the trusted request method and
+    /// the gateway-selected status — never from a response header name or value,
+    /// and never from a caller-supplied boolean that a future call site could
+    /// forget to derive.
+    Head { status: u16 },
+    /// Native gRPC trailers-only error: HTTP 200 with terminal metadata in the
+    /// header block and no DATA frames. gRPC never frames with
+    /// `Content-Length`, and the body is empty by construction, so the field is
+    /// removed outright — neither invented as `0` (which would break the
+    /// trailers-only frame sequence clients expect) nor preserved from a
+    /// plugin-authored value (which would be a framing lie on an empty body).
+    ///
+    /// The `Content-Length` outcome now coincides with [`Self::Streaming`], but
+    /// the variant is kept distinct because the two assert different things:
+    /// `Streaming` says "the length is not yet knowable", while `TrailersOnly`
+    /// says "there are no DATA frames at all and gRPC never frames with
+    /// `Content-Length`". Collapsing them would make a future length-bearing
+    /// relaxation of one silently apply to the other.
+    TrailersOnly,
+}
+
+/// Trusted body-omission signal for a final reject / synthetic response writer.
+///
+/// Derived only from the request method and the gateway-selected status through
+/// the shared synthetic-response wire contract
+/// ([`crate::plugins::utils::synthetic_response::synthetic_response_omits_body`]).
+/// It must never be inferred from response header names or values: plugins and
+/// backends control those, and that is exactly the input the protocol-framing
+/// advisory covers.
+///
+/// The default is deliberately [`Self::WireBody`] — the fail-closed choice. A
+/// caller that forgets to derive the signal publishes an authoritative exact
+/// length instead of preserving an attacker-authored one; the worst outcome is
+/// a `HEAD` reject losing its representation length, never a smuggling primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RejectBodyDisposition {
+    /// Ordinary HTTP reject (including failed WebSocket handshakes): the final
+    /// body slice *is* the wire representation, so its length is authoritative —
+    /// including zero. Any plugin-authored `Content-Length` is replaced.
+    #[default]
+    WireBody,
+    /// `HEAD`, or a status that forbids a message body. The shared contract
+    /// ([`crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire`])
+    /// already emptied the body and established (or stripped) the representation
+    /// `Content-Length`; only that length may survive. An empty wire body here
+    /// must not be turned into `Content-Length: 0`.
+    OmittedByProtocol,
+}
+
+impl RejectBodyDisposition {
+    /// Derive the disposition from the trusted request method and the final
+    /// gateway-selected status.
+    #[inline]
+    pub fn for_request(method: &str, status: u16) -> Self {
+        use crate::plugins::utils::synthetic_response::synthetic_response_omits_body;
+        if synthetic_response_omits_body(method, status) {
+            Self::OmittedByProtocol
+        } else {
+            Self::WireBody
+        }
+    }
+}
+
 /// Which trailer-section semantics one reconciliation is applying.
 ///
 /// This is the ONLY thing that can exempt a trailer field name, and it is chosen
@@ -691,6 +828,359 @@ impl TrailerSectionKind {
             }
         }
     }
+}
+
+impl ClientResponseFraming {
+    /// Framing for a final reject/synthetic writer whose body bytes are already
+    /// final.
+    ///
+    /// An ordinary empty reject resolves to `ExactBody { len: 0 }` so the
+    /// canonical `Content-Length: 0` replaces anything a mutable response hook
+    /// left behind. Only a trusted [`RejectBodyDisposition::OmittedByProtocol`]
+    /// selects [`Self::Head`], where a `HEAD` representation length must survive
+    /// untouched.
+    ///
+    /// A non-empty `body_len` always wins: the caller is about to write those
+    /// bytes, so claiming the protocol omitted the body would publish a length
+    /// that does not match the wire. That keeps a caller which derived the
+    /// disposition without running
+    /// [`crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire`]
+    /// framed correctly instead of length-less.
+    #[inline]
+    pub fn for_final_reject(
+        status: u16,
+        body_len: usize,
+        disposition: RejectBodyDisposition,
+    ) -> Self {
+        match disposition {
+            RejectBodyDisposition::OmittedByProtocol if body_len == 0 => Self::Head { status },
+            _ => Self::ExactBody {
+                status,
+                len: body_len as u64,
+            },
+        }
+    }
+
+    /// Framing for a fully buffered client response whose body bytes are final.
+    ///
+    /// Shared by the H1/H2 buffered writer, the native HTTP/3 buffered writer,
+    /// and the HTTP/3 cross-protocol bridge so the three cannot drift: on a
+    /// buffered path the gateway holds the exact wire body, so a stale or
+    /// plugin-authored `Content-Length` is replaced rather than preserved.
+    ///
+    /// `HEAD` is the one exception — its wire body is empty by protocol while
+    /// `Content-Length` still describes the representation a `GET` would return,
+    /// so [`Self::Head`] keeps the backend value instead of overwriting it
+    /// with `0`.
+    #[inline]
+    pub fn for_buffered_response(method: &str, status: u16, body_len: usize) -> Self {
+        if request_method_omits_response_body(method) {
+            Self::Head { status }
+        } else {
+            Self::ExactBody {
+                status,
+                len: body_len as u64,
+            }
+        }
+    }
+
+    /// Framing for a **streaming** plain-HTTP client response whose final wire
+    /// length is not knowable at header-write time.
+    ///
+    /// Shared by every H1/H2/H3 streaming writer so the ordinary-vs-`HEAD`
+    /// distinction is derived once, from the trusted request method, instead of
+    /// being spelled out per call site. An ordinary response resolves to
+    /// [`Self::Streaming`] and therefore loses any `Content-Length` that
+    /// survived `after_proxy`; only `HEAD` resolves to [`Self::Head`], where the
+    /// wire body is empty by protocol and a valid representation length may
+    /// stand.
+    ///
+    /// Native gRPC (and gRPC-Web translation) must NOT use this: gRPC has no
+    /// `HEAD` and never frames with `Content-Length`, so those writers pass
+    /// [`Self::Streaming`] / [`Self::TrailersOnly`] directly.
+    #[inline]
+    pub fn for_streaming_response(method: &str, status: u16) -> Self {
+        if request_method_omits_response_body(method) {
+            Self::Head { status }
+        } else {
+            Self::Streaming
+        }
+    }
+
+    /// Framing for a fully buffered **gRPC** response whose body bytes are final.
+    ///
+    /// An empty body means the response carries no DATA frames at all: either a
+    /// genuine native Trailers-Only response, or a gRPC error a plugin reject
+    /// produced in `after_proxy`, `on_response_body`, or `on_final_response_body`
+    /// (all three normalize to `body: []` with the plugin's own header map).
+    /// gRPC never frames with `Content-Length`, so the field is removed outright
+    /// — never invented as `0`, never preserved from a plugin-authored map.
+    ///
+    /// Keying on the final body rather than on which hook produced it is what
+    /// makes this total: the reject arms do not share a single flag, so any
+    /// phase-based discriminator silently misses the ones it does not enumerate.
+    ///
+    /// A non-empty buffered body publishes its exact length. gRPC has no `HEAD`,
+    /// so there is no representation-length case to preserve here.
+    #[inline]
+    pub fn for_buffered_grpc(status: u16, body_len: usize) -> Self {
+        if body_len == 0 {
+            Self::TrailersOnly
+        } else {
+            Self::ExactBody {
+                status,
+                len: body_len as u64,
+            }
+        }
+    }
+}
+
+/// Whether a plugin-produced map needs the full wire sanitizer for `framing`.
+///
+/// Hot paths that can share an immutable header map use this to avoid cloning
+/// when the map is already clean and framing requires no `Content-Length`
+/// rewrite.
+pub fn needs_client_response_wire_sanitization(
+    headers: &std::collections::HashMap<String, String>,
+    framing: ClientResponseFraming,
+) -> bool {
+    if has_client_response_hop_by_hop_headers(headers)
+        || headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length") && name != "content-length")
+    {
+        return true;
+    }
+    match framing {
+        ClientResponseFraming::ExactBody { status, len } => {
+            if status_forbids_response_body(status) {
+                headers.contains_key("content-length")
+            } else {
+                !headers
+                    .get("content-length")
+                    .is_some_and(|value| canonical_content_length_matches(value, len))
+            }
+        }
+        ClientResponseFraming::Head { status } => {
+            if status_forbids_response_body(status) {
+                headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("content-length"))
+            } else {
+                preserved_content_length_needs_repair(headers)
+            }
+        }
+        ClientResponseFraming::Streaming | ClientResponseFraming::TrailersOnly => headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+    }
+}
+
+/// Whether an existing value is already the exact canonical spelling
+/// [`set_content_length_header`] would write for `expected`.
+///
+/// Stricter than [`is_wire_valid_content_length`]: a leading zero is legal on
+/// the wire but is not what `u64::to_string()` produces, so `041` is reported as
+/// needing repair to keep the "already canonical" fast path honest.
+#[inline]
+fn canonical_content_length_matches(value: &str, expected: u64) -> bool {
+    let bytes = value.as_bytes();
+    is_wire_valid_content_length(value)
+        && (bytes.len() == 1 || bytes[0] != b'0')
+        && value.parse::<u64>() == Ok(expected)
+}
+
+/// Statuses that must not carry a message body (RFC 9110 §6.4.1 / §15.2).
+///
+/// Delegates to the shared synthetic-response wire contract rather than
+/// re-listing the statuses. The two halves of the reject boundary must agree:
+/// [`RejectBodyDisposition::for_request`] derives its omission signal from
+/// [`crate::plugins::utils::synthetic_response::synthetic_response_omits_body`]
+/// (which is built on the same predicate), and
+/// [`ClientResponseFraming::for_final_reject`] hands the result here for the
+/// actual `Content-Length` decision. A second copy of the status list would let
+/// those two disagree the moment either side gains a status — and a disposition
+/// that says "omitted" paired with a framing repair that says "body allowed"
+/// preserves exactly the plugin-authored length this boundary exists to remove.
+#[inline]
+fn status_forbids_response_body(status: u16) -> bool {
+    crate::plugins::utils::synthetic_response::status_forbids_response_body(status)
+}
+
+/// Methods whose response never carries content bytes (`HEAD`).
+///
+/// Delegates to the same shared contract as [`status_forbids_response_body`] so
+/// the framing constructors and [`RejectBodyDisposition::for_request`] cannot
+/// disagree about which requests are allowed to keep a representation length.
+#[inline]
+fn request_method_omits_response_body(method: &str) -> bool {
+    crate::plugins::utils::synthetic_response::request_method_omits_response_body(method)
+}
+
+/// Whether a value is a legal `Content-Length` field value for the wire.
+///
+/// RFC 9110 §8.6 defines `Content-Length = 1*DIGIT`, so acceptance must be an
+/// explicit ASCII-digit check — **not** `parse::<u64>()` alone. Rust's integer
+/// `FromStr` accepts a leading `+`, so a plugin-authored `Content-Length: +42`
+/// parses successfully while being malformed on the wire: a recipient may read
+/// it as `42`, as `0`, or reject the message, and disagreeing intermediaries on
+/// an H1 chain is exactly the framing-desync primitive this boundary exists to
+/// remove. Overflowing values (more digits than `u64` holds) are likewise
+/// refused because the gateway cannot represent, compare, or repair them.
+///
+/// Leading zeroes remain accepted: `1*DIGIT` permits them and the value is
+/// unambiguous, so a valid backend spelling is preserved rather than rewritten.
+#[inline]
+fn is_wire_valid_content_length(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok()
+}
+
+fn preserved_content_length_needs_repair(
+    headers: &std::collections::HashMap<String, String>,
+) -> bool {
+    let mut count = 0usize;
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        count += 1;
+        // `is_wire_valid_content_length` subsumes the old trim comparison:
+        // a digits-only value cannot carry leading or trailing whitespace.
+        if count > 1 || name != "content-length" || !is_wire_valid_content_length(value) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Preserve already-safe `content-length` key/value storage — including
+/// parseable leading-zero values — and repair only invalid or ambiguous
+/// storage. Multiple case variants are duplicate `Content-Length` fields
+/// once converted to an HTTP HeaderMap, so fail closed by removing all of them.
+///
+/// Already-safe common path: exactly one lowercase `content-length` whose value
+/// is a bare `1*DIGIT` string under the same acceptance policy as
+/// [`is_wire_valid_content_length`] is left untouched — no remove or reinsert
+/// allocation. Leading zeroes remain accepted (and preserved) because
+/// `1*DIGIT` permits them.
+///
+/// Repair only rehomes a value that is still an unambiguous decimal length once
+/// surrounding whitespace is removed. A spelling that is not `1*DIGIT` after
+/// trimming (a signed `+42`, a non-numeric string, an overflowing run of
+/// digits) is dropped outright rather than reinterpreted: the gateway has no way
+/// to verify the claim, and omitting the field leaves the response correctly
+/// framed by the protocol's own end-of-body signal.
+///
+/// Reached only from [`ClientResponseFraming::Head`] — the sole arm that
+/// preserves a caller-supplied length at all.
+fn canonicalize_preserved_content_length(headers: &mut std::collections::HashMap<String, String>) {
+    // Hot path: nothing to repair — keep existing key/value storage.
+    if !preserved_content_length_needs_repair(headers) {
+        return;
+    }
+    let mut parsed = None;
+    let mut count = 0usize;
+    for (name, value) in headers.iter() {
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        count += 1;
+        let trimmed = value.trim();
+        let value = is_wire_valid_content_length(trimmed)
+            .then(|| trimmed.parse::<u64>().ok())
+            .flatten();
+        if count == 1 {
+            parsed = value;
+        } else {
+            parsed = None;
+        }
+    }
+    if count == 0 {
+        return;
+    }
+    remove_content_length_header(headers);
+    if count == 1
+        && let Some(len) = parsed
+    {
+        headers.insert("content-length".to_string(), len.to_string());
+    }
+}
+
+/// Remove every `Content-Length` case variant from a plugin/backend string map.
+///
+/// [`ClientResponseFraming::Streaming`] now removes the field itself, so callers
+/// on paths that replace or retranslate the body (native H3 gRPC streaming,
+/// gRPC-Web translation, stream inspectors, deadline replacement) use this only
+/// to drop a length that internal accounting must not read either — the
+/// gateway's own `content_length_header_value` captures happen *after* those
+/// omissions, and a stale backend length there would misclassify a truncated or
+/// retranslated body. It remains mandatory before
+/// [`ClientResponseFraming::Head`], which still preserves a valid value.
+#[inline]
+pub fn remove_content_length_header(headers: &mut std::collections::HashMap<String, String>) {
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("content-length"));
+}
+
+/// The declared `Content-Length` the final wire boundary considers unambiguous,
+/// captured for the gateway's own accounting *before*
+/// [`ClientResponseFraming::Streaming`] removes the field.
+///
+/// Streaming writers still need a backend-declared length internally — H3
+/// graceful-close completeness classification, the direct-H2 large-response
+/// coalescer bypass, response body preallocation. Those reads used to happen
+/// against the post-sanitization map, so this reproduces exactly what that map
+/// would have held: `None` unless there is exactly one `Content-Length` case
+/// variant whose trimmed value is a `1*DIGIT` decimal that fits `u64`, and
+/// `None` for any status that forbids a message body.
+///
+/// It is deliberately NOT [`content_length_header_value`], which returns the
+/// first `parse()`-able variant: that accepts a signed `+42` and silently picks
+/// one of several conflicting duplicates, neither of which may inform gateway
+/// truncation decisions.
+pub fn preserved_response_content_length(
+    headers: &std::collections::HashMap<String, String>,
+    status: u16,
+) -> Option<u64> {
+    if status_forbids_response_body(status) {
+        return None;
+    }
+    let mut found = None;
+    let mut count = 0usize;
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        count += 1;
+        if count > 1 {
+            // Duplicate field once converted to a HeaderMap — fail closed.
+            return None;
+        }
+        let trimmed = value.trim();
+        if !is_wire_valid_content_length(trimmed) {
+            return None;
+        }
+        found = trimmed.parse::<u64>().ok();
+    }
+    found
+}
+
+fn set_content_length_header(headers: &mut std::collections::HashMap<String, String>, len: u64) {
+    // Hot path: exactly one lowercase canonical Content-Length whose untrimmed
+    // decimal value already matches the trusted length — preserve existing
+    // key/value storage instead of remove+reinsert allocation.
+    if headers
+        .get("content-length")
+        .is_some_and(|value| canonical_content_length_matches(value, len))
+        && !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length") && name != "content-length")
+    {
+        return;
+    }
+    remove_content_length_header(headers);
+    headers.insert("content-length".to_string(), len.to_string());
 }
 
 /// Outcome of a case-insensitive lookup into a plugin-facing header map.
@@ -1180,10 +1670,12 @@ pub(crate) fn reconcile_backend_trailers_with_response_policy(
 
 /// Strip response-direction hop-by-hop names from a plugin header map.
 ///
-/// Used as a final sanitation pass on HTTP/3 client-facing responses after
+/// Used as the hop-by-hop half of the final client-wire boundary after
 /// `after_proxy` hooks (which may reintroduce connection-specific fields such
-/// as `Connection: keep-alive`) and before every H3 response writer. H1 may
-/// still carry intentional connection options; H3 must not (RFC 9114 §4.2).
+/// as `Connection: keep-alive`) and before every H1/H2/H3 response builder.
+/// Gateway-owned connection options (`Connection: close` during drain, WebSocket
+/// `Upgrade`/`Connection`) are applied only after this strip returns.
+/// Prefer [`sanitize_client_response_headers_for_wire`] when body framing is known.
 pub fn strip_client_response_hop_by_hop_headers(
     headers: &mut std::collections::HashMap<String, String>,
 ) {
@@ -1197,6 +1689,57 @@ pub fn strip_client_response_hop_by_hop_headers(
                 .iter()
                 .any(|listed| name.eq_ignore_ascii_case(listed))
     });
+}
+
+/// Authoritative final protocol-aware response-header sanitizer.
+///
+/// Runs after every mutable response hook and before every H1/H2/H3 builder:
+/// strips hop-by-hop / Connection-listed fields, then derives or repairs
+/// `Content-Length` from [`ClientResponseFraming`]. Does not touch trailer
+/// frames (gRPC metadata); only the `Trailer` *header* is removed with the
+/// hop-by-hop set.
+pub fn sanitize_client_response_headers_for_wire(
+    headers: &mut std::collections::HashMap<String, String>,
+    framing: ClientResponseFraming,
+) {
+    strip_client_response_hop_by_hop_headers(headers);
+    match framing {
+        ClientResponseFraming::ExactBody { status, len } => {
+            if status_forbids_response_body(status) {
+                remove_content_length_header(headers);
+            } else {
+                set_content_length_header(headers, len);
+            }
+        }
+        ClientResponseFraming::Head { status } => {
+            if status_forbids_response_body(status) {
+                remove_content_length_header(headers);
+            } else {
+                // HEAD: the wire body is empty by protocol, so a valid value is
+                // a representation length that cannot desync framing. Preserve
+                // one, canonicalizing the key/value and removing duplicate case
+                // variants before HeaderMap construction.
+                canonicalize_preserved_content_length(headers);
+            }
+        }
+        // Ordinary streaming and trailers-only gRPC: nothing here can verify a
+        // length against the bytes still to be written, so every case variant
+        // goes — including a syntactically valid lowercase value a response hook
+        // authored. See `ClientResponseFraming::Streaming`.
+        ClientResponseFraming::Streaming | ClientResponseFraming::TrailersOnly => {
+            remove_content_length_header(headers)
+        }
+    }
+}
+
+/// Sanitize then apply headers onto a response builder.
+pub fn apply_sanitized_response_headers(
+    builder: http::response::Builder,
+    headers: &mut std::collections::HashMap<String, String>,
+    framing: ClientResponseFraming,
+) -> http::response::Builder {
+    sanitize_client_response_headers_for_wire(headers, framing);
+    apply_response_headers(builder, headers)
 }
 
 /// Append a cookie to the proxy's newline-separated multi-value representation.
@@ -2056,5 +2599,193 @@ mod tests {
             resp.headers().get("x-other").and_then(|v| v.to_str().ok()),
             Some("v")
         );
+    }
+
+    #[test]
+    fn protocol_managed_plugin_destinations_cover_framing_and_connection_control() {
+        for name in [
+            "Connection",
+            "CONTENT-LENGTH",
+            "keep-alive",
+            "Proxy-Authenticate",
+            "proxy-connection",
+            "TE",
+            "Trailer",
+            "Transfer-Encoding",
+            "Upgrade",
+        ] {
+            assert!(
+                is_protocol_managed_plugin_response_destination(name),
+                "{name} must be protocol-managed"
+            );
+        }
+        assert!(!is_protocol_managed_plugin_response_destination("x-custom"));
+        assert!(!is_protocol_managed_plugin_response_destination(
+            "content-type"
+        ));
+    }
+
+    #[test]
+    fn sanitize_client_response_strips_hop_by_hop_connection_listed_and_repairs_length() {
+        let mut headers = std::collections::HashMap::from([
+            ("connection".to_string(), "close, x-internal".to_string()),
+            ("x-internal".to_string(), "leak".to_string()),
+            ("transfer-encoding".to_string(), "chunked".to_string()),
+            ("content-length".to_string(), "999".to_string()),
+            ("x-ok".to_string(), "1".to_string()),
+        ]);
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::ExactBody {
+                status: 200,
+                len: 4,
+            },
+        );
+        assert!(!headers.contains_key("connection"));
+        assert!(!headers.contains_key("x-internal"));
+        assert!(!headers.contains_key("transfer-encoding"));
+        assert_eq!(headers.get("content-length").map(String::as_str), Some("4"));
+        assert_eq!(headers.get("x-ok").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn sanitize_client_response_strips_content_length_for_no_body_status() {
+        let mut headers = std::collections::HashMap::from([
+            ("content-length".to_string(), "12".to_string()),
+            ("x-ok".to_string(), "1".to_string()),
+        ]);
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::ExactBody {
+                status: 204,
+                len: 12,
+            },
+        );
+        assert!(!headers.contains_key("content-length"));
+        assert_eq!(headers.get("x-ok").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn sanitize_head_strips_invalid_content_length_and_preserves_valid() {
+        let mut bad = std::collections::HashMap::from([(
+            "content-length".to_string(),
+            "not-a-number".to_string(),
+        )]);
+        sanitize_client_response_headers_for_wire(
+            &mut bad,
+            ClientResponseFraming::Head { status: 200 },
+        );
+        assert!(!bad.contains_key("content-length"));
+
+        let mut good =
+            std::collections::HashMap::from([("content-length".to_string(), "42".to_string())]);
+        sanitize_client_response_headers_for_wire(
+            &mut good,
+            ClientResponseFraming::Head { status: 200 },
+        );
+        assert_eq!(good.get("content-length").map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn sanitize_head_canonicalizes_one_mixed_case_length_and_drops_duplicates() {
+        let mut mixed =
+            std::collections::HashMap::from([("Content-Length".to_string(), " 42 ".to_string())]);
+        sanitize_client_response_headers_for_wire(
+            &mut mixed,
+            ClientResponseFraming::Head { status: 200 },
+        );
+        assert_eq!(mixed.get("content-length").map(String::as_str), Some("42"));
+        assert!(!mixed.contains_key("Content-Length"));
+
+        let mut duplicates = std::collections::HashMap::from([
+            ("content-length".to_string(), "42".to_string()),
+            ("Content-Length".to_string(), "42".to_string()),
+        ]);
+        sanitize_client_response_headers_for_wire(
+            &mut duplicates,
+            ClientResponseFraming::Head { status: 200 },
+        );
+        assert!(
+            !duplicates
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length"))
+        );
+    }
+
+    #[test]
+    fn intentional_content_length_omit_before_streaming_sanitize_drops_mixed_case() {
+        // Paths that must omit length (H3 gRPC streaming, gRPC-Web translation,
+        // inspectors, deadline replacement) strip first so the gateway's own
+        // `content_length_header_value` capture cannot read a stale backend
+        // length; Streaming sanitization then drops any remaining variant.
+        let mut headers = std::collections::HashMap::from([
+            ("Content-Length".to_string(), "999".to_string()),
+            ("x-ok".to_string(), "1".to_string()),
+        ]);
+        assert_eq!(preserved_response_content_length(&headers, 200), Some(999));
+        remove_content_length_header(&mut headers);
+        sanitize_client_response_headers_for_wire(&mut headers, ClientResponseFraming::Streaming);
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length")),
+            "mixed-case Content-Length must not survive omit-then-Streaming sanitize"
+        );
+        assert_eq!(headers.get("x-ok").map(String::as_str), Some("1"));
+        assert_eq!(preserved_response_content_length(&headers, 200), None);
+    }
+
+    #[test]
+    fn sanitize_trailers_only_removes_every_content_length_variant() {
+        let mut headers = std::collections::HashMap::from([
+            ("Content-Length".to_string(), "999".to_string()),
+            ("content-length".to_string(), "0".to_string()),
+            ("grpc-status".to_string(), "7".to_string()),
+        ]);
+        assert!(needs_client_response_wire_sanitization(
+            &headers,
+            ClientResponseFraming::TrailersOnly
+        ));
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::TrailersOnly,
+        );
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length"))
+        );
+        assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
+
+        let mut clean = std::collections::HashMap::new();
+        clean.insert("grpc-status".to_string(), "7".to_string());
+        assert!(!needs_client_response_wire_sanitization(
+            &clean,
+            ClientResponseFraming::TrailersOnly
+        ));
+    }
+
+    #[test]
+    fn exact_body_sanitization_predicate_accepts_only_canonical_matching_length() {
+        let framing = ClientResponseFraming::ExactBody {
+            status: 200,
+            len: 42,
+        };
+        let canonical =
+            std::collections::HashMap::from([("content-length".to_string(), "42".to_string())]);
+        assert!(!needs_client_response_wire_sanitization(
+            &canonical, framing
+        ));
+
+        for value in ["041", "042", "42 ", "+42", "41"] {
+            let headers = std::collections::HashMap::from([(
+                "content-length".to_string(),
+                value.to_string(),
+            )]);
+            assert!(
+                needs_client_response_wire_sanitization(&headers, framing),
+                "{value:?} must be repaired"
+            );
+        }
     }
 }

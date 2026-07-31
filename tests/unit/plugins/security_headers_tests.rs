@@ -459,3 +459,119 @@ fn no_op_config_is_rejected() {
     .unwrap_err();
     assert!(err.contains("no headers"));
 }
+
+/// The closed set of destinations the gateway's final wire boundary owns.
+const PROTOCOL_MANAGED_DESTINATIONS: &[&str] = &[
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Every case spelling worth probing for one field name: canonical lowercase,
+/// screaming upper, and per-token title case.
+fn case_variants(name: &str) -> Vec<String> {
+    let title = name
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-");
+    vec![name.to_string(), name.to_ascii_uppercase(), title]
+}
+
+fn set_config(name: &str, value: &str) -> serde_json::Value {
+    let mut set = serde_json::Map::new();
+    set.insert(
+        name.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
+    json!({ "set": serde_json::Value::Object(set) })
+}
+
+/// GHSA-xvr4 residual: `set` accepted any syntactically valid field name,
+/// including protocol-managed framing names, and applied them in `after_proxy`
+/// — i.e. after the backend hop-by-hop strip and before the gateway's final
+/// wire boundary. A `Content-Length` authored there is a valid-looking length
+/// the gateway cannot verify against a streamed body's bytes.
+///
+/// Rejection uses the shared case-insensitive predicate over the shared closed
+/// set, so every case variant of every protocol-managed name fails identically.
+#[test]
+fn set_rejects_every_protocol_managed_destination_case_insensitively() {
+    for name in PROTOCOL_MANAGED_DESTINATIONS {
+        for spelling in case_variants(name) {
+            let error = SecurityHeaders::new(&set_config(&spelling, "1"))
+                .expect_err(&format!("set.{spelling} must be rejected"));
+            assert!(
+                error.contains("protocol-managed"),
+                "diagnostic for set.{spelling} must say why: {error}"
+            );
+            assert!(
+                error.contains(name),
+                "diagnostic must name the offending setting with its canonical \
+                 lowercase field name: {error}"
+            );
+        }
+    }
+}
+
+/// The rejection is scoped to `set` destinations. `remove` of the same names
+/// stays allowed: dropping a protocol-managed field is a no-op after the origin
+/// strip and can never invent framing.
+#[tokio::test]
+async fn remove_still_accepts_protocol_managed_names() {
+    for name in PROTOCOL_MANAGED_DESTINATIONS {
+        for spelling in case_variants(name) {
+            SecurityHeaders::new(&json!({ "remove": [spelling.clone()] }))
+                .unwrap_or_else(|error| panic!("remove of {spelling} must stay allowed: {error}"));
+        }
+    }
+
+    // A config that removes framing names and sets an ordinary one is valid, and
+    // the ordinary header still applies.
+    let plugin = SecurityHeaders::new(&json!({
+        "remove": ["Content-Length", "Transfer-Encoding"],
+        "set": { "X-Env": "prod" }
+    }))
+    .expect("mixed remove/set config must construct");
+    let mut headers = HashMap::from([("content-length".to_string(), "999".to_string())]);
+    let mut request = ctx();
+    plugin.after_proxy(&mut request, 200, &mut headers).await;
+    assert!(
+        !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "a configured remove must still drop the field"
+    );
+    assert_eq!(headers.get("x-env").map(String::as_str), Some("prod"));
+}
+
+/// Ordinary and security-relevant custom destinations are unaffected — the
+/// closed set must not grow into a general-purpose name filter.
+#[test]
+fn set_still_accepts_ordinary_response_header_destinations() {
+    for name in [
+        "X-Env",
+        "Cache-Control",
+        "Content-Type",
+        "Content-Security-Policy",
+        "Strict-Transport-Security",
+        "Content-Encoding",
+        "Vary",
+        "Set-Cookie",
+    ] {
+        SecurityHeaders::new(&set_config(name, "1"))
+            .unwrap_or_else(|error| panic!("set.{name} must stay allowed: {error}"));
+    }
+}

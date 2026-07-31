@@ -618,10 +618,10 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
 ///
 /// Seeds registry-backed families (including the DOC-10 cited database-delta,
 /// remote-discovery, and raw-TCP egress signals), appends process observability
-/// families, appends default-prefix mesh BPF families, and appends api_chargeback
-/// registry families. Kafka / log-sink / chargeback sink series require live
-/// plugin/process state and are covered by the inventory + chart validators
-/// rather than this scrape fixture.
+/// and notification-delivery families, appends default-prefix mesh BPF families,
+/// and appends api_chargeback registry families. Kafka / log-sink / chargeback
+/// sink series require live plugin/process state and are covered by the
+/// inventory + chart validators rather than this scrape fixture.
 fn representative_exposition() -> String {
     let registry = MetricsRegistry::new();
     registry.configure(60, 3600, 0, "contract-ns");
@@ -662,6 +662,7 @@ fn representative_exposition() -> String {
 
     let mut output = registry.render_uncached();
     output.push_str(&ferrum_edge::observability_delivery::render_prometheus());
+    output.push_str(&ferrum_edge::notifications::render_delivery_prometheus());
 
     let bpf =
         MeshBpfMetrics::new(&serde_json::json!({})).expect("default bpf metrics plugin config");

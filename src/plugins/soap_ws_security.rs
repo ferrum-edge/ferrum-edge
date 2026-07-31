@@ -5003,6 +5003,10 @@ impl Plugin for SoapWsSecurity {
         super::HTTP_ONLY_PROTOCOLS
     }
 
+    fn enforces_finalized_request_policy(&self) -> bool {
+        true
+    }
+
     /// The timestamp-only configuration keeps validating in `before_proxy`; an
     /// identity-establishing one moves to `authenticate` instead. The two are
     /// mutually exclusive, so no message is validated twice.

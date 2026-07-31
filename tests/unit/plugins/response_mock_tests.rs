@@ -218,6 +218,31 @@ fn test_creation_rejects_unknown_rule_key() {
 }
 
 #[test]
+fn test_creation_rejects_protocol_managed_response_headers() {
+    for name in [
+        "Connection",
+        "CONTENT-LENGTH",
+        "Transfer-Encoding",
+        "Trailer",
+        "Upgrade",
+        "Keep-Alive",
+        "proxy-connection",
+        "TE",
+        "Proxy-Authenticate",
+    ] {
+        let err = ResponseMock::new(&json!({
+            "rules": [{
+                "path": "/x",
+                "headers": { name: "1" }
+            }]
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("expected rejection for header {name}"));
+        assert!(err.contains("protocol-managed"), "{name}: {err}");
+    }
+}
+
+#[test]
 fn test_creation_accepts_status_code_boundaries() {
     for status_code in [101u64, 200, 599] {
         let plugin = ResponseMock::new(&json!({
@@ -911,14 +936,15 @@ async fn test_websocket_upgrade_unmatched_passthrough_continues() {
 async fn test_websocket_upgrade_status_101_is_still_synthetic_reject() {
     // status 101 is a legal HTTP status for the synthetic handshake response,
     // but PluginResult::Reject never upgrades the connection to a frame stream.
+    // Protocol-managed Upgrade/Connection headers are rejected at construction;
+    // the gateway owns handshake framing at the WebSocket boundary.
     let plugin = ResponseMock::new(&json!({
         "rules": [{
             "path": "/socket",
             "status_code": 101,
             "body": "",
             "headers": {
-                "upgrade": "websocket",
-                "connection": "Upgrade"
+                "content-type": "text/plain"
             }
         }]
     }))

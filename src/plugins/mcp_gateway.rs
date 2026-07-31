@@ -6616,6 +6616,22 @@ fn parse_sessions(object: &Map<String, Value>) -> Result<McpSessionConfig, Strin
         &downstream_session_header,
         "sessions.downstream_session_header",
     )?;
+    // This one is stamped onto the CLIENT response (`json_response` /
+    // `classify_batch_item_result` insert it into a `PluginResult::Reject`
+    // header map), so it is an arbitrary response-header destination. Reject
+    // protocol-managed framing / connection-control names with the shared
+    // case-insensitive predicate: the gateway's final wire boundary owns
+    // Content-Length and the hop-by-hop set. `upstream_session_header` is a
+    // backend REQUEST field and keeps its own contract.
+    if crate::proxy::headers::is_protocol_managed_plugin_response_destination(
+        &downstream_session_header,
+    ) {
+        return Err(format!(
+            "mcp_gateway: 'sessions.downstream_session_header' is protocol-managed (hop-by-hop or \
+             framing) and cannot carry an MCP session id: {}",
+            downstream_session_header.to_ascii_lowercase()
+        ));
+    }
     let upstream_session_header = optional_string_from_object(sessions, "upstream_session_header")?
         .unwrap_or_else(|| "mcp-session-id".to_string());
     validate_session_header_name(&upstream_session_header, "sessions.upstream_session_header")?;

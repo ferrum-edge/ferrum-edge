@@ -14,13 +14,26 @@ pub fn status_forbids_response_body(status: u16) -> bool {
     matches!(status, 204 | 205 | 304) || (100..200).contains(&status)
 }
 
+/// Whether the request METHOD alone forbids content bytes on the response.
+///
+/// `HEAD` is the only such method: its response carries the same header section
+/// a `GET` would have (representation metadata included) but no message body
+/// (RFC 9110 §9.3.2). Kept as one predicate so the final client-wire framing
+/// boundary ([`crate::proxy::headers::ClientResponseFraming::for_streaming_response`])
+/// and [`synthetic_response_omits_body`] cannot disagree about which methods are
+/// body-less.
+#[inline]
+pub fn request_method_omits_response_body(method: &str) -> bool {
+    method.eq_ignore_ascii_case("HEAD")
+}
+
 /// Whether the wire response must omit content bytes for this method/status.
 ///
 /// Shared across H1/H2/H3 so response-size and synthetic-response paths cannot
 /// drift on body presence.
 #[inline]
 pub fn synthetic_response_omits_body(method: &str, status: u16) -> bool {
-    method.eq_ignore_ascii_case("HEAD") || status_forbids_response_body(status)
+    request_method_omits_response_body(method) || status_forbids_response_body(status)
 }
 
 /// Prepare headers and report whether the caller must omit content bytes.

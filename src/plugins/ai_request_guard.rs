@@ -1746,6 +1746,10 @@ impl Plugin for AiRequestGuard {
         super::HTTP_GRPC_PROTOCOLS
     }
 
+    fn enforces_finalized_request_policy(&self) -> bool {
+        true
+    }
+
     fn modifies_request_body(&self) -> bool {
         self.needs_body_transform
     }

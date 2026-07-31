@@ -444,7 +444,7 @@ fn start_gateway_with_extra_env(
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
     observability_token: &str,
-) -> Result<(std::process::Child, u16), Box<dyn std::error::Error>> {
+) -> Result<(std::process::Child, u16, std::path::PathBuf), Box<dyn std::error::Error>> {
     // Use a fresh admin HTTP port and disable admin HTTPS so parallel gateways
     // in the same functional shard never contend on the default admin ports
     // (9000/9443). Admin-listener bind failure aborts startup (fatal), which
@@ -457,6 +457,9 @@ fn start_gateway_with_extra_env(
     let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .map(|a| a.port())?;
+    let stderr_path =
+        std::path::Path::new(config_path).with_extension(format!("gateway-{http_port}.stderr.log"));
+    let stderr_file = std::fs::File::create(&stderr_path)?;
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
@@ -474,7 +477,7 @@ fn start_gateway_with_extra_env(
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::from(stderr_file));
 
     if let Some(port) = https_port {
         cmd.env("FERRUM_PROXY_HTTPS_PORT", port.to_string())
@@ -490,10 +493,53 @@ fn start_gateway_with_extra_env(
         cmd.env(name, value);
     }
 
-    Ok((cmd.spawn()?, admin_http_port))
+    Ok((cmd.spawn()?, admin_http_port, stderr_path))
+}
+
+/// Include the bounded tail of the child log in startup failures. The previous
+/// null stderr made deterministic config rejection look like a port-readiness
+/// flake and multiplied one root cause across every fixture consumer.
+fn gateway_startup_error(
+    error: &str,
+    stderr_path: &std::path::Path,
+    observability_token: &str,
+) -> String {
+    const MAX_LOG_CHARS: usize = 4_000;
+    let Ok(stderr) = std::fs::read_to_string(stderr_path) else {
+        return error.to_string();
+    };
+    let stderr = stderr.replace(observability_token, "[REDACTED]");
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return error.to_string();
+    }
+    let tail = if stderr.chars().count() > MAX_LOG_CHARS {
+        stderr
+            .chars()
+            .rev()
+            .take(MAX_LOG_CHARS)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+    } else {
+        stderr.to_string()
+    };
+    format!("{error}; gateway stderr (tail): {tail}")
 }
 
 /// Write a YAML config file with a WebSocket proxy pointing to the given backend port.
+///
+/// Keep protocol-managed hop-by-hop/framing destinations (`Connection`,
+/// `Upgrade`, `Content-Length`, …) out of `security_headers.set`: the plugin now
+/// rejects those at construction, and their rejection matrix is covered by the
+/// plugin unit tests.
+///
+/// The WebSocket negotiation names (`Sec-WebSocket-*`) are deliberately KEPT:
+/// they are still admissible configuration, and stripping them at the WebSocket
+/// response boundary is a separate production guarantee. Without these sentinel
+/// values `assert_no_ws_transport_policy_values` would pass vacuously on both
+/// successful handshakes and rejects.
 fn write_ws_config(config_path: &std::path::Path, backend_port: u16) {
     let config = format!(
         r#"
@@ -514,8 +560,6 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
-        Upgrade: "policy-must-not-escape"
-        Connection: "policy-must-not-escape"
         Sec-WebSocket-Accept: "policy-must-not-escape"
         Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
@@ -588,8 +632,6 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
-        Upgrade: "policy-must-not-escape"
-        Connection: "policy-must-not-escape"
         Sec-WebSocket-Accept: "policy-must-not-escape"
         Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
@@ -672,8 +714,6 @@ plugin_configs:
       set:
         X-WS-Security: "gateway-enforced"
         X-WS-Reject-Order: "security-policy"
-        Upgrade: "policy-must-not-escape"
-        Connection: "policy-must-not-escape"
         Sec-WebSocket-Accept: "policy-must-not-escape"
         Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by", "content-type"]
@@ -726,15 +766,6 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
-        Upgrade: "policy-must-not-escape"
-        Connection: "policy-must-not-escape"
-        Keep-Alive: "policy-must-not-escape"
-        Proxy-Authenticate: "policy-must-not-escape"
-        Proxy-Connection: "policy-must-not-escape"
-        TE: "policy-must-not-escape"
-        Trailer: "policy-must-not-escape"
-        Transfer-Encoding: "policy-must-not-escape"
-        Content-Length: "1"
         Sec-WebSocket-Accept: "policy-must-not-escape"
         Sec-WebSocket-Key: "policy-must-not-escape"
         Sec-WebSocket-Version: "policy-must-not-escape"
@@ -775,8 +806,6 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
-        Upgrade: "policy-must-not-escape"
-        Connection: "policy-must-not-escape"
         Sec-WebSocket-Accept: "policy-must-not-escape"
         Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
@@ -828,8 +857,6 @@ plugin_configs:
       hsts: true
       set:
         X-WS-Security: "gateway-enforced"
-        Upgrade: "policy-must-not-escape"
-        Connection: "policy-must-not-escape"
         Sec-WebSocket-Accept: "policy-must-not-escape"
         Sec-WebSocket-Protocol: "policy-must-not-escape"
       remove: ["server", "x-powered-by"]
@@ -1117,7 +1144,7 @@ async fn start_gateway_with_retry_extra_env(
             extra_env,
             &observability_token,
         ) {
-            Ok((mut child, admin_port)) => {
+            Ok((mut child, admin_port, stderr_path)) => {
                 let owned = wait_for_owned_gateway(
                     &mut child,
                     admin_port,
@@ -1128,13 +1155,17 @@ async fn start_gateway_with_retry_extra_env(
                 match owned {
                     Ok(()) => return (child, gateway_port),
                     Err(e) => {
-                        last_err = e.to_string();
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        last_err = gateway_startup_error(
+                            &e.to_string(),
+                            &stderr_path,
+                            &observability_token,
+                        );
                         eprintln!(
                             "Gateway startup attempt {}/{} failed (port {}): {}",
                             attempt, MAX_ATTEMPTS, gateway_port, last_err
                         );
-                        let _ = child.kill();
-                        let _ = child.wait();
                     }
                 }
             }
@@ -1174,7 +1205,7 @@ async fn start_gateway_plain_with_retry_extra_env(
             extra_env,
             &observability_token,
         ) {
-            Ok((mut child, admin_port)) => {
+            Ok((mut child, admin_port, stderr_path)) => {
                 let owned = wait_for_owned_gateway(
                     &mut child,
                     admin_port,
@@ -1185,13 +1216,17 @@ async fn start_gateway_plain_with_retry_extra_env(
                 match owned {
                     Ok(()) => return (child, gateway_port),
                     Err(e) => {
-                        last_err = e.to_string();
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        last_err = gateway_startup_error(
+                            &e.to_string(),
+                            &stderr_path,
+                            &observability_token,
+                        );
                         eprintln!(
                             "Gateway startup attempt {}/{} failed (port {}): {}",
                             attempt, MAX_ATTEMPTS, gateway_port, last_err
                         );
-                        let _ = child.kill();
-                        let _ = child.wait();
                     }
                 }
             }
@@ -1245,7 +1280,7 @@ async fn start_gateway_tls_with_retry_extra_env(
             extra_env,
             &observability_token,
         ) {
-            Ok((mut child, admin_port)) => {
+            Ok((mut child, admin_port, stderr_path)) => {
                 let owned = wait_for_owned_gateway(
                     &mut child,
                     admin_port,
@@ -1256,13 +1291,17 @@ async fn start_gateway_tls_with_retry_extra_env(
                 match owned {
                     Ok(()) => return (child, gateway_http_port, gateway_https_port),
                     Err(e) => {
-                        last_err = e.to_string();
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        last_err = gateway_startup_error(
+                            &e.to_string(),
+                            &stderr_path,
+                            &observability_token,
+                        );
                         eprintln!(
                             "Gateway TLS startup attempt {}/{} failed (ports {}/{}): {}",
                             attempt, MAX_ATTEMPTS, gateway_http_port, gateway_https_port, last_err
                         );
-                        let _ = child.kill();
-                        let _ = child.wait();
                     }
                 }
             }
@@ -1349,12 +1388,24 @@ fn assert_ws_later_reject_hook_wins(headers: &http::HeaderMap) {
     );
 }
 
+/// A response-header policy must never control a transport-managed WebSocket
+/// field, on a successful handshake or on a reject.
+///
+/// The `sec-websocket-*` sentinels are the load-bearing ones: those names are
+/// still admissible `security_headers.set` destinations, so the fixtures author
+/// `policy-must-not-escape` for them and only the WebSocket response boundary
+/// can keep it off the wire. `upgrade` / `connection` are additionally rejected
+/// at plugin construction now, so their sentinel can no longer be authored —
+/// they stay here as a cheap belt-and-braces check against a future writer.
 fn assert_no_ws_transport_policy_values(headers: &http::HeaderMap) {
     for name in [
         "upgrade",
         "connection",
         "sec-websocket-accept",
+        "sec-websocket-key",
+        "sec-websocket-version",
         "sec-websocket-protocol",
+        "sec-websocket-extensions",
     ] {
         assert_ne!(
             headers.get(name).and_then(|value| value.to_str().ok()),
@@ -1373,7 +1424,12 @@ fn assert_no_h1_only_websocket_headers(headers: &http::HeaderMap) {
     }
 }
 
-fn assert_no_failed_websocket_transport_headers(headers: &http::HeaderMap) {
+/// A failed WebSocket handshake is an ordinary HTTP response (RFC 6455 §4.2.2):
+/// it must not carry transport-owned negotiation or hop-by-hop fields, but it
+/// keeps ordinary representation metadata such as `Content-Length`. Framing
+/// coverage lives in [`assert_failed_websocket_handshake_framing`] and
+/// [`assert_authoritative_content_length`].
+fn assert_no_failed_websocket_negotiation_headers(headers: &http::HeaderMap) {
     for name in [
         "connection",
         "keep-alive",
@@ -1383,7 +1439,6 @@ fn assert_no_failed_websocket_transport_headers(headers: &http::HeaderMap) {
         "trailer",
         "transfer-encoding",
         "upgrade",
-        "content-length",
         "sec-websocket-accept",
         "sec-websocket-key",
         "sec-websocket-version",
@@ -1395,6 +1450,39 @@ fn assert_no_failed_websocket_transport_headers(headers: &http::HeaderMap) {
             "failed WebSocket handshake must not carry transport-managed {name}"
         );
     }
+}
+
+/// The reject must be self-delimiting through an authoritative gateway-derived
+/// `Content-Length`, never through `Transfer-Encoding` or connection close. A
+/// missing length here is how the earlier HTTP/1.0 framing workaround made
+/// RFC 6455 clients fail the handshake response outright.
+fn assert_failed_websocket_handshake_framing(headers: &http::HeaderMap) {
+    let Some(content_length) = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+    else {
+        panic!("failed WebSocket handshake must advertise Content-Length; headers={headers:?}");
+    };
+    assert!(
+        !content_length.is_empty() && content_length.bytes().all(|b| b.is_ascii_digit()),
+        "Content-Length must be a plain decimal, got {content_length:?}"
+    );
+    assert!(
+        headers.get(http::header::TRANSFER_ENCODING).is_none(),
+        "failed WebSocket handshake must not be chunked; headers={headers:?}"
+    );
+}
+
+/// Exact-length variant for call sites that can read the reject body.
+fn assert_authoritative_content_length(headers: &http::HeaderMap, body_len: usize) {
+    let expected = body_len.to_string();
+    assert_eq!(
+        headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected.as_str()),
+        "Content-Length must equal the {body_len}-byte reject body; headers={headers:?}"
+    );
 }
 
 // ============================================================================
@@ -1409,7 +1497,7 @@ async fn test_file_mode_rejects_non_object_correlation_id_config() {
     write_invalid_correlation_id_file_config(&config_path, free_port().await);
     build_gateway().expect("build gateway");
 
-    let (mut gateway, _admin_port) = start_gateway_with_extra_env(
+    let (mut gateway, _admin_port, _stderr_path) = start_gateway_with_extra_env(
         config_path.to_str().unwrap(),
         free_port().await,
         None,
@@ -1569,6 +1657,7 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
             assert_ws_security_policy(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
+            assert_no_failed_websocket_negotiation_headers(response.headers());
         }
         other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
     }
@@ -1590,6 +1679,7 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
             assert_ws_security_policy(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
+            assert_no_failed_websocket_negotiation_headers(response.headers());
         }
         other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
     }
@@ -1739,6 +1829,7 @@ async fn test_websocket_key_auth_rejects_missing_key() {
             assert_ws_security_policy(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
+            assert_no_failed_websocket_negotiation_headers(response.headers());
             assert_eq!(
                 response
                     .headers()
@@ -1785,6 +1876,7 @@ async fn test_h3_websocket_key_auth_reject_strips_transport_policy_fields() {
     assert_ws_security_policy(&rejected.headers);
     assert_no_ws_transport_policy_values(&rejected.headers);
     assert_no_h1_only_websocket_headers(&rejected.headers);
+    assert_no_failed_websocket_negotiation_headers(&rejected.headers);
     assert_eq!(
         rejected
             .headers
@@ -2123,7 +2215,7 @@ async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
     let contested_port = squatter.local_addr().unwrap().port();
 
     let observability_token = mint_observability_token();
-    let (mut child, admin_port) = start_gateway_with_extra_env(
+    let (mut child, admin_port, _stderr_path) = start_gateway_with_extra_env(
         config_path.to_str().unwrap(),
         contested_port,
         None,
@@ -2281,11 +2373,14 @@ async fn test_websocket_backend_admission_reject_strips_transport_policy_fields(
             assert_ws_later_reject_hook_wins(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
-            let body = response
-                .body()
-                .as_ref()
-                .map(|bytes| String::from_utf8_lossy(bytes).to_string())
-                .unwrap_or_default();
+            assert_no_failed_websocket_negotiation_headers(response.headers());
+            assert_failed_websocket_handshake_framing(response.headers());
+            let body_bytes = response.body().as_ref().cloned().unwrap_or_default();
+            // The H1 reject must stay a valid HTTP/1.1 response whose length the
+            // gateway derives itself: tungstenite rejects HTTP/1.0 handshake
+            // responses outright (RFC 6455 §4.1).
+            assert_authoritative_content_length(response.headers(), body_bytes.len());
+            let body = String::from_utf8_lossy(&body_bytes).to_string();
             assert!(
                 body.contains("Upstream concurrency limit reached"),
                 "unexpected rejection body: {body}"
@@ -2352,18 +2447,21 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
     assert_ws_later_reject_hook_wins(&rejected.headers);
     assert_no_ws_transport_policy_values(&rejected.headers);
     assert_no_h1_only_websocket_headers(&rejected.headers);
-    assert_no_failed_websocket_transport_headers(&rejected.headers);
+    assert_no_failed_websocket_negotiation_headers(&rejected.headers);
     assert!(
         !rejected.headers.contains_key(http::header::CONTENT_TYPE),
         "the final H3 reject writer must preserve policy removal of content-type"
     );
-    assert!(
-        rejected
-            .recv_body_text()
-            .await
-            .expect("backend-admission rejection body")
-            .contains("Upstream concurrency limit reached")
-    );
+    assert_failed_websocket_handshake_framing(&rejected.headers);
+    let rejected_headers = rejected.headers.clone();
+    let rejected_body = rejected
+        .recv_body_text()
+        .await
+        .expect("backend-admission rejection body");
+    assert!(rejected_body.contains("Upstream concurrency limit reached"));
+    // RFC 9220 failed Extended CONNECT: negotiation fields are stripped, but the
+    // gateway-derived representation length stays authoritative.
+    assert_authoritative_content_length(&rejected_headers, rejected_body.len());
 
     first_ws
         .send_close()
@@ -2412,14 +2510,15 @@ async fn test_h3_websocket_open_circuit_reject_strips_transport_policy_fields() 
     assert_ws_security_policy(&circuit_rejected.headers);
     assert_no_ws_transport_policy_values(&circuit_rejected.headers);
     assert_no_h1_only_websocket_headers(&circuit_rejected.headers);
-    assert_no_failed_websocket_transport_headers(&circuit_rejected.headers);
-    assert!(
-        circuit_rejected
-            .recv_body_text()
-            .await
-            .expect("open-circuit rejection body")
-            .contains("circuit breaker open")
-    );
+    assert_no_failed_websocket_negotiation_headers(&circuit_rejected.headers);
+    assert_failed_websocket_handshake_framing(&circuit_rejected.headers);
+    let circuit_headers = circuit_rejected.headers.clone();
+    let circuit_body = circuit_rejected
+        .recv_body_text()
+        .await
+        .expect("open-circuit rejection body");
+    assert!(circuit_body.contains("circuit breaker open"));
+    assert_authoritative_content_length(&circuit_headers, circuit_body.len());
 
     let _ = gateway.kill();
     let _ = gateway.wait();
@@ -2466,6 +2565,7 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     assert_ws_security_policy(h1_rejected.headers());
     assert_no_ws_transport_policy_values(h1_rejected.headers());
     assert_no_h1_only_websocket_headers(h1_rejected.headers());
+    assert_no_failed_websocket_negotiation_headers(h1_rejected.headers());
 
     let h2_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
         .await
@@ -2500,6 +2600,7 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     assert_ws_security_policy(h2_rejected.headers());
     assert_no_ws_transport_policy_values(h2_rejected.headers());
     assert_no_h1_only_websocket_headers(h2_rejected.headers());
+    assert_no_failed_websocket_negotiation_headers(h2_rejected.headers());
     h2_connection_task.abort();
 
     let h3_url = format!("https://localhost:{gateway_https_port}/ws-echo");
@@ -2519,13 +2620,15 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     assert_ws_security_policy(&h3_rejected.headers);
     assert_no_ws_transport_policy_values(&h3_rejected.headers);
     assert_no_h1_only_websocket_headers(&h3_rejected.headers);
-    assert!(
-        h3_rejected
-            .recv_body_text()
-            .await
-            .expect("H3 method-filter rejection body")
-            .contains("Method Not Allowed")
-    );
+    assert_no_failed_websocket_negotiation_headers(&h3_rejected.headers);
+    assert_failed_websocket_handshake_framing(&h3_rejected.headers);
+    let h3_reject_headers = h3_rejected.headers.clone();
+    let h3_reject_body = h3_rejected
+        .recv_body_text()
+        .await
+        .expect("H3 method-filter rejection body");
+    assert!(h3_reject_body.contains("Method Not Allowed"));
+    assert_authoritative_content_length(&h3_reject_headers, h3_reject_body.len());
 
     let _ = gateway.kill();
     let _ = gateway.wait();

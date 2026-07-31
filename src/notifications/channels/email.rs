@@ -633,18 +633,48 @@ impl EmailChannel {
         extras: &HashMap<String, String>,
         http: &PluginHttpClient,
     ) -> Result<(), String> {
-        let message = self.build_message(notification, extras)?;
-        let _permit = Arc::clone(&self.sessions)
-            .try_acquire_owned()
-            .map_err(|_| {
-                format!(
-                    "email dispatch to {} skipped: channel already has {MAX_CONCURRENT_SESSIONS} SMTP sessions in flight",
-                    self.endpoint_label()
+        match self.dispatch_classified(notification, extras, http).await {
+            crate::notifications::outcome::DeliveryAttempt::Success => Ok(()),
+            crate::notifications::outcome::DeliveryAttempt::Failed { message, .. } => Err(message),
+        }
+    }
+
+    /// Classified SMTP dispatch for the retrying delivery runner.
+    pub async fn dispatch_classified(
+        &self,
+        notification: &Notification,
+        extras: &HashMap<String, String>,
+        http: &PluginHttpClient,
+    ) -> crate::notifications::outcome::DeliveryAttempt {
+        use crate::notifications::outcome::{DeliveryAttempt, FailureClass, classify_smtp_failure};
+        let message = match self.build_message(notification, extras) {
+            Ok(m) => m,
+            Err(e) => {
+                return DeliveryAttempt::failed(FailureClass::Permanent, e);
+            }
+        };
+        let _permit = match Arc::clone(&self.sessions).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                return DeliveryAttempt::failed(
+                    FailureClass::Transient,
+                    format!(
+                        "email dispatch to {} skipped: channel already has {MAX_CONCURRENT_SESSIONS} SMTP sessions in flight",
+                        self.endpoint_label()
+                    ),
+                );
+            }
+        };
+        match self.send(&message, http).await {
+            Ok(()) => DeliveryAttempt::Success,
+            Err(failure) => {
+                let class = classify_smtp_failure(&failure);
+                DeliveryAttempt::failed(
+                    class,
+                    format!("email dispatch to {} {failure}", self.endpoint_label()),
                 )
-            })?;
-        self.send(&message, http)
-            .await
-            .map_err(|failure| format!("email dispatch to {} {failure}", self.endpoint_label()))
+            }
+        }
     }
 
     /// `host:port` — the only endpoint detail that appears in errors/logs.

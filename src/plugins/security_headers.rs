@@ -322,6 +322,36 @@ fn parse_set_map(object: &serde_json::Map<String, Value>) -> Result<Vec<(String,
             let mut out = Vec::with_capacity(map.len());
             for (name, value) in map {
                 let name = parse_header_name("set", name)?;
+                // Framing and connection-control destinations belong to the
+                // gateway's final client-wire boundary, not to a static
+                // response-header policy. `set` runs in `after_proxy`, i.e.
+                // AFTER the backend hop-by-hop strip and before that boundary,
+                // so a `Content-Length` written here is a syntactically valid
+                // length the gateway cannot verify against the bytes it will
+                // actually write — on an HTTP/1.1 chain that is a
+                // request/response desync primitive.
+                //
+                // The check is the shared case-insensitive predicate over the
+                // shared closed set, so `Content-Length`, `CONTENT-LENGTH`, and
+                // `content-length` all fail closed identically and this plugin
+                // cannot drift from `response_transformer` / `response_mock` /
+                // `mesh_route_dispatch`. `remove` stays allowed: dropping a
+                // protocol-managed field is a no-op after the origin strip and
+                // never invents framing.
+                //
+                // `name` is already a validated `HeaderName` (lowercased by
+                // `HeaderName::as_str`) and, to reach this branch, a member of
+                // the compiled-in closed set — so echoing it names the offending
+                // setting without reflecting hostile config bytes.
+                if crate::proxy::headers::is_protocol_managed_plugin_response_destination(&name) {
+                    return Err(format!(
+                        "security_headers: 'set.{name}' is protocol-managed (hop-by-hop or \
+                         framing) and cannot be configured; the gateway derives Content-Length \
+                         from the final response body and strips \
+                         Connection/Transfer-Encoding/Trailer/Upgrade at the final response \
+                         boundary. Use 'remove' if the intent is to drop the field."
+                    ));
+                }
                 let value = value.as_str().ok_or_else(|| {
                     format!("security_headers: 'set.{name}' value must be a string")
                 })?;

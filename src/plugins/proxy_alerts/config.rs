@@ -13,6 +13,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde_json::{Map, Value};
 
+use crate::notifications::dispatch::DeliveryRetryPolicy;
 use crate::notifications::{NotificationChannel, Severity, channels::parse_channels};
 use crate::plugins::DisconnectCause;
 use crate::retry::ErrorClass;
@@ -39,6 +40,9 @@ const TOP_LEVEL_KEYS: &[&str] = &[
     "default_window_seconds",
     "default_resolved_window_seconds",
     "max_concurrent_dispatches",
+    "max_delivery_retries",
+    "delivery_retry_base_ms",
+    "delivery_retry_max_ms",
     "quiet_hours_utc",
     "channels",
     "rules",
@@ -146,6 +150,8 @@ pub struct ProxyAlertsConfig {
     /// Discord all firing simultaneously) should bump this to 16-32; see
     /// `docs/proxy_alerts.md` for tuning guidance.
     pub max_concurrent_dispatches: usize,
+    /// Bounded, jittered retry policy for transient channel failures.
+    pub delivery_retry: DeliveryRetryPolicy,
     pub quiet_hours: Vec<QuietHourWindow>,
     /// Channels indexed by name; kept around for admin debug surfaces and
     /// future use cases (e.g., a `/proxy_alerts` admin endpoint that lists
@@ -243,6 +249,45 @@ impl ProxyAlertsConfig {
             }
             n as usize
         };
+        let max_delivery_retries = {
+            let n = read_u32_default(config, "max_delivery_retries", 2)?;
+            if n > 8 {
+                return Err(
+                    "proxy_alerts: 'max_delivery_retries' must be <= 8 (bounded retry budget)"
+                        .to_string(),
+                );
+            }
+            n
+        };
+        let delivery_retry_base_ms = {
+            let n = read_u32_default(config, "delivery_retry_base_ms", 100)?;
+            if !(10..=60_000).contains(&n) {
+                return Err(
+                    "proxy_alerts: 'delivery_retry_base_ms' must be in [10, 60000]".to_string(),
+                );
+            }
+            n as u64
+        };
+        let delivery_retry_max_ms = {
+            let n = read_u32_default(config, "delivery_retry_max_ms", 2_000)?;
+            if !(10..=60_000).contains(&n) {
+                return Err(
+                    "proxy_alerts: 'delivery_retry_max_ms' must be in [10, 60000]".to_string(),
+                );
+            }
+            n as u64
+        };
+        if delivery_retry_max_ms < delivery_retry_base_ms {
+            return Err(
+                "proxy_alerts: 'delivery_retry_max_ms' must be >= 'delivery_retry_base_ms'"
+                    .to_string(),
+            );
+        }
+        let delivery_retry = DeliveryRetryPolicy {
+            max_retries: max_delivery_retries,
+            base_delay: std::time::Duration::from_millis(delivery_retry_base_ms),
+            max_delay: std::time::Duration::from_millis(delivery_retry_max_ms),
+        };
 
         let quiet_hours = parse_quiet_hours(config.get("quiet_hours_utc"))?;
 
@@ -322,6 +367,7 @@ impl ProxyAlertsConfig {
         Ok(Self {
             enabled,
             max_concurrent_dispatches,
+            delivery_retry,
             quiet_hours,
             channels: Arc::new(channels),
             channel_by_id: Arc::new(channel_by_id),

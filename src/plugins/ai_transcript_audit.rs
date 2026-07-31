@@ -3446,6 +3446,10 @@ impl Plugin for AiTranscriptAudit {
         HTTP_ONLY_PROTOCOLS
     }
 
+    fn enforces_finalized_request_policy(&self) -> bool {
+        true
+    }
+
     fn start_background_tasks(&self) -> Result<(), String> {
         // Materialize every custom header (resolving `${secret:NAME}` references
         // against `FERRUM_TRANSCRIPT_SINK_SECRET_*`) BEFORE the batching worker

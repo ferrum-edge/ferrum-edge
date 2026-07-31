@@ -87,8 +87,14 @@ async fn run_federation_final_body(
         .get("request_body")
         .cloned()
         .unwrap_or_default();
+    let mut backend_header_overlay = HashMap::new();
     plugin
-        .on_final_request_body_with_context(ctx, headers, body.as_bytes())
+        .dispatch_finalized_request_egress(
+            ctx,
+            headers,
+            body.as_bytes(),
+            &mut backend_header_overlay,
+        )
         .await
 }
 
@@ -2648,7 +2654,7 @@ async fn test_end_to_end_composition_streaming_vs_non_streaming() {
     ));
 
     // stream:false → NOT claimed by ai_stream_router and therefore remains
-    // eligible for ai_federation's later final-body phase.
+    // eligible for ai_federation's later finalized-egress phase.
     let non_streaming = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
     let mut ctx2 = post_ctx(&non_streaming);
     let mut headers2 = json_headers();

@@ -8,6 +8,14 @@
 //! - **terminate**: Invoke the function and return its response directly to the
 //!   client, bypassing backend proxying entirely.
 //!
+//! Both modes run in the finalized-request-egress phase, never `before_proxy`:
+//! the function is invoked only after request-body transforms and every
+//! `on_final_request_body` policy hook have accepted the exact backend-visible
+//! representation (advisory `GHSA-4vr5-4wm3-x5xv`). A `pre_proxy` function's
+//! header injections are published through the backend header overlay, which the
+//! proxy merges after re-establishing gateway-owned assertions and the egress
+//! baggage policy.
+//!
 //! ## Providers
 //!
 //! - **AWS Lambda**: Uses the Lambda Invoke API with SigV4 request signing.
@@ -627,10 +635,16 @@ impl ServerlessFunction {
     }
 
     /// Build the JSON payload sent to the serverless function.
+    ///
+    /// `finalized_body` is the backend-visible request body: request-body
+    /// transforms have run and every final request-policy hook has accepted it
+    /// (GHSA-4vr5-4wm3-x5xv). The function therefore observes exactly what the
+    /// backend would, including operator-configured removals and redactions.
     fn build_invocation_payload(
         &self,
         ctx: &RequestContext,
         proxy_headers: &HashMap<String, String>,
+        finalized_body: &[u8],
     ) -> Result<Value, InvocationFailure> {
         let mut payload = serde_json::Map::new();
 
@@ -685,17 +699,23 @@ impl ServerlessFunction {
         // Forward request body
         if self.forward_body {
             reject_encoded_request_body(ctx, proxy_headers)?;
-            let empty_body = Bytes::new();
-            let body = if let Some(body) = ctx.request_body_bytes.as_ref() {
-                body
-            } else if !crate::proxy::request_may_have_body(&ctx.method, proxy_headers) {
-                &empty_body
-            } else {
+            // `finalized_body` is authoritative. `ctx.request_body_bytes` is not
+            // read for content — it would be the PRE-transform client body — but
+            // its absence still witnesses that the gateway never collected a
+            // body for this request, which is the one case where an empty
+            // `finalized_body` is not a faithful representation of a request
+            // that may carry one. Fail closed rather than invoke the function on
+            // a silently truncated payload.
+            let body: &[u8] = finalized_body;
+            if body.is_empty()
+                && ctx.request_body_bytes.is_none()
+                && crate::proxy::request_may_have_body(&ctx.method, proxy_headers)
+            {
                 return Err(InvocationFailure::governed_input(
                     "request_body_unavailable",
                     "governed request body was unavailable before function invocation",
                 ));
-            };
+            }
             // Keep a single authoritative, lossless body representation. JSON
             // parsing here would collapse duplicate object members and rewrite
             // lexical number/whitespace forms before the external policy sees
@@ -2697,26 +2717,39 @@ impl Plugin for ServerlessFunction {
         super::HTTP_GRPC_PROTOCOLS
     }
 
+    /// A `pre_proxy` function still publishes backend-visible request headers.
+    /// It no longer mutates the `before_proxy` header map — this plugin has no
+    /// `before_proxy` hook — but its injections land in the backend header
+    /// overlay during the finalized-request-egress phase, which is LATER than
+    /// the `before_proxy` write it replaced.
+    ///
+    /// This capability is the composition signal for "backend-visible request
+    /// headers change at or after my effective priority", not "I write the
+    /// `before_proxy` map". Reporting `false` here would silently admit
+    /// `request_deduplication` (priority 3010) alongside a `pre_proxy` function
+    /// at 3025, letting deduplication fingerprint headers the function goes on
+    /// to change, and would diverge from the pure candidate view in
+    /// `plugin_cache::ServerlessSecurityCompositionPlugin` — candidate admission
+    /// would reject a chain runtime construction accepted.
     fn modifies_request_headers(&self) -> bool {
         self.mode == InvocationMode::PreProxy
     }
 
-    fn egresses_request_body_before_finalization(&self) -> bool {
-        self.forward_body
+    /// The function is invoked in the finalized-request-egress phase, after
+    /// body transforms and every final request-policy hook, so no request
+    /// egress happens before finalization (GHSA-4vr5-4wm3-x5xv).
+    fn dispatches_finalized_request_egress(&self) -> bool {
+        true
     }
 
     fn requires_prior_request_deduplication(&self) -> bool {
         self.mode == InvocationMode::Terminate
     }
 
-    fn defer_before_proxy_until_backend_path_resolved(&self) -> bool {
-        true
-    }
-
-    fn deferred_before_proxy_may_change_routing_headers(&self) -> bool {
-        self.mode == InvocationMode::PreProxy
-    }
-
+    /// Keeps the buffered-body collection (and therefore
+    /// `ctx.request_body_bytes`, the "a body was collected" witness) in front of
+    /// the transform/final-hook phases. The bytes the function receives come
+    /// from the finalized phase parameter, never from this early buffer.
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.requires_body
     }
@@ -2750,10 +2783,22 @@ impl Plugin for ServerlessFunction {
             .unwrap_or_default()
     }
 
-    async fn before_proxy(
+    /// Invoke the function over the finalized, backend-visible request.
+    ///
+    /// `headers` is the immutable finalized pre-egress baseline and `body` is
+    /// exactly what the primary backend would receive; every final
+    /// request-policy hook (WAF body rules, OpenAPI request schema, body
+    /// validation, the post-transform request-size ceiling) has already accepted
+    /// that representation. A `pre_proxy` function publishes its supported
+    /// post-policy header injections through `backend_header_overlay`, which the
+    /// proxy merges into the outbound map after re-establishing gateway-owned
+    /// assertions and the egress baggage policy.
+    async fn dispatch_finalized_request_egress(
         &self,
         ctx: &mut RequestContext,
-        headers: &mut HashMap<String, String>,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        backend_header_overlay: &mut HashMap<String, String>,
     ) -> PluginResult {
         if ctx
             .metadata
@@ -2785,7 +2830,7 @@ impl Plugin for ServerlessFunction {
         let native_grpc_terminate =
             self.mode == InvocationMode::Terminate && is_native_grpc_terminate_request(ctx);
 
-        let payload = match self.build_invocation_payload(ctx, headers) {
+        let payload = match self.build_invocation_payload(ctx, headers, body) {
             Ok(payload) => payload,
             Err(failure) => return self.pre_invocation_failure_result(ctx, failure),
         };
@@ -2955,7 +3000,11 @@ impl Plugin for ServerlessFunction {
                             {
                                 continue;
                             }
-                            headers.insert(key, value);
+                            // Published as an overlay rather than written into
+                            // the finalized snapshot: the representation this
+                            // function just decided on must stay exactly the one
+                            // policy accepted and the backend receives.
+                            backend_header_overlay.insert(key, value);
                         }
                     }
 

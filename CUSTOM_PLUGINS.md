@@ -375,7 +375,7 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn is_auth_plugin(&self) -> bool` | `false` | Set to `true` if your plugin participates in the authentication phase. |
 | `fn modifies_request_headers(&self) -> bool` | `false` | Set to `true` if your plugin modifies outgoing request headers in `before_proxy`. |
 | `fn modifies_request_body(&self) -> bool` | `false` | Set to `true` if your plugin transforms the request body via `transform_request_body`. |
-| `fn egresses_request_body_before_finalization(&self) -> bool` | `false` | Set to `true` if `before_proxy` sends the buffered request body to an external service before request transforms/final hooks. Candidate admission and runtime cache construction then reject same-protocol body-transform compositions. |
+| `fn egresses_request_body_before_finalization(&self) -> bool` | `false` | Set to `true` if `before_proxy` sends the buffered request body to an external service before request transforms/final hooks. Candidate admission and runtime cache construction then reject same-protocol body-transform compositions and same HTTP/gRPC-protocol final request-body policy plugins (`enforces_finalized_request_policy()`). |
 | `fn requires_prior_request_deduplication(&self) -> bool` | `false` | Set to `true` if `before_proxy` can execute an external side effect and return a terminal response. Any attached same-protocol `request_deduplication` instance must then have a strictly lower effective priority. |
 | `fn requires_request_body_before_before_proxy(&self) -> bool` | `false` | Set to `true` if your plugin needs the raw request body available during `before_proxy`. |
 | `fn requires_request_body_buffering(&self) -> bool` | Derived | By default returns `true` if `modifies_request_body()` or `requires_request_body_before_before_proxy()`. Override for custom logic. |
@@ -1543,7 +1543,7 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] `supported_protocols()` returns the correct protocol set
 - [ ] `is_auth_plugin()` returns `true` if it's an auth plugin
 - [ ] `modifies_request_body()` returns `true` if it transforms the request body
-- [ ] `egresses_request_body_before_finalization()` returns `true` if `before_proxy` sends body bytes to an external service before finalization
+- [ ] `egresses_request_body_before_finalization()` returns `true` if `before_proxy` sends body bytes to an external service before finalization (candidate admission then refuses same-protocol body transformers and same HTTP/gRPC-protocol final request-body policy plugins)
 - [ ] `requires_prior_request_deduplication()` returns `true` if a terminal external side effect must run after attached deduplication instances
 - [ ] `requires_request_body_buffering()` returns `true` if it reads the request body
 - [ ] Complete-body response plugins declare `requires_response_body_buffering()` and only narrow it in `should_buffer_response_body*()`

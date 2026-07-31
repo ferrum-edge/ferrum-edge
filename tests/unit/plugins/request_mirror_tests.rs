@@ -18,6 +18,49 @@ use std::sync::Mutex;
 
 use super::plugin_utils;
 
+/// Test shim for the finalized-request-egress phase.
+///
+/// The plugin no longer has a `before_proxy` hook: it dispatches in the
+/// finalized-request-egress phase over an immutable backend-visible snapshot
+/// (GHSA-4vr5-4wm3-x5xv). These tests stage that representation on the context
+/// exactly as the proxy would, so the shim derives the finalized body from the
+/// staged buffer and folds the backend header overlay back into the mutable
+/// header map the tests inspect.
+#[allow(async_fn_in_trait)]
+trait FinalizedEgressTestExt {
+    async fn finalized_egress(
+        &self,
+        ctx: &mut ferrum_edge::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult;
+}
+
+impl<T: Plugin + ?Sized> FinalizedEgressTestExt for T {
+    async fn finalized_egress(
+        &self,
+        ctx: &mut ferrum_edge::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        let body: Vec<u8> = ctx
+            .request_body_bytes
+            .as_ref()
+            .map(|body| body.to_vec())
+            .or_else(|| {
+                ctx.metadata
+                    .get("request_body")
+                    .map(|body| body.as_bytes().to_vec())
+            })
+            .unwrap_or_default();
+        let mut overlay = HashMap::new();
+        let snapshot = headers.clone();
+        let result = self
+            .dispatch_finalized_request_egress(ctx, &snapshot, &body, &mut overlay)
+            .await;
+        headers.extend(overlay);
+        result
+    }
+}
+
 fn make_ctx() -> RequestContext {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -314,13 +357,17 @@ async fn max_in_flight_drop_emits_explicit_mirror_result() {
 
     let mut first = make_ctx_with_proxy_timeout(30_000);
     let mut first_headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut first, &mut first_headers).await);
+    plugin_utils::assert_continue(
+        plugin
+            .finalized_egress(&mut first, &mut first_headers)
+            .await,
+    );
 
     let mut dropped = make_ctx_with_proxy_timeout(30_000);
     let mut dropped_headers = HashMap::new();
     plugin_utils::assert_continue(
         plugin
-            .before_proxy(&mut dropped, &mut dropped_headers)
+            .finalized_egress(&mut dropped, &mut dropped_headers)
             .await,
     );
     let meta = tokio::time::timeout(
@@ -375,9 +422,9 @@ async fn configured_instances_append_results_while_sampled_out_instance_adds_non
     let mut ctx = make_ctx_with_proxy();
     let mut headers = HashMap::new();
 
-    plugin_utils::assert_continue(mirror_a.before_proxy(&mut ctx, &mut headers).await);
-    plugin_utils::assert_continue(sampled_out.before_proxy(&mut ctx, &mut headers).await);
-    plugin_utils::assert_continue(mirror_b.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(mirror_a.finalized_egress(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(sampled_out.finalized_egress(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(mirror_b.finalized_egress(&mut ctx, &mut headers).await);
     assert_eq!(
         ctx.mirror_result_rxs.len(),
         2,
@@ -453,7 +500,7 @@ async fn backend_read_timeout_emits_explicit_mirror_error() {
     .unwrap();
     let mut ctx = make_ctx_with_proxy_timeout(50);
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
 
     let meta = tokio::time::timeout(
         std::time::Duration::from_secs(1),
@@ -1013,7 +1060,7 @@ async fn test_before_proxy_returns_continue() {
     let mut headers: HashMap<String, String> = HashMap::new();
     headers.insert("x-custom".to_string(), "value".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 }
 
@@ -1063,7 +1110,7 @@ async fn test_mirror_never_forwards_load_testing_trigger_even_if_it_runs_first()
     headers.insert("X-Loadtesting-Fanout".to_string(), "1".to_string());
     headers.insert("x-keep".to_string(), "preserved".to_string());
 
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     let _ = ctx.collect_mirror_result().await;
     let captured = tokio::time::timeout(std::time::Duration::from_secs(2), captured_rx)
         .await
@@ -1091,7 +1138,7 @@ async fn test_before_proxy_with_zero_percentage_returns_continue() {
     let mut ctx = make_ctx();
     let mut headers: HashMap<String, String> = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 }
 
@@ -1108,7 +1155,7 @@ async fn test_before_proxy_with_body_metadata() {
         .insert("request_body".to_string(), r#"{"name":"test"}"#.to_string());
     let mut headers: HashMap<String, String> = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 }
 
@@ -1127,7 +1174,7 @@ async fn test_before_proxy_with_matched_proxy_uses_proxy_timeout() {
     let mut headers: HashMap<String, String> = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 }
 
@@ -1144,7 +1191,7 @@ async fn test_before_proxy_without_matched_proxy_uses_default_timeout() {
     let mut ctx = make_ctx(); // No matched_proxy
     let mut headers: HashMap<String, String> = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 }
 
@@ -1412,7 +1459,7 @@ async fn test_sampling_dispatch_observes_selection_not_just_continue() {
     for _ in 0..32 {
         let mut ctx = make_ctx();
         let mut headers = HashMap::new();
-        plugin_utils::assert_continue(zero.before_proxy(&mut ctx, &mut headers).await);
+        plugin_utils::assert_continue(zero.finalized_egress(&mut ctx, &mut headers).await);
         assert!(
             ctx.mirror_result_rxs.is_empty(),
             "0% must not dispatch a mirror"
@@ -1424,7 +1471,7 @@ async fn test_sampling_dispatch_observes_selection_not_just_continue() {
     for _ in 0..8 {
         let mut ctx = make_ctx();
         let mut headers = HashMap::new();
-        plugin_utils::assert_continue(full.before_proxy(&mut ctx, &mut headers).await);
+        plugin_utils::assert_continue(full.finalized_egress(&mut ctx, &mut headers).await);
         assert!(
             ctx.mirror_result_rxs.len() == 1,
             "100% must dispatch a mirror"
@@ -1446,7 +1493,7 @@ async fn test_sampling_dispatch_observes_selection_not_just_continue() {
     for (i, expect) in expected.iter().enumerate() {
         let mut ctx = make_ctx();
         let mut headers = HashMap::new();
-        plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
         let did_dispatch = !ctx.mirror_result_rxs.is_empty();
         assert_eq!(
             did_dispatch, *expect,
@@ -1603,7 +1650,7 @@ async fn test_backend_path_policy_mirror_uses_authorized_effective_path() {
     );
     let mut headers = HashMap::new();
 
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     let _ = ctx.collect_mirror_result().await;
 
     let request_line = rx.await.expect("mirror request line");
@@ -1728,8 +1775,12 @@ async fn mesh_shadow_uses_rewritten_authority_and_explicit_mirror_path_wins() {
         ctx.route_override_authority.as_deref(),
         Some("internal.example.com:8443")
     );
-    plugin_utils::assert_continue(route_mirror.before_proxy(&mut ctx, &mut headers).await);
-    plugin_utils::assert_continue(explicit_mirror.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(route_mirror.finalized_egress(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(
+        explicit_mirror
+            .finalized_egress(&mut ctx, &mut headers)
+            .await,
+    );
     assert_eq!(ctx.mirror_result_rxs.len(), 2);
 
     let mut exact_ctx = make_ctx_with_proxy();
@@ -1746,7 +1797,7 @@ async fn mesh_shadow_uses_rewritten_authority_and_explicit_mirror_path_wins() {
     );
     plugin_utils::assert_continue(
         route_mirror
-            .before_proxy(&mut exact_ctx, &mut exact_headers)
+            .finalized_egress(&mut exact_ctx, &mut exact_headers)
             .await,
     );
     assert_eq!(exact_ctx.mirror_result_rxs.len(), 1);
@@ -1847,7 +1898,7 @@ async fn test_mirror_captures_proxy_context() {
 
     // This fires the mirror task — we can't inspect the spawned task's output
     // directly, but we verify the plugin reads all context fields without panicking.
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 }
 
@@ -1879,7 +1930,7 @@ async fn test_mirror_uses_binary_body_bytes_over_metadata() {
     // The plugin should read from request_body_bytes (binary-safe) rather than
     // the missing metadata key. This fires the mirror task — we verify it doesn't
     // panic and completes without error.
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 
     // Mirror result receiver should be set (mirror was dispatched)
@@ -1911,7 +1962,7 @@ async fn test_mirror_falls_back_to_metadata_when_no_body_bytes() {
 
     let mut headers: HashMap<String, String> = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 
     assert!(
@@ -2033,7 +2084,7 @@ async fn test_mirror_response_body_bounded_when_oversized_no_content_length() {
     let mut ctx = make_ctx_with_proxy();
     let mut headers: HashMap<String, String> = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 
     // Wait for the mirror task to finish and surface its meta via the watch
@@ -2094,7 +2145,7 @@ async fn test_mirror_response_body_drains_content_length_and_reports_both_sizes(
     let mut ctx = make_ctx_with_proxy();
     let mut headers: HashMap<String, String> = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 
     let meta = ctx
@@ -2176,7 +2227,7 @@ async fn test_mirror_error_does_not_leak_query_string_secret() {
 
     let mut headers: HashMap<String, String> = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 
     let meta = ctx
@@ -2304,7 +2355,7 @@ async fn test_stale_content_length_not_forwarded_when_body_not_mirrored() {
     headers.insert("content-length".to_string(), "99".to_string());
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.finalized_egress(&mut ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
 
     // Drain the mirror task so the request is actually sent.
@@ -2379,7 +2430,7 @@ async fn capture_mirror_request_headers(
         PluginHttpClient::default(),
     )
     .unwrap();
-    let _ = plugin.before_proxy(ctx, headers).await;
+    let _ = plugin.finalized_egress(ctx, headers).await;
     let _ = ctx.collect_mirror_result().await;
     rx.await.expect("mirror sink should capture headers")
 }
@@ -2553,7 +2604,7 @@ async fn capture_mirror_request_headers_h2c(
         PluginHttpClient::default(),
     )
     .unwrap();
-    let _ = plugin.before_proxy(ctx, headers).await;
+    let _ = plugin.finalized_egress(ctx, headers).await;
     let _ = ctx.collect_mirror_result().await;
     rx.await.expect("h2c mirror sink should capture headers")
 }
@@ -2667,7 +2718,7 @@ async fn capture_mirror_request_line(ctx: &mut RequestContext) -> String {
     )
     .unwrap();
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(ctx, &mut headers).await;
+    let result = plugin.finalized_egress(ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
     let _ = ctx.collect_mirror_result().await;
     rx.await.expect("mirror request line")
@@ -2876,7 +2927,7 @@ async fn test_grpc_mirror_preserves_binary_body_over_h2c() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = plugin.finalized_egress(&mut ctx, &mut headers).await;
     let meta = ctx.collect_mirror_result().await.expect("mirror result");
     assert!(
         meta.mirror_error.is_none(),
@@ -2954,7 +3005,7 @@ async fn test_grpc_mirror_preserves_multiframe_client_stream_body_over_h2c() {
         PluginHttpClient::default(),
     )
     .unwrap();
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = plugin.finalized_egress(&mut ctx, &mut headers).await;
     let meta = ctx.collect_mirror_result().await.expect("mirror result");
     assert!(
         meta.mirror_error.is_none(),
@@ -3281,7 +3332,7 @@ async fn content_length_responses_are_drained_for_http1_connection_reuse() {
     for _ in 0..2 {
         let mut ctx = make_ctx_with_proxy();
         let mut headers = HashMap::new();
-        plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
         let meta = ctx.collect_mirror_result().await.expect("mirror meta");
         assert!(
             meta.mirror_error.is_none(),
@@ -3357,7 +3408,7 @@ async fn mesh_shadow_ipv6_authority_stays_valid_on_outbound_host() {
     let mut headers = HashMap::new();
     headers.insert("host".to_string(), "client.example".to_string());
     plugin_utils::assert_continue(route.before_proxy(&mut ctx, &mut headers).await);
-    plugin_utils::assert_continue(mirror.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(mirror.finalized_egress(&mut ctx, &mut headers).await);
     let _ = ctx.collect_mirror_result().await;
 
     let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
@@ -3430,7 +3481,11 @@ async fn retained_body_budget_drops_when_exhausted_and_releases_on_completion() 
     let mut first = make_ctx_with_proxy();
     first.request_body_bytes = Some(body.clone());
     let mut first_headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut first, &mut first_headers).await);
+    plugin_utils::assert_continue(
+        plugin
+            .finalized_egress(&mut first, &mut first_headers)
+            .await,
+    );
 
     // Wait until the first mirror is in-flight and holding the body lease.
     let release = tokio::time::timeout(std::time::Duration::from_secs(1), gate_rx.recv())
@@ -3445,7 +3500,11 @@ async fn retained_body_budget_drops_when_exhausted_and_releases_on_completion() 
     let mut second = make_ctx_with_proxy();
     second.request_body_bytes = Some(body);
     let mut second_headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut second, &mut second_headers).await);
+    plugin_utils::assert_continue(
+        plugin
+            .finalized_egress(&mut second, &mut second_headers)
+            .await,
+    );
     let dropped = second
         .collect_mirror_result()
         .await
@@ -3506,7 +3565,7 @@ async fn zero_backend_read_timeout_still_cancels_never_responding_mirror() {
 
     let mut ctx = make_ctx_with_proxy_timeout(0);
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     let meta = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         ctx.collect_mirror_result(),
@@ -3579,7 +3638,7 @@ async fn sensitive_headers_stripped_by_default_including_grpc_metadata() {
     headers.insert("x-api-key".to_string(), "sk-live".to_string());
     headers.insert("x-custom".to_string(), "keep-me".to_string());
 
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     let _ = ctx.collect_mirror_result().await;
     let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
         .await
@@ -3659,7 +3718,7 @@ async fn sensitive_header_allowlist_forwards_only_listed_names() {
     headers.insert("cookie".to_string(), "session=nope".to_string());
     headers.insert("x-api-key".to_string(), "sk-nope".to_string());
 
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     let _ = ctx.collect_mirror_result().await;
     let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
         .await
@@ -3759,7 +3818,7 @@ async fn grpc_metadata_credentials_stripped_by_default_on_h2c_mirror() {
     );
     headers.insert("grpc-timeout".to_string(), "1S".to_string());
 
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     let meta = ctx.collect_mirror_result().await.expect("mirror result");
     assert!(
         meta.mirror_error.is_none(),
@@ -3844,7 +3903,7 @@ async fn oversized_content_length_response_is_drained_under_bounds() {
 
     let mut ctx = make_ctx_with_proxy();
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     let meta = ctx.collect_mirror_result().await.expect("mirror meta");
     assert!(
         meta.mirror_error.is_none(),
@@ -3932,7 +3991,7 @@ async fn sensitive_header_patterns_and_substrings_strip_vendor_credentials() {
     headers.insert("x-continuation-token".to_string(), "page2".to_string());
     headers.insert("x-custom".to_string(), "keep-me".to_string());
 
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     let _ = ctx.collect_mirror_result().await;
     let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
         .await
@@ -3994,7 +4053,7 @@ async fn mirror_metrics_track_dispatch_completion_and_timeout() {
     .unwrap();
     let mut ctx = make_ctx_with_proxy();
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(ok_plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(ok_plugin.finalized_egress(&mut ctx, &mut headers).await);
     let _ = ctx.collect_mirror_result().await;
     let m = request_mirror_metrics_snapshot_for_test(&ok_plugin);
     assert_eq!(m.dispatched, 1, "one task dispatched: {m:?}");
@@ -4030,7 +4089,11 @@ async fn mirror_metrics_track_dispatch_completion_and_timeout() {
     .unwrap();
     let mut ctx2 = make_ctx_with_proxy_timeout(0);
     let mut headers2 = HashMap::new();
-    plugin_utils::assert_continue(stuck_plugin.before_proxy(&mut ctx2, &mut headers2).await);
+    plugin_utils::assert_continue(
+        stuck_plugin
+            .finalized_egress(&mut ctx2, &mut headers2)
+            .await,
+    );
     let meta = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         ctx2.collect_mirror_result(),
@@ -4088,12 +4151,12 @@ async fn mirror_metrics_count_concurrency_drops() {
     // First dispatch holds the only permit for the whole test.
     let mut first = make_ctx_with_proxy();
     let mut h1 = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut first, &mut h1).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut first, &mut h1).await);
 
     // Second dispatch cannot acquire a permit → explicit concurrency drop.
     let mut second = make_ctx_with_proxy();
     let mut h2 = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut second, &mut h2).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut second, &mut h2).await);
     let dropped = second
         .collect_mirror_result()
         .await
@@ -4263,7 +4326,7 @@ async fn advisory_percentage_zero_disables_every_request_body_capability() {
 
     // Nothing is dispatched and nothing is recorded.
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     assert!(
         ctx.collect_mirror_results().await.is_empty(),
         "sampled-out work must leave no record"
@@ -4370,7 +4433,7 @@ async fn advisory_saturated_permits_keep_the_request_streaming() {
 
     // The drop is still attributable once the target URL is known.
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut saturated, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut saturated, &mut headers).await);
     let meta = saturated
         .collect_mirror_result()
         .await
@@ -4596,7 +4659,7 @@ async fn advisory_reservation_reconciles_to_the_observed_body_length() {
     // ...and `before_proxy` shrinks it to what was actually retained.
     ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'x'; 128]));
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     assert_eq!(
         request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
         1
@@ -4714,7 +4777,7 @@ async fn advisory_repeated_authorize_replaces_same_instance_admission() {
     // the predicate must keep reporting the answer the body was collected under.
     ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'x'; 4096]));
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     assert_eq!(
         request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
         1,
@@ -4732,7 +4795,7 @@ async fn advisory_repeated_authorize_replaces_same_instance_admission() {
     // Ownership moved out exactly once: a repeated `before_proxy` finds the
     // consumed marker, so it can neither re-sample, re-acquire a permit, nor
     // dispatch a second shadow request.
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     let after_repeat = request_mirror_metrics_snapshot_for_test(&plugin);
     assert_eq!(
         after_repeat.dispatched, 1,
@@ -4805,7 +4868,7 @@ async fn advisory_multiple_instances_stage_and_take_independently() {
     // Taking one instance must leave the sibling admission untouched.
     ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'x'; 2048]));
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(a.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(a.finalized_egress(&mut ctx, &mut headers).await);
     assert_eq!(
         request_mirror_metrics_snapshot_for_test(&a).dispatched,
         1,
@@ -4819,7 +4882,7 @@ async fn advisory_multiple_instances_stage_and_take_independently() {
     // a's slot stays staged as a consumed marker so the buffering predicate is
     // stable for the whole request, but its lease moved out exactly once: a
     // repeated `before_proxy` cannot re-acquire or dispatch again.
-    plugin_utils::assert_continue(a.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(a.finalized_egress(&mut ctx, &mut headers).await);
     assert_eq!(
         request_mirror_metrics_snapshot_for_test(&a).dispatched,
         1,
@@ -4883,7 +4946,7 @@ async fn advisory_oversized_declared_body_stays_streaming_and_unmirrored() {
     assert_eq!(metrics.concurrency_drops, 0);
 
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     assert!(ctx.collect_mirror_results().await.is_empty());
     assert_eq!(
         request_mirror_retained_request_body_bytes_for_test(&plugin),
@@ -5090,7 +5153,7 @@ async fn advisory_buffering_decision_stays_stable_after_before_proxy_consumes_it
 
     ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'x'; 128]));
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     assert_eq!(
         request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
         1
@@ -5106,7 +5169,7 @@ async fn advisory_buffering_decision_stays_stable_after_before_proxy_consumes_it
     );
 
     // A second `before_proxy` must not re-sample, re-acquire, or dispatch.
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     let metrics = request_mirror_metrics_snapshot_for_test(&plugin);
     assert_eq!(metrics.dispatched, 1, "no duplicate shadow request");
     assert_eq!(
@@ -5330,7 +5393,7 @@ async fn advisory_tiny_or_zero_declared_length_still_reserves_the_full_ceiling()
             Some(bytes::Bytes::from(vec![b'x'; observed]))
         };
         let mut headers = HashMap::new();
-        plugin_utils::assert_continue(plugin.before_proxy(&mut first, &mut headers).await);
+        plugin_utils::assert_continue(plugin.finalized_egress(&mut first, &mut headers).await);
         expected_dispatched += 1;
         assert_eq!(
             request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
@@ -5398,7 +5461,7 @@ async fn advisory_undeclared_request_with_no_body_reconciles_the_ceiling_back_to
     // No body materialized: reconciliation observes zero bytes.
     assert!(ctx.request_body_bytes.is_none());
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
     assert_eq!(
         request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
         1,
@@ -5451,7 +5514,7 @@ async fn advisory_body_inflated_past_the_ceiling_is_attributed_to_the_ceiling() 
     // The buffered body the normalizer left behind is larger than the ceiling.
     ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'z'; 4096]));
     let mut headers = HashMap::new();
-    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
 
     let dropped = ctx
         .collect_mirror_result()
@@ -5480,5 +5543,155 @@ async fn advisory_body_inflated_past_the_ceiling_is_attributed_to_the_ceiling() 
         request_mirror_retained_request_body_bytes_for_test(&plugin),
         0,
         "the staged ceiling reservation must be released, not leaked"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Finalized-request-egress phase (GHSA-4vr5-4wm3-x5xv)
+// ---------------------------------------------------------------------------
+
+/// The mirror participates in the finalized-egress phase and must not report the
+/// pre-finalization egress capability that composition admission refuses.
+#[test]
+fn test_request_mirror_declares_finalized_egress_phase() {
+    let plugin = RequestMirror::new(
+        &json!({ "mirror_host": "mirror.local", "mirror_request_body": true }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    assert!(plugin.dispatches_finalized_request_egress());
+    assert!(!plugin.egresses_request_body_before_finalization());
+}
+
+/// The advisory's first reproduction scenario for the mirror: the shadow
+/// destination must receive the transformed representation, never the
+/// pre-transform body the proxy staged on the context before transforms ran.
+#[tokio::test]
+async fn test_finalized_egress_mirrors_transformed_body_not_pretransform_metadata() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (tx, rx) = oneshot::channel::<String>();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        // Header terminator plus a complete small body.
+                        if let Some(pos) = buf
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|pos| pos + 4)
+                            && buf.len() > pos
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        } else {
+            let _ = tx.send(String::new());
+        }
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let pre_transform = br#"{"ssn":"123-45-6789","keep":"yes"}"#;
+    let finalized = br#"{"keep":"yes"}"#;
+
+    let mut ctx = make_ctx_with_proxy();
+    // Exactly what the proxy stages before request-body transforms run.
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(pre_transform));
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8_lossy(pre_transform).into_owned(),
+    );
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let mut overlay = HashMap::new();
+    plugin_utils::assert_continue(
+        plugin
+            .dispatch_finalized_request_egress(&mut ctx, &headers, finalized, &mut overlay)
+            .await,
+    );
+    assert!(
+        overlay.is_empty(),
+        "the mirror never mutates the outbound request"
+    );
+    let _ = ctx.collect_mirror_result().await;
+
+    let observed = rx
+        .await
+        .expect("mirror destination should observe a request");
+    assert!(
+        observed.contains("{\"keep\":\"yes\"}"),
+        "mirror must replay the finalized backend-visible body, got: {observed}"
+    );
+    assert!(
+        !observed.contains("123-45-6789"),
+        "the pre-transform value the operator redacted must never reach the shadow destination"
+    );
+}
+
+/// A transform that inflates the body past the plugin-local ceiling drops the
+/// mirror rather than replaying a truncated payload. This is the advisory's
+/// third reproduction scenario measured on the post-transform length.
+#[tokio::test]
+async fn test_finalized_egress_refuses_body_inflated_past_mirror_ceiling() {
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": "127.0.0.1",
+            "mirror_port": 1,
+            "mirror_request_body": true,
+            "max_mirrored_request_body_bytes": 16
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = make_ctx_with_proxy();
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(b"small"));
+    let headers: HashMap<String, String> = HashMap::new();
+    let inflated = vec![b'a'; 4096];
+
+    let mut overlay = HashMap::new();
+    plugin_utils::assert_continue(
+        plugin
+            .dispatch_finalized_request_egress(&mut ctx, &headers, &inflated, &mut overlay)
+            .await,
+    );
+    let result = ctx
+        .collect_mirror_result()
+        .await
+        .expect("a refused mirror still publishes an attributable outcome");
+    assert!(
+        result
+            .mirror_error
+            .as_deref()
+            .is_some_and(|error| error.contains("max_mirrored_request_body_bytes")),
+        "expected a post-transform ceiling refusal, got {result:?}"
     );
 }

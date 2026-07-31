@@ -11028,6 +11028,38 @@ impl LiveTwoClusterFixture {
 }
 
 #[cfg(target_os = "linux")]
+fn live_xc_decode_chunked_body(mut data: &[u8]) -> Result<String, String> {
+    let mut body = Vec::new();
+    loop {
+        let line_end = data
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(|| "missing chunk-size terminator".to_string())?;
+        let size_line = std::str::from_utf8(&data[..line_end])
+            .map_err(|error| format!("non-UTF-8 chunk size: {error}"))?;
+        let size_text = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_text, 16)
+            .map_err(|error| format!("invalid chunk size {size_text:?}: {error}"))?;
+        data = &data[line_end + 2..];
+        if data.len() < size.saturating_add(2) {
+            return Err(format!(
+                "truncated chunk: declared {size} bytes, received {}",
+                data.len()
+            ));
+        }
+        if size == 0 {
+            return String::from_utf8(body)
+                .map_err(|error| format!("non-UTF-8 HTTP response body: {error}"));
+        }
+        body.extend_from_slice(&data[..size]);
+        if &data[size..size + 2] != b"\r\n" {
+            return Err("missing chunk-data terminator".to_string());
+        }
+        data = &data[size + 2..];
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn live_xc_http_get_from_vip(
     pid: u32,
     destination: SocketAddr,
@@ -11055,10 +11087,23 @@ fn live_xc_http_get_from_vip(
             .and_then(|line| line.split_whitespace().nth(1))
             .and_then(|status| status.parse::<u16>().ok())
             .ok_or_else(|| format!("malformed HTTP VIP response: {response:?}"))?;
-        let body = response
+        let (headers, wire_body) = response
             .split_once("\r\n\r\n")
-            .map(|(_, body)| body.to_string())
-            .unwrap_or_default();
+            .ok_or_else(|| format!("HTTP VIP response has no header terminator: {response:?}"))?;
+        let chunked = headers.lines().skip(1).any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.trim().eq_ignore_ascii_case("transfer-encoding")
+                    && value
+                        .split(',')
+                        .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+            })
+        });
+        let body = if chunked {
+            live_xc_decode_chunked_body(wire_body.as_bytes())
+                .map_err(|error| format!("decode HTTP VIP chunked response: {error}"))?
+        } else {
+            wire_body.to_string()
+        };
         Ok((status, body))
     })
 }

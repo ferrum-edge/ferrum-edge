@@ -71,7 +71,12 @@
 //!     status `200–599`, or `101` for a synthetic WebSocket handshake response.
 //!     Other informational statuses (`100`, `102`–`199`) are rejected — a mock
 //!     cannot emit a 1xx as a body-bearing final response.
-//!   - **headers**: Response headers (default: `{"content-type": "application/json"}`)
+//!   - **headers**: Response headers (default: `{"content-type": "application/json"}`).
+//!     Protocol-managed hop-by-hop and framing names (`Connection`,
+//!     `Transfer-Encoding`, `Trailer`, `Upgrade`, `Content-Length`, …) are
+//!     rejected at construction; the gateway derives `Content-Length` from the
+//!     mock body/status/method and strips connection/framing fields at the final
+//!     response boundary.
 //!   - **body**: Response body string (default: empty). On the wire, `HEAD`
 //!     responses omit content bytes while keeping representation metadata
 //!     (including `Content-Length`). Statuses `204`/`205`/`304` omit both the
@@ -82,9 +87,9 @@
 //!   continue to the backend. If false (default), unmatched requests get 404.
 //!
 //! Unknown top-level and per-rule keys are rejected at construction. The
-//! free-form `headers` map remains open for arbitrary string-valued headers.
-//! HEAD / no-body wire shape is applied by the shared synthetic-response
-//! finalizer so H1, H2, and H3 stay aligned.
+//! free-form `headers` map rejects protocol-managed hop-by-hop and framing
+//! destinations. HEAD / no-body wire shape is applied by the shared
+//! synthetic-response finalizer so H1, H2, and H3 stay aligned.
 
 use async_trait::async_trait;
 use http::{
@@ -233,7 +238,19 @@ impl ResponseMock {
                         HeaderValue::from_str(s).map_err(|_| {
                             format!("response_mock: rule[{i}] header '{k}' value is invalid")
                         })?;
-                        headers.insert(k.to_ascii_lowercase(), s.to_string());
+                        let lower = k.to_ascii_lowercase();
+                        if crate::proxy::headers::is_protocol_managed_plugin_response_destination(
+                            &lower,
+                        ) {
+                            return Err(format!(
+                                "response_mock: rule[{i}] header '{k}' is protocol-managed \
+                                 (hop-by-hop or framing) and cannot be configured; the gateway \
+                                 derives Content-Length from the mock body/status/method and \
+                                 strips Connection/Transfer-Encoding/Trailer/Upgrade at the \
+                                 final response boundary"
+                            ));
+                        }
+                        headers.insert(lower, s.to_string());
                     }
                 }
                 Some(Value::Null) | None => {}

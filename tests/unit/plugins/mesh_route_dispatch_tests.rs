@@ -1229,6 +1229,88 @@ fn screen_mesh_route_dispatch_egress_rejects_metadata_destination() {
     assert!(screen_mesh_route_dispatch_egress(&allowed, &default_policy).is_ok());
 }
 
+/// `rules[].response_transform` publishes onto the `response_transformer` write
+/// surface, so it shares that plugin's closed protocol-managed destination set:
+/// an Istio VirtualService `headers.response.{set,add}` modifier must not be
+/// able to reintroduce a hop-by-hop or framing field after the origin strip.
+///
+/// The rejection is construction-time and fail-closed, so it must also hold on
+/// the shared file/admin admission path — a config that only the runtime
+/// constructor refuses would still be accepted by `validate_plugin_config`.
+#[test]
+fn mesh_route_dispatch_rejects_protocol_managed_response_transform_destinations() {
+    let protocol_managed = [
+        "connection",
+        "content-length",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        // Case variants must be refused by the same closed set.
+        "Content-Length",
+        "TRANSFER-ENCODING",
+        "Connection",
+        "Upgrade",
+    ];
+
+    for key in protocol_managed {
+        for operation in ["add", "update"] {
+            let config = json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"backend_host": "svc.internal", "backend_port": 8080},
+                    "response_transform": [{
+                        "operation": operation,
+                        "key": key,
+                        "value": "chunked"
+                    }]
+                }]
+            });
+            let error = MeshRouteDispatch::new(&config).expect_err(
+                "a protocol-managed response_transform destination must fail admission",
+            );
+            assert!(
+                error.contains("protocol-managed"),
+                "{operation} {key} rejection must name the reason; got: {error}"
+            );
+            assert!(
+                ferrum_edge::plugins::validate_plugin_config("mesh_route_dispatch", &config)
+                    .is_err(),
+                "the shared file/admin plugin admission path must reject {operation} {key}"
+            );
+        }
+
+        // `remove` stays allowed: it is a no-op after the origin hop-by-hop
+        // strip and never reintroduces a field.
+        let removal = json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"backend_host": "svc.internal", "backend_port": 8080},
+                "response_transform": [{"operation": "remove", "key": key}]
+            }]
+        });
+        MeshRouteDispatch::new(&removal)
+            .unwrap_or_else(|e| panic!("remove of {key} must remain allowed; got: {e}"));
+    }
+
+    // An ordinary response destination is unaffected.
+    let ordinary = json!({
+        "rules": [{
+            "match": {"methods": ["GET"]},
+            "destination": {"backend_host": "svc.internal", "backend_port": 8080},
+            "response_transform": [{
+                "operation": "update",
+                "key": "x-served-by",
+                "value": "edge"
+            }]
+        }]
+    });
+    MeshRouteDispatch::new(&ordinary).expect("ordinary response_transform must still admit");
+}
+
 // ── GRPCRoute pathless-predicate live data path (issue #3271) ─────────────
 //
 // These drive the *translator-emitted* `mesh_route_dispatch` config, so the

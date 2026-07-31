@@ -869,6 +869,17 @@ fn parse_header_map(
     Ok(headers)
 }
 
+/// Parse an operator-configured CLIENT RESPONSE header map (`deny_headers`,
+/// `fail_closed_headers`).
+///
+/// Both maps are installed verbatim onto a `PluginResult::Reject`, so their
+/// names are arbitrary response-header destinations. Protocol-managed framing /
+/// connection-control names are rejected at construction with the shared
+/// case-insensitive predicate: the gateway's final wire boundary owns
+/// `Content-Length` and the hop-by-hop set, and a configured value there is an
+/// unverifiable framing claim rather than a policy header. Names are validated
+/// `HeaderName`s from the compiled-in closed set by the time they are echoed, so
+/// the diagnostic identifies the setting without reflecting hostile input.
 fn parse_string_header_map(
     object: &Map<String, Value>,
     field: &'static str,
@@ -888,6 +899,17 @@ fn parse_string_header_map(
             .ok_or_else(|| format!("{plugin_name}: {field}['{key}'] must be a string"))?;
         let header_name = HeaderName::from_bytes(key.as_bytes())
             .map_err(|error| format!("{plugin_name}: invalid {field} name '{key}': {error}"))?;
+        if crate::proxy::headers::is_protocol_managed_plugin_response_destination(
+            header_name.as_str(),
+        ) {
+            return Err(format!(
+                "{plugin_name}: {field} name '{}' is protocol-managed (hop-by-hop or framing) and \
+                 cannot be configured; the gateway derives Content-Length from the reject body and \
+                 strips Connection/Transfer-Encoding/Trailer/Upgrade at the final response \
+                 boundary",
+                header_name.as_str()
+            ));
+        }
         HeaderValue::from_str(value).map_err(|error| {
             format!("{plugin_name}: invalid {field} value for '{key}': {error}")
         })?;

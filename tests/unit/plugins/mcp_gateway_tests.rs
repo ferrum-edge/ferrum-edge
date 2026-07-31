@@ -7667,6 +7667,48 @@ async fn batch_request_metadata_is_not_described_by_a_single_member() {
     );
 }
 
+/// `sessions.downstream_session_header` is stamped onto the CLIENT response
+/// (`json_response` and the batch re-stamp both insert it into a `Reject` header
+/// map), so it is an arbitrary response-header destination. Protocol-managed
+/// framing / connection-control names belong to the gateway's final wire
+/// boundary and are refused at construction, case-insensitively.
+///
+/// `sessions.upstream_session_header` is a backend REQUEST field and keeps its
+/// own contract, so it is deliberately not covered by this rejection.
+#[test]
+fn downstream_session_header_refuses_protocol_managed_destinations() {
+    for name in [
+        "connection",
+        "content-length",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        for spelling in [name.to_string(), name.to_ascii_uppercase()] {
+            let mut config = transparent_config("http://127.0.0.1:9/mcp");
+            config["sessions"] = json!({ "downstream_session_header": spelling.clone() });
+            assert!(
+                create_plugin("mcp_gateway", &config).is_err(),
+                "sessions.downstream_session_header = {spelling:?} must be rejected"
+            );
+        }
+    }
+
+    // The default and other ordinary header names stay accepted.
+    for spelling in ["mcp-session-id", "X-MCP-Session", "x-session"] {
+        let mut config = transparent_config("http://127.0.0.1:9/mcp");
+        config["sessions"] = json!({ "downstream_session_header": spelling });
+        assert!(
+            create_plugin("mcp_gateway", &config).is_ok(),
+            "sessions.downstream_session_header = {spelling:?} must stay allowed"
+        );
+    }
+}
+
 async fn start_mcp_output_schema_tool_server(output_schema: Value) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

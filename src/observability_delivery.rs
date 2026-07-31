@@ -256,6 +256,23 @@ impl DeliverySlot {
             .spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, future)
     }
 
+    /// Register terminal cleanup with a probe for the exact admitted lifecycle.
+    ///
+    /// The factory receives a [`DeliveryTaskContext`] bound to the same
+    /// generation `Arc` that performs admission — one snapshot, not a context
+    /// sample followed by a second load that could observe a replacement.
+    pub(crate) fn spawn_terminal_with_context<F, Fut>(&self, factory: F) -> bool
+    where
+        F: FnOnce(DeliveryTaskContext) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.snapshot().spawn_with_context(
+            TaskAdmission::External,
+            DeliveryTaskKind::Terminal,
+            factory,
+        )
+    }
+
     /// Register mirror work spawned by an already admitted delivery task.
     pub fn spawn_mirror<F>(&self, future: F) -> bool
     where
@@ -288,6 +305,25 @@ impl DeliverySlot {
     pub async fn shutdown(&self, timeout: Duration) -> DeliveryDrainReport {
         let lifecycle = self.snapshot();
         lifecycle.shutdown(timeout).await
+    }
+
+    /// Shut down the captured lifecycle and signal once admission is closed
+    /// and its absolute drain deadline has been established.
+    ///
+    /// Hidden test seam only: external paused-time regressions use the signal
+    /// as a causal barrier instead of polling admission or relying on scheduler
+    /// order. Production callers use [`Self::shutdown`].
+    #[allow(dead_code)] // Used by external lifecycle tests; production callers use `shutdown`.
+    #[doc(hidden)]
+    pub async fn shutdown_with_admission_closed_for_test(
+        &self,
+        timeout: Duration,
+        admission_closed_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> DeliveryDrainReport {
+        let lifecycle = self.snapshot();
+        lifecycle
+            .shutdown_with_admission_closed_signal(timeout, Some(admission_closed_tx))
+            .await
     }
 }
 
@@ -358,6 +394,25 @@ fn clamp_max_tasks(max_tasks: usize) -> usize {
         crate::logging::LOG_DELIVERY_MAX_TASKS_MIN,
         crate::logging::LOG_DELIVERY_MAX_TASKS_MAX,
     )
+}
+
+/// Exact delivery-lifecycle probe captured at task admission.
+///
+/// Notification settlement consults this snapshot rather than the process-global
+/// current generation, so a draining lifecycle that is replaced mid-drain still
+/// classifies its own hard aborts correctly.
+#[derive(Clone)]
+pub(crate) struct DeliveryTaskContext {
+    lifecycle: Arc<DeliveryLifecycle>,
+}
+
+impl DeliveryTaskContext {
+    /// Whether this exact lifecycle has begun hard-aborting admitted tasks
+    /// because its shutdown drain deadline expired.
+    #[inline]
+    pub(crate) fn is_aborting_at_deadline(&self) -> bool {
+        self.lifecycle.cancelling_tasks.load(Ordering::Acquire)
+    }
 }
 
 struct DeliveryLifecycle {
@@ -531,6 +586,29 @@ impl DeliveryLifecycle {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.spawn_with_context(admission, kind, |_| future)
+    }
+
+    /// Admit `factory`'s future against this exact lifecycle `Arc`.
+    ///
+    /// The context passed to `factory` is built from `self` before admission
+    /// continues, so callers never observe a different generation than the one
+    /// that reserved the permit and inserted the registry entry.
+    fn spawn_with_context<F, Fut>(
+        self: &Arc<Self>,
+        admission: TaskAdmission,
+        kind: DeliveryTaskKind,
+        factory: F,
+    ) -> bool
+    where
+        F: FnOnce(DeliveryTaskContext) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        // Bind the probe to this Arc before any further slot-level load can
+        // diverge. Admission below runs on the same generation.
+        let future = factory(DeliveryTaskContext {
+            lifecycle: Arc::clone(self),
+        });
         if !self.accepts(admission) {
             self.counters.record_rejected(kind);
             return false;
@@ -734,8 +812,20 @@ impl DeliveryLifecycle {
     }
 
     async fn shutdown(&self, timeout: Duration) -> DeliveryDrainReport {
+        self.shutdown_with_admission_closed_signal(timeout, None)
+            .await
+    }
+
+    async fn shutdown_with_admission_closed_signal(
+        &self,
+        timeout: Duration,
+        admission_closed_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> DeliveryDrainReport {
         let mut cached_report = self.shutdown_report.lock().await;
         if let Some(report) = *cached_report {
+            if let Some(tx) = admission_closed_tx {
+                let _ = tx.send(());
+            }
             return report;
         }
 
@@ -746,6 +836,9 @@ impl DeliveryLifecycle {
         self.accepting_external_tasks
             .store(false, Ordering::Release);
         let deadline = Instant::now() + timeout;
+        if let Some(tx) = admission_closed_tx {
+            let _ = tx.send(());
+        }
 
         let tasks_drained = self.wait_for_tasks(deadline).await;
         self.accepting_internal_tasks
@@ -1066,6 +1159,17 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     global().spawn_terminal(future)
+}
+
+/// Register terminal cleanup with a probe for the exact admitted lifecycle.
+///
+/// See [`DeliverySlot::spawn_terminal_with_context`].
+pub(crate) fn spawn_terminal_with_context<F, Fut>(factory: F) -> bool
+where
+    F: FnOnce(DeliveryTaskContext) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    global().spawn_terminal_with_context(factory)
 }
 
 /// Register mirror work spawned by an already admitted delivery task.
@@ -1562,5 +1666,78 @@ mod tests {
                 "cancelled={cancelled} must not exceed inserted task ids={ids_issued}"
             );
         }
+    }
+
+    /// Exact-generation context must outlive slot replacement.
+    ///
+    /// `DeliverySlot::shutdown` drains one captured lifecycle while
+    /// `begin_cycle` may install a fresh open generation before that drain
+    /// finishes. Hard-abort classification for tasks admitted on A must read
+    /// A's `cancelling_tasks`, not the slot's current B.
+    #[tokio::test]
+    async fn delivery_task_context_tracks_admitted_lifecycle_across_slot_replacement() {
+        let slot = DeliverySlot::new(0);
+        let lifecycle_a = slot.snapshot();
+        let generation_a = lifecycle_a.generation;
+
+        let captured = Arc::new(std::sync::OnceLock::new());
+        let task_started = Arc::new(Notify::new());
+
+        let factory_captured = Arc::clone(&captured);
+        let factory_started = Arc::clone(&task_started);
+        assert!(
+            slot.spawn_terminal_with_context(move |ctx| {
+                // Capture through the spawn factory so a double-snapshot
+                // implementation (context from one load, admission on another)
+                // cannot silently pass a hand-built context assertion.
+                let _ = factory_captured.set(ctx);
+                async move {
+                    factory_started.notify_one();
+                    std::future::pending::<()>().await;
+                }
+            }),
+            "admission against open lifecycle A must succeed"
+        );
+        task_started.notified().await;
+
+        let ctx = captured
+            .get()
+            .expect("context-bearing spawn must install the admission context")
+            .clone();
+        assert!(
+            !ctx.is_aborting_at_deadline(),
+            "open lifecycle A must not report deadline abort before cancel_remaining"
+        );
+
+        // Real slot replacement path: draining A lets begin_cycle install B.
+        lifecycle_a
+            .state
+            .store(GENERATION_DRAINING, Ordering::Release);
+        let generation_b = slot.begin_cycle();
+        assert_ne!(
+            generation_b, generation_a,
+            "begin_cycle must install a fresh generation while A drains"
+        );
+        let lifecycle_b = slot.snapshot();
+        assert_eq!(lifecycle_b.generation, generation_b);
+        assert!(
+            !lifecycle_b.cancelling_tasks.load(Ordering::Acquire),
+            "fresh generation B must not be cancelling"
+        );
+
+        // Hard-cancel the drained generation that still owns the admitted task.
+        lifecycle_a.cancel_remaining();
+        assert!(
+            ctx.is_aborting_at_deadline(),
+            "captured context must still observe A's deadline abort after slot replacement"
+        );
+        assert!(
+            !lifecycle_b.cancelling_tasks.load(Ordering::Acquire),
+            "slot current (B) must remain non-aborting while A cancels"
+        );
+        assert!(
+            !slot.snapshot().cancelling_tasks.load(Ordering::Acquire),
+            "current-generation sample must not be used for A's abort classification"
+        );
     }
 }

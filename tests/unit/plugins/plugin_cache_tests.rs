@@ -28,6 +28,69 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Test shim for the finalized-request-egress phase (GHSA-4vr5-4wm3-x5xv).
+///
+/// `request_mirror` and `serverless_function` no longer have a `before_proxy`
+/// hook. They dispatch over an immutable backend-visible snapshot, so this
+/// derives the finalized body from the representation the test staged on the
+/// context and folds the backend header overlay back into the mutable map.
+async fn finalized_egress(
+    plugin: &dyn Plugin,
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    let body: Vec<u8> = ctx
+        .request_body_bytes
+        .as_ref()
+        .map(|body| body.to_vec())
+        .or_else(|| {
+            ctx.metadata
+                .get("request_body")
+                .map(|body| body.as_bytes().to_vec())
+        })
+        .unwrap_or_default();
+    let mut overlay = HashMap::new();
+    let snapshot = headers.clone();
+    let result = plugin
+        .dispatch_finalized_request_egress(ctx, &snapshot, &body, &mut overlay)
+        .await;
+    headers.extend(overlay);
+    result
+}
+
+async fn run_finalized_egress_chain(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    let body: Vec<u8> = ctx
+        .request_body_bytes
+        .as_ref()
+        .map(|body| body.to_vec())
+        .or_else(|| {
+            ctx.metadata
+                .get("request_body")
+                .map(|body| body.as_bytes().to_vec())
+        })
+        .unwrap_or_default();
+    let snapshot = headers.clone();
+    let mut overlay = HashMap::new();
+    for plugin in plugins {
+        if !plugin.dispatches_finalized_request_egress() {
+            continue;
+        }
+        let result = plugin
+            .dispatch_finalized_request_egress(ctx, &snapshot, &body, &mut overlay)
+            .await;
+        if !matches!(result, PluginResult::Continue) {
+            headers.extend(overlay);
+            return result;
+        }
+    }
+    headers.extend(overlay);
+    PluginResult::Continue
+}
+
 struct LegacyAuthorizePlugin;
 
 #[async_trait::async_trait]
@@ -53,6 +116,32 @@ impl Plugin for RawCorrelationClaimPlugin {
 
     fn correlation_id_header_name(&self) -> Option<&str> {
         Some(self.claim)
+    }
+}
+
+/// Stands in for a custom plugin declaring the client-request-contract
+/// capability. No built-in can express the violating combination, so the
+/// invariant has to be exercised with a synthetic capability plugin.
+struct ClientContractCapabilityPlugin {
+    requires_prebuffer: bool,
+}
+
+#[async_trait::async_trait]
+impl Plugin for ClientContractCapabilityPlugin {
+    fn name(&self) -> &str {
+        "custom_client_contract"
+    }
+
+    fn validates_client_request_body_contract(&self) -> bool {
+        true
+    }
+
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.requires_prebuffer
+    }
+
+    fn should_buffer_request_body(&self, _ctx: &RequestContext) -> bool {
+        true
     }
 }
 
@@ -3195,9 +3284,10 @@ async fn serverless_instances_keep_independent_transaction_metadata() {
         "GET".to_string(),
         "/api".to_string(),
     );
+    let mut headers = HashMap::new();
 
     assert!(matches!(
-        run_before_proxy_chain(&plugins, &mut ctx).await,
+        run_finalized_egress_chain(&plugins, &mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
     assert_eq!(
@@ -3295,7 +3385,7 @@ async fn request_mirror_cache_construction_preserves_plugin_config_id() {
     let mut headers = HashMap::new();
 
     assert!(matches!(
-        mirror.before_proxy(&mut ctx, &mut headers).await,
+        finalized_egress(mirror.as_ref(), &mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
     let result = tokio::time::timeout(
@@ -3313,7 +3403,7 @@ async fn request_mirror_cache_construction_preserves_plugin_config_id() {
 }
 
 #[test]
-fn serverless_body_egress_rejects_request_body_transform_composition() {
+fn serverless_finalized_body_egress_allows_request_body_transform_composition() {
     let mut transform_cases = vec![
         (
             "body-transform",
@@ -3370,15 +3460,59 @@ fn serverless_body_egress_rejects_request_body_transform_composition() {
             ],
         );
 
-        let error = match PluginCache::new(&config) {
-            Ok(_) => panic!("serverless body egress plus {transform_name} must fail closed"),
-            Err(error) => error,
-        };
-        assert!(
-            error.contains("request-body") || error.contains("validation"),
-            "transform={transform_name}, got: {error}"
-        );
+        PluginCache::new(&config).unwrap_or_else(|error| {
+            panic!(
+                "serverless finalized-body egress plus {transform_name} must be admitted: {error}"
+            )
+        });
     }
+}
+
+/// Moving `pre_proxy` header injection into the finalized-request-egress
+/// overlay makes it land LATER than the `before_proxy` write it replaced, so
+/// the `request_deduplication` ordering gate must keep firing — and candidate
+/// admission (which sees the pure `ServerlessSecurityCompositionPlugin` view)
+/// must keep agreeing with runtime cache construction.
+#[test]
+fn serverless_pre_proxy_overlay_keeps_deduplication_gate_in_candidate_and_runtime() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "function"])],
+        vec![
+            make_plugin_config(
+                "dedup",
+                "request_deduplication",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config_with_json(
+                "function",
+                "serverless_function",
+                json!({
+                    "provider": "azure_functions",
+                    "function_url": "https://example.com/policy"
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .expect_err("candidate must reject a pre_proxy function ordered after deduplication");
+    assert!(
+        candidate_error.contains("must run before every request_deduplication"),
+        "{candidate_error}"
+    );
+
+    let runtime_error = PluginCache::new(&config)
+        .err()
+        .expect("runtime cache must repeat the fail-closed ordering check");
+    assert!(
+        runtime_error.contains("must run before every request_deduplication"),
+        "{runtime_error}"
+    );
 }
 
 #[test]
@@ -3397,6 +3531,8 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
     assert!(candidate.contains("is_security_composition_candidate_plugin("));
     assert!(candidate.contains("security_composition_capabilities("));
     assert!(candidate.contains("ServerlessSecurityCompositionPlugin"));
+    assert!(candidate.contains("finalized_request_policy_composition_spec("));
+    assert!(candidate.contains("FinalizedRequestPolicyCompositionPlugin"));
     let candidate_names_start = source
         .find("const SECURITY_COMPOSITION_PLUGIN_NAMES")
         .expect("security-composition candidate allowlist must exist");
@@ -3413,6 +3549,40 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
         candidate_names.contains("\"workload_metrics\""),
         "candidate construction must include every built-in request-header mutator so replay plugins cannot pass admission ahead of workload tracing rewrites"
     );
+    for expensive_final_policy in [
+        "waf",
+        "openapi_validator",
+        "body_validator",
+        "request_size_limiting",
+        "ai_tool_governor",
+        "ai_semantic_firewall",
+    ] {
+        assert!(
+            !candidate_names.contains(&format!("\"{expensive_final_policy}\"")),
+            "{expensive_final_policy} must use the pure finalized-policy composition view, not full construction"
+        );
+    }
+    let cheap_specs_start = source
+        .find("const FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS")
+        .expect("cheap finalized-policy composition inventory must exist");
+    let cheap_specs_end = source[cheap_specs_start..]
+        .find("];")
+        .map(|offset| cheap_specs_start + offset)
+        .expect("cheap finalized-policy composition inventory must terminate");
+    let cheap_specs = &source[cheap_specs_start..cheap_specs_end];
+    for expensive_final_policy in [
+        "waf",
+        "openapi_validator",
+        "body_validator",
+        "request_size_limiting",
+        "ai_tool_governor",
+        "ai_semantic_firewall",
+    ] {
+        assert!(
+            cheap_specs.contains(&format!("\"{expensive_final_policy}\"")),
+            "candidate admission must inventory {expensive_final_policy} in the pure capability view"
+        );
+    }
     let effective_chain_start = source
         .find("fn validate_plugin_security_composition(")
         .expect("effective-chain security validator must exist");
@@ -3424,6 +3594,336 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
     );
     assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
     assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
+}
+
+fn enforces_finalized_request_policy_override_returns_true(source: &str, fn_offset: usize) -> bool {
+    let after = &source[fn_offset..];
+    let open = match after.find('{') {
+        Some(idx) => idx,
+        None => return false,
+    };
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, ch) in after[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = match close {
+        Some(idx) => idx,
+        None => return false,
+    };
+    let body = &after[open + 1..close];
+    let mut expr = String::new();
+    for line in body.lines() {
+        let line = line.split("//").next().unwrap_or(line).trim();
+        if !line.is_empty() {
+            if !expr.is_empty() {
+                expr.push(' ');
+            }
+            expr.push_str(line);
+        }
+    }
+    expr == "true"
+}
+
+#[test]
+fn finalized_request_policy_candidate_inventory_covers_every_builtin_override() {
+    // Mechanically pin candidate admission inventories against every production
+    // Plugin override of enforces_finalized_request_policy() so a new final
+    // validator cannot ship without either full construction or the cheap view.
+    let cache_source = include_str!("../../../src/plugin_cache.rs");
+    let full_names_start = cache_source
+        .find("const SECURITY_COMPOSITION_PLUGIN_NAMES")
+        .expect("security-composition allowlist must exist");
+    let full_names_end = cache_source[full_names_start..]
+        .find("];")
+        .map(|offset| full_names_start + offset)
+        .expect("security-composition allowlist must terminate");
+    let full_names = &cache_source[full_names_start..full_names_end];
+    let cheap_specs_start = cache_source
+        .find("const FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS")
+        .expect("cheap finalized-policy inventory must exist");
+    let cheap_specs_end = cache_source[cheap_specs_start..]
+        .find("];")
+        .map(|offset| cheap_specs_start + offset)
+        .expect("cheap finalized-policy inventory must terminate");
+    let cheap_specs = &cache_source[cheap_specs_start..cheap_specs_end];
+
+    let plugins_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugins");
+    let mut plugin_sources = Vec::new();
+    for entry in std::fs::read_dir(&plugins_dir).expect("src/plugins must be readable") {
+        let entry = entry.expect("directory entry");
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            plugin_sources.push(std::fs::read_to_string(&path).expect("read plugin source"));
+        } else if path.is_dir() {
+            let mod_rs = path.join("mod.rs");
+            if mod_rs.is_file() {
+                plugin_sources.push(std::fs::read_to_string(&mod_rs).expect("read plugin mod"));
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+    for source in &plugin_sources {
+        let mut search = source.as_str();
+        while let Some(offset) = search.find("fn enforces_finalized_request_policy") {
+            if enforces_finalized_request_policy_override_returns_true(search, offset) {
+                // Walk backward to the nearest `fn name(&self)` return literal.
+                let before = &search[..offset];
+                let name_fn = before
+                    .rfind("fn name(&self)")
+                    .expect("enforces_finalized_request_policy override must follow fn name()");
+                let name_slice = &before[name_fn..];
+                let quote = name_slice
+                    .find('"')
+                    .expect("plugin name() must return a string literal");
+                let rest = &name_slice[quote + 1..];
+                let end = rest.find('"').expect("plugin name literal must terminate");
+                found.push(rest[..end].to_string());
+            }
+            search = &search[offset + "fn enforces_finalized_request_policy".len()..];
+        }
+    }
+    found.sort();
+    found.dedup();
+    assert!(
+        !found.is_empty(),
+        "expected at least one enforces_finalized_request_policy override"
+    );
+
+    for plugin_name in &found {
+        let in_full = full_names.contains(&format!("\"{plugin_name}\""));
+        let in_cheap = cheap_specs.contains(&format!("\"{plugin_name}\""));
+        assert!(
+            in_full ^ in_cheap,
+            "{plugin_name} must appear in exactly one candidate inventory \
+             (SECURITY_COMPOSITION_PLUGIN_NAMES or FINALIZED_REQUEST_POLICY_COMPOSITION_SPECS); \
+             full={in_full} cheap={in_cheap}"
+        );
+    }
+}
+
+#[test]
+fn candidate_rejects_legacy_early_egress_with_omitted_final_policy_validators() {
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let early_egress = || {
+        make_plugin_config_with_json(
+            "early-egress",
+            "example_plugin",
+            json!({"egresses_request_body_before_finalization": true}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )
+    };
+
+    // HTTP-only representative previously absent from the candidate allowlist.
+    let openapi = make_plugin_config_with_json(
+        "openapi",
+        "openapi_validator",
+        json!({
+            "operations": [{
+                "method": "GET",
+                "path_template": "/health",
+                "path_regex": "^/health$",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": { "type": "object" }
+                        }
+                    }
+                }
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let http_only = make_config(
+        vec![make_proxy("p1", "/api", vec!["early-egress", "openapi"])],
+        vec![early_egress(), openapi],
+    );
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&http_only, None)
+            .expect_err("candidate admission must reject early egress + openapi_validator");
+    assert!(
+        candidate_error.contains("example_plugin")
+            && candidate_error.contains("openapi_validator")
+            && candidate_error.contains("final request-body policy"),
+        "got: {candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&http_only)
+        .err()
+        .expect("runtime cache must repeat the fail-closed refusal");
+    assert!(
+        runtime_error.contains("example_plugin")
+            && runtime_error.contains("openapi_validator")
+            && runtime_error.contains("final request-body policy"),
+        "got: {runtime_error}"
+    );
+
+    // HTTP+gRPC representative previously absent from the candidate allowlist.
+    let size_limit = make_plugin_config_with_json(
+        "size",
+        "request_size_limiting",
+        json!({"max_bytes": 1048576}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let http_grpc = make_config(
+        vec![make_proxy("p1", "/api", vec!["early-egress", "size"])],
+        vec![early_egress(), size_limit],
+    );
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&http_grpc, None)
+            .expect_err("candidate admission must reject early egress + request_size_limiting");
+    assert!(
+        candidate_error.contains("example_plugin")
+            && candidate_error.contains("request_size_limiting")
+            && candidate_error.contains("final request-body policy"),
+        "got: {candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&http_grpc)
+        .err()
+        .expect("runtime cache must repeat the fail-closed refusal");
+    assert!(
+        runtime_error.contains("example_plugin")
+            && runtime_error.contains("request_size_limiting")
+            && runtime_error.contains("final request-body policy"),
+        "got: {runtime_error}"
+    );
+
+    // Unrelated protocols: TCP-only early egress must not collide with an
+    // HTTP-only final validator on the shared proxy chain.
+    let tcp_egress = make_plugin_config_with_json(
+        "early-egress",
+        "example_plugin",
+        json!({
+            "protocol": "tcp",
+            "egresses_request_body_before_finalization": true
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let openapi_safe = make_plugin_config_with_json(
+        "openapi",
+        "openapi_validator",
+        json!({
+            "operations": [{
+                "method": "GET",
+                "path_template": "/health",
+                "path_regex": "^/health$",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": { "type": "object" }
+                        }
+                    }
+                }
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let safe = make_config(
+        vec![make_proxy("p1", "/api", vec!["early-egress", "openapi"])],
+        vec![tcp_egress, openapi_safe],
+    );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&safe, None)
+        .expect("TCP-only early egress must compose with an HTTP-only final validator");
+    PluginCache::new(&safe)
+        .expect("runtime cache must admit unrelated-protocol early egress + openapi");
+}
+
+#[test]
+fn candidate_and_runtime_agree_on_early_egress_with_stream_enabled_waf() {
+    // Stream-enabled WAF advertises ALL_PROTOCOLS at runtime while the cheap
+    // candidate view stays on HTTP_FAMILY. The body-policy collision gate is
+    // scoped to HTTP/gRPC, so TCP-only early egress must admit on both paths
+    // and HTTP early egress must still fail closed on both.
+    if !ferrum_edge::custom_plugins::custom_plugin_names().contains(&"example_plugin") {
+        return;
+    }
+
+    let stream_waf = || {
+        make_plugin_config_with_json(
+            "waf",
+            "waf",
+            json!({
+                "include_default_rules": false,
+                "stream": {
+                    "signatures": [{
+                        "id": "STREAM-EARLY-EGRESS-1",
+                        "pattern": "(?i)union\\s+select"
+                    }]
+                }
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )
+    };
+
+    let tcp_egress = make_plugin_config_with_json(
+        "early-egress",
+        "example_plugin",
+        json!({
+            "protocol": "tcp",
+            "egresses_request_body_before_finalization": true
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let tcp_safe = make_config(
+        vec![make_proxy("p1", "/api", vec!["early-egress", "waf"])],
+        vec![tcp_egress, stream_waf()],
+    );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&tcp_safe, None)
+        .expect("candidate admission must admit TCP-only early egress with stream-enabled WAF");
+    PluginCache::new(&tcp_safe)
+        .expect("runtime PluginCache must admit TCP-only early egress with stream-enabled WAF");
+
+    let http_egress = make_plugin_config_with_json(
+        "early-egress",
+        "example_plugin",
+        json!({"egresses_request_body_before_finalization": true}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let http_collision = make_config(
+        vec![make_proxy("p1", "/api", vec!["early-egress", "waf"])],
+        vec![http_egress, stream_waf()],
+    );
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&http_collision, None)
+            .expect_err(
+                "candidate admission must reject HTTP early egress with stream-enabled WAF",
+            );
+    assert!(
+        candidate_error.contains("example_plugin")
+            && candidate_error.contains("waf")
+            && candidate_error.contains("final request-body policy"),
+        "got: {candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&http_collision)
+        .err()
+        .expect("runtime cache must reject HTTP early egress with stream-enabled WAF");
+    assert!(
+        runtime_error.contains("example_plugin")
+            && runtime_error.contains("waf")
+            && runtime_error.contains("final request-body policy"),
+        "got: {runtime_error}"
+    );
 }
 
 #[tokio::test]
@@ -3530,7 +4030,7 @@ fn candidate_serverless_composition_uses_pure_capabilities_not_runtime_credentia
 }
 
 #[test]
-fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egress() {
+fn candidate_serverless_pure_capabilities_reject_unsafe_order_and_allow_finalized_body_egress() {
     let mut terminal = make_plugin_config_with_json(
         "function",
         "serverless_function",
@@ -3564,7 +4064,7 @@ fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egr
         "{order_error}"
     );
 
-    let unsafe_body = make_config(
+    let transformed_body = make_config(
         vec![make_proxy("p1", "/api", vec!["function", "transform"])],
         vec![
             make_plugin_config_with_json(
@@ -3594,10 +4094,8 @@ fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egr
             ),
         ],
     );
-    let body_error =
-        validate_plugin_composition_candidate_with_real_ip_header_for_test(&unsafe_body, None)
-            .expect_err("pure forward_body capability must retain body-view enforcement");
-    assert!(body_error.contains("request-body"), "{body_error}");
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&transformed_body, None)
+        .expect("finalized forward_body egress must compose with request-body transforms");
 }
 
 #[test]
@@ -9653,6 +10151,64 @@ fn test_empty_third_party_correlation_capability_claims_fail_closed_clearly() {
 }
 
 #[test]
+fn client_contract_capability_without_prebuffer_requirement_fails_closed() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ClientContractCapabilityPlugin {
+        requires_prebuffer: false,
+    })];
+
+    let error = ferrum_edge::_test_support::validate_plugin_security_composition_for_test(&plugins)
+        .expect_err("a client-contract plugin without the pre-before_proxy buffer must be refused");
+
+    assert!(
+        error.contains("custom_client_contract"),
+        "error must name the offending plugin: {error}"
+    );
+    assert!(
+        error.contains("validates_client_request_body_contract()")
+            && error.contains("requires_request_body_before_before_proxy()"),
+        "error must name both capabilities: {error}"
+    );
+}
+
+#[test]
+fn client_contract_capability_with_prebuffer_requirement_is_admitted() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ClientContractCapabilityPlugin {
+        requires_prebuffer: true,
+    })];
+
+    ferrum_edge::_test_support::validate_plugin_security_composition_for_test(&plugins)
+        .expect("a correctly declared client-contract plugin must be admitted");
+}
+
+#[test]
+fn builtin_openapi_validator_satisfies_the_client_contract_capability_invariant() {
+    let validator = ferrum_edge::plugins::openapi_validator::OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/orders",
+            "path_regex": "^/orders$",
+            "request_required": true,
+            "request_body": {
+                "content": {
+                    "application/json": {"type": "object"}
+                }
+            }
+        }]
+    }))
+    .expect("construct openapi_validator");
+
+    assert!(validator.validates_client_request_body_contract());
+    assert!(
+        validator.requires_request_body_before_before_proxy(),
+        "the built-in must keep declaring the buffer its client-contract phase reads"
+    );
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(validator)];
+    ferrum_edge::_test_support::validate_plugin_security_composition_for_test(&plugins)
+        .expect("the built-in validator must pass the composition invariant");
+}
+
+#[test]
 fn test_third_party_correlation_capability_cannot_claim_real_ip_header() {
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RawCorrelationClaimPlugin {
         claim: " CF-Connecting-IP ",
@@ -9925,7 +10481,27 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
 }
 
 #[test]
-fn test_ai_federation_sets_terminal_final_body_dispatch_capability() {
+fn test_priority_override_preserves_finalized_request_policy_capability() {
+    let mut waf =
+        make_plugin_config_with_json("ps1", "waf", json!({}), PluginScope::Proxy, Some("p1"));
+    waf.priority_override = Some(2081);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["ps1"])], vec![waf]);
+    let cache = PluginCache::new(&config).unwrap();
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let waf = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "waf")
+        .expect("WAF plugin is cached");
+
+    assert!(
+        waf.enforces_finalized_request_policy(),
+        "priority_override must not hide a final request-body validator from the \
+         legacy pre-finalization egress composition gate"
+    );
+}
+
+#[test]
+fn test_ai_federation_sets_terminal_final_body_and_finalized_egress_capabilities() {
     let mut plugin_config = make_plugin_config_with_json(
         "ps1",
         "ai_federation",
@@ -9953,6 +10529,10 @@ fn test_ai_federation_sets_terminal_final_body_dispatch_capability() {
     assert!(
         caps.has(PluginCapabilities::FINAL_BODY_BEFORE_BACKEND_DISPATCH),
         "AI federation must finalize and dispatch before backend-only preflights and accounting"
+    );
+    assert!(
+        caps.has(PluginCapabilities::DISPATCHES_FINALIZED_REQUEST_EGRESS),
+        "AI federation provider I/O must run after the complete final request-policy hook pass"
     );
 }
 
@@ -11119,6 +11699,7 @@ fn test_serverless_terminate_grpc_config_lifecycle_create_update_reload_delete()
         "terminate mode must be the published behavior"
     );
     assert!(!created_instance.modifies_request_headers());
+    assert!(created_instance.dispatches_finalized_request_egress());
     assert_eq!(
         created_instance.warmup_hostnames(),
         vec!["example.com".to_string()]
@@ -11146,9 +11727,10 @@ fn test_serverless_terminate_grpc_config_lifecycle_create_update_reload_delete()
     );
     assert!(
         updated_instance.modifies_request_headers(),
-        "pre_proxy mode modifies request headers; terminate mode does not"
+        "pre_proxy mode must advertise its finalized backend-header overlay to replay/cache ordering admission"
     );
-    assert!(updated_instance.deferred_before_proxy_may_change_routing_headers());
+    assert!(!updated_instance.deferred_before_proxy_may_change_routing_headers());
+    assert!(updated_instance.dispatches_finalized_request_egress());
     assert_eq!(
         updated_instance.warmup_hostnames(),
         vec!["updated.example.net".to_string()],

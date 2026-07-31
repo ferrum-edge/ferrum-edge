@@ -473,6 +473,11 @@ fn build_config(echo_port: u16, with_host: bool) -> String {
     )
 }
 
+/// Valid gateway-error response policy for the H3 wire-boundary test.
+///
+/// Protocol-managed destinations are rejected at plugin construction (covered
+/// exhaustively in `security_headers_tests`), so this fixture sets only fields
+/// the policy owns and lets the gateway derive/strip framing on the final wire.
 fn build_config_with_h3_gateway_policy(echo_port: u16) -> String {
     format!(
         "version: \"1\"\nproxies:\n\
@@ -492,13 +497,11 @@ fn build_config_with_h3_gateway_policy(echo_port: u16) -> String {
          \x20     override_existing: false\n\
          \x20     set:\n\
          \x20       X-H3-Gateway-Policy: enforced\n\
-         \x20       Content-Type: text/plain\n\
-         \x20       Content-Length: \"999\"\n\
-         \x20       Transfer-Encoding: chunked\n",
+         \x20       Content-Type: text/plain\n",
     )
 }
 
-fn build_config_with_h3_sse_plugin_hop_headers(echo_port: u16) -> String {
+fn build_config_with_h3_sse_and_response_transformer(echo_port: u16) -> String {
     format!(
         r#"version: "1"
 proxies:
@@ -510,7 +513,7 @@ proxies:
     strip_listen_path: false
     plugins:
       - plugin_config_id: "sse-h3"
-      - plugin_config_id: "response-hop-headers"
+      - plugin_config_id: "response-marker"
 consumers: []
 plugin_configs:
   - id: "sse-h3"
@@ -520,21 +523,19 @@ plugin_configs:
     enabled: true
     config:
       force_sse_content_type: true
-  - id: "response-hop-headers"
+  - id: "response-marker"
     plugin_name: response_transformer
     scope: proxy
     proxy_id: "echo-http"
     enabled: true
     config:
       rules:
-        - operation: update
-          target: header
-          key: Connection
-          value: "X-Plugin-Hop, Keep-Alive"
-        - operation: update
-          target: header
-          key: X-Plugin-Hop
-          value: "must-not-reach-h3"
+        # Deliberately no rule that targets a protocol-managed destination: those
+        # are rejected at construction now (unit-covered in
+        # tests/unit/plugins/response_transformer_tests.rs) and such a config
+        # cannot start a gateway. Nothing here removes hop-by-hop fields either,
+        # so the assertions downstream can only be satisfied by the gateway's own
+        # response boundaries.
         - operation: update
           target: header
           key: X-Plugin-Kept
@@ -2060,7 +2061,21 @@ async fn functional_protocol_validation_h3_request_body_limit_rejects_from_env()
             .and_then(|value| value.to_str().ok()),
         Some("enforced")
     );
-    assert!(!policy_resp.headers.contains_key("content-length"));
+    // A 413 with a diagnostic body is an ordinary HTTP/3 response: the final
+    // anti-smuggling boundary derives an authoritative `Content-Length` from the
+    // bytes actually sent (it must never echo the attacker-declared `16`).
+    // `Transfer-Encoding` remains forbidden on H3 (RFC 9114 §4.2).
+    let policy_body_len = policy_resp.body_text().len().to_string();
+    assert_eq!(
+        policy_resp
+            .headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+        Some(policy_body_len.as_str()),
+        "H3 413 must advertise the derived body length, not the declared request length; \
+         headers={:?}",
+        policy_resp.headers
+    );
     assert!(!policy_resp.headers.contains_key("transfer-encoding"));
     assert_eq!(
         policy_resp
@@ -2692,15 +2707,27 @@ async fn functional_protocol_validation_response_hop_by_hop_stripped_http3() {
     echo_task.abort();
 }
 
+/// The final H3 client-wire boundary runs *after* every mutable response hook.
+///
+/// Configuration rejection and runtime stripping are deliberately separate
+/// guarantees: `response_transformer` / `response_mock` can no longer be
+/// configured to write a protocol-managed destination at all (unit coverage in
+/// `tests/unit/plugins/`), so a config that tries cannot even start a gateway.
+/// This test therefore uses a *valid* configuration where response plugins
+/// demonstrably run (SSE relabels `content-type`, the transformer adds
+/// `X-Plugin-Kept`) and asserts that no hop-by-hop field from any source
+/// survives to the H3 wire (RFC 9114 §4.2). Custom in-process plugins are still
+/// free to inject these names, which is exactly what the runtime boundary
+/// defends against.
 #[ignore]
 #[tokio::test]
-async fn functional_protocol_validation_h3_strips_plugin_reintroduced_hop_headers() {
+async fn functional_protocol_validation_h3_strips_hop_headers_after_response_plugins() {
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let echo_port = echo_listener.local_addr().unwrap().port();
     let echo_task = tokio::spawn(start_header_echo_server_on(echo_listener));
     sleep(Duration::from_millis(150)).await;
 
-    let config = build_config_with_h3_sse_plugin_hop_headers(echo_port);
+    let config = build_config_with_h3_sse_and_response_transformer(echo_port);
     let (mut gateway, https_port) = start_h3_validation_gateway_with_config(config, &[]).await;
 
     let client = Http3Client::insecure().expect("H3 client");
@@ -2724,10 +2751,20 @@ async fn functional_protocol_validation_h3_strips_plugin_reintroduced_hop_header
         Some("response-transformer-ran"),
         "the response transformer must run so this test exercises post-plugin sanitation"
     );
-    for banned in ["connection", "keep-alive", "x-plugin-hop"] {
+    for banned in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
         assert!(
             resp.headers.get(banned).is_none(),
-            "plugin-reintroduced hop-by-hop header `{banned}` leaked to H3; headers={:?}",
+            "hop-by-hop header `{banned}` leaked to H3 after the response plugin chain; \
+             headers={:?}",
             resp.headers
         );
     }

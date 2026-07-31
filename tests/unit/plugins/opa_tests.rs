@@ -1125,3 +1125,57 @@ async fn opa_error_logs_do_not_include_request_fields() {
         );
     }
 }
+
+/// `deny_headers` and `fail_closed_headers` are installed verbatim onto a client
+/// `Reject`, so their names are arbitrary response-header destinations. The
+/// gateway's final wire boundary owns framing and connection control, so those
+/// destinations are refused at construction with the same shared
+/// case-insensitive predicate `response_transformer` / `response_mock` /
+/// `security_headers` use.
+#[test]
+fn reject_header_maps_refuse_protocol_managed_destinations() {
+    for field in ["deny_headers", "fail_closed_headers"] {
+        for name in [
+            "connection",
+            "content-length",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            for spelling in [name.to_string(), name.to_ascii_uppercase()] {
+                let mut headers = serde_json::Map::new();
+                headers.insert(spelling.clone(), Value::String("x".to_string()));
+                let mut config = base_config("http://127.0.0.1:8181");
+                config
+                    .as_object_mut()
+                    .expect("object config")
+                    .insert(field.to_string(), Value::Object(headers));
+                // `Opa` has no `Debug`, so take the error rather than
+                // `expect_err`.
+                let error = Opa::new(&config, default_client())
+                    .err()
+                    .unwrap_or_else(|| panic!("{field}['{spelling}'] must be rejected"));
+                assert!(
+                    error.contains("protocol-managed") && error.contains(name),
+                    "diagnostic must name the offending {field} entry: {error}"
+                );
+            }
+        }
+
+        // Ordinary destinations stay accepted.
+        let mut headers = serde_json::Map::new();
+        headers.insert("x-policy".to_string(), Value::String("opa".to_string()));
+        headers.insert("Retry-After".to_string(), Value::String("30".to_string()));
+        let mut config = base_config("http://127.0.0.1:8181");
+        config
+            .as_object_mut()
+            .expect("object config")
+            .insert(field.to_string(), Value::Object(headers));
+        Opa::new(&config, default_client())
+            .unwrap_or_else(|error| panic!("ordinary {field} names must stay allowed: {error}"));
+    }
+}

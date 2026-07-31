@@ -61,6 +61,7 @@ pub mod config_builder;
 pub mod echo_servers;
 pub mod gateway_harness;
 pub mod hmac_helpers;
+pub mod protocol_managed_response_headers;
 
 pub use backend_availability::{
     IsolatedSqlDatabase, continue_if_backend_available, continue_if_tls_fixture_available,
@@ -79,7 +80,7 @@ pub use echo_servers::{
 pub use gateway_harness::{
     DbType, GatewayMode, TestGateway, TestGatewayBuilder, configure_coverage_gateway_command,
     ensure_gateway_built, ephemeral_port, explicit_test_binary, probe_gateway_identity,
-    shutdown_gateway_child,
+    scrub_gateway_capture_for_diagnostics, shutdown_gateway_child,
 };
 pub use hmac_helpers::{
     empty_digest_header, generate_hmac_signature, generate_hmac_signature_with_digest,

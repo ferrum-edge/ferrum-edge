@@ -45,6 +45,10 @@ mod load_balancer;
 mod logging;
 mod metrics;
 mod modes;
+// The reusable notification surface intentionally exposes helpers used by the
+// library's external tests and future producers that the binary does not yet
+// call directly.
+#[allow(dead_code)]
 mod notifications;
 mod observability_delivery;
 mod overload;

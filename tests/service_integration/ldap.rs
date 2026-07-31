@@ -60,10 +60,30 @@ cn: admins
 member: uid=alice,ou=people,dc=example,dc=org
 ";
 
+/// Controlled fixture Alice DN / password used by readiness probes and tests.
+/// Keep these aligned with `SEED_LDIF`; never log the password value.
+const FIXTURE_ALICE_DN: &str = "uid=alice,ou=people,dc=example,dc=org";
+const FIXTURE_ALICE_PASSWORD: &str = "alice-secret";
+
+/// Consecutive successful readiness rounds required before the fixture is
+/// considered stable enough for plugin authentication assertions.
+const REQUIRED_STABLE_READINESS_ROUNDS: u32 = 2;
+
+/// Install a test-scoped tracing formatter so hosted failures surface the
+/// LDAP plugin's backend `warn!` cause instead of only a generic HTTP 500.
+/// Non-panicking: a prior subscriber (parallel tests / harness) is fine.
+fn init_ldap_test_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_test_writer()
+        .try_init();
+}
+
 /// Start OpenLDAP and seed the test directory, or self-skip (locally) /
 /// hard-fail (CI). A started-but-unseedable server is a real failure, not a
 /// Docker-absence skip, so seeding panics.
 async fn ldap_ready(test: &str) -> Option<OpenLdapContainer> {
+    init_ldap_test_tracing();
     let container = match start_openldap_container().await {
         Ok(c) => c,
         Err(e) => {
@@ -83,16 +103,36 @@ async fn ldap_ready(test: &str) -> Option<OpenLdapContainer> {
 
 async fn wait_for_seeded_directory(container: &OpenLdapContainer) -> Result<(), BoxError> {
     let mut last = String::new();
+    let mut consecutive_ok = 0u32;
     for _ in 0..40 {
-        match seeded_directory_visible(&container.url).await {
-            Ok(()) => return Ok(()),
+        match seeded_directory_ready_round(&container.url).await {
+            Ok(()) => {
+                consecutive_ok += 1;
+                if consecutive_ok >= REQUIRED_STABLE_READINESS_ROUNDS {
+                    return Ok(());
+                }
+            }
             Err(err) => {
+                consecutive_ok = 0;
                 last = err.to_string();
-                tokio::time::sleep(Duration::from_millis(750)).await;
             }
         }
+        tokio::time::sleep(Duration::from_millis(750)).await;
     }
-    Err(format!("OpenLDAP seed was not visible through mapped port: {last}").into())
+    Err(format!(
+        "OpenLDAP seed was not stably visible through mapped port after \
+         {REQUIRED_STABLE_READINESS_ROUNDS} consecutive readiness rounds: {last}"
+    )
+    .into())
+}
+
+/// One readiness round: fresh admin visibility probe, then a fresh direct
+/// Alice bind on a separate connection. Both must succeed for the round to
+/// count toward consecutive stability.
+async fn seeded_directory_ready_round(ldap_url: &str) -> Result<(), BoxError> {
+    seeded_directory_visible(ldap_url).await?;
+    seeded_alice_direct_bind(ldap_url).await?;
+    Ok(())
 }
 
 async fn seeded_directory_visible(ldap_url: &str) -> Result<(), BoxError> {
@@ -115,11 +155,13 @@ async fn seeded_directory_visible(ldap_url: &str) -> Result<(), BoxError> {
         .await?
         .success()?;
     if people.len() != 1 {
+        let _ = ldap.unbind().await;
         return Err(format!("expected one seeded alice entry, got {}", people.len()).into());
     }
 
     let alice = SearchEntry::construct(people.into_iter().next().ok_or("missing alice entry")?);
-    if alice.dn != format!("uid=alice,{people_base}") {
+    if alice.dn != FIXTURE_ALICE_DN {
+        let _ = ldap.unbind().await;
         return Err(format!("unexpected alice DN {}", alice.dn).into());
     }
 
@@ -140,8 +182,27 @@ async fn seeded_directory_visible(ldap_url: &str) -> Result<(), BoxError> {
             .is_some_and(|values| values.iter().any(|value| value == "admins"))
     });
     if !has_admins_group {
+        let _ = ldap.unbind().await;
         return Err("expected seeded admins group containing alice".into());
     }
+
+    let _ = ldap.unbind().await;
+    Ok(())
+}
+
+/// Separate fresh connection that proves the seeded Alice user can bind with
+/// the controlled fixture credentials — the same path the plugin's first
+/// direct-bind authentication will take.
+async fn seeded_alice_direct_bind(ldap_url: &str) -> Result<(), BoxError> {
+    let (conn, mut ldap) = LdapConnAsync::new(ldap_url).await?;
+    ldap3::drive!(conn);
+    ldap.with_timeout(Duration::from_secs(5));
+
+    ldap.simple_bind(FIXTURE_ALICE_DN, FIXTURE_ALICE_PASSWORD)
+        .await
+        .map_err(|e| format!("alice direct bind connection failed: {e}"))?
+        .success()
+        .map_err(|e| format!("alice direct bind rejected: {e}"))?;
 
     let _ = ldap.unbind().await;
     Ok(())
