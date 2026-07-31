@@ -291,7 +291,7 @@ impl Plugin for TcpLogging {
             .start("tcp_logging", self.batch_config, move |batch| {
                 let flush_config = flush_config.clone();
                 let writer = Arc::clone(&writer);
-                async move { send_batch(&flush_config, &writer, batch).await }
+                async move { send_batch(&flush_config, &writer, &batch).await }
             })
     }
 
@@ -497,9 +497,9 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 async fn send_batch(
     cfg: &TcpFlushConfig,
     writer_state: &Mutex<Option<TcpWriter>>,
-    batch: Vec<QueuedSummaryPayload>,
+    batch: &[QueuedSummaryPayload],
 ) -> Result<(), String> {
-    let payload = assemble_ndjson(&batch);
+    let payload = assemble_ndjson(batch);
 
     let mut connection = writer_state
         .lock()
@@ -982,7 +982,7 @@ mod tests {
         ];
 
         let started = tokio::time::Instant::now();
-        let stalled_err = match send_batch(&stalled_cfg, &writer, batch).await {
+        let stalled_err = match send_batch(&stalled_cfg, &writer, &batch).await {
             Ok(()) => panic!("write against a non-reading peer must time out"),
             Err(error) => error,
         };
@@ -1020,7 +1020,7 @@ mod tests {
                 .expect("small test payload must serialize"),
         ];
         must(
-            send_batch(&healthy_cfg, &writer, small_batch).await,
+            send_batch(&healthy_cfg, &writer, &small_batch).await,
             "healthy collector must accept the reconnecting send",
         );
         let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())

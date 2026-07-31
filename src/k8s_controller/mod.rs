@@ -34,7 +34,7 @@ pub use reconciler::{
 use reconciler::{ReconcilerConfig, spawn_reconcile_loop};
 use resource_store::ResourceStoreSet;
 use status::GatewayApiStatusWriter;
-use watcher::{WatcherSelection, spawn_crd_reprobe_task, start_crd_watchers};
+use watcher::{RelistPolicy, WatcherSelection, spawn_crd_reprobe_task, start_crd_watchers};
 
 pub struct K8sControllerConfig {
     pub namespace: String,
@@ -64,6 +64,13 @@ pub struct K8sControllerConfig {
     pub mesh_sidecar_ingress_enforced: bool,
     pub debounce_ms: u64,
     pub full_sync_interval_secs: u64,
+    /// `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`, already clamped to
+    /// `0..=86_400` by the env parser. Rebuild a watch scope's reflector from
+    /// an authoritative list when it has delivered no event for this long; `0`
+    /// disables it. This is the only bound on a watch that stalls without
+    /// failing — `full_sync_interval_secs` re-reconciles from the same
+    /// reflector store, so it cannot recover objects the store never received.
+    pub watch_idle_relist_secs: u64,
     pub kubeconfig_path: Option<String>,
 }
 
@@ -608,6 +615,15 @@ pub async fn start_k8s_controller(
     // boundary for all of them (#3220).
     let registry = ControllerTaskRegistry::new();
 
+    let relist_policy = RelistPolicy::from_idle_secs(controller_config.watch_idle_relist_secs);
+    if relist_policy.idle_window.is_none() {
+        warn!(
+            "FERRUM_K8S_WATCH_IDLE_RELIST_SECS=0 disables watch-staleness recovery: a watch \
+             that stops delivering without failing will keep serving its last-known objects \
+             until the control plane restarts"
+        );
+    }
+
     let watchers_started = start_crd_watchers(
         client.clone(),
         store_set.clone(),
@@ -616,13 +632,19 @@ pub async fn start_k8s_controller(
         controller_namespace.clone(),
         istio_root_namespace.clone(),
         gateway_api_data_plane_service_namespace.clone(),
+        relist_policy,
+        metrics.clone(),
         shutdown.clone(),
         &registry,
         STARTUP_WATCHER_LABEL,
     )
     .await;
 
-    info!(watchers = watchers_started, "CRD watchers started");
+    info!(
+        watchers = watchers_started,
+        watch_idle_relist_secs = controller_config.watch_idle_relist_secs,
+        "CRD watchers started"
+    );
 
     let reconciler_config = ReconcilerConfig {
         namespace: controller_config.namespace,
@@ -680,6 +702,8 @@ pub async fn start_k8s_controller(
         controller_namespace,
         istio_root_namespace,
         gateway_api_data_plane_service_namespace,
+        relist_policy,
+        metrics.clone(),
         shutdown,
         Duration::from_secs(300),
         &registry,

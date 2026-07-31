@@ -6166,6 +6166,188 @@ pub mod _test_support {
         K8sControllerRegistryForTest(crate::k8s_controller::ControllerTaskRegistry::new())
     }
 
+    /// One watch scope driven by the production watcher task
+    /// ([`crate::k8s_controller::watcher::run_watcher_generations`]) over
+    /// scripted reflector generations instead of a live Kubernetes API server.
+    ///
+    /// Each generation gets its own event channel, so a test can hold a
+    /// replacement generation mid-initial-list and observe exactly what the
+    /// reconciler would see at that moment — which is what the make-before-break
+    /// relist contract is about.
+    pub struct K8sWatchScopeForTest {
+        store_set: std::sync::Arc<
+            tokio::sync::Mutex<crate::k8s_controller::resource_store::ResourceStoreSet>,
+        >,
+        senders: Vec<
+            tokio::sync::mpsc::UnboundedSender<
+                kube::runtime::watcher::Event<kube::api::DynamicObject>,
+            >,
+        >,
+        resource: kube::api::ApiResource,
+    }
+
+    impl K8sWatchScopeForTest {
+        /// A `DynamicObject` in this scope's namespace, shaped like one the
+        /// reflector would receive.
+        pub fn object(&self, namespace: &str, name: &str) -> kube::api::DynamicObject {
+            kube::api::DynamicObject::new(name, &self.resource)
+                .within(namespace)
+                .data(serde_json::json!({ "spec": {} }))
+        }
+
+        /// Deliver one watch event on `generation`'s stream. Panics if that
+        /// generation was never scripted.
+        pub fn emit(
+            &self,
+            generation: usize,
+            event: kube::runtime::watcher::Event<kube::api::DynamicObject>,
+        ) {
+            self.senders[generation]
+                .send(event)
+                .expect("scripted watch generation stream was dropped");
+        }
+
+        /// Object names the reconciler would see right now, sorted. This reads
+        /// the same `snapshot_all` the reconciler reads.
+        pub async fn visible_names(&self) -> Vec<String> {
+            let mut names: Vec<String> = self
+                .store_set
+                .lock()
+                .await
+                .snapshot_all()
+                .into_iter()
+                .map(|object| object.metadata.name)
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    /// The bounded per-scope idle-relist offset for one watch scope, in
+    /// milliseconds.
+    ///
+    /// Exposed so tests can assert its BOUNDS and its stability within one
+    /// process. The offset carries a per-process random seed (so control-plane
+    /// replicas do not relist the same scope in the same instant), so no test
+    /// may assert a particular value.
+    pub fn k8s_watch_idle_relist_jitter_millis(
+        api_version: &str,
+        kind: &str,
+        scope: &str,
+        idle_relist_secs: u64,
+    ) -> u64 {
+        use crate::k8s_controller::watcher::{RelistPolicy, idle_relist_jitter};
+
+        let window = RelistPolicy::from_idle_secs(idle_relist_secs).idle_window;
+        idle_relist_jitter(api_version, kind, scope, window).as_millis() as u64
+    }
+
+    /// Build a watch scope with `generations` scripted reflector generations and
+    /// return it alongside the production watcher task future.
+    ///
+    /// Generation 0's store is pre-registered exactly as `start_crd_watchers`
+    /// registers it. Streams past `generations` never yield and never end, so a
+    /// test cannot accidentally trip the stream-end deregistration path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn k8s_watch_scope_for_test(
+        group: &str,
+        version: &str,
+        kind: &str,
+        plural: &str,
+        scope: &str,
+        idle_relist_secs: u64,
+        generations: usize,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> (K8sWatchScopeForTest, impl std::future::Future<Output = ()>) {
+        use crate::k8s_controller::resource_store::{CrdResourceStore, ResourceStoreSet};
+        use crate::k8s_controller::watcher::{RelistPolicy, WatchTarget, run_watcher_generations};
+        use futures_util::{Stream, StreamExt};
+        use kube::api::{ApiResource, DynamicObject};
+        use kube::runtime::{reflector, watcher};
+
+        let api_version = if group.is_empty() {
+            version.to_string()
+        } else {
+            format!("{group}/{version}")
+        };
+        let resource = ApiResource {
+            group: group.to_string(),
+            version: version.to_string(),
+            api_version: api_version.clone(),
+            kind: kind.to_string(),
+            plural: plural.to_string(),
+        };
+
+        let mut senders = Vec::with_capacity(generations);
+        let mut receivers = std::collections::VecDeque::with_capacity(generations);
+        for _ in 0..generations {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            senders.push(tx);
+            receivers.push_back(rx);
+        }
+
+        let initial_writer = reflector::store::Writer::new(resource.clone());
+        let mut set = ResourceStoreSet::new();
+        set.add_store(std::sync::Arc::new(CrdResourceStore::new_scoped(
+            api_version.clone(),
+            kind.to_string(),
+            scope.to_string(),
+            initial_writer.as_reader(),
+        )));
+        let change_notifier = set.change_notifier();
+        let store_set = std::sync::Arc::new(tokio::sync::Mutex::new(set));
+
+        let target = WatchTarget {
+            api_version,
+            kind: kind.to_string(),
+            scope: scope.to_string(),
+            resource: resource.clone(),
+            watcher_label: "CRD watcher",
+        };
+
+        type ScriptedStream = std::pin::Pin<
+            Box<
+                dyn Stream<Item = Result<watcher::Event<DynamicObject>, watcher::Error>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+        let make_stream = move |writer: reflector::store::Writer<DynamicObject>| -> ScriptedStream {
+            match receivers.pop_front() {
+                Some(rx) => Box::pin(reflector::reflector(
+                    writer,
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+                        .map(Ok::<_, watcher::Error>),
+                )),
+                // Unscripted generations stay silent forever rather than ending,
+                // so they never look like a watch that closed.
+                None => Box::pin(futures_util::stream::pending::<
+                    Result<watcher::Event<DynamicObject>, watcher::Error>,
+                >()),
+            }
+        };
+
+        let task = run_watcher_generations(
+            target,
+            initial_writer,
+            store_set.clone(),
+            change_notifier,
+            RelistPolicy::from_idle_secs(idle_relist_secs),
+            std::sync::Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
+            shutdown,
+            make_stream,
+        );
+
+        (
+            K8sWatchScopeForTest {
+                store_set,
+                senders,
+                resource,
+            },
+            task,
+        )
+    }
+
     /// Thin wrapper over the production CP full-reload publication so external
     /// tests can drive it against real broadcast channels.
     #[allow(clippy::too_many_arguments)]

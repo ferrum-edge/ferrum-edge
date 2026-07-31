@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Kubernetes controller watch scopes now rebuild their reflector from an
+  authoritative list when they go idle past `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
+  (default `300`, `0` disables, clamped to `0`–`86400`). kube-rs raises an
+  error only when a watch *fails*, so a watch that stops delivering without
+  failing leaves the task alive while its reflector serves a permanently stale
+  object set and every later Gateway API / Istio resource stays invisible to
+  reconciles; `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` cannot recover it because it
+  re-reconciles that same store. A Gateway API conformance run captured that
+  signature — the TCPRoute `v1alpha2` scope initialized, four TCPRoutes existed
+  in the cluster, the sibling ReferenceGrant watcher kept receiving events, the
+  controller stayed alive and kept reconciling, and the TCPRoute store stayed
+  frozen with no watcher error, restart, or status write for 120s. That is
+  consistent with a silently stalled or black-holed watch; the artifact carries
+  no transport-level evidence of where the event stream was lost, so the
+  recovery is deliberately cause-agnostic and bounds any no-event stall. The
+  replacement generation is swapped in make-before-break — the previous store
+  keeps serving until the replacement reports `InitDone` — so a relist never
+  looks like a mass deletion, and a replacement that never finishes listing is
+  itself abandoned and retried without blanking the scope. Because bookmarks
+  are consumed inside kube-rs, a healthy quiet scope is indistinguishable from
+  a stalled one and relists on every window, so the window doubles as the
+  per-scope full-list rate against the API server; each scope's deadline
+  carries a bounded offset seeded per process, so neither the scopes on one
+  replica nor the replicas of one scope list in lockstep. Watcher task
+  ownership, the stream-end deregistration contract, and the CRD reprobe loop
+  are unchanged.
+
 - API-spec YAML ingestion now expands anchors and aliases through a bounded
   libyaml event graph (node, depth, alias-reference, expanded-byte, and work
   budgets) with cycle / undefined-alias / duplicate-anchor /
@@ -55,6 +82,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as well as API writes. Istio status planning remains unlimited
   (`StatusPlanBudget::unlimited(0)`). Fail-closed validation and status parity
   for every supported Istio/Gateway resource are preserved.
+- Shared `BatchingLogger` flush/retry/fallback now Arc-shares one immutable
+  batch payload (`Arc<Vec<T>>`) across every delivery attempt and the optional
+  failed-batch hook instead of deep-cloning owned records on each non-final
+  attempt (#3029). Sink flush closures borrow or Arc-clone that handle; byte
+  leases stay charged for the shared records' lifetime and release when the
+  last Arc drops after success, terminal discard, or fallback ownership
+  transfer.
 - `proxy_alerts` / notification delivery now expose bounded-cardinality
   Prometheus delivery metrics (`attempted` / `succeeded` /
   `failed_transient` / `failed_permanent` / `backpressure_dropped` /
@@ -101,6 +135,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Webhook/email consumers must be idempotent or duplicate-tolerant (#2448).
 
 ### Security
+
+- `body_validator` and `openapi_validator` validation diagnostics no longer
+  disclose the rejected representation (GHSA-5p2h-fq6q-gwh9). Both plugins used
+  to format the offending instance value — or a payload-chosen JSON, XML, form,
+  or multipart member name — into the string returned in the client-visible
+  reject / problem body and stored in `openapi_validator.request_error` /
+  `openapi_validator.response_error`, which every configured logging plugin
+  exports. On the response side that republished exactly the upstream
+  representation validation exists to withhold, letting a client that can
+  trigger an invalid backend response read back a token, credential, or PII
+  field; on the request side it copied caller credentials into gateway
+  telemetry and every downstream sink. Diagnostics are now assembled under a
+  centralized construction contract
+  (`plugins::utils::validation_diagnostics`): a compiled-in failure category, an
+  allowlisted JSON Schema keyword, and — request side only — a bounded instance
+  location. Numeric JSON Pointer segments render as a fixed `#` marker (pointer
+  text alone does not prove array shape); an object member name survives only
+  when the *configured schema declares it as a JSON property*, and every other
+  segment renders as `~`, so a hostile member name is replaced rather than
+  sanitized after the fact. Segment count, segment length, and total diagnostic
+  length are capped by compiled-in constants. Raw schema paths (including
+  `$defs` / reference names), configured XML names and namespaces, and hostile
+  `Content-Encoding` coding tokens are never formatted into diagnostics. No
+  production path formats a rejected value, an expected `enum` / `const`
+  constant, a raw `jsonschema` / `roxmltree` / `prost` rendering, a backend
+  `Content-Type`, or the request target, so there is nothing left for truncation
+  to protect and no raw-detail escape hatch in configuration or tracing.
+  Response-side conversion and decode failures collapse further, to a single
+  fixed sentence, because even the class of failure describes an upstream
+  representation the client was never entitled to observe.
+  `error_truncate_chars` is retained as a size bound and now only narrows
+  (`min(configured, 256)`). JSON, XML, form, multipart, protobuf, and gRPC
+  validation decisions, statuses, and fail-closed behavior are unchanged;
+  `openapi_validator`'s unknown-operation detail no longer interpolates the
+  request method and target.
 
 - Matched VirtualService route-level request/response header transforms remain
   authoritative under multiple same-type transformer instances

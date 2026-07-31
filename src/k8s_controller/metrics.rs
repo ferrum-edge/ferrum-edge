@@ -9,6 +9,15 @@ pub struct ControllerMetrics {
     /// budgeted planning pass so every eligible resource eventually enters the
     /// fair work window.
     pub gateway_api_status_plan_cursor: AtomicU64,
+    /// Reflector generations restarted because a watch scope produced no event
+    /// for the configured idle window (`FERRUM_K8S_WATCH_IDLE_RELIST_SECS`), or
+    /// because a replacement generation never finished its initial list.
+    ///
+    /// A quiet scope relists on every window even when it is perfectly healthy
+    /// — bookmarks never reach us, so idleness is not evidence of a fault — so
+    /// this counter measures relist *rate*, not error rate. What is diagnostic
+    /// is a scope that relists while the cluster is known to be changing.
+    pub watch_idle_relists: AtomicU64,
 }
 
 impl Default for ControllerMetrics {
@@ -25,6 +34,7 @@ impl ControllerMetrics {
             errors: AtomicU64::new(0),
             last_reconcile_duration_ms: AtomicU64::new(0),
             gateway_api_status_plan_cursor: AtomicU64::new(0),
+            watch_idle_relists: AtomicU64::new(0),
         }
     }
 
@@ -38,6 +48,9 @@ impl ControllerMetrics {
             last_reconcile_duration_ms: self
                 .last_reconcile_duration_ms
                 .load(std::sync::atomic::Ordering::Relaxed),
+            watch_idle_relists: self
+                .watch_idle_relists
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
@@ -48,4 +61,5 @@ pub struct MetricsSnapshot {
     pub full_syncs: u64,
     pub errors: u64,
     pub last_reconcile_duration_ms: u64,
+    pub watch_idle_relists: u64,
 }

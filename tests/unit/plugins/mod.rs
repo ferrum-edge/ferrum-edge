@@ -117,6 +117,7 @@ mod transaction_summary_tests;
 mod udp_endpoint_tests;
 mod udp_logging_tests;
 mod udp_rate_limiting_tests;
+mod validator_diagnostic_redaction_tests;
 mod waf_tests;
 mod ws_frame_logging_tests;
 mod ws_logging_tests;

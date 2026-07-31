@@ -18,6 +18,21 @@
 //! or vocabularies, non-local `$ref`s, and schemas outside the compile budgets all
 //! make `BodyValidator::new` return an error, which keeps the last known-good
 //! plugin generation in place (`PluginFailurePolicy::FailClosed`).
+//!
+//! # Diagnostic confidentiality
+//!
+//! Rejection details reach the client in the `details` field of the 400 / 502
+//! body and are re-emitted to internal tracing verbatim, so they are built
+//! under the contract in [`super::utils::validation_diagnostics`]: a
+//! compiled-in category, a bounded instance location whose object-member
+//! segments survive only when the configured schema declares them as JSON
+//! property names (numeric pointer segments render as a fixed marker; raw XML
+//! names are never collected), and an allowlisted JSON Schema keyword. No
+//! rejected instance value, expected constant, configured XML name, raw schema
+//! path, `roxmltree` parse token, or `prost` decode rendering is formatted into
+//! them (`GHSA-5p2h-fq6q-gwh9`). Response-side details stay coarser still, since
+//! describing an upstream body's shape back to the client is itself a
+//! disclosure.
 
 use async_trait::async_trait;
 use flate2::read::GzDecoder;
@@ -34,6 +49,10 @@ use tracing::{debug, warn};
 use crate::util::json_dup_keys::{self, JsonScanMemo};
 
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
+use super::utils::validation_diagnostics::{
+    SafeFieldNames, bound_detail, safe_keyword, safe_location, schema_violation_detail,
+    xml_error_category,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 /// Per-method message type descriptors for protobuf validation.
@@ -148,6 +167,10 @@ enum Direction {
 struct CompiledJsonSchema {
     validator: jsonschema::Validator,
     canonicalize_object_order: bool,
+    /// Member names this configured schema declares. Only these may appear in
+    /// a rendered violation location; every other instance-path segment is
+    /// payload-derived and is redacted (`GHSA-5p2h-fq6q-gwh9`).
+    safe_names: SafeFieldNames,
 }
 
 pub struct BodyValidator {
@@ -444,11 +467,15 @@ impl BodyValidator {
 
             return match result {
                 Ok(()) => PluginResult::Continue,
+                // Every producer above already builds a payload-free
+                // diagnostic; `bound_detail` is the compiled-in size ceiling on
+                // top of that, never the confidentiality mechanism
+                // (`GHSA-5p2h-fq6q-gwh9`).
                 Err(msg) => PluginResult::Reject {
                     status_code: 400,
                     body: serde_json::json!({
                         "error": "Request body validation failed",
-                        "details": msg
+                        "details": bound_detail(&msg)
                     })
                     .to_string(),
                     headers: HashMap::new(),
@@ -513,6 +540,12 @@ impl BodyValidator {
         // Parse as JSON. `serde_json`'s own 128-level nesting limit bounds the
         // instance depth the compiled validator then walks, so a deeply nested
         // hostile body cannot drive unbounded recursion here.
+        // `serde_json`'s error rendering for a `Value` target is a syntax
+        // category plus line/column — it never reproduces the offending token
+        // (the value-bearing `invalid type: ...` / `invalid value: ...` forms
+        // are raised only by typed `Deserialize` impls, which this call does
+        // not use). Keep the target as `Value` if this ever changes
+        // (`GHSA-5p2h-fq6q-gwh9`).
         let mut parsed: Value =
             serde_json::from_str(body).map_err(|e| format!("Invalid JSON: {}", e))?;
 
@@ -541,7 +574,11 @@ impl BodyValidator {
                 parsed.sort_all_objects();
             }
             if let Err(error) = schema.validator.validate(&parsed) {
-                return Err(schema_violation_message(&error, direction));
+                return Err(schema_violation_message(
+                    &error,
+                    direction,
+                    &schema.safe_names,
+                ));
             }
         }
 
@@ -607,9 +644,11 @@ impl BodyValidator {
             }
         }
 
-        for (idx, element) in required_xml_elements.iter().enumerate() {
+        for (idx, _) in required_xml_elements.iter().enumerate() {
             if !required_found[idx] {
-                return Err(format!("Missing required XML element: {}", element.display));
+                // Never echo a configured XML local name or Clark notation —
+                // those are schema/payload constants (`GHSA-5p2h-fq6q-gwh9`).
+                return Err("Missing required XML element".to_string());
             }
         }
 
@@ -626,8 +665,13 @@ impl BodyValidator {
         descriptor: &MessageDescriptor,
     ) -> Result<(), String> {
         let payload = parse_grpc_frame(body, self.grpc_max_decompressed_size_bytes)?;
+        // The `prost` decode error is not reproduced: its rendering is not part
+        // of a stability contract Ferrum controls, so it is not a surface this
+        // gateway can promise stays free of payload bytes
+        // (`GHSA-5p2h-fq6q-gwh9`). The failure class alone is what a caller or
+        // operator can act on.
         let msg = DynamicMessage::decode(descriptor.clone(), payload.as_ref())
-            .map_err(|e| format!("Protobuf decode failed: {}", e))?;
+            .map_err(|_| "Protobuf decode failed".to_string())?;
         // Wire decoding does not enforce proto2 initialization, so a correctly
         // framed message that omits a `required` field decodes cleanly
         // (GHSA-qvrp-m3v9-345m). Walk the descriptor and reject any missing
@@ -919,6 +963,7 @@ fn optional_compiled_schema(
             Some(CompiledJsonSchema {
                 validator,
                 canonicalize_object_order: audit.has_unique_items,
+                safe_names: SafeFieldNames::from_schema(value),
             })
         })
 }
@@ -1296,34 +1341,34 @@ fn unescape_json_pointer_segment(segment: &str) -> Cow<'_, str> {
 
 /// Client-visible message for a compiled-schema violation.
 ///
-/// The rejected instance value is never included. Request failures carry the
-/// instance location and the failing keyword so a caller can fix its own
-/// payload; response failures stay coarse so an upstream body's shape is not
-/// described back to the client.
+/// The rejected instance value is never included, in either direction. Request
+/// failures carry a bounded instance location plus an allowlisted keyword so a
+/// caller can fix its own payload; response failures stay coarse so an upstream
+/// body's shape is not described back to the client. Raw schema paths (including
+/// `$defs` names and `$ref` fragments) are never emitted.
+///
+/// The location is rendered by [`safe_location`]: numeric pointer segments
+/// become a fixed marker (JSON Pointer alone does not prove array shape), and
+/// object member names survive only when the *configured schema* declares them
+/// as JSON properties. A hostile member name — which `jsonschema` places in the
+/// instance path for `propertyNames`, `patternProperties`,
+/// `additionalProperties`, and nested `required` failures — is replaced with a
+/// placeholder rather than echoed, and depth, segment count, and total length
+/// are all capped (`GHSA-5p2h-fq6q-gwh9`).
 fn schema_violation_message(
     error: &jsonschema::ValidationError<'_>,
     direction: Direction,
+    safe_names: &SafeFieldNames,
 ) -> String {
-    let keyword = error.schema_path().to_string();
-    let keyword = keyword
-        .rsplit('/')
-        .next()
-        .filter(|segment| !segment.is_empty())
-        .unwrap_or("schema")
-        .to_string();
+    let keyword = safe_keyword(error.schema_path().as_str());
     match direction {
         Direction::Request => {
-            let location = error.instance_path().to_string();
-            let location = if location.is_empty() {
-                "(root)".to_string()
-            } else {
-                location
-            };
-            format!("JSON Schema validation failed at {location} (keyword '{keyword}')")
+            let location = safe_location(error.instance_path().as_str(), safe_names);
+            schema_violation_detail("JSON Schema validation failed", &location, keyword)
         }
-        Direction::Response => format!(
+        Direction::Response => bound_detail(&format!(
             "Response body does not satisfy the configured JSON Schema (keyword '{keyword}')"
-        ),
+        )),
     }
 }
 
@@ -1334,8 +1379,10 @@ fn schema_violation_message(
 /// in any namespace, or Clark notation (`{http://example.com/ns}item`), which
 /// requires both the expanded namespace URI and the local name to match. A
 /// literal `{}local` requires the element to be in no namespace.
+///
+/// The configured spelling is retained only for matching; diagnostics never
+/// echo it (`GHSA-5p2h-fq6q-gwh9`).
 struct RequiredXmlElement {
-    display: String,
     namespace: Option<String>,
     local: String,
 }
@@ -1381,56 +1428,9 @@ fn parse_required_xml_elements(
                 "body_validator: '{field}' entry at index {index} has an invalid local element name"
             ));
         }
-        parsed.push(RequiredXmlElement {
-            display: entry,
-            namespace,
-            local,
-        });
+        parsed.push(RequiredXmlElement { namespace, local });
     }
     Ok(parsed)
-}
-
-/// Stable, value-free category for an XML parse failure.
-///
-/// `roxmltree`'s own `Display` embeds parsed names and offsets; those are body
-/// content, so the client only ever sees the class of well-formedness error.
-fn xml_error_category(error: &roxmltree::Error) -> &'static str {
-    use roxmltree::Error as XmlError;
-    match error {
-        XmlError::InvalidXmlPrefixUri(_)
-        | XmlError::UnexpectedXmlUri(_)
-        | XmlError::UnexpectedXmlnsUri(_)
-        | XmlError::InvalidElementNamePrefix(_)
-        | XmlError::DuplicatedNamespace(_, _)
-        | XmlError::UnknownNamespace(_, _) => "namespace declaration is not well-formed",
-        XmlError::UnexpectedCloseTag(_, _, _)
-        | XmlError::UnexpectedEntityCloseTag(_)
-        | XmlError::UnclosedRootNode => "element tags are not balanced",
-        XmlError::UnknownEntityReference(_, _) | XmlError::MalformedEntityReference(_) => {
-            "entity reference is undeclared or malformed"
-        }
-        XmlError::EntityReferenceLoop(_) => "entity references expand recursively",
-        XmlError::InvalidAttributeValue(_) | XmlError::DuplicatedAttribute(_, _) => {
-            "attribute is malformed or duplicated"
-        }
-        XmlError::NoRootNode => "document has no root element",
-        XmlError::NodesLimitReached => "document exceeds the parser node budget",
-        XmlError::AttributesLimitReached => "element has too many attributes",
-        XmlError::NamespacesLimitReached => "document declares too many namespaces",
-        XmlError::UnexpectedDeclaration(_) => "XML declaration is misplaced or duplicated",
-        XmlError::DtdDetected => "document type declaration is not permitted",
-        XmlError::InvalidName(_) => "element or attribute name is not a valid XML name",
-        XmlError::NonXmlChar(_, _) => "document contains a character XML does not allow",
-        XmlError::InvalidChar(_, _, _) | XmlError::InvalidChar2(_, _, _) => {
-            "unexpected character in markup"
-        }
-        XmlError::InvalidString(_, _) => "unexpected token in markup",
-        XmlError::InvalidExternalID(_) => "external identifier is malformed",
-        XmlError::InvalidComment(_) => "comment is malformed",
-        XmlError::InvalidCharacterData(_) => "character data is malformed",
-        XmlError::UnknownToken(_) => "unrecognized markup",
-        XmlError::UnexpectedEndOfStream => "document ended before markup was complete",
-    }
 }
 
 /// Bounded budget for the recursive proto2 initialization walk.
@@ -2510,6 +2510,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Helper to build a rejection `PluginResult` for protobuf validation failures.
 fn protobuf_reject(status_code: u16, direction: &str, msg: &str) -> PluginResult {
+    let msg = bound_detail(msg);
     debug!(
         "body_validator: {} protobuf validation failed: {}",
         direction, msg
@@ -2649,12 +2650,13 @@ impl Plugin for BodyValidator {
         match result {
             Ok(()) => PluginResult::Continue,
             Err(msg) => {
-                debug!("body_validator: request validation failed: {}", msg);
+                let detail = bound_detail(&msg);
+                debug!("body_validator: request validation failed: {}", detail);
                 PluginResult::Reject {
                     status_code: 400,
                     body: serde_json::json!({
                         "error": "Request body validation failed",
-                        "details": msg
+                        "details": detail
                     })
                     .to_string(),
                     headers: HashMap::new(),
@@ -2860,12 +2862,17 @@ impl Plugin for BodyValidator {
         match result {
             Ok(()) => PluginResult::Continue,
             Err(msg) => {
-                debug!("body_validator: response validation failed: {}", msg);
+                // `msg` is already payload-free by construction, so the same
+                // string is safe for the client body and for internal tracing;
+                // there is no raw-detail development channel to fall back to
+                // (`GHSA-5p2h-fq6q-gwh9`).
+                let detail = bound_detail(&msg);
+                debug!("body_validator: response validation failed: {}", detail);
                 PluginResult::Reject {
                     status_code: 502,
                     body: serde_json::json!({
                         "error": "Response body validation failed",
-                        "details": msg
+                        "details": detail
                     })
                     .to_string(),
                     headers: HashMap::new(),
