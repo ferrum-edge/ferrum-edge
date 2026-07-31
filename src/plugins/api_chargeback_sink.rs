@@ -2863,23 +2863,25 @@ impl ApiChargebackSink {
             }) as Arc<dyn Fn(QueuedChargeEvent, &'static str) -> bool + Send + Sync>
         });
         let hooks = LoggerHooks {
-            on_failed_batch: Some(Arc::new(move |batch: Arc<Vec<QueuedChargeEvent>>, error| {
-                if snapshot_events_are_pre_spooled {
-                    return;
-                }
-                if let Some(enqueue) = failed_enqueue.as_ref() {
-                    // Terminal failure receives the shared batch handle; spool
-                    // ownership continues under the same Arc without cloning
-                    // ChargeEvent records.
-                    let _ = enqueue.try_enqueue(batch, "export failure");
-                } else {
-                    warn!(
-                        plugin = PLUGIN_NAME,
-                        error = %error,
-                        "Chargeback sink export failed and spool is disabled; batch was lost"
-                    );
-                }
-            })),
+            on_failed_batch: Some(Arc::new(
+                move |batch: Arc<Vec<QueuedChargeEvent>>, error| {
+                    if snapshot_events_are_pre_spooled {
+                        return;
+                    }
+                    if let Some(enqueue) = failed_enqueue.as_ref() {
+                        // Terminal failure receives the shared batch handle; spool
+                        // ownership continues under the same Arc without cloning
+                        // ChargeEvent records.
+                        let _ = enqueue.try_enqueue(batch, "export failure");
+                    } else {
+                        warn!(
+                            plugin = PLUGIN_NAME,
+                            error = %error,
+                            "Chargeback sink export failed and spool is disabled; batch was lost"
+                        );
+                    }
+                },
+            )),
             on_overflow,
             on_high_water: Some(Arc::new(move |_, _| {
                 high_water_metrics
@@ -4576,7 +4578,10 @@ fn materialize_json_each_row_refs(
     .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
 }
 
-async fn send_batch(cfg: &ClickHouseFlushConfig, batch: &[QueuedChargeEvent]) -> Result<(), String> {
+async fn send_batch(
+    cfg: &ClickHouseFlushConfig,
+    batch: &[QueuedChargeEvent],
+) -> Result<(), String> {
     let event_count = batch.len();
     let events: Vec<&ChargeEvent> = batch.iter().map(|queued| &queued.event).collect();
     let body = materialize_charge_body_refs(cfg, &events).inspect_err(|error| {
