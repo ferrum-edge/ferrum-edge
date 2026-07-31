@@ -121,7 +121,7 @@ pub struct BatchConfig {
     pub plugin_name: &'static str,
 }
 
-pub struct BatchingLogger<T: Send + 'static> {
+pub struct BatchingLogger<T: Send + Sync + 'static> {
     /// Pre-publication dormancy gate. [`Self::commit`] releases the flush
     /// worker; dropping this sender without commit makes the worker exit with
     /// no flush/network side effects.
@@ -144,7 +144,7 @@ pub struct BatchingLogger<T: Send + 'static> {
 /// the caller's responsibility: drop every handle, then
 /// [`BatchingLogger::close_and_await`] the lifecycle owner.
 #[derive(Clone)]
-pub struct BatchingLoggerHandle<T: Send + 'static> {
+pub struct BatchingLoggerHandle<T: Send + Sync + 'static> {
     sender: mpsc::Sender<T>,
     worker: Arc<DeliveryWorkerControl>,
     plugin_name: &'static str,
@@ -158,13 +158,13 @@ pub struct BatchingLoggerHandle<T: Send + 'static> {
 /// An atomically reserved queue slot for a record that will be constructed
 /// later. Dropping an unused permit releases both the channel slot and the
 /// logger's depth accounting.
-pub struct BatchingLoggerPermit<T: Send + 'static> {
+pub struct BatchingLoggerPermit<T: Send + Sync + 'static> {
     permit: Option<mpsc::OwnedPermit<T>>,
     queue_depth: Arc<AtomicUsize>,
     outstanding_count: Arc<AtomicUsize>,
 }
 
-impl<T: Send + 'static> BatchingLoggerPermit<T> {
+impl<T: Send + Sync + 'static> BatchingLoggerPermit<T> {
     pub fn send(mut self, item: T) {
         if let Some(permit) = self.permit.take() {
             permit.send(item);
@@ -172,7 +172,7 @@ impl<T: Send + 'static> BatchingLoggerPermit<T> {
     }
 }
 
-impl<T: Send + 'static> Drop for BatchingLoggerPermit<T> {
+impl<T: Send + Sync + 'static> Drop for BatchingLoggerPermit<T> {
     fn drop(&mut self) {
         if self.permit.is_some() {
             decrement_queue_depth(&self.queue_depth);
@@ -219,7 +219,7 @@ impl TrySendOutcome {
     }
 }
 
-pub struct LoggerHooks<T: Send + 'static> {
+pub struct LoggerHooks<T: Send + Sync + 'static> {
     pub on_failed_batch: Option<FailedBatchHook<T>>,
     /// Diverts an item away from the bounded channel. When the observed depth
     /// is at/above the high-water mark, presence of this hook **consumes** the
@@ -235,7 +235,7 @@ pub struct LoggerHooks<T: Send + 'static> {
     pub high_watermark_percent: u8,
 }
 
-impl<T: Send + 'static> Clone for LoggerHooks<T> {
+impl<T: Send + Sync + 'static> Clone for LoggerHooks<T> {
     fn clone(&self) -> Self {
         Self {
             on_failed_batch: self.on_failed_batch.clone(),
@@ -246,7 +246,7 @@ impl<T: Send + 'static> Clone for LoggerHooks<T> {
     }
 }
 
-impl<T: Send + 'static> Default for LoggerHooks<T> {
+impl<T: Send + Sync + 'static> Default for LoggerHooks<T> {
     fn default() -> Self {
         Self {
             on_failed_batch: None,
@@ -257,7 +257,7 @@ impl<T: Send + 'static> Default for LoggerHooks<T> {
     }
 }
 
-impl<T: Send + 'static> BatchingLogger<T> {
+impl<T: Send + Sync + 'static> BatchingLogger<T> {
     /// Spawn the flush loop on the current runtime and return a handle that
     /// plugins hold in their `Arc<dyn Plugin>` state.
     ///
@@ -589,7 +589,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
     }
 }
 
-impl<T: Send + 'static> Drop for BatchingLogger<T> {
+impl<T: Send + Sync + 'static> Drop for BatchingLogger<T> {
     fn drop(&mut self) {
         drop(self.sender.take());
         if self.committed.load(Ordering::Acquire) {
@@ -613,18 +613,18 @@ impl<T: Send + 'static> Drop for BatchingLogger<T> {
 /// stays runtime-free and leaves no flush worker behind. Staged workers stay
 /// dormant until [`Self::commit`]; dropping an uncommitted logger cancels them
 /// with no flush side effects.
-pub struct DeferredBatchingLogger<T: Send + 'static> {
+pub struct DeferredBatchingLogger<T: Send + Sync + 'static> {
     logger: OnceLock<BatchingLogger<T>>,
     start_lock: Mutex<()>,
 }
 
-impl<T: Send + 'static> Default for DeferredBatchingLogger<T> {
+impl<T: Send + Sync + 'static> Default for DeferredBatchingLogger<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Send + 'static> DeferredBatchingLogger<T> {
+impl<T: Send + Sync + 'static> DeferredBatchingLogger<T> {
     pub fn new() -> Self {
         Self {
             logger: OnceLock::new(),
@@ -732,7 +732,7 @@ impl<T: Send + 'static> DeferredBatchingLogger<T> {
     }
 }
 
-impl<T: Send + 'static> BatchingLoggerHandle<T> {
+impl<T: Send + Sync + 'static> BatchingLoggerHandle<T> {
     /// Non-blocking send. Compatibility wrapper: `true` only when the item was
     /// admitted to the bounded channel. Prefer [`Self::try_send_outcome`] when
     /// diversion, full-buffer drops, and shutdown must be distinguished.
@@ -921,7 +921,7 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
     flush: F,
     on_failed_batch: Option<FailedBatchHook<T>>,
 ) where
-    T: Send + 'static,
+    T: Send + Sync + 'static,
     F: Fn(Arc<Vec<T>>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), String>> + Send + 'static,
 {
@@ -999,7 +999,7 @@ async fn flush_with_retry<T, F, Fut>(
     batch: Vec<T>,
     on_failed_batch: Option<&FailedBatchHook<T>>,
 ) where
-    T: Send + 'static,
+    T: Send + Sync + 'static,
     F: Fn(Arc<Vec<T>>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), String>> + Send + 'static,
 {
