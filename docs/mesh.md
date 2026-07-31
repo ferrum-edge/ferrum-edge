@@ -3112,7 +3112,8 @@ These configure the in-cluster Istio / Gateway API translation controller and na
 | `FERRUM_K8S_CLUSTER_DOMAIN` | `cluster.local` | Cluster DNS domain for FQDN synthesis on the control plane |
 | `FERRUM_K8S_TRUST_DOMAIN` | `cluster.local` | SPIFFE trust domain used by the controller |
 | `FERRUM_K8S_NODE_LOCALITY_ENABLED` | `false` | Stamp Node `topology.kubernetes.io/region\|zone` labels onto workload locality |
-| `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` | `300` | Periodic full reconcile interval (seconds); safety valve against missed watch events |
+| `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` | `300` | Periodic re-reconcile interval (seconds) over the current reflector-store contents; it does not re-list Kubernetes |
+| `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` | `60` | Rebuild a watch scope's reflector from an authoritative list once it has delivered no event for this long; the safety valve against a silently stalled watch. `0` disables |
 | `FERRUM_K8S_RECONCILE_DEBOUNCE_MS` | `500` | Debounce window coalescing rapid watch events before a reconcile |
 | `FERRUM_K8S_KUBECONFIG_PATH` | (in-cluster) | Path to a kubeconfig for out-of-cluster runs. When unset, the controller tries the in-cluster service-account config first, then falls back to standard kubeconfig inference (`KUBECONFIG` / `~/.kube/config`) — so an out-of-cluster CP often needs no explicit path |
 

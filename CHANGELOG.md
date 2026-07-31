@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Kubernetes controller watch scopes now rebuild their reflector from an
+  authoritative list when they go idle past `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
+  (default `60`, `0` disables). A watch whose connection is black-holed never
+  raises an error in kube-rs, so the task stayed alive while its reflector
+  served a permanently stale object set and every later Gateway API / Istio
+  resource stayed invisible to reconciles; `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS`
+  could not recover it because it re-reconciles that same store. The
+  replacement generation is swapped in make-before-break — the previous store
+  keeps serving until the replacement reports `InitDone` — so a relist never
+  looks like a mass deletion, and a replacement that never finishes listing is
+  itself abandoned and retried without blanking the scope. Watcher task
+  ownership, the stream-end deregistration contract, and the CRD reprobe loop
+  are unchanged.
+
 - API-spec YAML ingestion now expands anchors and aliases through a bounded
   libyaml event graph (node, depth, alias-reference, expanded-byte, and work
   budgets) with cycle / undefined-alias / duplicate-anchor /

@@ -1609,9 +1609,17 @@ pub struct EnvConfig {
     /// arriving within this window are batched into a single reconciliation.
     /// Default: 500.
     pub k8s_reconcile_debounce_ms: u64,
-    /// Periodic full re-list interval in seconds. Safety valve against missed
-    /// watch events. Default: 300 (5 minutes).
+    /// Periodic re-reconcile interval in seconds. Re-translates whatever the
+    /// reflector stores currently hold; it does NOT re-list Kubernetes, so it
+    /// cannot recover objects a stalled watch never delivered — see
+    /// `k8s_watch_idle_relist_secs` for that. Default: 300 (5 minutes).
     pub k8s_full_sync_interval_secs: u64,
+    /// Rebuild a watch scope's reflector from an authoritative Kubernetes list
+    /// once it has delivered no event for this many seconds. Bounds how long a
+    /// silently dead watch (a black-holed connection surfaces no error to
+    /// kube-rs) can hide objects from every reconcile. `0` disables it.
+    /// Default: 60.
+    pub k8s_watch_idle_relist_secs: u64,
     /// Enable watching Istio CRDs (security.istio.io, networking.istio.io,
     /// telemetry.istio.io). Default: true.
     pub k8s_watch_istio_crds: bool,
@@ -2635,6 +2643,7 @@ impl Default for EnvConfig {
             k8s_kubeconfig_path: None,
             k8s_reconcile_debounce_ms: 500,
             k8s_full_sync_interval_secs: 300,
+            k8s_watch_idle_relist_secs: 60,
             k8s_watch_istio_crds: true,
             k8s_watch_mesh_config: true,
             k8s_watch_gateway_api_crds: true,
@@ -3075,6 +3084,7 @@ impl EnvConfig {
             k8s_kubeconfig_path: Option<String> = "FERRUM_K8S_KUBECONFIG_PATH";
             k8s_reconcile_debounce_ms: u64 = "FERRUM_K8S_RECONCILE_DEBOUNCE_MS" => 500u64;
             k8s_full_sync_interval_secs: u64 = "FERRUM_K8S_FULL_SYNC_INTERVAL_SECS" => 300u64;
+            k8s_watch_idle_relist_secs: u64 = "FERRUM_K8S_WATCH_IDLE_RELIST_SECS" => 60u64;
             k8s_watch_istio_crds: bool = "FERRUM_K8S_WATCH_ISTIO_CRDS" => true;
             k8s_watch_mesh_config: bool = "FERRUM_K8S_WATCH_MESH_CONFIG" => true;
             k8s_watch_gateway_api_crds: bool = "FERRUM_K8S_WATCH_GATEWAY_API_CRDS" => true;
@@ -3755,6 +3765,7 @@ impl EnvConfig {
             k8s_kubeconfig_path,
             k8s_reconcile_debounce_ms,
             k8s_full_sync_interval_secs,
+            k8s_watch_idle_relist_secs,
             k8s_watch_istio_crds,
             k8s_watch_mesh_config,
             k8s_watch_gateway_api_crds,

@@ -5,6 +5,12 @@ pub struct ControllerMetrics {
     pub full_syncs: AtomicU64,
     pub errors: AtomicU64,
     pub last_reconcile_duration_ms: AtomicU64,
+    /// Reflector generations restarted because a watch scope produced no event
+    /// for the configured idle window (`FERRUM_K8S_WATCH_IDLE_RELIST_SECS`), or
+    /// because a replacement generation never finished its initial list. A
+    /// steadily climbing value on a busy cluster means watch deliveries are
+    /// being lost somewhere between the API server and the reflector.
+    pub watch_idle_relists: AtomicU64,
 }
 
 impl Default for ControllerMetrics {
@@ -20,6 +26,7 @@ impl ControllerMetrics {
             full_syncs: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             last_reconcile_duration_ms: AtomicU64::new(0),
+            watch_idle_relists: AtomicU64::new(0),
         }
     }
 
@@ -33,6 +40,9 @@ impl ControllerMetrics {
             last_reconcile_duration_ms: self
                 .last_reconcile_duration_ms
                 .load(std::sync::atomic::Ordering::Relaxed),
+            watch_idle_relists: self
+                .watch_idle_relists
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
@@ -43,4 +53,5 @@ pub struct MetricsSnapshot {
     pub full_syncs: u64,
     pub errors: u64,
     pub last_reconcile_duration_ms: u64,
+    pub watch_idle_relists: u64,
 }
