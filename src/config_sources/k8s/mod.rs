@@ -1046,12 +1046,17 @@ pub fn translate_k8s_objects_collecting_skips(
     options: K8sTranslationOptions,
 ) -> Option<(K8sTranslation, std::collections::HashMap<K8sResourceKey, K8sTranslateError>)> {
     let mut skipped = std::collections::HashMap::new();
+    // Identity membership for the include filter — O(1) average, never
+    // `skipped.keys().any(matches_object)` which is O(objects × errors) (#2397).
+    let mut skipped_identities = std::collections::HashSet::<(String, String, String)>::new();
 
     loop {
         let translation = translate_k8s_objects_with_filter(objects, options.clone(), |object| {
-            !skipped
-                .keys()
-                .any(|key: &K8sResourceKey| key.matches_object(object))
+            !skipped_identities.contains(&(
+                object.kind.clone(),
+                object.metadata.namespace.clone(),
+                object.metadata.name.clone(),
+            ))
         });
 
         match translation {
@@ -1078,6 +1083,11 @@ pub fn translate_k8s_objects_collecting_skips(
                     })
                     .map(K8sResourceKey::from_object)
                     .unwrap_or_else(|| K8sResourceKey::from_error(&error));
+                skipped_identities.insert((
+                    key.kind.clone(),
+                    key.namespace.clone(),
+                    key.name.clone(),
+                ));
                 if skipped.insert(key, error).is_some() {
                     return None;
                 }

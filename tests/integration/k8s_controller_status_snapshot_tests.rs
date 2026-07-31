@@ -194,7 +194,8 @@ fn mock_kube_client(state: Arc<Mutex<MockKubeState>>) -> Client {
 #[test]
 fn both_writers_plan_from_one_arc_generation_with_parity() {
     let objects = mixed_generation();
-    let snapshot = shared_status_objects_snapshot(&objects, true, true).expect("both writers");
+    let snapshot =
+        shared_status_objects_snapshot(objects.clone(), true, true).expect("both writers");
     assert!(Arc::ptr_eq(&snapshot, &Arc::clone(&snapshot)));
 
     let gateway_slice = plan_gateway_api_status_updates(&objects, options(), &[]);
@@ -230,7 +231,7 @@ fn both_writers_plan_from_one_arc_generation_with_parity() {
 #[test]
 fn reload_and_delete_produce_fresh_generation_without_deleted_objects() {
     let initial = mixed_generation();
-    let first = shared_status_objects_snapshot(&initial, true, true).expect("initial");
+    let first = shared_status_objects_snapshot(initial.clone(), true, true).expect("initial");
 
     let mut reloaded: Vec<K8sObject> = initial
         .into_iter()
@@ -242,7 +243,7 @@ fn reload_and_delete_produce_fresh_generation_without_deleted_objects() {
         "sidecar",
         json!({ "egress": [{"hosts": ["./*"]}] }),
     ));
-    let second = shared_status_objects_snapshot(&reloaded, true, true).expect("reload");
+    let second = shared_status_objects_snapshot(reloaded, true, true).expect("reload");
 
     assert!(!Arc::ptr_eq(&first, &second));
     assert!(first.iter().any(|object| object.metadata.name == "vs"));
@@ -261,7 +262,7 @@ fn reload_and_delete_produce_fresh_generation_without_deleted_objects() {
 #[tokio::test]
 async fn istio_writer_failure_does_not_block_gateway_plan_from_shared_snapshot() {
     let objects = mixed_generation();
-    let snapshot = shared_status_objects_snapshot(&objects, true, true).expect("both writers");
+    let snapshot = shared_status_objects_snapshot(objects, true, true).expect("both writers");
 
     let gateway_updates = plan_gateway_api_status_updates(&snapshot, options(), &[]);
     let istio_updates = plan_istio_status_updates(&snapshot, options());

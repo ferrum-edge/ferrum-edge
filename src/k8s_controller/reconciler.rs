@@ -743,11 +743,11 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
         // Status writers share one immutable `Arc<[K8sObject]>` generation
         // (see [`shared_status_objects_snapshot`]). Deployments that don't
         // watch Gateway API / Istio CRDs (the default) pay zero per-
-        // reconcile clone cost.
+        // reconcile move cost.
         run_status_patchers(
             ctx.gateway_status_writer,
             ctx.istio_status_writer,
-            &objects,
+            objects,
             &options,
             Some(&translation.route_conflicts),
             gateway_api_status_context,
@@ -767,7 +767,7 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
     run_status_patchers(
         ctx.gateway_status_writer,
         ctx.istio_status_writer,
-        &objects,
+        objects,
         &options,
         Some(&translation.route_conflicts),
         gateway_api_status_context,
@@ -795,22 +795,26 @@ async fn do_reconcile(store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>, ctx:
 /// status writers for one reconcile.
 ///
 /// Returns `None` when neither writer will run so the default deployment
-/// (no Gateway API / Istio status watching) pays zero snapshot clone cost.
-/// When at least one writer is present, objects are deep-cloned exactly once
-/// into an `Arc<[K8sObject]>`; a second writer only bumps the refcount.
+/// (no Gateway API / Istio status watching) pays zero snapshot cost and the
+/// caller's `Vec` is dropped without wrapping. When at least one writer is
+/// present, the already-owned reconcile `Vec<K8sObject>` is moved into one
+/// `Arc<[K8sObject]>` without cloning elements or their `spec`/`status`
+/// payloads; a second writer only bumps the refcount.
 ///
 /// The Arc keeps planner futures `Send + 'static` across the reconciler's
 /// `tokio::spawn` HRTB boundary without aliasing the store's mutable
 /// reflector state — each reconcile owns a distinct generation.
 pub(crate) fn shared_status_objects_snapshot(
-    objects: &[K8sObject],
+    objects: Vec<K8sObject>,
     gateway_writer_present: bool,
     istio_writer_present: bool,
 ) -> Option<Arc<[K8sObject]>> {
     if !gateway_writer_present && !istio_writer_present {
         return None;
     }
-    Some(Arc::from(objects))
+    // `From<Vec<T>> for Arc<[T]>` moves the allocation; do not use
+    // `Arc::from(&[T])`, which deep-clones every `K8sObject` (#2397).
+    Some(Arc::<[K8sObject]>::from(objects))
 }
 
 /// Dispatch to whichever status patchers are configured.
@@ -824,7 +828,7 @@ pub(crate) fn shared_status_objects_snapshot(
 async fn run_status_patchers(
     gateway_writer: Option<GatewayApiStatusWriter>,
     istio_writer: Option<IstioStatusWriter>,
-    objects: &[K8sObject],
+    objects: Vec<K8sObject>,
     options: &K8sTranslationOptions,
     route_conflicts: Option<&[crate::config_sources::k8s::GatewayApiRouteConflict]>,
     gateway_api_status_context: GatewayApiStatusContext,
@@ -1338,20 +1342,78 @@ mod tests {
     #[test]
     fn shared_status_snapshot_skipped_when_no_writers() {
         let objects = vec![status_snapshot_object("ConfigMap", "cm")];
-        assert!(shared_status_objects_snapshot(&objects, false, false).is_none());
+        assert!(shared_status_objects_snapshot(objects, false, false).is_none());
     }
 
     #[test]
     fn shared_status_snapshot_built_once_for_single_writer() {
         let objects = vec![status_snapshot_object("HTTPRoute", "api")];
-        let gateway_only = shared_status_objects_snapshot(&objects, true, false)
+        let expected = objects.clone();
+        let gateway_only = shared_status_objects_snapshot(objects.clone(), true, false)
             .expect("gateway writer requires a snapshot");
-        let istio_only = shared_status_objects_snapshot(&objects, false, true)
+        let istio_only = shared_status_objects_snapshot(objects, false, true)
             .expect("istio writer requires a snapshot");
-        assert_eq!(gateway_only.as_ref(), objects.as_slice());
-        assert_eq!(istio_only.as_ref(), objects.as_slice());
+        assert_eq!(gateway_only.as_ref(), expected.as_slice());
+        assert_eq!(istio_only.as_ref(), expected.as_slice());
         assert_eq!(Arc::strong_count(&gateway_only), 1);
         assert_eq!(Arc::strong_count(&istio_only), 1);
+    }
+
+    #[test]
+    fn shared_status_snapshot_moves_owned_vec_without_element_deep_copy() {
+        let mut large_spec = serde_json::Map::new();
+        large_spec.insert("payload".to_string(), Value::String("x".repeat(64 * 1024)));
+        let objects = vec![K8sObject {
+            api_version: "gateway.networking.k8s.io/v1".to_string(),
+            kind: "HTTPRoute".to_string(),
+            metadata: K8sMetadata {
+                name: "large".to_string(),
+                uid: "uid-large".to_string(),
+                namespace: "default".to_string(),
+                generation: Some(1),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                creation_timestamp: None,
+                deletion_timestamp: None,
+            },
+            spec: Value::Object(large_spec),
+            status: json!({"observedGeneration": 1}),
+        }];
+        // Heap pointers inside the moved `K8sObject` must be preserved. A
+        // slice-based `Arc::from(&[T])` deep clone would allocate new String
+        // buffers and change these addresses.
+        let name_ptr = objects[0].metadata.name.as_ptr();
+        let payload_ptr = objects[0].spec["payload"]
+            .as_str()
+            .expect("payload")
+            .as_ptr();
+
+        let snapshot = shared_status_objects_snapshot(objects, true, true)
+            .expect("both writers share one snapshot");
+        assert_eq!(snapshot[0].metadata.name.as_ptr(), name_ptr);
+        assert_eq!(
+            snapshot[0].spec["payload"]
+                .as_str()
+                .expect("payload")
+                .as_ptr(),
+            payload_ptr
+        );
+        assert_eq!(Arc::strong_count(&snapshot), 1);
+
+        // Simulate the reconciler handoff: each writer receives an Arc clone,
+        // not a second deep copy of the large JSON payloads.
+        let gateway_view = Arc::clone(&snapshot);
+        let istio_view = Arc::clone(&snapshot);
+        assert!(Arc::ptr_eq(&gateway_view, &istio_view));
+        assert_eq!(Arc::strong_count(&snapshot), 3);
+        assert_eq!(
+            gateway_view[0].spec["payload"].as_str().map(str::len),
+            Some(64 * 1024)
+        );
+        // Dropping one writer view must not invalidate the other.
+        drop(gateway_view);
+        assert_eq!(Arc::strong_count(&snapshot), 2);
+        assert_eq!(istio_view.len(), 1);
     }
 
     #[test]
@@ -1375,24 +1437,14 @@ mod tests {
             status: json!({"observedGeneration": 1}),
         }];
 
-        let snapshot = shared_status_objects_snapshot(&objects, true, true)
+        let snapshot = shared_status_objects_snapshot(objects, true, true)
             .expect("both writers share one snapshot");
         assert_eq!(Arc::strong_count(&snapshot), 1);
 
-        // Simulate the reconciler handoff: each writer receives an Arc clone,
-        // not a second deep copy of the large JSON payloads.
         let gateway_view = Arc::clone(&snapshot);
         let istio_view = Arc::clone(&snapshot);
         assert!(Arc::ptr_eq(&gateway_view, &istio_view));
         assert_eq!(Arc::strong_count(&snapshot), 3);
-        assert_eq!(
-            gateway_view[0].spec["payload"].as_str().map(str::len),
-            Some(64 * 1024)
-        );
-        // Dropping one writer view must not invalidate the other.
-        drop(gateway_view);
-        assert_eq!(Arc::strong_count(&snapshot), 2);
-        assert_eq!(istio_view.len(), 1);
     }
 
     #[test]
@@ -1402,10 +1454,10 @@ mod tests {
             status_snapshot_object("VirtualService", "gone"),
         ];
         let first =
-            shared_status_objects_snapshot(&first_objects, true, true).expect("initial generation");
+            shared_status_objects_snapshot(first_objects, true, true).expect("initial generation");
 
         let reloaded_objects = vec![status_snapshot_object("HTTPRoute", "keep")];
-        let reloaded = shared_status_objects_snapshot(&reloaded_objects, true, true)
+        let reloaded = shared_status_objects_snapshot(reloaded_objects, true, true)
             .expect("reload generation");
 
         assert!(!Arc::ptr_eq(&first, &reloaded));
@@ -1428,7 +1480,7 @@ mod tests {
             status_snapshot_object("ConfigMap", "noise"),
         ];
         let snapshot =
-            shared_status_objects_snapshot(&objects, true, true).expect("both writers present");
+            shared_status_objects_snapshot(objects.clone(), true, true).expect("both writers present");
         let options = K8sTranslationOptions::new(
             "default".to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
@@ -1466,7 +1518,7 @@ mod tests {
             status_snapshot_object("VirtualService", "vs"),
         ];
         let snapshot =
-            shared_status_objects_snapshot(&objects, true, true).expect("both writers present");
+            shared_status_objects_snapshot(objects, true, true).expect("both writers present");
         let options = K8sTranslationOptions::new(
             "default".to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),

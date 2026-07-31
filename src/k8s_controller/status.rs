@@ -261,20 +261,32 @@ impl StatusTranslationReuse {
         }
     }
 
+    /// Look up the primary translate outcome for a live object.
+    ///
+    /// Exact `(api_version, kind, namespace, name)` hits first. When the skip
+    /// map still carries a versionless key from [`K8sResourceKey::from_error`],
+    /// a second O(1) get preserves that fallback. Never linearly scans the
+    /// error map (#2397).
     pub fn result_for<'a>(
         &'a self,
         object: &K8sObject,
     ) -> Result<&'a K8sTranslation, &'a K8sTranslateError> {
-        if let Some(error) = self
-            .errors
-            .iter()
-            .find(|(key, _)| key.matches_object(object))
-            .map(|(_, error)| error)
-        {
-            Err(error)
-        } else {
-            Ok(self.translation.as_ref())
+        let exact = K8sResourceKey::from_object(object);
+        if let Some(error) = self.errors.get(&exact) {
+            return Err(error);
         }
+        if !exact.api_version.is_empty() {
+            let versionless = K8sResourceKey {
+                api_version: String::new(),
+                kind: exact.kind,
+                namespace: exact.namespace,
+                name: exact.name,
+            };
+            if let Some(error) = self.errors.get(&versionless) {
+                return Err(error);
+            }
+        }
+        Ok(self.translation.as_ref())
     }
 }
 
@@ -285,6 +297,11 @@ struct GatewayApiStatusIndexes<'a> {
     managed_gateways: HashSet<(&'a str, &'a str)>,
     secrets_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
     services_by_ns_name: HashMap<(&'a str, &'a str), &'a K8sObject>,
+    namespaces_by_name: HashMap<&'a str, &'a K8sObject>,
+    /// Routes that parentRef a Gateway, keyed by `(gateway_ns, gateway_name)`.
+    /// Built once so attachedRoutes and listener evaluation never rescan the
+    /// full snapshot per listener (#2397).
+    routes_by_gateway: HashMap<(&'a str, &'a str), Vec<&'a K8sObject>>,
     reference_grants_by_ns: HashMap<&'a str, Vec<&'a K8sObject>>,
     has_any_service: bool,
     conflicts_by_loser: HashMap<K8sResourceKey, Vec<&'a GatewayApiRouteConflict>>,
@@ -296,6 +313,8 @@ impl<'a> GatewayApiStatusIndexes<'a> {
         let mut gateways_by_ns_name = HashMap::new();
         let mut secrets_by_ns_name = HashMap::new();
         let mut services_by_ns_name = HashMap::new();
+        let mut namespaces_by_name = HashMap::new();
+        let mut routes_by_gateway: HashMap<(&str, &str), Vec<&K8sObject>> = HashMap::new();
         let mut reference_grants_by_ns: HashMap<&str, Vec<&K8sObject>> = HashMap::new();
         let mut has_any_service = false;
 
@@ -332,11 +351,31 @@ impl<'a> GatewayApiStatusIndexes<'a> {
                         object,
                     );
                 }
+                "Namespace" => {
+                    namespaces_by_name.insert(object.metadata.name.as_str(), object);
+                }
                 "ReferenceGrant" => {
                     reference_grants_by_ns
                         .entry(object.metadata.namespace.as_str())
                         .or_default()
                         .push(object);
+                }
+                "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => {
+                    let mut seen_parents = HashSet::new();
+                    for parent_ref in route_parent_refs_borrowed(object) {
+                        let Some((namespace, name)) =
+                            parent_ref_gateway_target(object, parent_ref)
+                        else {
+                            continue;
+                        };
+                        if !seen_parents.insert((namespace, name)) {
+                            continue;
+                        }
+                        routes_by_gateway
+                            .entry((namespace, name))
+                            .or_default()
+                            .push(object);
+                    }
                 }
                 _ => {}
             }
@@ -364,6 +403,8 @@ impl<'a> GatewayApiStatusIndexes<'a> {
             managed_gateways,
             secrets_by_ns_name,
             services_by_ns_name,
+            namespaces_by_name,
+            routes_by_gateway,
             reference_grants_by_ns,
             has_any_service,
             conflicts_by_loser,
@@ -449,14 +490,7 @@ pub fn plan_gateway_api_status_updates_budgeted(
     let mut eligible: Vec<&K8sObject> = objects
         .iter()
         .filter(|object| is_status_kind(&object.kind))
-        .filter(|object| {
-            let managed_parent_refs = if route_status_kind(&object.kind) {
-                managed_route_parent_refs_indexed(object, &indexes)
-            } else {
-                Vec::new()
-            };
-            status_target_is_managed_by_ferrum_indexed(object, &managed_parent_refs, &indexes)
-        })
+        .filter(|object| status_candidate_is_eligible(object, &indexes))
         .collect();
     eligible.sort_by(|left, right| {
         (
@@ -474,6 +508,7 @@ pub fn plan_gateway_api_status_updates_budgeted(
     let window = select_fair_work_window(eligible.len(), budget);
     let mut updates = Vec::new();
     for (_, object) in fair_work_window_iter(&eligible, window) {
+        // Materialize borrowed parent-ref slices only for the selected window.
         let managed_parent_refs = if route_status_kind(&object.kind) {
             managed_route_parent_refs_indexed(object, &indexes)
         } else {
@@ -545,7 +580,7 @@ fn desired_status_for_object(
     translation_result: Result<&K8sTranslation, &K8sTranslateError>,
     route_conflicts: &[&GatewayApiRouteConflict],
     route_keys: &[GatewayApiRouteConflictKey],
-    managed_parent_refs: &[Value],
+    managed_parent_refs: &[&Value],
 ) -> Value {
     if object.kind == "GatewayClass" {
         return gateway_class_status(object);
@@ -1123,7 +1158,7 @@ fn gateway_listener_statuses(
             ];
             json!({
                 "name": listener_name,
-                "attachedRoutes": attached_route_count(objects, gateway, listener),
+                "attachedRoutes": attached_route_count(indexes, gateway, listener),
                 "supportedKinds": route_kinds.supported_kinds,
                 "conditions": conditions,
             })
@@ -1217,20 +1252,25 @@ fn listener_allowed_route_kind<'a>(kind: &Value, protocol_kinds: &'a [&str]) -> 
         .find(|allowed| *allowed == kind)
 }
 
-fn attached_route_count(objects: &[K8sObject], gateway: &K8sObject, listener: &Value) -> usize {
-    objects
-        .iter()
-        .filter(|object| {
-            matches!(
-                object.kind.as_str(),
-                "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute"
-            )
-        })
+fn attached_route_count(
+    indexes: &GatewayApiStatusIndexes<'_>,
+    gateway: &K8sObject,
+    listener: &Value,
+) -> usize {
+    let gateway_key = (
+        gateway.metadata.namespace.as_str(),
+        gateway.metadata.name.as_str(),
+    );
+    indexes
+        .routes_by_gateway
+        .get(&gateway_key)
+        .into_iter()
+        .flatten()
         .filter(|route| {
-            route_parent_refs(route).into_iter().any(|parent_ref| {
-                parent_ref_targets_gateway(route, &parent_ref, gateway)
-                    && parent_ref_matches_listener(&parent_ref, listener)
-                    && route_allowed_by_listener(objects, route, gateway, listener)
+            route_parent_refs_borrowed(route).iter().any(|parent_ref| {
+                parent_ref_targets_gateway(route, parent_ref, gateway)
+                    && parent_ref_matches_listener(parent_ref, listener)
+                    && route_allowed_by_listener(indexes, route, gateway, listener)
                     && route_kind_allowed_by_listener(route, listener)
                     && route_intersects_listener_hostname(route, listener)
             })
@@ -1264,7 +1304,7 @@ fn route_kind_allowed_by_listener(route: &K8sObject, listener: &Value) -> bool {
 }
 
 fn route_allowed_by_listener(
-    objects: &[K8sObject],
+    indexes: &GatewayApiStatusIndexes<'_>,
     route: &K8sObject,
     gateway: &K8sObject,
     listener: &Value,
@@ -1277,11 +1317,10 @@ fn route_allowed_by_listener(
             route.metadata.namespace == gateway.metadata.namespace
         }
         GatewayApiAllowedRoutesNamespaces::All => true,
-        GatewayApiAllowedRoutesNamespaces::Selector(selector) => objects
-            .iter()
-            .find(|object| {
-                object.kind == "Namespace" && object.metadata.name == route.metadata.namespace
-            })
+        GatewayApiAllowedRoutesNamespaces::Selector(selector) => indexes
+            .namespaces_by_name
+            .get(route.metadata.namespace.as_str())
+            .copied()
             .is_some_and(|namespace| {
                 namespace_selector_matches(&namespace.metadata.labels, &selector)
             }),
@@ -1421,7 +1460,7 @@ fn route_status(
     object: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
     result: Result<&crate::config_sources::k8s::K8sTranslation, &K8sTranslateError>,
-    managed_parent_refs: &[Value],
+    managed_parent_refs: &[&Value],
     route_conflicts: &[&GatewayApiRouteConflict],
     route_keys: &[GatewayApiRouteConflictKey],
 ) -> Value {
@@ -2076,41 +2115,76 @@ fn has_ferrum_parent_status(status: &Value) -> bool {
         })
 }
 
-fn route_parent_refs(object: &K8sObject) -> Vec<Value> {
+fn route_parent_refs_borrowed(object: &K8sObject) -> &[Value] {
     object
         .spec
         .get("parentRefs")
         .and_then(Value::as_array)
+        .map(Vec::as_slice)
         .filter(|refs| !refs.is_empty())
-        .cloned()
-        .unwrap_or_default()
+        .unwrap_or(&[])
 }
 
-fn status_target_is_managed_by_ferrum_indexed(
+fn status_candidate_is_eligible(
     object: &K8sObject,
-    managed_parent_refs: &[Value],
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
     match object.kind.as_str() {
         "GatewayClass" => gateway_class_is_managed_by_ferrum(object),
-        "Gateway" => indexes
-            .managed_gateways
-            .contains(&(object.metadata.namespace.as_str(), object.metadata.name.as_str())),
+        "Gateway" => indexes.managed_gateways.contains(&(
+            object.metadata.namespace.as_str(),
+            object.metadata.name.as_str(),
+        )),
         "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => {
-            !managed_parent_refs.is_empty() || has_ferrum_parent_status(&object.status)
+            // Borrowed predicate only — do not deep-clone parentRefs before the
+            // fair work budget selects the expensive status window (#2397).
+            route_has_managed_parent_ref_indexed(object, indexes)
+                || has_ferrum_parent_status(&object.status)
         }
         _ => false,
     }
 }
 
-fn managed_route_parent_refs_indexed(
+fn route_has_managed_parent_ref_indexed(
     route: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
-) -> Vec<Value> {
-    route_parent_refs(route)
-        .into_iter()
+) -> bool {
+    route_parent_refs_borrowed(route)
+        .iter()
+        .any(|parent_ref| parent_ref_targets_managed_gateway_indexed(route, parent_ref, indexes))
+}
+
+fn managed_route_parent_refs_indexed<'a>(
+    route: &'a K8sObject,
+    indexes: &GatewayApiStatusIndexes<'_>,
+) -> Vec<&'a Value> {
+    route_parent_refs_borrowed(route)
+        .iter()
         .filter(|parent_ref| parent_ref_targets_managed_gateway_indexed(route, parent_ref, indexes))
         .collect()
+}
+
+fn parent_ref_gateway_target<'a>(
+    route: &'a K8sObject,
+    parent_ref: &'a Value,
+) -> Option<(&'a str, &'a str)> {
+    let group = parent_ref
+        .get("group")
+        .and_then(Value::as_str)
+        .unwrap_or("gateway.networking.k8s.io");
+    let kind = parent_ref
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("Gateway");
+    let name = parent_ref.get("name").and_then(Value::as_str)?;
+    if group != "gateway.networking.k8s.io" || kind != "Gateway" {
+        return None;
+    }
+    let namespace = parent_ref
+        .get("namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(&route.metadata.namespace);
+    Some((namespace, name))
 }
 
 fn parent_ref_targets_managed_gateway_indexed(
@@ -2118,51 +2192,21 @@ fn parent_ref_targets_managed_gateway_indexed(
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> bool {
-    let group = parent_ref
-        .get("group")
-        .and_then(Value::as_str)
-        .unwrap_or("gateway.networking.k8s.io");
-    let kind = parent_ref
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("Gateway");
-    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
+    let Some((namespace, name)) = parent_ref_gateway_target(route, parent_ref) else {
         return false;
     };
-    if group != "gateway.networking.k8s.io" || kind != "Gateway" {
-        return false;
-    }
-    let namespace = parent_ref
-        .get("namespace")
-        .and_then(Value::as_str)
-        .unwrap_or(&route.metadata.namespace);
     indexes.managed_gateways.contains(&(namespace, name))
 }
 
 fn parent_ref_targets_gateway(route: &K8sObject, parent_ref: &Value, gateway: &K8sObject) -> bool {
-    let group = parent_ref
-        .get("group")
-        .and_then(Value::as_str)
-        .unwrap_or("gateway.networking.k8s.io");
-    let kind = parent_ref
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("Gateway");
-    let Some(name) = parent_ref.get("name").and_then(Value::as_str) else {
+    let Some((namespace, name)) = parent_ref_gateway_target(route, parent_ref) else {
         return false;
     };
-    if group != "gateway.networking.k8s.io" || kind != "Gateway" {
-        return false;
-    }
-    let namespace = parent_ref
-        .get("namespace")
-        .and_then(Value::as_str)
-        .unwrap_or(&route.metadata.namespace);
     namespace == gateway.metadata.namespace && name == gateway.metadata.name
 }
 
 fn route_parent_ref_has_matching_listener(
-    objects: &[K8sObject],
+    _objects: &[K8sObject],
     route: &K8sObject,
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
@@ -2189,13 +2233,13 @@ fn route_parent_ref_has_matching_listener(
         .any(|listener| {
             route_kind_allowed_by_listener(route, listener)
                 && parent_ref_matches_listener(parent_ref, listener)
-                && route_allowed_by_listener(objects, route, gateway, listener)
+                && route_allowed_by_listener(indexes, route, gateway, listener)
                 && route_intersects_listener_hostname(route, listener)
         })
 }
 
 fn route_parent_ref_not_allowed_by_listener(
-    objects: &[K8sObject],
+    _objects: &[K8sObject],
     route: &K8sObject,
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
@@ -2227,7 +2271,7 @@ fn route_parent_ref_not_allowed_by_listener(
         }
         saw_matching_listener = true;
         if route_kind_allowed_by_listener(route, listener)
-            && route_allowed_by_listener(objects, route, gateway, listener)
+            && route_allowed_by_listener(indexes, route, gateway, listener)
         {
             return false;
         }
@@ -2236,7 +2280,7 @@ fn route_parent_ref_not_allowed_by_listener(
 }
 
 fn route_parent_ref_has_matching_parent(
-    objects: &[K8sObject],
+    _objects: &[K8sObject],
     route: &K8sObject,
     parent_ref: &Value,
     indexes: &GatewayApiStatusIndexes<'_>,
@@ -2263,7 +2307,7 @@ fn route_parent_ref_has_matching_parent(
         .any(|listener| {
             route_kind_allowed_by_listener(route, listener)
                 && parent_ref_matches_listener(parent_ref, listener)
-                && route_allowed_by_listener(objects, route, gateway, listener)
+                && route_allowed_by_listener(indexes, route, gateway, listener)
         })
 }
 
@@ -2395,7 +2439,7 @@ fn gateway_listener_programmed(
 }
 
 fn route_unresolved_backend_ref_reason(
-    objects: &[K8sObject],
+    _objects: &[K8sObject],
     route: &K8sObject,
     indexes: &GatewayApiStatusIndexes<'_>,
 ) -> Option<&'static str> {
@@ -2431,7 +2475,7 @@ fn route_unresolved_backend_ref_reason(
         let backend_name = backend_ref.get("name").and_then(Value::as_str);
         if backend_namespace != route.metadata.namespace
             && !reference_grant_allows_backend_ref(
-                objects,
+                indexes,
                 route,
                 backend_namespace,
                 to_group,
@@ -2479,18 +2523,18 @@ fn service_has_port_indexed(
 }
 
 fn reference_grant_allows_backend_ref(
-    objects: &[K8sObject],
+    indexes: &GatewayApiStatusIndexes<'_>,
     route: &K8sObject,
     to_namespace: &str,
     to_group: &str,
     to_kind: &str,
     to_name: Option<&str>,
 ) -> bool {
-    objects
-        .iter()
-        .filter(|object| {
-            object.kind == "ReferenceGrant" && object.metadata.namespace == to_namespace
-        })
+    indexes
+        .reference_grants_by_ns
+        .get(to_namespace)
+        .into_iter()
+        .flatten()
         .any(|grant| {
             reference_grant_has_route_from(grant, route)
                 && reference_grant_has_backend_to(grant, to_group, to_kind, to_name)

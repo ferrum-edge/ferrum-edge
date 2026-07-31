@@ -6056,9 +6056,10 @@ pub mod _test_support {
     };
 
     /// Test-only view of the crate-private shared status-object generation
-    /// helper.
+    /// helper. Takes ownership of the reconcile `Vec` and moves it into one
+    /// shared `Arc<[K8sObject]>` when a writer is present (no element clone).
     pub fn shared_status_objects_snapshot(
-        objects: &[crate::config_sources::k8s::K8sObject],
+        objects: Vec<crate::config_sources::k8s::K8sObject>,
         gateway_writer_present: bool,
         istio_writer_present: bool,
     ) -> Option<std::sync::Arc<[crate::config_sources::k8s::K8sObject]>> {
