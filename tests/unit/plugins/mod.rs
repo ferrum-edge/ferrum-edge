@@ -97,6 +97,7 @@ mod response_caching_tests;
 mod response_mock_tests;
 mod response_size_limiting_tests;
 mod response_transformer_tests;
+mod route_header_finalization_tests;
 mod security_headers_tests;
 mod serverless_function_tests;
 mod soap_ws_security_tests;

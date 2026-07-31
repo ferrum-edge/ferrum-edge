@@ -123,6 +123,16 @@ async fn start_slow_backend_on(listener: TcpListener, delay_ms: u64, stop: Arc<A
 // ============================================================================
 // Gateway helpers (retry pattern per tests/functional/functional_file_mode_test.rs)
 // ============================================================================
+//
+// Readiness must prove process identity, not merely "something answered
+// `/health`" (issue #3428; hosted CI run 30642091981). `ephemeral_port`
+// releases its reservation before the subprocess binds, so a parallel overload
+// test that also drives `max_connections=10` can answer on the released admin
+// port while this child exits — `test_overload_endpoint_shape_normal` then
+// reads that sibling's `level=pressure` snapshot instead of its own `normal`.
+// Each spawn wires a unique `FERRUM_METRICS_BEARER_TOKEN` and waits for
+// authenticated `/health` detail + `ready: true` via
+// [`crate::common::probe_gateway_identity`].
 
 fn gateway_binary_path() -> &'static str {
     if std::path::Path::new("./target/debug/ferrum-edge").exists() {
@@ -139,6 +149,29 @@ async fn ephemeral_port() -> u16 {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port
+}
+
+/// Derive a per-spawn-attempt observability credential from the test process,
+/// both reserved ports, and the retry attempt. Wired into
+/// `FERRUM_METRICS_BEARER_TOKEN` so authenticated `/health` proves this child —
+/// not a parallel overload gateway that grabbed the released admin port.
+fn overload_observability_token(proxy_port: u16, admin_port: u16, attempt: u32) -> String {
+    format!(
+        "ferrum-edge-overload-probe-{}-{}-{}-{}",
+        std::process::id(),
+        proxy_port,
+        admin_port,
+        attempt
+    )
+}
+
+#[test]
+fn overload_observability_token_is_unique_per_attempt_and_ports() {
+    let base = overload_observability_token(10_001, 20_002, 1);
+    assert_ne!(base, overload_observability_token(10_001, 20_002, 2));
+    assert_ne!(base, overload_observability_token(10_001, 20_003, 1));
+    assert_ne!(base, overload_observability_token(10_002, 20_002, 1));
+    assert!(base.contains(&std::process::id().to_string()));
 }
 
 /// Bundle of overload-related env overrides. Only the entries that are `Some`
@@ -166,6 +199,7 @@ fn start_gateway(
     http_port: u16,
     admin_port: u16,
     env: &OverloadEnv,
+    observability_token: &str,
     capture_log_path: Option<&std::path::Path>,
 ) -> std::process::Child {
     let binary_path = gateway_binary_path();
@@ -183,7 +217,12 @@ fn start_gateway(
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
         // Known admin secret so the test can mint a token for the detailed
         // (auth-gated) `/overload` view. File mode honors this when set.
-        .env("FERRUM_ADMIN_JWT_SECRET", ADMIN_JWT_SECRET);
+        .env("FERRUM_ADMIN_JWT_SECRET", ADMIN_JWT_SECRET)
+        // Per-spawn ownership proof for readiness (issue #3428 / CI run
+        // 30642091981). The static admin JWT above is kept for `/overload`
+        // assertions; this token only proves the child that answered readiness
+        // is *this* child.
+        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token);
 
     if let Some(v) = env.max_connections {
         cmd.env("FERRUM_MAX_CONNECTIONS", v.to_string());
@@ -237,21 +276,67 @@ fn start_gateway(
         .expect("Failed to start gateway binary")
 }
 
-async fn wait_for_gateway(admin_port: u16) -> bool {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
-    let health_url = format!("http://127.0.0.1:{admin_port}/health");
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            return true;
+/// Wait until `child` proves it owns the admin listener for this spawn attempt.
+///
+/// Bare unauthenticated `/health` is not identity: [`ephemeral_port`] releases
+/// its reservation before the subprocess binds, so a parallel overload test
+/// can answer `/health` on the released admin port while this child exits on
+/// bind failure. The test then reads that sibling's pressure snapshot — e.g.
+/// `test_overload_endpoint_shape_normal` observed `level=pressure` with
+/// `max_connections=10` instead of the unloaded child's `normal`.
+///
+/// Barrier (same contract as `TestGateway` / `wait_for_owned_gateway` in
+/// `functional_grpc_plugins_test.rs`):
+/// 1. `Child::try_wait` around every probe — a dead child consumes the attempt.
+/// 2. Authenticated `/health` detail tier for this attempt's
+///    `FERRUM_METRICS_BEARER_TOKEN` with `ready: true`.
+/// 3. One more `try_wait` after a successful probe so a child that dies between
+///    answering `/health` and returning cannot look ready.
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    observability_token: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const STARTUP_TIMEOUT_SECS: u64 = 30;
+    const PROBE_SLICE: Duration = Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
+
+    let mut last_observation = String::from("no response yet");
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "overload gateway exited during startup with {status} \
+                 (last observation: {last_observation})"
+            )
+            .into());
         }
-        sleep(Duration::from_millis(250)).await;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "overload gateway did not prove ownership of admin port {admin_port} within \
+                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
+            )
+            .into());
+        }
+        match crate::common::probe_gateway_identity(
+            admin_port,
+            observability_token,
+            remaining.min(PROBE_SLICE),
+        )
+        .await
+        {
+            Ok(()) => {
+                if let Some(status) = child.try_wait()? {
+                    return Err(format!(
+                        "overload gateway exited after proving ownership with {status}"
+                    )
+                    .into());
+                }
+                return Ok(());
+            }
+            Err(err) => last_observation = err.to_string(),
+        }
     }
-    false
 }
 
 /// Start the gateway with retry across fresh ephemeral ports to avoid
@@ -264,18 +349,28 @@ async fn start_gateway_with_retry(
     for attempt in 1..=MAX_ATTEMPTS {
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
-        let mut child = start_gateway(config_path, proxy_port, admin_port, env, None);
-        if wait_for_gateway(admin_port).await {
-            return (child, proxy_port, admin_port);
-        }
-        eprintln!(
-            "overload gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
-             (proxy_port={proxy_port}, admin_port={admin_port})"
+        let observability_token = overload_observability_token(proxy_port, admin_port, attempt);
+        let mut child = start_gateway(
+            config_path,
+            proxy_port,
+            admin_port,
+            env,
+            &observability_token,
+            None,
         );
-        let _ = child.kill();
-        let _ = child.wait();
-        if attempt < MAX_ATTEMPTS {
-            sleep(Duration::from_secs(1)).await;
+        match wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
+            Ok(()) => return (child, proxy_port, admin_port),
+            Err(error) => {
+                eprintln!(
+                    "overload gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
+                     (proxy_port={proxy_port}, admin_port={admin_port}): {error}"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
         }
     }
     panic!("Gateway did not start after {MAX_ATTEMPTS} attempts");
@@ -294,18 +389,28 @@ async fn start_gateway_with_retry_capture_logs(
     for attempt in 1..=MAX_ATTEMPTS {
         let proxy_port = ephemeral_port().await;
         let admin_port = ephemeral_port().await;
-        let mut child = start_gateway(config_path, proxy_port, admin_port, env, Some(log_path));
-        if wait_for_gateway(admin_port).await {
-            return (child, proxy_port, admin_port);
-        }
-        eprintln!(
-            "overload gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
-             (proxy_port={proxy_port}, admin_port={admin_port})"
+        let observability_token = overload_observability_token(proxy_port, admin_port, attempt);
+        let mut child = start_gateway(
+            config_path,
+            proxy_port,
+            admin_port,
+            env,
+            &observability_token,
+            Some(log_path),
         );
-        let _ = child.kill();
-        let _ = child.wait();
-        if attempt < MAX_ATTEMPTS {
-            sleep(Duration::from_secs(1)).await;
+        match wait_for_owned_gateway(&mut child, admin_port, &observability_token).await {
+            Ok(()) => return (child, proxy_port, admin_port),
+            Err(error) => {
+                eprintln!(
+                    "overload gateway startup attempt {attempt}/{MAX_ATTEMPTS} failed \
+                     (proxy_port={proxy_port}, admin_port={admin_port}): {error}"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                if attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
         }
     }
     panic!("Gateway did not start after {MAX_ATTEMPTS} attempts");

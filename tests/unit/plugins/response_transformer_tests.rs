@@ -1334,7 +1334,8 @@ fn test_response_transformer_strong_etag_preflight_reports_conservative_capabili
 // ── Route-level transform overrides (`apply_route_overrides`) ──────────────
 
 use ferrum_edge::plugins::utils::route_header_transform::{
-    RawRouteHeaderTransformRule, parse_route_header_transforms,
+    RawRouteHeaderTransformRule, finalize_route_override_response_headers,
+    parse_route_header_transforms,
 };
 
 #[tokio::test]
@@ -1360,7 +1361,7 @@ async fn test_response_transformer_empty_rules_without_opt_in_still_errors() {
 async fn test_response_transformer_route_override_applies_after_static_rules() {
     // Static rule sets X-Backend=static; route-level override sets
     // X-Backend=route. Per documented precedence (static first, then
-    // per-rule), the route override must win.
+    // chain-level route finalization), the route override must win.
     let plugin = ResponseTransformer::new(&json!({
         "rules": [
             {"operation": "update", "target": "header", "key": "X-Backend", "value": "static"}
@@ -1380,13 +1381,13 @@ async fn test_response_transformer_route_override_applies_after_static_rules() {
     let _ = plugin
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
+    finalize_route_override_response_headers(&mut ctx, &mut response_headers);
 
     assert_eq!(
         response_headers.get("x-backend").map(String::as_str),
         Some("route")
     );
-    // Plugin must consume the Arc so a subsequent response_transformer
-    // instance in the chain does not re-apply the same list.
+    // Chain-level finalization consumes the Arc exactly once.
     assert!(ctx.route_override_response_transform.is_none());
 }
 
@@ -1413,6 +1414,7 @@ async fn test_response_transformer_apply_route_overrides_no_static_rules_applies
     let _ = plugin
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
+    finalize_route_override_response_headers(&mut ctx, &mut response_headers);
     assert_eq!(
         response_headers.get("x-cache").map(String::as_str),
         Some("miss")

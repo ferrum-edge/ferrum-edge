@@ -30,13 +30,18 @@
 //! ## Per-rule overrides from `mesh_route_dispatch`
 //!
 //! `mesh_route_dispatch` publishes per-rule
-//! `route_override_response_transform` Arcs onto `RequestContext`. This
-//! plugin applies them at the end of `after_proxy` — i.e. **static rules
-//! run first, then per-rule overrides** — so route-level writes win on
-//! conflict. The `apply_route_overrides: true` opt-in mirrors the
-//! `request_transformer` counterpart: it lets the K8s VirtualService
-//! translator auto-emit a `response_transformer` with zero static rules
-//! whose only job is to act as a consumer for per-rule overrides.
+//! `route_override_response_transform` Arcs onto `RequestContext`. Each
+//! enabled instance of this plugin applies only its **static** header rules
+//! in `after_proxy` (and the header-capability simulation). Proxy core then
+//! applies the matched route list **exactly once** after the last eligible
+//! (enabled) `response_transformer` in the ordered chain — including on
+//! ordinary H1/H2/H3 responses, synthetic/rejection paths, gRPC-Web header
+//! simulation, and deadline provenance rebuilds — so route-level writes win
+//! under multiple same-type instances. The `apply_route_overrides: true`
+//! opt-in mirrors the `request_transformer` counterpart: it lets the K8s
+//! VirtualService translator auto-emit a `response_transformer` with zero
+//! static rules whose only job is to act as an eligible consumer for that
+//! chain-level final phase.
 //!
 //! ## RTDS overlay
 //!
@@ -44,7 +49,9 @@
 //! `ferrum.response_transformer.<scope>.enabled` is bound into this
 //! instance's configuration by mesh preparation and resolved ONCE,
 //! immutably, at construction. A `false` value short-circuits rule
-//! application (static rules AND route-overlay overrides). A scope the
+//! application (static rules become no-ops) and the instance is **not**
+//! eligible for route-header finalization, so it cannot consume or suppress
+//! route overrides needed by a later enabled consumer. A scope the
 //! accepted overlay does not name falls back to `default_enabled`
 //! (defaults to `true` — fail-open).
 //!
@@ -108,16 +115,12 @@ use http::header::{HeaderName, HeaderValue};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::Arc;
 use tracing::debug;
 
 use super::response_representation::effective_response_media_type;
 use super::utils::body_transform::{self, BodyRule};
 use super::utils::policy_digest;
-use super::utils::route_header_transform::{
-    RouteHeaderTransformOp, RouteHeaderTransformRule, apply_route_header_transforms,
-    apply_route_header_transforms_tracked,
-};
+use super::utils::route_header_transform::RouteHeaderTransformOp;
 use super::utils::sse::is_text_event_stream_media_type;
 use super::utils::transformer_gate;
 use super::{Plugin, PluginResult, RequestContext};
@@ -623,10 +626,10 @@ impl ResponseTransformer {
 
         // `apply_route_overrides` is parsed and validated above so the
         // K8s VirtualService translator can auto-emit a `response_transformer`
-        // with zero static rules whose only purpose is to consume
-        // `ctx.route_override_response_transform` Arcs in `after_proxy`.
-        // The flag is config-time only — the runtime path consults `ctx`
-        // unconditionally — so we drop it after construction.
+        // with zero static rules that still participates in the chain-level
+        // route-header finalization phase. The flag is config-time only — an
+        // enabled instance is eligible for that phase regardless — so we drop
+        // it after construction.
         let _ = apply_route_overrides;
 
         let runtime_overlay_scope = match config.get("runtime_overlay_scope") {
@@ -860,7 +863,8 @@ impl Plugin for ResponseTransformer {
     /// mutable state. So this digest — not the separately published gate map —
     /// is the complete witness of what this instance does to a representation.
     /// The one non-config input, `ctx.route_override_response_transform`, is
-    /// header-only and is consumed without being applied on a finalized replay.
+    /// header-only and is finalized by proxy core without being re-applied on a
+    /// finalized replay.
     fn response_presentation_policy(&self) -> Option<super::ResponsePresentationPolicy> {
         Some(super::ResponsePresentationPolicy::Static(
             self.static_policy_digest,
@@ -920,15 +924,18 @@ impl Plugin for ResponseTransformer {
             return;
         }
         // Finalized cache/idempotent replays already carry post-transform
-        // headers. Consume any route override without re-applying it.
+        // headers. Static rules are skipped; proxy core still consumes the
+        // route override in the chain-level final phase without re-applying it.
         if ctx.finalized_response_replay {
-            let _ = ctx.route_override_response_transform.take();
             return;
         }
         self.apply_static_header_rules(response_headers, false, None);
-        if let Some(route_rules) = ctx.route_override_response_transform.take() {
-            apply_route_header_transforms(route_rules.as_ref(), response_headers);
-        }
+        // Route-level transforms are applied once after the last eligible
+        // response_transformer by proxy core — do not take or apply them here.
+    }
+
+    fn participates_in_route_response_header_finalization(&self) -> bool {
+        self.rules_enabled
     }
 
     fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
@@ -1129,15 +1136,14 @@ impl Plugin for ResponseTransformer {
 
     /// Fail closed: the governed field set is not enumerable at config time.
     ///
-    /// Static `rules` are enumerable, but `after_proxy` ALSO applies
-    /// `ctx.route_override_response_transform` — per-rule header transforms
-    /// published at request time by `mesh_route_dispatch` — and the runtime
-    /// path consults that context slot unconditionally, independent of the
-    /// config-time `apply_route_overrides` flag. A route-level `remove` whose
-    /// field arrived only as a backend trailer is therefore both invisible to
-    /// this declaration and invisible to observed-mutation reconciliation, so a
-    /// buffered path that forwards backend trailers drops the whole trailer
-    /// section instead of guessing which names are governed.
+    /// Static `rules` are enumerable, but the chain-level response route-header
+    /// finalizer ALSO applies `ctx.route_override_response_transform` — per-rule
+    /// header transforms published at request time by `mesh_route_dispatch` —
+    /// whenever an eligible enabled instance is on the chain. A route-level
+    /// `remove` whose field arrived only as a backend trailer is therefore both
+    /// invisible to this declaration and invisible to observed-mutation
+    /// reconciliation, so a buffered path that forwards backend trailers drops
+    /// the whole trailer section instead of guessing which names are governed.
     fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
         if self.rules_enabled {
             super::ResponseTrailerPolicy::Unbounded
@@ -1160,12 +1166,12 @@ impl Plugin for ResponseTransformer {
             return PluginResult::Continue;
         }
         // `response_caching` HIT/REVALIDATED and idempotent replays store the
-        // final post-transform header map. Re-running static or route-level
-        // sequences (especially non-idempotent `add`) would mutate the cached
-        // representation. Consume the route override so a later sibling cannot
-        // apply it either; leave the replayed headers untouched.
+        // final post-transform header map. Re-running static sequences
+        // (especially non-idempotent `add`) would mutate the cached
+        // representation. Leave the route override for proxy core's
+        // chain-level final phase, which consumes it without re-applying on
+        // finalized replay.
         if ctx.finalized_response_replay {
-            let _ = ctx.route_override_response_transform.take();
             return PluginResult::Continue;
         }
         // Collect fired whole-value writes only when a terminal replacement
@@ -1177,23 +1183,15 @@ impl Plugin for ResponseTransformer {
             true,
             track_owned.then_some(&mut fired_write_keys),
         );
-        // Per-rule overrides published by `mesh_route_dispatch` run AFTER
-        // static rules so route-level writes win on conflict — see module
-        // docstring. Take the Arc out so a later response_transformer
-        // instance in the chain does not re-apply the same list.
-        let route_rules: Option<Arc<Vec<RouteHeaderTransformRule>>> =
-            ctx.route_override_response_transform.take();
-        if let Some(route_rules) = route_rules.as_ref() {
-            apply_route_header_transforms_tracked(
-                route_rules.as_ref(),
-                response_headers,
-                track_owned.then_some(&mut fired_write_keys),
-            );
-        }
-        // Declare every WHOLE-VALUE gateway write (static and route-override) as
-        // gateway-owned for a gRPC deadline rebuild, because net-diff mutation
-        // tracking cannot see such a write when the backend already carried the
-        // identical bytes:
+        // Route-level overrides are applied exactly once by proxy core after
+        // the last eligible response_transformer — see
+        // `finalize_route_override_response_headers`. Applying them here would
+        // let a later same-type instance's static rules undo route policy.
+        //
+        // Declare every WHOLE-VALUE gateway write from this instance's static
+        // rules as gateway-owned for a gRPC deadline rebuild, because net-diff
+        // mutation tracking cannot see such a write when the backend already
+        // carried the identical bytes:
         //
         // * `update` overwrites with the configured value, so a backend that
         //   pre-populated the identical key/value must not be able to suppress
@@ -1204,26 +1202,20 @@ impl Plugin for ResponseTransformer {
         // * an `add` that actually INSERTED into an absent slot — including the
         //   `remove`-then-`add` sequence whose final map is byte-identical to the
         //   backend's, where the net diff is empty. `fired_write_keys` carries
-        //   these from both rule sets.
+        //   these from the static rule set.
         //
         // An `add` that APPENDED onto an existing value is deliberately absent:
         // it must stay on mutation tracking's append-partition branch so the
         // backend portion of the value never crosses onto the deadline response.
         //
-        // The provenance state exists only for deadline-bound buffered responses,
-        // so this is gated to avoid per-request allocation otherwise. Owned names
-        // are borrowed, not cloned.
+        // Route-level whole-value ownership is recorded in the chain-level
+        // finalizer when that list is applied. The provenance state exists only
+        // for deadline-bound buffered responses, so this is gated to avoid
+        // per-request allocation otherwise. Owned names are borrowed, not cloned.
         if track_owned {
             let mut owned: Vec<&str> = Vec::new();
             owned.extend(self.static_update_keys.iter().map(String::as_str));
             owned.extend(fired_write_keys.iter().map(String::as_str));
-            if let Some(route_rules) = route_rules.as_ref() {
-                for rule in route_rules.iter() {
-                    if rule.operation == RouteHeaderTransformOp::Update {
-                        owned.push(rule.key.as_str());
-                    }
-                }
-            }
             if !owned.is_empty() {
                 ctx.record_deadline_owned_response_headers(&owned, response_headers);
             }
