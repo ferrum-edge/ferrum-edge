@@ -709,17 +709,18 @@ fn namespace_selector_and_cross_namespace_grant_parity() {
         grant,
         backend_svc,
     ];
-    let conflicts = gateway_api_route_conflicts(&objects, &options());
+    let translation_options = options().with_source_namespaces(Vec::new());
+    let conflicts = gateway_api_route_conflicts(&objects, &translation_options);
     let (translation, errors) =
         ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips(
             &objects,
-            options(),
+            translation_options.clone(),
         )
         .expect("primary translation");
     let reuse = StatusTranslationReuse::from_owned(translation, errors);
     let outcome = plan_gateway_api_status_updates_budgeted(
         &objects,
-        options(),
+        translation_options,
         &conflicts,
         Default::default(),
         Some(&reuse),
@@ -1806,10 +1807,28 @@ fn reference_grant_gateway_certificate_and_route_backend_parity() {
 
 #[test]
 fn reference_grant_permission_index_avoids_raw_grant_scans() {
-    assert!(
-        STATUS_SRC.contains("reference_grant_permissions.allows("),
-        "lookups must consult the precomputed permission index"
-    );
+    let secret_indexed = STATUS_SRC
+        .split("fn reference_grant_allows_secret_indexed(")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfn gateway_status(").next())
+        .expect("reference_grant_allows_secret_indexed body");
+    let backend_ref = STATUS_SRC
+        .split("fn reference_grant_allows_backend_ref(")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfn api_group(").next())
+        .expect("reference_grant_allows_backend_ref body");
+    for (name, body) in [
+        (
+            "reference_grant_allows_secret_indexed",
+            secret_indexed,
+        ),
+        ("reference_grant_allows_backend_ref", backend_ref),
+    ] {
+        assert!(
+            body.contains("reference_grant_permissions") && body.contains(".allows("),
+            "{name} must consult the precomputed permission index"
+        );
+    }
     assert!(
         !STATUS_SRC.contains("reference_grants_by_ns"),
         "raw per-namespace grant vectors must be gone"
