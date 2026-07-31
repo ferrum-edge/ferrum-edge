@@ -691,6 +691,10 @@ fn safe_keyword_accepts_only_allowlisted_vocabulary_tokens() {
     assert_eq!(safe_keyword(&format!("/{CANARY}")), UNKNOWN_KEYWORD);
     // `$defs` map keys are schema identifiers, not diagnostic keywords.
     assert_eq!(safe_keyword(&format!("/$defs/{CANARY}/type")), "type");
+    // Draft 7 `dependencies` is part of the compiled vocabulary, so it reports
+    // itself rather than collapsing like a custom token.
+    assert_eq!(safe_keyword("/dependencies"), "dependencies");
+    assert_eq!(safe_keyword("/dependentRequired"), "dependentRequired");
 }
 
 #[test]
@@ -942,6 +946,36 @@ fn safe_field_names_collects_dependent_and_composed_schema_names() {
             "schema-declared member {declared:?} must survive collection"
         );
     }
+}
+
+#[test]
+fn safe_field_names_collects_draft7_dependencies_names() {
+    // Draft 7 `dependencies` carries both shapes its 2020-12 successors split
+    // apart: an array of declared member names and a subschema.
+    let names = SafeFieldNames::from_schema(&json!({
+        "type": "object",
+        "dependencies": {
+            "draft7Trigger": ["draft7Required"],
+            "draft7SchemaTrigger": {
+                "properties": {"draft7Sibling": {"type": "string"}}
+            }
+        }
+    }));
+    for declared in [
+        "draft7Trigger",
+        "draft7Required",
+        "draft7SchemaTrigger",
+        "draft7Sibling",
+    ] {
+        assert!(
+            names.allows(declared),
+            "Draft 7 dependencies member {declared:?} must survive collection"
+        );
+    }
+    assert!(
+        !names.allows(CANARY),
+        "collection must not widen beyond schema-declared names"
+    );
 }
 
 #[test]

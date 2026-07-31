@@ -91,10 +91,16 @@ const MAX_DECLARED_NAMES: usize = 2048;
 
 /// Explicit allowlist of JSON Schema keywords that may appear in a diagnostic.
 ///
-/// Drawn from the Draft 7 / Draft 2020-12 vocabularies Ferrum compiles. A short
-/// all-alphanumeric custom keyword, `$defs` / `definitions` map key, or any
-/// other schema-derived token is *not* in this set and collapses to
-/// [`UNKNOWN_KEYWORD`].
+/// Drawn from the Draft 7 and Draft 2020-12 vocabularies Ferrum compiles,
+/// including Draft 7 `dependencies` alongside the 2020-12 successors that
+/// replaced it (`dependentRequired` / `dependentSchemas`).
+///
+/// A short all-alphanumeric custom keyword, or a `$defs` / `definitions` /
+/// `patternProperties` map key carrying an operator's own schema identifier, is
+/// *not* in this set and collapses to [`UNKNOWN_KEYWORD`]. The one exception is
+/// a map key that happens to spell an allowlisted token: what is emitted is
+/// then the compiled-in `&'static str` from this table, so the output is still
+/// drawn from a fixed vocabulary and carries no payload bytes either way.
 pub const SAFE_KEYWORDS: &[&str] = &[
     "$anchor",
     "$dynamicAnchor",
@@ -116,6 +122,7 @@ pub const SAFE_KEYWORDS: &[&str] = &[
     "contentSchema",
     "default",
     "definitions",
+    "dependencies",
     "dependentRequired",
     "dependentSchemas",
     "deprecated",
@@ -199,9 +206,10 @@ const SCHEMA_MAP_KEYWORDS: &[&str] = &[
 /// is attacker- or backend-chosen and is replaced by [`REDACTED_SEGMENT`].
 ///
 /// Only JSON object member names (`properties`, `required`,
-/// `dependentRequired`, `dependentSchemas`) are collected. Configured
-/// `xml.name` values are deliberately excluded: they are wire/payload names,
-/// and echoing them contradicts the advisory's prohibition on raw XML names.
+/// `dependentRequired`, `dependentSchemas`, and the Draft 7 `dependencies` that
+/// preceded those two) are collected. Configured `xml.name` values are
+/// deliberately excluded: they are wire/payload names, and echoing them
+/// contradicts the advisory's prohibition on raw XML names.
 ///
 /// The walk is bounded in both depth and retained names so a large configured
 /// schema cannot make construction expensive or the set unbounded.
@@ -252,6 +260,28 @@ fn collect_declared_names(schema: &Value, out: &mut HashSet<String>, depth: usiz
                         insert_name(out, entry);
                     }
                 }
+            }
+        }
+    }
+    // Draft 7 `dependencies` is the ancestor of both keywords above and is a
+    // schema position Ferrum compiles and audits for `draft7` (see
+    // `body_validator::audit_schema_node`). Its map keys are declared member
+    // names, an array value lists further declared member names, and an
+    // object/boolean value is a subschema. Omitting it would redact names the
+    // configured schema does declare, making Draft 7 locations strictly less
+    // useful than their Draft 2020-12 equivalents for no confidentiality gain.
+    if let Some(Value::Object(dependencies)) = object.get("dependencies") {
+        for (name, dependency) in dependencies {
+            insert_name(out, name);
+            match dependency {
+                Value::Array(entries) => {
+                    for entry in entries {
+                        if let Some(entry) = entry.as_str() {
+                            insert_name(out, entry);
+                        }
+                    }
+                }
+                subschema => collect_declared_names(subschema, out, depth + 1),
             }
         }
     }
