@@ -8,9 +8,19 @@
 //! `Arc<Vec<RouteHeaderTransformRule>>`, and clones that `Arc` onto
 //! [`crate::plugins::RequestContext::route_override_request_transform`] /
 //! [`crate::plugins::RequestContext::route_override_response_transform`]
-//! when a `mesh_route_dispatch` rule matches. The consumer plugins read
-//! those `Arc`s and apply them via [`apply_route_header_transforms`]
-//! after their own static rules.
+//! when a `mesh_route_dispatch` rule matches.
+//!
+//! Enabled transformer instances apply only their **static** header rules.
+//! Proxy core then applies each matched route list **exactly once** in a
+//! chain-level final header phase after the last eligible (enabled)
+//! `request_transformer` / `response_transformer` in the ordered plugin
+//! chain. That keeps route-level policy authoritative under multiple
+//! same-type instances: a later static add/update/remove/rename cannot
+//! undo a route remove or set. A disabled RTDS instance is not eligible
+//! and neither consumes nor suppresses the route list. When the chain has
+//! no eligible consumer, the published `Arc` is left unused (the Virtual
+//! Service translator auto-emits an `apply_route_overrides` consumer when
+//! route header transforms are configured).
 //!
 //! Operations supported are the strict subset of header ops that the
 //! transformer plugins also expose:
@@ -30,10 +40,77 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::sync::Arc;
 
 use http::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::plugins::RequestContext;
+
+/// Apply the matched request route-header list exactly once and clear it from
+/// `ctx`. Proxy core calls this after the last eligible `request_transformer`
+/// static-rule pass so later same-type instances cannot undo route policy.
+pub fn finalize_route_override_request_headers(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    if let Some(route_rules) = ctx.route_override_request_transform.take() {
+        apply_route_header_transforms(route_rules.as_ref(), headers);
+    }
+}
+
+/// Apply (or consume without applying) the matched response route-header list
+/// exactly once. Finalized cache/idempotent replays already carry the
+/// post-transform map, so the Arc is taken without re-applying non-idempotent
+/// `add` sequences. Ordinary paths apply the list and record whole-value
+/// gateway ownership for deadline provenance when that state is active.
+pub fn finalize_route_override_response_headers(
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+) {
+    if ctx.finalized_response_replay {
+        let _ = ctx.route_override_response_transform.take();
+        return;
+    }
+    let Some(route_rules) = ctx.route_override_response_transform.take() else {
+        return;
+    };
+    finalize_route_override_response_headers_inner(ctx, response_headers, route_rules);
+}
+
+fn finalize_route_override_response_headers_inner(
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+    route_rules: Arc<Vec<RouteHeaderTransformRule>>,
+) {
+    let track_owned = ctx.has_buffered_deadline_response_header_provenance();
+    let mut fired_write_keys: Vec<String> = Vec::new();
+    apply_route_header_transforms_tracked(
+        route_rules.as_ref(),
+        response_headers,
+        track_owned.then_some(&mut fired_write_keys),
+    );
+    if track_owned {
+        let mut owned: Vec<&str> = Vec::new();
+        owned.extend(fired_write_keys.iter().map(String::as_str));
+        for rule in route_rules.iter() {
+            if rule.operation == RouteHeaderTransformOp::Update {
+                owned.push(rule.key.as_str());
+            }
+        }
+        if !owned.is_empty() {
+            ctx.record_deadline_owned_response_headers(&owned, response_headers);
+        }
+    }
+    // Whole-value ownership above covers writes whose final bytes can be
+    // indistinguishable from the backend baseline. Record the completed route
+    // phase as well so ordinary removals and appends are reconciled into
+    // deadline provenance. This must live in the finalizer rather than its
+    // callers: rejection/deadline early-return paths can finalize outside the
+    // ordinary after-proxy loop.
+    ctx.record_deadline_response_header_mutations(response_headers);
+}
 
 /// Operation in a route-level header transform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -755,6 +755,14 @@ impl Plugin for PriorityOverridePlugin {
     fn modifies_request_headers(&self) -> bool {
         self.inner.modifies_request_headers()
     }
+    fn participates_in_route_request_header_finalization(&self) -> bool {
+        self.inner
+            .participates_in_route_request_header_finalization()
+    }
+    fn participates_in_route_response_header_finalization(&self) -> bool {
+        self.inner
+            .participates_in_route_response_header_finalization()
+    }
     fn modifies_request_query(&self) -> bool {
         self.inner.modifies_request_query()
     }

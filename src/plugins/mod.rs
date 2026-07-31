@@ -2646,15 +2646,17 @@ pub struct RequestContext {
     pub route_override_retry: Option<Option<RetryConfig>>,
     /// Per-rule request header transforms published by `mesh_route_dispatch`
     /// when a matching rule carries `request_transform` rules (Istio
-    /// `VirtualService.http[].headers.request.{set,add,remove}`). The
-    /// `request_transformer` plugin applies these after its own static
-    /// header rules. Shared via `Arc` so the dispatch hot path clones a
-    /// pointer rather than the rule list.
+    /// `VirtualService.http[].headers.request.{set,add,remove}`). Enabled
+    /// `request_transformer` instances apply only their static header rules;
+    /// proxy core applies this list exactly once after the last eligible
+    /// transformer in the chain so route-level writes remain authoritative.
+    /// Shared via `Arc` so the dispatch hot path clones a pointer rather than
+    /// the rule list.
     pub route_override_request_transform:
         Option<Arc<Vec<utils::route_header_transform::RouteHeaderTransformRule>>>,
     /// Per-rule response header transforms; counterpart to
-    /// `route_override_request_transform`. Applied by `response_transformer`
-    /// after its own static header rules.
+    /// `route_override_request_transform`. Applied once by proxy core after
+    /// every eligible `response_transformer` has run its static header rules.
     pub route_override_response_transform:
         Option<Arc<Vec<utils::route_header_transform::RouteHeaderTransformRule>>>,
     /// Plugin-set override for the request path forwarded to the backend.
@@ -7434,7 +7436,7 @@ pub trait Plugin: Send + Sync {
     /// Only response *body* transforms need enrollment. `after_proxy` header
     /// hooks — including the rejection-path hooks a synthetic replay runs
     /// through — still execute on a finalized replay, so header policy is
-    /// enforced live and is never skipped. (`response_transformer` consuming
+    /// enforced live and is never skipped. (Proxy core consuming
     /// `ctx.route_override_response_transform` without applying it on a
     /// finalized replay is the deliberate counterpart: those route rules are
     /// header-only and are already baked into the stored header map.)
@@ -7613,6 +7615,29 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when this enabled instance participates in the
+    /// request-side route-header finalization chain.
+    ///
+    /// Eligible `request_transformer` instances apply only their static
+    /// header/query rules in `before_proxy`. Proxy core then applies
+    /// [`RequestContext::route_override_request_transform`] exactly once after
+    /// the last eligible instance so route-level policy cannot be undone by a
+    /// later static rule. Disabled RTDS instances must return `false` so they
+    /// neither consume nor suppress the shared route list.
+    fn participates_in_route_request_header_finalization(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this enabled instance participates in the
+    /// response-side route-header finalization chain.
+    ///
+    /// Counterpart to [`Self::participates_in_route_request_header_finalization`]
+    /// for `response_transformer` and
+    /// [`RequestContext::route_override_response_transform`].
+    fn participates_in_route_response_header_finalization(&self) -> bool {
+        false
+    }
+
     /// Applies this plugin's deterministic `after_proxy` response-header
     /// mutations to a simulated header map.
     ///
@@ -7620,7 +7645,10 @@ pub trait Plugin: Send + Sync {
     /// later header hooks without actually running plugin side effects early.
     /// Implementations MUST keep this pure with respect to the real request:
     /// the caller passes a cloned context when mutation is needed to mirror
-    /// runtime consumption of route overrides.
+    /// runtime consumption of route overrides. Route-level response transforms
+    /// are **not** applied here — proxy core applies them once after the last
+    /// eligible simulated transformer via
+    /// [`utils::route_header_transform::finalize_route_override_response_headers`].
     fn simulate_after_proxy_response_headers(
         &self,
         _ctx: &mut RequestContext,

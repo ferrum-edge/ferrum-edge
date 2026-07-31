@@ -4694,6 +4694,25 @@ pub mod _test_support {
         );
     }
 
+    /// Run reject-path `after_proxy` hooks (including chain-level response
+    /// route-header finalization) over an already-built rejection map.
+    pub async fn apply_replaceable_after_proxy_hooks_to_rejection_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        status_code: &mut u16,
+        response_body: &mut bytes::Bytes,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
+            plugins,
+            ctx,
+            status_code,
+            response_body,
+            response_headers,
+        )
+        .await;
+    }
+
     pub async fn run_after_proxy_hooks_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -4703,6 +4722,23 @@ pub mod _test_support {
         crate::proxy::run_after_proxy_hooks(plugins, ctx, response_status, response_headers)
             .await
             .is_some()
+    }
+
+    /// Run the production `before_proxy` chain including the chain-level
+    /// request route-header finalization phase (GHSA-3xxr-xhhj-9962).
+    pub async fn run_before_proxy_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> crate::plugins::PluginResult {
+        crate::proxy::run_before_proxy_hooks_for_backend_path_policy(
+            plugins,
+            ctx,
+            headers,
+            false,
+            crate::proxy::BackendPathBeforeProxyPass::Initial,
+        )
+        .await
     }
 
     /// Like [`run_after_proxy_hooks_for_test`] but surfaces the terminal

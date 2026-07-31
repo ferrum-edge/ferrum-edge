@@ -1196,15 +1196,17 @@ async fn test_request_transformer_rejects_missing_target() {
 // ── Route-level transform overrides (`apply_route_overrides`) ──────────────
 //
 // `mesh_route_dispatch` publishes per-rule Arcs onto
-// `ctx.route_override_request_transform`. The transformer plugin always
-// consumes them at the end of `before_proxy`. When the proxy has no
+// `ctx.route_override_request_transform`. Enabled transformer instances apply
+// only their static rules; proxy core applies the matched route list exactly
+// once after the last eligible instance. When the proxy has no
 // operator-configured `request_transformer`, the K8s VirtualService
 // translator auto-emits an instance with `apply_route_overrides: true` and
 // no static rules; that instance must still be valid and must declare
 // `modifies_request_headers() == true` so the dispatcher clones headers.
 
 use ferrum_edge::plugins::utils::route_header_transform::{
-    RawRouteHeaderTransformRule, parse_route_header_transforms,
+    RawRouteHeaderTransformRule, finalize_route_override_request_headers,
+    parse_route_header_transforms,
 };
 use std::sync::Arc;
 
@@ -1235,7 +1237,7 @@ async fn test_request_transformer_empty_rules_without_opt_in_still_errors() {
 async fn test_request_transformer_route_override_applies_after_static_rules() {
     // Static rule sets X-Trace=static; route-level override sets
     // X-Trace=route. Per the documented precedence (static first, then
-    // per-rule), the route override must win.
+    // chain-level route finalization), the route override must win.
     let plugin = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "update", "target": "header", "key": "X-Trace", "value": "static"}
@@ -1253,17 +1255,17 @@ async fn test_request_transformer_route_override_applies_after_static_rules() {
     ctx.route_override_request_transform = Some(route_rules);
     let mut headers: HashMap<String, String> = HashMap::new();
     let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    finalize_route_override_request_headers(&mut ctx, &mut headers);
 
     assert_eq!(headers.get("x-trace").map(String::as_str), Some("route"));
-    // Plugin must consume the Arc so a subsequent transformer instance in
-    // the chain does not re-apply the same list.
+    // Chain-level finalization consumes the Arc exactly once.
     assert!(ctx.route_override_request_transform.is_none());
 }
 
 #[tokio::test]
 async fn test_request_transformer_apply_route_overrides_no_static_rules_applies_overrides() {
     // The translator's auto-emitted instance: no static rules, only
-    // consumes per-context overrides.
+    // participates in chain-level route finalization.
     let plugin = RequestTransformer::new(&json!({
         "rules": [],
         "apply_route_overrides": true,
@@ -1283,6 +1285,7 @@ async fn test_request_transformer_apply_route_overrides_no_static_rules_applies_
     headers.insert("x-debug".to_string(), "yes".to_string());
 
     let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    finalize_route_override_request_headers(&mut ctx, &mut headers);
     assert_eq!(headers.get("x-api-version").map(String::as_str), Some("v1"));
     assert!(!headers.contains_key("x-debug"));
 }
@@ -1951,6 +1954,7 @@ async fn test_request_transformer_route_level_accepted_value_applies() {
     ctx.route_override_request_transform = Some(route_rules);
     let mut headers: HashMap<String, String> = HashMap::new();
     let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    finalize_route_override_request_headers(&mut ctx, &mut headers);
     assert_eq!(
         headers.get("x-route").map(String::as_str),
         Some("tab\there")
