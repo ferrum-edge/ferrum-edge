@@ -310,9 +310,8 @@ pub fn safe_location(pointer: &str, names: &SafeFieldNames) -> String {
         return ROOT_LOCATION.to_string();
     }
     let mut out = String::new();
-    let mut emitted = 0usize;
     let mut truncated = false;
-    for raw in pointer.split('/').skip(1) {
+    for (emitted, raw) in pointer.split('/').skip(1).enumerate() {
         if emitted >= MAX_LOCATION_SEGMENTS {
             truncated = true;
             break;
@@ -324,7 +323,6 @@ pub fn safe_location(pointer: &str, names: &SafeFieldNames) -> String {
         }
         out.push('/');
         out.push_str(&rendered);
-        emitted += 1;
     }
     if out.is_empty() {
         return ROOT_LOCATION.to_string();
