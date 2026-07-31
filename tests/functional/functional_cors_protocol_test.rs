@@ -547,9 +547,7 @@ async fn functional_cors_literal_exact_and_regex_origins_are_not_widened() {
         match try_cors_literal_exact_and_regex_origins_are_not_widened().await {
             CorsLiteralAttempt::Passed => return,
             CorsLiteralAttempt::Void(reason) => {
-                eprintln!(
-                    "cors literal-matcher attempt {attempt}/{MAX_ATTEMPTS} voided: {reason}"
-                );
+                eprintln!("cors literal-matcher attempt {attempt}/{MAX_ATTEMPTS} voided: {reason}");
                 last_void = reason;
             }
             CorsLiteralAttempt::Failed(reason) => panic!("{reason}"),
@@ -775,8 +773,15 @@ async fn literal_send_h1(
     requested_headers: Option<&str>,
     origin: &str,
 ) -> Result<CapturedResponse, CorsLiteralAttempt> {
-    match send_h1_path_result(harness, path, method, requested_method, requested_headers, origin)
-        .await
+    match send_h1_path_result(
+        harness,
+        path,
+        method,
+        requested_method,
+        requested_headers,
+        origin,
+    )
+    .await
     {
         Ok(response) => Ok(response),
         Err(error) => Err(classify_cors_transport_error(harness, "H1", &error)),
@@ -791,8 +796,15 @@ async fn literal_send_h2(
     requested_headers: Option<&str>,
     origin: &str,
 ) -> Result<CapturedResponse, CorsLiteralAttempt> {
-    match send_h2_path_result(harness, path, method, requested_method, requested_headers, origin)
-        .await
+    match send_h2_path_result(
+        harness,
+        path,
+        method,
+        requested_method,
+        requested_headers,
+        origin,
+    )
+    .await
     {
         Ok(response) => Ok(response),
         Err(error) => Err(classify_cors_transport_error(harness, "H2", &error)),
@@ -809,8 +821,15 @@ async fn literal_send_h3(
 ) -> Result<CapturedResponse, CorsLiteralAttempt> {
     // Single-shot: request-level retries would blur the void-vs-authoritative
     // boundary for an owned child that died mid-run.
-    match send_h3_path_once(harness, path, method, requested_method, requested_headers, origin)
-        .await
+    match send_h3_path_once(
+        harness,
+        path,
+        method,
+        requested_method,
+        requested_headers,
+        origin,
+    )
+    .await
     {
         Ok(response) => Ok(response),
         Err(error) => Err(classify_cors_transport_error(harness, "H3", &error)),
