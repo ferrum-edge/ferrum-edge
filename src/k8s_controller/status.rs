@@ -13,8 +13,9 @@ use crate::config_sources::k8s::{
     GatewayApiRouteConflictKey, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslation,
     K8sTranslationOptions, gateway_api_route_conflict_keys_with_acc,
     gateway_api_status_conflict_context, namespace_selector_matches,
-    parse_gateway_listener_allowed_route_namespaces, secret_object_is_valid_tls_certificate,
-    translate_k8s_objects_collecting_skips, validate_gateway_listener_allowed_routes,
+    parse_gateway_listener_allowed_route_namespaces, parse_reference_grant_permissions,
+    secret_object_is_valid_tls_certificate, translate_k8s_objects_collecting_skips,
+    validate_gateway_listener_allowed_routes,
 };
 use crate::k8s_controller::status_plan::{
     StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
@@ -352,59 +353,27 @@ struct ReferenceGrantAllowQuery<'a> {
     to_name: Option<&'a str>,
 }
 
-/// Optional ReferenceGrant `to.name` without allocating.
-///
-/// - absent → `Some(None)` (Gateway API wildcard)
-/// - string → `Some(Some(name))` (named grant)
-/// - present non-string → `None` (malformed; caller skips the `to` entry)
-fn reference_grant_optional_to_name(to: &Value) -> Option<Option<&str>> {
-    match to.get("name") {
-        None => Some(None),
-        Some(Value::String(name)) => Some(Some(name.as_str())),
-        Some(_) => None,
-    }
-}
-
 impl<'a> ReferenceGrantPermissionIndex<'a> {
     fn ingest(&mut self, grant: &'a K8sObject) {
+        // Same whole-object parser as canonical `collect_reference_grant`: any
+        // malformed present from/to entry grants nothing from this object.
+        let Ok(permissions) = parse_reference_grant_permissions(grant) else {
+            return;
+        };
         let to_namespace = grant.metadata.namespace.as_str();
-        let Some(from_entries) = grant.spec.get("from").and_then(Value::as_array) else {
-            return;
-        };
-        let Some(to_entries) = grant.spec.get("to").and_then(Value::as_array) else {
-            return;
-        };
-        for from in from_entries {
-            let Some(from_namespace) = from.get("namespace").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(from_kind) = from.get("kind").and_then(Value::as_str) else {
-                continue;
-            };
-            // Required: only an explicit string (including "") may be indexed.
-            // Missing or non-string `group` must not collapse to core "".
-            let Some(from_group) = from.get("group").and_then(Value::as_str) else {
-                continue;
-            };
-            for to in to_entries {
-                let Some(to_kind) = to.get("kind").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(to_group) = to.get("group").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(to_name) = reference_grant_optional_to_name(to) else {
-                    continue;
-                };
-                self.entries
-                    .entry(to_namespace)
-                    .or_default()
-                    .entry((from_namespace, from_group, from_kind))
-                    .or_default()
-                    .entry((to_group, to_kind))
-                    .or_default()
-                    .insert(to_name);
-            }
+        for permission in permissions {
+            self.entries
+                .entry(to_namespace)
+                .or_default()
+                .entry((
+                    permission.from_namespace,
+                    permission.from_group,
+                    permission.from_kind,
+                ))
+                .or_default()
+                .entry((permission.to_group, permission.to_kind))
+                .or_default()
+                .insert(permission.to_name);
         }
     }
 

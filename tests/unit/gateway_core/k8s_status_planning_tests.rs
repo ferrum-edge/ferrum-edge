@@ -20,6 +20,7 @@ use std::sync::Arc;
 const STATUS_SRC: &str = include_str!("../../../src/k8s_controller/status.rs");
 const RECONCILER_SRC: &str = include_str!("../../../src/k8s_controller/reconciler.rs");
 const TRANSLATE_SRC: &str = include_str!("../../../src/config_sources/k8s/mod.rs");
+const GATEWAY_API_SRC: &str = include_str!("../../../src/config_sources/k8s/gateway_api.rs");
 
 fn options() -> K8sTranslationOptions {
     K8sTranslationOptions::new(
@@ -1853,24 +1854,42 @@ fn reference_grant_permission_index_avoids_raw_grant_scans() {
         .and_then(|rest| rest.split("fn allows(").next())
         .expect("permission index ingest");
     assert!(
-        ingest.contains("from_entries") && ingest.contains("to_entries"),
-        "index must expand from×to once at build time"
+        ingest.contains("parse_reference_grant_permissions(grant)"),
+        "status index must consume the shared ReferenceGrant parser"
     );
     assert!(
-        STATUS_SRC.contains("fn reference_grant_optional_to_name"),
-        "optional to.name tri-state helper must exist"
+        GATEWAY_API_SRC.contains("fn parse_reference_grant_permissions"),
+        "canonical translation and status must share one ReferenceGrant parser"
+    );
+    assert!(
+        GATEWAY_API_SRC.contains("fn collect_reference_grant")
+            && GATEWAY_API_SRC
+                .split("fn collect_reference_grant")
+                .nth(1)
+                .and_then(|rest| rest.split("\npub(super) fn ").next())
+                .is_some_and(|body| body.contains("parse_reference_grant_permissions(object)")),
+        "collect_reference_grant must use the shared parser"
     );
     assert!(
         !ingest.contains("unwrap_or_default()"),
         "required group fields must not fail-open to empty core group"
     );
     assert!(
-        !ingest.contains("Missing / non-string"),
-        "ingest must not document non-string name as wildcard"
+        !GATEWAY_API_SRC
+            .split("fn collect_reference_grant")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub(super) fn ").next())
+            .expect("collect_reference_grant body")
+            .contains("unwrap_or_default()"),
+        "translator must not default missing ReferenceGrant groups to core"
     );
     assert!(
-        ingest.contains("reference_grant_optional_to_name(to)"),
-        "ingest must use the unambiguous optional-name helper"
+        GATEWAY_API_SRC.contains("fn reference_grant_optional_to_name"),
+        "optional to.name tri-state helper must live with the shared parser"
+    );
+    assert!(
+        !STATUS_SRC.contains("fn reference_grant_optional_to_name"),
+        "status must not keep a forked optional-name helper"
     );
 
     // Invalid-heavy / many-grants: planning must still succeed with the index.
@@ -1948,5 +1967,278 @@ fn reference_grant_permission_index_avoids_raw_grant_scans() {
         condition_status(&route.status, "ResolvedRefs"),
         Some("True"),
         "precomputed index must find the matching grant among many without raw vector scans"
+    );
+}
+
+fn unfiltered_options() -> K8sTranslationOptions {
+    options().with_source_namespaces(Vec::new())
+}
+
+fn cross_namespace_http_route(name: &str, backend: &str) -> K8sObject {
+    place_in_namespace(
+        object(
+            "HTTPRoute",
+            name,
+            json!({
+                "parentRefs": [{"name": "edge", "namespace": "default"}],
+                "rules": [{
+                    "backendRefs": [{"name": backend, "namespace": "backend", "port": 8080}]
+                }]
+            }),
+        ),
+        "apps",
+    )
+}
+
+fn backend_service_grant(name: &str, to: Value) -> K8sObject {
+    place_in_namespace(
+        object(
+            "ReferenceGrant",
+            name,
+            json!({
+                "from": [{
+                    "group": "gateway.networking.k8s.io",
+                    "kind": "HTTPRoute",
+                    "namespace": "apps"
+                }],
+                "to": [to]
+            }),
+        ),
+        "backend",
+    )
+}
+
+fn translation_permits_backend(objects: &[K8sObject], backend_host: &str) -> bool {
+    let opts = unfiltered_options();
+    let (translation, _) =
+        ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips(objects, opts)
+            .expect("translation");
+    translation
+        .config
+        .proxies
+        .iter()
+        .any(|proxy| proxy.backend_host == backend_host)
+}
+
+fn status_resolved_refs_reason(objects: &[K8sObject], route_name: &str) -> Option<String> {
+    let opts = unfiltered_options();
+    let conflicts = gateway_api_route_conflicts(objects, &opts);
+    let outcome = plan_gateway_api_status_updates(objects, opts, &conflicts);
+    outcome
+        .iter()
+        .find(|update| update.name == route_name)
+        .and_then(|update| condition_reason(&update.status, "ResolvedRefs").map(str::to_owned))
+}
+
+fn status_resolved_refs_is_true(objects: &[K8sObject], route_name: &str) -> bool {
+    let opts = unfiltered_options();
+    let conflicts = gateway_api_route_conflicts(objects, &opts);
+    let outcome = plan_gateway_api_status_updates(objects, opts, &conflicts);
+    outcome
+        .iter()
+        .find(|update| update.name == route_name)
+        .is_some_and(|update| condition_status(&update.status, "ResolvedRefs") == Some("True"))
+}
+
+/// Runtime config and status planning must share one fail-closed ReferenceGrant
+/// interpretation: malformed grants never authorize backends that status marks
+/// RefNotPermitted, and valid named/wildcard grants authorize both sides.
+#[test]
+fn reference_grant_translation_and_status_share_fail_closed_semantics() {
+    let api_host = "api.backend.svc.cluster.local";
+    let other_host = "other.backend.svc.cluster.local";
+
+    // Valid named + valid absent-name wildcard remain accepted on both paths.
+    let named_objects = vec![
+        ferrum_gateway_class(),
+        ferrum_gateway(),
+        cross_namespace_http_route("named-ok", "api"),
+        backend_service_grant("named", json!({ "group": "", "kind": "Service", "name": "api" })),
+        backend_service("backend", "api"),
+    ];
+    assert!(
+        translation_permits_backend(&named_objects, api_host),
+        "valid named grant must materialize the backend"
+    );
+    assert!(
+        status_resolved_refs_is_true(&named_objects, "named-ok"),
+        "valid named grant must resolve refs in status"
+    );
+
+    let wild_objects = vec![
+        ferrum_gateway_class(),
+        ferrum_gateway(),
+        cross_namespace_http_route("wild-ok", "other"),
+        backend_service_grant("wild", json!({ "group": "", "kind": "Service" })),
+        backend_service("backend", "other"),
+    ];
+    assert!(
+        translation_permits_backend(&wild_objects, other_host),
+        "valid absent-name wildcard must materialize the backend"
+    );
+    assert!(
+        status_resolved_refs_is_true(&wild_objects, "wild-ok"),
+        "valid absent-name wildcard must resolve refs in status"
+    );
+
+    // Present non-string to.name must never become wildcard on either path.
+    for (label, bad_name) in [
+        ("null", Value::Null),
+        ("bool", json!(true)),
+        ("number", json!(1)),
+        ("array", json!(["api"])),
+        ("object", json!({ "n": "api" })),
+    ] {
+        let mut to = json!({ "group": "", "kind": "Service" });
+        to.as_object_mut()
+            .expect("object")
+            .insert("name".to_string(), bad_name);
+        let objects = vec![
+            ferrum_gateway_class(),
+            ferrum_gateway(),
+            cross_namespace_http_route("bad-name", "api"),
+            backend_service_grant("bad-name", to),
+            backend_service("backend", "api"),
+        ];
+        assert!(
+            !translation_permits_backend(&objects, api_host),
+            "present non-string to.name ({label}) must not materialize backend"
+        );
+        assert_eq!(
+            status_resolved_refs_reason(&objects, "bad-name").as_deref(),
+            Some("RefNotPermitted"),
+            "present non-string to.name ({label}) must be RefNotPermitted in status"
+        );
+    }
+
+    // Missing / non-string required groups must not collapse to core "" on either path.
+    let group_cases: &[(&str, Value)] = &[
+        ("missing", json!({})),
+        ("null", Value::Null),
+        ("bool", json!(false)),
+        ("number", json!(0)),
+        ("array", json!([])),
+        ("object", json!({ "g": "" })),
+    ];
+    for (label, bad_group) in group_cases {
+        for which in ["from", "to"] {
+            let mut from = json!({
+                "group": "gateway.networking.k8s.io",
+                "kind": "HTTPRoute",
+                "namespace": "apps"
+            });
+            let mut to = json!({ "group": "", "kind": "Service", "name": "api" });
+            if *label == "missing" {
+                if which == "from" {
+                    from.as_object_mut().unwrap().remove("group");
+                } else {
+                    to.as_object_mut().unwrap().remove("group");
+                }
+            } else if which == "from" {
+                from.as_object_mut()
+                    .unwrap()
+                    .insert("group".to_string(), bad_group.clone());
+            } else {
+                to.as_object_mut()
+                    .unwrap()
+                    .insert("group".to_string(), bad_group.clone());
+            }
+            let objects = vec![
+                ferrum_gateway_class(),
+                ferrum_gateway(),
+                cross_namespace_http_route("bad-group", "api"),
+                place_in_namespace(
+                    object(
+                        "ReferenceGrant",
+                        "bad-group",
+                        json!({ "from": [from], "to": [to] }),
+                    ),
+                    "backend",
+                ),
+                backend_service("backend", "api"),
+            ];
+            assert!(
+                !translation_permits_backend(&objects, api_host),
+                "malformed {which}.group ({label}) must not materialize backend"
+            );
+            assert_eq!(
+                status_resolved_refs_reason(&objects, "bad-group").as_deref(),
+                Some("RefNotPermitted"),
+                "malformed {which}.group ({label}) must be RefNotPermitted in status"
+            );
+        }
+    }
+
+    // Mixed valid + malformed entries: canonical translation discards the whole
+    // object, so status must not retain any valid-looking partial cell either.
+    let mixed_to = vec![
+        ferrum_gateway_class(),
+        ferrum_gateway(),
+        cross_namespace_http_route("mixed-to", "api"),
+        place_in_namespace(
+            object(
+                "ReferenceGrant",
+                "mixed-to",
+                json!({
+                    "from": [{
+                        "group": "gateway.networking.k8s.io",
+                        "kind": "HTTPRoute",
+                        "namespace": "apps"
+                    }],
+                    "to": [
+                        { "group": "", "kind": "Service", "name": "api" },
+                        { "group": "", "kind": "Service", "name": 1 }
+                    ]
+                }),
+            ),
+            "backend",
+        ),
+        backend_service("backend", "api"),
+    ];
+    assert!(
+        !translation_permits_backend(&mixed_to, api_host),
+        "mixed valid+malformed to[] must discard the whole grant at translation"
+    );
+    assert_eq!(
+        status_resolved_refs_reason(&mixed_to, "mixed-to").as_deref(),
+        Some("RefNotPermitted"),
+        "mixed valid+malformed to[] must grant nothing in status either"
+    );
+
+    let mixed_from = vec![
+        ferrum_gateway_class(),
+        ferrum_gateway(),
+        cross_namespace_http_route("mixed-from", "api"),
+        place_in_namespace(
+            object(
+                "ReferenceGrant",
+                "mixed-from",
+                json!({
+                    "from": [
+                        {
+                            "group": "gateway.networking.k8s.io",
+                            "kind": "HTTPRoute",
+                            "namespace": "apps"
+                        },
+                        {
+                            "kind": "HTTPRoute",
+                            "namespace": "apps"
+                        }
+                    ],
+                    "to": [{ "group": "", "kind": "Service", "name": "api" }]
+                }),
+            ),
+            "backend",
+        ),
+        backend_service("backend", "api"),
+    ];
+    assert!(
+        !translation_permits_backend(&mixed_from, api_host),
+        "mixed valid+malformed from[] must discard the whole grant at translation"
+    );
+    assert_eq!(
+        status_resolved_refs_reason(&mixed_from, "mixed-from").as_deref(),
+        Some("RefNotPermitted"),
+        "mixed valid+malformed from[] must grant nothing in status either"
     );
 }
