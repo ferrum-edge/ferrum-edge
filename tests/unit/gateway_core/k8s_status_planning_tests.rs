@@ -1818,10 +1818,7 @@ fn reference_grant_permission_index_avoids_raw_grant_scans() {
         .and_then(|rest| rest.split("\nfn api_group(").next())
         .expect("reference_grant_allows_backend_ref body");
     for (name, body) in [
-        (
-            "reference_grant_allows_secret_indexed",
-            secret_indexed,
-        ),
+        ("reference_grant_allows_secret_indexed", secret_indexed),
         ("reference_grant_allows_backend_ref", backend_ref),
     ] {
         assert!(
