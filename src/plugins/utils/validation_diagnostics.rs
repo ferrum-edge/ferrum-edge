@@ -355,7 +355,7 @@ fn render_pointer_segment(raw: &str, names: &SafeFieldNames) -> String {
 }
 
 fn is_numeric_segment(segment: &str) -> bool {
-    !segment.is_empty() && segment.len() <= 10 && segment.bytes().all(|byte| byte.is_ascii_digit())
+    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn unescape_pointer_segment(segment: &str) -> String {

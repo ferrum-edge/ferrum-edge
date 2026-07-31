@@ -1356,11 +1356,10 @@ fn schema_violation_message(
     direction: Direction,
     safe_names: &SafeFieldNames,
 ) -> String {
-    let schema_path = error.schema_path().to_string();
-    let keyword = safe_keyword(&schema_path);
+    let keyword = safe_keyword(error.schema_path().as_str());
     match direction {
         Direction::Request => {
-            let location = safe_location(&error.instance_path().to_string(), safe_names);
+            let location = safe_location(error.instance_path().as_str(), safe_names);
             schema_violation_detail("JSON Schema validation failed", &location, keyword)
         }
         Direction::Response => bound_detail(&format!(

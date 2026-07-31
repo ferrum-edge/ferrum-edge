@@ -609,7 +609,8 @@ fn safe_location_keeps_declared_names_and_numeric_markers_only() {
                     "type": "object",
                     "properties": {"count": {"type": "integer"}}
                 }
-            }
+            },
+            "123456789012": {"type": "string"}
         }
     }));
     let redacted = format!("/{REDACTED_SEGMENT}");
@@ -633,6 +634,11 @@ fn safe_location_keeps_declared_names_and_numeric_markers_only() {
     assert!(
         !safe_location("/rows/2/count", &names).contains('2'),
         "raw digits must never be emitted"
+    );
+    assert_eq!(
+        safe_location("/123456789012", &names),
+        format!("/{NUMERIC_SEGMENT}"),
+        "even a declared numeric-looking member must not emit raw digits"
     );
 }
 

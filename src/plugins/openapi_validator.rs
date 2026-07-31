@@ -4036,12 +4036,9 @@ fn multipart_part_to_schema_value(
                 .validator
                 .validate(&converted)
                 .map_err(|error| {
-                    let schema_path = error.schema_path().to_string();
-                    let keyword = safe_keyword(&schema_path);
-                    let location = safe_location(
-                        &error.instance_path().to_string(),
-                        &header_validator.safe_names,
-                    );
+                    let keyword = safe_keyword(error.schema_path().as_str());
+                    let location =
+                        safe_location(error.instance_path().as_str(), &header_validator.safe_names);
                     format!(
                         "Multipart field header '{header_name}' failed validation at {location} (keyword '{keyword}')"
                     )
@@ -5585,10 +5582,10 @@ fn format_schema_error(
     side: ValidationSide,
     safe_names: &SafeFieldNames,
 ) -> String {
-    let keyword = safe_keyword(&error.schema_path().to_string());
+    let keyword = safe_keyword(error.schema_path().as_str());
     match side {
         ValidationSide::Request => {
-            let location = safe_location(&error.instance_path().to_string(), safe_names);
+            let location = safe_location(error.instance_path().as_str(), safe_names);
             schema_violation_detail(
                 "request body does not satisfy the request schema",
                 &location,
