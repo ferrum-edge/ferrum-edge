@@ -217,7 +217,9 @@ fn gateway_api_status_plan_cursor_retries_same_window_after_patch_failure() {
         .split("await_status_patch_batch")
         .next()
         .expect("pre-patch region");
-    let stores_before_patch = before_patch.matches("gateway_api_status_plan_cursor.store").count();
+    let stores_before_patch = before_patch
+        .matches("gateway_api_status_plan_cursor.store")
+        .count();
     assert_eq!(
         stores_before_patch, 1,
         "only the empty-plan branch may store the cursor before patch_updates"

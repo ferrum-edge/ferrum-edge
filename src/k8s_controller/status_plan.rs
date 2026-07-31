@@ -193,9 +193,11 @@ mod tests {
             take: 5,
             next_cursor: 8,
         };
-        assert!(fair_work_window_iter(&empty, inconsistent_empty)
-            .collect::<Vec<_>>()
-            .is_empty());
+        assert!(
+            fair_work_window_iter(&empty, inconsistent_empty)
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
 
         let items = ["a", "b", "c"];
         let oversized = FairWorkWindow {

@@ -873,9 +873,7 @@ fn gateway_has_multiple_distinct_tls_certificate_refs(
     for identity in listeners
         .iter()
         .filter(|listener| listener_is_terminating_tls(listener))
-        .flat_map(|listener| {
-            listener_tls_certificate_ref_identities(gateway, listener, indexes)
-        })
+        .flat_map(|listener| listener_tls_certificate_ref_identities(gateway, listener, indexes))
     {
         if selected
             .as_ref()
@@ -1546,8 +1544,7 @@ fn route_status(
         match result {
             Ok(_) => {
                 let programmed = !materialized_parent_refs.is_empty();
-                let unresolved_refs_reason =
-                    route_unresolved_backend_ref_reason(object, indexes);
+                let unresolved_refs_reason = route_unresolved_backend_ref_reason(object, indexes);
                 let resolved_refs = unresolved_refs_reason.is_none();
                 let resolved_refs_reason = unresolved_refs_reason.unwrap_or("ResolvedRefs");
                 (
