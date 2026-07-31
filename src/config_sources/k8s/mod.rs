@@ -892,7 +892,8 @@ where
     // `spec`/`status` JSON; deep-cloning the filtered set once per translate
     // (and historically once per status object) dominated large-cluster
     // reconciles. Downstream collectors only need `&K8sObject`.
-    let included_objects: Vec<&K8sObject> = objects.iter().filter(|object| include(object)).collect();
+    let included_objects: Vec<&K8sObject> =
+        objects.iter().filter(|object| include(object)).collect();
     let mut acc = K8sAccumulator::new(options);
 
     for object in &included_objects {
@@ -1106,7 +1107,10 @@ impl SkippedObjectIdentities {
 pub fn translate_k8s_objects_collecting_skips(
     objects: &[K8sObject],
     options: K8sTranslationOptions,
-) -> Option<(K8sTranslation, std::collections::HashMap<K8sResourceKey, K8sTranslateError>)> {
+) -> Option<(
+    K8sTranslation,
+    std::collections::HashMap<K8sResourceKey, K8sTranslateError>,
+)> {
     let mut skipped = std::collections::HashMap::new();
     // Identity membership for the include filter — O(1) average, never
     // `skipped.keys().any(matches_object)` which is O(objects × errors) (#2397).

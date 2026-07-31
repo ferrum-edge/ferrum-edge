@@ -293,19 +293,15 @@ pub fn plan_istio_status_updates_budgeted(
         let result = reuse.result_for(object);
         let (status, ferrum_detail) = match object.kind.as_str() {
             "AuthorizationPolicy" => authorization_policy_status(object, result),
-            "PeerAuthentication" => peer_authentication_status(
-                object,
-                result,
-                &options.istio_root_namespace,
-            ),
+            "PeerAuthentication" => {
+                peer_authentication_status(object, result, &options.istio_root_namespace)
+            }
             "DestinationRule" => destination_rule_status(object, result),
             "VirtualService" => virtual_service_status(object, result),
             "ServiceEntry" => service_entry_status(object, result),
-            "RequestAuthentication" => request_authentication_status(
-                object,
-                result,
-                &options.istio_root_namespace,
-            ),
+            "RequestAuthentication" => {
+                request_authentication_status(object, result, &options.istio_root_namespace)
+            }
             "WorkloadEntry" => workload_entry_status(object, result),
             "Sidecar" => sidecar_status(
                 object,
@@ -314,9 +310,7 @@ pub fn plan_istio_status_updates_budgeted(
                 options.mesh_sidecar_ingress_enforced,
             ),
             "Telemetry" => telemetry_status(object, result),
-            "ProxyConfig" => {
-                proxy_config_status(object, result, &options.istio_root_namespace)
-            }
+            "ProxyConfig" => proxy_config_status(object, result, &options.istio_root_namespace),
             _ => continue,
         };
         if status == object.status && ferrum_detail_matches(&object.status, &ferrum_detail) {

@@ -498,8 +498,7 @@ impl<'a> GatewayApiStatusIndexes<'a> {
                 "HTTPRoute" | "GRPCRoute" | "TCPRoute" | "TLSRoute" => {
                     let mut seen_parents = HashSet::new();
                     for parent_ref in route_parent_refs_borrowed(object) {
-                        let Some((namespace, name)) =
-                            parent_ref_gateway_target(object, parent_ref)
+                        let Some((namespace, name)) = parent_ref_gateway_target(object, parent_ref)
                         else {
                             continue;
                         };
@@ -962,7 +961,10 @@ fn listener_tls_certificate_ref_identities(
             {
                 return None;
             }
-            let secret = indexes.secrets_by_ns_name.get(&(namespace, name)).copied()?;
+            let secret = indexes
+                .secrets_by_ns_name
+                .get(&(namespace, name))
+                .copied()?;
             secret_object_is_valid_tls_certificate(secret)
                 .then(|| (namespace.to_string(), name.to_string()))
         })
@@ -2226,10 +2228,7 @@ fn route_parent_refs_borrowed(object: &K8sObject) -> &[Value] {
         .unwrap_or(&[])
 }
 
-fn status_candidate_is_eligible(
-    object: &K8sObject,
-    indexes: &GatewayApiStatusIndexes<'_>,
-) -> bool {
+fn status_candidate_is_eligible(object: &K8sObject, indexes: &GatewayApiStatusIndexes<'_>) -> bool {
     match object.kind.as_str() {
         "GatewayClass" => gateway_class_is_managed_by_ferrum(object),
         "Gateway" => indexes.managed_gateways.contains(&(

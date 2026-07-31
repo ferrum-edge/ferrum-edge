@@ -5,14 +5,14 @@ use ferrum_edge::config_sources::k8s::{
     K8sMetadata, K8sObject, K8sTranslationOptions, gateway_api_route_conflicts,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
+use ferrum_edge::k8s_controller::istio_status::plan_istio_status_updates_budgeted;
 use ferrum_edge::k8s_controller::status::{
-    FERRUM_GATEWAY_CONTROLLER_NAME, StatusTranslationReuse,
-    plan_gateway_api_status_updates, plan_gateway_api_status_updates_budgeted,
+    FERRUM_GATEWAY_CONTROLLER_NAME, StatusTranslationReuse, plan_gateway_api_status_updates,
+    plan_gateway_api_status_updates_budgeted,
 };
 use ferrum_edge::k8s_controller::status_plan::{
     DEFAULT_STATUS_PLAN_WORK_BUDGET, StatusPlanBudget, select_fair_work_window,
 };
-use ferrum_edge::k8s_controller::istio_status::plan_istio_status_updates_budgeted;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -174,14 +174,15 @@ fn fair_budget_bounds_expensive_planning_before_writes() {
 
 #[test]
 fn fair_budget_boundary_matches_default_cap() {
-    let window = select_fair_work_window(400, StatusPlanBudget::new(DEFAULT_STATUS_PLAN_WORK_BUDGET, 0));
+    let window = select_fair_work_window(
+        400,
+        StatusPlanBudget::new(DEFAULT_STATUS_PLAN_WORK_BUDGET, 0),
+    );
     assert_eq!(window.take, DEFAULT_STATUS_PLAN_WORK_BUDGET);
     assert_eq!(window.next_cursor, DEFAULT_STATUS_PLAN_WORK_BUDGET);
 
-    let wrap = select_fair_work_window(
-        5,
-        StatusPlanBudget::new(DEFAULT_STATUS_PLAN_WORK_BUDGET, 3),
-    );
+    let wrap =
+        select_fair_work_window(5, StatusPlanBudget::new(DEFAULT_STATUS_PLAN_WORK_BUDGET, 3));
     assert_eq!(wrap.take, 5);
     assert_eq!(wrap.start, 3);
 }
@@ -304,12 +305,8 @@ fn istio_budgeted_planning_reuses_shared_translation_path() {
         spec: json!({ "action": "ALLOW" }),
         status: Value::Object(serde_json::Map::new()),
     }];
-    let outcome = plan_istio_status_updates_budgeted(
-        &objects,
-        options(),
-        None,
-        StatusPlanBudget::new(1, 0),
-    );
+    let outcome =
+        plan_istio_status_updates_budgeted(&objects, options(), None, StatusPlanBudget::new(1, 0));
     assert_eq!(outcome.eligible_candidates, 1);
     assert_eq!(outcome.planned_candidates, 1);
     assert_eq!(outcome.updates.len(), 1);
@@ -432,11 +429,12 @@ fn invalid_heavy_error_lookup_stays_keyed_not_linear() {
         },
     );
 
-    let (translation, _) = ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips(
-        &base_objects_with_routes(1),
-        options(),
-    )
-    .expect("baseline translation");
+    let (translation, _) =
+        ferrum_edge::config_sources::k8s::translate_k8s_objects_collecting_skips(
+            &base_objects_with_routes(1),
+            options(),
+        )
+        .expect("baseline translation");
     let reuse = StatusTranslationReuse::from_owned(translation, errors);
 
     let versionless_object = http_route("versionless-hit");
@@ -515,7 +513,9 @@ fn mixed_valid_invalid_and_rotating_windows_preserve_status_parity() {
         );
     }
     assert!(
-        unlimited.iter().any(|update| update.name == "invalid-empty"),
+        unlimited
+            .iter()
+            .any(|update| update.name == "invalid-empty"),
         "invalid empty route must still receive status planning"
     );
 }
@@ -945,7 +945,10 @@ fn collecting_skips_index_is_nested_borrowed_not_linear_or_allocating() {
     let skip_type = TRANSLATE_SRC
         .split("struct SkippedObjectIdentities")
         .nth(1)
-        .and_then(|rest| rest.split("pub fn translate_k8s_objects_collecting_skips").next())
+        .and_then(|rest| {
+            rest.split("pub fn translate_k8s_objects_collecting_skips")
+                .next()
+        })
         .expect("SkippedObjectIdentities body");
     assert!(
         skip_type.contains("versionless"),
@@ -1093,9 +1096,15 @@ fn reference_grant_named_and_wildcard_backend_permissions() {
     ];
     let conflicts = gateway_api_route_conflicts(&objects, &options());
     let outcome = plan_gateway_api_status_updates(&objects, options(), &conflicts);
-    let named = outcome.iter().find(|u| u.name == "named-ok").expect("named");
+    let named = outcome
+        .iter()
+        .find(|u| u.name == "named-ok")
+        .expect("named");
     let wild = outcome.iter().find(|u| u.name == "wild-ok").expect("wild");
-    assert_eq!(condition_status(&named.status, "ResolvedRefs"), Some("True"));
+    assert_eq!(
+        condition_status(&named.status, "ResolvedRefs"),
+        Some("True")
+    );
     assert_eq!(condition_status(&wild.status, "ResolvedRefs"), Some("True"));
 }
 

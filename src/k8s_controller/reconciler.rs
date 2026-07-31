@@ -1479,8 +1479,8 @@ mod tests {
             status_snapshot_object("VirtualService", "vs"),
             status_snapshot_object("ConfigMap", "noise"),
         ];
-        let snapshot =
-            shared_status_objects_snapshot(objects.clone(), true, true).expect("both writers present");
+        let snapshot = shared_status_objects_snapshot(objects.clone(), true, true)
+            .expect("both writers present");
         let options = K8sTranslationOptions::new(
             "default".to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
@@ -2411,10 +2411,7 @@ fn translate_with_skip_retries(
     metrics: &ControllerMetrics,
 ) -> Option<(
     K8sTranslation,
-    std::collections::HashMap<
-        crate::config_sources::k8s::K8sResourceKey,
-        K8sTranslateError,
-    >,
+    std::collections::HashMap<crate::config_sources::k8s::K8sResourceKey, K8sTranslateError>,
 )> {
     let outcome = translate_k8s_objects_collecting_skips(objects, options);
     if let Some((_, ref errors)) = outcome {

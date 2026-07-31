@@ -75,7 +75,8 @@ fn shared_snapshot_none_one_and_both_writer_cases() {
 
     assert!(shared_status_objects_snapshot(objects.clone(), false, false).is_none());
 
-    let gateway_only = shared_status_objects_snapshot(objects.clone(), true, false).expect("gateway");
+    let gateway_only =
+        shared_status_objects_snapshot(objects.clone(), true, false).expect("gateway");
     let istio_only = shared_status_objects_snapshot(objects.clone(), false, true).expect("istio");
     let both = shared_status_objects_snapshot(objects.clone(), true, true).expect("both");
 
