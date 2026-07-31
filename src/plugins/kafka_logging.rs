@@ -2077,10 +2077,13 @@ pub(crate) async fn probe_byte_budget_before_serialize_for_test(
 /// `(instance_used_after_send, ceiling_used_after_send, instance_used_after_destroy,
 /// ceiling_used_after_destroy)`.
 ///
-/// The first two values must stay non-zero — librdkafka still retains its copies,
-/// so the lease must not have been released at handoff. The last two must be
-/// zero: producer destruction purges the queue, fires the delivery callback for
-/// every purged record, and releases each lease exactly once with no underflow.
+/// After `send_batch` returns, drop the probe-local batch before measuring the
+/// post-destroy snapshot so Ferrum's original lease handles are released and only
+/// librdkafka's opaque copies remain charged. The first two values must stay
+/// non-zero — those opaque copies are still retained downstream. The last two
+/// must be zero: producer destruction purges the queue, fires the delivery
+/// callback for every purged record, and releases each lease exactly once with
+/// no underflow.
 ///
 /// Failure is an assertable `Err` with a fixed, secret-free diagnostic, never a
 /// silent "capability unavailable" skip: librdkafka is an unconditional
@@ -2139,6 +2142,12 @@ pub(crate) fn probe_downstream_lease_ownership_for_test(
     let _ = send_batch(&state, "ferrum-edge-downstream-ownership-probe", &batch);
     let instance_after_send = byte_budget.used();
     let ceiling_after_send = ceiling.used();
+
+    // `send_batch` clones each lease Arc into librdkafka's opaque; release the
+    // probe's own `KafkaRecord` handles so post-send/post-destroy snapshots
+    // charge only what librdkafka retains, matching production where the shared
+    // `Arc<Vec<KafkaRecord>>` is dropped after admission.
+    drop(batch);
 
     // `ThreadedProducer::drop` joins the poll thread and the inner
     // `BaseProducer::drop` purges queue + in-flight, then flushes; the flush
