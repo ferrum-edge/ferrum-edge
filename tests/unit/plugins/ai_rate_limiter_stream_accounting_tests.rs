@@ -1057,7 +1057,9 @@ fn wrong_typed_reserved_event_stream_headers_fail_closed() {
     }
 }
 
-/// All nine documented AWS header value types are still walked in full for
+/// All ten documented AWS header value encodings (type codes 0 through 9:
+/// `BOOL_TRUE`, `BOOL_FALSE`, `BYTE`, `SHORT`, `INTEGER`, `LONG`, `BYTE_ARRAY`,
+/// `STRING`, `TIMESTAMP`, `UUID`) are still walked in full for
 /// NON-reserved headers, so a frame carrying operator/service metadata beside
 /// its reserved headers is metered normally — and an undefined value type on a
 /// non-reserved header still fails closed, because its width is unknown.
@@ -1197,10 +1199,14 @@ fn event_stream_damage_before_usage_recovers() {
     let chunk_headers = bedrock_event_headers("chunk");
     let non_json = event_stream_frame(&chunk_headers, b"not json at all");
     let truncated_inner = bedrock_chunk_frame(r#"{"type":"content_block_"#);
+    let empty_inner = bedrock_chunk_frame("");
+    let scalar_inner = bedrock_chunk_frame("42");
 
     for (label, damaging) in [
         ("non-JSON chunk payload", non_json),
         ("truncated inner document", truncated_inner),
+        ("empty inner document", empty_inner),
+        ("non-object inner document", scalar_inner),
     ] {
         let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
         scanner.observe(&damaging);
@@ -1222,6 +1228,148 @@ fn event_stream_damage_before_usage_recovers() {
             Some(46)
         );
     }
+}
+
+/// A payload that simply does not declare the base64 `bytes` envelope is the
+/// ordinary shape of a `ConverseStream` event and of any provider variant that
+/// frames its model document directly. Absence must therefore stay clean
+/// content — and a metrics container carried inline is still metered.
+#[test]
+fn a_chunk_without_a_bytes_field_stays_ordinary_content() {
+    let chunk_headers = bedrock_event_headers("chunk");
+    let content = event_stream_frame(
+        &chunk_headers,
+        br#"{"type":"content_block_delta","delta":{"text":"Hi"}}"#,
+    );
+    let inline_metrics = event_stream_frame(
+        &chunk_headers,
+        br#"{"amazon-bedrock-invocationMetrics":{"inputTokenCount":17,"outputTokenCount":83}}"#,
+    );
+
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&content);
+    scanner.finish();
+    assert!(
+        !scanner.malformed(),
+        "a missing `bytes` field is ordinary content, not an invalid envelope"
+    );
+    assert!(scanner.authoritative_usage().is_none());
+
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&content);
+    scanner.observe(&inline_metrics);
+    scanner.finish();
+    assert!(!scanner.malformed());
+    assert_eq!(
+        scanner
+            .authoritative_usage()
+            .and_then(|usage| usage.total_for_mode("total_tokens")),
+        Some(100),
+        "a frame with no `bytes` envelope is still metered normally"
+    );
+}
+
+/// An *explicitly declared* `bytes` field that is not a string is an invalid
+/// base64-envelope declaration, never ordinary content: the real payload cannot
+/// be reconstructed, so the scan halts as hard malformed and no later frame —
+/// including a valid authoritative cumulative record — may recover it.
+#[test]
+fn an_explicitly_wrong_typed_bytes_envelope_fails_hard() {
+    let chunk_headers = bedrock_event_headers("chunk");
+
+    let variants: [(&str, &[u8]); 5] = [
+        ("null", br#"{"bytes":null}"#),
+        ("number", br#"{"bytes":12345}"#),
+        ("boolean", br#"{"bytes":true}"#),
+        ("object", br#"{"bytes":{"inner":"eyJhIjoxfQ=="}}"#),
+        ("array", br#"{"bytes":["eyJhIjoxfQ=="]}"#),
+    ];
+
+    for (label, payload) in variants {
+        let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+        scanner.observe(&event_stream_frame(&chunk_headers, payload));
+        assert!(
+            scanner.malformed(),
+            "{label}: an explicit non-string `bytes` is an invalid envelope declaration"
+        );
+
+        // The failure is hard, not ordering-sensitive: parsing has stopped.
+        scanner.observe(&bedrock_metadata_usage_frame(12, 34));
+        scanner.finish();
+        assert!(
+            scanner.malformed(),
+            "{label}: a hard envelope failure is never cleared by a later record"
+        );
+        assert!(
+            scanner.authoritative_usage().is_none(),
+            "{label}: no frame after a hard envelope failure may be parsed"
+        );
+    }
+}
+
+/// A `bytes` value that is a string but not decodable base64 could have carried
+/// the terminal `amazon-bedrock-invocationMetrics`, and nothing about it can be
+/// reconstructed. It halts the scan for the same reason, so a later valid
+/// authoritative record behind it can neither be read nor recover the stream.
+#[test]
+fn an_undecodable_bytes_envelope_halts_and_cannot_be_recovered() {
+    let chunk_headers = bedrock_event_headers("chunk");
+    let undecodable = event_stream_frame(&chunk_headers, br#"{"bytes":"!!! not base64 !!!"}"#);
+
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&undecodable);
+    assert!(
+        scanner.malformed(),
+        "an undecodable envelope damages the scan immediately"
+    );
+
+    scanner.observe(&bedrock_metadata_usage_frame(12, 34));
+    scanner.finish();
+    assert!(
+        scanner.malformed(),
+        "invalid base64 is a hard failure, not ordering-sensitive damage"
+    );
+    assert!(
+        scanner.authoritative_usage().is_none(),
+        "a halted scan parses no further frames, so the later record is never read"
+    );
+}
+
+/// The contrast that pins the boundary: an envelope that DECODED but whose inner
+/// document was unreadable stays ordering-sensitive, while an envelope that never
+/// decoded at all does not. Same frame headers, same position in the stream, same
+/// following authoritative record — only the recoverability differs.
+#[test]
+fn only_a_decoded_envelope_stays_recoverable() {
+    let chunk_headers = bedrock_event_headers("chunk");
+    let decoded_but_unreadable = bedrock_chunk_frame("not a json document");
+    let never_decoded = event_stream_frame(&chunk_headers, br#"{"bytes":"%%%%"}"#);
+
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&decoded_but_unreadable);
+    assert!(scanner.malformed());
+    scanner.observe(&bedrock_metadata_usage_frame(12, 34));
+    scanner.finish();
+    assert!(
+        !scanner.malformed(),
+        "a decoded envelope's unreadable inner document is recoverable damage"
+    );
+    assert_eq!(
+        scanner
+            .authoritative_usage()
+            .and_then(|usage| usage.total_for_mode("total_tokens")),
+        Some(46)
+    );
+
+    let mut scanner = StreamUsageScanner::new(StreamUsageFormat::AwsEventStream, None);
+    scanner.observe(&never_decoded);
+    scanner.observe(&bedrock_metadata_usage_frame(12, 34));
+    scanner.finish();
+    assert!(
+        scanner.malformed(),
+        "an envelope that never decoded is irrecoverable"
+    );
+    assert!(scanner.authoritative_usage().is_none());
 }
 
 /// Ordinary provider content must be told apart from a malformed candidate. A
@@ -1508,6 +1656,63 @@ async fn bedrock_stream_damaged_after_usage_takes_the_unmetered_posture() {
         reserved,
         "the earlier Bedrock snapshot must not be charged for a stream damaged after it"
     );
+}
+
+/// Settlement implication of the hard envelope failures: a Bedrock stream whose
+/// tail declares an invalid `bytes` envelope — explicitly wrong-typed, or a
+/// string that is not decodable base64 — must take the unmetered posture instead
+/// of settling the snapshot the earlier frame reported, and the bytes must still
+/// reach the client untouched.
+#[tokio::test]
+async fn bedrock_stream_with_an_invalid_bytes_envelope_takes_the_unmetered_posture() {
+    let chunk_headers = bedrock_event_headers("chunk");
+
+    let variants: [(&str, &[u8]); 2] = [
+        ("wrong-typed `bytes`", br#"{"bytes":null}"#),
+        ("undecodable `bytes`", br#"{"bytes":"!!!!"}"#),
+    ];
+
+    for (label, payload) in variants {
+        let plugin: Arc<dyn Plugin> = Arc::new(limiter(json!({
+            "token_limit": 10_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true,
+            "on_unmetered_response": "charge_estimate"
+        })));
+        let mut ctx = ai_request_ctx(200, "damage my bedrock envelope");
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        let reserved = observed_usage_of(&plugin).await;
+        assert!(reserved > 0, "{label}");
+        assert_ne!(
+            reserved, 46,
+            "{label}: the estimate must differ from the snapshot the stream carries"
+        );
+
+        let usage_frame = bedrock_metadata_usage_frame(12, 34);
+        let damaged_frame = event_stream_frame(&chunk_headers, payload);
+        let chunks: [&[u8]; 2] = [&usage_frame, &damaged_frame];
+        let expected: Vec<u8> = chunks.concat();
+        let forwarded = stream_response(
+            &plugin,
+            &mut ctx,
+            "application/vnd.amazon.eventstream",
+            &chunks,
+            BodyOutcome::success(expected.len() as u64),
+        )
+        .await;
+
+        assert_eq!(
+            forwarded, expected,
+            "{label}: a fail-closed envelope changes accounting, never the client's bytes"
+        );
+        assert_eq!(
+            observed_usage_of(&plugin).await,
+            reserved,
+            "{label}: the earlier snapshot must not be settled after an invalid envelope"
+        );
+    }
 }
 
 /// A streamed Gemini response is charged against the window through the full

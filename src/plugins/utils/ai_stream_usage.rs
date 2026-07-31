@@ -65,14 +65,18 @@
 //! being ignored as absent.
 //!
 //! Within a frame that *is* allowed to carry usage, the payload is a usage
-//! candidate, so the same ordering-safe invariant applies: a payload (or an
-//! explicit base64 `bytes` envelope's inner document) that is not a decodable
-//! JSON object, and a usage container whose fields cannot be read as counts,
-//! invalidate any older snapshot for settlement until a later valid
+//! candidate, so the same ordering-safe invariant applies: a payload (or a
+//! successfully decoded base64 `bytes` envelope's inner document) that is not a
+//! decodable JSON object, and a usage container whose fields cannot be read as
+//! counts, invalidate any older snapshot for settlement until a later valid
 //! authoritative record recovers it. An ordinary `chunk` carrying model content
 //! and no usage container is *not* damage; a `metadata` event that reported no
 //! usage is, because that event kind exists to report it. CRC, prelude, header,
-//! oversize, and base64 framing failures remain hard malformed/halted instead.
+//! and oversize framing failures are hard malformed/halted instead, and so is
+//! every envelope failure that leaves nothing to decode: a `bytes` field that is
+//! explicitly present but not a string, an oversize encoded value, or a value
+//! that is not valid base64. Those halt the scan, so no later frame can recover
+//! them.
 
 use serde_json::Value;
 
@@ -268,9 +272,10 @@ fn parse_event_stream_headers(bytes: &[u8]) -> Option<EventStreamHeaders<'_>> {
             return None;
         }
 
-        // Value widths are the documented AWS event-stream header value types:
-        // 0/1 BOOL_TRUE/BOOL_FALSE (no bytes), 2 BYTE, 3 SHORT, 4 INTEGER,
-        // 5 LONG, 6 BYTE_ARRAY, 7 STRING, 8 TIMESTAMP, 9 UUID.
+        // Value widths are the ten documented AWS event-stream header value
+        // encodings, type codes 0 through 9: 0/1 BOOL_TRUE/BOOL_FALSE (no
+        // bytes), 2 BYTE, 3 SHORT, 4 INTEGER, 5 LONG, 6 BYTE_ARRAY, 7 STRING,
+        // 8 TIMESTAMP, 9 UUID.
         let fixed_width = match value_type {
             0 | 1 => 0usize,
             2 => 1,
@@ -762,6 +767,12 @@ impl StreamUsageScanner {
             }
         };
 
+        if self.halted {
+            // A hard envelope failure already made the scan irrecoverable;
+            // ordering-sensitive damage state is moot.
+            return;
+        }
+
         match outcome {
             // `merge` already cleared any outstanding damage.
             EventPayloadOutcome::Usage => {}
@@ -786,6 +797,16 @@ impl StreamUsageScanner {
     /// instead emits a `metadata` event whose payload carries `usage` directly.
     /// `unwrap_envelope` is false on the recursive call so a hostile payload
     /// cannot drive unbounded nesting.
+    ///
+    /// The envelope itself is all-or-nothing. A payload that simply does not
+    /// declare `bytes` is ordinary content; a `bytes` that is explicitly present
+    /// but not a string, one whose encoded value exceeds
+    /// [`MAX_EVENT_STREAM_MESSAGE_BYTES`], and one that is not decodable base64
+    /// are each an envelope declaration this scanner cannot reconstruct, so they
+    /// halt the scan as hard malformed. Only a *successfully decoded* envelope
+    /// whose inner bytes are empty, invalid JSON, or a non-object JSON value
+    /// stays ordering-sensitive damage that a later valid authoritative record
+    /// may recover.
     ///
     /// The returned [`EventPayloadOutcome`] tells the frame layer whether this
     /// payload produced an authoritative record, was ordinary provider content,
@@ -858,20 +879,33 @@ impl StreamUsageScanner {
         if !unwrap_envelope {
             return EventPayloadOutcome::resolve(recorded_usage, damaged);
         }
-        let Some(encoded) = json.get("bytes").and_then(Value::as_str) else {
-            return EventPayloadOutcome::resolve(recorded_usage, damaged);
+        // A *missing* `bytes` field is the ordinary case: `ConverseStream`
+        // events and plain provider content never declare the envelope. An
+        // explicitly declared `bytes` that is not a string (`null`, a number, a
+        // bool, an object, an array) is not content — it is an invalid
+        // base64-envelope declaration whose real payload cannot be
+        // reconstructed, so it must fail closed exactly like the other hard
+        // envelope failures rather than being walked past as ordinary content.
+        let encoded = match json.get("bytes") {
+            None => return EventPayloadOutcome::resolve(recorded_usage, damaged),
+            Some(Value::String(encoded)) => encoded,
+            Some(_) => {
+                self.halt_malformed();
+                return EventPayloadOutcome::Damaged;
+            }
         };
         // An oversized or non-base64 envelope is framing this scanner cannot
-        // reconstruct at all, so it stays a hard malformed scan rather than
-        // ordering-sensitive damage.
+        // reconstruct at all, so it is a hard malformed halt rather than
+        // ordering-sensitive damage: no later frame may recover it, and no
+        // further bytes of this stream are parsed.
         if encoded.len() > MAX_EVENT_STREAM_MESSAGE_BYTES {
-            self.malformed = true;
+            self.halt_malformed();
             return EventPayloadOutcome::Damaged;
         }
         use base64::Engine as _;
         let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
             // An undecodable envelope could have carried the terminal metrics.
-            self.malformed = true;
+            self.halt_malformed();
             return EventPayloadOutcome::Damaged;
         };
         // The envelope decoded, so its contents WERE a usage candidate. Inner
