@@ -23,7 +23,7 @@ use ferrum_edge::plugins::body_validator::BodyValidator;
 use ferrum_edge::plugins::openapi_validator::OpenapiValidator;
 use ferrum_edge::plugins::utils::validation_diagnostics::{
     MAX_DIAGNOSTIC_CHARS, MAX_RAW_SEGMENT_CHARS, MAX_SEGMENT_CHARS, NUMERIC_SEGMENT,
-    REDACTED_SEGMENT, ROOT_LOCATION, TRUNCATED_LOCATION_MARKER, SafeFieldNames, UNKNOWN_KEYWORD,
+    REDACTED_SEGMENT, ROOT_LOCATION, SafeFieldNames, TRUNCATED_LOCATION_MARKER, UNKNOWN_KEYWORD,
     bound_detail, safe_keyword, safe_location, xml_error_category,
 };
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
@@ -985,7 +985,10 @@ fn safe_field_names_skips_oversized_required_names_and_deep_leaves() {
         !deep.allows("deepLeaf"),
         "names beyond the schema walk budget must not be collected"
     );
-    assert!(deep.allows("inner"), "shallow declared names must still survive");
+    assert!(
+        deep.allows("inner"),
+        "shallow declared names must still survive"
+    );
 }
 
 #[test]
@@ -1142,9 +1145,7 @@ async fn openapi_request_xml_dtd_is_a_fixed_category_not_a_declaration() {
         }),
         XML,
     );
-    let body = format!(
-        "<!DOCTYPE {HOSTILE_MEMBER}><root><id>{CANARY}</id></root>"
-    );
+    let body = format!("<!DOCTYPE {HOSTILE_MEMBER}><root><id>{CANARY}</id></root>");
     let (status, detail, metadata) = oa_request_reject(&plugin, XML, body.as_bytes()).await;
 
     assert_eq!(status, 400);
