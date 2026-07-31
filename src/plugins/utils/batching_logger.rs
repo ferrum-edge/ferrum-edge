@@ -181,7 +181,9 @@ impl<T: Send + 'static> Drop for BatchingLoggerPermit<T> {
     }
 }
 
-type FailedBatchHook<T> = Arc<dyn Fn(Vec<T>, String) + Send + Sync>;
+/// Terminal failure handoff. Receives the same immutable shared batch every
+/// flush attempt used — never a deep-cloned `Vec<T>` of owned records.
+type FailedBatchHook<T> = Arc<dyn Fn(Arc<[T]>, String) + Send + Sync>;
 /// Overflow handoff. Returns `true` only when the hook actually accepted
 /// ownership of the item (durable diversion, intentional shed, or equivalent).
 /// Returning `false` means the item was not accepted; callers must not treat
@@ -263,15 +265,19 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// publication). Dropping an uncommitted logger cancels the worker with no
     /// flush side effects.
     ///
-    /// `flush` is called with a non-empty `Vec<T>` whenever the batch is full
-    /// OR the flush interval has elapsed with at least one buffered entry.
+    /// `flush` is called with a non-empty shared `Arc<[T]>` whenever the batch
+    /// is full OR the flush interval has elapsed with at least one buffered
+    /// entry. Every retry attempt and the optional failed-batch hook receive
+    /// another cheap `Arc` clone of that same immutable payload — records are
+    /// never deep-cloned for delivery/retry/fallback.
     ///
     /// If `flush` returns `Err`, the retry policy is applied. After the final
-    /// attempt fails, the batch is dropped and a warning is logged.
+    /// attempt fails, the shared batch is handed to `on_failed_batch` when
+    /// present; otherwise it is dropped and a warning is logged. A successful
+    /// flush drops the shared batch immediately (no post-success retention).
     pub fn spawn<F, Fut>(cfg: BatchConfig, flush: F) -> Self
     where
-        T: Clone,
-        F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         Self::spawn_with_hooks(cfg, LoggerHooks::default(), flush)
@@ -281,8 +287,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// failed batches or overflow entries instead of dropping them.
     pub fn spawn_with_hooks<F, Fut>(cfg: BatchConfig, hooks: LoggerHooks<T>, flush: F) -> Self
     where
-        T: Clone,
-        F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         let (commit_tx, commit_rx) = watch::channel(false);
@@ -300,8 +305,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
         flush: F,
     ) -> Self
     where
-        T: Clone,
-        F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         let batch_size = cfg.batch_size.clamp(1, MAX_BATCH_SIZE);
@@ -648,8 +652,7 @@ impl<T: Send + 'static> DeferredBatchingLogger<T> {
         flush: F,
     ) -> Result<(), String>
     where
-        T: Clone,
-        F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         if self.logger.get().is_some() {
@@ -686,8 +689,7 @@ impl<T: Send + 'static> DeferredBatchingLogger<T> {
         flush: F,
     ) -> Result<(), String>
     where
-        T: Clone,
-        F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         self.start_with_hooks(plugin_name, cfg, LoggerHooks::default(), flush)
@@ -919,8 +921,8 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
     flush: F,
     on_failed_batch: Option<FailedBatchHook<T>>,
 ) where
-    T: Send + Clone + 'static,
-    F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
+    T: Send + 'static,
+    F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), String>> + Send + 'static,
 {
     let mut buffer = Vec::with_capacity(cfg.batch_size);
@@ -997,32 +999,25 @@ async fn flush_with_retry<T, F, Fut>(
     batch: Vec<T>,
     on_failed_batch: Option<&FailedBatchHook<T>>,
 ) where
-    T: Send + Clone + 'static,
-    F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
+    T: Send + 'static,
+    F: Fn(Arc<[T]>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), String>> + Send + 'static,
 {
     let attempts = cfg.retry.max_attempts.max(1);
     let entry_count = batch.len();
-    let mut final_batch = Some(batch);
+    // One immutable shared payload for every attempt and the optional
+    // failed-batch hook. `Arc::clone` only bumps a refcount — no deep copy of
+    // owned records, and no transient byte-lease gap for retry copies.
+    let batch: Arc<[T]> = Arc::from(batch);
 
     for attempt in 1..=attempts {
-        // Reuse the owned batch on the final attempt so single-attempt plugins
-        // avoid the clone entirely and retried batches only clone N-1 times.
-        let keep_original_for_failure = attempt == attempts && on_failed_batch.is_some();
-        let attempt_batch = if attempt < attempts || keep_original_for_failure {
-            match final_batch.as_ref() {
-                Some(batch) => batch.clone(),
-                None => return,
-            }
-        } else {
-            match final_batch.take() {
-                Some(batch) => batch,
-                None => return,
-            }
-        };
-
+        let attempt_batch = Arc::clone(&batch);
         match flush(attempt_batch).await {
-            Ok(()) => return,
+            Ok(()) => {
+                // Success: drop the shared batch with this stack frame. Do not
+                // retain records after a delivered flush.
+                return;
+            }
             Err(error) if attempt < attempts => {
                 warn!(
                     plugin = cfg.plugin_name,
@@ -1047,9 +1042,7 @@ async fn flush_with_retry<T, F, Fut>(
                         entry_count,
                         error,
                     );
-                    if let Some(batch) = final_batch.take() {
-                        on_failed_batch(batch, error);
-                    }
+                    on_failed_batch(batch, error);
                 } else {
                     warn!(
                         plugin = cfg.plugin_name,

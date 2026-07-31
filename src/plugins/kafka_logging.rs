@@ -2550,9 +2550,9 @@ impl Plugin for KafkaLogging {
 fn send_batch(
     state: &Arc<KafkaProducerState>,
     topic: &str,
-    batch: Vec<KafkaRecord>,
+    batch: Arc<[KafkaRecord]>,
 ) -> Result<(), String> {
-    for record in batch {
+    for record in batch.iter() {
         // `ThreadedProducer::send` is the non-blocking local-queue admission
         // API; broker I/O and delivery callbacks run on librdkafka's own
         // thread. Calling it directly avoids queueing one Tokio blocking task
@@ -2566,17 +2566,19 @@ fn send_batch(
         // therefore keeps charging the downstream queue against both the
         // per-instance budget and the process-wide ceiling, and
         // `KafkaDeliveryContext::delivery` performs the single release.
-        let KafkaRecord {
-            payload,
-            key,
-            lease,
-        } = record;
-        let enqueue_error = match key.as_deref() {
+        //
+        // The shared logger passes an `Arc<[KafkaRecord]>` (single attempt for
+        // this sink). Cloning the lease Arc transfers accounting into the
+        // opaque without deep-cloning payload/key strings; dropping `batch`
+        // after admission releases Ferrum's handle while librdkafka retains
+        // its clone through delivery.
+        let lease = Arc::clone(&record.lease);
+        let enqueue_error = match record.key.as_deref() {
             Some(key) => state
                 .producer
                 .send(
                     BaseRecord::<str, str, Arc<KafkaByteLease>>::with_opaque_to(topic, lease)
-                        .payload(payload.as_ref())
+                        .payload(record.payload.as_ref())
                         .key(key),
                 )
                 .err()
@@ -2592,7 +2594,7 @@ fn send_batch(
                 .producer
                 .send(
                     BaseRecord::<(), str, Arc<KafkaByteLease>>::with_opaque_to(topic, lease)
-                        .payload(payload.as_ref()),
+                        .payload(record.payload.as_ref()),
                 )
                 .err()
                 .map(|(error, rejected)| {

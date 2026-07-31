@@ -291,7 +291,7 @@ impl Plugin for TcpLogging {
             .start("tcp_logging", self.batch_config, move |batch| {
                 let flush_config = flush_config.clone();
                 let writer = Arc::clone(&writer);
-                async move { send_batch(&flush_config, &writer, batch).await }
+                async move { send_batch(&flush_config, &writer, &batch).await }
             })
     }
 
@@ -497,9 +497,9 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 async fn send_batch(
     cfg: &TcpFlushConfig,
     writer_state: &Mutex<Option<TcpWriter>>,
-    batch: Vec<QueuedSummaryPayload>,
+    batch: &[QueuedSummaryPayload],
 ) -> Result<(), String> {
-    let payload = assemble_ndjson(&batch);
+    let payload = assemble_ndjson(batch);
 
     let mut connection = writer_state
         .lock()

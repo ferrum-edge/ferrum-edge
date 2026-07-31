@@ -823,7 +823,7 @@ impl Plugin for StatsdLogging {
             .start("statsd_logging", self.batch_config, move |batch| {
                 let flush_config = flush_config.clone();
                 let state = Arc::clone(&state);
-                async move { send_batch(&flush_config, &state, batch).await }
+                async move { send_batch(&flush_config, &state, &batch).await }
             })
     }
 
@@ -1289,7 +1289,7 @@ impl TagBlockBuilder {
 async fn send_batch(
     cfg: &StatsdFlushConfig,
     state: &Mutex<StatsdFlushState>,
-    batch: Vec<QueuedStatsdPayload>,
+    batch: &[QueuedStatsdPayload],
 ) -> Result<(), String> {
     if batch.is_empty() {
         return Ok(());

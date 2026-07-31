@@ -624,7 +624,7 @@ impl Plugin for UdpLogging {
             .start("udp_logging", self.batch_config, move |batch| {
                 let flush_config = flush_config.clone();
                 let state = Arc::clone(&state);
-                async move { send_batch(&flush_config, &state, batch).await }
+                async move { send_batch(&flush_config, &state, &batch).await }
             })
     }
 
@@ -839,7 +839,7 @@ async fn build_sender_for_addr(
 async fn send_batch(
     cfg: &UdpFlushConfig,
     state: &Mutex<UdpFlushState>,
-    batch: Vec<QueuedSummaryPayload>,
+    batch: &[QueuedSummaryPayload],
 ) -> Result<(), String> {
     if batch.is_empty() {
         return Ok(());

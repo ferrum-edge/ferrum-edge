@@ -122,7 +122,7 @@ impl Plugin for HttpLogging {
         self.logger
             .start("http_logging", self.batch_config, move |batch| {
                 let flush_config = flush_config.clone();
-                async move { send_batch(&flush_config, batch).await }
+                async move { send_batch(&flush_config, &batch).await }
             })
     }
 
@@ -155,9 +155,9 @@ impl Plugin for HttpLogging {
     }
 }
 
-async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<QueuedSummaryPayload>) -> Result<(), String> {
+async fn send_batch(cfg: &HttpFlushConfig, batch: &[QueuedSummaryPayload]) -> Result<(), String> {
     let entry_count = batch.len();
-    let body = assemble_json_array(&batch);
+    let body = assemble_json_array(batch);
     let mut req = cfg
         .http_client
         .get()
