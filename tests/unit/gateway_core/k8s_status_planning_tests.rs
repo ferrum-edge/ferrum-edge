@@ -75,6 +75,24 @@ fn ferrum_gateway() -> K8sObject {
     )
 }
 
+fn ferrum_gateway_allow_all_namespaces() -> K8sObject {
+    object(
+        "Gateway",
+        "edge",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "http",
+                "port": 80,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": { "from": "All" }
+                }
+            }]
+        }),
+    )
+}
+
 fn http_route(name: &str) -> K8sObject {
     object(
         "HTTPRoute",
@@ -650,6 +668,7 @@ fn namespace_selector_and_cross_namespace_grant_parity() {
         "HTTPRoute",
         "allowed",
         json!({
+            "hostnames": ["allowed.example.com"],
             "parentRefs": [{"name": "edge", "namespace": "default"}],
             "rules": [{
                 "backendRefs": [{
@@ -665,6 +684,7 @@ fn namespace_selector_and_cross_namespace_grant_parity() {
         "HTTPRoute",
         "denied",
         json!({
+            "hostnames": ["denied.example.com"],
             "parentRefs": [{"name": "edge", "namespace": "default"}],
             "rules": [{"backendRefs": [{"name": "api", "port": 8080}]}]
         }),
@@ -2051,7 +2071,7 @@ fn reference_grant_translation_and_status_share_fail_closed_semantics() {
     // Valid named + valid absent-name wildcard remain accepted on both paths.
     let named_objects = vec![
         ferrum_gateway_class(),
-        ferrum_gateway(),
+        ferrum_gateway_allow_all_namespaces(),
         cross_namespace_http_route("named-ok", "api"),
         backend_service_grant(
             "named",
@@ -2070,7 +2090,7 @@ fn reference_grant_translation_and_status_share_fail_closed_semantics() {
 
     let wild_objects = vec![
         ferrum_gateway_class(),
-        ferrum_gateway(),
+        ferrum_gateway_allow_all_namespaces(),
         cross_namespace_http_route("wild-ok", "other"),
         backend_service_grant("wild", json!({ "group": "", "kind": "Service" })),
         backend_service("backend", "other"),
@@ -2098,7 +2118,7 @@ fn reference_grant_translation_and_status_share_fail_closed_semantics() {
             .insert("name".to_string(), bad_name);
         let objects = vec![
             ferrum_gateway_class(),
-            ferrum_gateway(),
+            ferrum_gateway_allow_all_namespaces(),
             cross_namespace_http_route("bad-name", "api"),
             backend_service_grant("bad-name", to),
             backend_service("backend", "api"),
@@ -2148,7 +2168,7 @@ fn reference_grant_translation_and_status_share_fail_closed_semantics() {
             }
             let objects = vec![
                 ferrum_gateway_class(),
-                ferrum_gateway(),
+                ferrum_gateway_allow_all_namespaces(),
                 cross_namespace_http_route("bad-group", "api"),
                 place_in_namespace(
                     object(
@@ -2176,7 +2196,7 @@ fn reference_grant_translation_and_status_share_fail_closed_semantics() {
     // object, so status must not retain any valid-looking partial cell either.
     let mixed_to = vec![
         ferrum_gateway_class(),
-        ferrum_gateway(),
+        ferrum_gateway_allow_all_namespaces(),
         cross_namespace_http_route("mixed-to", "api"),
         place_in_namespace(
             object(
@@ -2210,7 +2230,7 @@ fn reference_grant_translation_and_status_share_fail_closed_semantics() {
 
     let mixed_from = vec![
         ferrum_gateway_class(),
-        ferrum_gateway(),
+        ferrum_gateway_allow_all_namespaces(),
         cross_namespace_http_route("mixed-from", "api"),
         place_in_namespace(
             object(
