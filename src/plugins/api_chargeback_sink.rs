@@ -1848,13 +1848,7 @@ fn start_spool_delivery(
     capacity: usize,
     commit_rx: watch::Receiver<bool>,
 ) -> Arc<SpoolDelivery> {
-    start_spool_delivery_with_clone_ceiling(
-        spool,
-        metrics,
-        capacity,
-        commit_rx,
-        process_ceiling(),
-    )
+    start_spool_delivery_with_clone_ceiling(spool, metrics, capacity, commit_rx, process_ceiling())
 }
 
 /// Internal constructor with an explicit ceiling for the exceptional

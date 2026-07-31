@@ -18,10 +18,9 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     probe_charge_body_materialization_for_tests,
     probe_charge_body_materialization_with_projection_for_tests,
     probe_compact_recovery_retry_for_tests, probe_shared_spool_batch_clone_for_tests,
-    render_prometheus, render_status_json,
-    replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
-    replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
-    serialize_json_each_row_projected, set_spool_write_hook_for_tests,
+    render_prometheus, render_status_json, replay_spool_once_for_tests,
+    replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
+    serialize_json_each_row, serialize_json_each_row_projected, set_spool_write_hook_for_tests,
     spool_artifact_byte_limit_for_tests, spool_claim_lease_secs_for_tests,
     spool_decompression_limit_for_tests, spool_index_entry_bytes_for_tests,
     spool_replay_peak_bytes_for_tests, spool_split_worklist_max_entries_for_tests,
@@ -7291,8 +7290,14 @@ async fn shared_spool_batch_clone_reserves_duplicate_bytes_until_write_completes
         probe.ceiling_used_after, probe.ceiling_used_baseline,
         "clone reservation must release exactly once after the blocking write"
     );
-    assert_eq!(probe.jobs_written, 1, "admitted shared clone must write once");
-    assert_eq!(probe.jobs_lost, 0, "admitted shared clone must not count as loss");
+    assert_eq!(
+        probe.jobs_written, 1,
+        "admitted shared clone must write once"
+    );
+    assert_eq!(
+        probe.jobs_lost, 0,
+        "admitted shared clone must not count as loss"
+    );
     assert_eq!(
         probe.durable_owned_files, 1,
         "admitted shared clone must leave one durable spool artifact"
