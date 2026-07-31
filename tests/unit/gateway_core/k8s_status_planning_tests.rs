@@ -379,9 +379,7 @@ fn budgeted_full_coverage_matches_unlimited_plan_over_rotations() {
     for update in &unlimited {
         let key = (update.kind.clone(), update.name.clone());
         let expected = status_without_last_transition_time(&update.status);
-        let actual = seen
-            .get(&key)
-            .map(status_without_last_transition_time);
+        let actual = seen.get(&key).map(status_without_last_transition_time);
         assert_eq!(
             actual.as_ref(),
             Some(&expected),
