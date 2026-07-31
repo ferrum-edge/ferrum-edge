@@ -1100,6 +1100,318 @@ fn reference_grant_named_and_wildcard_backend_permissions() {
 }
 
 #[test]
+fn reference_grant_malformed_name_and_group_fail_closed_at_status_boundaries() {
+    // Absent `to.name` remains the valid Gateway API wildcard (covered by
+    // reference_grant_named_and_wildcard_backend_permissions). Present non-string
+    // `to.name` and missing/non-string required `group` must never grant.
+    let malformed_names: &[(&str, Value)] = &[
+        ("null", Value::Null),
+        ("bool", json!(true)),
+        ("number", json!(1)),
+        ("array", json!(["api"])),
+        ("object", json!({ "n": "api" })),
+    ];
+
+    for (label, bad_name) in malformed_names {
+        let mut to_svc = json!({ "group": "", "kind": "Service" });
+        to_svc
+            .as_object_mut()
+            .expect("object")
+            .insert("name".to_string(), bad_name.clone());
+        let mut to_secret = json!({ "group": "", "kind": "Secret" });
+        to_secret
+            .as_object_mut()
+            .expect("object")
+            .insert("name".to_string(), bad_name.clone());
+
+        let gateway_class = ferrum_gateway_class();
+        let gateway = object(
+            "Gateway",
+            "edge",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "tls": {
+                        "certificateRefs": [{
+                            "name": "edge-cert",
+                            "namespace": "certs"
+                        }]
+                    }
+                }]
+            }),
+        );
+        let route = place_in_namespace(
+            object(
+                "HTTPRoute",
+                "cross",
+                json!({
+                    "parentRefs": [{"name": "edge", "namespace": "default"}],
+                    "rules": [{
+                        "backendRefs": [{"name": "api", "namespace": "backend", "port": 8080}]
+                    }]
+                }),
+            ),
+            "apps",
+        );
+        let secret_grant = place_in_namespace(
+            object(
+                "ReferenceGrant",
+                "bad-secret-name",
+                json!({
+                    "from": [{
+                        "group": "gateway.networking.k8s.io",
+                        "kind": "Gateway",
+                        "namespace": "default"
+                    }],
+                    "to": [to_secret]
+                }),
+            ),
+            "certs",
+        );
+        let backend_grant = place_in_namespace(
+            object(
+                "ReferenceGrant",
+                "bad-svc-name",
+                json!({
+                    "from": [{
+                        "group": "gateway.networking.k8s.io",
+                        "kind": "HTTPRoute",
+                        "namespace": "apps"
+                    }],
+                    "to": [to_svc]
+                }),
+            ),
+            "backend",
+        );
+        let secret = K8sObject {
+            api_version: "v1".to_string(),
+            kind: "Secret".to_string(),
+            metadata: K8sMetadata {
+                name: "edge-cert".to_string(),
+                uid: "uid-edge-cert".to_string(),
+                namespace: "certs".to_string(),
+                generation: Some(1),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                creation_timestamp: None,
+                deletion_timestamp: None,
+            },
+            spec: json!({
+                "type": "kubernetes.io/tls",
+                "data": { "tls.crt": "QQ==", "tls.key": "QQ==" }
+            }),
+            status: Value::Object(serde_json::Map::new()),
+        };
+        let objects = vec![
+            gateway_class,
+            gateway,
+            route,
+            secret_grant,
+            backend_grant,
+            secret,
+            backend_service("backend", "api"),
+        ];
+        let outcome = plan_gateway_api_status_updates(
+            &objects,
+            options(),
+            &gateway_api_route_conflicts(&objects, &options()),
+        );
+        let gateway_status = outcome.iter().find(|u| u.kind == "Gateway").expect("gw");
+        let route_status = outcome.iter().find(|u| u.name == "cross").expect("route");
+        assert_eq!(
+            condition_reason(&gateway_status.status, "ResolvedRefs"),
+            Some("RefNotPermitted"),
+            "present non-string to.name ({label}) must not grant Secret"
+        );
+        assert_eq!(
+            condition_reason(&route_status.status, "ResolvedRefs"),
+            Some("RefNotPermitted"),
+            "present non-string to.name ({label}) must not grant Service"
+        );
+    }
+
+    // Missing / non-string required groups must not collapse to core "".
+    let group_cases: &[(&str, Value)] = &[
+        ("missing", json!({})), // handled by omitting the key below
+        ("null", Value::Null),
+        ("bool", json!(false)),
+        ("number", json!(0)),
+        ("array", json!([])),
+        ("object", json!({ "g": "" })),
+    ];
+    for (label, bad_group) in group_cases {
+        for which in ["from", "to"] {
+            let mut from = json!({
+                "group": "gateway.networking.k8s.io",
+                "kind": "HTTPRoute",
+                "namespace": "apps"
+            });
+            let mut to = json!({ "group": "", "kind": "Service", "name": "api" });
+            if *label == "missing" {
+                if which == "from" {
+                    from.as_object_mut().unwrap().remove("group");
+                } else {
+                    to.as_object_mut().unwrap().remove("group");
+                }
+            } else if which == "from" {
+                from.as_object_mut()
+                    .unwrap()
+                    .insert("group".to_string(), bad_group.clone());
+            } else {
+                to.as_object_mut()
+                    .unwrap()
+                    .insert("group".to_string(), bad_group.clone());
+            }
+            let objects = vec![
+                ferrum_gateway_class(),
+                ferrum_gateway(),
+                place_in_namespace(
+                    object(
+                        "HTTPRoute",
+                        "cross",
+                        json!({
+                            "parentRefs": [{"name": "edge", "namespace": "default"}],
+                            "rules": [{
+                                "backendRefs": [{"name": "api", "namespace": "backend", "port": 8080}]
+                            }]
+                        }),
+                    ),
+                    "apps",
+                ),
+                place_in_namespace(
+                    object(
+                        "ReferenceGrant",
+                        "bad-group",
+                        json!({ "from": [from], "to": [to] }),
+                    ),
+                    "backend",
+                ),
+                backend_service("backend", "api"),
+            ];
+            let outcome = plan_gateway_api_status_updates(
+                &objects,
+                options(),
+                &gateway_api_route_conflicts(&objects, &options()),
+            );
+            let route_status = outcome.iter().find(|u| u.name == "cross").expect("route");
+            assert_eq!(
+                condition_reason(&route_status.status, "ResolvedRefs"),
+                Some("RefNotPermitted"),
+                "malformed {which}.group ({label}) must not grant Service"
+            );
+        }
+    }
+
+    // Explicit core-group empty string still permits Service and Secret refs.
+    let gateway = object(
+        "Gateway",
+        "edge",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "https",
+                "port": 443,
+                "protocol": "HTTPS",
+                "tls": {
+                    "certificateRefs": [{
+                        "name": "edge-cert",
+                        "namespace": "certs"
+                    }]
+                }
+            }]
+        }),
+    );
+    let secret = K8sObject {
+        api_version: "v1".to_string(),
+        kind: "Secret".to_string(),
+        metadata: K8sMetadata {
+            name: "edge-cert".to_string(),
+            uid: "uid-edge-cert".to_string(),
+            namespace: "certs".to_string(),
+            generation: Some(1),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            creation_timestamp: None,
+            deletion_timestamp: None,
+        },
+        spec: json!({
+            "type": "kubernetes.io/tls",
+            "data": { "tls.crt": "QQ==", "tls.key": "QQ==" }
+        }),
+        status: Value::Object(serde_json::Map::new()),
+    };
+    let objects = vec![
+        ferrum_gateway_class(),
+        gateway,
+        place_in_namespace(
+            object(
+                "HTTPRoute",
+                "cross",
+                json!({
+                    "parentRefs": [{"name": "edge", "namespace": "default"}],
+                    "rules": [{
+                        "backendRefs": [{"name": "api", "namespace": "backend", "port": 8080}]
+                    }]
+                }),
+            ),
+            "apps",
+        ),
+        place_in_namespace(
+            object(
+                "ReferenceGrant",
+                "allow-cert",
+                json!({
+                    "from": [{
+                        "group": "gateway.networking.k8s.io",
+                        "kind": "Gateway",
+                        "namespace": "default"
+                    }],
+                    "to": [{ "group": "", "kind": "Secret", "name": "edge-cert" }]
+                }),
+            ),
+            "certs",
+        ),
+        place_in_namespace(
+            object(
+                "ReferenceGrant",
+                "allow-api",
+                json!({
+                    "from": [{
+                        "group": "gateway.networking.k8s.io",
+                        "kind": "HTTPRoute",
+                        "namespace": "apps"
+                    }],
+                    "to": [{ "group": "", "kind": "Service", "name": "api" }]
+                }),
+            ),
+            "backend",
+        ),
+        secret,
+        backend_service("backend", "api"),
+    ];
+    let outcome = plan_gateway_api_status_updates(
+        &objects,
+        options(),
+        &gateway_api_route_conflicts(&objects, &options()),
+    );
+    let gateway_status = outcome.iter().find(|u| u.kind == "Gateway").expect("gw");
+    let route_status = outcome.iter().find(|u| u.name == "cross").expect("route");
+    assert_eq!(
+        condition_reason(&gateway_status.status, "ResolvedRefs"),
+        Some("InvalidCertificateRef"),
+        "explicit group:\"\" must still grant Secret (then TLS validity applies)"
+    );
+    assert_eq!(
+        condition_status(&route_status.status, "ResolvedRefs"),
+        Some("True"),
+        "explicit group:\"\" must still grant Service"
+    );
+}
+
+#[test]
 fn reference_grant_denies_wrong_from_to_and_malformed_entries() {
     let gateway_class = ferrum_gateway_class();
     let gateway = ferrum_gateway();
@@ -1446,6 +1758,22 @@ fn reference_grant_permission_index_avoids_raw_grant_scans() {
     assert!(
         ingest.contains("from_entries") && ingest.contains("to_entries"),
         "index must expand from×to once at build time"
+    );
+    assert!(
+        STATUS_SRC.contains("fn reference_grant_optional_to_name"),
+        "optional to.name tri-state helper must exist"
+    );
+    assert!(
+        !ingest.contains("unwrap_or_default()"),
+        "required group fields must not fail-open to empty core group"
+    );
+    assert!(
+        !ingest.contains("Missing / non-string"),
+        "ingest must not document non-string name as wildcard"
+    );
+    assert!(
+        ingest.contains("reference_grant_optional_to_name(to)"),
+        "ingest must use the unambiguous optional-name helper"
     );
 
     // Invalid-heavy / many-grants: planning must still succeed with the index.

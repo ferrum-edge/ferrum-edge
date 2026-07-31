@@ -353,6 +353,19 @@ impl<'a> Default for ReferenceGrantPermissionIndex<'a> {
     }
 }
 
+/// Optional ReferenceGrant `to.name` without allocating.
+///
+/// - absent → `Some(None)` (Gateway API wildcard)
+/// - string → `Some(Some(name))` (named grant)
+/// - present non-string → `None` (malformed; caller skips the `to` entry)
+fn reference_grant_optional_to_name(to: &Value) -> Option<Option<&str>> {
+    match to.get("name") {
+        None => Some(None),
+        Some(Value::String(name)) => Some(Some(name.as_str())),
+        Some(_) => None,
+    }
+}
+
 impl<'a> ReferenceGrantPermissionIndex<'a> {
     fn ingest(&mut self, grant: &'a K8sObject) {
         let to_namespace = grant.metadata.namespace.as_str();
@@ -369,15 +382,21 @@ impl<'a> ReferenceGrantPermissionIndex<'a> {
             let Some(from_kind) = from.get("kind").and_then(Value::as_str) else {
                 continue;
             };
-            let from_group = from.get("group").and_then(Value::as_str).unwrap_or_default();
+            // Required: only an explicit string (including "") may be indexed.
+            // Missing or non-string `group` must not collapse to core "".
+            let Some(from_group) = from.get("group").and_then(Value::as_str) else {
+                continue;
+            };
             for to in to_entries {
                 let Some(to_kind) = to.get("kind").and_then(Value::as_str) else {
                     continue;
                 };
-                let to_group = to.get("group").and_then(Value::as_str).unwrap_or_default();
-                // Missing / non-string `name` is wildcard — same as the prior
-                // `is_none_or` scan semantics.
-                let to_name = to.get("name").and_then(Value::as_str);
+                let Some(to_group) = to.get("group").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(to_name) = reference_grant_optional_to_name(to) else {
+                    continue;
+                };
                 self.entries
                     .entry(to_namespace)
                     .or_default()
