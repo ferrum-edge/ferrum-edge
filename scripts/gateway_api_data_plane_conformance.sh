@@ -94,9 +94,6 @@ deploy_control_plane() {
   done
   kubectl create namespace "$CP_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
   create_frontend_tls_secret
-  # FERRUM_K8S_WATCH_IDLE_RELIST_SECS is deliberately far below the production
-  # default (300): the black-box probes below give up after 120s, so a lab
-  # window of 20s is what makes watch-staleness recovery observable here.
   helm upgrade --install ferrum "$ROOT_DIR/charts/ferrum-mesh" \
     --namespace "$CP_NAMESPACE" \
     --set image.repository=ferrum-edge \
@@ -124,7 +121,6 @@ deploy_control_plane() {
     --set controlPlane.env.FERRUM_K8S_WATCH_MESH_CONFIG=false \
     --set controlPlane.env.FERRUM_K8S_POD_DISCOVERY_ENABLED=true \
     --set controlPlane.env.FERRUM_K8S_FULL_SYNC_INTERVAL_SECS=15 \
-    --set controlPlane.env.FERRUM_K8S_WATCH_IDLE_RELIST_SECS=20 \
     --set controlPlane.env.FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAMESPACE="$CP_NAMESPACE" \
     --set controlPlane.env.FERRUM_GATEWAY_API_DATA_PLANE_SERVICE_NAME="$DP_SERVICE_NAME" \
     --set controlPlane.env.FERRUM_GATEWAY_API_STATUS_ADDRESS="$GATEWAY_API_STATUS_ADDRESS" \
