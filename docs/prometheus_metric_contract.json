@@ -1684,6 +1684,43 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_slice_convergence_diverged",
+    "type": "gauge",
+    "help": "Number of tracked mesh identities whose last sent slice version is not acknowledged.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_mesh_slice_convergence_identities",
+    "type": "gauge",
+    "help": "Number of mesh identities retained in the CP slice-convergence tracker (connected plus retention window).",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_mesh_slice_status_reports_total",
+    "type": "counter",
+    "help": "Control-plane MeshSlice status reports by closed-set outcome (applied/rejected/stale_version/unknown_version/unknown_identity/identity_mismatch).",
+    "labels": [
+      "outcome",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_subscribe_audience_rejections_total",
     "type": "counter",
     "help": "MeshSubscribe subscriptions refused by the control plane because the bearer JWT audience does not match the required subscription purpose, by subscription class and reason.",

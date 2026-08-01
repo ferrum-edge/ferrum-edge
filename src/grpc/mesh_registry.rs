@@ -3,6 +3,11 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::Serialize;
+use std::sync::Arc;
+
+use super::mesh_slice_convergence::{
+    MeshSliceConvergenceSnapshot, MeshSliceConvergenceTracker, MeshSliceStatusOutcome,
+};
 
 pub const MESH_NODE_REGISTRY_STALE_TTL_SECONDS: i64 = 300;
 pub const MESH_NODE_REGISTRY_REAPER_INTERVAL: std::time::Duration =
@@ -25,23 +30,52 @@ pub struct MeshNodeInfo {
 #[derive(Default)]
 pub struct MeshNodeRegistry {
     nodes: DashMap<String, MeshNodeInfo>,
+    convergence: Arc<MeshSliceConvergenceTracker>,
 }
 
 impl MeshNodeRegistry {
     pub fn new() -> Self {
         Self {
             nodes: DashMap::new(),
+            convergence: Arc::new(MeshSliceConvergenceTracker::new()),
         }
     }
 
+    pub fn convergence(&self) -> Arc<MeshSliceConvergenceTracker> {
+        self.convergence.clone()
+    }
+
     pub fn insert(&self, info: MeshNodeInfo) {
+        self.insert_with_convergence(info, true);
+    }
+
+    pub fn insert_with_convergence(&self, info: MeshNodeInfo, track_convergence: bool) {
+        if track_convergence {
+            let now = Utc::now();
+            if !self
+                .convergence
+                .note_connected(&info.node_id, &info.namespace, now)
+            {
+                tracing::warn!(
+                    node_id = %info.node_id,
+                    max_identities =
+                        crate::grpc::mesh_slice_convergence::MESH_SLICE_CONVERGENCE_MAX_IDENTITIES,
+                    "Mesh slice convergence tracker at cardinality ceiling; identity not retained"
+                );
+            }
+        }
         self.nodes.insert(info.node_id.clone(), info);
     }
 
     pub fn remove_if_stale(&self, node_id: &str, expected_connected_at: DateTime<Utc>) {
-        self.nodes.remove_if(node_id, |_, info| {
+        let generation = self.convergence.connected_generation(node_id);
+        let removed = self.nodes.remove_if(node_id, |_, info| {
             info.connected_at == expected_connected_at
         });
+        if removed.is_some() {
+            self.convergence
+                .note_disconnected(node_id, generation, Utc::now());
+        }
     }
 
     pub fn touch_heartbeat(&self, node_id: &str, expected_connected_at: DateTime<Utc>) {
@@ -62,14 +96,56 @@ impl MeshNodeRegistry {
     pub fn remove_stale_heartbeats(&self, now: DateTime<Utc>, ttl: chrono::Duration) -> usize {
         let stale_before = now - ttl;
         let mut removed = 0usize;
-        self.nodes.retain(|_, info| {
+        let mut stale_ids: Vec<(String, Option<u64>)> = Vec::new();
+        self.nodes.retain(|node_id, info| {
             let keep = info.last_heartbeat_at >= stale_before;
             if !keep {
                 removed += 1;
+                stale_ids.push((
+                    node_id.clone(),
+                    self.convergence.connected_generation(node_id),
+                ));
             }
             keep
         });
+        for (node_id, generation) in stale_ids {
+            self.convergence
+                .note_disconnected(&node_id, generation, now);
+        }
+        let _ = self.convergence.reap_expired(now);
         removed
+    }
+
+    pub fn note_published(&self, version: &str) {
+        self.convergence.note_published(version, Utc::now());
+    }
+
+    pub fn note_sent(&self, node_id: &str, version: &str) {
+        self.convergence.note_sent(node_id, version, Utc::now());
+    }
+
+    pub fn note_status_report(
+        &self,
+        authenticated_subject: &str,
+        node_id: &str,
+        version: &str,
+        rejected_reason: Option<&str>,
+    ) -> MeshSliceStatusOutcome {
+        self.convergence.note_status_report(
+            authenticated_subject,
+            node_id,
+            version,
+            rejected_reason,
+            Utc::now(),
+        )
+    }
+
+    pub fn convergence_snapshot(&self) -> Vec<MeshSliceConvergenceSnapshot> {
+        self.convergence.snapshot(Utc::now())
+    }
+
+    pub fn convergence_for(&self, node_id: &str) -> Option<MeshSliceConvergenceSnapshot> {
+        self.convergence.snapshot_for(node_id, Utc::now())
     }
 
     pub fn snapshot(&self) -> Vec<MeshNodeInfo> {

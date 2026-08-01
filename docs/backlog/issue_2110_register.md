@@ -57,7 +57,7 @@ Current mesh HBONE/DNS perf status lives in
 |---|---|---|
 | TCP/UDP outbound PROXY protocol | Inbound only today; outbound not implemented | [`docs/tcp_udp_proxy.md`](../tcp_udp_proxy.md) |
 | DR `connectionPool.http.maxRequestsPerConnection` | Parsed/validated, not enforced; listed in K8s `deferred_fields` | [`docs/mesh.md`](../mesh.md), [`docs/mesh_supported_matrix.md`](../mesh_supported_matrix.md) |
-| Mesh CP per-DP slice-version drift endpoint | Future work | [`docs/mesh.md`](../mesh.md) |
+| Mesh CP per-DP slice-version drift endpoint | Done via #3265 (`GET /cluster` `mesh_slice_convergence`) | [`docs/mesh.md`](../mesh.md), [`docs/admin_api.md`](../admin_api.md) |
 | EgressGateway TCP stream experimental | Behind `FERRUM_MESH_EGRESS_STREAM_ENABLED=false` default | [`docs/mesh.md`](../mesh.md) |
 
 ## #2110-only discretionary remnants

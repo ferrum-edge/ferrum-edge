@@ -7883,11 +7883,14 @@ async fn test_cluster_endpoint_cp_mode_with_connected_mesh_nodes() {
     let mesh_nodes = body["mesh_nodes"].as_array().unwrap();
     assert_eq!(mesh_nodes.len(), 1);
     assert_eq!(mesh_nodes[0]["node_id"], "mesh-node-1");
-    assert_eq!(
-        mesh_nodes[0]["last_heartbeat_at"],
-        last_heartbeat_at.to_rfc3339()
-    );
+    assert_eq!(mesh_nodes[0]["last_heartbeat_at"], last_heartbeat_at.to_rfc3339());
     assert_eq!(mesh_nodes[0]["last_sync_at"], last_update_at.to_rfc3339());
+    assert_eq!(body["mesh_slice_convergence_retention_seconds"], 900);
+    assert!(body["mesh_slice_convergence"].is_array());
+    assert_eq!(body["mesh_slice_convergence"].as_array().unwrap().len(), 1);
+    assert_eq!(body["mesh_slice_convergence"][0]["node_id"], "mesh-node-1");
+    assert_eq!(body["mesh_slice_convergence"][0]["connected"], true);
+    assert!(mesh_nodes[0]["slice_convergence"].is_object());
 }
 
 #[tokio::test]

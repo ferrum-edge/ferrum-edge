@@ -15,6 +15,7 @@ pub mod cp_trust;
 pub mod dp_client;
 pub mod mesh_registry;
 pub mod mesh_server;
+pub mod mesh_slice_convergence;
 
 pub mod proto {
     tonic::include_proto!("ferrum");

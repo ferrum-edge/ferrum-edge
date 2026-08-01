@@ -45,6 +45,7 @@ mod load_balancer_tests;
 mod load_balancer_wrr_concurrency_tests;
 mod locality_lb_tests;
 mod mesh_bpf_metrics_contract_tests;
+mod mesh_slice_convergence_tests;
 mod mesh_startup_rollback_tests;
 mod mesh_udp_capture_outcome_tests;
 mod metrics_tests;

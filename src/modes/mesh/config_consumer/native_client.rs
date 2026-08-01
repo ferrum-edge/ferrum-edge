@@ -17,7 +17,7 @@ use super::update_validation::{
 use crate::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
-use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+use crate::grpc::proto::{MeshConfigUpdate, MeshSliceStatusReport, MeshSubscribeRequest};
 use crate::modes::mesh::revision::MeshRevisionRejection;
 use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall};
 use crate::modes::mesh::slice::MeshSlice;
@@ -235,14 +235,23 @@ async fn connect_mesh_subscribe(
         Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
     )?;
     let token: MetadataValue<_> = format!("Bearer {auth_token}").parse()?;
+    let report_token = token.clone();
 
     #[allow(clippy::result_large_err)]
     let mut client =
-        MeshConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+        MeshConfigSyncClient::with_interceptor(channel.clone(), move |mut req: tonic::Request<()>| {
             req.metadata_mut().insert("authorization", token.clone());
             Ok(req)
         })
         .max_decoding_message_size(MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE);
+
+    #[allow(clippy::result_large_err)]
+    let mut status_client =
+        MeshConfigSyncClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+            req.metadata_mut()
+                .insert("authorization", report_token.clone());
+            Ok(req)
+        });
 
     info!(
         node_id = %config.node_id,
@@ -282,11 +291,70 @@ async fn connect_mesh_subscribe(
                     version = %slice.version,
                     "Applied native MeshSubscribe update"
                 );
+                let report = MeshSliceStatusReport {
+                    node_id: config.node_id.clone(),
+                    version: slice.version.clone(),
+                    applied: true,
+                    rejected_reason: String::new(),
+                };
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    status_client.report_mesh_slice_status(report),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(status)) => {
+                        tracing::debug!(
+                            node_id = %config.node_id,
+                            code = %status.code(),
+                            "Mesh slice applied-status report refused"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            node_id = %config.node_id,
+                            "Mesh slice applied-status report timed out"
+                        );
+                    }
+                }
             }
             Ok(None) => {
                 tracing::debug!("Received native MeshSubscribe heartbeat");
             }
             Err(rejection) => {
+                // Best-effort NACK to the CP so operators can see repeatedly
+                // rejecting DPs on JWT-authenticated GET /cluster. Failures here
+                // must never override stream-terminal vs keep-stream decisions.
+                if !update.heartbeat && !update.version.is_empty() {
+                    let report = MeshSliceStatusReport {
+                        node_id: config.node_id.clone(),
+                        version: update.version.clone(),
+                        applied: false,
+                        rejected_reason: rejection.reason_label().to_string(),
+                    };
+                    match tokio::time::timeout(
+                        Duration::from_secs(2),
+                        status_client.report_mesh_slice_status(report),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(status)) => {
+                            tracing::debug!(
+                                node_id = %config.node_id,
+                                code = %status.code(),
+                                "Mesh slice rejected-status report refused"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                node_id = %config.node_id,
+                                "Mesh slice rejected-status report timed out"
+                            );
+                        }
+                    }
+                }
                 // The rejection site already emitted the reason-labelled metric
                 // and the sanitized diagnostic; last-good state is untouched
                 // either way. A response that is not bound to this subscription

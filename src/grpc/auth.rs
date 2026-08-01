@@ -369,7 +369,8 @@ pub(crate) fn verify_grpc_jwt_metadata_with_claims(
     .map_err(|(status, _)| status)
 }
 
-/// Verify the JWT under an explicit [`GrpcAudiencePolicy`].
+/// Verify the JWT under an explicit [`GrpcAudiencePolicy`] and return the
+/// authorized namespaces plus the authenticated `sub` claim.
 ///
 /// On failure the bounded [`AudienceRejectReason`] is returned alongside the
 /// `Status` **only** when the audience check is what failed, so callers can
@@ -384,6 +385,27 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
     audience_policy: GrpcAudiencePolicy<'_>,
     peer: Option<&CpGrpcConnectInfo>,
 ) -> Result<AllowedNamespaces, (Status, Option<AudienceRejectReason>)> {
+    verify_grpc_jwt_metadata_with_audience_and_subject(
+        metadata,
+        verifier,
+        expected_issuer,
+        audience_policy,
+        peer,
+    )
+    .map(|(allowed, _subject)| allowed)
+}
+
+/// Like [`verify_grpc_jwt_metadata_with_audience`], but also returns the JWT
+/// `sub` claim used as the stable authenticated DP identity for mesh-slice
+/// status reports (issue #3265).
+#[allow(clippy::result_large_err, clippy::type_complexity)]
+pub(crate) fn verify_grpc_jwt_metadata_with_audience_and_subject(
+    metadata: &tonic::metadata::MetadataMap,
+    verifier: &CpDpVerifier,
+    expected_issuer: &str,
+    audience_policy: GrpcAudiencePolicy<'_>,
+    peer: Option<&CpGrpcConnectInfo>,
+) -> Result<(AllowedNamespaces, String), (Status, Option<AudienceRejectReason>)> {
     let token = metadata
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -455,6 +477,20 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
         ));
     }
 
+    let subject = token_data
+        .claims
+        .get("sub")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            (
+                Status::unauthenticated("Invalid token: missing subject"),
+                None::<AudienceRejectReason>,
+            )
+        })?
+        .to_string();
+
     let claim = extract_ns_claim(&token_data.claims).map_err(|status| (status, None))?;
     let claim_present = claim.is_present();
     let claim_namespaces = claim.effective_namespaces().cloned();
@@ -477,7 +513,7 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
         )
     })?;
 
-    Ok(AllowedNamespaces::resolved(claim_present, effective))
+    Ok((AllowedNamespaces::resolved(claim_present, effective), subject))
 }
 
 fn required_grpc_claims() -> HashSet<String> {

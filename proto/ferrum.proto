@@ -12,6 +12,11 @@ service ConfigSync {
 service MeshConfigSync {
   // Mesh data planes subscribe to their canonical per-workload mesh slice.
   rpc MeshSubscribe(MeshSubscribeRequest) returns (stream MeshConfigUpdate);
+  // Mesh data planes report applied/rejected status for an exact sent slice
+  // version. Bound to the authenticated JWT `sub` (must equal `node_id`) and
+  // only marks convergence when `version` matches the CP's last sent version
+  // for that identity (issue #3265).
+  rpc ReportMeshSliceStatus(MeshSliceStatusReport) returns (MeshSliceStatusResponse);
 }
 
 message SubscribeRequest {
@@ -188,4 +193,27 @@ message MeshConfigUpdate {
   // survives control-plane restarts and is identical on every replica of one
   // config store.
   uint64 config_sequence = 7;
+}
+
+// Mesh DP → CP acknowledgement of a previously sent MeshConfigUpdate version
+// (issue #3265). `node_id` MUST equal the authenticated JWT `sub`. `version`
+// MUST equal the exact last non-heartbeat version the CP sent to that
+// identity; stale or unknown versions are ignored for convergence.
+message MeshSliceStatusReport {
+  string node_id = 1;
+  // Exact `MeshConfigUpdate.version` / embedded `MeshSlice.version` being
+  // acknowledged or rejected.
+  string version = 2;
+  // When true the DP applied the slice; when false the DP rejected it.
+  bool applied = 3;
+  // Bounded, redacted rejection reason. Empty on successful apply. Control
+  // planes truncate and strip control characters; never include secrets,
+  // JWTs, or unbounded peer-provided payloads.
+  string rejected_reason = 4;
+}
+
+message MeshSliceStatusResponse {
+  // Closed-set outcome label: applied / rejected / stale_version /
+  // unknown_version / unknown_identity / identity_mismatch.
+  string outcome = 1;
 }

@@ -8299,7 +8299,7 @@ async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes
             let mesh_node_details: Vec<serde_json::Value> = mesh_nodes
                 .iter()
                 .map(|n| {
-                    json!({
+                    let mut node = json!({
                         "node_id": n.node_id,
                         "version": n.version,
                         "namespace": n.namespace,
@@ -8307,9 +8307,38 @@ async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes
                         "connected_at": n.connected_at.to_rfc3339(),
                         "last_heartbeat_at": n.last_heartbeat_at.to_rfc3339(),
                         "last_sync_at": n.last_update_at.to_rfc3339(),
-                    })
+                    });
+                    if let Some(convergence) = state
+                        .mesh_registry
+                        .as_ref()
+                        .and_then(|registry| registry.convergence_for(&n.node_id))
+                    {
+                        node.as_object_mut().map(|obj| {
+                            obj.insert(
+                                "slice_convergence".to_string(),
+                                serde_json::to_value(convergence)
+                                    .unwrap_or_else(|_| json!({})),
+                            );
+                        });
+                    }
+                    node
                 })
                 .collect();
+            let mesh_slice_convergence = state
+                .mesh_registry
+                .as_ref()
+                .map(|registry| {
+                    serde_json::to_value(registry.convergence_snapshot())
+                        .unwrap_or_else(|_| json!([]))
+                })
+                .unwrap_or_else(|| json!([]));
+            let published = state.mesh_registry.as_ref().map(|registry| {
+                let tracker = registry.convergence();
+                (
+                    tracker.published_version(),
+                    tracker.published_at().map(|at| at.to_rfc3339()),
+                )
+            });
             Ok(json_response(
                 StatusCode::OK,
                 &json!({
@@ -8318,6 +8347,11 @@ async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes
                     "data_planes": data_plane_details,
                     "connected_mesh_nodes": mesh_nodes.len(),
                     "mesh_nodes": mesh_node_details,
+                    "mesh_slice_published_version": published.as_ref().and_then(|(v, _)| v.clone()),
+                    "mesh_slice_published_at": published.as_ref().and_then(|(_, at)| at.clone()),
+                    "mesh_slice_convergence": mesh_slice_convergence,
+                    "mesh_slice_convergence_retention_seconds":
+                        crate::grpc::mesh_slice_convergence::MESH_SLICE_CONVERGENCE_RETENTION_SECS,
                 }),
             ))
         }

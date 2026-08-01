@@ -1856,6 +1856,13 @@ paths:
         Mesh nodes. Each entry includes `node_id`, `version`, `namespace`,
         `status`, `connected_at`, and `last_sync_at`. Disconnected nodes
         are automatically removed from their respective registries.
+        CP responses also include `mesh_slice_convergence` — bounded
+        per-identity desired/sent/acknowledged/rejected mesh-slice version
+        metadata (issue #3265) retained across reconnects for
+        `mesh_slice_convergence_retention_seconds`. Online `mesh_nodes`
+        may also carry a nested `slice_convergence` object. This detail is
+        JWT-authenticated only and is never exposed on `/metrics` as
+        per-node labels.
 
         **DP mode**: Shows the connection to the Control Plane — `url`,
         `status` (online/offline), `is_primary` (primary vs fallback CP),
@@ -1905,6 +1912,21 @@ paths:
                         status: online
                         connected_at: "2025-01-15T10:32:00Z"
                         last_sync_at: "2025-01-15T10:35:00Z"
+                    mesh_slice_published_version: "2025-01-15T10:35:00Z"
+                    mesh_slice_published_at: "2025-01-15T10:35:00Z"
+                    mesh_slice_convergence_retention_seconds: 900
+                    mesh_slice_convergence:
+                      - node_id: "mesh-789"
+                        namespace: ferrum
+                        connected: true
+                        desired_version: "2025-01-15T10:35:00Z"
+                        desired_age_seconds: 12
+                        sent_version: "2025-01-15T10:35:00Z"
+                        sent_age_seconds: 12
+                        acknowledged_version: "2025-01-15T10:35:00Z"
+                        acknowledged_age_seconds: 10
+                        rejected_age_seconds: 0
+                        converged: true
                 dp_mode_online:
                   summary: DP connected to primary CP
                   value:
@@ -25333,7 +25355,16 @@ components:
 
     ClusterStatusCp:
       type: object
-      required: [mode, connected_data_planes, data_planes, connected_mesh_nodes, mesh_nodes]
+      required:
+        [
+          mode,
+          connected_data_planes,
+          data_planes,
+          connected_mesh_nodes,
+          mesh_nodes,
+          mesh_slice_convergence,
+          mesh_slice_convergence_retention_seconds,
+        ]
       properties:
         mode:
           type: string
@@ -25352,6 +25383,110 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ConnectedMeshNode"
+        mesh_slice_published_version:
+          type: string
+          nullable: true
+          description: |
+            Latest mesh config version the CP published (GatewayConfig
+            `loaded_at` stamp). Advances on every full/delta mesh broadcast
+            even for disconnected retained identities.
+        mesh_slice_published_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When `mesh_slice_published_version` was last advanced.
+        mesh_slice_convergence:
+          type: array
+          description: |
+            Bounded per-identity mesh-slice convergence state (issue #3265).
+            Includes connected MeshSubscribe identities and identities retained
+            after disconnect for `mesh_slice_convergence_retention_seconds`.
+            Never exposed on unauthenticated observability endpoints.
+          items:
+            $ref: "#/components/schemas/MeshSliceConvergence"
+        mesh_slice_convergence_retention_seconds:
+          type: integer
+          description: |
+            How long convergence metadata is retained after a MeshSubscribe
+            stream drops (default 900). Reconnecting with the same authenticated
+            `node_id` reuses the retained desired/sent/ack/reject watermarks.
+
+    MeshSliceConvergence:
+      type: object
+      required:
+        [
+          node_id,
+          namespace,
+          connected,
+          desired_age_seconds,
+          sent_age_seconds,
+          acknowledged_age_seconds,
+          rejected_age_seconds,
+          converged,
+        ]
+      properties:
+        node_id:
+          type: string
+          description: Authenticated stable mesh identity (JWT `sub` / MeshSubscribe node_id)
+        namespace:
+          type: string
+        connected:
+          type: boolean
+          description: True while a MeshSubscribe stream is active for this identity
+        desired_version:
+          type: string
+          description: Last desired/published slice version for this identity
+        desired_at:
+          type: string
+          format: date-time
+        desired_age_seconds:
+          type: integer
+          minimum: 0
+        sent_version:
+          type: string
+          description: Last non-heartbeat MeshConfigUpdate version handed to the DP stream
+        sent_at:
+          type: string
+          format: date-time
+        sent_age_seconds:
+          type: integer
+          minimum: 0
+        acknowledged_version:
+          type: string
+          description: |
+            Last version the DP reported applied. Only advances when the report
+            matches the exact last sent version for this authenticated identity.
+        acknowledged_at:
+          type: string
+          format: date-time
+        acknowledged_age_seconds:
+          type: integer
+          minimum: 0
+        rejected_version:
+          type: string
+          description: Last version the DP reported rejected (NACK)
+        rejected_at:
+          type: string
+          format: date-time
+        rejected_age_seconds:
+          type: integer
+          minimum: 0
+        rejected_reason:
+          type: string
+          description: |
+            Bounded, control-character-stripped rejection reason (max 128 bytes).
+            Prefer closed-set MeshUpdateRejectReason labels; never secrets/JWTs.
+        converged:
+          type: boolean
+          description: True when acknowledged_version equals the last sent_version
+        disconnected_at:
+          type: string
+          format: date-time
+          description: When the MeshSubscribe stream dropped (omitted while connected)
+        retention_deadline_at:
+          type: string
+          format: date-time
+          description: When retained-but-disconnected state will be reaped
 
     ConnectedMeshNode:
       type: object
@@ -25378,6 +25513,15 @@ components:
           type: string
           format: date-time
           description: When the last config update was broadcast to this mesh node
+        last_heartbeat_at:
+          type: string
+          format: date-time
+          description: When the CP last observed stream activity for this mesh node
+        slice_convergence:
+          $ref: "#/components/schemas/MeshSliceConvergence"
+          description: |
+            Per-identity desired/sent/acknowledged/rejected slice versions when
+            this online node is enrolled in the CP convergence tracker.
 
     ConnectedDpNode:
       type: object

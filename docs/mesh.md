@@ -1499,7 +1499,14 @@ Operator playbook:
 - **Spot RTDS drift**: compare `runtime_overlay.keys` and `runtime_overlay.fingerprint` across DPs. Missing keys point to subscription or layer merge issues; matching keys with different fingerprints mean a same-key runtime value diverged.
 - **Spot a wedged xDS DP**: when `convergence.converged` is `false` with a non-empty `convergence.missing_required_types` on a starting DP, the first slice is blocked waiting on those types — cross-check `ferrum_xds_first_slice_nacks_total` for a malformed required resource (NACK loop) versus a CP that is simply not sending that type (no NACKs, type stays missing).
 
-A CP-side endpoint that reports what slice version the CP last published to each connected DP (so external tooling can diff "what the CP thinks each DP should have" against "what each DP reports here") is future work; this endpoint covers the DP-local half of the drift picture.
+A CP-side view of per-DP desired/sent/acknowledged/rejected slice versions is
+exposed on the JWT-authenticated control-plane `GET /cluster` response
+(`mesh_slice_convergence`, plus optional nested `slice_convergence` on each
+online `mesh_nodes` entry). Pair DP-local `/mesh/config-drift` fingerprints
+with that CP view to diff "what the CP last published/sent" against "what each
+DP applied". See [admin_api.md](admin_api.md#cluster-status) and the
+acceptance notes under issue #3265 for retention, ACK binding, and cardinality
+bounds. This endpoint covers the DP-local half of the drift picture.
 
 ## Authoritative Config Revisions And Stale-Fallback Rejection
 

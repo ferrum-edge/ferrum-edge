@@ -18,12 +18,16 @@ use tracing::{error, info, warn};
 use super::auth::{
     AllowedNamespaces, AudienceRejectReason, GrpcAudiencePolicy, MESH_LOCAL_SUBSCRIBE_AUDIENCE,
     remote_discovery_audience, verify_grpc_jwt_metadata_with_audience,
+    verify_grpc_jwt_metadata_with_audience_and_subject,
 };
 use super::cp_server::{CpGrpcServer, CpScope, DEFAULT_CP_DP_JWT_ISSUER};
 use super::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
 use super::mesh_registry::{MeshNodeInfo, MeshNodeRegistry};
+use super::mesh_slice_convergence::MeshSliceStatusOutcome;
 use super::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
-use super::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+use super::proto::{
+    MeshConfigUpdate, MeshSliceStatusReport, MeshSliceStatusResponse, MeshSubscribeRequest,
+};
 use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::{GatewayConfig, default_namespace};
@@ -45,6 +49,7 @@ struct TrackedMeshStream<S> {
     registry: Arc<MeshNodeRegistry>,
     node_id: String,
     connected_at: DateTime<Utc>,
+    track_convergence: bool,
 }
 
 impl<S> Drop for TrackedMeshStream<S> {
@@ -57,7 +62,7 @@ impl<S> Drop for TrackedMeshStream<S> {
 
 impl<S> tokio_stream::Stream for TrackedMeshStream<S>
 where
-    S: tokio_stream::Stream,
+    S: tokio_stream::Stream<Item = Result<MeshConfigUpdate, Status>>,
 {
     type Item = S::Item;
 
@@ -66,6 +71,13 @@ where
             Poll::Ready(Some(item)) => {
                 self.registry
                     .touch_heartbeat(&self.node_id, self.connected_at);
+                if self.track_convergence
+                    && let Ok(update) = &item
+                    && !update.heartbeat
+                    && !update.version.is_empty()
+                {
+                    self.registry.note_sent(&self.node_id, &update.version);
+                }
                 Poll::Ready(Some(item))
             }
             other => other,
@@ -494,6 +506,7 @@ impl MeshGrpcServer {
         config: Arc<GatewayConfig>,
         registry: &MeshNodeRegistry,
     ) {
+        registry.note_published(&config.loaded_at.to_rfc3339());
         let _ = tx.send(MeshConfigBroadcast::Full(config));
         registry.touch_all();
     }
@@ -504,6 +517,7 @@ impl MeshGrpcServer {
         version: &str,
         registry: &MeshNodeRegistry,
     ) {
+        registry.note_published(version);
         let _ = tx.send(MeshConfigBroadcast::Delta {
             result: Box::new(result),
             version: version.to_string(),
@@ -633,14 +647,21 @@ impl MeshConfigSync for MeshGrpcServer {
         let initial = Self::build_mesh_config_update_from_slice(initial_slice.clone())?;
 
         let now = Utc::now();
-        self.registry.insert(MeshNodeInfo {
-            node_id: node_id.clone(),
-            version: node_version,
-            namespace: node_namespace,
-            connected_at: now,
-            last_heartbeat_at: now,
-            last_update_at: now,
-        });
+        // Remote-discovery polls are one-shot imports, not long-lived mesh data
+        // planes — keep them out of the per-DP convergence tracker.
+        let track_convergence = !remote_discovery;
+        self.registry
+            .insert_with_convergence(
+                MeshNodeInfo {
+                    node_id: node_id.clone(),
+                    version: node_version,
+                    namespace: node_namespace,
+                    connected_at: now,
+                    last_heartbeat_at: now,
+                    last_update_at: now,
+                },
+                track_convergence,
+            );
 
         let mut stream_config = initial_config;
         let mut previous_slice = initial_slice;
@@ -754,8 +775,84 @@ impl MeshConfigSync for MeshGrpcServer {
             registry: self.registry.clone(),
             node_id,
             connected_at: now,
+            track_convergence,
         };
         Ok(Response::new(Box::pin(tracked)))
+    }
+
+    async fn report_mesh_slice_status(
+        &self,
+        request: Request<MeshSliceStatusReport>,
+    ) -> Result<Response<MeshSliceStatusResponse>, Status> {
+        let remote_discovery = false;
+        let (allowed, subject) = match verify_grpc_jwt_metadata_with_audience_and_subject(
+            request.metadata(),
+            self.verifier.as_ref(),
+            &self.expected_issuer,
+            self.audience_policy_for(remote_discovery),
+            request.extensions().get::<CpGrpcConnectInfo>(),
+        ) {
+            Ok(ok) => ok,
+            Err((status, audience_reason)) => {
+                if let Some(reason) = audience_reason {
+                    crate::plugins::mesh::prometheus_helpers::increment_mesh_subscribe_audience_rejection(
+                        "local",
+                        reason.as_metric_label(),
+                    );
+                    warn!(
+                        audit.event = "mesh_slice_status_audience_rejected",
+                        surface = "MeshConfigSync.ReportMeshSliceStatus",
+                        subscription_class = "local",
+                        reason = reason.as_metric_label(),
+                        "Refused ReportMeshSliceStatus: JWT audience does not match local mesh purpose"
+                    );
+                }
+                return Err(status);
+            }
+        };
+
+        let report = request.into_inner();
+        if report.node_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "ReportMeshSliceStatus node_id is required",
+            ));
+        }
+        if report.version.is_empty() {
+            return Err(Status::invalid_argument(
+                "ReportMeshSliceStatus version is required",
+            ));
+        }
+        if subject != report.node_id {
+            crate::plugins::mesh::prometheus_helpers::increment_mesh_slice_status_report(
+                MeshSliceStatusOutcome::IdentityMismatch.as_metric_label(),
+            );
+            return Err(Status::permission_denied(
+                "ReportMeshSliceStatus node_id does not match authenticated subject",
+            ));
+        }
+        // Unknown identities fail closed without creating tracker slots from
+        // unsolicited reports (`note_status_report` → UnknownIdentity).
+        let _allowed = allowed;
+
+        let rejected_reason = if report.applied {
+            None
+        } else if report.rejected_reason.trim().is_empty() {
+            Some("rejected")
+        } else {
+            Some(report.rejected_reason.as_str())
+        };
+        let outcome = self.registry.note_status_report(
+            &subject,
+            &report.node_id,
+            &report.version,
+            rejected_reason,
+        );
+        crate::plugins::mesh::prometheus_helpers::increment_mesh_slice_status_report(
+            outcome.as_metric_label(),
+        );
+        Ok(Response::new(MeshSliceStatusResponse {
+            outcome: outcome.as_metric_label().to_string(),
+        }))
     }
 }
 

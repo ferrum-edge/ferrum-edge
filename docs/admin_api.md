@@ -616,7 +616,38 @@ Returns all currently connected Data Plane nodes and Mesh nodes. Each registry i
       "status": "online",
       "connected_at": "2025-01-15T10:32:00Z",
       "last_heartbeat_at": "2025-01-15T10:34:30Z",
-      "last_sync_at": "2025-01-15T10:35:00Z"
+      "last_sync_at": "2025-01-15T10:35:00Z",
+      "slice_convergence": {
+        "node_id": "mesh-789",
+        "namespace": "ferrum",
+        "connected": true,
+        "desired_version": "2025-01-15T10:35:00Z",
+        "desired_age_seconds": 12,
+        "sent_version": "2025-01-15T10:35:00Z",
+        "sent_age_seconds": 12,
+        "acknowledged_version": "2025-01-15T10:35:00Z",
+        "acknowledged_age_seconds": 10,
+        "rejected_age_seconds": 0,
+        "converged": true
+      }
+    }
+  ],
+  "mesh_slice_published_version": "2025-01-15T10:35:00Z",
+  "mesh_slice_published_at": "2025-01-15T10:35:00Z",
+  "mesh_slice_convergence_retention_seconds": 900,
+  "mesh_slice_convergence": [
+    {
+      "node_id": "mesh-789",
+      "namespace": "ferrum",
+      "connected": true,
+      "desired_version": "2025-01-15T10:35:00Z",
+      "desired_age_seconds": 12,
+      "sent_version": "2025-01-15T10:35:00Z",
+      "sent_age_seconds": 12,
+      "acknowledged_version": "2025-01-15T10:35:00Z",
+      "acknowledged_age_seconds": 10,
+      "rejected_age_seconds": 0,
+      "converged": true
     }
   ]
 }
@@ -625,6 +656,7 @@ Returns all currently connected Data Plane nodes and Mesh nodes. Each registry i
 - **`status`** is always `online` — disconnected DPs and mesh nodes are automatically removed from their registries when their gRPC stream drops. Mesh nodes also send lightweight `MeshSubscribe` heartbeats; the CP reaps entries that stop producing stream activity for 5 minutes.
 - **`last_sync_at`** updates whenever the CP broadcasts a config update (full snapshot or delta) to that registry. DP and mesh broadcasts share the same database polling cycle, so the timestamps converge on every successful poll.
 - **`last_heartbeat_at`** is mesh-only and updates whenever the CP produces a mesh stream item for that node: the initial snapshot, a config delta/full snapshot, or a heartbeat.
+- **`mesh_slice_convergence`** (issue #3265) is the CP half of mesh-slice drift: bounded per authenticated mesh identity (`node_id` = JWT `sub`) desired/published, sent, acknowledged/applied, and rejected version metadata plus ages and a redacted rejection reason. Acknowledgements are accepted only when the report's `node_id` matches the JWT `sub` **and** `version` equals the exact last non-heartbeat version the CP sent to that identity — stale or forged reports never mark convergence. State survives disconnects for **`mesh_slice_convergence_retention_seconds`** (900 s / 15 minutes) so reconnecting DPs keep prior watermarks; expired retained identities are reaped. Identity count is capped (4096); rejection reasons are control-character-stripped and truncated to 128 bytes. Native mesh DPs report status over `MeshConfigSync.ReportMeshSliceStatus` after apply/reject. Aggregate, fixed-cardinality companions on authenticated `/metrics`: `ferrum_mesh_slice_status_reports_total{outcome}`, `ferrum_mesh_slice_convergence_identities`, and `ferrum_mesh_slice_convergence_diverged` (no per-node labels).
 
 ### DP Mode Response
 

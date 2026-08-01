@@ -52,6 +52,10 @@ static MESH_CONFIG_REVISION_ADOPTIONS: AtomicU64 = AtomicU64::new(0);
 static MESH_SUBSCRIBE_AUDIENCE_REJECTIONS: LazyLock<
     DashMap<MeshSubscribeAudienceRejectKey, AtomicU64>,
 > = LazyLock::new(DashMap::new);
+static MESH_SLICE_STATUS_REPORTS: LazyLock<DashMap<&'static str, AtomicU64>> =
+    LazyLock::new(DashMap::new);
+static MESH_SLICE_CONVERGENCE_IDENTITIES: AtomicU64 = AtomicU64::new(0);
+static MESH_SLICE_CONVERGENCE_DIVERGED: AtomicU64 = AtomicU64::new(0);
 static XDS_STREAMS_REJECTED: AtomicU64 = AtomicU64::new(0);
 static MESH_INBOUND_PLAINTEXT_ALLOWED: AtomicU64 = AtomicU64::new(0);
 static XDS_WARMING_PARTIAL_APPLIES: LazyLock<DashMap<Arc<str>, AtomicU64>> =
@@ -607,6 +611,27 @@ pub fn increment_mesh_subscribe_audience_rejection(
         .fetch_add(1, Ordering::Relaxed);
 }
 
+/// Count a CP-side `ReportMeshSliceStatus` outcome (issue #3265).
+///
+/// `outcome` is a compile-time closed set from
+/// [`MeshSliceStatusOutcome::as_metric_label`] — never a peer-supplied string —
+/// so `/metrics` cardinality stays fixed. Per-DP version detail stays on the
+/// JWT-authenticated `GET /cluster` mesh_slice_convergence block.
+pub fn increment_mesh_slice_status_report(outcome: &'static str) {
+    MESH_SLICE_STATUS_REPORTS
+        .entry(outcome)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Publish bounded CP mesh-slice convergence gauges (issue #3265).
+///
+/// Both values are aggregate counts with no per-node labels.
+pub fn set_mesh_slice_convergence_gauges(identities: u64, diverged: u64) {
+    MESH_SLICE_CONVERGENCE_IDENTITIES.store(identities, Ordering::Relaxed);
+    MESH_SLICE_CONVERGENCE_DIVERGED.store(diverged, Ordering::Relaxed);
+}
+
 /// Count a foreign config authority the DP adopted after the configured grace
 /// period (`FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`). Label-free on purpose:
 /// the adopted authority is a CP-supplied string.
@@ -852,6 +877,43 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
             ));
         }
     }
+
+    if !MESH_SLICE_STATUS_REPORTS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_slice_status_reports_total Control-plane MeshSlice status reports by closed-set outcome (applied/rejected/stale_version/unknown_version/unknown_identity/identity_mismatch).\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_slice_status_reports_total counter\n");
+        for entry in MESH_SLICE_STATUS_REPORTS.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_slice_status_reports_total{{outcome=\"{}\"{}}} {}\n",
+                escape_label_value(entry.key()),
+                gateway_ns_label,
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    output.push_str(
+        "# HELP ferrum_mesh_slice_convergence_identities Number of mesh identities retained in the CP slice-convergence tracker (connected plus retention window).\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_slice_convergence_identities gauge\n");
+    render_mesh_process_metric(
+        output,
+        "ferrum_mesh_slice_convergence_identities",
+        MESH_SLICE_CONVERGENCE_IDENTITIES.load(Ordering::Relaxed),
+        gateway_ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_mesh_slice_convergence_diverged Number of tracked mesh identities whose last sent slice version is not acknowledged.\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_slice_convergence_diverged gauge\n");
+    render_mesh_process_metric(
+        output,
+        "ferrum_mesh_slice_convergence_diverged",
+        MESH_SLICE_CONVERGENCE_DIVERGED.load(Ordering::Relaxed),
+        gateway_ns_label,
+    );
 
     output.push_str(
         "# HELP ferrum_mesh_config_revision_adoptions_total Foreign mesh config authorities adopted after the configured grace period.\n",
