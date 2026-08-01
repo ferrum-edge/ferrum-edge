@@ -4738,7 +4738,9 @@ impl Plugin for McpGateway {
         body: &[u8],
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> super::ResponseBodyTransformOutcome {
+        use super::ResponseBodyTransformOutcome;
+
         let retained_ceiling = ctx.retained_response_body_ceiling();
         let original_metadata_stamped = ctx
             .metadata
@@ -4767,7 +4769,7 @@ impl Plugin for McpGateway {
             || original_content_length
                 .is_none_or(|length| length > self.validation.max_upstream_response_bytes)
         {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
         if body.len() > self.validation.max_upstream_response_bytes {
             warn!(
@@ -4780,31 +4782,39 @@ impl Plugin for McpGateway {
                 actual_bytes = body.len(),
                 "Skipping MCP response rewrite because upstream JSON response exceeded size limit"
             );
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
         // Screen the exact upstream bytes before any serde materialization can
-        // collapse duplicate members. Returning `None` preserves those bytes
+        // collapse duplicate members. Returning Unchanged preserves those bytes
         // for the authoritative final hook, which will reject the same
         // ambiguity (reusing the bounded memo for larger bodies) when
         // outputSchema enforcement is active.
         if ctx.json_scan_memo.ambiguity(body).is_some() {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
 
-        let method = ctx.metadata.get(METADATA_RESPONSE_REWRITE_METHOD_KEY)?;
+        let Some(method) = ctx.metadata.get(METADATA_RESPONSE_REWRITE_METHOD_KEY) else {
+            return ResponseBodyTransformOutcome::Unchanged;
+        };
         if !matches!(
             method.as_str(),
             "resources/read" | "tools/call" | "prompts/get"
         ) {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
-        let server_id = ctx.metadata.get(METADATA_RESPONSE_REWRITE_SERVER_KEY)?;
-        let session_hash = ctx.metadata.get(METADATA_RESPONSE_REWRITE_SESSION_KEY)?;
-        let expected_catalog_version = ctx
+        let Some(server_id) = ctx.metadata.get(METADATA_RESPONSE_REWRITE_SERVER_KEY) else {
+            return ResponseBodyTransformOutcome::Unchanged;
+        };
+        let Some(session_hash) = ctx.metadata.get(METADATA_RESPONSE_REWRITE_SESSION_KEY) else {
+            return ResponseBodyTransformOutcome::Unchanged;
+        };
+        let Some(expected_catalog_version) = ctx
             .metadata
-            .get(METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY)?
-            .parse::<u64>()
-            .ok()?;
+            .get(METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY)
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return ResponseBodyTransformOutcome::Unchanged;
+        };
         let catalog_lock = self
             .session_catalogs_by_hash
             .get(session_hash)
@@ -4819,10 +4829,14 @@ impl Plugin for McpGateway {
         if !catalog_version_matches
             && (method != "resources/read" || ctx.mcp_response_resource_binding.is_none())
         {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
-        let mut value: Value = serde_json::from_slice(body).ok()?;
-        let result = value.get_mut("result")?;
+        let Some(mut value) = serde_json::from_slice::<Value>(body).ok() else {
+            return ResponseBodyTransformOutcome::Unchanged;
+        };
+        let Some(result) = value.get_mut("result") else {
+            return ResponseBodyTransformOutcome::Unchanged;
+        };
 
         let outcome = match method.as_str() {
             "resources/read" => rewrite_resource_read_result(
@@ -4834,18 +4848,33 @@ impl Plugin for McpGateway {
                     .map(|(upstream, public)| (upstream.as_str(), public.as_str())),
                 catalog_version_matches,
             ),
-            "tools/call" => rewrite_tool_call_result(result, catalog.as_deref()?, server_id),
-            "prompts/get" => rewrite_prompt_get_result(result, catalog.as_deref()?, server_id),
+            "tools/call" => {
+                let Some(catalog) = catalog.as_deref() else {
+                    return ResponseBodyTransformOutcome::Unchanged;
+                };
+                rewrite_tool_call_result(result, catalog, server_id)
+            }
+            "prompts/get" => {
+                let Some(catalog) = catalog.as_deref() else {
+                    return ResponseBodyTransformOutcome::Unchanged;
+                };
+                rewrite_prompt_get_result(result, catalog, server_id)
+            }
             _ => ResponseRewriteOutcome::Unchanged,
         };
         if outcome != ResponseRewriteOutcome::Changed {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
         // Serialized through a sink bounded by this response's retained ceiling
         // — the same size as the window the transform phase reserved — so an
         // amplifying rewrite is refused while it is written rather than after a
-        // larger buffer is resident (GHSA-pwcm-6rh8-f2gh).
-        crate::proxy::response_buffer_budget::bounded_json_vec(&value, retained_ceiling)
+        // larger buffer is resident (GHSA-pwcm-6rh8-f2gh). A refused write after
+        // the rewrite already changed policy state must fail closed, not
+        // forward the original upstream-native body.
+        match crate::proxy::response_buffer_budget::bounded_json_vec(&value, retained_ceiling) {
+            Some(bytes) => ResponseBodyTransformOutcome::Replaced(bytes),
+            None => ResponseBodyTransformOutcome::CapacityRefused,
+        }
     }
 
     fn on_response_body_transformed(

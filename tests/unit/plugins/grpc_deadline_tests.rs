@@ -587,7 +587,7 @@ impl Plugin for StalledResponseTransformer {
         _body: &[u8],
         _content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> ferrum_edge::plugins::ResponseBodyTransformOutcome {
         std::future::pending().await
     }
 }

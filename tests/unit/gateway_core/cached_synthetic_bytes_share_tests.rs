@@ -123,10 +123,10 @@ impl Plugin for RewriteBodyPlugin {
         body: &[u8],
         _content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> ferrum_edge::plugins::ResponseBodyTransformOutcome {
         let mut rewritten = body.to_vec();
         rewritten.extend_from_slice(b"|rewritten");
-        Some(rewritten)
+        ferrum_edge::plugins::ResponseBodyTransformOutcome::Replaced(rewritten)
     }
 }
 

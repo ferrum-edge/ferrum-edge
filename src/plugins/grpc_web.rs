@@ -1019,8 +1019,11 @@ impl GrpcWebPlugin {
     /// that are already charged — but the bound is ENFORCED rather than assumed:
     /// every append goes through the sink, which refuses the write that would
     /// carry the buffer past the retained ceiling instead of allocating it
-    /// (GHSA-pwcm-6rh8-f2gh). A refusal returns `None`, which the caller treats
-    /// as "no translation" and fails closed on.
+    /// (GHSA-pwcm-6rh8-f2gh). A capacity refusal returns
+    /// [`crate::plugins::ResponseBodyTransformOutcome::CapacityRefused`] so the
+    /// shared transform loop can install the body-framed capacity terminal
+    /// rather than treating the miss as an ordinary no-op (which would forward
+    /// a native body under the already-relabeled gRPC-Web Content-Type).
     fn transform_grpc_web_response_body(
         &self,
         body: &[u8],
@@ -1028,11 +1031,15 @@ impl GrpcWebPlugin {
         response_headers: &HashMap<String, String>,
         provenance: TrailerFrameProvenance,
         ceiling: usize,
-    ) -> Option<Vec<u8>> {
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
+        use crate::plugins::ResponseBodyTransformOutcome;
+
         // Only transform if response content-type is gRPC-Web (set by after_proxy)
-        let ct = response_headers.get("content-type")?;
+        let Some(ct) = response_headers.get("content-type") else {
+            return ResponseBodyTransformOutcome::Unchanged;
+        };
         if !is_grpc_web_content_type(ct) {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
 
         let is_text = is_grpc_web_text(ct);
@@ -1065,9 +1072,12 @@ impl GrpcWebPlugin {
         // produce identical bytes; the written length is re-checked below
         // anyway, so a disagreement fails closed instead of shipping a frame
         // whose declared length lies.
-        let payload_ceiling = binary_ceiling
-            .checked_sub(body.len())?
-            .checked_sub(GRPC_FRAME_HEADER_BYTES)?;
+        let Some(payload_ceiling) = binary_ceiling
+            .checked_sub(body.len())
+            .and_then(|room| room.checked_sub(GRPC_FRAME_HEADER_BYTES))
+        else {
+            return ResponseBodyTransformOutcome::CapacityRefused;
+        };
         let mut counted = CountingTrailerPayloadSink::with_ceiling(payload_ceiling);
         if !write_trailer_frame_payload(
             &mut counted,
@@ -1077,10 +1087,12 @@ impl GrpcWebPlugin {
             provenance.shadowed_trailers,
             provenance.policy_state,
         ) {
-            return None;
+            return ResponseBodyTransformOutcome::CapacityRefused;
         }
         let payload_len_usize = counted.len;
-        let payload_len = u32::try_from(payload_len_usize).ok()?;
+        let Ok(payload_len) = u32::try_from(payload_len_usize) else {
+            return ResponseBodyTransformOutcome::CapacityRefused;
+        };
         let mut frame_header = [0u8; GRPC_FRAME_HEADER_BYTES];
         frame_header[0] = GRPC_FRAME_TRAILER;
         frame_header[1..].copy_from_slice(&payload_len.to_be_bytes());
@@ -1096,26 +1108,32 @@ impl GrpcWebPlugin {
             {
                 use std::io::Write;
                 let mut encoder = base64::write::EncoderWriter::new(&mut output, &engine);
-                encoder.write_all(body).ok()?;
-                encoder.write_all(&frame_header).ok()?;
-                if !write_trailer_frame_payload(
-                    &mut WriterTrailerPayloadSink(&mut encoder),
-                    response_headers,
-                    provenance.http_status,
-                    provenance.trailer_name_allowlist,
-                    provenance.shadowed_trailers,
-                    provenance.policy_state,
-                ) {
-                    return None;
+                if encoder.write_all(body).is_err()
+                    || encoder.write_all(&frame_header).is_err()
+                    || !write_trailer_frame_payload(
+                        &mut WriterTrailerPayloadSink(&mut encoder),
+                        response_headers,
+                        provenance.http_status,
+                        provenance.trailer_name_allowlist,
+                        provenance.shadowed_trailers,
+                        provenance.policy_state,
+                    )
+                    || encoder.finish().is_err()
+                {
+                    return ResponseBodyTransformOutcome::CapacityRefused;
                 }
-                encoder.finish().ok()?;
             }
-            let encoded = output.finish()?;
+            let Some(encoded) = output.finish() else {
+                return ResponseBodyTransformOutcome::CapacityRefused;
+            };
             // Padded standard base64 is a pure function of the preimage length,
             // so this proves the writing pass emitted exactly the payload the
             // counting pass declared in the frame header.
-            if encoded.len() != binary_len.div_ceil(3).checked_mul(4)? {
-                return None;
+            let Some(expected_len) = binary_len.div_ceil(3).checked_mul(4) else {
+                return ResponseBodyTransformOutcome::CapacityRefused;
+            };
+            if encoded.len() != expected_len {
+                return ResponseBodyTransformOutcome::CapacityRefused;
             }
             debug!(
                 plugin = "grpc_web",
@@ -1124,11 +1142,11 @@ impl GrpcWebPlugin {
                 encoded_len = encoded.len(),
                 "Base64-encoded gRPC-Web text response body"
             );
-            Some(encoded)
+            ResponseBodyTransformOutcome::Replaced(encoded)
         } else {
             for segment in [body, &frame_header[..]] {
                 if !output.push(segment) {
-                    return None;
+                    return ResponseBodyTransformOutcome::CapacityRefused;
                 }
             }
             if !write_trailer_frame_payload(
@@ -1139,19 +1157,21 @@ impl GrpcWebPlugin {
                 provenance.shadowed_trailers,
                 provenance.policy_state,
             ) {
-                return None;
+                return ResponseBodyTransformOutcome::CapacityRefused;
             }
             if output.len() != binary_len {
-                return None;
+                return ResponseBodyTransformOutcome::CapacityRefused;
             }
-            let framed = output.finish()?;
+            let Some(framed) = output.finish() else {
+                return ResponseBodyTransformOutcome::CapacityRefused;
+            };
             debug!(
                 plugin = "grpc_web",
                 instance = %self.instance_id_str,
                 body_len = framed.len(),
                 "Built gRPC-Web binary response with trailer frame"
             );
-            Some(framed)
+            ResponseBodyTransformOutcome::Replaced(framed)
         }
     }
 }
@@ -4126,7 +4146,7 @@ impl Plugin for GrpcWebPlugin {
         body: &[u8],
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
         // Legacy/no-context path used by focused framing unit tests. Production
         // buffering calls `transform_response_body_with_context`, which enforces
         // owner + exactly-once translation and applies backend-trailer provenance.
@@ -4150,14 +4170,16 @@ impl Plugin for GrpcWebPlugin {
         body: &[u8],
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
+        use crate::plugins::ResponseBodyTransformOutcome;
+
         // Non-owners and already-translated bodies must not append another
         // trailer frame or re-base64-encode text mode output.
         if !self.is_translation_owner(ctx) {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
         if ctx.metadata.contains_key(META_GRPC_WEB_RESPONSE_TRANSLATED) {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
         // Fail closed: do not invent a gRPC-Web body from content-type alone
         // when owner mode staging is missing or malformed.
@@ -4167,7 +4189,7 @@ impl Plugin for GrpcWebPlugin {
                 instance = %self.instance_id_str,
                 "Fail closed: refusing response translation without valid mode staging"
             );
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
 
         let http_status = ctx
@@ -4194,11 +4216,17 @@ impl Plugin for GrpcWebPlugin {
                 policy_state: ctx.buffered_initial_response_header_policy(),
             },
             ctx.retained_response_body_ceiling(),
-        )?;
-        ctx.metadata.insert(
-            META_GRPC_WEB_RESPONSE_TRANSLATED.to_string(),
-            self.instance_id_str.clone(),
         );
-        Some(translated)
+        match &translated {
+            ResponseBodyTransformOutcome::Replaced(_) => {
+                ctx.metadata.insert(
+                    META_GRPC_WEB_RESPONSE_TRANSLATED.to_string(),
+                    self.instance_id_str.clone(),
+                );
+            }
+            ResponseBodyTransformOutcome::Unchanged
+            | ResponseBodyTransformOutcome::CapacityRefused => {}
+        }
+        translated
     }
 }

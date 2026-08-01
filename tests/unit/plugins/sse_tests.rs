@@ -853,7 +853,7 @@ async fn test_wrap_and_force_compose_through_body_transform() {
     let body = br#"{"message":"hello"}"#;
     let transformed = plugin
         .transform_response_body_with_context(&mut ctx, body, Some("text/event-stream"), &headers)
-        .await
+        .await.replaced_bytes()
         .expect("wrap+force must still frame the body");
     assert_eq!(
         String::from_utf8(transformed).unwrap(),
@@ -887,7 +887,7 @@ async fn test_multiple_sse_instances_wrap_once_and_merge_cache_control_idempoten
     let body = br#"{"message":"hello"}"#;
     let transformed = first
         .transform_response_body_with_context(&mut ctx, body, Some("text/event-stream"), &headers)
-        .await
+        .await.replaced_bytes()
         .expect("the first wrapper must consume the original response decision");
     assert!(
         !ctx.metadata.contains_key("sse:wrap_non_sse"),
@@ -901,7 +901,7 @@ async fn test_multiple_sse_instances_wrap_once_and_merge_cache_control_idempoten
             Some("text/event-stream"),
             &headers,
         )
-        .await;
+        .await.replaced_bytes();
     assert!(
         repeated.is_none(),
         "a later SSE instance must not double-wrap"
@@ -932,12 +932,12 @@ async fn test_force_only_instance_before_wrapper_preserves_original_non_sse_prov
                 Some("text/event-stream"),
                 &headers,
             )
-            .await
+            .await.replaced_bytes()
             .is_none()
     );
     let transformed = wrapping
         .transform_response_body_with_context(&mut ctx, body, Some("text/event-stream"), &headers)
-        .await
+        .await.replaced_bytes()
         .expect("a later wrapper must honor the original non-SSE provenance");
 
     assert_eq!(
@@ -963,7 +963,7 @@ async fn test_genuine_sse_is_not_double_wrapped_after_lifecycle() {
     let body = b"data: already sse\n\n";
     let result = plugin
         .transform_response_body_with_context(&mut ctx, body, Some("text/event-stream"), &headers)
-        .await;
+        .await.replaced_bytes();
     assert!(result.is_none(), "genuine SSE must not be double-wrapped");
 }
 
@@ -1029,7 +1029,7 @@ async fn test_wrap_json_body_as_sse_event() {
 
     let result = plugin
         .transform_response_body(body, Some("application/json"), &headers)
-        .await;
+        .await.replaced_bytes();
 
     let transformed = result.expect("should wrap body");
     let output = String::from_utf8(transformed).unwrap();
@@ -1044,7 +1044,7 @@ async fn test_wrap_multiline_body_as_sse_event() {
 
     let result = plugin
         .transform_response_body(body, Some("text/plain"), &headers)
-        .await;
+        .await.replaced_bytes();
 
     let transformed = result.expect("should wrap body");
     let output = String::from_utf8(transformed).unwrap();
@@ -1062,7 +1062,7 @@ async fn test_wrap_includes_retry_field() {
 
     let result = plugin
         .transform_response_body(body, Some("text/plain"), &headers)
-        .await;
+        .await.replaced_bytes();
 
     let transformed = result.expect("should wrap body");
     let output = String::from_utf8(transformed).unwrap();
@@ -1077,7 +1077,7 @@ async fn test_does_not_wrap_already_sse_body() {
 
     let result = plugin
         .transform_response_body(body, Some("text/event-stream"), &headers)
-        .await;
+        .await.replaced_bytes();
 
     assert!(result.is_none(), "should not double-wrap SSE body");
 }
@@ -1090,7 +1090,7 @@ async fn test_wraps_sse_like_content_type_body() {
 
     let result = plugin
         .transform_response_body(body, Some("text/event-stream-like"), &headers)
-        .await;
+        .await.replaced_bytes();
 
     let transformed = result.expect("sse-like content type should not suppress wrapping");
     assert_eq!(
@@ -1107,7 +1107,7 @@ async fn test_does_not_wrap_when_disabled() {
 
     let result = plugin
         .transform_response_body(body, Some("application/json"), &headers)
-        .await;
+        .await.replaced_bytes();
 
     assert!(result.is_none());
 }
@@ -1119,7 +1119,7 @@ async fn test_does_not_wrap_empty_body() {
 
     let result = plugin
         .transform_response_body(b"", Some("application/json"), &headers)
-        .await;
+        .await.replaced_bytes();
 
     assert!(result.is_none());
 }
@@ -1139,7 +1139,7 @@ async fn test_wrap_lone_cr_does_not_inject_sse_fields() {
 
     let result = plugin
         .transform_response_body(body, Some("application/json"), &headers)
-        .await;
+        .await.replaced_bytes();
 
     let transformed = result.expect("should wrap body");
     let output = String::from_utf8(transformed).unwrap();
@@ -1179,11 +1179,11 @@ async fn test_wrap_crlf_and_lf_produce_identical_framing() {
 
     let crlf = plugin
         .transform_response_body(b"a\r\nb\r\nc", Some("text/plain"), &headers)
-        .await
+        .await.replaced_bytes()
         .expect("should wrap body");
     let lf = plugin
         .transform_response_body(b"a\nb\nc", Some("text/plain"), &headers)
-        .await
+        .await.replaced_bytes()
         .expect("should wrap body");
 
     assert_eq!(crlf, lf, "CRLF and LF bodies must frame identically");
@@ -1214,7 +1214,7 @@ async fn test_wrap_preserves_terminal_line_breaks() {
     for (body, expected_data) in cases {
         let framed = plugin
             .transform_response_body(body, Some("text/plain"), &headers)
-            .await
+            .await.replaced_bytes()
             .unwrap_or_else(|| panic!("should wrap {:?}", std::str::from_utf8(body)));
         let wire = String::from_utf8(framed).unwrap();
         assert!(
@@ -1341,7 +1341,7 @@ async fn wrap_body_once(config: serde_json::Value, body: &[u8]) -> Option<Vec<u8
     plugin.after_proxy(&mut ctx, 200, &mut headers).await;
     plugin
         .transform_response_body_with_context(&mut ctx, body, Some("text/event-stream"), &headers)
-        .await
+        .await.replaced_bytes()
 }
 
 #[tokio::test]
@@ -1429,7 +1429,7 @@ async fn test_wrap_is_refused_while_it_is_written_when_it_exceeds_the_ceiling() 
             Some("text/event-stream"),
             &headers,
         )
-        .await;
+        .await.replaced_bytes();
     assert!(
         wrapped.is_none(),
         "an over-ceiling framed event must be refused, leaving the original \

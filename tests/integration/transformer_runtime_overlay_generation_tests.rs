@@ -296,7 +296,7 @@ async fn observe_response(plugin: &std::sync::Arc<dyn Plugin>) -> (bool, bool, b
     let header_applied = headers.contains_key("x-redacted");
     let body_applied = plugin
         .transform_response_body(BODY, Some("application/json"), &headers)
-        .await
+        .await.replaced_bytes()
         .is_some_and(|body| !String::from_utf8_lossy(&body).contains("secret"));
     (buffers, header_applied, body_applied)
 }

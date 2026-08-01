@@ -952,7 +952,7 @@ async fn redacts_matched_args_and_never_leaks_secret_in_metadata() {
             Some("application/json"),
             &json_headers(),
         )
-        .await
+        .await.replaced_bytes()
         .expect("body is rewritten");
     let text = String::from_utf8(transformed).unwrap();
     assert!(!text.contains("SUPERSECRET"), "secret leaked: {text}");
@@ -1012,7 +1012,7 @@ async fn redaction_memos_distinguish_embedded_nul_boundaries() {
             Some("application/json"),
             &json_headers(),
         )
-        .await
+        .await.replaced_bytes()
         .expect("both tool calls require redaction");
     let json: Value = serde_json::from_slice(&transformed).expect("transformed response JSON");
     let calls = json["choices"][0]["message"]["tool_calls"]
@@ -1067,7 +1067,7 @@ async fn redacts_non_string_response_arguments_before_forwarding() {
             Some("application/json"),
             &json_headers(),
         )
-        .await
+        .await.replaced_bytes()
         .expect("structured arguments are redacted");
     let text = String::from_utf8(transformed).unwrap();
     assert!(!text.contains("STRUCTUREDSECRET"), "secret leaked: {text}");
@@ -1114,7 +1114,7 @@ async fn relabeled_json_shaped_response_is_still_redacted_by_transform() {
     // The redaction transform must also apply despite the non-JSON label.
     let transformed = plugin
         .transform_response_body_with_context(&mut ctx, &body, Some("text/html"), &html)
-        .await
+        .await.replaced_bytes()
         .expect("relabeled governed body is rewritten");
     let text = String::from_utf8(transformed.clone()).unwrap();
     assert!(!text.contains("RELABELEDSECRET"), "secret leaked: {text}");
@@ -1141,7 +1141,7 @@ async fn relabeled_json_shaped_response_is_still_redacted_by_transform() {
     assert!(
         plugin
             .transform_response_body_with_context(&mut fresh, &body, Some("text/html"), &html)
-            .await
+            .await.replaced_bytes()
             .is_none()
     );
 }
@@ -1168,7 +1168,7 @@ async fn dry_run_does_not_mutate_response_arguments() {
                 Some("application/json"),
                 &json_headers()
             )
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "dry-run must not mutate the delivered response body"
     );
@@ -1196,7 +1196,7 @@ async fn response_transform_respects_response_tool_calls_toggle() {
                 Some("application/json"),
                 &json_headers()
             )
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "response transform must be disabled when response_tool_calls=false"
     );
@@ -4078,7 +4078,7 @@ async fn redaction_does_not_trigger_duplicate_approval_on_final() {
             Some("application/json"),
             &json_headers(),
         )
-        .await
+        .await.replaced_bytes()
         .expect("redacted body");
     assert!(!String::from_utf8_lossy(&transformed).contains("sk-SECRET123"));
     // Final re-check sees the redacted body → matches updated hash → skip.
@@ -4116,7 +4116,7 @@ async fn redaction_placeholder_not_reflagged_on_final() {
             Some("application/json"),
             &json_headers(),
         )
-        .await
+        .await.replaced_bytes()
         .expect("redacted body");
     // The placeholder embeds "token" but the final re-check must forward, not 502.
     assert_continue(
@@ -4334,7 +4334,7 @@ async fn later_transform_does_not_reflag_redacted_call() {
             Some("application/json"),
             &json_headers(),
         )
-        .await
+        .await.replaced_bytes()
         .expect("redacted body");
     // A later response_transformer adds an unrelated field, changing the body
     // hash but leaving the redacted call unchanged.
@@ -4375,7 +4375,7 @@ async fn model_only_transform_does_not_reflag_redacted_call() {
             Some("application/json"),
             &json_headers(),
         )
-        .await
+        .await.replaced_bytes()
         .expect("redacted body");
 
     let mut val: Value = serde_json::from_slice(&redacted).unwrap();
@@ -4692,7 +4692,7 @@ async fn non_2xx_json_error_body_is_not_rewritten_by_transform() {
                 Some("application/json"),
                 &json_headers()
             )
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "non-2xx error body must not be silently modified"
     );
@@ -7087,7 +7087,7 @@ async fn oversized_framed_grpc_buffered_response_is_untouched() {
             Some("application/grpc+json"),
             &HashMap::new(),
         )
-        .await;
+        .await.replaced_bytes();
     assert!(rewritten.is_none(), "framed gRPC must never be rewritten");
 }
 
@@ -8332,7 +8332,7 @@ async fn redact_args_transform_invalidates_stale_response_validators() {
                 Some("application/json"),
                 &clean_headers,
             )
-            .await
+            .await.replaced_bytes()
             .is_none()
     );
     assert_eq!(clean_headers, original_headers);
@@ -8354,7 +8354,7 @@ async fn redact_args_transform_invalidates_stale_response_validators() {
             Some("application/json"),
             &original_headers,
         )
-        .await
+        .await.replaced_bytes()
         .expect("redact_args must rewrite the body");
     assert!(
         !String::from_utf8_lossy(&rewritten).contains("sk-secret123"),
@@ -9285,7 +9285,7 @@ async fn redact_args_amplification_clears_hash_on_transform() {
                 Some("application/json"),
                 &json_headers(),
             )
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "amplifying redact must decline the rewrite"
     );
@@ -9337,7 +9337,7 @@ async fn transform_response_ambiguous_body_clears_hash_via_memo_screen() {
                 Some("application/json"),
                 &json_headers(),
             )
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "ambiguous transform body must decline rewrite"
     );
@@ -9392,7 +9392,7 @@ async fn aggregate_redacted_arguments_cannot_exceed_response_limit() {
                 Some("application/json"),
                 &json_headers(),
             )
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "aggregate redaction past 4 MiB must not be emitted"
     );
@@ -9425,7 +9425,7 @@ async fn serialized_redaction_overhead_cannot_exceed_response_limit() {
                 Some("application/json"),
                 &json_headers(),
             )
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "serialized body past 4 MiB must not be emitted"
     );
@@ -9466,7 +9466,7 @@ async fn buffered_legacy_function_call_redact_args_rewrites() {
             Some("application/json"),
             &json_headers(),
         )
-        .await
+        .await.replaced_bytes()
         .expect("legacy function_call redact must rewrite");
     let text = String::from_utf8(rewritten).unwrap();
     assert!(!text.contains("sk-legacysecret99"), "secret leaked: {text}");
@@ -9495,7 +9495,7 @@ async fn buffered_legacy_function_call_redact_amplification_fails_closed() {
                 Some("application/json"),
                 &json_headers(),
             )
-            .await
+            .await.replaced_bytes()
             .is_none()
     );
 }
@@ -9604,7 +9604,7 @@ async fn redact_transform_leaves_non_redactable_shapes_unchanged() {
                     Some("application/json"),
                     &json_headers(),
                 )
-                .await
+                .await.replaced_bytes()
                 .is_none(),
             "probe should be a no-op: {probe}"
         );

@@ -220,13 +220,15 @@ impl ResponseTransformer {
         body: &[u8],
         content_type: Option<&str>,
         ceiling: usize,
-    ) -> Option<Vec<u8>> {
+    ) -> super::ResponseBodyTransformOutcome {
+        use super::ResponseBodyTransformOutcome;
+
         if !self.rules_enabled {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
         // Framed gRPC is declined explicitly rather than left to fail inside
-        // `apply_body_rules`. Both routes return `None`, but only the explicit
-        // decline makes the media-type condition here symmetric with
+        // `apply_body_rules`. Both routes return Unchanged, but only the
+        // explicit decline makes the media-type condition here symmetric with
         // `enforces_response_body_policy` by construction, so the claim
         // predicate and the enforcer cannot drift apart on the `+json` gRPC
         // types that satisfy `is_json_content_type`.
@@ -234,7 +236,7 @@ impl ResponseTransformer {
             && (!body_transform::is_json_content_type(ct)
                 || body_transform::is_framed_grpc_content_type(ct))
         {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
         body_transform::apply_body_rules_bounded(body, &self.body_rules, ceiling)
     }
@@ -1343,24 +1345,26 @@ impl Plugin for ResponseTransformer {
         body: &[u8],
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> super::ResponseBodyTransformOutcome {
+        use super::ResponseBodyTransformOutcome;
+
         // Defense in depth: the shared synthetic path already skips ordinary
         // presentation transforms when `finalized_response_replay` is set.
-        // Returning `None` here keeps direct callers from re-mutating a cached
-        // final body if they forget that gate.
+        // Returning Unchanged here keeps direct callers from re-mutating a
+        // cached final body if they forget that gate.
         if ctx.finalized_response_replay {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
         if framed_grpc_request_without_proven_media_type(ctx, body) {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
         // Same resolution the claim predicate applies, for the same reason and
         // over the same bytes: an unproven post-hook/translation-added framed
         // gRPC label must not make the enforcer decline what the claim just
         // claimed. Dropping it here restores the untyped branch, so
         // `apply_body_rules` actually runs — and a body that is not a parseable
-        // document still returns `None` into the gate's fail-closed rejection
-        // instead of being forwarded unredacted.
+        // document still returns Unchanged into the gate's fail-closed
+        // rejection instead of being forwarded unredacted.
         let content_type = effective_response_media_type(ctx, content_type, body);
         // The rewritten document is serialized through a sink bounded by THIS
         // response's retained ceiling — the same size as the window the phase
@@ -1383,7 +1387,7 @@ impl Plugin for ResponseTransformer {
         body: &[u8],
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> super::ResponseBodyTransformOutcome {
         self.apply_response_body_rules(
             body,
             content_type,
@@ -1404,7 +1408,7 @@ impl Plugin for ResponseTransformer {
         // pre-rewrite bytes. Last-Modified is dropped (not rewritten) because it
         // names when the origin representation changed, not the gateway-authored
         // JSON rewrite. The proxy calls this only after `transform_response_body`
-        // returns `Some`, so parse failures and semantic no-ops keep origin
+        // returns Replaced, so parse failures and semantic no-ops keep origin
         // validators.
         super::invalidate_content_bound_response_headers(response_headers);
     }

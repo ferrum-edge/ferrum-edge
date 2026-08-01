@@ -626,8 +626,16 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
 /// actually changed the body.
 ///
 /// Content-type is checked by the caller — this function assumes JSON input.
+///
+/// Request-side callers keep this `Option` contract: a serialize/ceiling
+/// refusal of a modified document still returns `None` so the original request
+/// body is left unchanged (request bounds live on the request-body ceilings).
 pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
-    apply_body_rules_bounded(body, rules, usize::MAX)
+    match apply_body_rules_bounded(body, rules, usize::MAX) {
+        crate::plugins::ResponseBodyTransformOutcome::Replaced(bytes) => Some(bytes),
+        crate::plugins::ResponseBodyTransformOutcome::Unchanged
+        | crate::plugins::ResponseBodyTransformOutcome::CapacityRefused => None,
+    }
 }
 
 /// [`apply_body_rules`] with an explicit ceiling on the produced document.
@@ -636,22 +644,30 @@ pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
 /// JSON is serialized THROUGH a bounded sink: a rule set that amplifies a
 /// document past what the gateway reserved for it fails while the output is
 /// being written, instead of materialising a larger `Vec` that is only rejected
-/// afterwards (GHSA-pwcm-6rh8-f2gh). The request side keeps `usize::MAX`; its
-/// bounds live on the request-body ceilings.
+/// afterwards (GHSA-pwcm-6rh8-f2gh). The request side keeps `usize::MAX` via
+/// [`apply_body_rules`]; its bounds live on the request-body ceilings.
+///
+/// When rules actually change the document but serialization cannot finish
+/// within `ceiling`, this returns
+/// [`crate::plugins::ResponseBodyTransformOutcome::CapacityRefused`] rather than
+/// an ordinary no-op — response producers must fail closed instead of
+/// forwarding the original body.
 pub fn apply_body_rules_bounded(
     body: &[u8],
     rules: &[BodyRule],
     ceiling: usize,
-) -> Option<Vec<u8>> {
+) -> crate::plugins::ResponseBodyTransformOutcome {
+    use crate::plugins::ResponseBodyTransformOutcome;
+
     if rules.is_empty() || body.is_empty() {
-        return None;
+        return ResponseBodyTransformOutcome::Unchanged;
     }
 
     let mut json: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
             debug!("body_transform: failed to parse body as JSON: {}", e);
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
     };
 
@@ -702,17 +718,18 @@ pub fn apply_body_rules_bounded(
 
     if modified {
         match crate::proxy::response_buffer_budget::bounded_json_vec(&json, ceiling) {
-            Some(bytes) => Some(bytes),
+            Some(bytes) => ResponseBodyTransformOutcome::Replaced(bytes),
             None => {
                 // Either the document did not serialize or it would have grown
-                // past the ceiling. Both leave the body unchanged; neither logs
-                // body content.
+                // past the ceiling. Response producers treat both as capacity
+                // refusal so a configured rewrite cannot silently forward the
+                // original body. Neither logs body content.
                 debug!("body_transform: transformed body was not serialized within its ceiling");
-                None
+                ResponseBodyTransformOutcome::CapacityRefused
             }
         }
     } else {
-        None
+        ResponseBodyTransformOutcome::Unchanged
     }
 }
 

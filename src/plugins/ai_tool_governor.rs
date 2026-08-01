@@ -3213,7 +3213,7 @@ impl Plugin for AiToolGovernor {
         body: &[u8],
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
         // Context-aware so the redaction path is gated the same way as the
         // governance path: a streaming-only config redacts a JSON body only for
         // a streaming request's SSE fallback, not an ordinary JSON response.
@@ -3222,7 +3222,7 @@ impl Plugin for AiToolGovernor {
             || self.engine.mode == Mode::DryRun
             || !self.governs_buffered_json(ctx)
         {
-            return None;
+            return crate::plugins::ResponseBodyTransformOutcome::Unchanged;
         }
         // Framed gRPC/gRPC-Web is out of scope (same gate as the buffered
         // hooks): defense in depth — `on_response_body` no longer records the
@@ -3230,7 +3230,7 @@ impl Plugin for AiToolGovernor {
         // already declines, but a rewrite of framed wire bytes must never be
         // possible even if that changes.
         if content_type.is_some_and(is_framed_grpc_content_type) {
-            return None;
+            return crate::plugins::ResponseBodyTransformOutcome::Unchanged;
         }
         // Redaction rewrites only bodies this plugin actually governed in
         // `on_response_body` (the governed-response hash marker is recorded
@@ -3239,7 +3239,9 @@ impl Plugin for AiToolGovernor {
         // e.g. a backend 4xx/5xx JSON error whose shape happens to contain
         // `choices[].message.tool_calls[]`, which `on_response_body` skips as
         // non-2xx before recording the hash.
-        self.response_hash(ctx)?;
+        if self.response_hash(ctx).is_none() {
+            return crate::plugins::ResponseBodyTransformOutcome::Unchanged;
+        }
         // Mirror the `looks_like_json` fallback in `on_response_body`: a header
         // rule can strip/relabel `Content-Type: application/json` before this
         // transform runs while leaving the governed JSON intact. Redaction must
@@ -3248,10 +3250,10 @@ impl Plugin for AiToolGovernor {
         // governed hash.
         let json_ct = content_type.is_some_and(is_json_content_type);
         if !json_ct && !looks_like_json(body) {
-            return None;
+            return crate::plugins::ResponseBodyTransformOutcome::Unchanged;
         }
         if body.is_empty() || body.len() > MAX_PARSE_BYTES {
-            return None;
+            return crate::plugins::ResponseBodyTransformOutcome::Unchanged;
         }
         // Strip a leading BOM (same as the governance parse) so a BOM-prefixed
         // governed body — now inspected by `on_response_body` — is also
@@ -3270,7 +3272,7 @@ impl Plugin for AiToolGovernor {
         if ctx.json_scan_memo.ambiguity(strip_json_bom(body)).is_some() {
             self.clear_response_hash(ctx);
             ctx.ai_tool_governor_call_hashes.remove(&self.instance_id);
-            return None;
+            return crate::plugins::ResponseBodyTransformOutcome::Unchanged;
         }
         let mut json: Value = serde_json::from_slice(strip_json_bom(body)).ok()?;
         // The redacted document is serialized through a sink bounded by this
@@ -3295,7 +3297,7 @@ impl Plugin for AiToolGovernor {
                         // and let the terminal re-check fail closed.
                         self.clear_response_hash(ctx);
                         ctx.ai_tool_governor_call_hashes.remove(&self.instance_id);
-                        return None;
+                        return crate::plugins::ResponseBodyTransformOutcome::Unchanged;
                     }
                 };
                 // Record the redacted body's hash so `on_final_response_body` treats
@@ -3315,7 +3317,7 @@ impl Plugin for AiToolGovernor {
                     .map(str::to_string);
                 let corr = self.correlation(ctx, model, provider.as_deref());
                 self.record_governed_calls(ctx, &corr, &extract_response_tool_calls(&json).0);
-                Some(rewritten)
+                crate::plugins::ResponseBodyTransformOutcome::Replaced(rewritten)
             }
             RedactTransform::AmplificationFailed => {
                 // Do not forward unredacted secrets under a skipped final
@@ -3324,9 +3326,9 @@ impl Plugin for AiToolGovernor {
                 // unavailable and fails closed.
                 self.clear_response_hash(ctx);
                 ctx.ai_tool_governor_call_hashes.remove(&self.instance_id);
-                None
+                crate::plugins::ResponseBodyTransformOutcome::Unchanged
             }
-            RedactTransform::Unchanged => None,
+            RedactTransform::Unchanged => crate::plugins::ResponseBodyTransformOutcome::Unchanged,
         }
     }
 

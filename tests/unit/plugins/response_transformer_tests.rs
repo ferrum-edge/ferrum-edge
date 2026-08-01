@@ -388,7 +388,7 @@ async fn test_response_transformer_body_rename_field() {
     let body = br#"{"old_name":"Alice","age":30}"#;
     let result = plugin
         .transform_response_body(body, Some("application/json"), &HashMap::new())
-        .await;
+        .await.replaced_bytes();
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["new_name"], "Alice");
     assert!(transformed.get("old_name").is_none());
@@ -406,7 +406,7 @@ async fn test_response_transformer_body_rename_nested_field() {
     let body = br#"{"data":{"old_field":"value","other":"keep"}}"#;
     let result = plugin
         .transform_response_body(body, Some("application/json"), &HashMap::new())
-        .await;
+        .await.replaced_bytes();
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["data"]["new_field"], "value");
     assert!(transformed["data"].get("old_field").is_none());
@@ -425,7 +425,7 @@ async fn test_response_transformer_body_remove_field() {
     let body = br#"{"data":"public","internal":{"debug_info":"secret","id":"keep"}}"#;
     let result = plugin
         .transform_response_body(body, Some("application/json"), &HashMap::new())
-        .await;
+        .await.replaced_bytes();
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["data"], "public");
     assert!(transformed["internal"].get("debug_info").is_none());
@@ -444,7 +444,7 @@ async fn test_response_transformer_body_add_field() {
     let body = br#"{"data":"response"}"#;
     let result = plugin
         .transform_response_body(body, Some("application/json"), &HashMap::new())
-        .await;
+        .await.replaced_bytes();
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["data"], "response");
     assert_eq!(transformed["gateway_version"], 1.0);
@@ -462,7 +462,7 @@ async fn test_response_transformer_body_update_field() {
     let body = br#"{"status":"pending","data":"result"}"#;
     let result = plugin
         .transform_response_body(body, Some("application/json"), &HashMap::new())
-        .await;
+        .await.replaced_bytes();
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["status"], "processed");
     assert_eq!(transformed["data"], "result");
@@ -482,7 +482,7 @@ async fn test_response_transformer_body_multiple_rules() {
     let body = br#"{"resp_data":"payload","internal_trace_id":"abc123"}"#;
     let result = plugin
         .transform_response_body(body, Some("application/json"), &HashMap::new())
-        .await;
+        .await.replaced_bytes();
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["data"], "payload");
     assert!(transformed.get("resp_data").is_none());
@@ -516,7 +516,7 @@ async fn test_response_transformer_body_mixed_header_and_body_rules() {
     let body = br#"{"old_field":"data"}"#;
     let body_result = plugin
         .transform_response_body(body, Some("application/json"), &HashMap::new())
-        .await;
+        .await.replaced_bytes();
     let transformed: serde_json::Value = serde_json::from_slice(&body_result.unwrap()).unwrap();
     assert_eq!(transformed["new_field"], "data");
 }
@@ -533,7 +533,7 @@ async fn test_response_transformer_body_non_json_skipped() {
     let body = b"<xml>not json</xml>";
     let result = plugin
         .transform_response_body(body, Some("text/html"), &HashMap::new())
-        .await;
+        .await.replaced_bytes();
     assert!(result.is_none());
 }
 
@@ -562,7 +562,7 @@ async fn test_response_transformer_body_deeply_nested() {
     let body = br#"{"a":{"b":{"c":{"old":"deep_value","keep":"yes"}}}}"#;
     let result = plugin
         .transform_response_body(body, Some("application/json"), &HashMap::new())
-        .await;
+        .await.replaced_bytes();
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["a"]["b"]["c"]["new"], "deep_value");
     assert!(transformed["a"]["b"]["c"].get("old").is_none());
@@ -581,7 +581,7 @@ async fn test_response_transformer_body_vnd_json_content_type() {
     let body = br#"{"data":"value"}"#;
     let result = plugin
         .transform_response_body(body, Some("application/vnd.api+json"), &HashMap::new())
-        .await;
+        .await.replaced_bytes();
     let transformed: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
     assert_eq!(transformed["processed"], true);
 }
@@ -822,7 +822,7 @@ async fn test_response_transformer_body_array_index() {
     let body = br#"{"items":[{"name":"a"},{"name":"b"}]}"#;
     let out = plugin
         .transform_response_body(body, Some("application/json"), &HashMap::new())
-        .await
+        .await.replaced_bytes()
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(parsed["items"][0]["name"], "a");
@@ -840,7 +840,7 @@ async fn test_response_transformer_body_remove_array_element() {
     let body = br#"{"items":[{"id":1},{"id":2}]}"#;
     let out = plugin
         .transform_response_body(body, Some("application/json"), &HashMap::new())
-        .await
+        .await.replaced_bytes()
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(parsed["items"].as_array().unwrap().len(), 1);
@@ -1039,7 +1039,7 @@ async fn test_response_transformer_body_update_null_value() {
     let body = br#"{"error":"timeout"}"#;
     let out = plugin
         .transform_response_body(body, Some("application/json"), &HashMap::new())
-        .await
+        .await.replaced_bytes()
         .expect("body should be modified");
     let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert!(parsed["error"].is_null());
@@ -1681,7 +1681,7 @@ async fn test_response_transformer_disabled_overlay_skips_response_buffering() {
     assert!(
         disabled
             .transform_response_body(br#"{"old":"v"}"#, Some("application/json"), &HashMap::new())
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "the phase that would have consumed the buffer must agree it is disabled"
     );
@@ -1738,7 +1738,7 @@ async fn body_rewrite_hook_strips_stale_representation_validators() {
 
     let rewritten = plugin
         .transform_response_body(original, Some("application/json"), &headers)
-        .await
+        .await.replaced_bytes()
         .expect("body update must rewrite bytes");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&rewritten).unwrap()["state"],
@@ -1755,8 +1755,8 @@ async fn body_rewrite_hook_strips_stale_representation_validators() {
     );
 }
 
-/// Semantic no-ops (add of an already-present field) return `None` and leave
-/// origin validators untouched; the hook is only invoked after `Some`.
+/// Semantic no-ops (add of an already-present field) return Unchanged and leave
+/// origin validators untouched; the hook is only invoked after Replaced.
 #[tokio::test]
 async fn semantic_noop_preserves_representation_validators() {
     let plugin = ResponseTransformer::new(&json!({
@@ -1776,14 +1776,14 @@ async fn semantic_noop_preserves_representation_validators() {
     assert!(
         plugin
             .transform_response_body(body, Some("application/json"), &headers)
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "add of an existing field is a semantic no-op"
     );
     assert_eq!(headers, before);
     assert_stale_representation_headers_present(&headers);
 
-    // Lifecycle path must likewise leave validators when transform returns None.
+    // Lifecycle path must likewise leave validators when transform is Unchanged.
     let plugin = Arc::new(plugin) as Arc<dyn Plugin>;
     let mut ctx = make_ctx();
     let mut status = 200u16;
@@ -1821,7 +1821,7 @@ async fn parse_failure_and_non_json_preserve_representation_validators() {
     assert!(
         plugin
             .transform_response_body(malformed, Some("application/json"), &headers)
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "malformed JSON must not rewrite bytes"
     );
@@ -2394,4 +2394,96 @@ fn a_disabled_or_header_only_instance_never_pins_a_body() {
         200,
         &headers,
     ));
+}
+
+/// A rewrite that cannot serialize within the retained ceiling must signal
+/// CapacityRefused — never collapse into the same Unchanged no-op used when no
+/// rule matched — and the shared transform loop must install the capacity
+/// terminal rather than forwarding the original body.
+#[tokio::test]
+async fn over_ceiling_body_rewrite_is_capacity_refused_not_noop() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_STATUS,
+        transform_buffered_response_body_with_deadline_full_for_test,
+    };
+    use ferrum_edge::plugins::ResponseBodyTransformOutcome;
+
+    // Amplifying update: replace a short field with a long string so a tight
+    // ceiling can admit the input but not the rewritten document.
+    let long_secret = "x".repeat(64);
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "body", "key": "secret", "value": long_secret}
+        ]
+    }))
+    .unwrap();
+    let body = br#"{"secret":"s","keep":1}"#;
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), body.len().to_string()),
+    ]);
+
+    let mut direct_ctx = make_ctx();
+    direct_ctx.max_response_body_size_bytes = body.len();
+    let outcome = plugin
+        .transform_response_body_with_context(
+            &mut direct_ctx,
+            body,
+            Some("application/json"),
+            &headers,
+        )
+        .await;
+    assert!(
+        matches!(outcome, ResponseBodyTransformOutcome::CapacityRefused),
+        "modified policy that cannot serialize must CapacityRefuse, got {outcome:?}"
+    );
+
+    // Semantic no-op remains Unchanged under the same tight ceiling.
+    let noop = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "body", "key": "secret", "value": "ignored"}
+        ]
+    }))
+    .unwrap();
+    let mut noop_ctx = make_ctx();
+    noop_ctx.max_response_body_size_bytes = body.len();
+    assert!(
+        noop
+            .transform_response_body_with_context(
+                &mut noop_ctx,
+                body,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_unchanged(),
+        "add of an already-present field must stay an ordinary no-op"
+    );
+
+    // Shared loop: CapacityRefused installs the gateway capacity terminal.
+    let plugins = vec![Arc::new(plugin) as Arc<dyn Plugin>];
+    let mut ctx = make_ctx();
+    ctx.max_response_body_size_bytes = body.len();
+    let mut status = 200u16;
+    let mut loop_headers = headers.clone();
+    let mut body_buf = bytes::Bytes::from(body.to_vec());
+    stamp_original_response_metadata_for_test(&mut ctx, status, &loop_headers);
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut loop_headers,
+        &mut body_buf,
+        None,
+        false,
+    )
+    .await;
+    assert!(replaced, "capacity refusal must replace the response");
+    assert_eq!(status, RESPONSE_BUFFER_OVERLOAD_STATUS);
+    assert_eq!(&body_buf[..], RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+    assert_ne!(
+        &body_buf[..],
+        body,
+        "must not silently forward the unrewritten original body"
+    );
 }

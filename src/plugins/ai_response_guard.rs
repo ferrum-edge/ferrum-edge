@@ -3487,7 +3487,7 @@ impl Plugin for AiResponseGuard {
         body: &[u8],
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
         // Protobuf redaction needs the request's gRPC method to select the
         // message descriptor, which only the context carries.
         // Every replacement this plugin produces is built inside a
@@ -3497,7 +3497,9 @@ impl Plugin for AiResponseGuard {
         // after a larger buffer is resident (GHSA-pwcm-6rh8-f2gh).
         let ceiling = ctx.retained_response_body_ceiling();
         if self.grpc_transform_applies(ctx, content_type) {
-            let replacement = self.redacted_grpc_body(ctx, response_headers, body, ceiling);
+            let replacement = crate::plugins::ResponseBodyTransformOutcome::from_optional_replacement(
+                self.redacted_grpc_body(ctx, response_headers, body, ceiling),
+            );
             return self.discharge_pending_redaction(ctx, replacement);
         }
         // A gRPC or gRPC-Web response body is length-prefixed protobuf framing
@@ -3516,9 +3518,11 @@ impl Plugin for AiResponseGuard {
         // apply, `on_response_body` has already failed closed under the same
         // predicate for anything it detected, so deliver them unchanged.
         if ctx.is_native_grpc_request() || response_is_grpc_framed(ctx, content_type, body) {
-            return None;
+            return crate::plugins::ResponseBodyTransformOutcome::Unchanged;
         }
-        let replacement = self.redacted_response_body(body, content_type, ceiling);
+        let replacement = crate::plugins::ResponseBodyTransformOutcome::from_optional_replacement(
+            self.redacted_response_body(body, content_type, ceiling),
+        );
         self.discharge_pending_redaction(ctx, replacement)
     }
 
@@ -3531,11 +3535,13 @@ impl Plugin for AiResponseGuard {
         body: &[u8],
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
-        self.redacted_response_body(
-            body,
-            content_type,
-            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
+        crate::plugins::ResponseBodyTransformOutcome::from_optional_replacement(
+            self.redacted_response_body(
+                body,
+                content_type,
+                crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
+            ),
         )
     }
 
@@ -3613,15 +3619,19 @@ impl AiResponseGuard {
     /// Clear this instance's promised-redaction marker when — and only when — a
     /// replacement was actually produced.
     ///
-    /// `None` leaves the marker outstanding, so `on_final_response_body` turns
-    /// it into a rejection instead of letting the original detected body be
-    /// forwarded as "unchanged".
+    /// [`crate::plugins::ResponseBodyTransformOutcome::Unchanged`] (and
+    /// capacity refusal) leaves the marker outstanding, so
+    /// `on_final_response_body` turns it into a rejection instead of letting
+    /// the original detected body be forwarded as "unchanged".
     fn discharge_pending_redaction(
         &self,
         ctx: &mut RequestContext,
-        replacement: Option<Vec<u8>>,
-    ) -> Option<Vec<u8>> {
-        if replacement.is_some() {
+        replacement: crate::plugins::ResponseBodyTransformOutcome,
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
+        if matches!(
+            replacement,
+            crate::plugins::ResponseBodyTransformOutcome::Replaced(_)
+        ) {
             ctx.ai_response_guard_pending_redactions
                 .remove(&self.instance_id);
         }

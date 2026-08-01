@@ -173,7 +173,7 @@ async fn reverse_mapped_tool_resource_uri(
             Some("application/json"),
             &known_json_response_headers(&response),
         )
-        .await
+        .await.replaced_bytes()
         .expect("selected-server template should reverse-map the resource link");
     serde_json::from_slice::<Value>(&rewritten).unwrap()["result"]["content"][0]["uri"]
         .as_str()
@@ -1571,7 +1571,7 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
                 Some("application/json"),
                 &ambiguous_headers,
             )
-            .await
+            .await.replaced_bytes()
             .is_none()
     );
     let (status, rejected, _) = reject_json(
@@ -1614,7 +1614,7 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
                 Some("application/json"),
                 &unknown_length_response_headers,
             )
-            .await
+            .await.replaced_bytes()
             .is_none()
     );
 
@@ -1639,7 +1639,7 @@ async fn aggregate_resource_read_response_echoes_public_uri() {
             Some("application/json"),
             &response_headers,
         )
-        .await
+        .await.replaced_bytes()
         .expect("resource read response should be reverse-mapped");
     plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
     assert!(!response_headers.contains_key("etag"));
@@ -1722,7 +1722,7 @@ async fn aggregate_resource_read_preserves_requested_template_public_uri() {
             Some("application/json"),
             &known_json_response_headers(&upstream_response),
         )
-        .await
+        .await.replaced_bytes()
         .expect("resource echo should retain the routed public URI");
     let rewritten_response: Value = serde_json::from_slice(&rewritten_response).unwrap();
     assert_eq!(
@@ -1792,7 +1792,7 @@ async fn aggregate_response_preserves_validators_when_no_uri_is_rewritten() {
                 Some("application/json"),
                 &response_headers,
             )
-            .await
+            .await.replaced_bytes()
             .is_none()
     );
     assert_eq!(
@@ -1898,7 +1898,7 @@ async fn aggregate_tool_call_response_rewrites_embedded_resource_uris() {
             Some("application/json"),
             &known_json_response_headers(&upstream_response),
         )
-        .await
+        .await.replaced_bytes()
         .expect("tool result resource URIs should be reverse-mapped");
     let rewritten: Value = serde_json::from_slice(&rewritten).unwrap();
     assert_eq!(rewritten["result"]["content"][0]["uri"], public_uri);
@@ -1962,7 +1962,7 @@ async fn aggregate_tool_call_reverse_maps_native_mcp_template_uri() {
             Some("application/json"),
             &known_json_response_headers(&upstream_response),
         )
-        .await
+        .await.replaced_bytes()
         .expect("native MCP template URI should be reverse-mapped");
     let rewritten: Value = serde_json::from_slice(&rewritten).unwrap();
     let public_uri = rewritten["result"]["content"][0]["uri"]
@@ -2063,7 +2063,7 @@ async fn aggregate_template_reverse_mapping_preserves_upstream_percent_escapes()
             Some("application/json"),
             &known_json_response_headers(&upstream_response),
         )
-        .await
+        .await.replaced_bytes()
         .expect("reserved template URI should be reverse-mapped");
     let rewritten: Value = serde_json::from_slice(&rewritten).unwrap();
     let public_uri = rewritten["result"]["content"][0]["uri"]
@@ -2202,7 +2202,7 @@ async fn aggregate_resource_read_reuses_selected_server_template_cache() {
             Some("application/json"),
             &known_json_response_headers(&tool_response),
         )
-        .await
+        .await.replaced_bytes()
         .expect("selected-server template should reverse-map the resource link");
     let rewritten_response: Value = serde_json::from_slice(&rewritten_response).unwrap();
     let public_uri = rewritten_response["result"]["content"][0]["uri"]
@@ -9077,7 +9077,7 @@ async fn validate_tool_results_rejects_duplicate_json_keys() {
                     Some("application/json"),
                     &headers,
                 )
-                .await
+                .await.replaced_bytes()
                 .is_none(),
             "{case}: response rewrite must not materialize ambiguous raw JSON"
         );
@@ -9440,4 +9440,144 @@ async fn validate_tool_results_pinned_validator_survives_catalog_refresh_and_clo
             .map(String::as_str),
         Some("pass")
     );
+}
+
+/// An MCP response rewrite that already changed policy state but cannot serialize
+/// within the retained ceiling must CapacityRefuse — never collapse into the
+/// ordinary Unchanged no-op used when no rewrite applies.
+#[tokio::test]
+async fn mcp_response_rewrite_capacity_refusal_is_not_noop() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_STATUS,
+        stamp_original_response_metadata_for_test,
+        transform_buffered_response_body_with_deadline_full_for_test,
+    };
+    use ferrum_edge::plugins::ResponseBodyTransformOutcome;
+
+    let server = start_mcp_catalog_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (mut list_ctx, mut list_headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "resources/list",
+        "params": {}
+    }));
+    list_headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let (_, list_body, _) =
+        reject_json(plugin.before_proxy(&mut list_ctx, &mut list_headers).await);
+    let public_uri = list_body["result"]["resources"][0]["uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "resources/read",
+        "params": { "uri": public_uri }
+    });
+    let (mut ctx, mut headers) = mcp_ctx(request_body.clone());
+    headers.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let _ = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            serde_json::to_vec(&request_body).unwrap().as_slice(),
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("resource read request rewrite");
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "result": {
+            "contents": [{
+                "uri": "file:///project/README.md",
+                "mimeType": "text/markdown",
+                "text": "read me"
+            }]
+        }
+    }))
+    .unwrap();
+    let response_headers = known_json_response_headers(&upstream_response);
+
+    // Control: ordinary rewrite succeeds under an ample ceiling.
+    let mut roomy = ctx.clone();
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut roomy,
+            &upstream_response,
+            Some("application/json"),
+            &response_headers,
+        )
+        .await
+        .replaced_bytes()
+        .expect("in-ceiling MCP rewrite must install public URI");
+    assert_ne!(rewritten, upstream_response);
+
+    // No-rewrite path stays Unchanged even under a tight ceiling.
+    let mut bare = create_test_context();
+    bare.max_response_body_size_bytes = 8;
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut bare,
+                &upstream_response,
+                Some("application/json"),
+                &response_headers,
+            )
+            .await
+            .is_unchanged(),
+        "missing rewrite staging must remain an ordinary no-op"
+    );
+
+    // Required rewrite that cannot serialize: CapacityRefused, not Unchanged.
+    ctx.max_response_body_size_bytes = 8;
+    let refused = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &upstream_response,
+            Some("application/json"),
+            &response_headers,
+        )
+        .await;
+    assert!(
+        matches!(refused, ResponseBodyTransformOutcome::CapacityRefused),
+        "changed MCP rewrite past the ceiling must CapacityRefuse, got {refused:?}"
+    );
+
+    // Shared loop installs the HTTP capacity terminal instead of forwarding.
+    let plugins = vec![Arc::clone(&plugin)];
+    let mut loop_ctx = ctx.clone();
+    loop_ctx.max_response_body_size_bytes = 8;
+    let mut status = 200u16;
+    let mut loop_headers = response_headers.clone();
+    let mut body_buf = Bytes::from(upstream_response.clone());
+    stamp_original_response_metadata_for_test(&mut loop_ctx, status, &loop_headers);
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut loop_ctx,
+        &mut status,
+        &mut loop_headers,
+        &mut body_buf,
+        None,
+        false,
+    )
+    .await;
+    assert!(replaced);
+    assert_eq!(status, RESPONSE_BUFFER_OVERLOAD_STATUS);
+    assert_eq!(&body_buf[..], RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+    assert_ne!(&body_buf[..], &upstream_response[..]);
 }

@@ -1222,7 +1222,7 @@ impl Plugin for PriorityOverridePlugin {
         body: &[u8],
         content_type: Option<&str>,
         response_headers: &std::collections::HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
         self.inner
             .transform_response_body(body, content_type, response_headers)
             .await
@@ -1233,7 +1233,7 @@ impl Plugin for PriorityOverridePlugin {
         body: &[u8],
         content_type: Option<&str>,
         response_headers: &std::collections::HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
         self.inner
             .transform_response_body_with_context(ctx, body, content_type, response_headers)
             .await

@@ -123,14 +123,21 @@
 //!   candidate anyway.
 //!
 //! A promised rewrite that never happens is the same hole seen from the other
-//! side. A refused construction returns "no replacement", and to a transform
-//! loop that is indistinguishable from "nothing to change" — so a policy plugin
-//! that already decided the original bytes are unsafe would have them forwarded
-//! by the very refusal that was supposed to be fail-closed. `ai_response_guard`
-//! therefore records a detected-but-not-yet-redacted response in typed request
-//! state (`RequestContext::ai_response_guard_pending_redactions`), discharges it
-//! only when its producer actually installs bytes, and rejects at
-//! `on_final_response_body` when the promise is still outstanding.
+//! side. A refused construction used to return "no replacement", and to a
+//! transform loop that was indistinguishable from "nothing to change" — so a
+//! policy plugin that already decided the original bytes are unsafe would have
+//! them forwarded by the very refusal that was supposed to be fail-closed.
+//! Producers therefore return
+//! [`crate::plugins::ResponseBodyTransformOutcome`]: intentional no-ops stay
+//! [`crate::plugins::ResponseBodyTransformOutcome::Unchanged`], while a
+//! retained-ceiling refusal after a required change is
+//! [`crate::plugins::ResponseBodyTransformOutcome::CapacityRefused`] and the
+//! shared loop installs the neutral capacity terminal. `ai_response_guard`
+//! additionally records a detected-but-not-yet-redacted response in typed
+//! request state (`RequestContext::ai_response_guard_pending_redactions`) for
+//! representations its rewriter cannot address, discharges it only when its
+//! producer actually installs bytes, and rejects at `on_final_response_body`
+//! when the promise is still outstanding.
 //!
 //! The same rule covers a body a plugin *copies out* into storage that outlives
 //! the request — `response_caching`'s entry copy is a distinct allocation from

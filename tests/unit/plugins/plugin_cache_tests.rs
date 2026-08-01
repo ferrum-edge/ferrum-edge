@@ -166,7 +166,7 @@ impl Plugin for StalledDeadlineResponseTransformer {
         _body: &[u8],
         _content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> ferrum_edge::plugins::ResponseBodyTransformOutcome {
         std::future::pending().await
     }
 }
@@ -1517,7 +1517,7 @@ async fn cache_internal_finalizers_declare_response_body_never() {
     assert!(
         mesh_finalizer
             .transform_response_body(br#"{"a":1}"#, Some("application/json"), &headers)
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "Never must stay truthful: transform returns None"
     );
@@ -1566,7 +1566,7 @@ async fn cache_internal_finalizers_declare_response_body_never() {
     assert!(
         cors_finalizer
             .transform_response_body(br#"{"a":1}"#, Some("application/json"), &headers)
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "Never must stay truthful: transform returns None"
     );
@@ -9007,7 +9007,7 @@ async fn test_priority_override_delegates_context_response_body_transform() {
             Some("application/json"),
             &response_headers,
         )
-        .await
+        .await.replaced_bytes()
         .expect("priority override wrapper should forward the context-aware transform");
 
     use flate2::read::GzDecoder;
@@ -11351,7 +11351,7 @@ async fn grpc_web_global_shadowed_by_two_scoped_instances_unions_expose_headers_
                 response_headers.get("content-type").map(String::as_str),
                 &response_headers,
             )
-            .await
+            .await.replaced_bytes()
         {
             body = next;
         }

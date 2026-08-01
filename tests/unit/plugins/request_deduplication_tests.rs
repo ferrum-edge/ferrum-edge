@@ -111,8 +111,8 @@ impl Plugin for FailingMandatoryReplayTransform {
         _body: &[u8],
         _content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
-        None
+    ) -> ferrum_edge::plugins::ResponseBodyTransformOutcome {
+        ferrum_edge::plugins::ResponseBodyTransformOutcome::Unchanged
     }
 }
 
@@ -160,10 +160,10 @@ impl Plugin for AppendingResponseTransform {
         body: &[u8],
         _content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> ferrum_edge::plugins::ResponseBodyTransformOutcome {
         let mut transformed = body.to_vec();
         transformed.extend_from_slice(b"|transformed");
-        Some(transformed)
+        ferrum_edge::plugins::ResponseBodyTransformOutcome::Replaced(transformed)
     }
 }
 

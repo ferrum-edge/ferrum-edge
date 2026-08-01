@@ -516,7 +516,7 @@ async fn response_body_production_declarations_match_the_built_in_producers() {
         assert!(
             plugin
                 .transform_response_body(br#"{"a":1}"#, Some("application/json"), &headers)
-                .await
+                .await.replaced_bytes()
                 .is_none(),
             "{} declares it never replaces a response body, so nothing reserves \
              a window for it; returning bytes here would be refused at runtime",

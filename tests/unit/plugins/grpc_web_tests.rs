@@ -1603,7 +1603,7 @@ async fn test_transform_response_body_binary() {
 
     let result = plugin
         .transform_response_body(&body, Some("application/grpc-web"), &response_headers)
-        .await;
+        .await.replaced_bytes();
 
     assert!(result.is_some());
     let output = result.unwrap();
@@ -1642,7 +1642,7 @@ async fn test_transform_response_body_text() {
 
     let result = plugin
         .transform_response_body(&body, Some("application/grpc-web-text"), &response_headers)
-        .await;
+        .await.replaced_bytes();
 
     assert!(result.is_some());
     let output = result.unwrap();
@@ -1667,7 +1667,7 @@ async fn test_transform_response_body_noop_for_non_grpc_web() {
 
     let result = plugin
         .transform_response_body(body, Some("application/grpc"), &response_headers)
-        .await;
+        .await.replaced_bytes();
 
     assert!(result.is_none());
 }
@@ -1681,7 +1681,7 @@ async fn test_transform_response_body_no_content_type() {
 
     let result = plugin
         .transform_response_body(body, None, &response_headers)
-        .await;
+        .await.replaced_bytes();
 
     assert!(result.is_none());
 }
@@ -1759,7 +1759,7 @@ async fn test_full_roundtrip_binary() {
 
     let result = plugin
         .transform_response_body(&body, Some("application/grpc-web+proto"), &response_headers)
-        .await;
+        .await.replaced_bytes();
     assert!(result.is_some());
     let output = result.unwrap();
 
@@ -1816,7 +1816,7 @@ async fn test_full_roundtrip_text() {
             Some("application/grpc-web-text"),
             &response_headers,
         )
-        .await;
+        .await.replaced_bytes();
     assert!(response_body.is_some());
 
     // Verify base64 encoding
@@ -2124,7 +2124,7 @@ async fn test_transform_response_body_binary_and_text_embed_custom_trailers() {
 
     let binary = plugin
         .transform_response_body(&body, Some("application/grpc-web"), &response_headers)
-        .await
+        .await.replaced_bytes()
         .expect("binary transform");
     let binary_payload = grpc_web_trailer_payload(&binary[body.len()..]);
     assert!(binary_payload.contains("grpc-status: 0"));
@@ -2140,7 +2140,7 @@ async fn test_transform_response_body_binary_and_text_embed_custom_trailers() {
     );
     let text = plugin
         .transform_response_body(&body, Some("application/grpc-web-text"), &response_headers)
-        .await
+        .await.replaced_bytes()
         .expect("text transform");
     let decoded = BASE64.decode(&text).expect("text body is base64");
     assert_eq!(&decoded[..body.len()], &body[..]);
@@ -2184,7 +2184,7 @@ async fn test_transform_with_provenance_excludes_initial_header_only_fields() {
             Some("application/grpc-web"),
             &response_headers,
         )
-        .await
+        .await.replaced_bytes()
         .expect("transform");
     let payload = grpc_web_trailer_payload(&output);
     assert!(payload.contains("grpc-status: 0"));
@@ -2257,7 +2257,7 @@ async fn grpc_web_body_frame_after_policy_hooks(
             Some("application/grpc-web"),
             &plugin_view,
         )
-        .await
+        .await.replaced_bytes()
         .expect("transform");
     let mut wire_trailers = backend_trailers;
     grpc_proxy::reconcile_grpc_trailers_from_view(
@@ -2970,7 +2970,7 @@ async fn test_transform_with_provenance_uses_true_shadowed_trailer_value() {
             Some("application/grpc-web"),
             &merged_view,
         )
-        .await
+        .await.replaced_bytes()
         .expect("transform");
     let payload = grpc_web_trailer_payload(&output);
     assert!(payload.contains("x-shared-meta: trailer-value\r\n"));
@@ -2986,7 +2986,7 @@ async fn test_transform_with_provenance_uses_true_shadowed_trailer_value() {
             Some("application/grpc-web"),
             &merged_view,
         )
-        .await
+        .await.replaced_bytes()
         .expect("sanitized transform");
     let payload = grpc_web_trailer_payload(&output);
     assert!(payload.contains("x-shared-meta: sanitized\r\n"));
@@ -3002,7 +3002,7 @@ async fn test_transform_with_provenance_uses_true_shadowed_trailer_value() {
             Some("application/grpc-web"),
             &merged_view,
         )
-        .await
+        .await.replaced_bytes()
         .expect("removed transform");
     let payload = grpc_web_trailer_payload(&output);
     assert!(!payload.contains("x-shared-meta"));
@@ -3042,7 +3042,7 @@ async fn test_transform_missing_collision_provenance_fails_closed() {
             Some("application/grpc-web"),
             &response_headers,
         )
-        .await
+        .await.replaced_bytes()
         .expect("transform");
     let payload = grpc_web_trailer_payload(&output);
     assert!(payload.contains("grpc-status: 0"));
@@ -3214,7 +3214,7 @@ async fn test_transform_response_body_missing_grpc_status_reports_unknown() {
 
     let output = plugin
         .transform_response_body(body, Some("application/grpc-web"), &response_headers)
-        .await
+        .await.replaced_bytes()
         .expect("gRPC-Web response body should be transformed");
 
     assert_eq!(output[0], 0x80);
@@ -3324,7 +3324,7 @@ async fn grpc_web_response_after_proxy_and_transform(
             response_headers.get("content-type").map(String::as_str),
             &response_headers,
         )
-        .await
+        .await.replaced_bytes()
         .expect("gRPC-Web response body should be transformed");
 
     (http_status, response_headers, output)
@@ -3596,7 +3596,7 @@ async fn run_two_instance_response_chain(
                 response_headers.get("content-type").map(String::as_str),
                 &response_headers,
             )
-            .await
+            .await.replaced_bytes()
         {
             body = next;
         }
@@ -3785,7 +3785,7 @@ async fn test_follower_fails_closed_without_owner_staging_on_response_transform(
                 Some("application/grpc-web"),
                 &response_headers,
             )
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "malformed mode staging must fail closed"
     );
@@ -3797,7 +3797,7 @@ async fn test_follower_fails_closed_without_owner_staging_on_response_transform(
                 Some("application/grpc-web"),
                 &response_headers,
             )
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "non-owner must never translate the response body"
     );
@@ -3829,7 +3829,7 @@ async fn test_owner_requires_namespaced_mode_even_when_shared_mode_is_valid() {
                 Some("application/grpc-web-text"),
                 &response_headers,
             )
-            .await
+            .await.replaced_bytes()
             .is_none(),
         "owner must not fall back to shared mode after losing its namespaced staging"
     );
@@ -3878,7 +3878,7 @@ async fn test_text_mode_streamed_armouring_equals_base64_of_the_binary_framing()
         );
         let binary = plugin
             .transform_response_body(&body, Some("application/grpc-web"), &response_headers)
-            .await
+            .await.replaced_bytes()
             .expect("binary transform");
 
         response_headers.insert(
@@ -3887,7 +3887,7 @@ async fn test_text_mode_streamed_armouring_equals_base64_of_the_binary_framing()
         );
         let text = plugin
             .transform_response_body(&body, Some("application/grpc-web-text"), &response_headers)
-            .await
+            .await.replaced_bytes()
             .expect("text transform");
 
         assert_eq!(
@@ -3929,9 +3929,9 @@ async fn test_translation_is_refused_when_the_trailer_frame_cannot_fit_the_ceili
         )
         .await;
     assert!(
-        translated.is_none(),
-        "an over-ceiling translation must fail closed rather than materialise \
-         the trailer block first"
+        translated.is_capacity_refused(),
+        "an over-ceiling translation must signal CapacityRefused rather than an \
+         ordinary no-op that would forward the untranslated body"
     );
 
     // Control: the same staged request with an ample ceiling DOES translate, so
@@ -3946,6 +3946,7 @@ async fn test_translation_is_refused_when_the_trailer_frame_cannot_fit_the_ceili
             &response_headers,
         )
         .await
+        .replaced_bytes()
         .expect("an in-ceiling translation must still be produced");
     assert!(ok.len() > body.len(), "the trailer frame was appended");
 }
@@ -3997,7 +3998,7 @@ async fn test_large_trailer_block_frames_identically_in_binary_and_text() {
             Some("application/grpc-web"),
             &large_trailer_headers("application/grpc-web"),
         )
-        .await
+        .await.replaced_bytes()
         .expect("binary transform");
     let text = plugin
         .transform_response_body(
@@ -4005,7 +4006,7 @@ async fn test_large_trailer_block_frames_identically_in_binary_and_text() {
             Some("application/grpc-web-text"),
             &large_trailer_headers("application/grpc-web-text"),
         )
-        .await
+        .await.replaced_bytes()
         .expect("text transform");
 
     // The declared frame length must match the payload the writing pass
@@ -4075,9 +4076,123 @@ async fn test_large_trailer_block_is_refused_under_a_small_retained_ceiling() {
                     &large_trailer_headers(content_type),
                 )
                 .await
-                .is_none(),
+                .is_capacity_refused(),
             "{content_type}: a trailer block above the retained ceiling must be \
-             refused during the counting pass, never materialised first"
+             CapacityRefused during the counting pass, never materialised first \
+             and never collapsed into an ordinary no-op"
         );
     }
+}
+
+/// gRPC-Web transform overflow must install the shared body-framed capacity
+/// terminal through the buffered transform loop — never forward the native body
+/// under the already-relabeled `application/grpc-web[-text]` Content-Type.
+#[tokio::test]
+async fn buffered_transform_loop_installs_capacity_terminal_on_binary_and_text_overflow() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+        transform_buffered_response_body_with_deadline_full_for_test,
+    };
+
+    for content_type in ["application/grpc-web", "application/grpc-web-text"] {
+        let plugin = create_plugin_default();
+        let mut ctx = create_grpc_web_context(content_type);
+        plugin.on_request_received(&mut ctx).await;
+
+        let mut response_headers = HashMap::new();
+        response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+        response_headers.insert("grpc-status".to_string(), "0".to_string());
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        assert_eq!(
+            response_headers.get("content-type").map(String::as_str),
+            Some(content_type),
+            "after_proxy must already have relabeled the response media type"
+        );
+
+        let mut body = vec![0x00u8];
+        body.extend_from_slice(&5u32.to_be_bytes());
+        body.extend_from_slice(b"hello");
+        // Room for the data frames but not the trailer frame: an intentional
+        // CapacityRefused from the owner, not an ordinary non-owner Unchanged.
+        ctx.max_response_body_size_bytes = body.len() + 2;
+
+        let plugins = vec![Arc::clone(&plugin)];
+        let mut status = 200u16;
+        let mut body_buf = bytes::Bytes::from(body.clone());
+        let (replaced, _transformed) =
+            transform_buffered_response_body_with_deadline_full_for_test(
+                &plugins,
+                &mut ctx,
+                &mut status,
+                &mut response_headers,
+                &mut body_buf,
+                Some(content_type),
+                false,
+            )
+            .await;
+
+        assert!(
+            replaced,
+            "{content_type}: capacity refusal must replace the buffered response"
+        );
+        assert_eq!(status, 200, "gRPC-Web capacity terminal rides HTTP 200");
+        assert_eq!(
+            response_headers.get("content-type").map(String::as_str),
+            Some(content_type)
+        );
+        assert_ne!(
+            &body_buf[..],
+            &body[..],
+            "{content_type}: must not forward the untranslated native body under the \
+             relabeled gRPC-Web Content-Type"
+        );
+        let payload = String::from_utf8_lossy(&body_buf);
+        assert!(
+            payload.contains(&format!("grpc-status: {RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS}")),
+            "{content_type}: capacity status must ride a body trailer frame: {payload:?}"
+        );
+        assert!(
+            !response_headers.contains_key("grpc-status"),
+            "{content_type}: terminal status must be body-framed, not an initial header"
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_owner_transform_remains_ordinary_unchanged_not_capacity_refusal() {
+    let owner = create_plugin_default();
+    let stranger = create_plugin("grpc_web", &json!({})).unwrap().unwrap();
+
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    owner.on_request_received(&mut ctx).await;
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+
+    let mut body = vec![0x00u8];
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+    // Even under a ceiling that would refuse an owner translation, a non-owner
+    // must report Unchanged — never CapacityRefused.
+    ctx.max_response_body_size_bytes = body.len() + 2;
+
+    let outcome = stranger
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc-web"),
+            &response_headers,
+        )
+        .await;
+    assert!(
+        outcome.is_unchanged(),
+        "non-owner must stay an ordinary no-op, got {outcome:?}"
+    );
+    assert!(!outcome.is_capacity_refused());
 }

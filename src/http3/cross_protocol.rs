@@ -2949,7 +2949,7 @@ where
                     }
                 ) {
                     for plugin in plugins {
-                        if let Some(transformed) = plugin
+                        match plugin
                             .transform_response_body_with_context(
                                 &mut *ctx,
                                 &response_body,
@@ -2958,25 +2958,45 @@ where
                             )
                             .await
                         {
-                            response_headers.insert(
-                                "content-length".to_string(),
-                                transformed.len().to_string(),
-                            );
-                            response_body = bytes::Bytes::from(transformed);
-                            crate::plugins::finalize_response_body_transformation(
-                                plugin.as_ref(),
-                                ctx,
-                                &mut response_headers,
-                            );
-                        } else {
-                            if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
-                                ctx,
-                                &mut response_status,
-                                &mut response_headers,
-                                &mut response_body,
-                            ) {
+                            crate::plugins::ResponseBodyTransformOutcome::Replaced(
+                                transformed,
+                            ) => {
+                                response_headers.insert(
+                                    "content-length".to_string(),
+                                    transformed.len().to_string(),
+                                );
+                                response_body = bytes::Bytes::from(transformed);
+                                crate::plugins::finalize_response_body_transformation(
+                                    plugin.as_ref(),
+                                    ctx,
+                                    &mut response_headers,
+                                );
+                            }
+                            crate::plugins::ResponseBodyTransformOutcome::CapacityRefused => {
+                                tracing::warn!(
+                                    plugin = plugin.name(),
+                                    "Response body transform refused: retained-ceiling construction failed after a required rewrite"
+                                );
+                                crate::proxy::replace_buffered_response_with_capacity_refusal(
+                                    ctx,
+                                    &mut response_status,
+                                    &mut response_headers,
+                                    &mut response_body,
+                                    initial_response_header_policy_plugins,
+                                );
                                 response_body_rejected = true;
                                 break;
+                            }
+                            crate::plugins::ResponseBodyTransformOutcome::Unchanged => {
+                                if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                                    ctx,
+                                    &mut response_status,
+                                    &mut response_headers,
+                                    &mut response_body,
+                                ) {
+                                    response_body_rejected = true;
+                                    break;
+                                }
                             }
                         }
                         ctx.record_deadline_response_header_plugin(
@@ -5199,25 +5219,43 @@ where
                             break;
                         }
                     };
-                    if let Some(transformed) = transformed {
-                        plugin_response_headers
-                            .insert("content-length".to_string(), transformed.len().to_string());
-                        response_body = bytes::Bytes::from(transformed);
-                        crate::plugins::finalize_response_body_transformation(
-                            plugin.as_ref(),
-                            ctx,
-                            &mut plugin_response_headers,
-                        );
-                        representation_rewritten = true;
-                    } else {
-                        if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
-                            ctx,
-                            &mut response_status,
-                            &mut plugin_response_headers,
-                            &mut response_body,
-                        ) {
+                    match transformed {
+                        crate::plugins::ResponseBodyTransformOutcome::Replaced(transformed) => {
+                            plugin_response_headers
+                                .insert("content-length".to_string(), transformed.len().to_string());
+                            response_body = bytes::Bytes::from(transformed);
+                            crate::plugins::finalize_response_body_transformation(
+                                plugin.as_ref(),
+                                ctx,
+                                &mut plugin_response_headers,
+                            );
+                            representation_rewritten = true;
+                        }
+                        crate::plugins::ResponseBodyTransformOutcome::CapacityRefused => {
+                            tracing::warn!(
+                                plugin = plugin.name(),
+                                "Response body transform refused: retained-ceiling construction failed after a required rewrite"
+                            );
+                            crate::proxy::replace_buffered_response_with_capacity_refusal(
+                                ctx,
+                                &mut response_status,
+                                &mut plugin_response_headers,
+                                &mut response_body,
+                                initial_response_header_policy_plugins,
+                            );
                             response_body_rejected = true;
                             break;
+                        }
+                        crate::plugins::ResponseBodyTransformOutcome::Unchanged => {
+                            if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                                ctx,
+                                &mut response_status,
+                                &mut plugin_response_headers,
+                                &mut response_body,
+                            ) {
+                                response_body_rejected = true;
+                                break;
+                            }
                         }
                     }
                     ctx.record_deadline_response_header_plugin(

@@ -17336,27 +17336,48 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                 }
                 Err(()) => break,
             };
-            if let Some(transformed) = transformed {
-                response_headers
-                    .insert("content-length".to_string(), transformed.len().to_string());
-                *response_body = Bytes::from(transformed);
-                crate::plugins::finalize_response_body_transformation(
-                    plugin.as_ref(),
-                    ctx,
-                    response_headers,
-                );
-            } else if mandatory_replay_transform {
-                mandatory_replay_transform_failed = Some(plugin.name());
-                break;
-            } else {
-                if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
-                    ctx,
-                    response_status,
-                    response_headers,
-                    response_body,
-                ) {
+            match transformed {
+                crate::plugins::ResponseBodyTransformOutcome::Replaced(transformed) => {
+                    response_headers
+                        .insert("content-length".to_string(), transformed.len().to_string());
+                    *response_body = Bytes::from(transformed);
+                    crate::plugins::finalize_response_body_transformation(
+                        plugin.as_ref(),
+                        ctx,
+                        response_headers,
+                    );
+                }
+                crate::plugins::ResponseBodyTransformOutcome::CapacityRefused => {
+                    warn!(
+                        plugin = plugin.name(),
+                        "Response body transform refused: retained-ceiling construction failed after a required rewrite"
+                    );
+                    replace_buffered_response_with_capacity_refusal_with_policy_source(
+                        ctx,
+                        response_status,
+                        response_headers,
+                        response_body,
+                        InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
+                    );
                     terminal_body_response_selected = true;
                     break;
+                }
+                crate::plugins::ResponseBodyTransformOutcome::Unchanged
+                    if mandatory_replay_transform =>
+                {
+                    mandatory_replay_transform_failed = Some(plugin.name());
+                    break;
+                }
+                crate::plugins::ResponseBodyTransformOutcome::Unchanged => {
+                    if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                        ctx,
+                        response_status,
+                        response_headers,
+                        response_body,
+                    ) {
+                        terminal_body_response_selected = true;
+                        break;
+                    }
                 }
             }
         }
@@ -19601,32 +19622,62 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                 return (true, body_transformed);
             }
         };
-        if let Some(transformed) = transformed {
-            // The transform installs a DIFFERENT allocation than the one the
-            // collector charged (and a decode can be far larger than its
-            // input), so the replacement carries its OWN charge, transferred out
-            // of the window reserved above and owned by the replacement
-            // allocation rather than by this request: the permit is returned
-            // when the last handle to those bytes drops, wherever they are
-            // copied or stored (GHSA-pwcm-6rh8-f2gh).
-            //
-            // Refusal fails closed with the shared gateway-capacity terminal —
-            // `503` plus the fixed redaction-safe body, or the gRPC
-            // `RESOURCE_EXHAUSTED` terminal for a gRPC-flavored response —
-            // rather than retaining uncharged bytes. An output larger than the
-            // window is refused for the same reason a backend body that size
-            // would be: it is above this response's retained ceiling.
-            //
-            // A `None` window here means a plugin declared as a non-producer
-            // returned bytes anyway: nothing was reserved for them, so they are
-            // refused rather than installed uncharged.
-            let transformed_len = transformed.len();
-            let Some(charged) = window.as_mut().and_then(|w| w.charge(transformed)) else {
+        match transformed {
+            crate::plugins::ResponseBodyTransformOutcome::Replaced(transformed) => {
+                // The transform installs a DIFFERENT allocation than the one the
+                // collector charged (and a decode can be far larger than its
+                // input), so the replacement carries its OWN charge, transferred out
+                // of the window reserved above and owned by the replacement
+                // allocation rather than by this request: the permit is returned
+                // when the last handle to those bytes drops, wherever they are
+                // copied or stored (GHSA-pwcm-6rh8-f2gh).
+                //
+                // Refusal fails closed with the shared gateway-capacity terminal —
+                // `503` plus the fixed redaction-safe body, or the gRPC
+                // `RESOURCE_EXHAUSTED` terminal for a gRPC-flavored response —
+                // rather than retaining uncharged bytes. An output larger than the
+                // window is refused for the same reason a backend body that size
+                // would be: it is above this response's retained ceiling.
+                //
+                // A `None` window here means a plugin declared as a non-producer
+                // returned bytes anyway: nothing was reserved for them, so they are
+                // refused rather than installed uncharged.
+                let transformed_len = transformed.len();
+                let Some(charged) = window.as_mut().and_then(|w| w.charge(transformed)) else {
+                    warn!(
+                        plugin = plugin.name(),
+                        replacement_bytes = transformed_len,
+                        "Response body transform refused: replacement body is not covered by a \
+                         reserved retained-response window"
+                    );
+                    replace_buffered_response_with_capacity_refusal(
+                        ctx,
+                        response_status,
+                        response_headers,
+                        response_body,
+                        initial_response_header_policy_plugins,
+                    );
+                    return (true, true);
+                };
+                response_headers.insert("content-length".to_string(), transformed_len.to_string());
+                *response_body = charged;
+                crate::plugins::finalize_response_body_transformation(
+                    plugin.as_ref(),
+                    ctx,
+                    response_headers,
+                );
+                body_transformed = true;
+            }
+            crate::plugins::ResponseBodyTransformOutcome::CapacityRefused => {
+                // The producer already decided the body must change (gRPC-Web
+                // framing after Content-Type relabel, JSON redaction/rewrite,
+                // …) but could not construct the replacement under the retained
+                // ceiling. That is not an ordinary no-op: forwarding the original
+                // bytes would ship a mislabeled or unredacted body
+                // (GHSA-pwcm-6rh8-f2gh).
                 warn!(
                     plugin = plugin.name(),
-                    replacement_bytes = transformed_len,
-                    "Response body transform refused: replacement body is not covered by a \
-                     reserved retained-response window"
+                    "Response body transform refused: retained-ceiling construction failed after a required rewrite"
                 );
                 replace_buffered_response_with_capacity_refusal(
                     ctx,
@@ -19635,24 +19686,17 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                     response_body,
                     initial_response_header_policy_plugins,
                 );
-                return (true, true);
-            };
-            response_headers.insert("content-length".to_string(), transformed_len.to_string());
-            *response_body = charged;
-            crate::plugins::finalize_response_body_transformation(
-                plugin.as_ref(),
-                ctx,
-                response_headers,
-            );
-            body_transformed = true;
-        } else {
-            if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
-                ctx,
-                response_status,
-                response_headers,
-                response_body,
-            ) {
-                return (true, true);
+                return (true, body_transformed);
+            }
+            crate::plugins::ResponseBodyTransformOutcome::Unchanged => {
+                if crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                ) {
+                    return (true, true);
+                }
             }
         }
         ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
@@ -40182,8 +40226,10 @@ mod tests {
             _body: &[u8],
             _content_type: Option<&str>,
             _response_headers: &HashMap<String, String>,
-        ) -> Option<Vec<u8>> {
-            Some(b"transformed application response".to_vec())
+        ) -> crate::plugins::ResponseBodyTransformOutcome {
+            crate::plugins::ResponseBodyTransformOutcome::Replaced(
+                b"transformed application response".to_vec(),
+            )
         }
     }
 

@@ -4427,7 +4427,7 @@ async fn gateway_compressed_oversized_non_candidate_skips_final_decode() {
 
     let encoded = compression
         .transform_response_body_with_context(&mut ctx, &plaintext, Some("text/plain"), &headers)
-        .await
+        .await.replaced_bytes()
         .expect("planned gateway compression should transform the body");
     assert!(encoded.len() < plaintext.len());
     assert_continue(
@@ -4484,7 +4484,7 @@ async fn public_compression_metadata_cannot_claim_encoded_origin_response() {
                 Some("text/plain"),
                 &headers,
             )
-            .await
+            .await.replaced_bytes()
             .is_none()
     );
     assert_continue(

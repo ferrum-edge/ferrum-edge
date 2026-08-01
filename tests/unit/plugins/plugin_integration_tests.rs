@@ -133,7 +133,7 @@ async fn run_buffered_response_lifecycle(
     for plugin in plugins {
         if let Some(transformed) = plugin
             .transform_response_body(&response_body, content_type, &response_headers)
-            .await
+            .await.replaced_bytes()
         {
             response_headers.insert("content-length".to_string(), transformed.len().to_string());
             response_body = transformed;
@@ -876,7 +876,7 @@ mod runtime_overlay_cache_provenance {
                     content_type.as_deref(),
                     &response_headers,
                 )
-                .await
+                .await.replaced_bytes()
             {
                 response_headers
                     .insert("content-length".to_string(), transformed.len().to_string());

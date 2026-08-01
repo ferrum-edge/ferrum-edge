@@ -2069,12 +2069,12 @@ impl Plugin for CompressionPlugin {
         _body: &[u8],
         _content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
         // Compression needs the `after_proxy` decision in request metadata to
         // distinguish a gateway-committed encoding from an origin-supplied
         // `Content-Encoding`. Production proxy paths call the context-aware
         // variant below.
-        None
+        crate::plugins::ResponseBodyTransformOutcome::Unchanged
     }
 
     async fn transform_response_body_with_context(
@@ -2083,12 +2083,13 @@ impl Plugin for CompressionPlugin {
         body: &[u8],
         _content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
+        use crate::plugins::ResponseBodyTransformOutcome;
         // HEAD never transfers content bytes. Even if an earlier phase
         // incorrectly committed a Content-Encoding, refuse to synthesize an
         // encoded-empty body / Content-Length (RFC 9110 §9.3.2 / §8.6).
         if ctx.method.eq_ignore_ascii_case("HEAD") {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
 
         // The algorithm decision was made in `after_proxy` and recorded in
@@ -2096,17 +2097,21 @@ impl Plugin for CompressionPlugin {
         // the origin, committed a response encoding. Only the owning instance
         // may emit the coding layer so Content-Encoding stays 1:1 with body
         // layers across multi-instance transform loops.
-        let encoding = response_headers.get("content-encoding")?;
-        ctx.gateway_response_compression_algorithm()?;
+        let Some(encoding) = response_headers.get("content-encoding") else {
+            return ResponseBodyTransformOutcome::Unchanged;
+        };
+        if ctx.gateway_response_compression_algorithm().is_none() {
+            return ResponseBodyTransformOutcome::Unchanged;
+        }
         if !self.is_response_encode_owner(ctx) {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
         let encoding = if encoding.eq_ignore_ascii_case("gzip") {
             "gzip"
         } else if encoding.eq_ignore_ascii_case("br") {
             "br"
         } else {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         };
 
         // The buffer permit is what admitted this body onto the compression-only
@@ -2119,7 +2124,7 @@ impl Plugin for CompressionPlugin {
                 "compression: missing response-buffer admission permit for committed Content-Encoding '{encoding}'"
             );
             ctx.mark_compression_response_encode_aborted();
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         };
         // Codec CPU admission is acquired only here, immediately before the
         // blocking worker, so a slow backend holding a buffer slot never pins a
@@ -2132,7 +2137,7 @@ impl Plugin for CompressionPlugin {
             drop(buffer_permit);
             warn!("compression: codec admission saturated while encoding response body");
             ctx.mark_compression_response_encode_aborted();
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         };
 
         // Once `after_proxy` set `Content-Encoding`, the response is committed
@@ -2161,10 +2166,10 @@ impl Plugin for CompressionPlugin {
         // request's compression admission.
         drop(buffer_permit);
         match compressed {
-            Some(compressed) => Some(compressed),
+            Some(compressed) => ResponseBodyTransformOutcome::Replaced(compressed),
             None => {
                 ctx.mark_compression_response_encode_aborted();
-                None
+                ResponseBodyTransformOutcome::Unchanged
             }
         }
     }

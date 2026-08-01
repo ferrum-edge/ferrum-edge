@@ -1727,7 +1727,7 @@ async fn test_skips_205_reset_content_absent_and_zero_content_length() {
                     Some("application/json"),
                     &resp_headers,
                 )
-                .await
+                .await.replaced_bytes()
                 .is_none()
         );
     }
@@ -1794,7 +1794,7 @@ async fn test_skips_head_present_and_absent_content_length() {
                     Some("application/json"),
                     &resp_headers,
                 )
-                .await
+                .await.replaced_bytes()
                 .is_none(),
             "HEAD must never gzip an empty wire body (cl={content_length:?})"
         );
@@ -2851,7 +2851,7 @@ async fn test_gzip_response_compression_roundtrip() {
             Some("application/json"),
             &resp_headers,
         )
-        .await
+        .await.replaced_bytes()
         .expect("should compress");
 
     assert!(compressed.len() < original.len());
@@ -2879,7 +2879,7 @@ async fn test_brotli_response_compression_roundtrip() {
 
     let compressed = plugin
         .transform_response_body_with_context(&mut ctx, original, Some("text/html"), &resp_headers)
-        .await
+        .await.replaced_bytes()
         .expect("should compress");
 
     assert!(compressed.len() < original.len());
@@ -2916,7 +2916,7 @@ async fn test_compresses_tiny_body_when_committed_in_transform() {
             Some("application/json"),
             &resp_headers,
         )
-        .await
+        .await.replaced_bytes()
         .expect("once Content-Encoding is set, transform must compress regardless of size");
 
     // Verify the body is actually gzip-compressed (not the original bytes)
@@ -2947,7 +2947,7 @@ async fn test_transform_response_body_compresses_when_encoding_already_committed
             Some("application/json"),
             &resp_headers,
         )
-        .await
+        .await.replaced_bytes()
         .expect("committed Content-Encoding must produce an encoded body");
 
     assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
@@ -2980,7 +2980,7 @@ async fn test_transform_response_body_uses_final_supported_content_encoding() {
             Some("application/json"),
             &resp_headers,
         )
-        .await
+        .await.replaced_bytes()
         .expect("gateway-committed encoding should follow the final supported header");
 
     use flate2::read::GzDecoder;
@@ -3009,7 +3009,7 @@ async fn test_transform_response_body_skips_origin_encoding_without_commit_metad
             Some("application/json"),
             &resp_headers,
         )
-        .await;
+        .await.replaced_bytes();
 
     assert!(
         result.is_none(),
@@ -3041,7 +3041,7 @@ async fn test_after_proxy_skips_when_content_length_below_min() {
             Some("application/json"),
             &resp_headers,
         )
-        .await;
+        .await.replaced_bytes();
     assert!(result.is_none());
 }
 
@@ -3394,7 +3394,7 @@ async fn test_full_response_compression_lifecycle_gzip() {
             Some("application/json"),
             &resp_headers,
         )
-        .await
+        .await.replaced_bytes()
         .expect("should compress");
     assert!(compressed.len() < body.len());
 
@@ -5506,7 +5506,7 @@ async fn test_codec_admission_saturation_skips_response_transform() {
                     Some("application/json"),
                     &resp,
                 )
-                .await
+                .await.replaced_bytes()
                 .is_none(),
             "saturated codec budget must decline the response transform"
         );
@@ -6152,7 +6152,7 @@ async fn test_response_encode_abort_restores_identity_representation() {
     let mut identity = bytes::Bytes::from(compressible_json_body());
     let transformed = plugin
         .transform_response_body_with_context(&mut ctx, &identity, Some("application/json"), &resp)
-        .await;
+        .await.replaced_bytes();
     assert!(
         transformed.is_none(),
         "encode abort must not emit compressed bytes"
@@ -6222,7 +6222,7 @@ async fn test_codec_saturation_at_transform_restores_identity_and_frees_buffer_s
                         Some("application/json"),
                         &resp,
                     )
-                    .await
+                    .await.replaced_bytes()
                     .is_none(),
                 "codec saturation must abort the encode instead of emitting bytes"
             );
@@ -6294,7 +6294,7 @@ async fn test_codec_saturation_with_identity_forbidden_returns_406() {
                         Some("application/json"),
                         &resp,
                     )
-                    .await
+                    .await.replaced_bytes()
                     .is_none()
             );
             let mut status = 200;
@@ -6367,7 +6367,7 @@ async fn test_buffer_slot_recovers_after_successful_encode() {
                     Some("application/json"),
                     &resp,
                 )
-                .await
+                .await.replaced_bytes()
                 .expect("codec admission is available, so the encode must succeed");
             assert!(!compressed.is_empty());
             assert_ne!(compressed, identity, "body must actually be gzip encoded");
@@ -6469,7 +6469,7 @@ async fn test_codec_offload_allows_unrelated_async_progress() {
     let encode = tokio::spawn(async move {
         plugin
             .transform_response_body_with_context(&mut ctx, &body, Some("application/json"), &resp)
-            .await
+            .await.replaced_bytes()
     });
 
     // Deterministic liveness: an unrelated task must be able to run while the

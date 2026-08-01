@@ -1185,8 +1185,9 @@ impl BufferedInitialResponseHeaderPolicyState {
 /// declaration, and its default is fail-closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseBodyProduction {
-    /// This plugin never returns `Some` from `normalize_response_body_with_context`
-    /// or `transform_response_body[_with_context]`. No window is reserved on its
+    /// This plugin never returns [`ResponseBodyTransformOutcome::Replaced`] from
+    /// `normalize_response_body_with_context` or
+    /// `transform_response_body[_with_context]`. No window is reserved on its
     /// account; if it nevertheless returns bytes, the phase fails closed rather
     /// than installing an allocation nothing reserved for.
     Never,
@@ -1206,6 +1207,71 @@ impl ResponseBodyProduction {
     /// Whether a window must be reserved on this plugin's account.
     pub fn may_replace_response_body(self) -> bool {
         !matches!(self, Self::Never)
+    }
+}
+
+/// Outcome of a buffered response-body producer hook.
+///
+/// The shared transform loop must distinguish an intentional no-op from a
+/// retained-ceiling refusal after the producer already decided the body must
+/// change. Collapsing both into `None`/`Unchanged` would forward the original
+/// body after `after_proxy` relabeled gRPC-Web Content-Type, or after a JSON
+/// redaction/rewrite mutated policy state but could not serialize within the
+/// ceiling (GHSA-pwcm-6rh8-f2gh).
+///
+/// Non-owner / no-match / semantic no-op paths return [`Self::Unchanged`] and
+/// are never treated as failures. Only a producer that attempted a required
+/// replacement and could not construct it within the retained ceiling returns
+/// [`Self::CapacityRefused`], which installs the shared gateway capacity
+/// terminal.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResponseBodyTransformOutcome {
+    /// Leave the current body unchanged.
+    Unchanged,
+    /// Install these replacement bytes.
+    Replaced(Vec<u8>),
+    /// Construction refused by the retained ceiling (or an equivalent bounded
+    /// writer failure) after this producer decided the body must change.
+    CapacityRefused,
+}
+
+impl ResponseBodyTransformOutcome {
+    /// Map a legacy `Option<Vec<u8>>` producer result: `Some` → replaced,
+    /// `None` → unchanged. Capacity refusals cannot be expressed this way.
+    #[inline]
+    pub fn from_optional_replacement(body: Option<Vec<u8>>) -> Self {
+        match body {
+            Some(bytes) => Self::Replaced(bytes),
+            None => Self::Unchanged,
+        }
+    }
+
+    /// `Some` when this outcome carries replacement bytes.
+    #[inline]
+    pub fn replaced_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Replaced(bytes) => Some(bytes),
+            Self::Unchanged | Self::CapacityRefused => None,
+        }
+    }
+
+    /// Whether this is an intentional no-op.
+    #[inline]
+    pub fn is_unchanged(&self) -> bool {
+        matches!(self, Self::Unchanged)
+    }
+
+    /// Whether construction was refused after a required change.
+    #[inline]
+    pub fn is_capacity_refused(&self) -> bool {
+        matches!(self, Self::CapacityRefused)
+    }
+}
+
+impl From<Option<Vec<u8>>> for ResponseBodyTransformOutcome {
+    #[inline]
+    fn from(body: Option<Vec<u8>>) -> Self {
+        Self::from_optional_replacement(body)
     }
 }
 
@@ -8548,18 +8614,24 @@ pub trait Plugin: Send + Sync {
     /// when `requires_response_body_buffering()` returns `true`. The body
     /// bytes are the raw backend response body.
     ///
-    /// Return `Some(new_body)` to replace the body, or `None` to leave it
-    /// unchanged. The `content_type` parameter is extracted from the response
-    /// headers so plugins can decide whether to parse the body. The full
-    /// `response_headers` map is also available for plugins that need other
-    /// headers (e.g., `content-encoding` for compression).
+    /// Return [`ResponseBodyTransformOutcome::Replaced`] to install new bytes,
+    /// [`ResponseBodyTransformOutcome::Unchanged`] for an intentional no-op
+    /// (non-owner, no-match, semantic no-change), or
+    /// [`ResponseBodyTransformOutcome::CapacityRefused`] when this producer
+    /// decided the body must change but could not construct the replacement
+    /// within the retained ceiling. The shared transform loop treats capacity
+    /// refusal as fail-closed — never as an ordinary no-op. The `content_type`
+    /// parameter is extracted from the response headers so plugins can decide
+    /// whether to parse the body. The full `response_headers` map is also
+    /// available for plugins that need other headers (e.g., `content-encoding`
+    /// for compression).
     async fn transform_response_body(
         &self,
         _body: &[u8],
         _content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
-        None
+    ) -> ResponseBodyTransformOutcome {
+        ResponseBodyTransformOutcome::Unchanged
     }
 
     /// Context-aware variant of `transform_response_body`.
@@ -8574,7 +8646,7 @@ pub trait Plugin: Send + Sync {
         body: &[u8],
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> ResponseBodyTransformOutcome {
         self.transform_response_body(body, content_type, response_headers)
             .await
     }
@@ -8688,8 +8760,10 @@ pub trait Plugin: Send + Sync {
     ///
     /// Use this to attach validators, integrity digests, or other headers the
     /// plugin recomputed for its replacement bytes. The hook is not called when
-    /// the transform returns `None`, so unchanged responses retain their
-    /// original headers.
+    /// the transform returns [`ResponseBodyTransformOutcome::Unchanged`] or
+    /// [`ResponseBodyTransformOutcome::CapacityRefused`], so unchanged and
+    /// refused responses retain their original headers until the shared
+    /// capacity terminal (if any) replaces the representation.
     fn on_response_body_transformed(
         &self,
         _ctx: &mut RequestContext,

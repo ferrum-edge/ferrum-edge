@@ -741,9 +741,11 @@ impl super::Plugin for SsePlugin {
         body: &[u8],
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
+        use crate::plugins::ResponseBodyTransformOutcome;
+
         if !self.wrap_non_sse_responses || body.is_empty() {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
 
         // This is a one-shot request decision. Multiple `sse` instances can
@@ -764,21 +766,26 @@ impl super::Plugin for SsePlugin {
         // Direct callers without after_proxy still wrap only when the supplied
         // type is not already SSE.
         if !wrap_requested && content_type.is_some_and(Self::is_sse_content_type) {
-            return None;
+            return ResponseBodyTransformOutcome::Unchanged;
         }
 
         // Built inside a sink sized to this response's retained ceiling, so an
         // event that would exceed it is refused during construction rather than
-        // allocated and rejected afterwards (GHSA-pwcm-6rh8-f2gh). A refusal
-        // leaves the original body in place.
-        let output = self.wrap_body_as_sse_event(body, ctx.retained_response_body_ceiling())?;
+        // allocated and rejected afterwards (GHSA-pwcm-6rh8-f2gh). Optional SSE
+        // wrapping leaves the original body in place on refusal — it is not a
+        // security policy rewrite.
+        let Some(output) =
+            self.wrap_body_as_sse_event(body, ctx.retained_response_body_ceiling())
+        else {
+            return ResponseBodyTransformOutcome::Unchanged;
+        };
         debug!(
             plugin = "sse",
             original_bytes = body.len(),
             wrapped_bytes = output.len(),
             "wrapped response into SSE event"
         );
-        Some(output)
+        ResponseBodyTransformOutcome::Replaced(output)
     }
 
     async fn transform_response_body(
@@ -786,7 +793,7 @@ impl super::Plugin for SsePlugin {
         body: &[u8],
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
-    ) -> Option<Vec<u8>> {
+    ) -> crate::plugins::ResponseBodyTransformOutcome {
         // Fallback when no request context is available (legacy callers).
         let mut ctx =
             RequestContext::new("0.0.0.0".to_string(), "GET".to_string(), "/".to_string());
