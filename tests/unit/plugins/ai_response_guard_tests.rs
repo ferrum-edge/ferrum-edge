@@ -5499,3 +5499,83 @@ async fn test_amplifying_sse_redaction_is_refused_during_event_construction() {
     assert!(!redacted.contains("@b.co"));
     assert!(redacted.contains("[REDACTED:pii:email]"));
 }
+
+
+/// Failure to reserve the residual-inspection window is gateway-local capacity,
+/// not restricted backend content: the typed capacity signal must be selected
+/// and the shared overload body/error class used (GHSA-pwcm-6rh8-f2gh).
+#[tokio::test]
+async fn inspection_window_capacity_selects_gateway_buffer_capacity_not_content_502() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS,
+        RESPONSE_BUFFER_OVERLOAD_STATUS, gateway_capacity_response_selected_for_test,
+        install_response_buffer_capacity_refusal_for_test,
+        mark_gateway_capacity_response_selected_for_test,
+    };
+    use ferrum_edge::retry::ErrorClass;
+
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "action": "redact"
+    }));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let body = br#"{"message":"contact user@example.com"}"#;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    // Simulate the inspection-window refusal path: the plugin marks capacity
+    // selection, and the shared installer produces the health-neutral terminal.
+    mark_gateway_capacity_response_selected_for_test(&mut ctx);
+    assert!(gateway_capacity_response_selected_for_test(&ctx));
+
+    let mut status = 200u16;
+    let mut response_body = bytes::Bytes::from_static(body);
+    install_response_buffer_capacity_refusal_for_test(
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut response_body,
+    );
+
+    assert_eq!(status, RESPONSE_BUFFER_OVERLOAD_STATUS);
+    assert_eq!(
+        response_body,
+        bytes::Bytes::from_static(RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes())
+    );
+    let rendered = String::from_utf8(response_body.to_vec()).unwrap();
+    assert!(
+        !rendered.contains("restricted content"),
+        "capacity must not be misattributed as content-guard rejection: {rendered}"
+    );
+    assert!(
+        !ctx.metadata.contains_key("ai_response_guard_rejected"),
+        "capacity refusal must not stamp a content-guard rejection reason"
+    );
+    assert_eq!(
+        RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS,
+        ErrorClass::GatewayBufferCapacity
+    );
+
+    // Content findings still fail closed as 502s when capacity is available.
+    let mut content_ctx = ctx_with_content_type("POST", "application/json");
+    let result = plugin
+        .on_response_body(&mut content_ctx, 200, &mut headers, body)
+        .await;
+    match result {
+        PluginResult::Reject { status_code, body, .. } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("restricted content") || body.contains("AI response blocked"));
+            assert!(!gateway_capacity_response_selected_for_test(&content_ctx));
+        }
+        PluginResult::Continue => {
+            // Redact mode continues after detection; that is still content-path,
+            // not capacity.
+            assert!(
+                content_ctx.metadata.contains_key("ai_response_guard_redacted"),
+                "content detection must stay on the content path"
+            );
+            assert!(!gateway_capacity_response_selected_for_test(&content_ctx));
+        }
+        other => panic!("unexpected result: {other:?}"),
+    }
+}

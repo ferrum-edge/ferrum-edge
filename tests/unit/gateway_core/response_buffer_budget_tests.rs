@@ -912,10 +912,11 @@ fn every_capacity_refusal_uses_the_shared_gateway_terminal() {
         proxy
             .matches("replace_buffered_response_with_capacity_refusal(")
             .count(),
-        5,
+        8,
         "one definition, the transform window-open/admission/publication \
-         refusals, and final gRPC-Web reframe; the normalize call site lives in \
-         src/plugins/mod.rs"
+         refusals, final gRPC-Web reframe, H1/H2 + native-gRPC on_response_body \
+         capacity installers, and the synthetic short-circuit body path; \
+         the normalize call site lives in src/plugins/mod.rs"
     );
     assert_eq!(
         proxy
@@ -2833,4 +2834,172 @@ fn bounded_sink_capacity_never_exceeds_ceiling_on_successful_writes() {
     assert!(!sink.overflowed());
     let finished = sink.finish().expect("in-ceiling writes finish");
     assert!(finished.len() <= 128);
+}
+
+// ---------------------------------------------------------------------------
+// Normalize-phase capacity terminals are authoritative across every buffered
+// frontend call site: later body policy / transform / final-validator phases
+// must observe the typed selection signal and leave the terminal alone
+// (GHSA-pwcm-6rh8-f2gh).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn capacity_refusal_records_an_explicit_selection_signal() {
+    let mut ctx = refusal_ctx();
+    assert!(
+        !ferrum_edge::_test_support::gateway_capacity_response_selected_for_test(&ctx),
+        "fresh contexts must not look like a capacity terminal"
+    );
+    let mut status = 200u16;
+    let mut headers = refusal_headers(&[("content-type", "application/json")]);
+    let mut body = bytes::Bytes::from_static(b"backend representation");
+    install_response_buffer_capacity_refusal_for_test(
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    );
+    assert!(
+        ferrum_edge::_test_support::gateway_capacity_response_selected_for_test(&ctx),
+        "installing the shared capacity terminal must record the typed selection signal"
+    );
+    assert_eq!(status, RESPONSE_BUFFER_OVERLOAD_STATUS);
+    assert_eq!(
+        body,
+        bytes::Bytes::from_static(RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes())
+    );
+    assert_eq!(
+        RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS,
+        ErrorClass::GatewayBufferCapacity
+    );
+}
+
+#[test]
+fn every_buffered_normalize_call_site_honors_capacity_terminal_immutability() {
+    let plugins = include_str!("../../../src/plugins/mod.rs");
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let h3_server = include_str!("../../../src/http3/server.rs");
+    let h3_cross = include_str!("../../../src/http3/cross_protocol.rs");
+
+    assert!(
+        plugins.contains("enum NormalizeResponseBodyOutcome")
+            && plugins.contains("CapacityTerminal")
+            && plugins.contains("DeadlineTerminal")
+            && plugins.contains("Replaced"),
+        "normalize must expose an explicit CapacityTerminal outcome distinct from \
+         ordinary Replaced and from DeadlineTerminal"
+    );
+    assert!(
+        plugins.contains("gateway_capacity_response_selected")
+            && plugins.contains("mark_gateway_capacity_response_selected"),
+        "RequestContext must carry a typed capacity-terminal selection signal"
+    );
+    assert!(
+        proxy.contains("ctx.mark_gateway_capacity_response_selected();"),
+        "the shared capacity installer must record the selection signal"
+    );
+
+    for (label, source) in [
+        ("h1/h2 + native grpc", proxy),
+        ("h3 native", h3_server),
+        ("h3 cross-protocol", h3_cross),
+    ] {
+        assert!(
+            source.contains("capacity_terminal()")
+                || source.contains("gateway_capacity_response_selected()"),
+            "{label}: every buffered path must consult the capacity-terminal signal \
+             rather than treating ordinary normalize success as mutable"
+        );
+        assert!(
+            source.contains("!ctx.gateway_capacity_response_selected()")
+                || source.contains("capacity_terminal()"),
+            "{label}: transform/final phases must be gated on the capacity signal so a \
+             gRPC-Web text capacity trailer cannot be double-encoded or replaced by a \
+             later validator"
+        );
+    }
+
+    // Final validators remain suppressed once capacity selection sets
+    // `response_body_rejected` / the typed capacity signal.
+    assert!(
+        proxy.contains("on_final_response_body")
+            && (proxy.contains("!response_body_rejected")
+                || proxy.contains("gateway_capacity_response_selected()")),
+        "final validators must not replace a selected capacity terminal"
+    );
+}
+
+#[test]
+fn grpc_web_text_capacity_terminal_is_single_layer_base64() {
+    use base64::Engine as _;
+
+    let mut ctx = refusal_ctx();
+    ctx.metadata.insert(
+        ferrum_edge::_test_support::GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY
+            .to_string(),
+        "application/grpc-web-text+proto".to_string(),
+    );
+    let mut status = 200u16;
+    let mut headers = refusal_headers(&[("content-type", "application/grpc")]);
+    let mut body = bytes::Bytes::from_static(b"native-grpc-bytes");
+    install_response_buffer_capacity_refusal_for_test(
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    );
+
+    assert_eq!(status, 200, "gRPC-Web errors ride HTTP 200");
+    assert!(
+        ferrum_edge::_test_support::gateway_capacity_response_selected_for_test(&ctx),
+        "selection signal must be set for later phases to skip re-framing"
+    );
+    // Text mode is already base64 of a trailer frame. Later transforms must not
+    // encode it again once the capacity signal is set.
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&body)
+        .expect("text gRPC-Web capacity body must be single-layer base64");
+    assert_eq!(
+        decoded.first().copied(),
+        Some(0x80),
+        "decoded capacity body must start with a gRPC-Web trailer frame flag"
+    );
+    let rendered = String::from_utf8_lossy(&decoded);
+    let expected_grpc_status = RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS.to_string();
+    assert!(
+        rendered.contains(&format!("grpc-status: {expected_grpc_status}")),
+        "trailer frame must carry the capacity status: {rendered:?}"
+    );
+    assert!(
+        base64::engine::general_purpose::STANDARD
+            .decode(&decoded)
+            .is_err(),
+        "capacity text body must not be double-base64-encoded"
+    );
+}
+
+#[test]
+fn ai_response_guard_routes_inspection_window_refusal_to_capacity_not_content() {
+    let guard = include_str!("../../../src/plugins/ai_response_guard.rs");
+    assert!(
+        guard.contains("fn respond_to_inspection_capacity_unavailable("),
+        "residual-window budget failure must have a dedicated capacity path"
+    );
+    assert!(
+        guard.contains("mark_gateway_capacity_response_selected()"),
+        "AI inspection capacity refusal must select the shared capacity terminal signal"
+    );
+    assert_eq!(
+        guard
+            .matches("Self::respond_to_inspection_capacity_unavailable(ctx)")
+            .count(),
+        3,
+        "SSE residual, JSON/content residual, and gRPC redaction preflight must \
+         each route window-open failure to capacity"
+    );
+    assert_eq!(
+        RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS,
+        ErrorClass::GatewayBufferCapacity,
+        "capacity classification must remain the health-neutral GatewayBufferCapacity class"
+    );
 }

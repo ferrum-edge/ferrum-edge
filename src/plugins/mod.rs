@@ -2120,6 +2120,15 @@ pub struct RequestContext {
     /// backend or plugin-controlled `grpc-status`/`grpc-message` text must not
     /// unlock the write-biased terminal H3 completion path.
     gateway_deadline_response_selected: bool,
+    /// Whether the gateway selected the health-neutral retained-response
+    /// capacity terminal for this request (`GatewayBufferCapacity`). Kept
+    /// typed and out of metadata so a later body policy/transform/final
+    /// validator cannot mistake ordinary normalization success for a
+    /// mutable body and reframe or replace the already-complete terminal
+    /// (GHSA-pwcm-6rh8-f2gh). Distinct from
+    /// [`Self::gateway_deadline_response_selected`]: deadline ownership and
+    /// capacity ownership must not overload each other.
+    gateway_capacity_response_selected: bool,
     /// Monotonic request-global proof that at least one response-caching
     /// instance served a HIT or REVALIDATED response. Kept outside public
     /// metadata so sibling/custom plugins cannot clear or forge the signal
@@ -2917,6 +2926,7 @@ impl RequestContext {
             grpc_deadline_at: None,
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
+            gateway_capacity_response_selected: false,
             response_cache_hit: false,
             origin_http_response_status: None,
             metadata: HashMap::new(),
@@ -3149,6 +3159,14 @@ impl RequestContext {
 
     pub(crate) fn gateway_deadline_response_selected(&self) -> bool {
         self.gateway_deadline_response_selected
+    }
+
+    pub(crate) fn mark_gateway_capacity_response_selected(&mut self) {
+        self.gateway_capacity_response_selected = true;
+    }
+
+    pub(crate) fn gateway_capacity_response_selected(&self) -> bool {
+        self.gateway_capacity_response_selected
     }
 
     /// Remaining whole-millisecond gRPC budget, rounded up so a positive
@@ -3831,6 +3849,7 @@ impl RequestContext {
             grpc_deadline_at: self.grpc_deadline_at,
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
+            gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             response_cache_hit: self.response_cache_hit,
             origin_http_response_status: self.origin_http_response_status,
             // Omit `request_body` (the full buffered prompt): no
@@ -5510,8 +5529,40 @@ pub(crate) const PRODUCER_REFUSED_WINDOW_UNAVAILABLE: &str = "retained_window_un
 /// it could allocate outside the aggregate cap.
 pub(crate) const PRODUCER_REFUSED_UNDECLARED_CONTRACT: &str = "undeclared_replacement_contract";
 
+/// Outcome of [`normalize_response_body_for_inspection`].
+///
+/// Capacity and deadline terminals are explicit variants so callers cannot
+/// mistake ordinary successful normalization (`Replaced`) for an authoritative
+/// gateway terminal that later body phases must leave alone
+/// (GHSA-pwcm-6rh8-f2gh).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormalizeResponseBodyOutcome {
+    /// No normalizer rewrote the body and no gateway terminal was selected.
+    Unchanged,
+    /// A normalizer installed replacement bytes; later inspection phases proceed.
+    Replaced,
+    /// The request deadline owns the client-visible outcome.
+    DeadlineTerminal,
+    /// Aggregate retained-response capacity refused; the shared capacity
+    /// terminal is already complete and later body policy / transform /
+    /// final-validator phases must not run.
+    CapacityTerminal,
+}
+
+impl NormalizeResponseBodyOutcome {
+    /// True when any bytes were substituted for the backend body.
+    pub fn body_replaced(self) -> bool {
+        !matches!(self, Self::Unchanged)
+    }
+
+    /// True when the shared capacity terminal is authoritative.
+    pub fn capacity_terminal(self) -> bool {
+        matches!(self, Self::CapacityTerminal)
+    }
+}
+
 /// Run buffered provider/protocol normalizers before response-body policy
-/// inspection. Returns whether any plugin replaced the bytes.
+/// inspection.
 ///
 /// This is shared by the H1/H2 and all buffered H3 bridge/native paths so a
 /// frontend protocol cannot change which representation guardrails inspect.
@@ -5527,7 +5578,7 @@ pub async fn normalize_response_body_for_inspection(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut bytes::Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
-) -> bool {
+) -> NormalizeResponseBodyOutcome {
     let response_status_in = *response_status;
     // Seed provenance before the rewrite gate: a status that forbids body
     // rewrites can still be replaced by the request's gRPC deadline, and an
@@ -5552,10 +5603,10 @@ pub async fn normalize_response_body_for_inspection(
             initial_response_header_policy_plugins,
         )
         .as_u16();
-        return true;
+        return NormalizeResponseBodyOutcome::DeadlineTerminal;
     }
     if !response_body_rewrite_allowed(response_status_in) {
-        return false;
+        return NormalizeResponseBodyOutcome::Unchanged;
     }
     let content_type = response_headers.get("content-type").cloned();
     // A normalizer allocates its replacement itself, so the blocks that will pay
@@ -5590,7 +5641,7 @@ pub async fn normalize_response_body_for_inspection(
                     response_body,
                     initial_response_header_policy_plugins,
                 );
-                return true;
+                return NormalizeResponseBodyOutcome::CapacityTerminal;
             }
         }
     } else {
@@ -5622,7 +5673,7 @@ pub async fn normalize_response_body_for_inspection(
                 response_body,
                 initial_response_header_policy_plugins,
             );
-            return true;
+            return NormalizeResponseBodyOutcome::CapacityTerminal;
         }
         let deadline = ctx.grpc_deadline_at();
         let body = match await_grpc_deadline(
@@ -5651,8 +5702,7 @@ pub async fn normalize_response_body_for_inspection(
                     response_body,
                     initial_response_header_policy_plugins,
                 );
-                normalized = true;
-                break;
+                return NormalizeResponseBodyOutcome::DeadlineTerminal;
             }
         };
         if let Some(body) = body {
@@ -5689,7 +5739,7 @@ pub async fn normalize_response_body_for_inspection(
                     response_body,
                     initial_response_header_policy_plugins,
                 );
-                return true;
+                return NormalizeResponseBodyOutcome::CapacityTerminal;
             };
             response_headers.insert("content-length".to_string(), body_len.to_string());
             *response_body = charged;
@@ -5697,7 +5747,11 @@ pub async fn normalize_response_body_for_inspection(
         }
         ctx.record_deadline_response_header_mutations(response_headers);
     }
-    normalized
+    if normalized {
+        NormalizeResponseBodyOutcome::Replaced
+    } else {
+        NormalizeResponseBodyOutcome::Unchanged
+    }
 }
 
 /// Pipes each chunk through a chain of [`ResponseStreamInspector`]s: inspector

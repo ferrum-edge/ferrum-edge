@@ -732,6 +732,18 @@ pub mod _test_support {
         ctx.mark_gateway_deadline_response_selected();
     }
 
+    pub fn gateway_capacity_response_selected_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.gateway_capacity_response_selected()
+    }
+
+    pub fn mark_gateway_capacity_response_selected_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.mark_gateway_capacity_response_selected();
+    }
+
     /// Run the buffered request-body stage the way the proxy does: every
     /// `transform_request_body` hook first, then every `on_final_request_body`
     /// hook, over one shared `RequestContext`.

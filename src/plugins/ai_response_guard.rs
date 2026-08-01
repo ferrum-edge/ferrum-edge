@@ -954,9 +954,14 @@ impl AiResponseGuard {
     /// unrewritable content still matches, the caller must reject.
     /// `ceiling` is this response's retained ceiling; the candidate is built
     /// under a budget window of that size, reserved before it exists.
-    fn redact_sse_leaves_residual(&self, body: &[u8], ceiling: usize) -> bool {
+    ///
+    /// Returns `None` when the aggregate retained-response budget cannot admit
+    /// the inspection window — a gateway-local capacity condition, not residual
+    /// content (GHSA-pwcm-6rh8-f2gh). `Some(true)` means residual content;
+    /// `Some(false)` means the candidate is clean.
+    fn redact_sse_leaves_residual(&self, body: &[u8], ceiling: usize) -> Option<bool> {
         if self.detection_pattern_count == 0 {
-            return false;
+            return Some(false);
         }
         // The candidate here is a COMPLETE would-be client-visible body, built
         // during INSPECTION — before any producer phase has opened a transform
@@ -966,13 +971,10 @@ impl AiResponseGuard {
         // bypass this advisory closes. So a window sized to THIS response's
         // retained ceiling is reserved first and released as soon as the scan is
         // done, keeping the peak at the documented two ceilings; a budget that
-        // cannot admit it fails closed (treated as residual) rather than
-        // materialising the candidate anyway (GHSA-pwcm-6rh8-f2gh).
-        let Some(window) =
-            crate::proxy::response_buffer_budget::ResponseTransformWindow::open(ceiling)
-        else {
-            return true;
-        };
+        // cannot admit it fails closed as capacity rather than materialising the
+        // candidate anyway (GHSA-pwcm-6rh8-f2gh).
+        let window =
+            crate::proxy::response_buffer_budget::ResponseTransformWindow::open(ceiling)?;
         // Scan the exact bytes the client would receive: transformed output
         // when redaction changed an event, otherwise the original framing.
         // The residual pass masks only preserved top-level structural scalar
@@ -982,7 +984,7 @@ impl AiResponseGuard {
         let residual = self.sse_body_has_residual(redacted.as_deref().unwrap_or(body));
         drop(redacted);
         drop(window);
-        residual
+        Some(residual)
     }
 
     /// Re-scan an SSE body produced by [`Self::redact_sse_body`]. Scan-all
@@ -1343,6 +1345,24 @@ impl AiResponseGuard {
             ctx.metadata
                 .insert("ai_response_guard_warning".to_string(), reason.to_string());
             PluginResult::Continue
+        }
+    }
+
+    /// Signal that residual inspection could not reserve its retained-response
+    /// window. Callers install the shared health-neutral capacity terminal
+    /// instead of a content-guard 502 (GHSA-pwcm-6rh8-f2gh).
+    fn respond_to_inspection_capacity_unavailable(ctx: &mut RequestContext) -> PluginResult {
+        debug!(
+            "ai_response_guard: retained-response inspection window unavailable; \
+             selecting gateway capacity terminal"
+        );
+        ctx.mark_gateway_capacity_response_selected();
+        // Placeholder reject shape: protocol writers replace it with the shared
+        // capacity terminal when they observe the typed selection signal.
+        PluginResult::Reject {
+            status_code: crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
+            body: crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY.to_string(),
+            headers: HashMap::new(),
         }
     }
 
@@ -1789,7 +1809,7 @@ impl AiResponseGuard {
             // ceiling is reserved first and released as soon as the preflight is
             // done — the same shape `redact_sse_leaves_residual` uses, and the
             // same documented two-ceiling peak. A budget that cannot admit the
-            // window is a REFUSAL, not a licence to build the candidate anyway
+            // window is a gateway-local capacity refusal, not a content finding
             // (GHSA-pwcm-6rh8-f2gh).
             let redaction_verified =
                 match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(
@@ -1807,10 +1827,13 @@ impl AiResponseGuard {
                         // charge covers it for its whole lifetime.
                         drop(rewritten);
                         drop(window);
-                        verified
+                        Some(verified)
                     }
-                    None => false,
+                    None => None,
                 };
+            let Some(redaction_verified) = redaction_verified else {
+                return Self::respond_to_inspection_capacity_unavailable(ctx);
+            };
             if key_match || cross_boundary_only || !redaction_verified {
                 debug!(
                     "ai_response_guard: gRPC redaction leaves residual content \
@@ -3282,26 +3305,32 @@ impl Plugin for AiResponseGuard {
             }
 
             let retained_ceiling = ctx.retained_response_body_ceiling();
-            if self.action == GuardAction::Redact
-                && self.redact_sse_leaves_residual(body, retained_ceiling)
-            {
-                debug!(
-                    "ai_response_guard: redact leaves residual SSE content (types: {:?}), rejecting response",
-                    detected
-                );
-                let types_json: Vec<String> = detected
-                    .iter()
-                    .map(|t| format!("\"{}\"", escape_json_string(t)))
-                    .collect();
-                Self::mark_rejected(ctx, detected.join(","));
-                return PluginResult::Reject {
-                    status_code: 502,
-                    body: format!(
-                        r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
-                        types_json.join(","),
-                    ),
-                    headers: HashMap::new(),
-                };
+            if self.action == GuardAction::Redact {
+                match self.redact_sse_leaves_residual(body, retained_ceiling) {
+                    None => {
+                        return Self::respond_to_inspection_capacity_unavailable(ctx);
+                    }
+                    Some(true) => {
+                        debug!(
+                            "ai_response_guard: redact leaves residual SSE content (types: {:?}), rejecting response",
+                            detected
+                        );
+                        let types_json: Vec<String> = detected
+                            .iter()
+                            .map(|t| format!("\"{}\"", escape_json_string(t)))
+                            .collect();
+                        Self::mark_rejected(ctx, detected.join(","));
+                        return PluginResult::Reject {
+                            status_code: 502,
+                            body: format!(
+                                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                                types_json.join(","),
+                            ),
+                            headers: HashMap::new(),
+                        };
+                    }
+                    Some(false) => {}
+                }
             }
 
             return self.respond_to_detection(ctx, response_status, &detected);
@@ -3441,10 +3470,10 @@ impl Plugin for AiResponseGuard {
         // response's retained ceiling is reserved before the candidate exists
         // and released as soon as the scan is done, keeping the peak at the
         // documented two ceilings. A budget that cannot admit the window is a
-        // refusal, and a refusal is residual — fail closed rather than build the
-        // candidate anyway (GHSA-pwcm-6rh8-f2gh).
-        let leaves_residual = self.action == GuardAction::Redact
-            && match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(
+        // gateway-local capacity refusal, not a content finding
+        // (GHSA-pwcm-6rh8-f2gh).
+        let leaves_residual = if self.action == GuardAction::Redact {
+            match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(
                 ctx.retained_response_body_ceiling(),
             ) {
                 Some(window) => {
@@ -3454,10 +3483,16 @@ impl Plugin for AiResponseGuard {
                         self.content_redact_leaves_residual(&json)
                     };
                     drop(window);
-                    residual
+                    Some(residual)
                 }
-                None => true,
-            };
+                None => None,
+            }
+        } else {
+            Some(false)
+        };
+        let Some(leaves_residual) = leaves_residual else {
+            return Self::respond_to_inspection_capacity_unavailable(ctx);
+        };
         if leaves_residual {
             debug!(
                 "ai_response_guard: redact leaves residual content (types: {:?}), rejecting response",

@@ -7226,11 +7226,11 @@ async fn handle_h3_request(
         }
 
         // Set once an earlier body phase selects a gateway-authored terminal
-        // response. The transform phase still runs so presentation/protocol
-        // transforms can emit the correct wire shape, but final-body validators
-        // must not replace the selected error. While this is first set by
-        // `on_response_body`, it also records a representation-gate or deadline
-        // replacement below.
+        // response. Ordinary on_response_body rejects still run the transform
+        // phase so presentation/protocol transforms can emit the correct wire
+        // shape, but a normalize-phase capacity terminal is already complete
+        // and must skip later body policy/transform/final-validator phases
+        // (GHSA-pwcm-6rh8-f2gh).
         let mut response_body_rejected = false;
 
         // Response-body plugins cannot inspect or transform trailers today, so
@@ -7250,7 +7250,7 @@ async fn handle_h3_request(
         // Mirrors the HTTP/1.1 path in proxy/mod.rs.
         if !after_proxy_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
-            if normalize_response_body_for_inspection(
+            let normalize_outcome = normalize_response_body_for_inspection(
                 &plugins,
                 &mut ctx,
                 &mut response_status,
@@ -7258,84 +7258,108 @@ async fn handle_h3_request(
                 &mut response_body,
                 initial_response_header_policy_plugins.as_ref(),
             )
-            .await
-            {
+            .await;
+            if normalize_outcome.body_replaced() {
                 // Normalization replaced the backend representation, so its
                 // body-specific trailers no longer describe the bytes on wire.
                 response_trailers = None;
             }
-            let mut response_body_reject = None;
-            for plugin in plugins.iter() {
-                let deadline = ctx.grpc_deadline_at();
-                let result = match crate::plugins::await_grpc_deadline(
-                    deadline,
-                    plugin.on_response_body(
-                        &mut ctx,
-                        response_status,
-                        &mut response_headers,
-                        &response_body,
-                    ),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(()) => {
-                        ctx.mark_gateway_deadline_response_selected();
-                        crate::plugins::grpc_deadline_exceeded_plugin_result()
-                    }
-                };
-                match result {
-                    PluginResult::Continue => {
-                        ctx.record_deadline_response_header_plugin(
-                            plugin.as_ref(),
-                            &response_headers,
-                        );
-                    }
-                    reject @ PluginResult::Reject { .. }
-                    | reject @ PluginResult::RejectBinary { .. } => {
-                        let Some(reject) = plugin_result_into_reject_parts(reject) else {
-                            tracing::error!(
-                                "Plugin result could not be converted to rejection parts"
+            if normalize_outcome.capacity_terminal() {
+                response_body_rejected = true;
+            } else {
+                let mut response_body_reject = None;
+                let mut capacity_selected = false;
+                for plugin in plugins.iter() {
+                    let deadline = ctx.grpc_deadline_at();
+                    let result = match crate::plugins::await_grpc_deadline(
+                        deadline,
+                        plugin.on_response_body(
+                            &mut ctx,
+                            response_status,
+                            &mut response_headers,
+                            &response_body,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(()) => {
+                            ctx.mark_gateway_deadline_response_selected();
+                            crate::plugins::grpc_deadline_exceeded_plugin_result()
+                        }
+                    };
+                    match result {
+                        PluginResult::Continue => {
+                            ctx.record_deadline_response_header_plugin(
+                                plugin.as_ref(),
+                                &response_headers,
                             );
-                            response_status = 500;
-                            response_headers.clear();
-                            response_headers
-                                .insert("content-type".to_string(), "application/json".to_string());
-                            response_body = Bytes::from_static(b"Internal Server Error");
-                            // Synthesized error body — backend trailers no
-                            // longer apply (issue #1630).
-                            response_trailers = None;
-                            response_body_rejected = true;
+                        }
+                        reject @ PluginResult::Reject { .. }
+                        | reject @ PluginResult::RejectBinary { .. } => {
+                            if ctx.gateway_capacity_response_selected() {
+                                capacity_selected = true;
+                                break;
+                            }
+                            let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                                tracing::error!(
+                                    "Plugin result could not be converted to rejection parts"
+                                );
+                                response_status = 500;
+                                response_headers.clear();
+                                response_headers.insert(
+                                    "content-type".to_string(),
+                                    "application/json".to_string(),
+                                );
+                                response_body = Bytes::from_static(b"Internal Server Error");
+                                // Synthesized error body — backend trailers no
+                                // longer apply (issue #1630).
+                                response_trailers = None;
+                                response_body_rejected = true;
+                                break;
+                            };
+                            debug!(
+                                plugin = plugin.name(),
+                                status_code = reject.status_code,
+                                "Plugin rejected response body (HTTP/3)"
+                            );
+                            response_body_reject = Some(reject);
                             break;
-                        };
-                        debug!(
-                            plugin = plugin.name(),
-                            status_code = reject.status_code,
-                            "Plugin rejected response body (HTTP/3)"
-                        );
-                        response_body_reject = Some(reject);
-                        break;
+                        }
                     }
                 }
-            }
-            if let Some(reject) = response_body_reject {
-                response_body = apply_plugin_rejection_response(
-                    &plugins,
-                    &mut ctx,
-                    &mut response_status,
-                    &mut response_headers,
-                    reject,
-                )
-                .await;
-                // Backend trailers no longer describe this (rejected) response.
-                response_trailers = None;
-                response_body_rejected = true;
+                if capacity_selected {
+                    crate::proxy::replace_buffered_response_with_capacity_refusal(
+                        &mut ctx,
+                        &mut response_status,
+                        &mut response_headers,
+                        &mut response_body,
+                        initial_response_header_policy_plugins.as_ref(),
+                    );
+                    response_trailers = None;
+                    response_body_rejected = true;
+                } else if let Some(reject) = response_body_reject {
+                    response_body = apply_plugin_rejection_response(
+                        &plugins,
+                        &mut ctx,
+                        &mut response_status,
+                        &mut response_headers,
+                        reject,
+                    )
+                    .await;
+                    // Backend trailers no longer describe this (rejected) response.
+                    response_trailers = None;
+                    response_body_rejected = true;
+                }
             }
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
         // transform_response_body hooks — only for buffered responses.
-        if !after_proxy_rejected && !plugins.is_empty() {
+        if !after_proxy_rejected
+            && !ctx.gateway_capacity_response_selected()
+            && !plugins.is_empty()
+        {
             let phase_start = std::time::Instant::now();
             let (response_replaced, body_transformed) =
                 crate::proxy::transform_buffered_response_body_with_deadline(

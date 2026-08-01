@@ -1,6 +1,6 @@
 use ferrum_edge::plugins::{
-    GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, create_plugin,
-    normalize_response_body_for_inspection, priority,
+    GRPC_ONLY_PROTOCOLS, NormalizeResponseBodyOutcome, Plugin, PluginResult, RequestContext,
+    create_plugin, normalize_response_body_for_inspection, priority,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -2605,7 +2605,10 @@ async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
     )
     .await;
 
-    assert!(normalized);
+    assert_eq!(
+        normalized,
+        NormalizeResponseBodyOutcome::DeadlineTerminal
+    );
     assert_eq!(
         headers.get("x-correlation-id").map(String::as_str),
         Some("request-123")
@@ -2674,7 +2677,7 @@ async fn response_normalizer_deadline_preserves_grpc_web_framing() {
         let mut body = bytes::Bytes::from_static(b"backend response");
 
         let mut normalize_status = 200u16;
-        assert!(
+        assert_eq!(
             normalize_response_body_for_inspection(
                 &plugins,
                 &mut ctx,
@@ -2683,7 +2686,8 @@ async fn response_normalizer_deadline_preserves_grpc_web_framing() {
                 &mut body,
                 &[],
             )
-            .await
+            .await,
+            NormalizeResponseBodyOutcome::DeadlineTerminal
         );
         assert_eq!(
             headers.get("content-type").map(String::as_str),
