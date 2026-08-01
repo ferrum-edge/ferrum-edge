@@ -1447,6 +1447,24 @@ pub struct MeshSidecar {
     /// explicit empty `ingress: []`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<MeshSidecarIngress>,
+    /// Istio `spec.outboundTrafficPolicy.mode` for this Sidecar.
+    ///
+    /// When set, the slice builder projects it onto
+    /// [`crate::modes::mesh::slice::MeshSlice::outbound_traffic_policy`] for the
+    /// selected workload, overriding mesh-wide
+    /// [`MeshConfig::outbound_traffic_policy`] /
+    /// `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`. `None` (omitted on the Sidecar)
+    /// inherits that mesh-wide / runtime default. Selection uses the same
+    /// Sidecar precedence tiers as egress/ingress (workload-scoped → root
+    /// workload-scoped → namespace default → root-namespace default); the
+    /// selected Sidecar's own field is used and does **not** walk the egress
+    /// `inherits_defaults` chain.
+    ///
+    /// Supported modes: `ALLOW_ANY` / `allow_any` and `REGISTRY_ONLY` /
+    /// `registry_only`. Unsupported values are rejected at the Kubernetes
+    /// translator boundary (fail closed with a field-specific diagnostic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
 }
 
 /// A single ingress listener entry under a [`MeshSidecar`] (`spec.ingress[]`).
@@ -2473,6 +2491,10 @@ pub struct MeshConfig {
     /// the legacy `AllowAny` behavior (no gate). When set to `RegistryOnly`,
     /// the mesh outbound dispatcher rejects requests whose destination does
     /// not appear in the slice-derived known-destinations registry.
+    ///
+    /// Per-workload Istio `Sidecar.outboundTrafficPolicy.mode` overrides this
+    /// mesh-wide default when the applicable Sidecar declares a mode (see
+    /// [`MeshSidecar::outbound_traffic_policy`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
     /// Operator-defined ECDS resources served by the ADS translator as

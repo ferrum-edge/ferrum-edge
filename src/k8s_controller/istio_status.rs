@@ -25,10 +25,12 @@
 //!   and host/endpoint/port counts.
 //! - `RequestAuthentication` — status reports the resolved scope and the
 //!   number of JWT rules (permissive-by-default semantics).
-//! - `Sidecar` — status reports the egress scope and the modeled `ingress[]`
-//!   listener count. Only ingress entries Ferrum cannot model (Unix-socket /
-//!   non-loopback `defaultEndpoint`, non-HTTP-family protocol) remain in
-//!   `deferred_fields`; resolvable listeners are materialized.
+//! - `Sidecar` — status reports the egress scope, the modeled `ingress[]`
+//!   listener count, and `outboundTrafficPolicy.mode` when set. Only ingress
+//!   entries Ferrum cannot model (Unix-socket / non-loopback `defaultEndpoint`,
+//!   non-HTTP-family protocol) remain in `deferred_fields`; resolvable listeners
+//!   are materialized. `outboundTrafficPolicy` is translated and enforced (not
+//!   deferred).
 //! - `Telemetry` — status reports which sections (tracing / metrics /
 //!   accessLogging) are present.
 //! - `WorkloadEntry` — status reports the derived SPIFFE service account
@@ -1181,9 +1183,12 @@ fn workload_entry_status(
     }
 }
 
-/// Status for `Sidecar`. Ferrum models the egress scope AND (F6 §6.2) the
-/// `ingress[]` custom inbound listeners. Egress narrowing is gated by
+/// Status for `Sidecar`. Ferrum models the egress scope, (F6 §6.2) the
+/// `ingress[]` custom inbound listeners, and `outboundTrafficPolicy.mode`
+/// (`ALLOW_ANY` / `REGISTRY_ONLY`). Egress narrowing is gated by
 /// `FERRUM_MESH_SIDECAR_ENFORCED` (Sidecars are always parsed/persisted).
+/// `outboundTrafficPolicy` is projected onto the workload slice whenever an
+/// applicable Sidecar declares it (independent of the egress-narrowing gate).
 /// Ingress entries that Ferrum cannot represent (Unix-socket / non-loopback
 /// `defaultEndpoint`, non-HTTP-family protocol) stay in `deferred_fields`;
 /// resolvable listeners are materialized and reported via `ingress_modeled`.
@@ -1221,6 +1226,14 @@ fn sidecar_status(
     } else {
         "Namespace"
     };
+    let outbound_traffic_policy = object
+        .spec
+        .get("outboundTrafficPolicy")
+        .and_then(|policy| policy.get("mode"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .map(ToOwned::to_owned);
 
     match result {
         Ok(_translation) => {
@@ -1253,15 +1266,20 @@ fn sidecar_status(
                      {ingress_modelable} modelable when enabled)"
                 )
             };
+            let outbound_clause = match outbound_traffic_policy.as_deref() {
+                Some(mode) => format!("outboundTrafficPolicy.mode={mode}"),
+                None => "outboundTrafficPolicy omitted (inherits mesh-wide / runtime default)"
+                    .to_string(),
+            };
             let message = if deferred.is_empty() {
                 format!(
                     "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
-                     {ingress_clause}; egress narrowing gated by FERRUM_MESH_SIDECAR_ENFORCED)"
+                     {ingress_clause}; {outbound_clause}; egress narrowing gated by FERRUM_MESH_SIDECAR_ENFORCED)"
                 )
             } else {
                 format!(
                     "Ferrum accepted this Sidecar (scope: {scope}; {egress_entry_count} egress entry/entries; \
-                     {ingress_clause}); deferred fields: {}",
+                     {ingress_clause}; {outbound_clause}); deferred fields: {}",
                     deferred.join(", ")
                 )
             };
@@ -1270,6 +1288,7 @@ fn sidecar_status(
                     "scope": scope,
                     "egress_entries": egress_entry_count,
                     "ingress_modeled": ingress_modeled,
+                    "outbound_traffic_policy": outbound_traffic_policy,
                     "deferred_fields": deferred,
                 }
             });
@@ -1281,6 +1300,7 @@ fn sidecar_status(
                 "translation": {
                     "scope": scope,
                     "egress_entries": egress_entry_count,
+                    "outbound_traffic_policy": outbound_traffic_policy,
                     "error": format!("{error}"),
                 }
             });
@@ -3526,6 +3546,109 @@ mod tests {
                 .iter()
                 .any(|f| f.contains("duplicate listener port")),
             "a deferred entry must not make a later valid entry a duplicate, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_outbound_traffic_policy_is_reported_not_deferred() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "registry-only-sidecar",
+            json!({
+                "outboundTrafficPolicy": {"mode": "REGISTRY_ONLY"},
+                "egress": [{"hosts": ["./*"]}]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["outbound_traffic_policy"].as_str(),
+            Some("REGISTRY_ONLY"),
+            "accepted Sidecar must surface outboundTrafficPolicy.mode"
+        );
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            !deferred
+                .iter()
+                .any(|f| f.contains("outboundTrafficPolicy")),
+            "translated outboundTrafficPolicy must not appear in deferred_fields, got {deferred:?}"
+        );
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("True"));
+        assert!(
+            c["message"]
+                .as_str()
+                .unwrap()
+                .contains("outboundTrafficPolicy.mode=REGISTRY_ONLY"),
+            "status message should name the mode, got {}",
+            c["message"]
+        );
+    }
+
+    #[test]
+    fn sidecar_omitted_outbound_traffic_policy_status_notes_inheritance() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "inherit-sidecar",
+            json!({
+                "egress": [{"hosts": ["./*"]}]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert!(
+            detail["translation"]["outbound_traffic_policy"].is_null(),
+            "omitted outboundTrafficPolicy should be null in status detail"
+        );
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert!(
+            c["message"]
+                .as_str()
+                .unwrap()
+                .contains("outboundTrafficPolicy omitted"),
+            "status message should describe inheritance, got {}",
+            c["message"]
+        );
+    }
+
+    #[test]
+    fn sidecar_unsupported_outbound_traffic_policy_status_is_rejected() {
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "bad-policy-sidecar",
+            json!({
+                "outboundTrafficPolicy": {"mode": "REGISTRY_ONLY_PLUS"},
+                "egress": [{"hosts": ["./*"]}]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+        assert!(
+            c["message"]
+                .as_str()
+                .unwrap()
+                .contains("outboundTrafficPolicy.mode 'REGISTRY_ONLY_PLUS' is unsupported"),
+            "rejection message must be field-specific, got {}",
+            c["message"]
         );
     }
 

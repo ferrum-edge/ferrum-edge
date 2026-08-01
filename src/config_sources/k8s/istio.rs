@@ -12,10 +12,10 @@ use crate::modes::mesh::config::{
     MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress,
     MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
     MeshTrafficPolicy, MeshTrafficPolicyTls, MeshVirtualServiceCorsPolicy, MetricTagOverride,
-    MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
-    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
-    TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
-    WorkloadSelector, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
+    MtlsMode, OutboundTrafficPolicy, PeerAuthentication, PolicyAction, PolicyScope,
+    PrincipalMatch, RequestMatch, Resolution, ServiceEntry, ServiceEntryLocation, ServicePort,
+    SourceNegationMatch, TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload,
+    WorkloadPort, WorkloadSelector, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
     mesh_condition_has_values, validate_mesh_condition_ip_block,
 };
 
@@ -644,9 +644,12 @@ fn peer_authentication(
 ///     `materialize_sidecar_inbound_proxies`). Unix-socket `defaultEndpoint`s
 ///     and non-HTTP-family listeners are parsed but cannot be modeled and stay
 ///     in the `deferred_fields` report (resolved fail-closed downstream).
-///
-/// `outboundTrafficPolicy` is still not translated here — it stays in the
-/// documented "deferred" table until a separate PR lands it.
+///   - `spec.outboundTrafficPolicy.mode` →
+///     [`MeshSidecar::outbound_traffic_policy`]. Supported values are
+///     `ALLOW_ANY` / `allow_any` and `REGISTRY_ONLY` / `registry_only`.
+///     Omitted `outboundTrafficPolicy` inherits mesh-wide /
+///     `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY` at slice build. A present object
+///     with missing, empty, or unsupported `mode` is rejected fail-closed.
 fn sidecar(
     _acc: &mut K8sAccumulator,
     object: &K8sObject,
@@ -792,6 +795,8 @@ fn sidecar(
         }
     }
 
+    let outbound_traffic_policy = translate_sidecar_outbound_traffic_policy(object)?;
+
     Ok(MeshSidecar {
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
@@ -800,7 +805,76 @@ fn sidecar(
         egress,
         ingress_declared,
         ingress,
+        outbound_traffic_policy,
     })
+}
+
+/// Translate Istio `Sidecar.spec.outboundTrafficPolicy`.
+///
+/// Fallback semantics (exact):
+/// - Field omitted or JSON `null` → `None` (inherit mesh-wide /
+///   `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY` at slice build).
+/// - Object present with `mode: ALLOW_ANY` / `allow_any` (ASCII case-insensitive)
+///   → [`OutboundTrafficPolicy::AllowAny`].
+/// - Object present with `mode: REGISTRY_ONLY` / `registry_only` →
+///   [`OutboundTrafficPolicy::RegistryOnly`].
+/// - Object present with missing, null, empty, non-string, or any other `mode`
+///   → hard reject (`FerrumAccepted=False`) with a field-specific diagnostic.
+///   Ferrum does **not** adopt the protobuf zero-value (`REGISTRY_ONLY`) for an
+///   empty mode: an incomplete declaration must not silently change egress
+///   posture.
+fn translate_sidecar_outbound_traffic_policy(
+    object: &K8sObject,
+) -> Result<Option<OutboundTrafficPolicy>, K8sTranslateError> {
+    let Some(raw) = object.spec.get("outboundTrafficPolicy") else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let policy_obj = raw.as_object().ok_or_else(|| {
+        invalid_resource(
+            object,
+            "Sidecar outboundTrafficPolicy must be an object with mode ALLOW_ANY or REGISTRY_ONLY",
+        )
+    })?;
+    let mode_value = match policy_obj.get("mode") {
+        None | Some(Value::Null) => {
+            return Err(invalid_resource(
+                object,
+                "Sidecar outboundTrafficPolicy.mode is required when outboundTrafficPolicy is set \
+                 (ALLOW_ANY or REGISTRY_ONLY)",
+            ));
+        }
+        Some(value) => value,
+    };
+    let mode = mode_value.as_str().ok_or_else(|| {
+        invalid_resource(
+            object,
+            "Sidecar outboundTrafficPolicy.mode must be a string (ALLOW_ANY or REGISTRY_ONLY)",
+        )
+    })?;
+    let mode = mode.trim();
+    if mode.is_empty() {
+        return Err(invalid_resource(
+            object,
+            "Sidecar outboundTrafficPolicy.mode must be ALLOW_ANY or REGISTRY_ONLY (empty mode is \
+             rejected fail-closed)",
+        ));
+    }
+    if mode.eq_ignore_ascii_case("ALLOW_ANY") || mode.eq_ignore_ascii_case("allow_any") {
+        return Ok(Some(OutboundTrafficPolicy::AllowAny));
+    }
+    if mode.eq_ignore_ascii_case("REGISTRY_ONLY") || mode.eq_ignore_ascii_case("registry_only") {
+        return Ok(Some(OutboundTrafficPolicy::RegistryOnly));
+    }
+    Err(invalid_resource(
+        object,
+        format!(
+            "Sidecar outboundTrafficPolicy.mode '{mode}' is unsupported; expected ALLOW_ANY or \
+             REGISTRY_ONLY"
+        ),
+    ))
 }
 
 fn request_authentication(
@@ -17183,6 +17257,110 @@ extensionProviders:
             ]
         );
         assert_eq!(sc.egress[0].port, Some(8080));
+        assert_eq!(
+            sc.outbound_traffic_policy, None,
+            "omitted outboundTrafficPolicy inherits mesh-wide / runtime default"
+        );
+    }
+
+    #[test]
+    fn sidecar_outbound_traffic_policy_registry_only_translates() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "outboundTrafficPolicy": {"mode": "REGISTRY_ONLY"},
+                    "egress": [{"hosts": ["./*"]}]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(
+            mesh.sidecars[0].outbound_traffic_policy,
+            Some(OutboundTrafficPolicy::RegistryOnly)
+        );
+    }
+
+    #[test]
+    fn sidecar_outbound_traffic_policy_allow_any_case_insensitive() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "outboundTrafficPolicy": {"mode": "allow_any"},
+                    "egress": [{"hosts": ["./*"]}]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let mesh = result.config.mesh.expect("mesh config");
+        assert_eq!(
+            mesh.sidecars[0].outbound_traffic_policy,
+            Some(OutboundTrafficPolicy::AllowAny)
+        );
+    }
+
+    #[test]
+    fn sidecar_outbound_traffic_policy_missing_mode_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "outboundTrafficPolicy": {},
+                    "egress": [{"hosts": ["./*"]}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("missing mode must fail closed");
+        assert!(
+            err.to_string()
+                .contains("outboundTrafficPolicy.mode is required"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_outbound_traffic_policy_unsupported_mode_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "outboundTrafficPolicy": {"mode": "REGISTRY_ONLY_PLUS"},
+                    "egress": [{"hosts": ["./*"]}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unsupported mode must fail closed");
+        assert!(
+            err.to_string()
+                .contains("outboundTrafficPolicy.mode 'REGISTRY_ONLY_PLUS' is unsupported"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn sidecar_outbound_traffic_policy_non_object_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "outboundTrafficPolicy": "REGISTRY_ONLY",
+                    "egress": [{"hosts": ["./*"]}]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("non-object policy must fail closed");
+        assert!(
+            err.to_string()
+                .contains("outboundTrafficPolicy must be an object"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]

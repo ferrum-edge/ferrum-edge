@@ -1,6 +1,8 @@
 //! Mesh outbound registry plugin.
 //!
-//! Implements Istio `MeshConfig.outboundTrafficPolicy.mode: REGISTRY_ONLY`.
+//! Implements Istio `outboundTrafficPolicy.mode: REGISTRY_ONLY` (mesh-wide
+//! `MeshConfig` / `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`, or an applicable
+//! `Sidecar.spec.outboundTrafficPolicy`).
 //! When the slice declares `RegistryOnly`, the gateway auto-injects this
 //! global plugin with a pre-built set of known destinations from the slice
 //! (services with their FQDN/namespace-qualified forms, local-namespace

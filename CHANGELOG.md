@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Istio `Sidecar.spec.outboundTrafficPolicy.mode` (`ALLOW_ANY` / `REGISTRY_ONLY`)
+  is translated onto `MeshSidecar`, projected onto the workload
+  `MeshSlice.outbound_traffic_policy` with Sidecar selection precedence over
+  mesh-wide `MeshConfig.outbound_traffic_policy` /
+  `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY`, carried on native/xDS, and enforced by
+  the existing HTTP + stream REGISTRY_ONLY escape controls (#3262). Omitted
+  Sidecar mode inherits mesh-wide/runtime; incomplete or unsupported modes are
+  rejected fail-closed with field-specific status diagnostics.
+
 - Kubernetes controller watch scopes now rebuild their reflector from an
   authoritative list when they go idle past `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
   (default `300`, `0` disables, clamped to `0`–`86400`). kube-rs raises an

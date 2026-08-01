@@ -2878,6 +2878,7 @@ mod tests {
                     }],
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 }],
                 ..MeshConfig::default()
             })),
@@ -2914,6 +2915,7 @@ mod tests {
                     }],
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 }],
                 ..MeshConfig::default()
             })),

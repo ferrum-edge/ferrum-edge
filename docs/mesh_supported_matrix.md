@@ -62,7 +62,8 @@ CI today."
 
 - **GA track — Ferrum-native sidecar mesh.** `Sidecar` topology + native
   `MeshSubscribe` + SPIRE/SPIFFE mTLS + `AuthorizationPolicy`/`RequestAuthentication`
-  + `ServiceEntry` HTTP egress + `REGISTRY_ONLY` + `VirtualService` routing +
+  + `ServiceEntry` HTTP egress + `REGISTRY_ONLY` (mesh-wide env/native **and**
+  Istio `Sidecar.outboundTrafficPolicy.mode`) + `VirtualService` routing +
   `DestinationRule` LB/timeout/outlier. Semantics are pinned, and the sidecar
   traffic surface **and the native config transport** are now **live-verified
   and blocking**: the `mesh-e2e-sidecar` kind+SPIRE suite drives the real

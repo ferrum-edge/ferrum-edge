@@ -386,11 +386,18 @@ pub struct MeshSlice {
     pub trust_bundles: Option<TrustBundleSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_cluster: Option<MultiClusterConfig>,
-    /// Mesh-wide outbound traffic policy. `None` keeps the legacy
-    /// `AllowAny` behavior. When `Some(RegistryOnly)`, the slice-apply
-    /// path auto-injects the `mesh_outbound_registry` plugin with a
-    /// registry built from `services` ∪ `service_entries` ∪
-    /// `workloads.addresses`.
+    /// Effective outbound traffic policy for this workload slice. `None`
+    /// keeps the legacy `AllowAny` behavior (runtime env fallback). When
+    /// `Some(RegistryOnly)`, the slice-apply path auto-injects the
+    /// `mesh_outbound_registry` plugin with a registry built from
+    /// `services` ∪ `service_entries` ∪ `workloads.addresses`, and stream-
+    /// family capture paths consult the same registry.
+    ///
+    /// Resolved CP-side as: applicable [`MeshSidecar::outbound_traffic_policy`]
+    /// (same Sidecar selection tiers as egress/ingress) when set, else
+    /// [`MeshConfig::outbound_traffic_policy`]. The Sidecar records themselves
+    /// do not ride the slice; only this effective value is carried (native /
+    /// xDS `OutboundTrafficPolicyCarrier`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbound_traffic_policy: Option<OutboundTrafficPolicy>,
     /// Cold-path operator view of the Sidecar egress scope that was applied,
@@ -1497,7 +1504,11 @@ impl MeshSlice {
                     .retain(|gateway| gateway.namespace == request_namespace);
                 scoped
             }),
-            outbound_traffic_policy: mesh.outbound_traffic_policy,
+            outbound_traffic_policy: resolve_effective_outbound_traffic_policy(
+                mesh,
+                effective_namespace,
+                &effective_labels,
+            ),
             sidecar_egress_scope,
             extension_configs,
             // The canonical GatewayConfig has no declarative RTDS surface.
@@ -2331,6 +2342,37 @@ fn resolve_applicable_sidecar_egress<'a, L: WorkloadLabels + ?Sized>(
         namespace: sidecar_host_match_namespace(selected, workload_namespace, root_namespace),
         egress: &selected.egress,
     })
+}
+
+/// Resolve the effective outbound traffic policy for a workload slice.
+///
+/// Precedence (exact):
+/// 1. Applicable Sidecar's `outbound_traffic_policy` when set — selected with
+///    the same tiers as egress/ingress (`select_applicable_sidecar`), without
+///    walking the egress `inherits_defaults` chain.
+/// 2. Else `MeshConfig.outbound_traffic_policy` (mesh-wide / native CRD).
+/// 3. Else `None` — materialization falls back to
+///    `FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY` / runtime `AllowAny`.
+///
+/// Always resolved (independent of `FERRUM_MESH_SIDECAR_ENFORCED`): Sidecar
+/// egress host narrowing stays gated, but `outboundTrafficPolicy` is a
+/// security control that must apply once translated, matching mesh-wide
+/// `outbound_traffic_policy` which already applies without the Sidecar flag.
+fn resolve_effective_outbound_traffic_policy<L: WorkloadLabels + ?Sized>(
+    mesh: &MeshConfig,
+    workload_namespace: &str,
+    workload_labels: &L,
+) -> Option<OutboundTrafficPolicy> {
+    if let Some(sidecar) = select_applicable_sidecar(
+        &mesh.sidecars,
+        workload_namespace,
+        workload_labels,
+        mesh.istio_root_namespace.as_str(),
+    ) && let Some(policy) = sidecar.outbound_traffic_policy
+    {
+        return Some(policy);
+    }
+    mesh.outbound_traffic_policy
 }
 
 /// Select the single applicable `Sidecar` for a workload by the SAME tier
@@ -6069,6 +6111,7 @@ mod tests {
                 .collect(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }
     }
 
@@ -6085,6 +6128,7 @@ mod tests {
             egress: Vec::new(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         }
     }
 
@@ -6644,6 +6688,7 @@ mod tests {
             egress: Vec::new(),
             ingress_declared: false,
             ingress: Vec::new(),
+            outbound_traffic_policy: None,
         };
         sidecar.ingress = vec![MeshSidecarIngress {
             port: 8443,
@@ -8131,6 +8176,7 @@ mod tests {
                     egress: Vec::new(),
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 },
             ],
             service_entries: vec![
@@ -8211,6 +8257,7 @@ mod tests {
                     egress: Vec::new(),
                     ingress_declared: false,
                     ingress: Vec::new(),
+                    outbound_traffic_policy: None,
                 },
                 make_inheriting_sidecar(
                     "frontend-ingress-only",
@@ -8326,6 +8373,7 @@ mod tests {
                 egress: Vec::new(),
                 ingress_declared: false,
                 ingress: Vec::new(),
+                outbound_traffic_policy: None,
             }],
             service_entries: vec![make_se_with_host(
                 "reviews",
@@ -8607,6 +8655,7 @@ mod tests {
                 ],
                 ingress_declared: false,
                 ingress: Vec::new(),
+                outbound_traffic_policy: None,
             }],
             services: vec![
                 make_service("alpha", "reviews"),
@@ -8682,5 +8731,167 @@ mod tests {
         assert_eq!(slice.services[0].name, "checkout");
         assert_eq!(slice.destination_rules.len(), 1);
         assert_eq!(slice.destination_rules[0].name, "beta-checkout-dr");
+    }
+
+    #[test]
+    fn sidecar_outbound_traffic_policy_overrides_mesh_wide_even_without_enforcement() {
+        // Sidecar.outboundTrafficPolicy is a security control: it applies even
+        // when FERRUM_MESH_SIDECAR_ENFORCED is off (egress host narrowing stays
+        // gated). A workload-scoped REGISTRY_ONLY Sidecar must win over mesh-wide
+        // ALLOW_ANY and land on the slice for cold-path materialization.
+        let mut mesh = MeshConfig {
+            outbound_traffic_policy: Some(OutboundTrafficPolicy::AllowAny),
+            sidecars: vec![MeshSidecar {
+                name: "frontend".into(),
+                namespace: "alpha".into(),
+                workload_selector: Some(WorkloadSelector {
+                    labels: HashMap::from([("app".into(), "frontend".into())]),
+                    namespace: Some("alpha".into()),
+                }),
+                egress_inherits_defaults: true,
+                egress: Vec::new(),
+                ingress_declared: false,
+                ingress: Vec::new(),
+                outbound_traffic_policy: Some(OutboundTrafficPolicy::RegistryOnly),
+            }],
+            ..MeshConfig::default()
+        };
+        // Keep a namespace-default Sidecar without a policy so inheritance/precedence
+        // cannot accidentally pick it for the policy field.
+        mesh.sidecars.push(MeshSidecar {
+            name: "namespace-default".into(),
+            namespace: "alpha".into(),
+            workload_selector: None,
+            egress_inherits_defaults: false,
+            egress: vec![MeshSidecarEgress {
+                hosts: vec!["./*".into()],
+                port: None,
+            }],
+            ingress_declared: false,
+            ingress: Vec::new(),
+            outbound_traffic_policy: None,
+        });
+        let config = config_with_mesh(mesh);
+        let labels = BTreeMap::from([("app".into(), "frontend".into())]);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            MeshSliceRequest {
+                namespace: "alpha".into(),
+                labels,
+                enforce_sidecar_egress: false,
+                ..MeshSliceRequest::default()
+            },
+        );
+        assert_eq!(
+            slice.outbound_traffic_policy,
+            Some(OutboundTrafficPolicy::RegistryOnly),
+            "selected Sidecar REGISTRY_ONLY must override mesh-wide ALLOW_ANY"
+        );
+    }
+
+    #[test]
+    fn sidecar_omitted_outbound_traffic_policy_inherits_mesh_wide() {
+        let mesh = MeshConfig {
+            outbound_traffic_policy: Some(OutboundTrafficPolicy::RegistryOnly),
+            sidecars: vec![MeshSidecar {
+                name: "namespace-default".into(),
+                namespace: "alpha".into(),
+                workload_selector: None,
+                egress_inherits_defaults: false,
+                egress: vec![MeshSidecarEgress {
+                    hosts: vec!["./*".into()],
+                    port: None,
+                }],
+                ingress_declared: false,
+                ingress: Vec::new(),
+                outbound_traffic_policy: None,
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(
+            slice.outbound_traffic_policy,
+            Some(OutboundTrafficPolicy::RegistryOnly),
+            "omitted Sidecar outboundTrafficPolicy inherits MeshConfig"
+        );
+    }
+
+    #[test]
+    fn sidecar_outbound_traffic_policy_allow_any_overrides_mesh_registry_only() {
+        let mesh = MeshConfig {
+            outbound_traffic_policy: Some(OutboundTrafficPolicy::RegistryOnly),
+            sidecars: vec![MeshSidecar {
+                name: "namespace-default".into(),
+                namespace: "alpha".into(),
+                workload_selector: None,
+                egress_inherits_defaults: false,
+                egress: vec![MeshSidecarEgress {
+                    hosts: vec!["./*".into()],
+                    port: None,
+                }],
+                ingress_declared: false,
+                ingress: Vec::new(),
+                outbound_traffic_policy: Some(OutboundTrafficPolicy::AllowAny),
+            }],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let slice = MeshSlice::from_gateway_config(&config, slice_request_enforced("alpha"));
+        assert_eq!(
+            slice.outbound_traffic_policy,
+            Some(OutboundTrafficPolicy::AllowAny),
+            "Sidecar ALLOW_ANY must override mesh-wide REGISTRY_ONLY without widening unrelated policy"
+        );
+    }
+
+    #[test]
+    fn sidecar_outbound_traffic_policy_does_not_follow_egress_inherits_defaults() {
+        // When a workload Sidecar omits egress (inherits defaults) but sets
+        // outboundTrafficPolicy, the policy comes from the selected Sidecar —
+        // not from the namespace-default Sidecar that supplies egress hosts.
+        let mesh = MeshConfig {
+            outbound_traffic_policy: Some(OutboundTrafficPolicy::AllowAny),
+            sidecars: vec![
+                MeshSidecar {
+                    name: "namespace-default".into(),
+                    namespace: "alpha".into(),
+                    workload_selector: None,
+                    egress_inherits_defaults: false,
+                    egress: vec![MeshSidecarEgress {
+                        hosts: vec!["./*".into()],
+                        port: None,
+                    }],
+                    ingress_declared: false,
+                    ingress: Vec::new(),
+                    outbound_traffic_policy: Some(OutboundTrafficPolicy::AllowAny),
+                },
+                MeshSidecar {
+                    name: "frontend".into(),
+                    namespace: "alpha".into(),
+                    workload_selector: Some(WorkloadSelector {
+                        labels: HashMap::from([("app".into(), "frontend".into())]),
+                        namespace: Some("alpha".into()),
+                    }),
+                    egress_inherits_defaults: true,
+                    egress: Vec::new(),
+                    ingress_declared: false,
+                    ingress: Vec::new(),
+                    outbound_traffic_policy: Some(OutboundTrafficPolicy::RegistryOnly),
+                },
+            ],
+            ..MeshConfig::default()
+        };
+        let config = config_with_mesh(mesh);
+        let labels = BTreeMap::from([("app".into(), "frontend".into())]);
+        let slice = MeshSlice::from_gateway_config(
+            &config,
+            slice_request_enforced_with_labels("alpha", labels),
+        );
+        assert_eq!(
+            slice.outbound_traffic_policy,
+            Some(OutboundTrafficPolicy::RegistryOnly),
+            "selected Sidecar policy must not be replaced by the egress-inheritance donor"
+        );
     }
 }
