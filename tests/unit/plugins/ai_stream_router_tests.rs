@@ -322,7 +322,47 @@ fn test_config_rejects_missing_api_key() {
 }
 
 #[test]
-fn test_config_google_gemini_not_yet_implemented() {
+fn test_config_google_gemini_requires_stream_generate_path() {
+    let cfg = json!({
+        "providers": [{
+            "name": "gemini", "provider_type": "google_gemini",
+            "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            "api_key": "k", "model_patterns": ["gemini-*"]
+        }]
+    });
+    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
+    assert!(err.contains("streamGenerateContent"), "{err}");
+}
+
+#[test]
+fn test_config_google_gemini_requires_model_placeholder() {
+    let cfg = json!({
+        "providers": [{
+            "name": "gemini", "provider_type": "google_gemini",
+            "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+            "api_key": "k", "model_patterns": ["gemini-*"]
+        }]
+    });
+    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
+    assert!(err.contains("{model}"), "{err}");
+}
+
+#[test]
+fn test_config_google_gemini_rejects_anthropic_version() {
+    let cfg = json!({
+        "providers": [{
+            "name": "gemini", "provider_type": "google_gemini",
+            "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent",
+            "api_key": "k", "model_patterns": ["gemini-*"],
+            "anthropic_version": "2023-06-01"
+        }]
+    });
+    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
+    assert!(err.contains("anthropic_version"), "{err}");
+}
+
+#[test]
+fn test_config_google_gemini_constructs() {
     let cfg = json!({
         "providers": [{
             "name": "gemini", "provider_type": "google_gemini",
@@ -330,8 +370,20 @@ fn test_config_google_gemini_not_yet_implemented() {
             "api_key": "k", "model_patterns": ["gemini-*"]
         }]
     });
-    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
-    assert!(err.contains("not yet implemented"), "{err}");
+    assert!(AiStreamRouter::new(&cfg, http_client()).is_ok());
+}
+
+fn gemini_config() -> Value {
+    json!({
+        "providers": [{
+            "name": "gemini",
+            "provider_type": "google_gemini",
+            "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent",
+            "api_key": "AIza-test",
+            "model_patterns": ["gemini-*"],
+            "priority": 1
+        }]
+    })
 }
 
 #[test]
@@ -6330,4 +6382,295 @@ async fn only_the_owner_enforces_and_normalizes_under_a_forged_model_key() {
             .await,
         PluginResult::Continue
     ));
+}
+
+// ---------------------------------------------------------------------------
+// google_gemini adapter (#3299)
+// ---------------------------------------------------------------------------
+
+const GEMINI_TEXT_SSE: &str = concat!(
+    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]},\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":1,\"totalTokenCount\":4},\"modelVersion\":\"gemini-2.0-flash\",\"responseId\":\"resp_1\"}\n\n",
+    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\" world\"}]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":2,\"totalTokenCount\":5},\"modelVersion\":\"gemini-2.0-flash\",\"responseId\":\"resp_1\"}\n\n",
+);
+
+const GEMINI_VERTEX_SAFETY_SSE: &str = concat!(
+    "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"},\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":0,\"totalTokenCount\":2}}\n\n",
+);
+
+const GEMINI_TOOL_SSE: &str = concat!(
+    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"lookup\",\"args\":{\"q\":\"ok\"}}}]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2},\"responseId\":\"resp_tool\"}\n\n",
+);
+
+const GEMINI_ERROR_SSE: &str = concat!(
+    "data: {\"error\":{\"code\":400,\"message\":\"secret provider detail\",\"status\":\"INVALID_ARGUMENT\"}}\n\n",
+);
+
+async fn claim_gemini(plugin: &AiStreamRouter, body: &Value) -> (RequestContext, HashMap<String, String>) {
+    let mut ctx = post_ctx(body);
+    let mut headers = json_headers();
+    headers.insert("accept-encoding".to_string(), "gzip, br".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    (ctx, headers)
+}
+
+async fn run_gemini_sse(sse: &str) -> String {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let (ctx, _) = claim_gemini(&plugin, &body).await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("gemini inspector");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(17) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    String::from_utf8(collected).unwrap()
+}
+
+#[tokio::test]
+async fn test_gemini_claim_injects_alt_sse_and_goog_api_key() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let (ctx, headers) = claim_gemini(&plugin, &body).await;
+    assert_eq!(
+        headers.get("x-goog-api-key").map(String::as_str),
+        Some("AIza-test")
+    );
+    assert!(!headers.contains_key("authorization"));
+    assert_eq!(
+        headers.get("accept-encoding").map(String::as_str),
+        Some("identity")
+    );
+    let path = ctx.route_override_path.as_deref().unwrap();
+    assert!(
+        path.contains("/models/gemini-2.0-flash:streamGenerateContent"),
+        "{path}"
+    );
+    assert!(path.contains("alt=sse"), "{path}");
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router.provider_type")
+            .map(String::as_str),
+        Some("google_gemini")
+    );
+}
+
+#[tokio::test]
+async fn test_gemini_translates_tools_and_history() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "stream": true,
+        "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"ok\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "{\"output\":\"ok\"}"}
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "lookup",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+            }
+        }],
+        "tool_choice": "none",
+        "max_tokens": 128,
+        "temperature": 0.2
+    });
+    let (mut ctx, headers) = claim_gemini(&plugin, &body).await;
+    let raw = serde_json::to_vec(&body).unwrap();
+    let translated = plugin
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await
+        .expect("gemini translation");
+    let parsed: Value = serde_json::from_slice(&translated).unwrap();
+    assert!(parsed.get("model").is_none(), "model stays in the URL path");
+    assert_eq!(parsed["systemInstruction"]["parts"][0]["text"], json!("be brief"));
+    assert_eq!(parsed["contents"][1]["parts"][0]["functionCall"]["name"], json!("lookup"));
+    assert_eq!(
+        parsed["contents"][2]["parts"][0]["functionResponse"]["name"],
+        json!("lookup")
+    );
+    assert_eq!(
+        parsed["toolConfig"]["functionCallingConfig"]["mode"],
+        json!("NONE")
+    );
+    assert_eq!(parsed["generationConfig"]["maxOutputTokens"], json!(128));
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &translated)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_gemini_sse_text_usage_and_done_golden() {
+    let out = run_gemini_sse(GEMINI_TEXT_SSE).await;
+    assert!(out.contains("chat.completion.chunk"), "{out}");
+    assert!(out.contains("\"content\":\"Hello\""), "{out}");
+    assert!(out.contains("\"content\":\" world\""), "{out}");
+    assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+    assert!(out.contains("\"prompt_tokens\":3"), "{out}");
+    assert!(out.contains("\"completion_tokens\":2"), "{out}");
+    assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+    assert!(!out.contains("candidates"), "{out}");
+    assert!(!out.contains("finishReason"), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_vertex_safety_block_maps_to_content_filter() {
+    let out = run_gemini_sse(GEMINI_VERTEX_SAFETY_SSE).await;
+    assert!(out.contains("\"finish_reason\":\"content_filter\""), "{out}");
+    assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_function_call_normalizes_to_tool_calls() {
+    let out = run_gemini_sse(GEMINI_TOOL_SSE).await;
+    assert!(out.contains("\"tool_calls\""), "{out}");
+    assert!(out.contains("\"name\":\"lookup\""), "{out}");
+    assert!(out.contains("\"finish_reason\":\"tool_calls\""), "{out}");
+    // Tool arguments must appear in the OpenAI frame, but the provider error
+    // path must never leak a raw provider error body (covered separately).
+    assert!(out.contains("\"arguments\""), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_provider_error_is_fixed_cardinality() {
+    let out = run_gemini_sse(GEMINI_ERROR_SSE).await;
+    assert!(out.contains("upstream_error"), "{out}");
+    assert!(
+        !out.contains("secret provider detail"),
+        "provider error bodies must not be echoed: {out}"
+    );
+    assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_premature_eof_fails_closed() {
+    let sse = concat!(
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"partial\"}]},\"index\":0}]}\n\n",
+    );
+    let out = run_gemini_sse(sse).await;
+    assert!(
+        out.contains("before a terminal finishReason"),
+        "{out}"
+    );
+    assert!(out.contains("upstream_error"), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_ambiguous_part_fails_closed() {
+    let sse = concat!(
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"x\",\"functionCall\":{\"name\":\"lookup\",\"args\":{}}}]},\"finishReason\":\"STOP\",\"index\":0}]}\n\n",
+    );
+    let out = run_gemini_sse(sse).await;
+    assert!(out.contains("ambiguous Gemini content part"), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_tool_choice_none_rejects_provider_function_call() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}}
+        }],
+        "tool_choice": "none"
+    });
+    let (mut ctx, headers) = claim_gemini(&plugin, &body).await;
+    let raw = serde_json::to_vec(&body).unwrap();
+    let _ = plugin
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await
+        .expect("translate");
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let out = match inspector.on_chunk(GEMINI_TOOL_SSE.as_bytes()).await {
+        ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
+            String::from_utf8(b.to_vec()).unwrap()
+        }
+        ResponseStreamAction::Terminate(None) => String::new(),
+    };
+    assert!(
+        out.contains("tool use despite tool_choice none"),
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn test_gemini_config_removal_constructs_without_gemini() {
+    // Reload/removal surface: a config that drops google_gemini still constructs,
+    // and an invalid gemini replacement is rejected by the shared FailClosed path
+    // (see plugin_cache delta coverage).
+    let without = json!({
+        "providers": [{
+            "name": "openai",
+            "provider_type": "openai",
+            "endpoint": "https://api.openai.com/v1/chat/completions",
+            "api_key": "sk",
+            "model_patterns": ["gpt-*"]
+        }]
+    });
+    assert!(AiStreamRouter::new(&without, http_client()).is_ok());
+}
+
+#[tokio::test]
+async fn test_gemini_buffered_normalize_live_path() {
+    let plugin = build(gemini_config());
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let (mut ctx, _) = claim_gemini(&plugin, &body).await;
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let normalized = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            GEMINI_TEXT_SSE.as_bytes(),
+            Some("text/event-stream"),
+            &response_headers,
+        )
+        .await
+        .expect("buffered gemini normalize");
+    let out = String::from_utf8(normalized).unwrap();
+    assert!(out.contains("\"content\":\"Hello\""), "{out}");
+    assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+    assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
 }

@@ -250,3 +250,112 @@ async fn premature_eof_buffered_path_surfaces_upstream_error() {
     assert!(text.contains("before message_stop"));
     assert_eq!(text.matches("data: [DONE]").count(), 1);
 }
+
+fn gemini_plugin() -> AiStreamRouter {
+    AiStreamRouter::new(
+        &json!({
+            "providers": [{
+                "name": "gemini",
+                "provider_type": "google_gemini",
+                "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent",
+                "api_key": "AIza-test",
+                "model_patterns": ["gemini-*"],
+                "priority": 1
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .expect("valid gemini config")
+}
+
+const GEMINI_SSE: &str = concat!(
+    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"integrated\"}]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":1,\"totalTokenCount\":2},\"responseId\":\"resp_i\"}\n\n",
+);
+
+#[tokio::test]
+async fn gemini_claim_translates_and_normalizes_buffered_stream() {
+    let plugin = gemini_plugin();
+    let body = json!({
+        "model": "gemini-2.0-flash",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        ]
+    });
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".into(),
+        "POST".into(),
+        "/v1/chat/completions".into(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&body).unwrap(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("accept-encoding".to_string(), "gzip, br".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("accept-encoding").map(String::as_str),
+        Some("identity")
+    );
+    assert!(
+        ctx.route_override_path
+            .as_deref()
+            .is_some_and(|path| path.contains("alt=sse"))
+    );
+
+    let translated = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("gemini tool history must translate");
+    let parsed: serde_json::Value = serde_json::from_slice(&translated).unwrap();
+    assert!(parsed.get("model").is_none());
+    assert_eq!(
+        parsed["contents"][1]["parts"][0]["functionCall"]["name"],
+        json!("lookup")
+    );
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let normalized = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            GEMINI_SSE.as_bytes(),
+            Some("text/event-stream"),
+            &response_headers,
+        )
+        .await
+        .expect("gemini buffered normalize");
+    let out = String::from_utf8(normalized).unwrap();
+    assert!(out.contains("\"content\":\"integrated\""), "{out}");
+    assert!(out.contains("\"finish_reason\":\"stop\""), "{out}");
+    assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+}

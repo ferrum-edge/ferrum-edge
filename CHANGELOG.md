@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ai_stream_router` now implements the `google_gemini` provider adapter
+  end-to-end (#3299): OpenAI Chat Completions streaming requests translate to
+  Gemini `streamGenerateContent` (native Generative Language API and
+  Vertex-shaped `GenerateContentResponse` SSE via required/`alt=sse`
+  injection), and provider SSE normalizes to OpenAI `chat.completion.chunk`
+  with bounded framing/JSON parse, text deltas, function calls, usageMetadata,
+  safety-block / finishReason mapping, fixed-cardinality provider terminal
+  errors, and fail-closed premature EOF. Shared finish/safety/usage helpers
+  live in `plugins::utils::gemini_generate` so protocol mappings stay reusable
+  without depending on unmerged usage-stream work.
+
 - Kubernetes controller watch scopes now rebuild their reflector from an
   authoritative list when they go idle past `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
   (default `300`, `0` disables, clamped to `0`–`86400`). kube-rs raises an

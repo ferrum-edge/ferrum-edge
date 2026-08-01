@@ -60,8 +60,14 @@
 //!   `Accept-Encoding`, and residual `Content-Encoding` is decoded (gzip / br)
 //!   or rejected before SSE parsing so response headers describe identity
 //!   bytes.
-//! - `google_gemini`: config is accepted and validated but construction fails
-//!   with a clear "not yet implemented" error until the second phase lands.
+//! - `google_gemini`: OpenAI Chat Completions requests are translated to Gemini
+//!   `streamGenerateContent` (native Generative Language API and Vertex-shaped
+//!   GenerateContentResponse streams via `alt=sse`). Response SSE is normalized
+//!   to OpenAI `chat.completion.chunk` SSE with the same bound/fail-closed
+//!   posture as Anthropic (text deltas, function calls, usageMetadata, safety
+//!   blocks / finishReason, provider terminal errors). Endpoints must embed a
+//!   `{model}` path placeholder and target `streamGenerateContent`; `alt=sse`
+//!   is required/injected so framing stays progressive.
 //!
 //! ## Provider fallback is rejected, not stored
 //!
@@ -211,6 +217,8 @@ use super::{
 use crate::config::types::{BackendScheme, BackendTlsConfig};
 use crate::util::unknown_keys::reject_unknown_keys;
 
+mod gemini;
+
 /// Exact response fields invalidated when Anthropic SSE is normalized.
 ///
 /// Derived from the shared representation-invalidation inventory so trailer
@@ -312,14 +320,14 @@ const META_NORMALIZED: &str = "ai_stream_router.normalized_response_stream";
 /// `AiStreamRouterClaim::request_translated`, written by this instance's own
 /// transform hook on the same context the final body hook reads.
 const META_REQUEST_TRANSLATED: &str = "ai_stream_router.request_translated";
-/// OBSERVABILITY ONLY. Set when the claimed Anthropic request carries
-/// `tool_choice: {"type":"none"}`. The decisive value is
+/// OBSERVABILITY ONLY. Set when the claimed Anthropic/Gemini request carries
+/// a none tool-choice constraint. The decisive value is
 /// `AiStreamRouterClaim::tool_choice_none`, committed at claim time: the
 /// response normalizer fails closed if the provider nevertheless emits
-/// `tool_use` for that generation, so it must not be disarmable by a later
+/// tool use for that generation, so it must not be disarmable by a later
 /// metadata write.
 const META_TOOL_CHOICE_NONE: &str = "ai_stream_router.tool_choice_none";
-/// Provider `Content-Encoding` that must be decoded before Anthropic SSE
+/// Provider `Content-Encoding` that must be decoded before Anthropic/Gemini SSE
 /// normalization. Stamped in `after_proxy` before representation headers are
 /// repaired so both streaming and buffered normalizers see the same coding.
 ///
@@ -381,13 +389,7 @@ impl ProviderType {
     /// Whether provider-native response SSE must be normalized to OpenAI
     /// `chat.completion.chunk` SSE.
     fn needs_response_normalization(self) -> bool {
-        matches!(self, Self::Anthropic)
-    }
-
-    /// Whether MVP can serve this provider. `google_gemini` is designed into the
-    /// config now but not yet implemented.
-    fn is_implemented(self) -> bool {
-        !matches!(self, Self::GoogleGemini)
+        matches!(self, Self::Anthropic | Self::GoogleGemini)
     }
 }
 
@@ -417,7 +419,7 @@ struct StreamProvider {
     host: String,
     port: u16,
     /// Absolute backend path (includes leading `/`, no query). May contain a
-    /// literal `{model}` placeholder for future Gemini-style path routing.
+    /// literal `{model}` placeholder for Gemini-style path routing.
     path: String,
     /// Endpoint query string (no leading `?`), e.g. Azure-style
     /// `api-version=...`. Merged with the client's own query at claim time.
@@ -643,10 +645,9 @@ impl AiStreamRouter {
                 "ai_stream_router: provider '{name}' missing 'provider_type'"
             ))?;
             let provider_type = ProviderType::from_str(provider_type_str)?;
-            if !provider_type.is_implemented() {
+            if provider_type != ProviderType::Anthropic && pv.get("anthropic_version").is_some() {
                 return Err(format!(
-                    "ai_stream_router: provider '{name}' provider_type '{}' is not yet implemented in this MVP",
-                    provider_type.as_str()
+                    "ai_stream_router: provider '{name}' anthropic_version is only valid for anthropic providers"
                 ));
             }
 
@@ -672,6 +673,9 @@ impl AiStreamRouter {
             ))?;
             let allow_plaintext = pv["allow_plaintext"].as_bool().unwrap_or(false);
             let parsed = parse_endpoint(&name, endpoint, allow_plaintext, &backend_allow_ips)?;
+            if provider_type == ProviderType::GoogleGemini {
+                gemini::validate_gemini_endpoint(&name, &parsed.path, parsed.has_model_placeholder)?;
+            }
 
             let api_key = config_or_env_str(pv, "api_key").ok_or(format!(
                 "ai_stream_router: provider '{name}' missing 'api_key'"
@@ -2143,7 +2147,7 @@ impl Plugin for AiStreamRouter {
             );
         }
 
-        // Fail closed on Anthropic tool-history / tool_choice / thinking shapes
+        // Fail closed on Anthropic / Gemini tool-history / tool_choice shapes
         // that cannot be represented safely before the route override commits.
         if provider.provider_type == ProviderType::Anthropic
             && let Err(message) = validate_anthropic_translation(&openai_body)
@@ -2158,6 +2162,22 @@ impl Plugin for AiStreamRouter {
             return openai_error_response(
                 400,
                 &format!("Invalid request for Anthropic translation: {message}"),
+                "invalid_request_error",
+                param,
+                code,
+            );
+        }
+        if provider.provider_type == ProviderType::GoogleGemini
+            && let Err(message) = gemini::validate_gemini_translation(&openai_body)
+        {
+            let (param, code) = if message.contains("tool_choice") || message.contains("tools") {
+                (Some("tool_choice"), Some("invalid_tool_choice"))
+            } else {
+                (Some("messages"), Some("invalid_messages"))
+            };
+            return openai_error_response(
+                400,
+                &format!("Invalid request for Gemini translation: {message}"),
                 "invalid_request_error",
                 param,
                 code,
@@ -2191,17 +2211,30 @@ impl Plugin for AiStreamRouter {
         //    backend-visible query as of this moment, which is the raw wire
         //    query (or an earlier plugin's published outbound query) after the
         //    authentication-owned strip markers.
-        let committed_query = if provider.endpoint_query.is_some() {
+        let committed_query = if provider.endpoint_query.is_some()
+            || provider.provider_type == ProviderType::GoogleGemini
+        {
+            // Gemini always folds `alt=sse` into the absolute override path so
+            // progressive SSE framing is guaranteed; the separately appended
+            // query is therefore committed empty (same as endpoint-query case).
             String::new()
         } else {
             crate::proxy::effective_backend_query_string(ctx).into_owned()
         };
 
-        if let Some(endpoint_query) = provider.endpoint_query.as_deref() {
+        if provider.provider_type == ProviderType::GoogleGemini
+            || provider.endpoint_query.is_some()
+        {
+            let endpoint_query = provider.endpoint_query.as_deref().unwrap_or("");
             let endpoint_query = if provider.path_has_model_placeholder {
                 endpoint_query.replace("{model}", &model)
             } else {
                 endpoint_query.to_string()
+            };
+            let endpoint_query = if provider.provider_type == ProviderType::GoogleGemini {
+                gemini::ensure_gemini_alt_sse_query(&endpoint_query)
+            } else {
+                endpoint_query
             };
             backend_path.push('?');
             backend_path.push_str(&endpoint_query);
@@ -2286,8 +2319,10 @@ impl Plugin for AiStreamRouter {
         // `tool_use` guard must be armed by what the request actually asked for
         // and must not be disarmable afterwards. Only meaningful for the
         // provider type whose SSE this instance translates.
-        let tool_choice_none = provider.provider_type == ProviderType::Anthropic
-            && openai_body.get("tool_choice").and_then(Value::as_str) == Some("none");
+        let tool_choice_none = matches!(
+            provider.provider_type,
+            ProviderType::Anthropic | ProviderType::GoogleGemini
+        ) && openai_body.get("tool_choice").and_then(Value::as_str) == Some("none");
         ctx.ai_stream_router_claim = Some(Box::new(AiStreamRouterClaim {
             owner: self.owner_id,
             provider_index,
@@ -2392,6 +2427,22 @@ impl Plugin for AiStreamRouter {
                 }
                 Some(translated)
             }
+            ProviderType::GoogleGemini => {
+                let openai_body: Value = serde_json::from_slice(body).ok()?;
+                let translated = gemini::translate_to_gemini_stream(&openai_body, &model).ok()?;
+                if let Some(claim) = ctx.ai_stream_router_claim.as_deref_mut() {
+                    claim.request_translated = true;
+                }
+                ctx.metadata
+                    .insert(META_REQUEST_TRANSLATED.to_string(), "true".to_string());
+                if openai_body.get("tool_choice").and_then(Value::as_str) == Some("none") {
+                    ctx.metadata
+                        .insert(META_TOOL_CHOICE_NONE.to_string(), "true".to_string());
+                } else {
+                    ctx.metadata.remove(META_TOOL_CHOICE_NONE);
+                }
+                Some(translated)
+            }
             ProviderType::OpenAi | ProviderType::OpenAiCompatible => {
                 if self.inject_usage_options {
                     inject_include_usage(body)
@@ -2399,8 +2450,6 @@ impl Plugin for AiStreamRouter {
                     None
                 }
             }
-            // Unreachable: google_gemini fails construction in this MVP.
-            ProviderType::GoogleGemini => None,
         }
     }
 
@@ -2454,6 +2503,7 @@ impl Plugin for AiStreamRouter {
         let (
             provider_index,
             provider_is_anthropic,
+            provider_is_gemini,
             destination_intact,
             committed_model,
             request_translated,
@@ -2467,6 +2517,7 @@ impl Plugin for AiStreamRouter {
             (
                 claim.provider_index,
                 provider.provider_type == ProviderType::Anthropic,
+                provider.provider_type == ProviderType::GoogleGemini,
                 route_override_still_targets(ctx, claim),
                 claim.model.clone(),
                 claim.request_translated,
@@ -2477,6 +2528,15 @@ impl Plugin for AiStreamRouter {
             return openai_error_response(
                 400,
                 "The Anthropic request body could not be translated safely",
+                "invalid_request_error",
+                Some("messages"),
+                Some("invalid_messages"),
+            );
+        }
+        if provider_is_gemini && !request_translated {
+            return openai_error_response(
+                400,
+                "The Gemini request body could not be translated safely",
                 "invalid_request_error",
                 Some("messages"),
                 Some("invalid_messages"),
@@ -2530,6 +2590,23 @@ impl Plugin for AiStreamRouter {
                 "The final AI provider request body is not valid JSON after request transforms",
             );
         };
+
+        // Gemini embeds the generation identity in the URL path, not a body
+        // `model` field. Revalidate contents + optional body model against the
+        // private claim; destination_intact already pins the substituted path.
+        if provider_is_gemini {
+            if let Err(message) = gemini::gemini_final_body_model_ok(&final_body, &committed_model)
+            {
+                return model_policy_violation(message);
+            }
+            if !provider.matches_model(&committed_model) {
+                return model_policy_violation(
+                    "The final AI provider request model does not match the routed model policy",
+                );
+            }
+            return PluginResult::Continue;
+        }
+
         let final_model = match final_body.get("model") {
             Some(Value::String(model)) if !model.is_empty() => model.as_str(),
             _ => {
@@ -2578,12 +2655,16 @@ impl Plugin for AiStreamRouter {
         // into every client-visible chunk and the fail-closed `tool_use` guard,
         // both from the private claim rather than from the forgeable
         // `ai_stream_router.model` / `ai_stream_router.tool_choice_none` keys.
-        let (model, tools_forbidden) = {
+        let (model, tools_forbidden, provider_type) = {
             let (claim, provider) = self.owned_claim(ctx)?;
             if !provider.normalizes_response(self.normalize_response_stream) {
                 return None;
             }
-            (claim.model.clone(), claim.tool_choice_none)
+            (
+                claim.model.clone(),
+                claim.tool_choice_none,
+                provider.provider_type,
+            )
         };
         // Only normalize a successful event stream; a non-2xx/non-SSE body is an
         // error envelope that should reach the client untouched.
@@ -2594,11 +2675,19 @@ impl Plugin for AiStreamRouter {
             return None;
         }
         let encoding = ctx.metadata.get(META_PROVIDER_ENCODING).cloned();
-        Some(wrap_anthropic_normalizer(
-            model,
-            encoding.as_deref(),
-            tools_forbidden,
-        ))
+        match provider_type {
+            ProviderType::Anthropic => Some(wrap_anthropic_normalizer(
+                model,
+                encoding.as_deref(),
+                tools_forbidden,
+            )),
+            ProviderType::GoogleGemini => Some(gemini::wrap_gemini_normalizer(
+                model,
+                encoding.as_deref(),
+                tools_forbidden,
+            )),
+            ProviderType::OpenAi | ProviderType::OpenAiCompatible => None,
+        }
     }
 
     async fn normalize_response_body_with_context(
@@ -2616,12 +2705,16 @@ impl Plugin for AiStreamRouter {
         // committed generation identity and tool-use guard
         // (`GHSA-xhp5-hqj8-3mwg`). Scoped so the claim borrow ends before the
         // buffered normalization await.
-        let (model, tools_forbidden) = {
+        let (model, tools_forbidden, provider_type) = {
             let (claim, provider) = self.owned_claim(ctx)?;
             if !provider.normalizes_response(self.normalize_response_stream) {
                 return None;
             }
-            (claim.model.clone(), claim.tool_choice_none)
+            (
+                claim.model.clone(),
+                claim.tool_choice_none,
+                provider.provider_type,
+            )
         };
         // Match the streaming normalizer: provider error envelopes reach the
         // client untouched even when a backend labels them as event streams.
@@ -2653,7 +2746,16 @@ impl Plugin for AiStreamRouter {
                 return bounded_upstream_sse_error_body(&message, ceiling);
             }
         };
-        normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden, ceiling).await
+        match provider_type {
+            ProviderType::Anthropic => {
+                normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden, ceiling).await
+            }
+            ProviderType::GoogleGemini => {
+                gemini::normalize_gemini_sse_buffered(model, &plaintext, tools_forbidden, ceiling)
+                    .await
+            }
+            ProviderType::OpenAi | ProviderType::OpenAiCompatible => None,
+        }
     }
 
     /// Bind every field normalized Anthropic SSE invalidates.
@@ -2708,7 +2810,7 @@ impl Plugin for AiStreamRouter {
             }
             ProviderContentEncoding::Unsupported(message) => openai_error_response(
                 502,
-                &format!("Upstream Anthropic SSE used an unsupported Content-Encoding: {message}"),
+                &format!("Upstream provider SSE used an unsupported Content-Encoding: {message}"),
                 "upstream_error",
                 None,
                 Some("unsupported_content_encoding"),

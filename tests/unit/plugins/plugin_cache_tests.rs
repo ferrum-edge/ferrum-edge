@@ -5311,6 +5311,19 @@ fn test_apply_delta_rejects_invalid_ai_stream_router_config_and_keeps_last_known
                 "provider fallback is not implemented",
             ][..],
         ),
+        (
+            "gemini-missing-stream-path",
+            json!({
+                "providers": [{
+                    "name": "gemini",
+                    "provider_type": "google_gemini",
+                    "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    "api_key": "sk-bad",
+                    "model_patterns": ["gemini-*"]
+                }]
+            }),
+            &["streamGenerateContent"][..],
+        ),
     ] {
         let config2 = make_config(
             vec![make_proxy("p1", "/api", vec!["pc-router"])],

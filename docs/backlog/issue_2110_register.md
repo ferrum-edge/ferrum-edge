@@ -32,6 +32,7 @@ Current mesh HBONE/DNS perf status lives in
 | `WsDisconnectLogEntry` log schema | Implemented — [`docs/log_schema.md`](../log_schema.md) WebSocket disconnect family |
 | Mesh TLS-SNI L4 routing | Supported — VirtualService `tls[]` SNI passthrough (`sniHosts`); see [`docs/mesh_supported_matrix.md`](../mesh_supported_matrix.md) and `tests/integration/mesh_l7_routing_tests.rs` |
 | Remote-discovery JWT audience binding | Implemented — closed [#2475](https://github.com/ferrum-edge/ferrum-edge/issues/2475) |
+| `ai_stream_router` `google_gemini` adapter | Implemented — [#3299](https://github.com/ferrum-edge/ferrum-edge/issues/3299) |
 
 ## Live dedicated trackers (current backlog)
 
@@ -39,7 +40,6 @@ Current mesh HBONE/DNS perf status lives in
 |---|---|---|
 | Subset-scoped Istio HTTP connection-pool policy | [#3228](https://github.com/ferrum-edge/ferrum-edge/issues/3228) / [#3240](https://github.com/ferrum-edge/ferrum-edge/issues/3240)–[#3242](https://github.com/ferrum-edge/ferrum-edge/issues/3242) | `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests` inside subsets |
 | EgressGateway UDP `ServiceEntry` materialization | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | HTTP/TCP stream egress exists; UDP ports still skipped |
-| `ai_stream_router` `google_gemini` adapter | [#3299](https://github.com/ferrum-edge/ferrum-edge/issues/3299) | Config accepted; construction fails closed until implemented |
 | AI semantic-firewall token windows | [#3302](https://github.com/ferrum-edge/ferrum-edge/issues/3302) | `streaming.window: tokens` rejected |
 | Native-gRPC transcript capture | [#3304](https://github.com/ferrum-edge/ferrum-edge/issues/3304) | HTTP-only today |
 | Pre-first-byte stream-router fallback | [#3328](https://github.com/ferrum-edge/ferrum-edge/issues/3328) | Implement or explicitly reject |

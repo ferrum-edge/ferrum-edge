@@ -5,6 +5,7 @@
 
 pub mod ai_pii;
 pub mod ai_providers;
+pub mod gemini_generate;
 pub mod auth_attempt;
 pub mod auth_flow;
 pub mod aws_sigv4;
