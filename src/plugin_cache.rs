@@ -520,13 +520,15 @@ pub(crate) fn validate_plugin_security_composition(
                 plugin.supported_protocols().contains(&protocol)
                     && plugin.name() != "request_deduplication"
                     && plugin.priority() >= deduplication.priority()
-                    && (plugin.modifies_request_headers() || plugin.modifies_request_query())
+                    && (plugin.modifies_request_headers()
+                        || plugin.modifies_request_query()
+                        || plugin.modifies_request_destination())
             }) {
                 return Err(format!(
                     "request mutation plugin '{}' at effective priority {} must run before \
                      every request_deduplication instance for protocol {:?}; \
-                     request_deduplication priority {} would fingerprint headers/query before \
-                     their backend-visible mutation",
+                     request_deduplication priority {} would fingerprint headers/query/destination \
+                     before their backend-visible mutation",
                     later_mutator.name(),
                     later_mutator.priority(),
                     protocol,
@@ -569,13 +571,15 @@ pub(crate) fn validate_plugin_security_composition(
                     // compression to retain final encoded representations.
                     && plugin.name() != "compression"
                     && plugin.priority() >= response_cache.priority()
-                    && (plugin.modifies_request_headers() || plugin.modifies_request_query())
+                    && (plugin.modifies_request_headers()
+                        || plugin.modifies_request_query()
+                        || plugin.modifies_request_destination())
             }) {
                 return Err(format!(
                     "request mutation plugin '{}' at effective priority {} must run before \
                      every response_caching instance for protocol {:?}; response_caching \
                      priority {} would select a retained response before the final \
-                     backend-visible headers/query exist",
+                     backend-visible headers/query/destination exist",
                     later_mutator.name(),
                     later_mutator.priority(),
                     protocol,
@@ -755,8 +759,19 @@ impl Plugin for PriorityOverridePlugin {
     fn modifies_request_headers(&self) -> bool {
         self.inner.modifies_request_headers()
     }
+    fn participates_in_route_request_header_finalization(&self) -> bool {
+        self.inner
+            .participates_in_route_request_header_finalization()
+    }
+    fn participates_in_route_response_header_finalization(&self) -> bool {
+        self.inner
+            .participates_in_route_response_header_finalization()
+    }
     fn modifies_request_query(&self) -> bool {
         self.inner.modifies_request_query()
+    }
+    fn modifies_request_destination(&self) -> bool {
+        self.inner.modifies_request_destination()
     }
     fn modifies_request_body(&self) -> bool {
         self.inner.modifies_request_body()

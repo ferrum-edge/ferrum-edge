@@ -533,55 +533,82 @@ async fn functional_cors_forwarded_preflight_and_composition_match_h1_h2_h3() {
 /// matcher it must authorize only the byte-identical `Origin` and must NOT
 /// authorize any subdomain — that difference is the security property, so it is
 /// asserted from outside the process, over real H1/H2/H3 frontends.
+///
+/// Transport errors are classified against the owned gateway child: a dead
+/// child voids the attempt (retry with a fresh harness), while a still-healthy
+/// child makes the transport error authoritative. HTTP statuses and CORS
+/// security assertions are never retried.
 #[ignore]
 #[tokio::test]
 async fn functional_cors_literal_exact_and_regex_origins_are_not_widened() {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_void = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        match try_cors_literal_exact_and_regex_origins_are_not_widened().await {
+            CorsLiteralAttempt::Passed => return,
+            CorsLiteralAttempt::Void(reason) => {
+                eprintln!("cors literal-matcher attempt {attempt}/{MAX_ATTEMPTS} voided: {reason}");
+                last_void = reason;
+            }
+            CorsLiteralAttempt::Failed(reason) => panic!("{reason}"),
+        }
+    }
+    panic!(
+        "cors literal-matcher fixture voided after {MAX_ATTEMPTS} attempts; \
+         last void reason:\n{last_void}"
+    );
+}
+
+/// Outcome of one fresh-harness attempt of the literal-matcher CORS fixture.
+///
+/// Only [`CorsLiteralAttempt::Void`] is retryable. Protocol responses and
+/// transport errors from a still-running owned gateway child are authoritative.
+enum CorsLiteralAttempt {
+    Passed,
+    Void(String),
+    Failed(String),
+}
+
+async fn try_cors_literal_exact_and_regex_origins_are_not_widened() -> CorsLiteralAttempt {
     let mut harness = CorsProtocolHarness::spawn().await;
+    let outcome = run_cors_literal_exact_and_regex_origins_are_not_widened(&mut harness).await;
+    harness.shutdown();
+    outcome
+}
+
+async fn run_cors_literal_exact_and_regex_origins_are_not_widened(
+    harness: &mut CorsProtocolHarness,
+) -> CorsLiteralAttempt {
     const PATH: &str = "/literal-matchers";
 
     // 1. The literal `*.example.com` matcher authorizes exactly its own string
     //    and reflects it (credentialed, so never `*`).
-    for response in [
-        send_h1_path(
-            &harness,
-            PATH,
-            Method::GET,
-            None,
-            None,
-            LITERAL_WILDCARD_ORIGIN,
-        )
-        .await,
-        send_h2_path(
-            &harness,
-            PATH,
-            Method::GET,
-            None,
-            None,
-            LITERAL_WILDCARD_ORIGIN,
-        )
-        .await,
-        send_h3_path(
-            &harness,
-            PATH,
-            Method::GET,
-            None,
-            None,
-            LITERAL_WILDCARD_ORIGIN,
-        )
-        .await,
-    ] {
+    let allowed_responses = match collect_literal_protocol_responses(
+        harness,
+        PATH,
+        Method::GET,
+        None,
+        None,
+        LITERAL_WILDCARD_ORIGIN,
+    )
+    .await
+    {
+        Ok(responses) => responses,
+        Err(outcome) => return outcome,
+    };
+    for response in &allowed_responses {
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(
-            header(&response, "access-control-allow-origin"),
+            header(response, "access-control-allow-origin"),
             LITERAL_WILDCARD_ORIGIN,
             "a literal exact matcher reflects the request origin verbatim"
         );
         assert_eq!(
-            header(&response, "access-control-allow-credentials"),
+            header(response, "access-control-allow-credentials"),
             "true",
             "a concrete literal origin keeps credentialed CORS usable"
         );
-        assert_vary(&response, "Origin");
+        assert_vary(response, "Origin");
     }
 
     // 2. The security property: a real subdomain is NOT authorized. If the
@@ -592,45 +619,62 @@ async fn functional_cors_literal_exact_and_regex_origins_are_not_widened() {
         "https://deep.sub.example.com",
         "https://example.com",
     ] {
-        for response in [
-            send_h1_path(&harness, PATH, Method::GET, None, None, origin).await,
-            send_h2_path(&harness, PATH, Method::GET, None, None, origin).await,
-            send_h3_path(&harness, PATH, Method::GET, None, None, origin).await,
-        ] {
+        let denied_responses = match collect_literal_protocol_responses(
+            harness,
+            PATH,
+            Method::GET,
+            None,
+            None,
+            origin,
+        )
+        .await
+        {
+            Ok(responses) => responses,
+            Err(outcome) => return outcome,
+        };
+        for response in &denied_responses {
             assert_eq!(
                 response.status,
                 StatusCode::FORBIDDEN,
                 "`{origin}` must not be widened into the literal `*.example.com` matcher"
             );
-            assert_no_access_control_headers(&response);
+            assert_no_access_control_headers(response);
         }
     }
 
     // 3. The bounded regex matcher full-matches, with no implicit `.*`.
-    let allowed = send_h1_path(
-        &harness,
+    let allowed = match literal_send_h1(
+        harness,
         PATH,
         Method::GET,
         None,
         None,
         "https://v2.api.example.com",
     )
-    .await;
+    .await
+    {
+        Ok(response) => response,
+        Err(outcome) => return outcome,
+    };
     assert_eq!(allowed.status, StatusCode::OK);
     assert_eq!(
         header(&allowed, "access-control-allow-origin"),
         "https://v2.api.example.com"
     );
 
-    let suffixed = send_h1_path(
-        &harness,
+    let suffixed = match literal_send_h1(
+        harness,
         PATH,
         Method::GET,
         None,
         None,
         "https://v2.api.example.com.evil.com",
     )
-    .await;
+    .await
+    {
+        Ok(response) => response,
+        Err(outcome) => return outcome,
+    };
     assert_eq!(
         suffixed.status,
         StatusCode::FORBIDDEN,
@@ -639,15 +683,19 @@ async fn functional_cors_literal_exact_and_regex_origins_are_not_widened() {
 
     // 4. A credentialed preflight from the literal origin is answered locally
     //    with the exact origin reflected and the configured method/header lists.
-    let preflight = send_h1_path(
-        &harness,
+    let preflight = match literal_send_h1(
+        harness,
         PATH,
         Method::OPTIONS,
         Some("PUT"),
         Some("X-Custom"),
         LITERAL_WILDCARD_ORIGIN,
     )
-    .await;
+    .await
+    {
+        Ok(response) => response,
+        Err(outcome) => return outcome,
+    };
     assert_eq!(preflight.status, StatusCode::NO_CONTENT);
     assert_eq!(
         header(&preflight, "access-control-allow-origin"),
@@ -660,19 +708,155 @@ async fn functional_cors_literal_exact_and_regex_origins_are_not_widened() {
 
     // An uncredentialed, unmatched preflight stays fail-closed on the native
     // (non-Istio) policy shape.
-    let denied_preflight = send_h1_path(
-        &harness,
+    let denied_preflight = match literal_send_h1(
+        harness,
         PATH,
         Method::OPTIONS,
         Some("PUT"),
         None,
         "https://app.example.com",
     )
-    .await;
+    .await
+    {
+        Ok(response) => response,
+        Err(outcome) => return outcome,
+    };
     assert_eq!(denied_preflight.status, StatusCode::FORBIDDEN);
     assert_no_access_control_headers(&denied_preflight);
 
-    harness.shutdown();
+    CorsLiteralAttempt::Passed
+}
+
+async fn collect_literal_protocol_responses(
+    harness: &mut CorsProtocolHarness,
+    path: &str,
+    method: Method,
+    requested_method: Option<&str>,
+    requested_headers: Option<&str>,
+    origin: &str,
+) -> Result<[CapturedResponse; 3], CorsLiteralAttempt> {
+    let h1 = literal_send_h1(
+        harness,
+        path,
+        method.clone(),
+        requested_method,
+        requested_headers,
+        origin,
+    )
+    .await?;
+    let h2 = literal_send_h2(
+        harness,
+        path,
+        method.clone(),
+        requested_method,
+        requested_headers,
+        origin,
+    )
+    .await?;
+    let h3 = literal_send_h3(
+        harness,
+        path,
+        method,
+        requested_method,
+        requested_headers,
+        origin,
+    )
+    .await?;
+    Ok([h1, h2, h3])
+}
+
+async fn literal_send_h1(
+    harness: &mut CorsProtocolHarness,
+    path: &str,
+    method: Method,
+    requested_method: Option<&str>,
+    requested_headers: Option<&str>,
+    origin: &str,
+) -> Result<CapturedResponse, CorsLiteralAttempt> {
+    match send_h1_path_result(
+        harness,
+        path,
+        method,
+        requested_method,
+        requested_headers,
+        origin,
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        Err(error) => Err(classify_cors_transport_error(harness, "H1", &error)),
+    }
+}
+
+async fn literal_send_h2(
+    harness: &mut CorsProtocolHarness,
+    path: &str,
+    method: Method,
+    requested_method: Option<&str>,
+    requested_headers: Option<&str>,
+    origin: &str,
+) -> Result<CapturedResponse, CorsLiteralAttempt> {
+    match send_h2_path_result(
+        harness,
+        path,
+        method,
+        requested_method,
+        requested_headers,
+        origin,
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        Err(error) => Err(classify_cors_transport_error(harness, "H2", &error)),
+    }
+}
+
+async fn literal_send_h3(
+    harness: &mut CorsProtocolHarness,
+    path: &str,
+    method: Method,
+    requested_method: Option<&str>,
+    requested_headers: Option<&str>,
+    origin: &str,
+) -> Result<CapturedResponse, CorsLiteralAttempt> {
+    // Single-shot: request-level retries would blur the void-vs-authoritative
+    // boundary for an owned child that died mid-run.
+    match send_h3_path_once(
+        harness,
+        path,
+        method,
+        requested_method,
+        requested_headers,
+        origin,
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        Err(error) => Err(classify_cors_transport_error(harness, "H3", &error)),
+    }
+}
+
+fn classify_cors_transport_error(
+    harness: &mut CorsProtocolHarness,
+    protocol: &str,
+    error: &dyn std::fmt::Display,
+) -> CorsLiteralAttempt {
+    let proxy_port = harness.gateway.proxy_port;
+    let https_port = harness.https_port;
+    let diagnostics = harness.gateway.diagnostic_captured_output();
+    if harness.gateway.is_running() {
+        CorsLiteralAttempt::Failed(format!(
+            "{protocol} CORS transport error while owned gateway child is still running \
+             (proxy_port={proxy_port} https_port={https_port}): {error}\n\
+             --- gateway output ---\n{diagnostics}"
+        ))
+    } else {
+        CorsLiteralAttempt::Void(format!(
+            "{protocol} CORS transport error after owned gateway child exited \
+             (proxy_port={proxy_port} https_port={https_port}): {error}\n\
+             --- gateway output ---\n{diagnostics}"
+        ))
+    }
 }
 
 struct CorsProtocolHarness {
@@ -697,6 +881,9 @@ impl CorsProtocolHarness {
                 // The pinned HTTPS/QUIC port must change between attempts, so
                 // this outer loop owns startup retries.
                 .max_attempts(1)
+                // Capture to secret-scrubbed diagnostics when classifying a
+                // mid-run transport error against owned-child liveness.
+                .capture_output()
                 .env("FERRUM_ENABLE_HTTP3", "true")
                 .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
                 .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
@@ -982,6 +1169,26 @@ async fn send_h1_path(
     requested_headers: Option<&str>,
     origin: &str,
 ) -> CapturedResponse {
+    send_h1_path_result(
+        harness,
+        path,
+        method,
+        requested_method,
+        requested_headers,
+        origin,
+    )
+    .await
+    .expect("H1 CORS request")
+}
+
+async fn send_h1_path_result(
+    harness: &CorsProtocolHarness,
+    path: &str,
+    method: Method,
+    requested_method: Option<&str>,
+    requested_headers: Option<&str>,
+    origin: &str,
+) -> Result<CapturedResponse, reqwest::Error> {
     let client = reqwest::Client::builder()
         .http1_only()
         .timeout(Duration::from_secs(5))
@@ -994,9 +1201,8 @@ async fn send_h1_path(
         origin,
     )
     .send()
-    .await
-    .expect("H1 CORS request");
-    capture_reqwest(response).await
+    .await?;
+    Ok(capture_reqwest(response).await)
 }
 
 async fn send_h2(
@@ -1024,6 +1230,26 @@ async fn send_h2_path(
     requested_headers: Option<&str>,
     origin: &str,
 ) -> CapturedResponse {
+    send_h2_path_result(
+        harness,
+        path,
+        method,
+        requested_method,
+        requested_headers,
+        origin,
+    )
+    .await
+    .expect("H2 CORS request")
+}
+
+async fn send_h2_path_result(
+    harness: &CorsProtocolHarness,
+    path: &str,
+    method: Method,
+    requested_method: Option<&str>,
+    requested_headers: Option<&str>,
+    origin: &str,
+) -> Result<CapturedResponse, reqwest::Error> {
     let client = reqwest::Client::builder()
         .http2_prior_knowledge()
         .timeout(Duration::from_secs(5))
@@ -1036,10 +1262,9 @@ async fn send_h2_path(
         origin,
     )
     .send()
-    .await
-    .expect("H2 CORS request");
+    .await?;
     assert_eq!(response.version(), reqwest::Version::HTTP_2);
-    capture_reqwest(response).await
+    Ok(capture_reqwest(response).await)
 }
 
 async fn capture_reqwest(response: reqwest::Response) -> CapturedResponse {
@@ -1107,6 +1332,35 @@ async fn send_h3_path(
             Err(error) => panic!("H3 CORS request did not complete: {error}"),
         }
     }
+}
+
+async fn send_h3_path_once(
+    harness: &CorsProtocolHarness,
+    path: &str,
+    method: Method,
+    requested_method: Option<&str>,
+    requested_headers: Option<&str>,
+    origin: &str,
+) -> Result<CapturedResponse, String> {
+    let client = Http3Client::insecure().expect("H3 client");
+    let mut options = GetOptions::default().method(method);
+    options = options.header("origin", origin);
+    if let Some(method) = requested_method {
+        options = options.header("access-control-request-method", method);
+    }
+    if let Some(headers) = requested_headers {
+        options = options.header("access-control-request-headers", headers);
+    }
+
+    let response = client
+        .get_with_options(&harness.h3_url(path), options)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(CapturedResponse {
+        status: response.status,
+        headers: response.headers,
+        body: response.body_bytes,
+    })
 }
 
 fn header<'a>(response: &'a CapturedResponse, name: &str) -> &'a str {

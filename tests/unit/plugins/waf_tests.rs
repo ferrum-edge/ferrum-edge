@@ -2716,6 +2716,29 @@ async fn rule_override_fp_filter_suppresses_special_hpp_rule() {
 }
 
 #[tokio::test]
+async fn hpp_rule_blocks_plus_and_percent_space_key_aliases() {
+    let plugin = Waf::new(&json!({
+        "mode": "enforce",
+        "default_rule_action": "enforce"
+    }))
+    .unwrap();
+
+    let mut request = ctx("GET", "/search");
+    request.set_raw_query_string("tenant+id=victim&tenant%20id=admin".into());
+    assert!(matches!(
+        plugin.authorize(&mut request).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        request
+            .metadata
+            .get("waf.first_blocking_rule")
+            .map(String::as_str),
+        Some("FE-HPP-001")
+    );
+}
+
+#[tokio::test]
 async fn rule_override_scopes_built_in_rule_to_paths() {
     let plugin = Waf::new(&json!({
         "mode": "enforce",
@@ -4251,4 +4274,686 @@ fn waf_custom_rule_path_regex_docs_match_unanchored_runtime() {
             && openapi.contains("`~regex` is a start-anchored regex"),
         "openapi.yaml must keep unanchored rule conditions and start-anchored exemptions"
     );
+}
+
+// ---------------------------------------------------------------------------
+// GHSA-7jh9-fjqf-jcvf — a body that does not fit inside `max_scan_bytes` must
+// not be forwarded past an enforcing body rule just because its scanned prefix
+// was clean. `on_final_request_body_with_context` and `on_final_response_body`
+// are the single protocol-shared final-body hooks, so H1/H2/H3 share exactly
+// the decision exercised here.
+// ---------------------------------------------------------------------------
+
+/// `max_scan_bytes` used by the oversize-body tests. Small so the padding is
+/// readable; the decision is a pure length comparison, so the cap size itself
+/// carries no behavior.
+const SCAN_CAP: usize = 16;
+
+fn body_ctx() -> RequestContext {
+    let mut ctx = ctx("POST", "/submit");
+    ctx.headers
+        .insert("content-type".into(), "application/json".into());
+    ctx
+}
+
+/// `SCAN_CAP` benign bytes followed by `suffix`, i.e. the advisory's padding
+/// strategy: a clean scanned prefix hiding a blocked payload past the cap.
+fn padded_body(suffix: &str) -> Vec<u8> {
+    let mut body = vec![b'a'; SCAN_CAP];
+    body.extend_from_slice(suffix.as_bytes());
+    body
+}
+
+fn enforcing_request_body_rule() -> serde_json::Value {
+    json!({
+        "id": "CUSTOM-REQ-BODY",
+        "name": "request body marker",
+        "category": "custom",
+        "severity": "high",
+        "target": "body_text",
+        "match_kind": "contains",
+        "pattern": "needle",
+        "action": "enforce"
+    })
+}
+
+fn monitor_request_body_rule() -> serde_json::Value {
+    json!({
+        "id": "CUSTOM-REQ-BODY",
+        "name": "request body marker",
+        "category": "custom",
+        "severity": "high",
+        "target": "body_text",
+        "match_kind": "contains",
+        "pattern": "needle",
+        "action": "monitor"
+    })
+}
+
+fn response_body_rule(action: &str) -> serde_json::Value {
+    json!({
+        "id": "CUSTOM-RESP-BODY",
+        "name": "response body secret",
+        "category": "custom",
+        "severity": "high",
+        "target": "response_body",
+        "match_kind": "contains",
+        "pattern": "secret",
+        "action": action
+    })
+}
+
+#[tokio::test]
+async fn padded_request_body_suffix_fails_closed_by_default() {
+    // The advisory repro: an enforced custom body rule, a body padded past
+    // `max_scan_bytes`, and the blocked token in the unscanned suffix. Defaults
+    // everywhere else — no `on_body_too_large` override.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "custom_rules": [enforcing_request_body_rule()]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &padded_body("needle"))
+        .await;
+
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "an unscannable body must not reach the backend under an enforcing body rule"
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("body_too_large")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.body_too_large").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("waf.body_too_large_target")
+            .map(String::as_str),
+        Some("request_body")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("blocked")
+    );
+    // Fixed-cardinality metadata only: no body bytes are ever recorded.
+    assert!(
+        ctx.metadata.values().all(|value| !value.contains("needle")),
+        "WAF metadata must never carry body content"
+    );
+}
+
+#[tokio::test]
+async fn exact_boundary_request_body_is_fully_scanned() {
+    // A body of exactly `max_scan_bytes` is completely inspected: it blocks on
+    // the rule itself, not on size, and records no truncation.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "custom_rules": [enforcing_request_body_rule()]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    let headers = ctx.headers.clone();
+    let mut body = vec![b'a'; SCAN_CAP - "needle".len()];
+    body.extend_from_slice(b"needle");
+    assert_eq!(body.len(), SCAN_CAP);
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body)
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("rule")
+    );
+    assert!(!ctx.metadata.contains_key("waf.body_too_large"));
+    assert!(!ctx.metadata.contains_key("waf.scan_truncated"));
+}
+
+#[tokio::test]
+async fn exact_boundary_clean_request_body_is_not_truncated() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "custom_rules": [enforcing_request_body_rule()]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &[b'a'; SCAN_CAP])
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("waf.body_too_large"));
+    assert!(!ctx.metadata.contains_key("waf.scan_truncated"));
+    assert_eq!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("clean")
+    );
+}
+
+#[tokio::test]
+async fn one_byte_over_boundary_request_body_fails_closed() {
+    // Immediately over the cap, with a clean prefix and no hidden payload at
+    // all: the block is about unscannability, not about a match.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "reject_status_code": 422,
+        "custom_rules": [enforcing_request_body_rule()]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &[b'a'; SCAN_CAP + 1])
+        .await;
+
+    // The configured rejection shape is preserved, so the reject stays
+    // protocol-appropriate for whichever frontend produced the request.
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 422,
+            ..
+        }
+    ));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("body_too_large")
+    );
+}
+
+#[tokio::test]
+async fn builtin_body_rule_enforced_by_rule_modes_fails_closed_on_oversize_body() {
+    // Same posture through the built-in pack rather than a custom rule.
+    let plugin = Waf::new(&json!({
+        "max_scan_bytes": SCAN_CAP,
+        "rule_modes": { "FE-CMD-002": "enforce" }
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &padded_body("bash -i"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("body_too_large")
+    );
+}
+
+#[tokio::test]
+async fn anomaly_scoring_fails_closed_on_oversize_request_body() {
+    // Scoring can block on accumulated monitored hits, so an unscanned suffix
+    // is a real enforcement gap even with no `action: enforce` rule.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "scoring": { "enabled": true, "block_threshold": 5 },
+        "custom_rules": [monitor_request_body_rule()]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &padded_body("needle"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("body_too_large")
+    );
+}
+
+#[tokio::test]
+async fn scoped_enforcing_body_rule_only_fails_closed_when_conditions_match() {
+    let mut rule = enforcing_request_body_rule();
+    rule["conditions"] = json!({ "paths": ["/admin"] });
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "custom_rules": [rule]
+    }))
+    .unwrap();
+
+    let mut outside_scope = body_ctx();
+    let outside_headers = outside_scope.headers.clone();
+    let outside_result = plugin
+        .on_final_request_body_with_context(
+            &mut outside_scope,
+            &outside_headers,
+            &padded_body("needle"),
+        )
+        .await;
+    assert!(matches!(outside_result, PluginResult::Continue));
+    assert_eq!(
+        outside_scope
+            .metadata
+            .get("waf.scan_truncated")
+            .map(String::as_str),
+        Some("true"),
+        "an out-of-scope enforcing rule must not make unrelated routes block"
+    );
+
+    let mut in_scope = body_ctx();
+    in_scope.path = "/admin".to_string();
+    let in_scope_headers = in_scope.headers.clone();
+    let in_scope_result = plugin
+        .on_final_request_body_with_context(
+            &mut in_scope,
+            &in_scope_headers,
+            &padded_body("needle"),
+        )
+        .await;
+    assert!(matches!(in_scope_result, PluginResult::Reject { .. }));
+    assert_eq!(
+        in_scope
+            .metadata
+            .get("waf.block_reason")
+            .map(String::as_str),
+        Some("body_too_large")
+    );
+}
+
+#[tokio::test]
+async fn scoped_scoring_body_rule_only_fails_closed_when_conditions_match() {
+    let mut rule = monitor_request_body_rule();
+    rule["conditions"] = json!({ "methods": ["PUT"] });
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "scoring": { "enabled": true, "block_threshold": 5 },
+        "custom_rules": [rule]
+    }))
+    .unwrap();
+
+    let mut post = body_ctx();
+    let post_headers = post.headers.clone();
+    let post_result = plugin
+        .on_final_request_body_with_context(&mut post, &post_headers, &padded_body("needle"))
+        .await;
+    assert!(matches!(post_result, PluginResult::Continue));
+    assert_eq!(
+        post.metadata.get("waf.scan_truncated").map(String::as_str),
+        Some("true"),
+        "scoring cannot block on a body rule whose conditions do not match"
+    );
+
+    let mut put = body_ctx();
+    put.method = "PUT".to_string();
+    let put_headers = put.headers.clone();
+    let put_result = plugin
+        .on_final_request_body_with_context(&mut put, &put_headers, &padded_body("needle"))
+        .await;
+    assert!(matches!(put_result, PluginResult::Reject { .. }));
+    assert_eq!(
+        put.metadata.get("waf.block_reason").map(String::as_str),
+        Some("body_too_large")
+    );
+}
+
+#[tokio::test]
+async fn request_wide_header_exemption_prevents_oversize_fail_closed_block() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "global_exemptions": {
+            "header_present": { "x-waf-exempt": null }
+        },
+        "custom_rules": [enforcing_request_body_rule()]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    ctx.headers
+        .insert("x-waf-exempt".to_string(), "true".to_string());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &padded_body("needle"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.scan_truncated").map(String::as_str),
+        Some("true"),
+        "a request-wide rule exemption must not become an oversize block"
+    );
+}
+
+#[tokio::test]
+async fn monitor_only_body_rules_still_prefix_scan_oversize_request_body() {
+    // No enforcing body policy: the oversize body is observed, not blocked.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "custom_rules": [monitor_request_body_rule()]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &padded_body("needle"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.body_too_large").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.scan_truncated").map(String::as_str),
+        Some("true")
+    );
+    assert_ne!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("blocked")
+    );
+}
+
+#[tokio::test]
+async fn default_builtin_pack_does_not_block_oversize_body() {
+    // The stock config (built-ins, which are monitor-only unless opted in) must
+    // not start rejecting large uploads because of the new default.
+    let plugin = Waf::new(&json!({ "max_scan_bytes": SCAN_CAP })).unwrap();
+    let mut ctx = body_ctx();
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &padded_body("bash -i"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.scan_truncated").map(String::as_str),
+        Some("true")
+    );
+    assert_ne!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("blocked")
+    );
+}
+
+#[tokio::test]
+async fn monitor_mode_never_blocks_oversize_body_with_enforcing_rule() {
+    let plugin = Waf::new(&json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "custom_rules": [enforcing_request_body_rule()]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &padded_body("needle"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.body_too_large").map(String::as_str),
+        Some("true")
+    );
+    assert_ne!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("blocked")
+    );
+}
+
+#[tokio::test]
+async fn scan_truncated_opt_out_preserves_prefix_only_inspection() {
+    // The documented compatibility escape hatch: operators who accept
+    // prefix-only inspection keep the pre-fix behavior verbatim.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "on_body_too_large": "scan_truncated",
+        "custom_rules": [enforcing_request_body_rule()]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &padded_body("needle"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.scan_truncated").map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn explicit_block_still_rejects_oversize_body_without_enforcing_body_rule() {
+    // `block` keeps its stricter meaning: it does not narrow to the
+    // enforcing-policy predicate that `fail_closed` uses.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "on_body_too_large": "block",
+        "custom_rules": [monitor_request_body_rule()]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &padded_body("needle"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("body_too_large")
+    );
+}
+
+#[tokio::test]
+async fn finalized_request_body_over_cap_fails_closed_despite_small_content_length() {
+    // The final request-body hook decides on the exact backend-visible bytes, so
+    // a transformer (or a lying `Content-Length`) that grows the body past the
+    // cap is still governed — the declared length is never the input.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "custom_rules": [enforcing_request_body_rule()]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    ctx.headers.insert("content-length".into(), "4".into());
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &padded_body("needle"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Reject { .. }));
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("body_too_large")
+    );
+}
+
+#[tokio::test]
+async fn oversize_response_body_fails_closed_by_default() {
+    // Backend-controlled disclosure content placed past the scan cap.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [response_body_rule("enforce")]
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/report");
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, &padded_body("secret"))
+        .await;
+
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "an unscannable response must not be released under an enforcing response-body rule"
+    );
+    assert_eq!(
+        ctx.metadata.get("waf.block_reason").map(String::as_str),
+        Some("body_too_large")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("waf.body_too_large_target")
+            .map(String::as_str),
+        Some("response_body")
+    );
+}
+
+#[tokio::test]
+async fn monitor_only_response_body_rule_prefix_scans_oversize_response_body() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [response_body_rule("monitor")]
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/report");
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, &padded_body("secret"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.scan_truncated").map(String::as_str),
+        Some("true")
+    );
+    assert_ne!(
+        ctx.metadata.get("waf.action").map(String::as_str),
+        Some("blocked")
+    );
+}
+
+#[tokio::test]
+async fn enforcing_request_body_rule_does_not_fail_close_the_response_body() {
+    // Direction isolation: the size decision consults only the rules that read
+    // the body being decided about, so a request-only policy cannot start
+    // rejecting large responses.
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [enforcing_request_body_rule(), response_body_rule("monitor")]
+    }))
+    .unwrap();
+    let mut ctx = ctx("GET", "/report");
+    let response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, &padded_body("secret"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.scan_truncated").map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn enforcing_response_body_rule_does_not_fail_close_the_request_body() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "max_scan_bytes": SCAN_CAP,
+        "response_inspection": true,
+        "response_body_inspection": true,
+        "custom_rules": [monitor_request_body_rule(), response_body_rule("enforce")]
+    }))
+    .unwrap();
+    let mut ctx = body_ctx();
+    let headers = ctx.headers.clone();
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &padded_body("needle"))
+        .await;
+
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("waf.scan_truncated").map(String::as_str),
+        Some("true")
+    );
+}
+
+#[test]
+fn on_body_too_large_accepts_fail_closed_and_rejects_unknown_values() {
+    let accepted = Waf::new(&json!({ "on_body_too_large": "fail_closed" }));
+    assert!(accepted.is_ok());
+
+    let rejected = Waf::new(&json!({ "on_body_too_large": "scan_truncted" }));
+    let error = rejected.unwrap_err();
+    assert!(
+        error.contains("fail_closed") && error.contains("scan_truncated"),
+        "unknown on_body_too_large value must name the supported set, got: {error}"
+    );
+}
+
+/// `on_body_too_large` is a security-relevant default, so the published schema
+/// must agree with the runtime parser on both the accepted set and the default.
+#[test]
+fn on_body_too_large_openapi_runtime_parity() {
+    use serde_json::Value as JsonValue;
+
+    let spec: JsonValue =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/WafPluginConfig/properties/on_body_too_large")
+        .expect("WafPluginConfig.on_body_too_large schema");
+
+    assert_eq!(
+        schema["default"], "fail_closed",
+        "openapi default must stay the fail-closed value"
+    );
+    let documented: Vec<&str> = schema["enum"]
+        .as_array()
+        .expect("on_body_too_large enum")
+        .iter()
+        .map(|value| value.as_str().expect("enum entries are strings"))
+        .collect();
+    assert_eq!(
+        documented,
+        vec!["fail_closed", "scan_truncated", "skip", "block"]
+    );
+    for value in &documented {
+        assert!(
+            Waf::new(&json!({ "on_body_too_large": value })).is_ok(),
+            "runtime must accept documented on_body_too_large value {value}"
+        );
+    }
 }

@@ -63,15 +63,25 @@ async fn run_buffered_response_lifecycle(
     // moved copy of `ctx.headers`), never an empty map. Cache key construction
     // / Vary snapshots must see the same credentials as a later HIT lookup.
     let mut proxy_headers = ctx.headers.clone();
-    for plugin in plugins {
+    for (index, plugin) in plugins.iter().enumerate() {
         if let Some((status_code, body, headers)) =
             reject_parts(plugin.before_proxy(ctx, &mut proxy_headers).await)
         {
             return (status_code, headers, body);
         }
+        if plugin.participates_in_route_request_header_finalization()
+            && !plugins[index + 1..]
+                .iter()
+                .any(|later| later.participates_in_route_request_header_finalization())
+        {
+            ferrum_edge::plugins::utils::route_header_transform::finalize_route_override_request_headers(
+                ctx,
+                &mut proxy_headers,
+            );
+        }
     }
 
-    for plugin in plugins {
+    for (index, plugin) in plugins.iter().enumerate() {
         if let Some((status_code, body, headers)) = reject_parts(
             plugin
                 .after_proxy(ctx, response_status, &mut response_headers)
@@ -84,6 +94,16 @@ async fn run_buffered_response_lifecycle(
                 .or_insert_with(|| "application/json".to_string());
             response_body = body;
             return (response_status, response_headers, response_body);
+        }
+        if plugin.participates_in_route_response_header_finalization()
+            && !plugins[index + 1..]
+                .iter()
+                .any(|later| later.participates_in_route_response_header_finalization())
+        {
+            ferrum_edge::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+                ctx,
+                &mut response_headers,
+            );
         }
     }
 

@@ -707,13 +707,132 @@ fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
     assert!(authentication.contains("ctx.mark_gateway_deadline_response_selected()"));
 
     let server = include_str!("../../../src/http3/server.rs");
+    for (start_marker, end_marker, phase) in [
+        (
+            "// Execute on_request_received hooks",
+            "// Materialize query params before authentication.",
+            "on_request_received",
+        ),
+        (
+            "// Authorization phase (pre-computed authorize plugin list",
+            "let maybe_needs_request_buffering =",
+            "authorize",
+        ),
+        (
+            "async fn run_h3_backend_path_plugins_or_send_reject(",
+            "async fn run_h3_backend_admission_or_send_reject(",
+            "on_backend_path_resolved",
+        ),
+    ] {
+        let start = server
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("native H3 {phase} phase must remain present"));
+        let end = server[start..]
+            .find(end_marker)
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("native H3 {phase} phase must remain bounded"));
+        let phase_source = &server[start..end];
+        assert!(
+            phase_source.contains("await_request_plugin_deadline_with_provenance("),
+            "native H3 {phase} must retain provenance-aware deadline awaits"
+        );
+        assert!(
+            phase_source.contains(".into_plugin_result("),
+            "native H3 {phase} must convert deadline outcomes with the live context"
+        );
+    }
     assert_eq!(
         server
             .matches("await_request_plugin_deadline_with_provenance(")
             .count(),
-        5,
-        "every native H3 request plugin phase must retain deadline provenance"
+        3,
+        "only native H3 request-plugin phases retain direct deadline awaits in server.rs"
     );
+
+    let before_proxy_helper = proxy
+        .split("pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(")
+        .nth(1)
+        .expect("shared before_proxy backend-path policy helper must remain present")
+        .split("const MAX_SET_COOKIE_NAME_VALUE_BYTES")
+        .next()
+        .expect("shared before_proxy backend-path policy helper must remain bounded");
+    assert!(before_proxy_helper.contains("await_request_plugin_deadline_with_provenance("));
+    assert!(before_proxy_helper.contains("plugin.before_proxy(ctx, headers)"));
+    assert!(before_proxy_helper.contains(".into_plugin_result(ctx)"));
+
+    let initial_before_proxy_start = server
+        .find("// before_proxy hooks — only clone headers if at least one plugin modifies them.")
+        .expect("native H3 initial before_proxy block must remain present");
+    let initial_before_proxy_end = server[initial_before_proxy_start..]
+        .find("// Keep H3 body-plugin applicability aligned with the H1/H2 path:")
+        .map(|offset| initial_before_proxy_start + offset)
+        .expect("native H3 initial before_proxy block must remain bounded");
+    let initial_before_proxy = &server[initial_before_proxy_start..initial_before_proxy_end];
+
+    let initial_clone_before_proxy = initial_before_proxy
+        .split("let mut cloned = ctx.headers.clone();")
+        .nth(1)
+        .expect("native H3 header-clone before_proxy path must remain present")
+        .split("owned_proxy_headers = Some(cloned);")
+        .next()
+        .expect("native H3 header-clone before_proxy path must remain bounded");
+    assert!(
+        initial_clone_before_proxy.contains("run_before_proxy_hooks_for_backend_path_policy(")
+            && initial_clone_before_proxy.contains("BackendPathBeforeProxyPass::Initial"),
+        "native H3 header-clone path must delegate before_proxy to the shared helper"
+    );
+
+    let initial_take_before_proxy = initial_before_proxy
+        .split("let mut tmp_headers = std::mem::take(&mut ctx.headers);")
+        .nth(1)
+        .expect("native H3 zero-clone before_proxy path must remain present")
+        .split("ctx.headers = tmp_headers;")
+        .next()
+        .expect("native H3 zero-clone before_proxy path must remain bounded");
+    assert!(
+        initial_take_before_proxy.contains("run_before_proxy_hooks_for_backend_path_policy(")
+            && initial_take_before_proxy.contains("BackendPathBeforeProxyPass::Initial"),
+        "native H3 zero-clone path must delegate before_proxy to the shared helper"
+    );
+
+    let routing_deferred_before_proxy = server
+        .split("if has_deferred_routing_header_hooks {")
+        .nth(1)
+        .expect("native H3 routing-header deferred block must remain present")
+        .split("if backend_path_is_policy_bound {")
+        .next()
+        .expect("native H3 routing-header deferred block must remain bounded");
+    assert!(
+        routing_deferred_before_proxy.contains("run_before_proxy_hooks_for_backend_path_policy(")
+            && routing_deferred_before_proxy
+                .contains("BackendPathBeforeProxyPass::RoutingHeaderDeferred"),
+        "native H3 routing-header deferred pass must delegate before_proxy to the shared helper"
+    );
+
+    let remaining_deferred_before_proxy = server
+        .split("if has_deferred_routing_header_hooks {")
+        .nth(1)
+        .expect("native H3 remaining deferred block must remain present")
+        .split("if backend_path_is_policy_bound {")
+        .nth(1)
+        .expect("native H3 remaining deferred pass must remain present")
+        .split("match deferred_result {")
+        .next()
+        .expect("native H3 remaining deferred pass must remain bounded");
+    assert!(
+        remaining_deferred_before_proxy.contains("run_before_proxy_hooks_for_backend_path_policy(")
+            && remaining_deferred_before_proxy
+                .contains("BackendPathBeforeProxyPass::RemainingDeferred"),
+        "native H3 remaining deferred pass must delegate before_proxy to the shared helper"
+    );
+    assert_eq!(
+        server
+            .matches("run_before_proxy_hooks_for_backend_path_policy(")
+            .count(),
+        4,
+        "native H3 must delegate both initial header paths and each deferred pass"
+    );
+
     let writer = server
         .split("async fn send_h3_plugin_reject_flavor_aware(")
         .nth(1)

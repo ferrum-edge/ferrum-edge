@@ -1059,6 +1059,30 @@ async fn test_credential_shaped_values_are_redacted_regardless_of_field_name() {
 }
 
 #[test]
+fn test_padded_jwt_values_are_redacted_from_structured_bodies() {
+    let plugin = capture_plugin();
+    let credential = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0=.sig";
+
+    let json_body = serde_json::to_vec(&json!({"note": credential})).unwrap();
+    let json = plugin.render_captured_body(&json_body, BodyKind::Json, 512);
+    assert!(!json.rendered.contains(credential), "{}", json.rendered);
+    assert!(
+        json.rendered.contains("***REDACTED***"),
+        "{}",
+        json.rendered
+    );
+
+    let form_body = b"note=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0%3D.sig";
+    let form = plugin.render_captured_body(form_body, BodyKind::Form, 512);
+    assert!(
+        !form.rendered.contains("eyJhbGciOiJIUzI1NiJ9"),
+        "{}",
+        form.rendered
+    );
+    assert_eq!(form.rendered, "note=***REDACTED***");
+}
+
+#[test]
 fn test_many_jwt_prefixes_without_compact_serialization_remain_visible() {
     let plugin = capture_plugin();
     let benign = format!("{}tail", "eyJ".repeat(1_000));

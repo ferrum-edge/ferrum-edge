@@ -48,31 +48,35 @@
 //!
 //! When `mesh_route_dispatch` matches a rule that carries
 //! `request_transform`, it publishes a pre-compiled `Arc` onto
-//! [`RequestContext::route_override_request_transform`]. This plugin always
-//! consults that field at the end of `before_proxy` — i.e. **static rules
-//! run first, then per-rule overrides**. The ordering is deterministic so
-//! operators can predict the final header state when both surfaces are in
-//! use simultaneously (e.g. a proxy-wide `set X-Trace: gateway` plus a
-//! route-level `set X-Trace: canary`: the route-level write wins because it
-//! runs last).
+//! [`RequestContext::route_override_request_transform`]. Each enabled
+//! instance of this plugin applies only its **static** header/query rules in
+//! `before_proxy`. Proxy core then applies the matched route list **exactly
+//! once** after the last eligible (enabled) `request_transformer` in the
+//! ordered chain — i.e. **all static rules run first, then route-level
+//! writes**. That ordering is structural under multiple same-type instances
+//! and priority overrides: a later static add/update/remove/rename cannot
+//! recreate or overwrite a header the matched route removed or set.
 //!
 //! ## `apply_route_overrides` opt-in
 //!
 //! Setting `apply_route_overrides: true` on the plugin config lets the
 //! instance carry zero static `rules`. The K8s VirtualService translator
 //! uses this to auto-emit a `request_transformer` on proxies that do not
-//! already have one, so per-rule route-level transforms still find a
-//! consumer. Direct operator configs without static rules and without this
-//! flag continue to be rejected.
+//! already have one, so per-rule route-level transforms still find an
+//! eligible consumer for the chain-level final phase. Direct operator
+//! configs without static rules and without this flag continue to be
+//! rejected.
 //!
 //! ## RTDS overlay
 //!
 //! When `runtime_overlay_scope: "<scope>"` is set, the effective value of
 //! `ferrum.request_transformer.<scope>.enabled` is bound into this instance's
 //! configuration by mesh preparation and resolved ONCE, immutably, at
-//! construction. A `false` value short-circuits the plugin (static rules AND
-//! route-overlay overrides become no-ops). A scope the accepted overlay does
-//! not name falls back to `default_enabled` (defaults to `true` so the gate is
+//! construction. A `false` value short-circuits the plugin (static rules
+//! become no-ops) and the instance is **not** eligible for route-header
+//! finalization, so it cannot consume or suppress route overrides needed by
+//! a later enabled consumer. A scope the accepted overlay does not name
+//! falls back to `default_enabled` (defaults to `true` so the gate is
 //! fail-open).
 //!
 //! The gate is deliberately NOT read at request time (GHSA-83rc-23c9-3g9x).
@@ -90,14 +94,10 @@ use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use tracing::debug;
 
 use super::utils::body_transform::{self, BodyRule};
 use super::utils::query::OrderedQuery;
-use super::utils::route_header_transform::{
-    RouteHeaderTransformRule, apply_route_header_transforms,
-};
 use super::utils::transformer_gate;
 use super::{Plugin, PluginResult, RequestContext};
 
@@ -549,6 +549,10 @@ impl Plugin for RequestTransformer {
         !self.query_rules.is_empty()
     }
 
+    fn participates_in_route_request_header_finalization(&self) -> bool {
+        self.rules_enabled
+    }
+
     fn modifies_request_body(&self) -> bool {
         // The gate is immutable for this plugin generation, so a disabled
         // instance can safely drop the config-time buffering capability too.
@@ -601,16 +605,11 @@ impl Plugin for RequestTransformer {
         if !self.query_rules.is_empty() {
             apply_query_rules(self, ctx);
         }
-        // Per-rule header transforms published by `mesh_route_dispatch`
-        // run AFTER this plugin's static rules so route-level writes win on
-        // conflict — see the module docstring for the precedence rationale.
-        // Take the Arc out of ctx so a future plugin instance in the chain
-        // does not re-apply the same list.
-        let route_rules: Option<Arc<Vec<RouteHeaderTransformRule>>> =
-            ctx.route_override_request_transform.take();
-        if let Some(route_rules) = route_rules {
-            apply_route_header_transforms(route_rules.as_ref(), headers);
-        }
+        // Route-level header transforms are applied exactly once by proxy core
+        // after the last eligible request_transformer in the chain — see
+        // `finalize_route_override_request_headers`. Do not take or apply them
+        // here: a later same-type instance must still be able to run static
+        // rules before that authoritative final phase.
         PluginResult::Continue
     }
 

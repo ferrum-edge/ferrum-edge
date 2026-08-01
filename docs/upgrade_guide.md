@@ -320,20 +320,26 @@ one fail-closed replay-partition contract
   were previously sharing one completion will now miss. Only transport/hop-by-hop
   framing fields Ferrum provably regenerates for the backend hop are excluded;
   `Host`/authority is bound as its own field.
-- **`response_caching` now binds the complete request target too.** The
-  backend-effective query is a mandatory key dimension.
+- **`response_caching` now binds the complete request context too.** The
+  backend-effective query and every origin-visible request header are mandatory
+  base-key dimensions, even when the origin omits a header from `Vary`.
   `cache_key_include_query: false` remains accepted only to rotate/partition
   legacy keyspaces; it no longer allows responses to be shared across
-  origin-visible query values. Its request-header dimension is unchanged — the
-  complete `Vary` tuple (backend-nominated dimensions, `vary_by_headers`, and
-  the mandatory credential/session auto-Vary) — because RFC 9111 §4.1 selection
-  is target + `Vary` and a conditional revalidation, a client `no-cache`
-  refresh, and `Content-Length: 0` are addressed to a stored entry rather than
-  selecting a different one. Header/query priority overrides that run at or
-  after `response_caching` and deferred request-body transformers now fail
-  configuration admission. `Authorization`, `Proxy-Authorization`, and
-  `Cookie` are mandatory Vary dimensions even when absent, so anonymous cache
-  HITs now include those names in `Vary`; present values remain hashed.
+  origin-visible query values. The only header exemptions are operations this
+  cache actually implements: `If-None-Match` / `If-Modified-Since`, zero-length
+  `Content-Length`, and a pure bare, argument-free `no-cache` / `no-store`
+  refresh while `respect_no_cache` is enabled. `Range`, unsupported
+  preconditions, `Pragma`, mixed/arbitrary/argument-bearing request
+  `Cache-Control`, and all request `Cache-Control` when `respect_no_cache` is
+  disabled remain bound. The complete `Vary` tuple (backend-nominated
+  dimensions, `vary_by_headers`, and mandatory credential/session auto-Vary)
+  is an additional digest. Header/query priority overrides that run at or after
+  `response_caching` and deferred request-body transformers now fail
+  configuration admission. Expect a one-time key rotation and more conservative
+  misses for requests whose headers previously shared one Vary-only partition.
+  `Authorization`, `Proxy-Authorization`, and `Cookie` are mandatory Vary
+  dimensions even when absent, so anonymous cache HITs now include those names
+  in `Vary`; present values remain hashed.
   Authorization storage admission also checks both the pristine inbound and
   live backend-visible header views, so a transformer that removes or adds the
   field cannot bypass the origin shared-cache opt-in requirement.
@@ -342,7 +348,7 @@ one fail-closed replay-partition contract
   non-empty or cannot be proven empty. This closes H2/H3 GET-with-DATA replay
   even when no `Content-Length` is present. Expect those requests to reach the
   origin instead of receiving or populating a cached response.
-- **Tracing and correlation request headers are now `ai_semantic_cache` key
+- **Tracing and correlation request headers are now retained-cache key
   dimensions.** An earlier revision excluded `traceparent`, `tracestate`, `b3`,
   `X-B3-*`, `X-Request-Id`, `X-Correlation-Id` and friends from the shared
   request-header partition by reusing the *response*-cache sanitation classifier
@@ -351,25 +357,27 @@ one fail-closed replay-partition contract
   may not be configured at all, and the value reaches the origin either way.
   Wherever that partition is used they are bound like any other backend-visible
   header, so a client that varies its trace header per request will now miss per
-  request. **Plan for this before enabling `ai_semantic_cache` alongside request
+  request; `response_caching` now binds the same origin-visible fields directly
+  in its base partition even when the origin does not nominate them in `Vary`.
+  **Plan for this before enabling either retained cache alongside request
   tracing.** `otel_tracing` injects a `traceparent` carrying a freshly generated
   span ID into the backend-visible header map on *every* request (in both
   `trace_context_trust` modes, whenever `generate_trace_id` is `true`), and
   `correlation_id` injects a generated identifier whenever the client supplied
-  none. Either one makes the exact key and the semantic scope key unique per
-  request, so the cache cannot hit at all — and it still pays for an embedding
-  call and a store on every miss. `trace_context_trust: untrusted` does **not**
+  none. Either one makes the response-cache base key and the semantic cache's
+  exact/scope keys unique per request, so neither cache can hit; the semantic
+  cache also pays for an embedding call and a store on every miss.
+  `trace_context_trust: untrusted` does **not**
   help: it generates a fresh root rather than normalizing to a shared value. To
-  keep both, either run the cached route on a proxy that does not inject a
-  per-request identifier (`otel_tracing` with `generate_trace_id: false` and no
+  keep either cache effective, run the cached route on a proxy that does not
+  inject a per-request identifier (`otel_tracing` with
+  `generate_trace_id: false` and no
   trusted inbound parent, or no `correlation_id` instance), or remove the
   identifier from the backend-visible view with a `request_transformer` header
   rule at priority `3000` — which also removes it from what the provider
-  receives, so downstream propagation is lost. `response_caching` is unaffected:
-  it keys request headers through `Vary`, so a trace header is a dimension there
-  only when the origin nominates it or an operator lists it in
-  `vary_by_headers`. Response-header replay sanitation still strips trace
-  identifiers from a retained response; that contract is unchanged.
+  receives, so downstream propagation is lost. Response-header replay
+  sanitation still strips trace identifiers from a retained response; that
+  contract is unchanged.
 - **`scope_by_consumer: false` and `cache_key_include_consumer` no longer
   disable caller isolation.** Every key now binds an authorization-context
   fingerprint (mechanism, identity, consumer, peer SPIFFE identity, and digests

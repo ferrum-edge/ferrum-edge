@@ -76,7 +76,12 @@ use tracing::warn;
 use crate::config_sources::k8s::{
     K8sObject, K8sTranslateError, K8sTranslation, K8sTranslationOptions,
     route_local_fault_delay_for_rule, service_entry_port_protocol_is_udp,
-    sidecar_selector_from_istio, translate_k8s_objects_with_filter, workload_selector_from_istio,
+    sidecar_selector_from_istio, translate_k8s_objects_collecting_skips,
+    workload_selector_from_istio,
+};
+use crate::k8s_controller::status::StatusTranslationReuse;
+use crate::k8s_controller::status_plan::{
+    StatusPlanBudget, fair_work_window_iter, select_fair_work_window,
 };
 
 /// Field manager used on every `patch_status` call. Kubernetes uses this
@@ -215,66 +220,118 @@ fn istio_api_resource(update: &IstioStatusUpdate) -> Option<ApiResource> {
 }
 
 /// Plan a batch of [`IstioStatusUpdate`]s for the supported Istio CRDs in
-/// `objects`. The plan is computed cheaply over the same `objects` slice
-/// the reconciler already snapshotted; each entry re-runs translation
-/// filtered to a single object so it can report per-resource accept /
-/// reject without re-walking the whole cluster's CRDs.
+/// `objects`.
+///
+/// Reuses one shared translation/materialization (or the primary reconcile
+/// reuse bundle) instead of retranslating a filtered snapshot once per CRD
+/// (#2397). Fail-closed accept/reject parity is preserved via the skip-error
+/// map collected while producing that translation.
 pub fn plan_istio_status_updates(
     objects: &[K8sObject],
     options: K8sTranslationOptions,
 ) -> Vec<IstioStatusUpdate> {
-    objects
+    plan_istio_status_updates_budgeted(objects, options, None, StatusPlanBudget::unlimited(0))
+        .updates
+}
+
+/// Outcome of a budgeted Istio status planning pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IstioStatusPlanOutcome {
+    pub updates: Vec<IstioStatusUpdate>,
+    pub next_cursor: usize,
+    pub eligible_candidates: usize,
+    pub planned_candidates: usize,
+}
+
+/// Plan Istio status updates with translation reuse and an optional fair work
+/// budget applied before expensive per-object status construction.
+pub fn plan_istio_status_updates_budgeted(
+    objects: &[K8sObject],
+    options: K8sTranslationOptions,
+    translation_reuse: Option<&StatusTranslationReuse>,
+    budget: StatusPlanBudget,
+) -> IstioStatusPlanOutcome {
+    let owned_reuse;
+    let reuse = match translation_reuse {
+        Some(reuse) => reuse,
+        None => {
+            let Some((translation, errors)) =
+                translate_k8s_objects_collecting_skips(objects, options.clone())
+            else {
+                return IstioStatusPlanOutcome {
+                    updates: Vec::new(),
+                    next_cursor: budget.cursor,
+                    eligible_candidates: 0,
+                    planned_candidates: 0,
+                };
+            };
+            owned_reuse = StatusTranslationReuse::from_owned(translation, errors);
+            &owned_reuse
+        }
+    };
+
+    let mut eligible: Vec<&K8sObject> = objects
         .iter()
         .filter(|object| is_supported_istio_kind(&object.kind))
-        .filter_map(|object| {
-            let result = translate_k8s_objects_with_filter(objects, options.clone(), |candidate| {
-                same_resource(candidate, object)
-                // Translation of any Istio CRD that produces routing
-                // resources needs the Service collection so port-name
-                // lookups succeed (matches the Gateway API path).
-                    || candidate.kind == "Service"
-            });
-            let (status, ferrum_detail) = match object.kind.as_str() {
-                "AuthorizationPolicy" => authorization_policy_status(object, result.as_ref()),
-                "PeerAuthentication" => peer_authentication_status(
-                    object,
-                    result.as_ref(),
-                    &options.istio_root_namespace,
-                ),
-                "DestinationRule" => destination_rule_status(object, result.as_ref()),
-                "VirtualService" => virtual_service_status(object, result.as_ref()),
-                "ServiceEntry" => service_entry_status(object, result.as_ref()),
-                "RequestAuthentication" => request_authentication_status(
-                    object,
-                    result.as_ref(),
-                    &options.istio_root_namespace,
-                ),
-                "WorkloadEntry" => workload_entry_status(object, result.as_ref()),
-                "Sidecar" => sidecar_status(
-                    object,
-                    result.as_ref(),
-                    &options.istio_root_namespace,
-                    options.mesh_sidecar_ingress_enforced,
-                ),
-                "Telemetry" => telemetry_status(object, result.as_ref()),
-                "ProxyConfig" => {
-                    proxy_config_status(object, result.as_ref(), &options.istio_root_namespace)
-                }
-                _ => return None,
-            };
-            if status == object.status && ferrum_detail_matches(&object.status, &ferrum_detail) {
-                return None;
+        .collect();
+    eligible.sort_by(|left, right| {
+        (
+            left.kind.as_str(),
+            left.metadata.namespace.as_str(),
+            left.metadata.name.as_str(),
+        )
+            .cmp(&(
+                right.kind.as_str(),
+                right.metadata.namespace.as_str(),
+                right.metadata.name.as_str(),
+            ))
+    });
+
+    let window = select_fair_work_window(eligible.len(), budget);
+    let mut updates = Vec::new();
+    for (_, object) in fair_work_window_iter(&eligible, window) {
+        let result = reuse.result_for(object);
+        let (status, ferrum_detail) = match object.kind.as_str() {
+            "AuthorizationPolicy" => authorization_policy_status(object, result),
+            "PeerAuthentication" => {
+                peer_authentication_status(object, result, &options.istio_root_namespace)
             }
-            Some(IstioStatusUpdate {
-                api_version: object.api_version.clone(),
-                kind: object.kind.clone(),
-                namespace: object.metadata.namespace.clone(),
-                name: object.metadata.name.clone(),
-                status,
-                ferrum_detail,
-            })
-        })
-        .collect()
+            "DestinationRule" => destination_rule_status(object, result),
+            "VirtualService" => virtual_service_status(object, result),
+            "ServiceEntry" => service_entry_status(object, result),
+            "RequestAuthentication" => {
+                request_authentication_status(object, result, &options.istio_root_namespace)
+            }
+            "WorkloadEntry" => workload_entry_status(object, result),
+            "Sidecar" => sidecar_status(
+                object,
+                result,
+                &options.istio_root_namespace,
+                options.mesh_sidecar_ingress_enforced,
+            ),
+            "Telemetry" => telemetry_status(object, result),
+            "ProxyConfig" => proxy_config_status(object, result, &options.istio_root_namespace),
+            _ => continue,
+        };
+        if status == object.status && ferrum_detail_matches(&object.status, &ferrum_detail) {
+            continue;
+        }
+        updates.push(IstioStatusUpdate {
+            api_version: object.api_version.clone(),
+            kind: object.kind.clone(),
+            namespace: object.metadata.namespace.clone(),
+            name: object.metadata.name.clone(),
+            status,
+            ferrum_detail,
+        });
+    }
+
+    IstioStatusPlanOutcome {
+        updates,
+        next_cursor: window.next_cursor,
+        eligible_candidates: eligible.len(),
+        planned_candidates: window.take,
+    }
 }
 
 fn ferrum_detail_matches(status: &Value, desired: &Option<Value>) -> bool {
@@ -297,13 +354,6 @@ fn is_supported_istio_kind(kind: &str) -> bool {
             | "Telemetry"
             | "ProxyConfig"
     )
-}
-
-fn same_resource(left: &K8sObject, right: &K8sObject) -> bool {
-    left.api_version == right.api_version
-        && left.kind == right.kind
-        && left.metadata.namespace == right.metadata.namespace
-        && left.metadata.name == right.metadata.name
 }
 
 /// Build the final `status` sub-object to PATCH onto an Istio CRD.

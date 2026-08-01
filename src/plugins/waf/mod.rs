@@ -100,9 +100,40 @@ enum TimeoutAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TooLargeAction {
+    /// Default. A governed body that does not fit inside `max_scan_bytes` is
+    /// rejected when the direction actually carries an enforcing body policy,
+    /// and prefix-scanned (with truncation metadata) otherwise. This closes the
+    /// deterministic "pad the prefix, hide the payload in the suffix" bypass
+    /// (`GHSA-7jh9-fjqf-jcvf`) without making monitor-only policy block.
+    FailClosed,
+    /// Explicit compatibility opt-out: scan only the first `max_scan_bytes` and
+    /// forward the complete body even when an enforcing body rule is
+    /// configured. Prefix-only inspection is *not* a complete body control.
     ScanTruncated,
+    /// Do not inspect an oversize body at all.
     Skip,
+    /// Strictest: reject every oversize governed body while globally enforcing,
+    /// even when no body rule is set to enforce.
     Block,
+}
+
+/// Which governed body a size decision is being made about. Selects the rule
+/// set whose enforcement is at stake so a request-only policy cannot make a
+/// response fail closed (and vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyDirection {
+    Request,
+    Response,
+}
+
+impl BodyDirection {
+    /// Fixed-cardinality metadata value. Never derived from body content.
+    fn as_metadata_target(self) -> &'static str {
+        match self {
+            BodyDirection::Request => "request_body",
+            BodyDirection::Response => "response_body",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -195,31 +226,59 @@ impl Waf {
         })
     }
 
-    fn has_enforcing_response_body_policy(&self) -> bool {
-        if self.config.mode != GlobalMode::Enforce {
+    /// Whether a body in `direction` can actually be blocked by this instance:
+    /// globally enforcing, not request-wide exempt, and either anomaly scoring
+    /// can consume an applicable body-rule hit or an applicable rule that reads
+    /// that body — including the body-scoped encoding specials, which run on
+    /// both directions — is itself set to enforce.
+    ///
+    /// This is the predicate that decides whether an unscannable body is a
+    /// protection-mechanism failure or merely a lost observation.
+    fn has_enforcing_body_policy(&self, direction: BodyDirection, ctx: &RequestContext) -> bool {
+        if self.config.mode != GlobalMode::Enforce
+            || self.exemptions.suppresses_rule_for_request(ctx)
+        {
             return false;
         }
-        if self.config.scoring.is_some() {
-            return true;
-        }
+        let scoring_enabled = self.config.scoring.is_some();
         let encoding = self.specials.encoding;
         let overlong_utf8 = self.specials.overlong_utf8;
         self.compiled.rules.iter().enumerate().any(|(index, rule)| {
-            rule.action == RuleAction::Enforce
-                && (matches!(rule.target, self::rules::RuleTarget::ResponseBody)
-                    || encoding == Some(index)
-                    || overlong_utf8 == Some(index))
+            if !rule.matches_conditions(ctx) {
+                return false;
+            }
+            let reads_body = match direction {
+                BodyDirection::Request => matches!(
+                    rule.target,
+                    self::rules::RuleTarget::BodyText | self::rules::RuleTarget::BodyJsonPath(_)
+                ),
+                BodyDirection::Response => {
+                    matches!(rule.target, self::rules::RuleTarget::ResponseBody)
+                }
+            };
+            let reads_direction =
+                reads_body || encoding == Some(index) || overlong_utf8 == Some(index);
+            reads_direction && (scoring_enabled || rule.action == RuleAction::Enforce)
         })
+    }
+
+    fn has_enforcing_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        self.has_enforcing_body_policy(BodyDirection::Response, ctx)
     }
 
     fn handle_unbounded_response_stream(&self, ctx: &mut RequestContext) -> PluginResult {
         if self.config.log_to_metadata {
             ctx.set_waf_metadata("waf.response_stream_uninspectable", "true");
         }
+        // An unbounded stream has no prefix at all, so the `scan_truncated`
+        // compatibility opt-out (which only concedes the *suffix* of a bounded
+        // body) does not reach it: it stays fail-closed exactly as before.
         let should_block = match self.config.on_body_too_large {
             TooLargeAction::Skip => false,
             TooLargeAction::Block => self.config.mode == GlobalMode::Enforce,
-            TooLargeAction::ScanTruncated => self.has_enforcing_response_body_policy(),
+            TooLargeAction::FailClosed | TooLargeAction::ScanTruncated => {
+                self.has_enforcing_response_body_policy(ctx)
+            }
         };
         if should_block {
             if self.config.log_to_metadata {
@@ -285,10 +344,12 @@ impl Waf {
                 .as_deref()
                 .unwrap_or("log_and_allow"),
         )?;
+        // Fail closed by default (GHSA-7jh9-fjqf-jcvf). `scan_truncated` remains
+        // available as an explicit, documented prefix-only opt-out.
         let on_body_too_large = parse_too_large_action(
             optional_string(object, "on_body_too_large")?
                 .as_deref()
-                .unwrap_or("scan_truncated"),
+                .unwrap_or("fail_closed"),
         )?;
         let include_default_rules = optional_bool(object, "include_default_rules")?.unwrap_or(true);
         let disabled_default_rules = optional_string_vec(object, "disabled_default_rules")?
@@ -630,38 +691,72 @@ impl Waf {
         }
     }
 
-    /// Decide how to handle a body larger than `max_scan_bytes`. Returns the
-    /// (possibly truncated) slice to scan and a `truncated` flag, or a
-    /// short-circuit result: `Skip` → continue unscanned; `Block` → reject when
-    /// enforcing (fail closed), else scan the prefix and flag it.
+    /// Decide how to handle a governed body larger than `max_scan_bytes`.
+    ///
+    /// Returns the (possibly truncated) slice to scan plus a `truncated` flag,
+    /// or a short-circuit result. The threat this arbitrates is
+    /// `GHSA-7jh9-fjqf-jcvf`: prefix-only inspection lets a client (or a
+    /// compromised backend) pad `max_scan_bytes` of benign bytes and place the
+    /// blocked content in the unscanned suffix, defeating a rule the operator
+    /// explicitly set to enforce.
+    ///
+    /// - `FailClosed` (default) — reject when `direction` carries an enforcing
+    ///   body policy; otherwise scan the prefix and flag truncation, so
+    ///   monitor-only and observation-only deployments never start blocking.
+    /// - `ScanTruncated` — documented compatibility opt-out; always scans the
+    ///   prefix and forwards the rest.
+    /// - `Skip` — continue unscanned.
+    /// - `Block` — reject every oversize governed body while globally
+    ///   enforcing, regardless of which rules enforce.
+    ///
+    /// Every recorded field is fixed-cardinality; no body bytes are logged.
     fn clamp_body<'a>(
         &self,
         ctx: &mut RequestContext,
+        direction: BodyDirection,
         body: &'a [u8],
     ) -> Result<(&'a [u8], bool), PluginResult> {
+        // Exact-boundary bodies are fully scanned: only a body strictly larger
+        // than the cap is unscannable.
         if body.len() <= self.config.max_scan_bytes {
             return Ok((body, false));
         }
-        match self.config.on_body_too_large {
-            TooLargeAction::ScanTruncated => Ok((&body[..self.config.max_scan_bytes], true)),
-            TooLargeAction::Skip => Err(PluginResult::Continue),
-            TooLargeAction::Block => {
-                if self.config.log_to_metadata {
-                    ctx.set_waf_metadata("waf.body_too_large", "true");
-                }
-                if self.config.mode == GlobalMode::Enforce {
-                    if self.config.log_to_metadata {
-                        ctx.set_waf_metadata("waf.action", "blocked");
-                        ctx.set_waf_metadata_if_absent("waf.block_reason", "body_too_large");
-                    }
-                    Err(self.reject())
-                } else {
-                    // Cannot block in monitor mode; scan the prefix instead so
-                    // the oversize body still produces signal.
-                    Ok((&body[..self.config.max_scan_bytes], true))
-                }
-            }
+        if self.config.on_body_too_large == TooLargeAction::Skip {
+            return Err(PluginResult::Continue);
         }
+        if self.config.log_to_metadata {
+            ctx.set_waf_metadata("waf.body_too_large", "true");
+            ctx.set_waf_metadata("waf.body_too_large_target", direction.as_metadata_target());
+        }
+        let should_block = match self.config.on_body_too_large {
+            // `Skip` short-circuited above; it is listed for exhaustiveness.
+            TooLargeAction::Skip | TooLargeAction::ScanTruncated => false,
+            TooLargeAction::FailClosed => self.has_enforcing_body_policy(direction, ctx),
+            TooLargeAction::Block => self.config.mode == GlobalMode::Enforce,
+        };
+        if should_block {
+            if self.config.log_to_metadata {
+                ctx.set_waf_metadata("waf.action", "blocked");
+                ctx.set_waf_metadata_if_absent("waf.block_reason", "body_too_large");
+            }
+            if self.config.log_to_stdout {
+                warn!(
+                    target: "waf",
+                    proxy = %proxy_id(ctx),
+                    client_ip = %ctx.client_ip,
+                    path = %ctx.path,
+                    method = %ctx.method,
+                    body_target = %direction.as_metadata_target(),
+                    max_scan_bytes = self.config.max_scan_bytes,
+                    "WAF body exceeds max_scan_bytes and cannot be fully inspected"
+                );
+            }
+            return Err(self.reject());
+        }
+        // Not blockable (monitor mode, no enforcing body rule, or an explicit
+        // compatibility opt-out): scan the prefix so the oversize body still
+        // produces signal, and flag the truncation.
+        Ok((&body[..self.config.max_scan_bytes], true))
     }
 
     fn record_hits(
@@ -1173,7 +1268,7 @@ impl Plugin for Waf {
         {
             return PluginResult::Continue;
         }
-        let (body, truncated) = match self.clamp_body(ctx, body) {
+        let (body, truncated) = match self.clamp_body(ctx, BodyDirection::Request, body) {
             Ok(value) => value,
             Err(result) => return result,
         };
@@ -1323,7 +1418,7 @@ impl Plugin for Waf {
         ) {
             return PluginResult::Continue;
         }
-        let (body, truncated) = match self.clamp_body(ctx, body) {
+        let (body, truncated) = match self.clamp_body(ctx, BodyDirection::Response, body) {
             Ok(value) => value,
             Err(result) => return result,
         };
@@ -1413,11 +1508,13 @@ fn parse_timeout_action(raw: &str) -> Result<TimeoutAction, String> {
 
 fn parse_too_large_action(raw: &str) -> Result<TooLargeAction, String> {
     match raw {
+        "fail_closed" => Ok(TooLargeAction::FailClosed),
         "scan_truncated" => Ok(TooLargeAction::ScanTruncated),
         "skip" => Ok(TooLargeAction::Skip),
         "block" => Ok(TooLargeAction::Block),
         other => Err(format!(
-            "waf: 'on_body_too_large' must be scan_truncated, skip, or block; got {other:?}"
+            "waf: 'on_body_too_large' must be fail_closed, scan_truncated, \
+             skip, or block; got {other:?}"
         )),
     }
 }

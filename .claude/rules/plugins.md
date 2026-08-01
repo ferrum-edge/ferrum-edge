@@ -55,27 +55,40 @@ paths:
   Deduplication runs at priority 3010, after route dispatch and
   `request_transformer` header/query rules but before terminate-mode
   `serverless_function`. Plugin-cache admission rejects every same-protocol
-  header/query mutator at or after deduplication, including priority overrides,
+  header/query/destination mutator at or after deduplication, including priority
+  overrides,
   and rejects any deferred request-body transformer whose final bytes are not
   exactly the body produced by the pre-`before_proxy` normalization phase.
 - `response_caching` likewise requires the proxy's private proof that the
   complete GET/HEAD upload is empty before lookup, binds the complete
   backend-visible request target (including the effective outbound query),
-  rejects later header/query mutation, and rejects deferred body transforms that
-  could synthesize bytes after lookup. Configured request decompression remains
-  compatible because its exact final body is published during pre-`before_proxy`
-  normalization. Its request-header dimension is the complete `Vary` tuple, not
-  the raw header view: RFC 9111 §4.1 selection is target + `Vary`, and a
-  conditional revalidation, a client `no-cache` refresh, and `Content-Length: 0`
-  are addressed to an entry rather than selecting a different one — keying the
-  raw view would put each of them in a partition the entry cannot be reached
-  from and make the `Vary` index unreachable. Cross-caller isolation is the
-  mandatory caller partition. `Authorization`, `Proxy-Authorization`, and
-  `Cookie` remain mandatory Vary names even for anonymous entries because
-  downstream shared caches cannot observe Ferrum's private caller partition;
-  present values are hashed and absence is a distinct keyed state. The RFC
-  shared-cache authorization admission checks both pristine inbound and live
-  backend-visible `Authorization`, so request transforms cannot erase it.
+  rejects later header/query/destination mutation, and rejects deferred body
+  transforms that could synthesize bytes after lookup. Configured request
+  decompression remains compatible because its exact final body is published
+  during pre-`before_proxy` normalization. Its request-header dimension
+  conservatively binds all backend-visible headers, in addition to the complete
+  `Vary` tuple, except the entry-operation headers whose semantics this plugin
+  actually implements:
+  `If-None-Match` / `If-Modified-Since` revalidation, pure honored request
+  `Cache-Control: no-cache` / `no-store` refreshes (bare and argument-free, only
+  when every meaningful member is such a refresh and only when
+  `respect_no_cache` is enabled), and zero-length `Content-Length`
+  framing. A conditional revalidation, a pure client no-cache/no-store refresh,
+  and `Content-Length: 0` are addressed to an entry rather than selecting a
+  different one — keying the raw view would put each of them in a partition
+  the entry cannot be reached from and make the `Vary` index unreachable.
+  Unsupported precondition / range / pragma headers (`If-Match`,
+  `If-Unmodified-Since`, `If-Range`, `Range`, `Pragma`), mixed / arbitrary /
+  unrecognized or argument-bearing request `Cache-Control` content, and any
+  `Cache-Control` when `respect_no_cache` is false stay bound so they cannot
+  share a replay key.
+  Cross-caller isolation is the mandatory caller partition. `Authorization`,
+  `Proxy-Authorization`, and `Cookie` remain mandatory Vary names even for
+  anonymous entries because downstream shared caches cannot observe Ferrum's
+  private caller partition; present values are hashed and absence is a distinct
+  keyed state. The RFC shared-cache authorization admission checks both pristine
+  inbound and live backend-visible `Authorization`, so request transforms cannot
+  erase it.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order

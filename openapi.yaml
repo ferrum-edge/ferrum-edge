@@ -16058,12 +16058,16 @@ components:
                   Per-rule request header transforms (Istio VirtualService
                   `http[].headers.request.{set,add,remove}`). Published onto
                   `RequestContext.route_override_request_transform` when this
-                  rule matches; consumed by the `request_transformer` plugin
-                  on the proxy when its `apply_route_overrides` flag is true.
-                  Route-level transforms layer AFTER the static plugin rules,
-                  so route-level header writes win on conflict. Validated at
-                  config load — CRLF in values and unknown operations are
-                  rejected.
+                  rule matches. Every enabled `request_transformer` on the
+                  proxy applies only its static header rules first; proxy core
+                  then applies this list exactly once after the last eligible
+                  (enabled) instance so route-level header writes win under
+                  multiple same-type instances and priority overrides. A
+                  disabled RTDS transformer is not eligible and does not
+                  consume the list. `apply_route_overrides: true` lets an
+                  auto-emitted empty-rules instance act as that eligible
+                  consumer. Validated at config load — CRLF in values and
+                  unknown operations are rejected.
                 items:
                   type: object
                   additionalProperties: false
@@ -16106,8 +16110,11 @@ components:
                 description: |
                   Per-rule response header transforms (Istio VirtualService
                   `http[].headers.response.{set,add,remove}`). Same shape as
-                  `request_transform` but applied on the response path via
-                  the `response_transformer` plugin.
+                  `request_transform` but applied on the response path: every
+                  enabled `response_transformer` applies static header rules
+                  first, then proxy core applies this list exactly once after
+                  the last eligible instance (ordinary H1/H2/H3, synthetic/
+                  rejection, header simulation, and deadline provenance paths).
 
                   Because this publishes onto the `response_transformer`
                   write surface, it shares that plugin's closed destination
@@ -17967,11 +17974,14 @@ components:
         rejected. Every rule must set an explicit `target` (`header`,
         `query`, or `body`); there is no default.
 
-        When `apply_route_overrides: true`, the plugin also consumes per-rule
-        header transforms published by `mesh_route_dispatch` onto
-        `RequestContext.route_override_request_transform`. Static `rules`
-        run first, then per-rule overrides — route-level header writes win
-        on conflict. The Istio VirtualService translator auto-emits a
+        When `apply_route_overrides: true`, the plugin accepts an empty `rules`
+        array so it can participate in the chain-level route-header final
+        phase for per-rule transforms published by `mesh_route_dispatch` onto
+        `RequestContext.route_override_request_transform`. Every enabled
+        instance applies only its static `rules` first; proxy core then applies
+        the matched route list exactly once after the last eligible instance —
+        route-level header writes win under multiple same-type instances and
+        priority overrides. The Istio VirtualService translator auto-emits a
         proxy-scoped instance with `rules: []` + `apply_route_overrides: true`
         on routes that carry `headers.request.{set,add,remove}` and have no
         operator-configured `request_transformer`. Operators with a global
@@ -17999,12 +18009,12 @@ components:
           default: false
           description: |
             When `true`, this instance accepts an empty `rules` array and
-            consumes per-rule header transforms published by
-            `mesh_route_dispatch` on the matching route. The plugin declares
-            `modifies_request_headers() == true` so the dispatcher allocates
-            a separate cloned header map for route-level writes (preserving
-            the gateway invariant that `ctx.headers` carries the original
-            inbound headers during `before_proxy`). Auto-emitted by the
+            participates in the chain-level request route-header finalization
+            phase for transforms published by `mesh_route_dispatch`. The plugin
+            declares `modifies_request_headers() == true` so the dispatcher
+            allocates a separate cloned header map for route-level writes
+            (preserving the gateway invariant that `ctx.headers` carries the
+            original inbound headers during `before_proxy`). Auto-emitted by the
             Istio VirtualService translator.
         runtime_overlay_scope:
           type: string
@@ -18175,10 +18185,13 @@ components:
         `body` only — unlike request_transformer, there is no `query`
         target.
 
-        When `apply_route_overrides: true`, the plugin consumes per-rule
-        header transforms published by `mesh_route_dispatch` onto
-        `RequestContext.route_override_response_transform`. See the
-        `request_transformer` notes on shadowing of operator-configured
+        When `apply_route_overrides: true`, the plugin accepts an empty `rules`
+        array so it can participate in the chain-level response route-header
+        final phase for transforms published by `mesh_route_dispatch` onto
+        `RequestContext.route_override_response_transform`. Every enabled
+        instance applies only its static rules first; proxy core then applies
+        the matched route list exactly once after the last eligible instance.
+        See the `request_transformer` notes on shadowing of operator-configured
         globals — the same applies on the response side.
       properties:
         rules:
@@ -18197,9 +18210,11 @@ components:
           default: false
           description: |
             Counterpart to `request_transformer.apply_route_overrides` for
-            response headers. Auto-emitted by the Istio VirtualService
-            translator on routes carrying `headers.response.{set,add,remove}`
-            that have no operator-configured `response_transformer`.
+            response headers: accept empty `rules` and remain eligible for the
+            chain-level route-header finalization phase. Auto-emitted by the
+            Istio VirtualService translator on routes carrying
+            `headers.response.{set,add,remove}` that have no operator-configured
+            `response_transformer`.
         runtime_overlay_scope:
           type: string
           minLength: 1
@@ -18734,12 +18749,19 @@ components:
           default: log_and_allow
         on_body_too_large:
           type: string
-          enum: [scan_truncated, skip, block]
-          default: scan_truncated
+          enum: [fail_closed, scan_truncated, skip, block]
+          default: fail_closed
           description: >-
-            Behavior when a body exceeds max_scan_bytes. scan_truncated scans
-            the prefix; skip scans nothing; block rejects (fail closed) when
-            mode is enforce, otherwise scans the prefix.
+            Behavior when a governed body exceeds max_scan_bytes. fail_closed
+            (default) rejects when that direction has an applicable enforcing
+            body rule or anomaly scoring with an applicable body rule, and
+            otherwise scans the prefix and records truncation, so monitor-only
+            or conditionally out-of-scope policy never starts blocking.
+            scan_truncated is the explicit compatibility opt-out that always
+            scans only the prefix and forwards the complete body — prefix-only
+            inspection lets a padded suffix carry blocked content past an
+            enforcing rule. skip scans nothing. block rejects every oversize
+            governed body while mode is enforce, otherwise scans the prefix.
         include_default_rules:
           type: boolean
           default: true
@@ -19630,7 +19652,18 @@ components:
           type: integer
           format: uint64
           default: 1024
-          description: Maximum validation-error characters written to metadata and problem bodies.
+          description: >
+            Size bound on the validation diagnostic written to
+            openapi_validator.request_error / openapi_validator.response_error
+            metadata and to the problem body. Only ever narrows: the effective
+            cap is min(error_truncate_chars, 256). This is not a
+            confidentiality control. Diagnostics are payload-free by
+            construction and never contain the rejected instance value, an
+            expected enum/const constant, a raw schema path or schema-library
+            / XML-parser rendering, a configured XML name or namespace, a
+            hostile Content-Encoding coding token, a backend Content-Type, the
+            request target, or a payload-chosen JSON/XML/form/multipart member
+            name.
 
     OpenapiValidatorJsonSchema:
       type: [object, boolean]

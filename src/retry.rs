@@ -555,6 +555,17 @@ fn classify_typed_chain(
     None
 }
 
+/// Pre-dial refusal emitted by `proxy::connect_websocket_backend` when the
+/// target-effective backend TLS carries an SNI override the WebSocket transport
+/// cannot apply (issue #2416): the dial derives both `Host` and the TLS server
+/// name from the request URI, so honoring the URI host would silently verify the
+/// wrong server name.
+///
+/// It is BOTH the emitted message and the classifier anchor below, so the two
+/// cannot drift. Carries no configured value — the SNI itself is never echoed.
+pub const WS_BACKEND_TLS_SNI_UNSUPPORTED: &str = "WebSocket backend dial refused: backend TLS SNI override is not supported on the WebSocket \
+     transport";
+
 /// Tightened substring fallback for boxed/reqwest errors when the typed
 /// walk is exhausted.
 ///
@@ -576,6 +587,14 @@ fn classify_substring_fallback(error_str: &str, debug_str: &str) -> Option<Error
     // blocked before any dial). This is a distinct, non-retryable, backend-
     // health-neutral dispatch class — not a connect/DNS/TLS transport failure.
     if error_str.contains("egress policy") {
+        return Some(ErrorClass::DispatchPolicyRejected);
+    }
+    // Gateway-side refusal of a resolved backend TLS SNI override the WebSocket
+    // transport cannot carry (issue #2416): the dial never happened, so it is
+    // the same non-retryable, backend-health-neutral dispatch class as the
+    // egress denial above. Anchored BEFORE the certificate/TLS tokens, which
+    // would otherwise misreport it as a handshake failure the backend caused.
+    if error_str.contains(WS_BACKEND_TLS_SNI_UNSUPPORTED) {
         return Some(ErrorClass::DispatchPolicyRejected);
     }
     if error_str.contains("connect timeout") || error_str.contains("timed out") {

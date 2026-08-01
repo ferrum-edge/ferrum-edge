@@ -4419,6 +4419,12 @@ impl Plugin for McpGateway {
         self.enabled
     }
 
+    fn modifies_request_destination(&self) -> bool {
+        // Routed MCP calls replace the backend scheme/host/port, authority,
+        // and path with the selected catalog server destination.
+        self.enabled
+    }
+
     fn modifies_request_body(&self) -> bool {
         self.enabled && self.mode == McpGatewayMode::AggregateRouter
     }

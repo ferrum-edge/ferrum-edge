@@ -79,8 +79,42 @@ fn query_duplicate_check_detects_percent_encoded_key_collision() {
 }
 
 #[test]
+fn query_duplicate_check_detects_plus_and_percent_space_key_collision() {
+    assert!(has_conflicting_duplicate_query_key("a+b=1&a%20b=2"));
+}
+
+#[test]
 fn query_duplicate_check_allows_percent_encoded_keys_with_same_value() {
     assert!(!has_conflicting_duplicate_query_key("a%20b=1&a%20b=1"));
+}
+
+#[test]
+fn query_duplicate_check_normalizes_plus_in_values() {
+    assert!(!has_conflicting_duplicate_query_key(
+        "a=hello+world&a=hello%20world"
+    ));
+}
+
+#[test]
+fn query_duplicate_check_detects_encoded_plus_vs_raw_plus_value_conflict() {
+    // `%2B` decodes to literal plus; raw `+` is form-urlencoded space.
+    assert!(has_conflicting_duplicate_query_key("a=%2B&a=+"));
+}
+
+#[test]
+fn query_duplicate_check_preserves_encoded_plus_as_literal_plus() {
+    assert!(!has_conflicting_duplicate_query_key("a=%2B&a=%2B"));
+}
+
+#[test]
+fn query_duplicate_check_does_not_collapse_encoded_plus_and_raw_plus_keys() {
+    // `a%2Bb` decodes to `a+b`; raw `a+b` is the distinct key `a b`.
+    assert!(!has_conflicting_duplicate_query_key("a%2Bb=1&a+b=2"));
+}
+
+#[test]
+fn query_duplicate_check_normalizes_raw_plus_and_percent_space_key_aliases() {
+    assert!(!has_conflicting_duplicate_query_key("a+b=1&a%20b=1"));
 }
 
 #[test]

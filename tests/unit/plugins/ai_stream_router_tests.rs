@@ -172,6 +172,7 @@ fn test_valid_config_parses() {
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(plugin.requires_request_body_before_before_proxy());
     assert!(plugin.modifies_request_headers());
+    assert!(plugin.modifies_request_destination());
     assert!(plugin.modifies_request_body());
     assert!(plugin.needs_final_request_body_context());
     // An anthropic provider with normalization on wires the response-stream hook.
@@ -517,6 +518,7 @@ fn test_disabled_plugin_does_not_wire_hooks() {
     let plugin = build(cfg);
     assert!(!plugin.requires_response_stream_hooks());
     assert!(!plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_destination());
 }
 
 // ---------------------------------------------------------------------------

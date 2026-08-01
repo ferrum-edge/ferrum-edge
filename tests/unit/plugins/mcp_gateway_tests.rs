@@ -815,6 +815,7 @@ fn registered_and_exposes_expected_basics() {
     assert!(plugin.requires_request_body_before_before_proxy());
     assert!(plugin.needs_request_body_bytes());
     assert!(plugin.modifies_request_headers());
+    assert!(plugin.modifies_request_destination());
     assert!(ferrum_edge::plugins::available_plugins().contains(&"mcp_gateway"));
 }
 

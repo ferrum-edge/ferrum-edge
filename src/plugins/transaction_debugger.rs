@@ -1967,7 +1967,7 @@ fn looks_like_credential(value: &str) -> bool {
     // suffix for every `eyJ` occurrence would make an attacker-shaped captured
     // value quadratic even though the total capture is byte-bounded.
     trimmed
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '=')))
         .any(|token| {
             let Some(start) = token.find("eyJ") else {
                 return false;

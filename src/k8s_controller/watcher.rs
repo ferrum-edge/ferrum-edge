@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::TryStreamExt;
+use futures_util::{Stream, TryStreamExt};
 use kube::api::{ApiResource, DynamicObject};
 use kube::discovery;
 use kube::runtime::reflector;
@@ -10,7 +10,8 @@ use kube::runtime::watcher;
 use kube::{Api, Client};
 use tracing::{debug, error, info, warn};
 
-use super::resource_store::{CrdResourceStore, ResourceStoreSet};
+use super::metrics::ControllerMetrics;
+use super::resource_store::{CrdResourceStore, ResourceChangeNotifier, ResourceStoreSet};
 use super::{ControllerTaskRegistry, REPROBE_WATCHER_LABEL};
 
 pub struct CrdSpec {
@@ -420,6 +421,349 @@ fn find_crd_resource(api_group: &discovery::ApiGroup, crd: &CrdSpec) -> Option<A
         .find(|ar| ar.kind == crd.kind && ar.plural == crd.plural)
 }
 
+/// Identity of one watched `(apiVersion, kind, scope)` triple, plus the static
+/// label used when logging about it. Every field is compile-time-derived or a
+/// namespace from configuration — never cluster object contents.
+#[derive(Clone)]
+pub(crate) struct WatchTarget {
+    pub api_version: String,
+    pub kind: String,
+    pub scope: String,
+    pub resource: ApiResource,
+    /// `"CRD watcher"` or `"K8s core watcher"`, so one shared task body keeps
+    /// the two families' log wording.
+    pub watcher_label: &'static str,
+}
+
+/// Documented opt-out for `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`: no idle relist.
+pub const K8S_WATCH_IDLE_RELIST_SECS_MIN: u64 = 0;
+
+/// Upper bound for `FERRUM_K8S_WATCH_IDLE_RELIST_SECS` (24 hours).
+///
+/// The parser clamps to this, which is what keeps every duration derived from
+/// the window inside its own range: [`RelistPolicy::readiness_timeout`]
+/// multiplies it by two, the watcher adds it to a [`tokio::time::Instant`], and
+/// the jitter converts a quarter of it to milliseconds. An unbounded `u64` from
+/// the environment would expose all three to an overflow panic at startup.
+pub const K8S_WATCH_IDLE_RELIST_SECS_MAX: u64 = 86_400;
+
+/// Default idle-relist window.
+///
+/// Bookmarks are consumed inside kube-rs, so a healthy but quiet scope is
+/// indistinguishable from a stalled one and *will* relist on every window. A
+/// controller watching three namespaces runs on the order of 39 scope watchers
+/// (about 69 with Istio and core resources enabled), and the count grows with
+/// the namespace count — so the window is a per-scope full-list rate against
+/// the API server, not just a recovery bound. Five minutes keeps that load
+/// modest while still bounding staleness well below an operator's patience.
+pub const K8S_WATCH_IDLE_RELIST_SECS_DEFAULT: u64 = 300;
+
+/// When a watcher rebuilds its reflector from an authoritative list.
+///
+/// A kube-rs `watcher` surfaces an error only when the watch *fails*. A watch
+/// that stops delivering without failing — a silently stalled or black-holed
+/// connection, where no FIN, RST, or HTTP/2 GOAWAY ever arrives — leaves the
+/// task alive, the reflector store serving whatever it held when delivery
+/// stopped, and objects created in Kubernetes from then on absent from every
+/// reconcile snapshot. `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` does not help — it
+/// re-reconciles from the same stale store — so this is the only bound on that
+/// blindness. The recovery is deliberately cause-agnostic: it is driven by the
+/// observable symptom (no event for a whole window), not by any particular
+/// diagnosis of where the stream was lost.
+#[derive(Clone, Copy)]
+pub(crate) struct RelistPolicy {
+    /// Rebuild the reflector when the scope has produced no event for this
+    /// long. `None` disables idle relisting
+    /// (`FERRUM_K8S_WATCH_IDLE_RELIST_SECS=0`).
+    ///
+    /// Watch bookmarks are consumed inside kube-rs and never reach us, so
+    /// "no event" cannot distinguish a quiet scope from a dead one. The window
+    /// is therefore a bound on *staleness*, and a busy scope never pays it.
+    pub idle_window: Option<Duration>,
+    /// How long a replacement generation may take to finish its initial list
+    /// before it is abandoned and another one is started. Without this, a
+    /// replacement that inherited the same stalled path would leave the scope
+    /// pinned to its last-known-good state forever.
+    pub readiness_timeout: Duration,
+}
+
+impl RelistPolicy {
+    pub(crate) fn from_idle_secs(idle_relist_secs: u64) -> Self {
+        // The parser clamps to `K8S_WATCH_IDLE_RELIST_SECS_MAX`; clamp again
+        // here so a direct caller (tests, future call sites) can never build a
+        // window whose doubling below would overflow.
+        let idle_relist_secs = idle_relist_secs.min(K8S_WATCH_IDLE_RELIST_SECS_MAX);
+        let idle_window = (idle_relist_secs > 0).then(|| Duration::from_secs(idle_relist_secs));
+        // Two idle windows, floored, so a replacement gets a generous but
+        // bounded chance to list before it is retried.
+        let readiness_timeout = idle_window
+            .map(|window| (window * 2).max(MIN_RELIST_READINESS_TIMEOUT))
+            .unwrap_or(MIN_RELIST_READINESS_TIMEOUT);
+        Self {
+            idle_window,
+            readiness_timeout,
+        }
+    }
+}
+
+/// Floor for [`RelistPolicy::readiness_timeout`]; also the value used when idle
+/// relisting is disabled (where it is unreachable, since no replacement
+/// generation is ever started).
+const MIN_RELIST_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One random seed per controller process, folded into every scope's jitter.
+///
+/// Without it the offset would be a pure function of the watched triple, so
+/// every control-plane replica would compute the *same* offset for the same
+/// scope and issue its full list in the same instant — the thundering herd the
+/// jitter exists to prevent, just moved from "all scopes on one replica" to
+/// "one scope on all replicas". `RandomState` is the standard library's own
+/// per-instance random seed, so this needs no new dependency and no RNG crate.
+fn process_relist_jitter_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SEED.get_or_init(|| {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(0);
+        hasher.finish()
+    })
+}
+
+/// Bounded per-scope offset added to the idle deadline so that watchers which
+/// went quiet together (typically all of them, right after startup) do not
+/// relist in the same tick. Spreads over the first quarter of the window.
+///
+/// Stable *within* a process — a scope's deadline must not wander between
+/// iterations — but seeded per process by [`process_relist_jitter_seed`], so
+/// replicas of the same control plane stagger independently. Callers must
+/// therefore never assume a particular offset; only that it is in
+/// `0..window/4`.
+pub(crate) fn idle_relist_jitter(
+    api_version: &str,
+    kind: &str,
+    scope: &str,
+    idle_window: Option<Duration>,
+) -> Duration {
+    let Some(window) = idle_window else {
+        return Duration::ZERO;
+    };
+    // The window is clamped to `K8S_WATCH_IDLE_RELIST_SECS_MAX`, so a quarter
+    // of it in milliseconds is far inside `u64`.
+    let spread = (window.as_millis() / 4) as u64;
+    if spread == 0 {
+        return Duration::ZERO;
+    }
+    // FNV-1a over the watched triple, offset-basis-mixed with the process seed:
+    // distinct scopes land on distinct offsets, distinct processes on distinct
+    // sets of offsets.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325 ^ process_relist_jitter_seed();
+    for part in [
+        api_version.as_bytes(),
+        "|".as_bytes(),
+        kind.as_bytes(),
+        "|".as_bytes(),
+        scope.as_bytes(),
+    ] {
+        for byte in part {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    Duration::from_millis(hash % spread)
+}
+
+async fn sleep_until_or_pending(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Drive one watch scope for the lifetime of the controller task, rebuilding
+/// its reflector whenever the scope goes idle for longer than the policy allows.
+///
+/// Generation 0 uses `initial_writer`, whose store the caller has already
+/// registered in `store_set` (so duplicate-start detection and the reconciler's
+/// initial readiness wait both see it synchronously). Later generations build
+/// their own writer/store pair and are swapped in **make-before-break**: the
+/// previous store stays registered, serving its last-known-good objects, until
+/// the replacement reports `InitDone`. There is no window in which the scope
+/// contributes nothing, so a relist can never be mistaken for a mass deletion.
+///
+/// Ownership is unchanged: this is one task per scope for the process lifetime.
+/// Relisting spawns nothing, registers nothing new with the task registry, and
+/// leaves the stream-end contract (deregister the scope, return, let the CRD
+/// reprobe loop restart it) exactly as it was.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_watcher_generations<S, F>(
+    target: WatchTarget,
+    initial_writer: reflector::store::Writer<DynamicObject>,
+    store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
+    change_notifier: ResourceChangeNotifier,
+    policy: RelistPolicy,
+    metrics: Arc<ControllerMetrics>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut make_stream: F,
+) where
+    F: FnMut(reflector::store::Writer<DynamicObject>) -> S,
+    S: Stream<Item = Result<watcher::Event<DynamicObject>, watcher::Error>>,
+{
+    let jitter = idle_relist_jitter(
+        &target.api_version,
+        &target.kind,
+        &target.scope,
+        policy.idle_window,
+    );
+    let mut initial_writer = Some(initial_writer);
+
+    loop {
+        // `pending` is `Some` only for a replacement generation, i.e. exactly
+        // while an older store is still the one registered for this scope.
+        let (writer, mut pending) = match initial_writer.take() {
+            Some(writer) => (writer, None),
+            None => {
+                let writer = reflector::store::Writer::new(target.resource.clone());
+                let store = Arc::new(CrdResourceStore::new_scoped(
+                    target.api_version.clone(),
+                    target.kind.clone(),
+                    target.scope.clone(),
+                    writer.as_reader(),
+                ));
+                (writer, Some(store))
+            }
+        };
+
+        let stream = make_stream(writer);
+        tokio::pin!(stream);
+
+        let generation_start = tokio::time::Instant::now();
+        let mut last_event = generation_start;
+
+        loop {
+            let deadline = match pending.as_ref() {
+                Some(_) => Some(generation_start + policy.readiness_timeout),
+                None => policy
+                    .idle_window
+                    .map(|window| last_event + window + jitter),
+            };
+
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        debug!(
+                            kind = %target.kind,
+                            scope = %target.scope,
+                            "Watcher shutting down"
+                        );
+                        return;
+                    }
+                }
+                _ = sleep_until_or_pending(deadline) => {
+                    metrics
+                        .watch_idle_relists
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if pending.is_some() {
+                        warn!(
+                            kind = %target.kind,
+                            api_version = %target.api_version,
+                            scope = %target.scope,
+                            timeout_secs = policy.readiness_timeout.as_secs_f64(),
+                            "Replacement {} did not finish its initial list in time; \
+                             retrying (the previous store keeps serving meanwhile)",
+                            target.watcher_label
+                        );
+                    } else {
+                        debug!(
+                            kind = %target.kind,
+                            api_version = %target.api_version,
+                            scope = %target.scope,
+                            "{} idle past the relist window; rebuilding its reflector from \
+                             an authoritative list",
+                            target.watcher_label
+                        );
+                    }
+                    break;
+                }
+                item = stream.try_next() => {
+                    match item {
+                        Ok(Some(event)) => {
+                            last_event = tokio::time::Instant::now();
+                            let Some(store) = pending.take() else {
+                                change_notifier.notify_change();
+                                continue;
+                            };
+                            if !matches!(event, watcher::Event::InitDone) {
+                                // Still listing. The replacement's objects are
+                                // buffered inside its writer and become visible
+                                // atomically at `InitDone`.
+                                pending = Some(store);
+                                continue;
+                            }
+                            let replaced = {
+                                let mut set = store_set.lock().await;
+                                if set.replace_store_for_scope(Arc::clone(&store)) {
+                                    true
+                                } else {
+                                    // The scope was deregistered while this
+                                    // generation was listing. Re-register rather
+                                    // than leave the watcher feeding a store the
+                                    // reconciler cannot see.
+                                    set.add_store(store)
+                                }
+                            };
+                            debug!(
+                                kind = %target.kind,
+                                api_version = %target.api_version,
+                                scope = %target.scope,
+                                replaced,
+                                "Relisted {} store is live",
+                                target.watcher_label
+                            );
+                        }
+                        Ok(None) => {
+                            error!(
+                                kind = %target.kind,
+                                api_version = %target.api_version,
+                                scope = %target.scope,
+                                "{} stream ended unexpectedly; \
+                                 removing stale store so reprobe will restart",
+                                target.watcher_label
+                            );
+                            let removed = store_set
+                                .lock()
+                                .await
+                                .remove_store_for_scope(
+                                    &target.api_version,
+                                    &target.kind,
+                                    &target.scope,
+                                );
+                            if !removed {
+                                debug!(
+                                    kind = %target.kind,
+                                    api_version = %target.api_version,
+                                    scope = %target.scope,
+                                    "Stale store already absent at stream end"
+                                );
+                            }
+                            return;
+                        }
+                        Err(e) => {
+                            error!(
+                                kind = %target.kind,
+                                scope = %target.scope,
+                                error = %e,
+                                "Watch error, kube-rs will retry with backoff"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Start every selected CRD and core-resource watcher, registering each one
 /// with `registry` so the control plane owns it (#3220).
 ///
@@ -440,6 +784,8 @@ pub(crate) async fn start_crd_watchers(
     node_waypoint_namespace: String,
     istio_root_namespace: String,
     gateway_api_data_plane_service_namespace: Option<String>,
+    relist_policy: RelistPolicy,
+    metrics: Arc<ControllerMetrics>,
     shutdown: tokio::sync::watch::Receiver<bool>,
     registry: &ControllerTaskRegistry,
     task_label: &str,
@@ -538,71 +884,26 @@ pub(crate) async fn start_crd_watchers(
                 set.change_notifier()
             };
 
-            let mut watcher_shutdown = shutdown.clone();
-            let cleanup_scope = scope.clone();
-            let task_kind = kind.clone();
-            let task_api_version = api_version.clone();
-            let task_store_set = store_set.clone();
             let watcher_config = watcher::Config::default();
-
-            let watcher_task = async move {
-                let stream = reflector::reflector(writer, watcher(api, watcher_config));
-
-                tokio::pin!(stream);
-
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = watcher_shutdown.changed() => {
-                            if *watcher_shutdown.borrow() {
-                                debug!(kind = %task_kind, scope = %cleanup_scope, "Watcher shutting down");
-                                return;
-                            }
-                        }
-                        item = stream.try_next() => {
-                            match item {
-                                Ok(Some(_event)) => {
-                                    change_notifier.notify_change();
-                                }
-                                Ok(None) => {
-                                    error!(
-                                        kind = %task_kind,
-                                        api_version = %task_api_version,
-                                        scope = %cleanup_scope,
-                                        "CRD watcher stream ended unexpectedly; \
-                                         removing stale store so reprobe will restart"
-                                    );
-                                    let removed = task_store_set
-                                        .lock()
-                                        .await
-                                        .remove_store_for_scope(
-                                            &task_api_version,
-                                            &task_kind,
-                                            &cleanup_scope,
-                                        );
-                                    if !removed {
-                                        debug!(
-                                            kind = %task_kind,
-                                            api_version = %task_api_version,
-                                            scope = %cleanup_scope,
-                                            "Stale store already absent at stream end"
-                                        );
-                                    }
-                                    return;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        kind = %task_kind,
-                                        scope = %cleanup_scope,
-                                        error = %e,
-                                        "Watch error, kube-rs will retry with backoff"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+            let target = WatchTarget {
+                api_version: api_version.clone(),
+                kind: kind.clone(),
+                scope: scope.clone(),
+                resource: ar.clone(),
+                watcher_label: "CRD watcher",
             };
+            let watcher_task = run_watcher_generations(
+                target,
+                writer,
+                store_set.clone(),
+                change_notifier,
+                relist_policy,
+                Arc::clone(&metrics),
+                shutdown.clone(),
+                move |writer| {
+                    reflector::reflector(writer, watcher(api.clone(), watcher_config.clone()))
+                },
+            );
 
             let name = format!("{task_label}/{}", crd.kind);
             if !registry.spawn_named(&name, watcher_task, shutdown.clone()) {
@@ -724,74 +1025,29 @@ pub(crate) async fn start_crd_watchers(
                     set.change_notifier()
                 };
 
-                let mut watcher_shutdown = shutdown.clone();
-                let cleanup_scope = scope.clone();
-                let task_kind = kind.clone();
-                let task_api_version = api_version.clone();
-                let task_store_set = store_set.clone();
                 let watcher_config = match resource.field_selector {
                     Some(selector) => watcher::Config::default().fields(selector),
                     None => watcher::Config::default(),
                 };
-
-                let watcher_task = async move {
-                    let stream = reflector::reflector(writer, watcher(api, watcher_config));
-
-                    tokio::pin!(stream);
-
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _ = watcher_shutdown.changed() => {
-                                if *watcher_shutdown.borrow() {
-                                    debug!(kind = %task_kind, scope = %cleanup_scope, "Watcher shutting down");
-                                    return;
-                                }
-                            }
-                            item = stream.try_next() => {
-                                match item {
-                                    Ok(Some(_event)) => {
-                                        change_notifier.notify_change();
-                                    }
-                                    Ok(None) => {
-                                        error!(
-                                            kind = %task_kind,
-                                            api_version = %task_api_version,
-                                            scope = %cleanup_scope,
-                                            "K8s core watcher stream ended unexpectedly; \
-                                             removing stale store so reprobe will restart"
-                                        );
-                                        let removed = task_store_set
-                                            .lock()
-                                            .await
-                                            .remove_store_for_scope(
-                                                &task_api_version,
-                                                &task_kind,
-                                                &cleanup_scope,
-                                            );
-                                        if !removed {
-                                            debug!(
-                                                kind = %task_kind,
-                                                api_version = %task_api_version,
-                                                scope = %cleanup_scope,
-                                                "Stale store already absent at stream end"
-                                            );
-                                        }
-                                        return;
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            kind = %task_kind,
-                                            scope = %cleanup_scope,
-                                            error = %e,
-                                            "Watch error, kube-rs will retry with backoff"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                let target = WatchTarget {
+                    api_version: api_version.clone(),
+                    kind: kind.clone(),
+                    scope: scope.clone(),
+                    resource: ar.clone(),
+                    watcher_label: "K8s core watcher",
                 };
+                let watcher_task = run_watcher_generations(
+                    target,
+                    writer,
+                    store_set.clone(),
+                    change_notifier,
+                    relist_policy,
+                    Arc::clone(&metrics),
+                    shutdown.clone(),
+                    move |writer| {
+                        reflector::reflector(writer, watcher(api.clone(), watcher_config.clone()))
+                    },
+                );
 
                 let name = format!("{task_label}/{}", resource.kind);
                 if !registry.spawn_named(&name, watcher_task, shutdown.clone()) {
@@ -853,6 +1109,8 @@ pub(crate) fn spawn_crd_reprobe_task(
     node_waypoint_namespace: String,
     istio_root_namespace: String,
     gateway_api_data_plane_service_namespace: Option<String>,
+    relist_policy: RelistPolicy,
+    metrics: Arc<ControllerMetrics>,
     shutdown: tokio::sync::watch::Receiver<bool>,
     interval: Duration,
     registry: &Arc<ControllerTaskRegistry>,
@@ -891,6 +1149,8 @@ pub(crate) fn spawn_crd_reprobe_task(
                         node_waypoint_namespace.clone(),
                         istio_root_namespace.clone(),
                         gateway_api_data_plane_service_namespace.clone(),
+                        relist_policy,
+                        Arc::clone(&metrics),
                         watcher_shutdown.clone(),
                         &registry,
                         REPROBE_WATCHER_LABEL,

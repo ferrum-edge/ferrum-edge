@@ -223,7 +223,8 @@ pub const RECORD_ENVELOPE_OVERHEAD_BYTES: usize = 8_192;
 pub const STAGING_ENTRY_OVERHEAD_BYTES: usize = 1_024;
 /// Attacker-shaped serialized copies charged for one admitted record: its
 /// pre-serialized queue payload plus its bytes in the contiguous HTTP batch.
-/// Retry clones share the queue payload and attempts run sequentially.
+/// The shared logger Arc-shares the queue payload across retries; attempts run
+/// sequentially.
 pub const RECORD_RETAINED_COPIES: usize = 2;
 /// Maximum expansion of one input byte when serde_json escapes it (`\u00XX`).
 /// This is used only to derive a default/minimum serialized-entry ceiling from
@@ -234,8 +235,9 @@ pub const JSON_WORST_CASE_EXPANSION: usize = 6;
 /// one byte to each of two retained copies covers `[` + commas + `]`.
 pub const RECORD_BATCH_FRAMING_BYTES: usize = 1;
 /// Fixed delivery-state allowance for the queue item, its shared `Bytes`
-/// allocation, the original/attempt batch vector slots, and lease handles.
-/// Attacker-shaped content is charged exactly in addition to this allowance.
+/// allocation, the shared `Arc<Vec<QueuedAuditRecord>>` batch handle, and lease
+/// handles. Attacker-shaped content is charged exactly in addition to this
+/// allowance.
 pub const RECORD_DELIVERY_OVERHEAD_BYTES: usize = 128;
 /// Default aggregate retained-byte budget for one plugin instance (128 MiB),
 /// covering staged candidates, pre-commit reservations, and queued records.
@@ -1237,10 +1239,11 @@ struct AuditRecord {
 
 /// One bounded, pre-serialized audit record retained by the batching queue.
 ///
-/// `Bytes` makes every shared-logger retry clone a fixed-size refcount
-/// increment instead of a deep clone of attacker-shaped strings/maps/vectors.
-/// The lease remains live across queueing, exact-capacity batch assembly, the
-/// HTTP request, retries, and the failed-batch hook.
+/// `Bytes` keeps the queued payload immutable and cheap to share. The shared
+/// logger hands every flush attempt and the failed-batch hook an `Arc` clone of
+/// the same shared batch — never a deep clone of attacker-shaped strings/maps/
+/// vectors. The lease remains live across queueing, exact-capacity batch
+/// assembly, the HTTP request, retries, and the failed-batch hook.
 #[derive(Clone)]
 struct QueuedAuditRecord {
     json: Bytes,
@@ -2224,8 +2227,8 @@ impl AiTranscriptAudit {
     /// Reserve the complete retained charge a record may consume at the
     /// admitted serialized-entry ceiling. Paired with the queue permit so a
     /// promise of capacity is a promise of both a slot and every attacker-shaped
-    /// byte the queue, retry clone, and HTTP request can retain; `enqueue`
-    /// shrinks it after exact bounded serialization.
+    /// byte the queue, shared retry batch, and HTTP request can retain;
+    /// `enqueue` shrinks it after exact bounded serialization.
     fn reserve_commit_lease(&self) -> Option<(Arc<ByteLease>, usize)> {
         let projected = self.limits.max_entry_retained_bytes();
         self.retained_budget
@@ -3466,7 +3469,7 @@ impl Plugin for AiTranscriptAudit {
         let healthy = Arc::clone(&self.sink_healthy);
         let hooks = LoggerHooks {
             on_failed_batch: Some(Arc::new(
-                move |_batch: Vec<QueuedAuditRecord>, _error: String| {
+                move |_batch: Arc<Vec<QueuedAuditRecord>>, _error: String| {
                     healthy.store(false, Ordering::Relaxed);
                 },
             )),
@@ -3478,7 +3481,7 @@ impl Plugin for AiTranscriptAudit {
             hooks,
             move |batch| {
                 let flush_config = flush_config.clone();
-                async move { send_batch(&flush_config, batch).await }
+                async move { send_batch(&flush_config, &batch).await }
             },
         )
     }
@@ -4506,9 +4509,9 @@ impl ResponseStreamInspector for AuditStreamInspector {
 
 // ---- sink ----
 
-async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<QueuedAuditRecord>) -> Result<(), String> {
+async fn send_batch(cfg: &HttpFlushConfig, batch: &[QueuedAuditRecord]) -> Result<(), String> {
     let entry_count = batch.len();
-    let body = build_batch_body(&batch);
+    let body = build_batch_body(batch);
     let mut request = cfg
         .http_client
         .get()
@@ -4556,8 +4559,10 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<QueuedAuditRecord>) -> Res
     let result = classify_batch_delivery(cfg, entry_count, status, ack);
     // Keep every entry lease alive until the request body and acknowledgement
     // are finished. Releasing earlier would let new queue admissions consume
-    // the bytes while reqwest still retains the contiguous batch.
-    drop(batch);
+    // the bytes while reqwest still retains the contiguous batch. The shared
+    // logger also retains the master `Arc<Vec<QueuedAuditRecord>>` across retries;
+    // this attempt's borrow ends with the function.
+    let _ = batch;
     result
 }
 
@@ -4565,7 +4570,8 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<QueuedAuditRecord>) -> Res
 ///
 /// Capacity is exact, so Vec growth cannot retain an uncharged spare buffer.
 /// The original `batch` remains borrowed/alive for the complete HTTP attempt;
-/// retry clones share each entry's immutable `Bytes`.
+/// the shared logger Arc-shares that batch across retries without cloning
+/// each entry's immutable `Bytes`.
 fn build_batch_body(batch: &[QueuedAuditRecord]) -> Vec<u8> {
     let framing = if batch.is_empty() {
         2

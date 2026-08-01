@@ -1610,7 +1610,7 @@ struct QueuedChargeEvent {
 }
 
 enum SpoolJob {
-    Events(Vec<QueuedChargeEvent>),
+    Events(Arc<Vec<QueuedChargeEvent>>),
     /// Snapshot cardinality/byte overflow charges. On durable write success the
     /// worker advances the overflow-spooled counters; on write/cancellation
     /// failure it re-stages the exact events into the accumulator's bounded
@@ -1750,7 +1750,7 @@ struct SpoolDelivery {
 }
 
 impl SpoolDelivery {
-    fn try_enqueue(&self, events: Vec<QueuedChargeEvent>, _reason: &'static str) -> bool {
+    fn try_enqueue(&self, events: Arc<Vec<QueuedChargeEvent>>, _reason: &'static str) -> bool {
         if events.is_empty() {
             return true;
         }
@@ -1791,9 +1791,10 @@ impl SpoolDelivery {
 
     /// Enqueue snapshot overflow events for durable async spooling. The bounded
     /// queue owns compression/write/fsync and preserves the byte leases until
-    /// the blocking write finishes. Admission refusal returns the exact events
-    /// to the caller; after delivery ownership begins, a full/closed queue or
-    /// worker teardown re-stages them before releasing that ownership.
+    /// the blocking write finishes. Admission or queue-capacity refusal returns
+    /// the exact events to the caller before delivery ownership begins. Once a
+    /// reserved slot accepts the job, worker teardown re-stages it before
+    /// releasing that ownership.
     fn try_enqueue_snapshot_overflow(
         &self,
         events: Vec<QueuedChargeEvent>,
@@ -1807,6 +1808,16 @@ impl SpoolDelivery {
         let Some(_admission) = self.worker.try_admit() else {
             return Err(events);
         };
+        // Reserve the typed channel slot before constructing or transferring
+        // the SnapshotOverflow job. A failed `try_send(SpoolJob)` returned a
+        // mixed enum and forced an "impossible" production panic arm for the
+        // sibling Events variant. Keeping the exact Vec here until a permit is
+        // secured both removes that panic and lets a full/closed queue return
+        // the original charged events to the caller without cloning.
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(_) => return Err(events),
+        };
         accumulator.begin_overflow_delivery();
         self.pending_jobs.fetch_add(1, Ordering::Relaxed);
         self.pending_events
@@ -1819,26 +1830,11 @@ impl SpoolDelivery {
             Arc::clone(&self.pending_jobs),
             Arc::clone(&self.pending_events),
         );
-        match self.sender.try_send(SpoolJob::SnapshotOverflow(job)) {
-            Ok(()) => {
-                self.metrics
-                    .spool_jobs_enqueued_total
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(error) => {
-                match error.into_inner() {
-                    SpoolJob::SnapshotOverflow(mut job) => {
-                        // Stage back while this job still owns the lifecycle's
-                        // delivery count. Drop releases ownership only after the
-                        // accumulator mutation is complete.
-                        job.restage();
-                        Ok(())
-                    }
-                    SpoolJob::Events(events) => Err(events),
-                }
-            }
-        }
+        permit.send(SpoolJob::SnapshotOverflow(job));
+        self.metrics
+            .spool_jobs_enqueued_total
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     fn pending_jobs(&self) -> usize {
@@ -1851,6 +1847,20 @@ fn start_spool_delivery(
     metrics: Arc<SinkMetrics>,
     capacity: usize,
     commit_rx: watch::Receiver<bool>,
+) -> Arc<SpoolDelivery> {
+    start_spool_delivery_with_clone_ceiling(spool, metrics, capacity, commit_rx, process_ceiling())
+}
+
+/// Internal constructor with an explicit ceiling for the exceptional
+/// shared-`Arc` clone. Production always passes [`process_ceiling`]; external
+/// tests pass an isolated leaked ceiling so refusal coverage cannot consume the
+/// process-global admission budget used by concurrently running tests.
+fn start_spool_delivery_with_clone_ceiling(
+    spool: Arc<SpoolManager>,
+    metrics: Arc<SinkMetrics>,
+    capacity: usize,
+    commit_rx: watch::Receiver<bool>,
+    clone_ceiling: &'static RetainedByteCeiling,
 ) -> Arc<SpoolDelivery> {
     let capacity = capacity.clamp(1, MAX_BUFFER_CAPACITY);
     let (sender, mut receiver) = mpsc::channel(capacity);
@@ -1890,6 +1900,34 @@ fn start_spool_delivery(
                     match job {
                         Some(SpoolJob::Events(queued_events)) => {
                             let event_count = queued_events.len();
+                            // The failed-batch handoff normally transfers the
+                            // logger's final Arc, so this unwrap is zero-copy.
+                            // If a future caller retains another handle, recover
+                            // without an unaccounted deep clone: reserve the
+                            // duplicate ChargeEvent payload first and keep that
+                            // reservation through the blocking write.
+                            let mut clone_reservation: Option<ProcessByteReservation> = None;
+                            let queued_events = match Arc::try_unwrap(queued_events) {
+                                Ok(queued_events) => queued_events,
+                                Err(shared) => {
+                                    let bytes = shared
+                                        .iter()
+                                        .map(|queued| charge_event_retained_bytes(&queued.event))
+                                        .fold(0usize, usize::saturating_add);
+                                    let Some(reservation) = clone_ceiling.try_acquire(bytes) else {
+                                        metrics_for_worker.record_spool_job_loss(
+                                            event_count as u64,
+                                            "shared spool batch clone refused by the retained-byte ceiling",
+                                        );
+                                        pending_jobs_for_loop.fetch_sub(1, Ordering::Relaxed);
+                                        pending_events_for_loop
+                                            .fetch_sub(event_count, Ordering::Relaxed);
+                                        continue;
+                                    };
+                                    clone_reservation = Some(reservation);
+                                    shared.as_ref().clone()
+                                }
+                            };
                             let (events, leases): (Vec<_>, Vec<_>) = queued_events
                                 .into_iter()
                                 .map(|queued| (queued.event, queued.lease))
@@ -1902,6 +1940,7 @@ fn start_spool_delivery(
                                 // blocking write finishes, even if its async
                                 // waiter is cancelled during a timed-out drain.
                                 drop(leases);
+                                drop(clone_reservation);
                                 result
                             })
                             .await;
@@ -2825,7 +2864,7 @@ impl ApiChargebackSink {
                     invalidate_status_cache();
                     return true;
                 }
-                let accepted = overflow_enqueue.try_enqueue(vec![queued], reason);
+                let accepted = overflow_enqueue.try_enqueue(Arc::new(vec![queued]), reason);
                 if accepted && reason == "queue high water" {
                     overflow_metrics
                         .queue_high_water_diversions_total
@@ -2836,20 +2875,25 @@ impl ApiChargebackSink {
             }) as Arc<dyn Fn(QueuedChargeEvent, &'static str) -> bool + Send + Sync>
         });
         let hooks = LoggerHooks {
-            on_failed_batch: Some(Arc::new(move |batch: Vec<QueuedChargeEvent>, error| {
-                if snapshot_events_are_pre_spooled {
-                    return;
-                }
-                if let Some(enqueue) = failed_enqueue.as_ref() {
-                    let _ = enqueue.try_enqueue(batch, "export failure");
-                } else {
-                    warn!(
-                        plugin = PLUGIN_NAME,
-                        error = %error,
-                        "Chargeback sink export failed and spool is disabled; batch was lost"
-                    );
-                }
-            })),
+            on_failed_batch: Some(Arc::new(
+                move |batch: Arc<Vec<QueuedChargeEvent>>, error| {
+                    if snapshot_events_are_pre_spooled {
+                        return;
+                    }
+                    if let Some(enqueue) = failed_enqueue.as_ref() {
+                        // Terminal failure receives the shared batch handle; spool
+                        // ownership continues under the same Arc without cloning
+                        // ChargeEvent records.
+                        let _ = enqueue.try_enqueue(batch, "export failure");
+                    } else {
+                        warn!(
+                            plugin = PLUGIN_NAME,
+                            error = %error,
+                            "Chargeback sink export failed and spool is disabled; batch was lost"
+                        );
+                    }
+                },
+            )),
             on_overflow,
             on_high_water: Some(Arc::new(move |_, _| {
                 high_water_metrics
@@ -2881,15 +2925,9 @@ impl ApiChargebackSink {
             commit_rx,
             {
                 let flush_config = flush_config.clone();
-                move |batch: Vec<QueuedChargeEvent>| {
+                move |batch: Arc<Vec<QueuedChargeEvent>>| {
                     let flush_config = flush_config.clone();
-                    async move {
-                        let (events, _leases): (Vec<_>, Vec<_>) = batch
-                            .into_iter()
-                            .map(|queued| (queued.event, queued.lease))
-                            .unzip();
-                        send_batch(&flush_config, events).await
-                    }
+                    async move { send_batch(&flush_config, &batch).await }
                 }
             },
         );
@@ -4472,20 +4510,111 @@ fn materialize_json_each_row(
     .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
 }
 
-async fn send_batch(cfg: &ClickHouseFlushConfig, batch: Vec<ChargeEvent>) -> Result<(), String> {
+fn charge_body_byte_bound_refs(
+    batch: &[&ChargeEvent],
+    projection: Option<&ChargeEventProjection>,
+) -> Option<usize> {
+    let projection_row_bytes = projection.map_or(0, |p| p.row_overhead_bytes);
+    let mut total = CHARGE_ROW_JSON_OVERHEAD_BYTES;
+    for event in batch {
+        total = total
+            .checked_add(
+                charge_event_retained_bytes(event).checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
+            )?
+            .checked_add(CHARGE_ROW_JSON_OVERHEAD_BYTES)?
+            .checked_add(projection_row_bytes)?;
+    }
+    Some(total)
+}
+
+fn validate_charge_batch_refs(batch: &[&ChargeEvent]) -> Result<(), String> {
+    for event in batch {
+        for (field, value) in [
+            ("charge_call", event.charge_call),
+            ("charge_bytes_sent", event.charge_bytes_sent),
+            ("charge_bytes_received", event.charge_bytes_received),
+            ("charge_total", event.charge_total),
+        ] {
+            require_finite_charge(value, field).map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: event '{}' cannot be serialized: {error}",
+                    event.event_id
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn write_json_each_row_refs<W: Write>(
+    writer: &mut W,
+    batch: &[&ChargeEvent],
+    projection: Option<&ChargeEventProjection>,
+) -> Result<(), String> {
+    for (index, event) in batch.iter().enumerate() {
+        if index > 0 {
+            writer
+                .write_all(b"\n")
+                .map_err(|error| format!("failed to write row separator: {error}"))?;
+        }
+        let result = match projection {
+            None => serde_json::to_writer(&mut *writer, event),
+            Some(projection) => serde_json::to_writer(
+                &mut *writer,
+                &SchemaView {
+                    summary: *event,
+                    schema: &projection.schema,
+                },
+            ),
+        };
+        result.map_err(|error| format!("failed to serialize charge event: {error}"))?;
+    }
+    Ok(())
+}
+
+fn materialize_json_each_row_refs(
+    ceiling: &'static RetainedByteCeiling,
+    batch: &[&ChargeEvent],
+    projection: Option<&ChargeEventProjection>,
+) -> Result<ReservedPayload, String> {
+    validate_charge_batch_refs(batch)?;
+    let bound = charge_body_byte_bound_refs(batch, projection).ok_or_else(|| {
+        format!(
+            "{PLUGIN_NAME}: {}",
+            PayloadMaterializationError::BoundOverflowed.reason()
+        )
+    })?;
+    materialize_reserved_payload(ceiling, bound, |writer| {
+        write_json_each_row_refs(writer, batch, projection)
+    })
+    .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
+}
+
+async fn send_batch(
+    cfg: &ClickHouseFlushConfig,
+    batch: &[QueuedChargeEvent],
+) -> Result<(), String> {
     let event_count = batch.len();
-    let body = materialize_charge_body(cfg, &batch).inspect_err(|error| {
+    let events: Vec<&ChargeEvent> = batch.iter().map(|queued| &queued.event).collect();
+    let body = materialize_charge_body_refs(cfg, &events).inspect_err(|error| {
         cfg.metrics
             .record_failure(FailureReason::Serialize, error.clone());
     })?;
-    // The reserved body is the only representation delivery needs; the events
-    // themselves are released here so peak retention is the queue's leases plus
-    // one bounded body rather than the queue plus per-attempt copies.
-    drop(batch);
+    // The reserved body is the only per-attempt attacker-shaped representation.
+    // Queued records stay under the shared logger's Arc across retries; dropping
+    // this slice borrow here does not release their leases early.
+    drop(events);
     match post_json_each_row(cfg, body, event_count).await {
         DeliveryOutcome::Delivered => Ok(()),
         other => Err(other.safe_message().to_string()),
     }
+}
+
+fn materialize_charge_body_refs(
+    cfg: &ClickHouseFlushConfig,
+    batch: &[&ChargeEvent],
+) -> Result<ReservedPayload, String> {
+    materialize_json_each_row_refs(cfg.ceiling, batch, cfg.projection.as_deref())
 }
 
 async fn post_json_each_row(
@@ -8589,6 +8718,144 @@ pub fn probe_compact_recovery_retry_for_tests(
     Ok((retained_bytes, held, pending, ceiling.used()))
 }
 
+/// Outcome of [`probe_shared_spool_batch_clone_for_tests`].
+///
+/// External tests assert the shared-owner `SpoolJob::Events` recovery: a
+/// duplicate ChargeEvent payload is reserved against the injected ceiling
+/// before cloning, held through the blocking write, released on completion, or
+/// refused without writing when the ceiling cannot admit the clone. Production
+/// injects the process ceiling.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct SharedSpoolBatchCloneProbe {
+    pub clone_bytes: usize,
+    pub ceiling_used_baseline: usize,
+    /// Injected-ceiling usage while BeforeWrite ran with the clone reservation
+    /// still held. `None` when the ceiling refused the clone.
+    pub ceiling_used_while_clone_held: Option<usize>,
+    pub ceiling_used_after: usize,
+    pub jobs_written: u64,
+    pub jobs_lost: u64,
+    pub durable_owned_files: usize,
+}
+
+/// Drive one shared-owner `SpoolJob::Events` recovery through the live delivery
+/// worker.
+///
+/// The probe retains an extra `Arc` handle so `Arc::try_unwrap` fails — the
+/// exceptional path that reserves before cloning. `clone_ceiling` is injected
+/// into the real delivery worker, allowing external tests to exercise both
+/// admission and refusal without perturbing the process-global ceiling.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn probe_shared_spool_batch_clone_for_tests(
+    spool: Arc<SpoolManager>,
+    events: Vec<ChargeEvent>,
+    clone_ceiling: &'static RetainedByteCeiling,
+) -> SharedSpoolBatchCloneProbe {
+    let clone_bytes = events
+        .iter()
+        .map(charge_event_retained_bytes)
+        .fold(0usize, usize::saturating_add);
+
+    let budget = ByteBudget::new(
+        PLUGIN_NAME,
+        MAX_CHARGE_EVENT_BYTES.saturating_mul(events.len().max(1)),
+    );
+    let mut queued = Vec::with_capacity(events.len());
+    for event in events {
+        let retained = charge_event_retained_bytes(&event);
+        let lease = budget
+            .try_acquire(retained)
+            .expect("shared spool clone probe must lease queued events");
+        queued.push(QueuedChargeEvent { event, lease });
+    }
+    let shared = Arc::new(queued);
+    // Retain a second handle for the whole probe so try_unwrap takes the Err path.
+    let retained_handle = Arc::clone(&shared);
+
+    let ceiling_used_baseline = clone_ceiling.used();
+
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            set_spool_write_hook_for_tests(None);
+        }
+    }
+    let _clear_hook = ClearHook;
+    let held_sample = Arc::new(AtomicUsize::new(usize::MAX));
+    let hook_root = spool.namespace_root_for_tests().to_path_buf();
+    let sample = Arc::clone(&held_sample);
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point, namespace_root| {
+        if point != SpoolWriteHookPoint::BeforeWrite {
+            return;
+        }
+        if !namespace_root.starts_with(&hook_root) {
+            return;
+        }
+        // clone_reservation is still live inside spawn_blocking until after
+        // write_events returns, so BeforeWrite observes the charged clone.
+        sample.store(clone_ceiling.used(), Ordering::SeqCst);
+    })));
+
+    let metrics = Arc::new(SinkMetrics::default());
+    let (commit_tx, commit_rx) = watch::channel(false);
+    let delivery = start_spool_delivery_with_clone_ceiling(
+        Arc::clone(&spool),
+        Arc::clone(&metrics),
+        8,
+        commit_rx,
+        clone_ceiling,
+    );
+    let _ = commit_tx.send(true);
+
+    assert!(
+        delivery.try_enqueue(shared, "shared spool clone probe"),
+        "{PLUGIN_NAME}: shared spool clone probe failed to enqueue"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while delivery.pending_jobs() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{PLUGIN_NAME}: shared spool clone probe timed out waiting for delivery"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let ceiling_used_after = clone_ceiling.used();
+    let ceiling_used_while_clone_held = {
+        let sampled = held_sample.load(Ordering::SeqCst);
+        if sampled == usize::MAX {
+            None
+        } else {
+            Some(sampled)
+        }
+    };
+    let jobs_written = metrics.spool_jobs_written_total.load(Ordering::Relaxed);
+    let jobs_lost = metrics.spool_jobs_lost_total.load(Ordering::Relaxed);
+    let durable_owned_files = spool
+        .list_owned_spool_files_for_tests()
+        .expect("shared spool clone probe must list owned files")
+        .len();
+
+    delivery.worker.abort();
+    // Keep the retained handle alive through abort so strong_count stayed > 1
+    // for the entire worker recovery window.
+    drop(retained_handle);
+
+    SharedSpoolBatchCloneProbe {
+        clone_bytes,
+        ceiling_used_baseline,
+        ceiling_used_while_clone_held,
+        ceiling_used_after,
+        jobs_written,
+        jobs_lost,
+        durable_owned_files,
+    }
+}
+
 /// Opaque compact-recovery handle for deterministic external concurrency tests.
 #[doc(hidden)]
 #[allow(dead_code)]
@@ -11077,15 +11344,14 @@ fn spool_snapshot_overflow_event(lifecycle: &SnapshotLifecycle, event: ChargeEve
                         lifecycle.generation,
                     ) {
                         Ok(()) => {
-                            // Either the delivery worker owns the job (durable
-                            // counters advance after write) or a full/closed
-                            // queue already restaged under delivery ownership.
+                            // The delivery worker owns the job; durable counters
+                            // advance only after the write completes.
                             invalidate_status_cache();
                             return;
                         }
-                        // Admission refused (worker closing): recover the event
-                        // (the lease drops here, releasing its export-queue byte
-                        // reservation) and fall through to bounded staging.
+                        // Admission or queue-capacity refused: recover the event
+                        // (the lease drops here, releasing its export-queue
+                        // byte reservation) and fall through to bounded staging.
                         Err(mut returned) => match returned.pop() {
                             Some(queued) => queued.event,
                             None => return,

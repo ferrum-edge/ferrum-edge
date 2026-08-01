@@ -1281,7 +1281,13 @@ async fn test_response_cache_hit_cannot_bypass_required_406() {
     store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     prove_empty_request_body(&mut store_ctx);
     seed_response_cache_presentation_policy(&mut store_ctx);
-    let mut store_headers = HashMap::new();
+    // Seed the defensive replay case under the same origin-visible request
+    // partition as the later HIT. A different Accept-Encoding now correctly
+    // selects a different base key.
+    store_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "*;q=0".to_string());
+    let mut store_headers = store_ctx.headers.clone();
     assert!(matches!(
         plugins[0]
             .before_proxy(&mut store_ctx, &mut store_headers)
@@ -1375,37 +1381,45 @@ async fn test_response_cache_hit_preserves_identity_when_acceptable() {
     let compression = Arc::new(make_plugin(json!({}))) as Arc<dyn Plugin>;
     let plugins = vec![cache, compression];
 
-    let mut store_ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        "/cache-identity-ok".to_string(),
-    );
-    store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
-    prove_empty_request_body(&mut store_ctx);
-    seed_response_cache_presentation_policy(&mut store_ctx);
-    let mut store_headers = HashMap::new();
-    assert!(matches!(
-        plugins[0]
-            .before_proxy(&mut store_ctx, &mut store_headers)
-            .await,
-        PluginResult::Continue
-    ));
-    let mut store_resp = HashMap::new();
-    store_resp.insert("content-type".to_string(), "application/json".to_string());
-    store_resp.insert("cache-control".to_string(), "max-age=60".to_string());
-    plugins[0]
-        .after_proxy(&mut store_ctx, 200, &mut store_resp)
-        .await;
-    plugins[0]
-        .on_final_response_body(
-            &mut store_ctx,
-            200,
-            &store_resp,
-            br#"{"cached":"identity"}"#,
-        )
-        .await;
-
     for accept_encoding in [None, Some("gzip"), Some("identity")] {
+        // Every backend-visible request header is part of the response-cache
+        // base partition. Seed each Accept-Encoding case under the exact
+        // request view that will perform the HIT.
+        let mut store_ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/cache-identity-ok".to_string(),
+        );
+        store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+        prove_empty_request_body(&mut store_ctx);
+        seed_response_cache_presentation_policy(&mut store_ctx);
+        if let Some(ae) = accept_encoding {
+            store_ctx
+                .headers
+                .insert("accept-encoding".to_string(), ae.to_string());
+        }
+        let mut store_headers = store_ctx.headers.clone();
+        assert!(matches!(
+            plugins[0]
+                .before_proxy(&mut store_ctx, &mut store_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        let mut store_resp = HashMap::new();
+        store_resp.insert("content-type".to_string(), "application/json".to_string());
+        store_resp.insert("cache-control".to_string(), "max-age=60".to_string());
+        plugins[0]
+            .after_proxy(&mut store_ctx, 200, &mut store_resp)
+            .await;
+        plugins[0]
+            .on_final_response_body(
+                &mut store_ctx,
+                200,
+                &store_resp,
+                br#"{"cached":"identity"}"#,
+            )
+            .await;
+
         let mut hit_ctx = RequestContext::new(
             "127.0.0.1".to_string(),
             "GET".to_string(),

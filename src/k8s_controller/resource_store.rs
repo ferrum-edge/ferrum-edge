@@ -140,6 +140,32 @@ impl ResourceStoreSet {
         true
     }
 
+    /// Swap a fresh reflector store in for the one already registered under the
+    /// same `(api_version, kind, scope)` triple, in place and under one lock.
+    ///
+    /// This is the make-before-break half of the idle relist in
+    /// [`super::watcher`]: the previous generation's store keeps serving its
+    /// last-known-good objects to `snapshot_all` until the replacement has
+    /// finished its initial list, so a relist never opens a window in which the
+    /// scope contributes zero objects. A gap there would look exactly like a
+    /// mass deletion to the reconciler and would broadcast a config wipe.
+    ///
+    /// Returns `false` when no store is registered for the triple; the caller
+    /// then falls back to [`Self::add_store`] rather than dropping the scope.
+    pub fn replace_store_for_scope(&mut self, store: Arc<CrdResourceStore>) -> bool {
+        let Some(index) = self.stores.iter().position(|existing| {
+            existing.api_version == store.api_version
+                && existing.kind == store.kind
+                && existing.scope == store.scope
+        }) else {
+            return false;
+        };
+
+        self.stores[index] = store;
+        self.notify_change();
+        true
+    }
+
     pub fn has_store(&self, api_version: &str, kind: &str) -> bool {
         self.stores
             .iter()

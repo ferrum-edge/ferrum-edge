@@ -39,6 +39,24 @@ const QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'|')
     .add(b'}');
 
+/// Decode one query name or value for WAF HPP comparison.
+///
+/// `application/x-www-form-urlencoded` treats literal `+` as space, but `%2B`
+/// is an unambiguous encoded plus. Normalize only raw `+` before percent-
+/// decoding so `%2B` stays literal plus.
+fn decode_form_urlencoded_component_for_hpp(raw: &str) -> String {
+    let normalized;
+    let component = if raw.as_bytes().contains(&b'+') {
+        normalized = raw.replace('+', " ");
+        normalized.as_str()
+    } else {
+        raw
+    };
+    percent_decode_str(component)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
 /// Whether one decoded query name appears with conflicting decoded values.
 ///
 /// The WAF parameter-pollution rule deliberately keeps this narrower
@@ -54,10 +72,8 @@ pub fn has_conflicting_duplicate_query_key(raw_query: &str) -> bool {
             continue;
         }
         let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-        let key = percent_decode_str(raw_key).decode_utf8_lossy().into_owned();
-        let value = percent_decode_str(raw_value)
-            .decode_utf8_lossy()
-            .into_owned();
+        let key = decode_form_urlencoded_component_for_hpp(raw_key);
+        let value = decode_form_urlencoded_component_for_hpp(raw_value);
         match seen.get(&key) {
             Some(previous) if previous != &value => return true,
             Some(_) => {}

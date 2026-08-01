@@ -554,6 +554,210 @@ async fn base_cache_key_for_raw_query(plugin: &ResponseCaching, raw_query: &str)
 }
 
 #[tokio::test]
+async fn base_cache_key_partitions_unannounced_origin_visible_headers() {
+    let plugin = default_plugin();
+    let mut alpha = make_ctx("GET", "/tenant-data");
+    let mut alpha_headers = HashMap::from([("x-tenant-id".to_string(), "alpha".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut alpha, &mut alpha_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut beta = make_ctx("GET", "/tenant-data");
+    let mut beta_headers = HashMap::from([("x-tenant-id".to_string(), "beta".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut beta, &mut beta_headers).await,
+        PluginResult::Continue
+    ));
+
+    assert_ne!(
+        alpha.metadata.get(&staging_key(&plugin, "cache_base_key")),
+        beta.metadata.get(&staging_key(&plugin, "cache_base_key")),
+        "an origin-visible header must partition the cache even without Vary"
+    );
+}
+
+async fn staged_base_cache_key(
+    plugin: &ResponseCaching,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> Option<String> {
+    let mut ctx = make_ctx("GET", path);
+    let mut headers = HashMap::new();
+    for (name, value) in extra_headers {
+        headers.insert((*name).to_string(), (*value).to_string());
+    }
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    ctx.metadata
+        .get(&staging_key(plugin, "cache_base_key"))
+        .cloned()
+}
+
+#[tokio::test]
+async fn base_cache_key_keeps_supported_entry_operation_headers_reachable() {
+    let plugin = default_plugin();
+    let path = "/entry-ops-reachable";
+    let baseline = staged_base_cache_key(&plugin, path, &[])
+        .await
+        .expect("baseline request must stage a base key");
+
+    let supported = [
+        ("if-none-match", r#""etag-1""#),
+        ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("cache-control", "no-cache"),
+        ("cache-control", "no-store"),
+        ("content-length", "0"),
+    ];
+    for (name, value) in supported {
+        let key = staged_base_cache_key(&plugin, path, &[(name, value)])
+            .await
+            .unwrap_or_else(|| panic!("{name}: {value} must stage a base key"));
+        assert_eq!(
+            key, baseline,
+            "{name}: {value} is a handled entry operation and must stay reachable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn base_cache_key_binds_unsupported_precondition_range_and_pragma_dimensions() {
+    let plugin = default_plugin();
+    let path = "/unsupported-preconditions";
+    let baseline = staged_base_cache_key(&plugin, path, &[])
+        .await
+        .expect("baseline request must stage a base key");
+
+    let unsupported = [
+        ("if-match", r#""etag-1""#),
+        ("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("if-range", r#""etag-1""#),
+        ("range", "bytes=0-3"),
+        ("pragma", "no-cache"),
+    ];
+    for (name, value) in unsupported {
+        let key = staged_base_cache_key(&plugin, path, &[(name, value)])
+            .await
+            .unwrap_or_else(|| panic!("{name}: {value} must stage a base key"));
+        assert_ne!(
+            key, baseline,
+            "{name} is not implemented as a cache operation and must not share a replay key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn base_cache_key_cache_control_exclusion_is_value_aware() {
+    let plugin = default_plugin();
+    let path = "/cache-control-value-aware";
+    let baseline = staged_base_cache_key(&plugin, path, &[])
+        .await
+        .expect("baseline request must stage a base key");
+
+    let recognized_refresh = staged_base_cache_key(&plugin, path, &[("cache-control", "no-cache")])
+        .await
+        .expect("recognized no-cache refresh must stage a base key");
+    assert_eq!(
+        recognized_refresh, baseline,
+        "recognized no-cache must remain under the original partition for replacement"
+    );
+
+    let recognized_store = staged_base_cache_key(&plugin, path, &[("cache-control", "no-store")])
+        .await
+        .expect("recognized no-store refresh must stage a base key");
+    assert_eq!(
+        recognized_store, baseline,
+        "recognized no-store must remain under the original partition for replacement"
+    );
+
+    let pure_pair =
+        staged_base_cache_key(&plugin, path, &[("cache-control", "no-cache, no-store")])
+            .await
+            .expect("pure no-cache/no-store pair must stage a base key");
+    assert_eq!(
+        pure_pair, baseline,
+        "a header of only honored refresh members must stay under the original partition"
+    );
+
+    let unrecognized = [
+        ("max-age=0", "request max-age is not a handled refresh"),
+        (
+            "only-if-cached",
+            "only-if-cached is not interpreted by this cache",
+        ),
+        (
+            "foo",
+            "arbitrary Cache-Control extensions are backend-visible",
+        ),
+        ("public", "public on a request is not a handled refresh"),
+    ];
+    for (value, reason) in unrecognized {
+        let key = staged_base_cache_key(&plugin, path, &[("cache-control", value)])
+            .await
+            .unwrap_or_else(|| panic!("cache-control: {value} must stage a base key"));
+        assert_ne!(
+            key, baseline,
+            "cache-control: {value} must partition ({reason})"
+        );
+    }
+
+    // Mixed recognized refresh + unimplemented members remain backend-visible
+    // context and must not collapse onto the baseline refresh partition.
+    let mixed_max_age =
+        staged_base_cache_key(&plugin, path, &[("cache-control", "no-cache, max-age=0")])
+            .await
+            .expect("mixed no-cache refresh must stage a base key");
+    assert_ne!(
+        mixed_max_age, baseline,
+        "mixed no-cache plus max-age=0 must not share the baseline replay key"
+    );
+
+    let mixed_extension =
+        staged_base_cache_key(&plugin, path, &[("cache-control", "no-cache, x-tenant=a")])
+            .await
+            .expect("mixed no-cache plus extension must stage a base key");
+    assert_ne!(
+        mixed_extension, baseline,
+        "mixed no-cache plus an arbitrary extension must not share the baseline replay key"
+    );
+
+    for value in [
+        r#"no-cache="authorization, cookie""#,
+        "no-cache=opaque",
+        "no-store=opaque",
+        r#"no-cache="authorization", x-tenant=a"#,
+        r#"no-cache="authorization"junk"#,
+        r#"no-cache="authorization"#,
+    ] {
+        let key = staged_base_cache_key(&plugin, path, &[("cache-control", value)])
+            .await
+            .unwrap_or_else(|| panic!("cache-control: {value} must stage a base key"));
+        assert_ne!(
+            key, baseline,
+            "argument-bearing, mixed, or malformed cache-control must fail closed into its own partition"
+        );
+    }
+}
+
+#[tokio::test]
+async fn base_cache_key_binds_cache_control_when_respect_no_cache_disabled() {
+    let plugin = plugin_with_config(json!({ "respect_no_cache": false }));
+    let path = "/cache-control-respect-disabled";
+    let baseline = staged_base_cache_key(&plugin, path, &[])
+        .await
+        .expect("baseline request must stage a base key");
+
+    for value in ["no-cache", "no-store", r#"no-cache="authorization""#] {
+        let key = staged_base_cache_key(&plugin, path, &[("cache-control", value)])
+            .await
+            .unwrap_or_else(|| panic!("cache-control: {value} must stage a base key"));
+        assert_ne!(
+            key, baseline,
+            "respect_no_cache=false leaves cache-control: {value} backend-visible and bound"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_raw_query_cache_key_preserves_exact_semantics() {
     let plugin = default_plugin();
 
@@ -1175,7 +1379,26 @@ async fn test_bypassed_zero_freshness_with_new_vary_invalidates_matched_entry() 
     let path = "/api/no-cache-zero-new-vary";
     let mut resp_headers = HashMap::new();
     resp_headers.insert("cache-control".to_string(), "max-age=60".to_string());
-    cache_response(&plugin, "GET", path, 200, &resp_headers, b"cached").await;
+    // Seed the entry under the same origin-visible Accept-Encoding partition
+    // as the refresh below. A different request-header view is deliberately a
+    // different base key and must not be invalidated by this response.
+    let mut store_ctx = make_ctx("GET", path);
+    store_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut store_headers = store_ctx.headers.clone();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut store_ctx, &mut store_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    plugin
+        .after_proxy(&mut store_ctx, 200, &mut resp_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut store_ctx, 200, &resp_headers, b"cached")
+        .await;
     assert!(response_caching_current_total_size_for_test(&plugin) > 0);
 
     let mut bypass_ctx = make_ctx("GET", path);
@@ -3490,15 +3713,11 @@ async fn test_concurrent_stores_atomically_union_vary_dimensions_and_remove_narr
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
     let mut tasks = Vec::new();
-    for (request_header, request_value, body) in
-        [("x-a", "value-a", b"body-a"), ("x-b", "value-b", b"body-b")]
-    {
+    for (vary_header, body) in [("x-a", b"body-a"), ("x-b", b"body-b")] {
         let plugin = Arc::clone(&plugin);
         let barrier = Arc::clone(&barrier);
         tasks.push(tokio::spawn(async move {
             let mut ctx = make_ctx("GET", "/vary-race");
-            ctx.headers
-                .insert(request_header.to_string(), request_value.to_string());
             let mut request_headers = ctx.headers.clone();
             assert!(matches!(
                 plugin.before_proxy(&mut ctx, &mut request_headers).await,
@@ -3510,7 +3729,7 @@ async fn test_concurrent_stores_atomically_union_vary_dimensions_and_remove_narr
                     "cache-control".to_string(),
                     "public, max-age=60".to_string(),
                 ),
-                ("vary".to_string(), request_header.to_string()),
+                ("vary".to_string(), vary_header.to_string()),
             ]);
             plugin
                 .after_proxy(&mut ctx, 200, &mut response_headers)
@@ -3550,18 +3769,10 @@ async fn test_concurrent_stores_atomically_union_vary_dimensions_and_remove_narr
     );
     assert_size_accounting_exact(&plugin);
 
-    let mut hit_count = 0;
-    for (request_header, request_value) in [("x-a", "value-a"), ("x-b", "value-b")] {
-        let mut ctx = make_ctx("GET", "/vary-race");
-        ctx.headers
-            .insert(request_header.to_string(), request_value.to_string());
-        let mut request_headers = ctx.headers.clone();
-        if is_reject(&plugin.before_proxy(&mut ctx, &mut request_headers).await) {
-            hit_count += 1;
-        }
-    }
-    assert_eq!(
-        hit_count, 1,
+    let mut ctx = make_ctx("GET", "/vary-race");
+    let mut request_headers = ctx.headers.clone();
+    assert!(
+        is_reject(&plugin.before_proxy(&mut ctx, &mut request_headers).await),
         "the sole retained wide-key entry must remain reachable under the final union"
     );
 }
@@ -5204,7 +5415,14 @@ async fn test_request_declaring_a_body_bypasses_cache() {
     )
     .await;
 
-    for (name, value) in [("content-length", "7"), ("transfer-encoding", "chunked")] {
+    for (name, value) in [
+        ("content-length", "7"),
+        ("content-length", ""),
+        ("content-length", "+0"),
+        ("content-length", "not-a-length"),
+        ("content-length", "0, 0"),
+        ("transfer-encoding", "chunked"),
+    ] {
         let mut ctx = make_ctx("GET", "/api/items");
         ctx.headers
             .insert("host".to_string(), "a.example.com".to_string());
@@ -5216,19 +5434,19 @@ async fn test_request_declaring_a_body_bypasses_cache() {
                 plugin.before_proxy(&mut ctx, &mut headers).await,
                 PluginResult::Continue
             ),
-            "a declared body must never replay a stored representation ({name})"
+            "unsafe body framing must not replay ({name}={value:?})"
         );
         assert_eq!(
             ctx.metadata
                 .get(&staging_key(&plugin, "cache_status"))
                 .map(String::as_str),
             Some("BYPASS"),
-            "a declared body must bypass ({name})"
+            "unsafe body framing must bypass ({name}={value:?})"
         );
         assert!(
             !ctx.metadata
                 .contains_key(&staging_key(&plugin, "cache_base_key")),
-            "a bypassed request must not stage a storage key ({name})"
+            "a bypassed request must not stage a key ({name}={value:?})"
         );
     }
 
@@ -6069,14 +6287,9 @@ async fn replay_partition_isolates_query_and_path_delimiters() {
 }
 
 /// An origin-visible request header the backend never nominates in `Vary` is
-/// keyed through `vary_by_headers`, which is the operator-facing control for
-/// exactly this case.
-///
-/// The raw header view is deliberately not a base-key dimension: RFC 9111 §4.1
-/// selection is target + `Vary`, and keying every header would make the `Vary`
-/// index unreachable and put a conditional revalidation or a client `no-cache`
-/// refresh in a different partition from the entry it names. Cross-caller
-/// isolation is the mandatory caller partition, which is unconditional.
+/// already bound by the conservative base partition. `vary_by_headers` remains
+/// an additional operator-declared `Vary` dimension, including its explicit
+/// absent-versus-present behavior, and must continue to agree at lookup/store.
 #[tokio::test]
 async fn replay_partition_binds_vary_by_headers_the_backend_never_nominates() {
     let _policy_guard = response_cache_replay_policy_guard();

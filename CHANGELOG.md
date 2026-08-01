@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Kubernetes controller watch scopes now rebuild their reflector from an
+  authoritative list when they go idle past `FERRUM_K8S_WATCH_IDLE_RELIST_SECS`
+  (default `300`, `0` disables, clamped to `0`–`86400`). kube-rs raises an
+  error only when a watch *fails*, so a watch that stops delivering without
+  failing leaves the task alive while its reflector serves a permanently stale
+  object set and every later Gateway API / Istio resource stays invisible to
+  reconciles; `FERRUM_K8S_FULL_SYNC_INTERVAL_SECS` cannot recover it because it
+  re-reconciles that same store. A Gateway API conformance run captured that
+  signature — the TCPRoute `v1alpha2` scope initialized, four TCPRoutes existed
+  in the cluster, the sibling ReferenceGrant watcher kept receiving events, the
+  controller stayed alive and kept reconciling, and the TCPRoute store stayed
+  frozen with no watcher error, restart, or status write for 120s. That is
+  consistent with a silently stalled or black-holed watch; the artifact carries
+  no transport-level evidence of where the event stream was lost, so the
+  recovery is deliberately cause-agnostic and bounds any no-event stall. The
+  replacement generation is swapped in make-before-break — the previous store
+  keeps serving until the replacement reports `InitDone` — so a relist never
+  looks like a mass deletion, and a replacement that never finishes listing is
+  itself abandoned and retried without blanking the scope. Because bookmarks
+  are consumed inside kube-rs, a healthy quiet scope is indistinguishable from
+  a stalled one and relists on every window, so the window doubles as the
+  per-scope full-list rate against the API server; each scope's deadline
+  carries a bounded offset seeded per process, so neither the scopes on one
+  replica nor the replicas of one scope list in lockstep. Watcher task
+  ownership, the stream-end deregistration contract, and the CRD reprobe loop
+  are unchanged.
+
 - API-spec YAML ingestion now expands anchors and aliases through a bounded
   libyaml event graph (node, depth, alias-reference, expanded-byte, and work
   budgets) with cycle / undefined-alias / duplicate-anchor /
@@ -43,8 +70,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/dependency-policy.md`, `docs/vendored-patch-lifecycle.json`, and
   `docs/upstream-*-patches/` off the lightweight documentation path.
 
+### Fixed
+
+- H1/H2 WebSocket backend dials now use the effective proxy of the target they
+  are actually dialing (#2416). The WebSocket branch previously received only
+  the retry-capped base proxy: retry rotation moved the URL, the admission
+  target, and the circuit-breaker key to the next port while the socket kept the
+  unresolved route-level `connectTimeout`, trust roots, client identity, and
+  verification posture — so any selected port with distinct
+  `portLevelSettings` could dial with the wrong timeout, trust an unintended CA,
+  or present the wrong client certificate. Every attempt (the initial one and
+  each rotation) now resolves
+  `resolve_backend_connection_proxy_for_target` for its own `current_target` at
+  the top of the dial loop and passes that one proxy to both the direct
+  TCP/TLS dial and the mesh egress dial, matching what the H3 WebSocket bridge
+  already did. Retry accounting, health/load-balancer feedback, circuit
+  breaking, connection and request guards, and the selected target's identity
+  are unchanged. `docs/mesh.md` no longer documents an H1/H2 WebSocket
+  exception to the effective-proxy pipeline.
+- WebSocket policy-port vs transport-dial-port semantics are now stated
+  explicitly and shared by both frontends (#2416): target selection chooses the
+  **policy port** (`UpstreamTarget::dispatch_policy_port()` — the declared
+  Service port when a Kubernetes `targetPort` remap applies), and that port
+  keys every DestinationRule lookup the upgrade makes. The transport dial port
+  is separate: a `mesh.mtls` target dials `:15006` and a `mesh.hbone` target
+  dials `:15008`, reaching the app port through the tunnel, and those transport
+  listener ports are never policy sources. See "WebSocket policy port vs
+  transport dial port" in `docs/mesh.md`.
+- A WebSocket backend dial whose effective backend TLS carries an `sni`
+  override now fails closed instead of silently verifying the request URI's
+  host (#2416). `client_async_tls_with_config` derives both `Host` and the TLS
+  server name from the request URI and cannot apply a separate SNI, so the
+  upgrade is refused pre-dial as a gateway-side dispatch rejection (`502`,
+  non-retryable, neutral to the circuit breaker and passive health) — the same
+  posture the reqwest retry path already takes. Because the policy is resolved
+  per target, a `portLevelSettings[].tls.sni` refuses only that port's
+  upgrades. Mesh egress is unaffected (its SNI is chosen by the mesh dial
+  plans). **Behavior change:** a `wss://` route that previously connected while
+  ignoring a configured backend TLS SNI now returns `502`. Direct WebSocket
+  transport requires the backend URI hostname to be the intended TLS server
+  name (with `dns_override` available when that name must resolve to a specific
+  address); a distinct backend TLS SNI override is unsupported.
+
 ### Changed
 
+- Gateway API and Istio status planning now build immutable per-reconcile
+  indexes and reuse one primary translation/materialization (plus skip errors)
+  instead of retranslating a filtered snapshot once per status object, and
+  borrow included `K8sObject` values rather than deep-cloning `spec`/`status`
+  JSON (#2397). Both paths share that translation/index snapshot; only Gateway
+  API status planning applies the fair deterministic 256-candidate rotating
+  work budget *before* expensive per-object status work so the cap bounds CPU
+  as well as API writes. Istio status planning remains unlimited
+  (`StatusPlanBudget::unlimited(0)`). Fail-closed validation and status parity
+  for every supported Istio/Gateway resource are preserved.
+- Shared `BatchingLogger` flush/retry/fallback now Arc-shares one immutable
+  batch payload (`Arc<Vec<T>>`) across every delivery attempt and the optional
+  failed-batch hook instead of deep-cloning owned records on each non-final
+  attempt (#3029). Sink flush closures borrow or Arc-clone that handle; byte
+  leases stay charged for the shared records' lifetime and release when the
+  last Arc drops after success, terminal discard, or fallback ownership
+  transfer.
 - `proxy_alerts` / notification delivery now expose bounded-cardinality
   Prometheus delivery metrics (`attempted` / `succeeded` /
   `failed_transient` / `failed_permanent` / `backpressure_dropped` /
@@ -91,6 +177,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Webhook/email consumers must be idempotent or duplicate-tolerant (#2448).
 
 ### Security
+
+- WAF no longer forwards the unscanned suffix of an oversize body past an
+  enforcing body rule (GHSA-7jh9-fjqf-jcvf). `max_scan_bytes` defaults to 1 MiB
+  while the gateway admits 10 MiB request and response bodies by default, and
+  the previous `on_body_too_large: scan_truncated` default scanned only that
+  first 1 MiB, recorded `waf.scan_truncated`, and then forwarded the complete
+  body even in global enforce mode. A client could pad an upload with 1 MiB of
+  benign bytes and place an enforced SQLi/XSS/traversal/SSRF/custom-rule payload
+  after the cap; a compromised backend could do the same with configured
+  disclosure/data-leak content in a response. `on_body_too_large` now defaults
+  to the new **`fail_closed`** value: a governed request or response body that
+  does not fit inside `max_scan_bytes` is rejected whenever that direction
+  actually carries an enforcing body policy — global `mode: enforce` plus either
+  anomaly `scoring` with an applicable body rule or at least one applicable
+  `action: enforce` rule reading `body_text` / `body_json_path` (request) or
+  `response_body` (response), including the body-scoped `FE-ENCODING-001` /
+  `FE-ENCODING-002` specials. Per-rule path, method, header, and consumer
+  conditions and request-wide `global_exemptions.header_present` suppression are
+  honored, so a scoped or exempted enforcing rule does not block an unrelated
+  request. Both directions share one decision on the finalized backend-visible
+  representation, so H1, H2, and H3 behave identically and a request transformer
+  that grows a body past the cap is still governed. A body of exactly
+  `max_scan_bytes` is scanned in full and is not oversize.
+
+  Monitor-only operation is deliberately unaffected: with `mode: monitor`, or
+  with every body rule left at the built-in monitor default, an oversize body is
+  still prefix-scanned and recorded rather than blocked. Oversize bodies handled
+  by `fail_closed`, `scan_truncated`, or `block` record fixed-cardinality
+  `waf.body_too_large=true` and `waf.body_too_large_target` (`request_body` /
+  `response_body`); blocks add `waf.action=blocked` with
+  `waf.block_reason=body_too_large`, and prefix scans keep
+  `waf.scan_truncated=true`. No body bytes are logged. The explicit `skip` mode
+  still avoids body inspection and may avoid buffering a known-oversize request,
+  so it emits none of this body-size metadata. Operators who deliberately accept
+  prefix-only inspection can opt out with the still-supported
+  `on_body_too_large: scan_truncated`; `skip` and `block` are otherwise
+  unchanged. The unbounded-SSE decision is also unchanged — the prefix-only
+  opt-out concedes the suffix of a bounded body and does not reach a stream with
+  no scanned prefix.
+
+- `body_validator` and `openapi_validator` validation diagnostics no longer
+  disclose the rejected representation (GHSA-5p2h-fq6q-gwh9). Both plugins used
+  to format the offending instance value — or a payload-chosen JSON, XML, form,
+  or multipart member name — into the string returned in the client-visible
+  reject / problem body and stored in `openapi_validator.request_error` /
+  `openapi_validator.response_error`, which every configured logging plugin
+  exports. On the response side that republished exactly the upstream
+  representation validation exists to withhold, letting a client that can
+  trigger an invalid backend response read back a token, credential, or PII
+  field; on the request side it copied caller credentials into gateway
+  telemetry and every downstream sink. Diagnostics are now assembled under a
+  centralized construction contract
+  (`plugins::utils::validation_diagnostics`): a compiled-in failure category, an
+  allowlisted JSON Schema keyword, and — request side only — a bounded instance
+  location. Numeric JSON Pointer segments render as a fixed `#` marker (pointer
+  text alone does not prove array shape); an object member name survives only
+  when the *configured schema declares it as a JSON property*, and every other
+  segment renders as `~`, so a hostile member name is replaced rather than
+  sanitized after the fact. Segment count, segment length, and total diagnostic
+  length are capped by compiled-in constants. Raw schema paths (including
+  `$defs` / reference names), configured XML names and namespaces, and hostile
+  `Content-Encoding` coding tokens are never formatted into diagnostics. No
+  production path formats a rejected value, an expected `enum` / `const`
+  constant, a raw `jsonschema` / `roxmltree` / `prost` rendering, a backend
+  `Content-Type`, or the request target, so there is nothing left for truncation
+  to protect and no raw-detail escape hatch in configuration or tracing.
+  Response-side conversion and decode failures collapse further, to a single
+  fixed sentence, because even the class of failure describes an upstream
+  representation the client was never entitled to observe.
+  `error_truncate_chars` is retained as a size bound and now only narrows
+  (`min(configured, 256)`). JSON, XML, form, multipart, protobuf, and gRPC
+  validation decisions, statuses, and fail-closed behavior are unchanged;
+  `openapi_validator`'s unknown-operation detail no longer interpolates the
+  request method and target.
+
+- Matched VirtualService route-level request/response header transforms remain
+  authoritative under multiple same-type transformer instances
+  (GHSA-3xxr-xhhj-9962). Previously each enabled `request_transformer` /
+  `response_transformer` applied its static rules and then consumed the shared
+  route-override list, so a later instance could re-add, rename into, or
+  overwrite a backend- or client-bound field the matched route had removed or
+  set. Enabled instances now apply only static header rules; proxy core applies
+  each matched route list exactly once after the last eligible instance on the
+  request and response chains (ordinary H1/H2/H3, synthetic/rejection,
+  header-capability simulation, and deadline provenance paths). Disabled RTDS
+  instances stay complete no-ops and do not suppress route overrides. Query and
+  body transform ordering is unchanged.
 
 - Updated the transitive `event-listener` dependency from 5.4.1 to 5.4.2,
   removing the `StackSlot` cross-thread unsoundness reported as
@@ -200,19 +373,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `response_caching` now binds the same complete backend-visible request
     *target* unconditionally: the effective outbound query is a key dimension
     even when `cache_key_include_query` is `false`, which is retained only as a
-    legacy keyspace toggle. Its request-header dimension stays the complete
-    `Vary` tuple (backend-nominated dimensions, `vary_by_headers`, and the
-    mandatory credential/session auto-Vary) rather than the raw header view.
+    legacy keyspace toggle. Its base partition also binds every origin-visible
+    request header, including tenant, policy, tracing, correlation, unsupported
+    precondition, `Range`, and arbitrary request `Cache-Control` dimensions,
+    even when the origin omits them from `Vary`. Only operations this cache
+    actually implements stay addressable under the original entry partition:
+    `If-None-Match` / `If-Modified-Since`, zero-length `Content-Length`, and a
+    pure bare, argument-free `no-cache` / `no-store` refresh when
+    `respect_no_cache` is enabled. The complete `Vary` tuple remains an
+    additional backend-nominated and operator-configured digest.
     `Authorization`, `Proxy-Authorization`, and `Cookie` are now present as
     dimensions on every retained response, including anonymous responses, so
     the emitted `Vary` contract also protects downstream shared caches that
     cannot see Ferrum's private caller partition. Authorization storage
     admission checks both the pristine inbound and live backend-visible views,
     so a request transformer cannot erase the origin opt-in requirement.
-    This tuple is used
-    because RFC 9111 §4.1 selection is target + `Vary` and a conditional
-    revalidation, a client `no-cache` refresh, and `Content-Length: 0` are
-    addressed to a stored entry rather than selecting a different one.
+    Conditional revalidation, a pure client no-cache/no-store refresh, and
+    `Content-Length: 0` are addressed to a stored entry rather than selecting a
+    different one; mixed, argument-bearing, disabled, or unimplemented request
+    directives stay bound.
   - **`ai_semantic_cache` lookup moved to the final-request-body stage**
     (priority `2996` → `4057`). It previously looked up in `before_proxy`,
     ahead of `request_transformer` (3000) and every `transform_request_body`

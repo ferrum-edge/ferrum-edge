@@ -1654,6 +1654,12 @@ impl Plugin for AiStreamRouter {
         self.enabled
     }
 
+    fn modifies_request_destination(&self) -> bool {
+        // Claimed requests replace the backend scheme/host/port, authority,
+        // and path with the selected provider destination.
+        self.enabled
+    }
+
     fn modifies_request_body(&self) -> bool {
         // Anthropic translation and optional usage injection rewrite the body.
         self.enabled

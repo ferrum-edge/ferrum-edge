@@ -5297,6 +5297,64 @@ fn test_db_full_load_page_size_clamped_to_maximum() {
     );
 }
 
+// ── FERRUM_K8S_WATCH_IDLE_RELIST_SECS ───────────────────────────────────────
+
+#[test]
+fn test_k8s_watch_idle_relist_secs_defaults_to_five_minutes() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_K8S_WATCH_IDLE_RELIST_SECS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.k8s_watch_idle_relist_secs, 300,
+                "a quiet scope relists on every window, so the default has to \
+                 be a modest full-list rate across all watched scopes"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_k8s_watch_idle_relist_secs_zero_is_preserved_as_the_opt_out() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_K8S_WATCH_IDLE_RELIST_SECS", "0"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.k8s_watch_idle_relist_secs, 0,
+                "0 is the documented opt-out and must survive the clamp"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_k8s_watch_idle_relist_secs_above_max_is_clamped() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_K8S_WATCH_IDLE_RELIST_SECS", "18446744073709551615"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(
+                config.k8s_watch_idle_relist_secs, 86_400,
+                "an unbounded window would overflow the doubled readiness \
+                 timeout and the Instant deadline at runtime"
+            );
+        },
+    );
+}
+
 // ── FERRUM_POOL_SHARD_AMOUNT ────────────────────────────────────────────────
 
 #[test]

@@ -302,13 +302,45 @@ Response inspection is **off by default**. Enable `response_inspection` (and
 `response_body_inspection` for body rules) to run the disclosure and
 data-leak rules.
 
-`max_scan_bytes` (default 1 MiB) bounds how much of a body is scanned.
-`on_body_too_large` decides what happens when a body exceeds it:
+`max_scan_bytes` (default 1 MiB) bounds how much of a body is scanned. A body
+whose length is exactly `max_scan_bytes` is scanned in full; only a strictly
+larger body is oversize. `on_body_too_large` decides what happens then:
 
-- `scan_truncated` (default) — scan the first `max_scan_bytes`, flag truncation
+- `fail_closed` (default) — reject when that direction carries an enforcing body
+  policy, otherwise scan the first `max_scan_bytes` and flag truncation
+- `scan_truncated` — explicit compatibility opt-out: always scan only the first
+  `max_scan_bytes` and forward the complete body
 - `skip` — do not scan
-- `block` — reject when enforcing (fail closed; for high-assurance routes set
-  `max_scan_bytes` at or above `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`)
+- `block` — reject every oversize governed body when enforcing, regardless of
+  which rules enforce
+
+**Why the default fails closed.** Prefix-only inspection is not a body control.
+A client can pad an upload with `max_scan_bytes` of benign bytes and place an
+enforced SQLi/XSS/traversal/SSRF/custom-rule payload in the unscanned suffix; a
+compromised backend can do the same with disclosure content in a response. The
+gateway's own default body ceilings (`FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` /
+`FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, 10 MiB each) admit far more than the
+1 MiB scan cap, so the gap is reachable by default. `fail_closed` closes it
+(`GHSA-7jh9-fjqf-jcvf`).
+
+"Carries an enforcing body policy" means global `mode: enforce` **and** either
+anomaly `scoring` has an applicable rule reading that direction's body or at
+least one applicable `action: enforce` rule reads it — `body_text` /
+`body_json_path` for requests, `response_body` for responses, plus the
+body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials, which read both. A
+rule is applicable only when its path, method, header, and consumer conditions
+match the current request. A request-wide `global_exemptions.header_present`
+match also suppresses both rule hits and this fail-closed decision. Built-in
+rules are monitor-only unless you set `default_rule_action` or `rule_modes`, so
+a purely observational WAF (and any `mode: monitor` WAF) keeps prefix-scanning
+and never starts blocking. Requests and responses share one decision, so H1,
+H2, and H3 behave identically, and the request decision is made on the finalized
+backend-visible body — a request transformer that grows a body past the cap is
+still governed.
+
+Prefer sizing over rejecting where you can: setting `max_scan_bytes` at or above
+the effective request/response ceiling (including any route-scoped ceiling)
+means no admitted body is ever oversize, and `fail_closed` never fires.
 
 `scan_budget_ms` bounds total scan time; `on_scan_timeout` (`allow`, `block`,
 `log_and_allow`) decides the outcome when the budget is exceeded.
@@ -317,9 +349,11 @@ For a pristine backend `text/event-stream`, request `Accept` and internal
 streaming markers cannot bypass response-body policy. Because an unbounded
 stream cannot be truncated and scanned before headers are committed,
 `on_body_too_large` supplies the explicit disposition: `skip` allows it
-uninspected; `block` rejects in enforce mode; and `scan_truncated` rejects when
-an enforcing response-body rule or anomaly-scoring policy would otherwise claim
-inspection, while monitor-only policy records and allows it. With metadata
+uninspected; `block` rejects in enforce mode; and both `fail_closed` and
+`scan_truncated` reject when an enforcing response-body rule or anomaly-scoring
+policy would otherwise claim inspection, while monitor-only policy records and
+allows it. The prefix-only opt-out does not reach an unbounded stream — it
+concedes the suffix of a bounded body, and here there is no prefix. With metadata
 logging enabled, WAF writes `waf.response_stream_uninspectable=true` plus either
 `waf.action=stream_uninspected` or `waf.action=blocked` and
 `waf.block_reason=unbounded_response_stream`. `on_scan_timeout` does not apply
@@ -460,7 +494,10 @@ logging sinks are configured (stdout, http, tcp, kafka, loki, …):
 `waf.instances.<id>.score` / `waf.instance_scores`, `waf.action`
 (`blocked` / `monitored` / `clean`), `waf.first_blocking_rule`,
 `waf.block_reason`, `waf.scoring_instance`, `waf.would_block_reason`,
-`waf.paranoia`, plus `waf.scan_truncated` / `waf.scan_timed_out`. Blocked
+`waf.paranoia`, plus `waf.scan_truncated` / `waf.scan_timed_out` /
+`waf.body_too_large` / `waf.body_too_large_target` (`request_body` or
+`response_body`). All of these are fixed-cardinality; body bytes are never
+logged. Blocked
 requests reject before backend dispatch and still produce a transaction summary
 carrying these fields, so blocks are visible in the same per-request log line as
 allowed traffic.
@@ -503,7 +540,7 @@ fire, then switch to `enforce`.
 | `scan_budget_ms` | int | `50` | total scan-time budget (0 = unbounded) |
 | `on_scan_timeout` | enum | `log_and_allow` | `allow` / `block` / `log_and_allow` |
 | `max_scan_bytes` | int | `1048576` | body scan cap |
-| `on_body_too_large` | enum | `scan_truncated` | `scan_truncated` / `skip` / `block` |
+| `on_body_too_large` | enum | `fail_closed` | `fail_closed` / `scan_truncated` / `skip` / `block` |
 | `body_methods` | string[] | `[POST,PUT,PATCH]` | methods whose bodies are scanned |
 | `body_content_types` | string[] | see code | inspectable content types |
 | `inspect_multipart` | bool | `false` | scan multipart bodies |

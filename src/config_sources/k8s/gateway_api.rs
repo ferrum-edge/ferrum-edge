@@ -177,47 +177,144 @@ pub(super) fn translate(
     }
 }
 
+/// Borrowed, validated ReferenceGrant from×to permission cell.
+///
+/// Shared by canonical translation and status indexing so both sides consume
+/// one interpretation of Gateway API ReferenceGrant permissions (#2397).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValidatedReferenceGrantPermission<'a> {
+    pub from_namespace: &'a str,
+    pub from_group: &'a str,
+    pub from_kind: &'a str,
+    pub to_group: &'a str,
+    pub to_kind: &'a str,
+    /// `None` = Gateway API wildcard (absent `to.name`); `Some` = named grant.
+    pub to_name: Option<&'a str>,
+}
+
+/// Whole-object ReferenceGrant validation failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReferenceGrantParseError {
+    pub message: &'static str,
+}
+
+fn reference_grant_required_string<'a>(
+    entry: &'a Value,
+    field: &str,
+    message: &'static str,
+) -> Result<&'a str, ReferenceGrantParseError> {
+    match entry.get(field) {
+        Some(Value::String(value)) => Ok(value.as_str()),
+        _ => Err(ReferenceGrantParseError { message }),
+    }
+}
+
+/// Optional ReferenceGrant `to.name` without allocating.
+///
+/// - absent → `Ok(None)` (Gateway API wildcard)
+/// - string → `Ok(Some(name))` (named grant)
+/// - present non-string → `Err` (must never become wildcard)
+fn reference_grant_optional_to_name(to: &Value) -> Result<Option<&str>, ReferenceGrantParseError> {
+    match to.get("name") {
+        None => Ok(None),
+        Some(Value::String(name)) => Ok(Some(name.as_str())),
+        Some(_) => Err(ReferenceGrantParseError {
+            message: "ReferenceGrant spec.to[].name must be a string when present",
+        }),
+    }
+}
+
+/// Parse ReferenceGrant permissions with whole-object fail-closed semantics.
+///
+/// - Missing/non-array top-level `from` → `Ok([])` (no permissions).
+/// - Present `from[]` entries are validated first; a malformed present `from`
+///   entry returns `Err` even when top-level `to` is missing/non-array.
+/// - Valid `from` with missing/non-array `to` → `Ok([])` (authorizes nothing).
+/// - Every present from/to entry requires explicit string `namespace`/`group`/
+///   `kind` (from) and `group`/`kind` (to); absent `to.name` is the valid
+///   wildcard; present non-string `to.name` is invalid.
+/// - Any malformed present entry rejects the **entire** grant (no partial
+///   cells). Callers must grant nothing on `Err`.
+pub(crate) fn parse_reference_grant_permissions<'a>(
+    object: &'a K8sObject,
+) -> Result<Vec<ValidatedReferenceGrantPermission<'a>>, ReferenceGrantParseError> {
+    let Some(from_entries) = object.spec.get("from").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    // Validate every present from[] entry before consulting `to`, matching the
+    // pre-shared-parser collect loop: a malformed from must fail closed even
+    // when `to` is absent or non-array.
+    let mut validated_from = Vec::with_capacity(from_entries.len());
+    for from in from_entries {
+        let from_namespace = reference_grant_required_string(
+            from,
+            "namespace",
+            "ReferenceGrant spec.from[].namespace is required",
+        )?;
+        let from_group = reference_grant_required_string(
+            from,
+            "group",
+            "ReferenceGrant spec.from[].group is required",
+        )?;
+        let from_kind = reference_grant_required_string(
+            from,
+            "kind",
+            "ReferenceGrant spec.from[].kind is required",
+        )?;
+        validated_from.push((from_namespace, from_group, from_kind));
+    }
+
+    let Some(to_entries) = object.spec.get("to").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    let mut permissions = Vec::new();
+    for (from_namespace, from_group, from_kind) in validated_from {
+        for to in to_entries {
+            let to_kind = reference_grant_required_string(
+                to,
+                "kind",
+                "ReferenceGrant spec.to[].kind is required",
+            )?;
+            let to_group = reference_grant_required_string(
+                to,
+                "group",
+                "ReferenceGrant spec.to[].group is required",
+            )?;
+            let to_name = reference_grant_optional_to_name(to)?;
+            permissions.push(ValidatedReferenceGrantPermission {
+                from_namespace,
+                from_group,
+                from_kind,
+                to_group,
+                to_kind,
+                to_name,
+            });
+        }
+    }
+    Ok(permissions)
+}
+
 pub(super) fn collect_reference_grant(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
 ) -> Result<(), K8sTranslateError> {
-    for from in object
-        .spec
-        .get("from")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let from_namespace = string_field(from, "namespace").ok_or_else(|| {
-            invalid_resource(object, "ReferenceGrant spec.from[].namespace is required")
-        })?;
-        let from_group = string_field(from, "group").unwrap_or_default();
-        let from_kind = string_field(from, "kind").ok_or_else(|| {
-            invalid_resource(object, "ReferenceGrant spec.from[].kind is required")
-        })?;
-
-        for to in object
-            .spec
-            .get("to")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let to_kind = string_field(to, "kind").ok_or_else(|| {
-                invalid_resource(object, "ReferenceGrant spec.to[].kind is required")
-            })?;
-            let to_group = string_field(to, "group").unwrap_or_default();
-            let to_name = string_field(to, "name").map(ToOwned::to_owned);
-            acc.add_reference_grant(
-                from_namespace.to_string(),
-                from_group.to_string(),
-                from_kind.to_string(),
-                object.metadata.namespace.clone(),
-                to_group.to_string(),
-                to_kind.to_string(),
-                to_name,
-            );
-        }
+    // Validate the whole object before inserting any permission cell so a
+    // later malformed entry cannot leave earlier cells in the accumulator
+    // (status conflict context ignores Err with `let _ =`).
+    let permissions = parse_reference_grant_permissions(object)
+        .map_err(|err| invalid_resource(object, err.message))?;
+    for permission in permissions {
+        acc.add_reference_grant(
+            permission.from_namespace.to_string(),
+            permission.from_group.to_string(),
+            permission.from_kind.to_string(),
+            object.metadata.namespace.clone(),
+            permission.to_group.to_string(),
+            permission.to_kind.to_string(),
+            permission.to_name.map(str::to_owned),
+        );
     }
     Ok(())
 }
@@ -888,8 +985,8 @@ fn metadata_key<'a>(object: &'a K8sObject, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-pub(crate) fn route_conflicts(
-    objects: &[K8sObject],
+pub(crate) fn route_conflicts<'a>(
+    objects: impl IntoIterator<Item = &'a K8sObject>,
     options: &K8sTranslationOptions,
     acc: Option<&K8sAccumulator>,
 ) -> Vec<GatewayApiRouteConflict> {
@@ -900,7 +997,7 @@ pub(crate) fn route_conflicts(
     let mut route_entries: Vec<CrossKindRouteEntry> = Vec::new();
 
     for object in objects
-        .iter()
+        .into_iter()
         .filter(|object| super::includes_object_namespace(options, object))
         .filter(|object| matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute"))
     {

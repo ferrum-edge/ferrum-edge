@@ -73,6 +73,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+use crate::util::body_limit::{ContentLength, parse_content_length};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::replay_partition::{self, AnonymousCallerScope, PartitionHasher};
@@ -320,12 +321,20 @@ fn request_declares_body(headers: &HashMap<String, String>) -> bool {
     let Some(content_length) = header_value(headers, "content-length") else {
         return false;
     };
-    let trimmed = content_length.trim();
-    if trimmed.is_empty() {
-        return false;
+    // Keep folded values on the fail-closed bypass path even when every member
+    // is the same zero. This cache does not need to normalize request framing,
+    // and a single authoritative field is the narrow proof its key exemption
+    // is designed around.
+    if content_length.contains(',') {
+        return true;
     }
-    // An unparsable Content-Length is not proof of an empty body.
-    trimmed.parse::<u64>().map_or(true, |length| length > 0)
+    // `parse::<u64>()` accepts a leading `+`, which is not valid HTTP
+    // Content-Length syntax. Reuse the canonical 1*DIGIT parser so malformed,
+    // overflowing, and non-zero values are never evidence of an empty body.
+    !matches!(
+        parse_content_length(content_length),
+        ContentLength::Exact(0)
+    )
 }
 
 fn is_auto_sensitive_vary_header(header: &str) -> bool {
@@ -1455,28 +1464,32 @@ impl ResponseCaching {
     ///   rewritten path. `response_caching` runs at
     ///   [`super::priority::RESPONSE_CACHING`], after every route-dispatch
     ///   plugin, so this is the destination that will actually serve a miss;
-    /// * **request target** — original authority, `Host`, method, path, and the
+    /// * **request context** — original authority, `Host`, method, path, the
     ///   *effective outbound* query, so a `request_transformer` query rewrite
     ///   that ran before this plugin is part of the partition. The request
-    ///   header dimension is deliberately **not** the raw header view: it is the
-    ///   complete `Vary` tuple appended by [`Self::extend_base_key_with_vary`]
-    ///   (backend-nominated dimensions, `vary_by_headers`, and the mandatory
-    ///   credential/session auto-Vary), plus the caller partition below.
+    ///   header dimension binds every backend-visible header except the
+    ///   entry-operation headers whose semantics this plugin actually
+    ///   implements (`If-None-Match` / `If-Modified-Since` revalidation,
+    ///   pure honored bare request `Cache-Control: no-cache` / `no-store`
+    ///   refreshes when `respect_no_cache` is enabled, and zero-length
+    ///   `Content-Length` framing). This prevents replay across unannounced
+    ///   tenant or policy headers even when an origin omits `Vary`. Unsupported
+    ///   precondition / range / pragma dimensions and mixed / arbitrary
+    ///   `Cache-Control` content remain bound. The complete `Vary` tuple is
+    ///   additionally appended by [`Self::extend_base_key_with_vary`].
     ///
-    ///   Binding the whole live header map here instead would be
-    ///   self-defeating rather than stricter. A shared cache selects a stored
-    ///   representation by target + `Vary` (RFC 9111 §4.1), and three of this
-    ///   plugin's own contracts are addressed *to the entry* rather than
-    ///   selecting it: an `If-None-Match` / `If-Modified-Since` revalidation
-    ///   (RFC 9110 §13), a client `Cache-Control: no-cache` refresh whose
-    ///   zero-freshness response must invalidate the entry (RFC 9111 §5.2),
-    ///   and `Content-Length: 0` framing. Each of those requests carries a
-    ///   header the stored request did not, so a raw-header partition would put
-    ///   it in a different partition from the entry it names — and the `Vary`
-    ///   index, variant union, and predictor would become unreachable because
-    ///   no two requests could ever share a base key. Origin-visible headers
-    ///   the backend does not nominate are covered by `vary_by_headers`, and
-    ///   cross-caller isolation by the mandatory caller partition;
+    ///   Supported entry-operation headers are excluded so revalidation,
+    ///   pure no-cache/no-store replacement, and zero-length framing can still
+    ///   address the stored entry. Unimplemented
+    ///   precondition and pragma headers are *not* treated as operations: a
+    ///   fresh HIT must not ignore a client `If-Match` /
+    ///   `If-Unmodified-Since` / `If-Range` / `Range` / `Pragma` the plugin
+    ///   does not gate. `Cache-Control` exclusion is value-aware and gated by
+    ///   `respect_no_cache` — only a header whose every meaningful member is a
+    ///   bare, argument-free refresh this plugin honors is omitted; mixed
+    ///   recognized refresh plus any other member, argument-bearing refreshes,
+    ///   and any `Cache-Control` when `respect_no_cache` is false stay in the
+    ///   partition as backend-visible policy;
     /// * **complete `Vary` tuple** — appended to this base key by
     ///   [`Self::extend_base_key_with_vary`];
     /// * **caller authorization context** — see
@@ -1522,7 +1535,12 @@ impl ResponseCaching {
         // the digest so flipping it still produces a disjoint keyspace rather
         // than silently reusing entries minted under the other setting.
         hasher.bool_value("include_consumer", self.config.cache_key_include_consumer);
-        replay_partition::append_request_target_partition(&mut hasher, ctx, request_headers);
+        replay_partition::append_response_cache_request_partition(
+            &mut hasher,
+            ctx,
+            request_headers,
+            self.config.respect_no_cache,
+        );
         replay_partition::append_caller_partition(
             &mut hasher,
             ctx,

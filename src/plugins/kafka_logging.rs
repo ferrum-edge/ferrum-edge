@@ -1801,7 +1801,7 @@ impl KafkaLogging {
                 move |batch| {
                     let state = Arc::clone(&state);
                     let topic = topic.clone();
-                    async move { send_batch(&state, &topic, batch) }
+                    async move { send_batch(&state, &topic, &batch) }
                 }
             },
         );
@@ -2077,10 +2077,13 @@ pub(crate) async fn probe_byte_budget_before_serialize_for_test(
 /// `(instance_used_after_send, ceiling_used_after_send, instance_used_after_destroy,
 /// ceiling_used_after_destroy)`.
 ///
-/// The first two values must stay non-zero — librdkafka still retains its copies,
-/// so the lease must not have been released at handoff. The last two must be
-/// zero: producer destruction purges the queue, fires the delivery callback for
-/// every purged record, and releases each lease exactly once with no underflow.
+/// After `send_batch` returns, drop the probe-local batch before measuring the
+/// post-destroy snapshot so Ferrum's original lease handles are released and only
+/// librdkafka's opaque copies remain charged. The first two values must stay
+/// non-zero — those opaque copies are still retained downstream. The last two
+/// must be zero: producer destruction purges the queue, fires the delivery
+/// callback for every purged record, and releases each lease exactly once with
+/// no underflow.
 ///
 /// Failure is an assertable `Err` with a fixed, secret-free diagnostic, never a
 /// silent "capability unavailable" skip: librdkafka is an unconditional
@@ -2136,9 +2139,15 @@ pub(crate) fn probe_downstream_lease_ownership_for_test(
         byte_budget: Arc::clone(&byte_budget),
         finalized: AtomicBool::new(false),
     });
-    let _ = send_batch(&state, "ferrum-edge-downstream-ownership-probe", batch);
+    let _ = send_batch(&state, "ferrum-edge-downstream-ownership-probe", &batch);
     let instance_after_send = byte_budget.used();
     let ceiling_after_send = ceiling.used();
+
+    // `send_batch` clones each lease Arc into librdkafka's opaque; release the
+    // probe's own `KafkaRecord` handles so post-send/post-destroy snapshots
+    // charge only what librdkafka retains, matching production where the shared
+    // `Arc<Vec<KafkaRecord>>` is dropped after admission.
+    drop(batch);
 
     // `ThreadedProducer::drop` joins the poll thread and the inner
     // `BaseProducer::drop` purges queue + in-flight, then flushes; the flush
@@ -2550,9 +2559,9 @@ impl Plugin for KafkaLogging {
 fn send_batch(
     state: &Arc<KafkaProducerState>,
     topic: &str,
-    batch: Vec<KafkaRecord>,
+    batch: &[KafkaRecord],
 ) -> Result<(), String> {
-    for record in batch {
+    for record in batch.iter() {
         // `ThreadedProducer::send` is the non-blocking local-queue admission
         // API; broker I/O and delivery callbacks run on librdkafka's own
         // thread. Calling it directly avoids queueing one Tokio blocking task
@@ -2566,17 +2575,19 @@ fn send_batch(
         // therefore keeps charging the downstream queue against both the
         // per-instance budget and the process-wide ceiling, and
         // `KafkaDeliveryContext::delivery` performs the single release.
-        let KafkaRecord {
-            payload,
-            key,
-            lease,
-        } = record;
-        let enqueue_error = match key.as_deref() {
+        //
+        // The shared logger Arc-shares one `Arc<Vec<KafkaRecord>>` across the
+        // single attempt this sink configures. Cloning the lease Arc transfers
+        // accounting into the opaque without deep-cloning payload/key strings;
+        // dropping the shared batch after admission releases Ferrum's handle
+        // while librdkafka retains its clone through delivery.
+        let lease = Arc::clone(&record.lease);
+        let enqueue_error = match record.key.as_deref() {
             Some(key) => state
                 .producer
                 .send(
                     BaseRecord::<str, str, Arc<KafkaByteLease>>::with_opaque_to(topic, lease)
-                        .payload(payload.as_ref())
+                        .payload(record.payload.as_ref())
                         .key(key),
                 )
                 .err()
@@ -2592,7 +2603,7 @@ fn send_batch(
                 .producer
                 .send(
                     BaseRecord::<(), str, Arc<KafkaByteLease>>::with_opaque_to(topic, lease)
-                        .payload(payload.as_ref()),
+                        .payload(record.payload.as_ref()),
                 )
                 .err()
                 .map(|(error, rejected)| {
