@@ -181,3 +181,26 @@ fn deadline_bearing_buffered_logging_uses_owned_bounded_cleanup() {
     assert!(helper.contains("crate::observability_delivery::spawn_deadline_cleanup(async move"));
     assert!(helper.contains("std::time::Duration::from_secs(5)"));
 }
+
+#[test]
+fn shipped_example_plugins_declare_never_response_body_production() {
+    assert!(
+        EXAMPLE_SOURCE.contains("fn response_body_production(&self) -> ResponseBodyProduction")
+            && EXAMPLE_SOURCE.contains("ResponseBodyProduction::Never"),
+        "example_plugin must declare Never so buffered H1/H2 responses are not refused as Undeclared"
+    );
+    assert!(
+        !EXAMPLE_SOURCE.contains("fn transform_response_body")
+            && !EXAMPLE_SOURCE.contains("fn normalize_response_body"),
+        "Never must stay truthful for example_plugin"
+    );
+    assert!(
+        CUSTOM_PLUGIN_GUIDE.contains("ResponseBodyProduction::Never")
+            && CUSTOM_PLUGIN_GUIDE.contains("intentionally fail-closed")
+            && CUSTOM_PLUGIN_GUIDE.contains("refuses the producer before invocation")
+            && CUSTOM_PLUGIN_GUIDE.contains("BoundedByRetainedCeiling")
+            && CUSTOM_PLUGIN_GUIDE.contains("BoundedResponseBodySink")
+            && CUSTOM_PLUGIN_GUIDE.contains("refused rather than installed"),
+        "CUSTOM_PLUGINS.md must teach the fail-closed custom producer contract"
+    );
+}

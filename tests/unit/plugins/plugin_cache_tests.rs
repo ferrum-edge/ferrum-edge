@@ -2,6 +2,7 @@
 
 use chrono::Utc;
 use ferrum_edge::_test_support::{
+    PRODUCER_REFUSED_UNDECLARED_CONTRACT, admit_response_body_producer_for_test,
     incremental_plugin_rebuild_targets_for_test,
     initial_response_header_policy_plugins_by_bare_proxy_id_for_test,
     initial_response_header_policy_plugins_for_test, plugin_cache_with_real_ip_header_for_test,
@@ -18,9 +19,10 @@ use ferrum_edge::config::types::{
     PluginScope, Proxy,
 };
 use ferrum_edge::config_delta::ConfigDelta;
+use ferrum_edge::plugins::builtin_parity::declared_response_body_production;
 use ferrum_edge::plugins::{
-    Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
-    apply_initial_response_header_policies,
+    Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext, ResponseBodyProduction,
+    StreamConnectionContext, apply_initial_response_header_policies,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use ferrum_edge::{PluginCache, PluginCapabilities};
@@ -149,6 +151,11 @@ struct StalledDeadlineResponseTransformer;
 
 #[async_trait::async_trait]
 impl Plugin for StalledDeadlineResponseTransformer {
+    /// Test producer: declares the bounded-construction contract so the
+    /// buffered phases reserve a window for it (GHSA-pwcm-6rh8-f2gh).
+    fn response_body_production(&self) -> ferrum_edge::plugins::ResponseBodyProduction {
+        ferrum_edge::plugins::ResponseBodyProduction::BoundedByRetainedCeiling
+    }
     fn name(&self) -> &str {
         "stalled_deadline_response_transformer"
     }
@@ -1438,6 +1445,141 @@ fn mesh_route_dispatch_ignores_non_http_interleaving_when_finalizing() {
     let tcp_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
     let tcp_names: Vec<_> = tcp_plugins.iter().map(|plugin| plugin.name()).collect();
     assert_eq!(tcp_names, ["tcp_connection_throttle"]);
+}
+
+/// Cache-internal finalizers are proven response-body non-producers whose
+/// names are absent from the public built-in inventory. They must declare
+/// `Never` on the live `Plugin` so the shared producer gate does not refuse
+/// them as `Undeclared` (GHSA-pwcm-6rh8-f2gh / Gateway HTTPRoute 503s).
+#[tokio::test]
+async fn cache_internal_finalizers_declare_response_body_never() {
+    let mesh_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["get-route", "post-route"])],
+        vec![
+            make_plugin_config_with_json(
+                "get-route",
+                "mesh_route_dispatch",
+                json!({
+                    "rules": [{
+                        "match": {"methods": ["GET"]},
+                        "destination": {"upstream_id": "get-backend"}
+                    }],
+                    "reject_unmatched": true
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "post-route",
+                "mesh_route_dispatch",
+                json!({
+                    "rules": [{
+                        "match": {"methods": ["POST"]},
+                        "destination": {"upstream_id": "post-backend"}
+                    }],
+                    "reject_unmatched": true
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let mesh_cache = PluginCache::new(&mesh_config).expect("mesh route chain");
+    let mesh_plugins = mesh_cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let mesh_finalizer = mesh_plugins
+        .iter()
+        .find(|plugin| plugin.name() == "__mesh_route_dispatch_finalizer")
+        .expect("mesh route chain installs the dispatch finalizer");
+    assert_eq!(
+        mesh_finalizer.response_body_production(),
+        ResponseBodyProduction::Never,
+        "mesh-route finalizer must not resolve through the public inventory default"
+    );
+    assert_eq!(
+        admit_response_body_producer_for_test(mesh_finalizer.response_body_production(), None),
+        None,
+        "a Never finalizer is admitted without a transform window"
+    );
+    let headers = HashMap::new();
+    assert!(
+        mesh_finalizer
+            .normalize_response_body_with_context(
+                &mut RequestContext::new("127.0.0.1".into(), "GET".into(), "/api".into()),
+                200,
+                br#"{"a":1}"#,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "Never must stay truthful: normalize returns None"
+    );
+    assert!(
+        mesh_finalizer
+            .transform_response_body(br#"{"a":1}"#, Some("application/json"), &headers)
+            .await
+            .is_none(),
+        "Never must stay truthful: transform returns None"
+    );
+
+    let cors_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["permissive", "strict"])],
+        vec![
+            cors_config(
+                "permissive",
+                &["GET", "DELETE"],
+                &["X-Shared", "Authorization"],
+                None,
+            ),
+            cors_config("strict", &["GET"], &["X-Shared"], None),
+        ],
+    );
+    let cors_cache = PluginCache::new(&cors_config).expect("composed CORS chain");
+    let cors_plugins = cors_cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let cors_finalizer = cors_plugins
+        .iter()
+        .find(|plugin| plugin.name() == "__cors_finalizer")
+        .expect("composed CORS installs the cors finalizer");
+    assert_eq!(
+        cors_finalizer.response_body_production(),
+        ResponseBodyProduction::Never,
+        "cors finalizer must not resolve through the public inventory default"
+    );
+    assert_eq!(
+        admit_response_body_producer_for_test(cors_finalizer.response_body_production(), None),
+        None,
+        "a Never finalizer is admitted without a transform window"
+    );
+    assert!(
+        cors_finalizer
+            .normalize_response_body_with_context(
+                &mut RequestContext::new("127.0.0.1".into(), "GET".into(), "/api".into()),
+                200,
+                br#"{"a":1}"#,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "Never must stay truthful: normalize returns None"
+    );
+    assert!(
+        cors_finalizer
+            .transform_response_body(br#"{"a":1}"#, Some("application/json"), &headers)
+            .await
+            .is_none(),
+        "Never must stay truthful: transform returns None"
+    );
+
+    // Out-of-tree / unknown names remain fail-closed: reserve + refuse.
+    assert_eq!(
+        declared_response_body_production("__custom_out_of_tree_plugin__"),
+        ResponseBodyProduction::Undeclared
+    );
+    assert_eq!(
+        admit_response_body_producer_for_test(ResponseBodyProduction::Undeclared, None),
+        Some(PRODUCER_REFUSED_UNDECLARED_CONTRACT)
+    );
 }
 
 fn plugin_ptr_by_name(plugins: &[Arc<dyn Plugin>], name: &str) -> usize {
@@ -8650,7 +8792,16 @@ async fn plugin_cache_wires_stable_plugin_config_id_into_dedup_logical_keys() {
         ));
         let keys = request_deduplication_logical_keys_from_context_for_test(&ctx);
         assert_eq!(keys.len(), 1);
-        keys.into_iter().next().unwrap()
+        let key = keys.into_iter().next().unwrap();
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(2))
+            .await;
+        assert_eq!(
+            plugin.tracked_keys_count(),
+            Some(0),
+            "logical-key probe must release in-flight ownership before the next same-identity lookup"
+        );
+        key
     }
 
     let sibling_a = logical_key(&first_plugins[0]).await;

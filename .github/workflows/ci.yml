@@ -349,6 +349,23 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      # The `acme` feature is not default, so the unit suite above compiles the
+      # DNS-01 hook out entirely. Issue #2409's cancellation contract (a hook
+      # child must not outlive the renewal claim) only has a gate if it is run
+      # explicitly with the feature on.
+      - name: Run ACME DNS-01 hook cancellation regressions
+        run: cargo test --features acme --test unit_tests tls::acme_dns01_hook_tests
+        env:
+          RUST_BACKTRACE: 1
+
+      # Same reason: the renewal-resumption entry point (issue #2409's crash
+      # recovery) only exists behind `acme`, so the takeover/skip decisions it
+      # makes before any ACME networking need the feature on to be gated at all.
+      - name: Run ACME renewal crash-recovery regressions
+        run: cargo test --features acme --lib tls::acme_renewal_resume_tests
+        env:
+          RUST_BACKTRACE: 1
+
   test-secrets:
     name: Secret Backends
     needs: ci-plan
@@ -966,6 +983,7 @@ jobs:
               functional_ai_response_guard_grpc_test
               functional_ai_stream_router_test
               functional_ai_semantic_firewall_streaming_test
+              functional_body_validator_request_representation_test
               functional_body_validator_response_stream_test
               functional_json_duplicate_key_test
               functional_grpc_method_pre_hook_test
@@ -1011,6 +1029,7 @@ jobs:
               functional_request_mirror_admission_test
               functional_request_mirror_query_parity_test
               functional_request_transformer_query_test
+              functional_ai_stream_router_boundary_test
               functional_openapi_client_contract_test
               functional_load_testing_replay_test
               functional_passthrough_test

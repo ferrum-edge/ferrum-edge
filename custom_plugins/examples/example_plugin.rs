@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use crate::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
-    StreamConnectionContext, TCP_ONLY_PROTOCOLS, TransactionSummary,
+    ResponseBodyProduction, StreamConnectionContext, TCP_ONLY_PROTOCOLS, TransactionSummary,
 };
 
 pub struct ExamplePlugin {
@@ -205,6 +205,15 @@ impl Plugin for ExamplePlugin {
     /// plugins.
     fn egresses_request_body_before_finalization(&self) -> bool {
         self.egresses_request_body_before_finalization
+    }
+
+    /// Header/request-body example: never replaces a retained response body.
+    /// Declare `Never` explicitly — custom plugin names are absent from the
+    /// built-in inventory, so the trait default resolves to `Undeclared` and
+    /// the shared producer gate refuses buffered H1/H2 response processing
+    /// before default hooks run (GHSA-pwcm-6rh8-f2gh).
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
     }
 
     /// Called after a route matches and its allowed-method check succeeds.

@@ -3,7 +3,8 @@
 use ferrum_edge::custom_plugins::{create_custom_plugin, custom_plugin_names};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
-    RequestContext, TCP_ONLY_PROTOCOLS, plugin_failure_policy, validate_plugin_config,
+    RequestContext, ResponseBodyProduction, TCP_ONLY_PROTOCOLS, plugin_failure_policy,
+    validate_plugin_config,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -214,5 +215,34 @@ fn shared_admission_uses_the_strict_constructor_and_keep_last_known_good_policy(
     assert_eq!(
         plugin_failure_policy("example_plugin"),
         Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
+}
+
+#[test]
+fn declares_never_response_body_production() {
+    let source = include_str!("../../../custom_plugins/examples/example_plugin.rs");
+    assert!(
+        source.contains("ResponseBodyProduction::Never"),
+        "example_plugin must explicitly declare Never rather than inherit Undeclared"
+    );
+    assert!(
+        source.contains("fn response_body_production(&self) -> ResponseBodyProduction"),
+        "example_plugin must override response_body_production"
+    );
+    assert!(
+        !source.contains("fn transform_response_body")
+            && !source.contains("fn normalize_response_body"),
+        "Never must stay truthful: example_plugin must not add a response-body producer hook"
+    );
+
+    if !example_plugin_registered() {
+        return;
+    }
+
+    let plugin = create_example_plugin(&json!({})).expect("empty object is valid");
+    assert_eq!(
+        plugin.response_body_production(),
+        ResponseBodyProduction::Never,
+        "live trait value must be Never when the opt-in example is compiled in"
     );
 }

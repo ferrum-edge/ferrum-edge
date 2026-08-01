@@ -33,6 +33,83 @@ pub fn tls_managed_store_path_from_env() -> String {
         .unwrap_or_else(|| DEFAULT_TLS_MANAGED_STORE_PATH.to_string())
 }
 
+/// Default bound on waiting for the shared managed-TLS/ACME store lock.
+pub const DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 10;
+/// Settings key for that bound.
+pub const TLS_STORE_LOCK_TIMEOUT_KEY: &str = "FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS";
+const MIN_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 1;
+const MAX_TLS_STORE_LOCK_TIMEOUT_SECONDS: u64 = 120;
+
+/// How long a managed TLS / ACME store mutation waits for the cross-instance
+/// advisory lock before failing closed (`FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`).
+///
+/// Read directly rather than through `EnvConfig` because the stores are opened
+/// lazily by the admin API, the `managed://` / `acme://` source loaders, and the
+/// renewal scheduler — all of which can run before or without a full
+/// `EnvConfig`.
+///
+/// # Absent, clamped, and malformed are three different things
+///
+/// * **Absent** — the key appears in neither the environment nor `ferrum.conf` —
+///   selects [`DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS`]. That is the documented
+///   default, not a fallback from a failure.
+/// * **A valid number outside the supported range** is clamped to
+///   `[1, 120]` seconds, which is the documented contract for this setting: the
+///   operator asked for a bound and gets the nearest supported one.
+/// * **A malformed value** — anything present that is not a whole number of
+///   seconds, blank included — is an **error**. Quietly substituting the
+///   default here would make a documented availability/security control lie: an
+///   operator who set `30s`, `sixty`, or nothing at all after the `=` would be
+///   told nothing and would run on a 10-second bound they never chose. A
+///   configured-but-unusable value is surfaced wherever the shared store is
+///   opened and fails that open closed.
+///
+/// The error names the variable and the rule, never the configured value:
+/// external-secret suffixes apply to every `FERRUM_*` key, so the value must
+/// not be echoed into a diagnostic (`secrets::is_external_secret_key`).
+pub fn tls_store_lock_timeout_from_env() -> Result<std::time::Duration, String> {
+    parse_tls_store_lock_timeout(
+        crate::config::conf_file::resolve_ferrum_var(TLS_STORE_LOCK_TIMEOUT_KEY).as_deref(),
+    )
+}
+
+/// The parsing/validation half of [`tls_store_lock_timeout_from_env`], split out
+/// from the environment read.
+///
+/// `None` is "the key is configured nowhere". Keeping the decision pure is what
+/// lets the three-outcome contract above be tested exhaustively without any
+/// test mutating a process-wide `FERRUM_*` variable that concurrently running
+/// store-open tests in the same binary would read.
+pub fn parse_tls_store_lock_timeout(raw: Option<&str>) -> Result<std::time::Duration, String> {
+    let seconds = match raw {
+        None => DEFAULT_TLS_STORE_LOCK_TIMEOUT_SECONDS,
+        Some(value) => value.trim().parse::<u64>().map_err(|_| {
+            format!(
+                "{TLS_STORE_LOCK_TIMEOUT_KEY} must be a whole number of seconds; \
+                 the configured value is not"
+            )
+        })?,
+    };
+    Ok(std::time::Duration::from_secs(seconds.clamp(
+        MIN_TLS_STORE_LOCK_TIMEOUT_SECONDS,
+        MAX_TLS_STORE_LOCK_TIMEOUT_SECONDS,
+    )))
+}
+
+/// Operator-pinned identity for this instance's shared TLS store leases
+/// (`FERRUM_TLS_STORE_INSTANCE_ID`).
+///
+/// Returned **verbatim**: `tls::lease` validates it and fails closed on an
+/// empty, overlong, or otherwise unusable value. Trimming or filtering here
+/// would be a silent normalization, and normalizing two distinct configured
+/// identities onto one is precisely what lets two replicas collide on a single
+/// renewal claim. A setting that is simply absent yields `None`, which selects
+/// the always-distinct generated identity.
+pub fn tls_store_instance_id_from_env() -> Option<String> {
+    let key = "FERRUM_TLS_STORE_INSTANCE_ID";
+    crate::config::conf_file::resolve_ferrum_var(key)
+}
+
 /// SQL connection target for secondary consumers that must track the gateway
 /// configuration database (`FERRUM_DB_TYPE` + effective `FERRUM_DB_URL`).
 ///
@@ -987,6 +1064,14 @@ pub struct EnvConfig {
     /// Seconds to wait after DNS-01 hook publication before marking the ACME
     /// challenge ready.
     pub acme_dns01_propagation_seconds: u64,
+    /// Lifetime of the shared per-certificate ACME renewal lease that makes one
+    /// instance the single renewer for a given certificate. The holder
+    /// heartbeats the claim every third of this value for as long as the
+    /// renewal runs, so it does **not** have to cover a whole order/finalize
+    /// cycle — only one heartbeat interval plus scheduling slack. What it does
+    /// set is how long a *crashed* holder's certificate stays unrenewable
+    /// before another instance takes over. Default: 900.
+    pub acme_renewal_lease_ttl_seconds: u64,
     /// When true, streaming responses are wrapped with a lightweight tracker
     /// that records the final transfer time via a deferred task. Adds one
     /// `Arc<StreamingMetrics>` + one `tokio::spawn` per streaming request.
@@ -1681,6 +1766,31 @@ pub struct EnvConfig {
     pub max_header_count: usize,
     pub max_request_body_size_bytes: usize,
     pub max_response_body_size_bytes: usize,
+    /// Fail-closed per-response ceiling applied when the effective response-body
+    /// limit resolves to `0` ("unlimited") *and* the response is being retained
+    /// in memory for a plugin rather than streamed. `0 = unlimited` remains a
+    /// valid streaming policy; it is not a valid buffering policy, because one
+    /// client-chosen response could then grow without bound
+    /// (GHSA-pwcm-6rh8-f2gh). Runtime clamps this fallback to one 64 KiB
+    /// reservation block at minimum and `usize::MAX / 2` at maximum. Default:
+    /// 10485760 (10 MiB).
+    pub response_buffer_fallback_max_bytes: usize,
+    /// Aggregate ceiling (bytes) on everything concurrent buffered responses
+    /// retain at once. A finite per-response ceiling still multiplies by
+    /// concurrency, so this is the bound that actually caps gateway memory under
+    /// a flood of buffered responses. The charge travels with the retained bytes
+    /// and is returned only when they are dropped, so this bounds *resident*
+    /// memory rather than collection time. A response that cannot reserve
+    /// capacity is refused with `503` / gRPC `RESOURCE_EXHAUSTED` instead of
+    /// being collected.
+    ///
+    /// Clamped up to at least the FALLBACK per-response ceiling
+    /// ([`Self::response_buffer_fallback_max_bytes`]) and nothing else: one
+    /// fallback-sized response is always admissible, but an arbitrarily larger
+    /// configured or route-effective per-response ceiling is NOT — widening the
+    /// aggregate cap to fit one huge response would hand the memory bound back
+    /// to whoever picks the response. Default: 268435456 (256 MiB).
+    pub response_buffer_max_total_bytes: usize,
     /// Cutoff (bytes) below which response bodies with a known Content-Length
     /// are eagerly buffered into a single allocation instead of streamed
     /// frame-by-frame. For small JSON API responses the single `bytes().await`
@@ -2538,6 +2648,7 @@ impl Default for EnvConfig {
             acme_renew_poll_timeout_seconds: 60,
             acme_dns01_hook_command: None,
             acme_dns01_propagation_seconds: 60,
+            acme_renewal_lease_ttl_seconds: 900,
             enable_streaming_latency_tracking: false,
             proxy_http_port: 8000,
             proxy_https_port: 8443,
@@ -2684,6 +2795,10 @@ impl Default for EnvConfig {
             max_header_count: 100,
             max_request_body_size_bytes: 10_485_760,
             max_response_body_size_bytes: 10_485_760,
+            response_buffer_fallback_max_bytes:
+                crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES,
+            response_buffer_max_total_bytes:
+                crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES,
             response_buffer_cutoff_bytes: 65_536,
             h2_coalesce_target_bytes: 131_072,
             max_url_length_bytes: 8_192,
@@ -2898,6 +3013,7 @@ impl EnvConfig {
             acme_renew_poll_timeout_seconds: u64 = "FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS" => 60u64, clamp(1u64, 600u64);
             acme_dns01_hook_command: Option<String> = "FERRUM_ACME_DNS01_HOOK_COMMAND";
             acme_dns01_propagation_seconds: u64 = "FERRUM_ACME_DNS01_PROPAGATION_SECONDS" => 60u64, clamp(0u64, 3600u64);
+            acme_renewal_lease_ttl_seconds: u64 = "FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS" => 900u64, clamp(60u64, 7_200u64);
             enable_streaming_latency_tracking: bool = "FERRUM_ENABLE_STREAMING_LATENCY_TRACKING" => false;
         }
         let log_buffer_bytes = log_buffer_bytes.max(log_max_record_bytes);
@@ -3144,6 +3260,8 @@ impl EnvConfig {
             max_header_count: usize = "FERRUM_MAX_HEADER_COUNT" => 100usize;
             max_request_body_size_bytes: usize = "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES" => 10_485_760usize;
             max_response_body_size_bytes: usize = "FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES" => 10_485_760usize;
+            response_buffer_fallback_max_bytes: usize = "FERRUM_RESPONSE_BUFFER_FALLBACK_MAX_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_BUFFERED_RESPONSE_FALLBACK_BYTES;
+            response_buffer_max_total_bytes: usize = "FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES" => crate::proxy::response_buffer_budget::DEFAULT_RESPONSE_BUFFER_TOTAL_BYTES;
             response_buffer_cutoff_bytes: usize = "FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES" => 65_536usize;
             h2_coalesce_target_bytes: usize = "FERRUM_H2_COALESCE_TARGET_BYTES" => 131_072usize, clamp(16_384usize, 1_048_576usize);
             max_url_length_bytes: usize = "FERRUM_MAX_URL_LENGTH_BYTES" => 8_192usize;
@@ -3665,6 +3783,7 @@ impl EnvConfig {
             acme_renew_poll_timeout_seconds,
             acme_dns01_hook_command,
             acme_dns01_propagation_seconds,
+            acme_renewal_lease_ttl_seconds,
             enable_streaming_latency_tracking,
             proxy_http_port,
             proxy_https_port,
@@ -3808,6 +3927,8 @@ impl EnvConfig {
             max_header_count,
             max_request_body_size_bytes,
             max_response_body_size_bytes,
+            response_buffer_fallback_max_bytes,
+            response_buffer_max_total_bytes,
             response_buffer_cutoff_bytes,
             h2_coalesce_target_bytes,
             max_url_length_bytes,

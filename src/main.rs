@@ -750,6 +750,15 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         env_config.max_concurrent_fault_delays,
     );
 
+    // Publish the buffered-response bounds before any listener accepts traffic,
+    // so the very first retained response is already charged against the
+    // aggregate budget and can never fall back to an unlimited ceiling
+    // (GHSA-pwcm-6rh8-f2gh).
+    crate::proxy::response_buffer_budget::init(
+        env_config.response_buffer_fallback_max_bytes,
+        env_config.response_buffer_max_total_bytes,
+    );
+
     // Apply the aggregate AI stream-accounting budget for the same reason and
     // at the same point: it bounds retained incremental usage-scanner state
     // across every concurrent model stream, so it must be in force before the

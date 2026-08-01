@@ -21,6 +21,7 @@ Every classifier funnels its result into [`crate::retry::ErrorClass`](../src/ret
 | `ReadWriteTimeout` | Backend read or write exceeded the per-direction watermark. | `true` (post-wire) |
 | `ProtocolError` | HTTP/2 or HTTP/3 protocol-level error after a stream is opened (stream reset, GOAWAY, RST_STREAM), or RFC 6455 WebSocket protocol violation. NOTE: gRPC h2c handshake failure classifies as `ConnectionRefused` (pre-wire), NOT `ProtocolError` — see the gRPC kind table below. | `true` (post-wire) |
 | `ResponseBodyTooLarge` | Backend response exceeded the configured maximum size. | `true` (post-wire) |
+| `GatewayBufferCapacity` | The gateway's process-wide budget for *retained* (buffered) response bodies could not admit this response (`FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES`). The backend answered correctly and within every per-response ceiling, so this is gateway-local transient capacity, not a backend fault: it is non-retryable and backend-health-neutral (`client_side_no_backend_signal`), and surfaces as HTTP `503` / gRPC `RESOURCE_EXHAUSTED`. | `true` (gateway-local terminal) |
 | `RequestBodyTooLarge` | Request body exceeded the configured maximum size. | `true` (post-wire) |
 | `ConnectionPoolError` | Could not acquire or create an HTTP client from the pool. | `false` (pre-wire) |
 | `PortExhaustion` | EADDRNOTAVAIL — all ephemeral ports in use. | `false` (pre-wire) |

@@ -373,6 +373,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: importAcmeCertificate
       summary: Import an ACME-issued certificate and private key
@@ -403,6 +405,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/acme/certificates/{id}:
     get:
@@ -424,6 +428,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateAcmeCertificate
       summary: Replace an ACME-issued certificate and private key
@@ -453,6 +459,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "408":
           $ref: "#/components/responses/RequestTimeout"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteAcmeCertificate
       summary: Delete an unreferenced ACME-issued TLS certificate
@@ -470,6 +478,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/acme/orders:
     get:
@@ -500,6 +510,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createAcmeOrder
       summary: Create an ACME HTTP-01, TLS-ALPN-01, or DNS-01 order
@@ -538,6 +550,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
 
@@ -549,6 +563,10 @@ paths:
         Lists non-secret ACME account metadata discovered from persisted
         ACME account credentials, orders, and certificates. Account credentials
         are never returned.
+
+        An empty list means the shared stores hold no accounts. A store that
+        cannot be opened, read, or parsed returns `500` instead: an unreachable
+        account store is never reported as "no persisted credentials".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/PaginationLimit"
@@ -566,6 +584,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/acme/renew/{id}:
     post:
@@ -608,6 +628,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
 
@@ -631,6 +653,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteAcmeOrder
       summary: Delete an ACME order and stop serving its challenges
@@ -646,16 +670,30 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/acme/orders/{id}/finalize:
     post:
       operationId: finalizeAcmeOrder
       summary: Finalize an ACME HTTP-01, TLS-ALPN-01, or DNS-01 order
       description: |
-        Marks the order's prepared HTTP-01, TLS-ALPN-01, or DNS-01 challenges ready,
-        waits for the ACME directory to accept the authorizations, finalizes
-        the order, fetches the issued certificate, and stores it as an
-        `acme://certificates/{id}` record. The endpoint requires the optional
+        Drives the order from whatever state the ACME directory currently reports
+        it in, and stores the issued certificate as an `acme://certificates/{id}`
+        record. A `pending` order validates each challenge endpoint, notifies only
+        challenges that are still `pending` (leaving `processing`/`valid`
+        challenges alone and failing closed on `invalid`), and is polled to
+        `ready`; a `ready` order is
+        finalized exactly once with the CSR generated when the order was created;
+        a `processing` or `valid` order is **not** finalized again — its
+        certificate is retrieved and paired with the private key persisted at
+        creation time. An `invalid` order fails closed. An order whose persisted
+        key/CSR material is missing or unusable is rejected with `400` before any
+        directory request using a fixed response that never describes the material.
+        Usability requires exactly one parseable private key PEM record, a complete
+        CSR DER whose signature verifies, matching private-key/CSR public keys, and
+        a CSR DNS SAN set that exactly matches the order domains. The endpoint
+        requires the optional
         `acme` Cargo feature and returns `501 Not Implemented` without it.
         Persisted order and server-provided authorization, challenge, finalize,
         and certificate URLs remain subject to the directory's HTTPS same-origin
@@ -689,10 +727,12 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
-        "502":
-          $ref: "#/components/responses/BadGateway"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/BadGateway"
 
   /admin/tls/certificates:
     get:
@@ -715,6 +755,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsCertificate
       summary: Upload an admin-managed TLS certificate and private key
@@ -747,6 +789,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/certificates/{id}:
     get:
@@ -770,6 +814,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsCertificate
       summary: Rotate an admin-managed TLS certificate and private key
@@ -807,6 +853,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsCertificate
       summary: Delete an unreferenced admin-managed TLS certificate
@@ -826,6 +874,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/ca-bundles:
     get:
@@ -848,6 +898,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsCaBundle
       summary: Upload an admin-managed TLS CA bundle
@@ -879,6 +931,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/ca-bundles/{id}:
     get:
@@ -902,6 +956,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsCaBundle
       summary: Rotate an admin-managed TLS CA bundle
@@ -937,6 +993,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsCaBundle
       summary: Delete an unreferenced admin-managed TLS CA bundle
@@ -956,6 +1014,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/crls:
     get:
@@ -978,6 +1038,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsCrl
       summary: Upload an admin-managed TLS CRL bundle
@@ -1009,6 +1071,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/crls/{id}:
     get:
@@ -1032,6 +1096,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsCrl
       summary: Rotate an admin-managed TLS CRL bundle
@@ -1065,6 +1131,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsCrl
       summary: Delete an unreferenced admin-managed TLS CRL bundle
@@ -1084,6 +1152,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/ocsp-responses:
     get:
@@ -1106,6 +1176,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsOcspResponse
       summary: Upload an admin-managed DER OCSP response
@@ -1137,6 +1209,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/ocsp-responses/{id}:
     get:
@@ -1160,6 +1234,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsOcspResponse
       summary: Rotate an admin-managed DER OCSP response
@@ -1193,6 +1269,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsOcspResponse
       summary: Delete an unreferenced admin-managed OCSP response
@@ -1212,6 +1290,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/jwks:
     get:
@@ -1234,6 +1314,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     post:
       operationId: createManagedTlsJwks
       summary: Upload an admin-managed JWKS document
@@ -1265,6 +1347,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/jwks/{id}:
     get:
@@ -1288,6 +1372,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     put:
       operationId: updateManagedTlsJwks
       summary: Rotate an admin-managed JWKS document
@@ -1321,6 +1407,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
     delete:
       operationId: deleteManagedTlsJwks
       summary: Delete an unreferenced admin-managed JWKS document
@@ -1340,6 +1428,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
 
   /admin/tls/rotate/{surface}:
     post:
@@ -14555,6 +14645,7 @@ components:
         - client_disconnect
         - protocol_error
         - response_body_too_large
+        - gateway_buffer_capacity
         - request_body_too_large
         - connection_pool_error
         - port_exhaustion
@@ -14570,6 +14661,14 @@ components:
         terminal gateway decisions taken before any backend dial (for example
         an unsupportable backend TLS SNI override) and is intentionally not a
         connection error, so retry policies do not fire.
+        `gateway_buffer_capacity` is the gateway's process-wide budget for
+        *retained* (buffered) response bodies refusing another response: the
+        backend answered correctly and within every configured per-response
+        ceiling, so the refusal is gateway-local transient capacity. It is
+        health-neutral (no circuit-breaker, passive-health, or
+        adaptive-concurrency effect) and not retried, and it surfaces as HTTP
+        `503` or gRPC `RESOURCE_EXHAUSTED` — never as a backend `502` /
+        `response_body_too_large`.
 
     DisconnectCause:
       type: string
@@ -19289,7 +19388,23 @@ components:
         decoded protobuf messages must satisfy proto2 required-field
         initialization. Configuration errors use value-free field and category
         messages; supplied keys, paths, URIs, schema values, XML entries, and
-        compiler diagnostics are not reproduced.
+        compiler diagnostics are not reproduced. Applicability follows the
+        configured representation, never the request method: any request whose
+        Content-Type matches content_types (or is application/grpc for protobuf
+        configs) is buffered and validated, including GET, HEAD, OPTIONS,
+        DELETE, PUT, PATCH, and non-standard methods. Once a configured rule
+        applies, an empty, absent, or non-UTF-8 representation fails closed
+        (400 request, 502 response) instead of being skipped, and native gRPC
+        always runs frame validation. The only exemptions are protocol-defined:
+        empty terminal gRPC error replies (a single valid non-zero grpc-status),
+        and responses that carry no content by status/method semantics (1xx,
+        204, 205, 304, and responses to HEAD). Early before_proxy inspection
+        prefers a rewritten UTF-8 request_body metadata view when present,
+        falls back to raw buffered bytes when no text view exists, then the
+        transport-proven-empty witness, and otherwise fails closed; the final
+        request-body hook validates the exact backend-visible bytes.
+        Representation-gap diagnostics are fixed strings and never echo body
+        bytes.
       properties:
         json_schema:
           type: object

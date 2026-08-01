@@ -178,6 +178,244 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Buffered response bodies the gateway retains are now bounded per response and
+  in aggregate, and every retained allocation is charged before it exists
+  (GHSA-pwcm-6rh8-f2gh). `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0` ("unlimited")
+  remains a streaming policy but folds to a finite fail-closed ceiling whenever
+  a body is retained, and a new process-wide budget
+  (`FERRUM_RESPONSE_BUFFER_MAX_TOTAL_BYTES`, default 256 MiB, charged in 64 KiB
+  blocks) caps what all concurrent buffered responses hold at once. The charge
+  is owned by the allocation rather than by the request, so it survives the
+  collector's return and is released when the last handle drops — covering
+  retries, plugin replacement, the response cache entry copy, deadlines,
+  disconnects, and cancellation identically. What is charged is CAPACITY, not
+  payload length: collectors pick their own growth target and reserve it before
+  asking the allocator, preallocation hints are charged before they are
+  allocated, and the eager small-response paths collect through that same
+  collector instead of awaiting an opaque whole-body read (a declared
+  `Content-Length` is a backend claim, not proof of the capacity handed out).
+  Representation decodes charge their output capacity, their stacked
+  input+output peak, and a conservative per-codec working-set ceiling. Plugins
+  that replace a buffered response body (`response_transformer` body rules,
+  `compression`, `sse`, `grpc_web`, `mcp_gateway`, and the AI response
+  plugins) now run inside a reserved window: a full covering window is a
+  precondition of every producer invocation, refilled only after the previous
+  replacement was installed, and each producer materialises its output through
+  a ceiling-bounded sink so an oversized replacement is refused while it is
+  written rather than after it is resident. A plugin whose replacement contract
+  the gateway cannot prove — any out-of-tree plugin that does not declare
+  `Plugin::response_body_production()` — is refused rather than invoked, and a
+  chain that cannot rewrite reserves no window at all. Refusals are separated
+  by cause: a body past the per-response ceiling keeps its backend
+  `response_body_too_large` attribution, while an exhausted aggregate budget is
+  the gateway-local, health-neutral `gateway_buffer_capacity` terminal
+  (HTTP `503` / gRPC `RESOURCE_EXHAUSTED`) with a fixed redacted body, so it
+  never poisons circuit breaking, passive health, or adaptive concurrency.
+  "Materialises through a ceiling-bounded sink" now holds from the first output
+  byte in every declared producer, not just at the point the finished bytes are
+  installed: `sse` frames its wrapped event incrementally over the input instead
+  of building normalized full-body `String` copies, `ai_response_guard`
+  assembles redacted SSE one event at a time, applies its regex pattern passes
+  under one shared ceiling, and re-frames redacted protobuf straight into the
+  bounded output, `ai_stream_router` serializes its upstream-error envelope
+  through the sink and drives the buffered Anthropic normalizer in fixed-size
+  slices, and `grpc_web` streams base64 armouring into the sink rather than
+  holding a second complete encoded copy. Multi-pattern whole-body text redaction
+  keeps the prior pass buffer live while building the next inside one
+  ceiling-sized window, so allocator capacity slack can reduce the largest
+  redactable body to well below the per-response ceiling (often on the order of
+  half or less, depending on pattern count) and fail closed rather than
+  forwarding partially redacted bytes. `ai_response_guard`'s SSE
+  fail-closed residual check builds its candidate body under a reserved budget
+  window as well. That keeps the documented worst-case peak of a rewriting
+  response at exactly two ceilings (the old body plus one covering window).
+  Three residual holes in that construction-side bound are closed with it.
+  `grpc_web` no longer builds a complete trailer payload — every eligible,
+  upstream-controlled `(name, value)` cloned into an owned vector — before
+  copying or armouring it: the frame's declared length now comes from a bounded
+  counting pass that retains no value, and a second pass writes the payload
+  straight into the final bounded destination, so neither a complete payload nor
+  a complete binary preimage is ever resident beside the output. gRPC-Web
+  **text**-mode bodies that concatenate independently padded base64 segments
+  (one padded run per upstream flush boundary) are now accepted at reframing time,
+  decoded as one framed stream, and re-emitted as a single canonical standard
+  base64 body — original flush segment boundaries are not preserved on output.
+  The buffered
+  Anthropic SSE normalizer writes every normalized byte through an accumulator
+  bound to the response's own retained ceiling rather than returning a complete
+  expanded emission per call, so a small route-effective ceiling is enforced
+  from the first output byte instead of only after a constant-sized transient.
+  `ai_response_guard` reserves a real budget window for the two remaining
+  full-size candidates it builds during inspection (the JSON/content residual
+  scan and the native-gRPC redaction preflight), treating a refused window as a
+  rejection; and a detected `redact` that never produced a safe replacement is
+  now tracked in typed request state and rejected at the final response-body
+  hook, because a refused construction returns "no replacement", which a
+  transform loop would otherwise read as "unchanged" and forward the original
+  sensitive body. The reserve-then-fill sink seam hands its producer a target
+  limited to exactly the room it was admitted for, and no longer skips the fill
+  and its length check for a zero-length append.
+
+- `ai_stream_router` now enforces its provider credential and model policy
+  against the **final** backend-visible request instead of only at claim time
+  (GHSA-xhp5-hqj8-3mwg). The plugin selected a provider, stripped client
+  credentials, injected the provider key, and translated the body at priority
+  2984, while the generic `request_transformer` runs at 3000 — so a later header
+  rule could add, overwrite, or rename the credential (leaking a normal-backend
+  static secret to the third-party provider, or restoring a client-controlled
+  credential header), and a later body rule could replace the already-selected
+  `model` after `model_patterns` matched. Two shared lifecycle boundaries close
+  it, neither of which depends on relative priority: a new non-rejecting
+  `enforce_final_backend_header_policy` phase re-strips every credential and
+  gateway-identity header and re-installs only the selected provider's
+  credential over the finalized outbound header map — after every `before_proxy`
+  pass, after each deferred routing/remaining pass, and after a finalized-egress
+  header overlay, on the H1/H2 and native HTTP/3 ladders alike — and
+  `on_final_request_body` now fails closed unless the provider-visible `model` is
+  a non-empty string equal to the committed model that still matches the selected
+  provider's `model_patterns`, the final body is unambiguous JSON, and the
+  committed destination witness is intact. Model failures
+  return an OpenAI-shaped `400` (`model_policy_violation`); a broken
+  provider/route invariant returns `500` (`provider_policy_violation`). No model,
+  header, query, or body value is echoed or logged. Headers outside the plugin's
+  owned set are untouched, so intended non-credential transforms still apply —
+  Ferrum does not attempt to classify an arbitrary unknown custom header as a
+  credential, so a bespoke normal-backend secret header configured on the same
+  proxy is still forwarded. Because
+  the header re-assertion happens after every `before_proxy` hook, plugin-cache
+  admission now **rejects** `ai_stream_router` composed with
+  `request_deduplication` on the same proxy and protocol (`response_caching` was
+  already refused alongside it by the deferred-request-body-transformer rule).
+
+  The boundary now covers the rest of the provider-visible request as well,
+  through one private typed claim on the request context (never metadata, never
+  logged, holding the opaque owning-instance identity plus the exact committed
+  model, destination, resolved backend TLS, DNS decision, and backend-visible
+  query):
+
+  - **Model.** The model that selected the provider is authorization state, not
+    observability: it is committed to the private claim, and final body
+    enforcement plus the claim-owned response normalizers read it from there.
+    `ai_stream_router.model` remains published for logs and other plugins, but
+    is never read back — otherwise a later in-process plugin could change the
+    final body's `model` *and* republish that key as the same value, satisfying
+    an equality check while bypassing the selection that chose the provider, the
+    price, and (for `{model}` endpoints) the backend URL. Whether the owning
+    instance's own transform produced the Anthropic representation, and whether
+    the claim forbids tool use for this generation (the response normalizer's
+    fail-closed `tool_use` guard), are claim state for the same reason. The one
+    metadata value a claim-owned hook still reads is
+    `ai_stream_router.provider_content_encoding`, which comes from the
+    provider's own response headers and only selects a bounded decoder.
+  - **Query.** `request_transformer` can also add / update / rename / remove
+    query pairs after the claim, appending a normal-backend static secret to the
+    third-party provider target. The claim now freezes the exact safe
+    backend-visible query — after authentication strip markers and current
+    pre-router mutations — and the gateway replays it at
+    `effective_backend_query_string*`, the single capture funnel for H1/H2,
+    native HTTP/3, and retry replay. A folded endpoint query still means an
+    empty separately-appended query; otherwise the already-safe client query
+    continues unchanged.
+  - **Upstream identity and backend TLS.** The destination witness previously
+    checked only scheme/host/port/authority/path, so a later plugin could keep
+    the visible host while changing upstream / load-balancer identity or
+    weakening server verification, SNI, or mTLS. The claim now clears
+    `route_override_upstream_id` and requires it to stay clear, and pins
+    `route_override_resolved_tls` for exact equality (plaintext HTTP is a
+    distinct committed state). Both default public verification and
+    `inherit_backend_tls: true` are covered.
+  - **DNS.** A base proxy's `dns_override` was cleared only when the override
+    changed the backend host *text*, so a proxy already configured with the
+    provider's hostname kept its pinned address and could receive the provider
+    credential at an operator-chosen destination. A narrow typed route-override
+    knob (`RouteOverrideDnsPolicy::ClearInherited`, honored by
+    `RequestContext::apply_route_overrides*`) now lets a direct provider claim
+    revoke the inherited pin explicitly. Unrelated same-host route rewrites keep
+    their existing semantics.
+  - **Instance ownership.** Multiple `ai_stream_router` instances are allowed and
+    two of them may share a provider *name* while differing in endpoint, key,
+    provider type, patterns, and normalization — so the public
+    `ai_stream_router.provider` metadata key could not decide who owned a claim,
+    and both instances could reapply credentials, transform the body twice, or
+    normalize the response twice. Exactly one instance now claims (first match in
+    configured order), and request transformation, final header/query
+    enforcement, final body revalidation, response-header handling, and response
+    stream inspector / normalizer selection all verify the private owner.
+    `fail_on_missing_model` / `fail_on_no_matching_provider` still decide an
+    unclaimed request in normal plugin order.
+  - **Built-in coordination follows the private claim.** `ai_federation`,
+    `request_mirror`, `serverless_function`, `mcp_gateway`, and
+    `mesh_route_dispatch` decided whether to skip a claimed provider request
+    from the public `ai_stream_router_claimed` metadata string. Metadata is a
+    mutable map, so a later plugin deleting or rewriting that marker could make
+    those built-ins re-route, mirror, federate, or invoke a function over a
+    request whose third-party provider credential, model, destination, and query
+    were already committed. All five now decide from a crate-private
+    `RequestContext::has_ai_stream_router_claim()`, which exposes only the
+    claim's existence — never its owner, model, destination, TLS, DNS decision,
+    query, or credential. The marker is still published for logs and
+    third-party/custom plugins, and intentionally UNCLAIMED pass-through still
+    coordinates through `ai_stream_router_pass_through`.
+- Stateful plugin protections are no longer owned by an individual plugin
+  instance, so a qualifying configuration reload can no longer reset them
+  (GHSA-wmqm-6mxj-gm9p). `request_deduplication` in local mode now owns its
+  active idempotency leases, retained completed responses, execution barriers,
+  and their accounting through a **stable policy identity** (`namespace` +
+  plugin-config id) rather than through the instance the plugin cache happened
+  to construct. Previously a routine incremental rebuild handed a replacement
+  instance an empty map while the original request was still executing, so an
+  immediate retry of the same idempotency key re-dispatched a side-effecting
+  operation — a duplicate payment or write during ordinary dynamic
+  configuration change — and a completed entry retained only by the retired
+  instance was likewise forgotten. A compatible reload now inherits the live
+  state; changing `header_name`, switching between `local` and `redis`, or
+  changing `on_redis_unavailable` is a semantic change that isolates onto fresh
+  state, so a retired generation's late completion lands on the state it took
+  its lease from and cannot corrupt the replacement policy. Capacity and TTL
+  changes are compatible without resetting the protection domain. Each
+  admitted operation, completion, and execution barrier retains its original
+  protection window, so a reload cannot shorten an in-flight lease; new
+  operations use the replacement settings. Every still-live semantic
+  generation remains discoverable, so a rapid A → B → A policy sequence
+  recovers A's active protection domain instead of admitting against a third
+  empty state.
+  Retention is bounded to currently configured policies plus whatever in-flight
+  work still holds a reference.
+
+- `load_testing` now admits at most **one** effective instance per proxy after
+  global/proxy/proxy_group merge, rejected at plugin-cache construction
+  (GHSA-wmqm-6mxj-gm9p). Two same-name effective instances each held their own
+  run-admission flag and could start overlapping high-cost cohorts against one
+  gateway with no reload at all, multiplying thousands of loopback requests per
+  instance. Cross-generation admission for one policy identity was already
+  shared; this closes the duplicate-instance half.
+  Compatible-state lookup also retains every still-live semantic generation,
+  so an A → B → A reload cannot lose A's active cohort admission flag.
+
+- `body_validator` no longer fails open on unusual methods, empty bodies, or
+  uninspectable data (GHSA-2vmr-ww8r-mww3,
+  <https://github.com/ferrum-edge/ferrum-edge/security/advisories/GHSA-2vmr-ww8r-mww3>).
+  Request-side applicability now follows the configured representation instead
+  of a hard-coded `GET`/`HEAD`/`OPTIONS`/`DELETE` exclusion, so a body-bearing
+  request under a governed media type is buffered and validated on any method.
+  Once a configured rule applies, an empty JSON/XML document, a body that is not
+  valid UTF-8, and a missing buffered representation are rejections (`400`
+  request, `502` response) rather than silent pass-throughs; the early request
+  hook prefers a downstream-rewritten UTF-8 `request_body` metadata view when
+  present (composition with `ai_prompt_shield`), falls back to raw buffered
+  bytes when no text view exists, then the transport-proven-empty witness, and
+  otherwise fails closed — while the final request-body hook still validates
+  the exact backend-visible bytes. Native gRPC always runs frame validation, so
+  a zero-length transport body or anything shorter than the five-byte frame
+  header is rejected, while a well-formed frame carrying an empty proto3
+  message is validated normally. Response-side no-body exemptions are now
+  explicit and protocol-correct (`1xx`, `204`, `205`, `304`, `HEAD` responses,
+  and empty terminal gRPC *error* replies with a single valid non-zero
+  `grpc-status`); an ordinary body-bearing success such as `200` with an empty
+  body, or an empty `grpc-status: 0` unary reply, is no longer exempt. The new
+  representation-failure diagnostics are fixed strings that never log or echo
+  body bytes.
+
 - WAF no longer forwards the unscanned suffix of an oversize body past an
   enforcing body rule (GHSA-7jh9-fjqf-jcvf). `max_scan_bytes` defaults to 1 MiB
   while the gateway admits 10 MiB request and response bodies by default, and
@@ -285,6 +523,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schemas, always count; collision-shaped reserved spellings outside those
   contexts count fail-closed. The walk remains a conservative `chars/4`
   heuristic, not provider tokenizer parity.
+
 - Irreversible request egress no longer precedes request-body transformation or
   final request policy (GHSA-4vr5-4wm3-x5xv). `request_mirror` and
   `serverless_function` previously ran their external dispatch in

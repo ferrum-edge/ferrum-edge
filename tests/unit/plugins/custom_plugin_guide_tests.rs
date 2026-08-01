@@ -1,7 +1,7 @@
 //! Compile and consistency guard for the copyable custom-plugin guide sample.
 
 use async_trait::async_trait;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, ResponseBodyProduction};
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -67,6 +67,10 @@ impl Plugin for MyHeaderInjector {
         "my_header_injector"
     }
 
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
+    }
+
     async fn before_proxy(
         &self,
         _ctx: &mut RequestContext,
@@ -103,4 +107,40 @@ fn markdown_keeps_the_compiled_fallible_constructor_pattern() {
     assert!(!GUIDE.contains("let plugin = MyHeaderInjector::new(&config);"));
     assert!(GUIDE.contains("HeaderName::from_bytes(header_name.as_bytes())"));
     assert!(GUIDE.contains("HeaderValue::from_str(&header_value)"));
+}
+
+#[test]
+fn guide_teaches_fail_closed_response_body_production_contract() {
+    assert!(
+        GUIDE.contains("ResponseBodyProduction::Never"),
+        "quick-start / capability guidance must teach non-producers to declare Never"
+    );
+    assert!(
+        GUIDE.contains("BoundedByRetainedCeiling"),
+        "guide must name the only permitted producer declaration"
+    );
+    assert!(
+        GUIDE.contains("BoundedResponseBodySink") && GUIDE.contains("bounded_json_vec"),
+        "guide must require construction-time ceiling-bounded materialization"
+    );
+    assert!(
+        GUIDE.contains("post-allocation length check is not")
+            || GUIDE.contains("post-allocation length check is not a substitute")
+            || GUIDE.contains("A post-allocation length check is not sufficient"),
+        "guide must not imply a post-allocation length check is enough"
+    );
+    assert!(
+        GUIDE.contains("intentionally fail-closed")
+            && GUIDE.contains("refuses the producer before invocation"),
+        "guide must teach undeclared custom producers are refused before invocation"
+    );
+    assert!(
+        GUIDE.contains("refused rather than installed"),
+        "guide must teach Never+Some is refused rather than installed"
+    );
+    assert!(
+        GUIDE.contains("fn response_body_production(&self) -> ResponseBodyProduction")
+            && GUIDE.contains("ResponseBodyProduction::Never"),
+        "quick-start header-only sample must declare Never so copies do not inherit Undeclared"
+    );
 }

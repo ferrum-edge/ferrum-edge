@@ -208,6 +208,39 @@ pub struct ResponseTransformer {
 const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.response_transformer.static.v1";
 
 impl ResponseTransformer {
+    /// Apply the configured JSON body rules, serializing the result through a
+    /// sink bounded by `ceiling`.
+    ///
+    /// This is the single materialisation point for this plugin's replacement
+    /// body. Both `Plugin` entry points reach it, so the ceiling-bounded
+    /// construction cannot be bypassed by calling the context-free hook
+    /// (GHSA-pwcm-6rh8-f2gh).
+    fn apply_response_body_rules(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+        ceiling: usize,
+    ) -> crate::plugins::BoundedResponseBodyConstruction {
+        use crate::plugins::BoundedResponseBodyConstruction;
+
+        if !self.rules_enabled {
+            return BoundedResponseBodyConstruction::Unchanged;
+        }
+        // Framed gRPC is declined explicitly rather than left to fail inside
+        // `apply_body_rules`. Both routes return `Unchanged`, but only the
+        // explicit decline makes the media-type condition here symmetric with
+        // `enforces_response_body_policy` by construction, so the claim
+        // predicate and the enforcer cannot drift apart on the `+json` gRPC
+        // types that satisfy `is_json_content_type`.
+        if let Some(ct) = content_type
+            && (!body_transform::is_json_content_type(ct)
+                || body_transform::is_framed_grpc_content_type(ct))
+        {
+            return BoundedResponseBodyConstruction::Unchanged;
+        }
+        body_transform::apply_body_rules_bounded(body, &self.body_rules, ceiling)
+    }
+
     fn static_rules_may_modify_content_type(&self) -> bool {
         self.header_rules.iter().any(|rule| match rule.operation {
             HeaderOp::Add | HeaderOp::Update | HeaderOp::Remove => rule.key == "content-type",
@@ -990,15 +1023,52 @@ impl Plugin for ResponseTransformer {
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        // Body transforms operate on an assembled JSON document. A backend
-        // response that actually declares `text/event-stream` is outside that
-        // policy and must be released after headers rather than collected until
-        // the response-body ceiling. Missing, JSON, and every ambiguous type
-        // stay on the conservative buffered path. The shared refinement refuses
-        // this downgrade when any later hook may rewrite Content-Type, so a
-        // relabel cannot bypass the final client-visible policy decision.
-        self.should_buffer_response_body(ctx)
-            && !content_type.is_some_and(is_text_event_stream_media_type)
+        // Body transforms operate on an assembled JSON document. Once the
+        // backend named the media type, every representation this plugin
+        // provably declines can be released instead of collected up to the
+        // response-body ceiling and then rejected unread
+        // (GHSA-pwcm-6rh8-f2gh). The release condition mirrors what
+        // `transform_response_body` declines, with one fail-closed exception for
+        // ambiguous event-stream lookalikes that must remain bounded:
+        //
+        //   * an ordinary DECLARED non-JSON type (binary downloads,
+        //     `text/event-stream`, video, `application/octet-stream`, …) — the
+        //     transform returns `None` for it, and `enforces_response_body_policy`
+        //     declines it for the same reason, so nothing was ever going to read
+        //     these bytes;
+        //   * framed gRPC `+json` flavors — length-prefixed frames, declined by
+        //     both the transform and the claim predicate.
+        //
+        // Exact `text/event-stream` (optional parameters allowed) is released as
+        // the unbounded SSE representation. Ambiguous lookalikes that merely
+        // contain the `event-stream` substring — vendor types, `*-like` names,
+        // `+json` / profile parameters — stay buffered under the retained ceiling
+        // so they cannot inherit unbounded SSE treatment by substring coincidence.
+        //
+        // An ABSENT `Content-Type` is deliberately NOT released: the transform
+        // treats it as JSON, so those bytes are still inspected and a body rule
+        // still applies (including the fail-closed rejection of an untyped
+        // unparseable document). A non-identity `Content-Encoding` over a JSON
+        // type is likewise not released — the buffered path is what turns an
+        // undecodable representation into a fail-closed refusal instead of
+        // forwarding opaque bytes past a configured redaction.
+        //
+        // Two guards keep this from becoming a bypass: the shared refinement
+        // refuses the downgrade outright when any later hook may rewrite
+        // `Content-Type`, and a translated gRPC-Web response whose terminal
+        // metadata this instance polices stays buffered.
+        if !self.should_buffer_response_body(ctx) {
+            return false;
+        }
+        if self.requires_buffered_grpc_web_trailer_policy(ctx) {
+            return true;
+        }
+        !content_type.is_some_and(|ct| {
+            let release_declined_non_json = !body_transform::is_json_content_type(ct)
+                && !(body_transform::is_event_stream_content_type(ct)
+                    && !is_text_event_stream_media_type(ct));
+            release_declined_non_json || body_transform::is_framed_grpc_content_type(ct)
+        })
     }
 
     fn enforces_response_body_policy(
@@ -1274,7 +1344,7 @@ impl Plugin for ResponseTransformer {
         ctx: &mut RequestContext,
         body: &[u8],
         content_type: Option<&str>,
-        response_headers: &HashMap<String, String>,
+        _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         // Defense in depth: the shared synthetic path already skips ordinary
         // presentation transforms when `finalized_response_replay` is set.
@@ -1294,36 +1364,35 @@ impl Plugin for ResponseTransformer {
         // document still returns `None` into the gate's fail-closed rejection
         // instead of being forwarded unredacted.
         let content_type = effective_response_media_type(ctx, content_type, body);
-        self.transform_response_body(body, content_type, response_headers)
-            .await
+        // The rewritten document is serialized through a sink bounded by THIS
+        // response's retained ceiling — the same size as the window the phase
+        // reserved before invoking this hook — so an amplifying rule set is
+        // refused while the output is written rather than after a larger buffer
+        // is already resident (GHSA-pwcm-6rh8-f2gh).
+        self.apply_response_body_rules(body, content_type, ctx.retained_response_body_ceiling())
+            .into_transform_option(ctx)
     }
 
     /// The context-free transform. Every buffered call site reaches this through
     /// [`Plugin::transform_response_body_with_context`] above, which applies the
     /// `ctx`-dependent half of the claim symmetry first; this method carries the
     /// half that needs only the media type.
+    ///
+    /// Without a context there is no route-effective ceiling, so this falls back
+    /// to the process fail-closed retained ceiling — still finite, just looser
+    /// than the per-response one production uses.
     async fn transform_response_body(
         &self,
         body: &[u8],
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if !self.rules_enabled {
-            return None;
-        }
-        // Framed gRPC is declined explicitly rather than left to fail inside
-        // `apply_body_rules`. Both routes return `None`, but only the explicit
-        // decline makes the media-type condition here symmetric with
-        // `enforces_response_body_policy` by construction, so the claim
-        // predicate and the enforcer cannot drift apart on the `+json` gRPC
-        // types that satisfy `is_json_content_type`.
-        if let Some(ct) = content_type
-            && (!body_transform::is_json_content_type(ct)
-                || body_transform::is_framed_grpc_content_type(ct))
-        {
-            return None;
-        }
-        body_transform::apply_body_rules(body, &self.body_rules)
+        self.apply_response_body_rules(
+            body,
+            content_type,
+            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
+        )
+        .into_option()
     }
 
     fn on_response_body_transformed(

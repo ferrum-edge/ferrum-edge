@@ -5121,6 +5121,56 @@ fn test_forward_headers_lowercase() {
     assert_eq!(plugin.name(), "serverless_function");
 }
 
+/// Build a context carrying a REAL `ai_stream_router` provider claim by running
+/// the router's own `before_proxy`, then delete the public coordination marker.
+///
+/// Deleting it is the point: `serverless_function` invokes an external function
+/// over the finalized backend-visible representation, so a later plugin erasing
+/// the observability marker must not be able to hand a provider-bound request —
+/// its committed credential, model, destination, and query — to that function
+/// (`GHSA-xhp5-hqj8-3mwg`).
+async fn claimed_ai_stream_router_context() -> ferrum_edge::plugins::RequestContext {
+    let router = ferrum_edge::plugins::ai_stream_router::AiStreamRouter::new(
+        &json!({
+            "enabled": true,
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "endpoint": "https://api.openai.com/v1/chat/completions",
+                "api_key": "sk-provider-secret",
+                "model_patterns": ["gpt-*"]
+            }]
+        }),
+        default_client(),
+    )
+    .expect("ai_stream_router config should be valid");
+
+    let mut ctx = ferrum_edge::plugins::RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({"model": "gpt-4o", "stream": true, "messages": [{"role": "user", "content": "hi"}]})
+            .to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    assert!(matches!(
+        router.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        ferrum_edge::_test_support::request_has_ai_stream_router_claim_for_test(&ctx),
+        "the router must have recorded a private claim"
+    );
+    ctx.metadata.remove("ai_stream_router_claimed");
+    ctx
+}
+
 #[tokio::test]
 async fn test_skips_ai_stream_router_claimed_provider_requests() {
     let plugin = ServerlessFunction::new(
@@ -5133,9 +5183,11 @@ async fn test_skips_ai_stream_router_claimed_provider_requests() {
     )
     .unwrap();
 
-    let mut ctx = create_test_context();
-    ctx.metadata
-        .insert("ai_stream_router_claimed".to_string(), "true".to_string());
+    // Drive a REAL `ai_stream_router` claim. The public
+    // `ai_stream_router_claimed` metadata key is observability only; the
+    // decision is the private typed claim (`GHSA-xhp5-hqj8-3mwg`), so a
+    // marker-only fixture would no longer exercise the skip at all.
+    let mut ctx = claimed_ai_stream_router_context().await;
     let mut headers = HashMap::new();
     headers.insert(
         "authorization".to_string(),

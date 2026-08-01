@@ -627,15 +627,37 @@ pub fn parse_body_rules(config: &Value) -> Result<Vec<BodyRule>, String> {
 ///
 /// Content-type is checked by the caller — this function assumes JSON input.
 pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
+    apply_body_rules_bounded(body, rules, usize::MAX).into_option()
+}
+
+/// [`apply_body_rules`] with an explicit ceiling on the produced document.
+///
+/// The response side passes this response's retained ceiling so the rewritten
+/// JSON is serialized THROUGH a bounded sink: a rule set that amplifies a
+/// document past what the gateway reserved for it fails while the output is
+/// being written, instead of materialising a larger `Vec` that is only rejected
+/// afterwards (GHSA-pwcm-6rh8-f2gh). The request side keeps `usize::MAX`; its
+/// bounds live on the request-body ceilings.
+/// Returns [`crate::plugins::BoundedResponseBodyConstruction::CapacityRefused`]
+/// when a rule set claimed a rewrite but the rewritten document could not be
+/// serialized within the ceiling — distinct from an ordinary semantic no-op
+/// ([`crate::plugins::BoundedResponseBodyConstruction::Unchanged`]).
+pub(crate) fn apply_body_rules_bounded(
+    body: &[u8],
+    rules: &[BodyRule],
+    ceiling: usize,
+) -> crate::plugins::BoundedResponseBodyConstruction {
+    use crate::plugins::BoundedResponseBodyConstruction;
+
     if rules.is_empty() || body.is_empty() {
-        return None;
+        return BoundedResponseBodyConstruction::Unchanged;
     }
 
     let mut json: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
             debug!("body_transform: failed to parse body as JSON: {}", e);
-            return None;
+            return BoundedResponseBodyConstruction::Unchanged;
         }
     };
 
@@ -685,18 +707,19 @@ pub fn apply_body_rules(body: &[u8], rules: &[BodyRule]) -> Option<Vec<u8>> {
     }
 
     if modified {
-        match serde_json::to_vec(&json) {
-            Ok(bytes) => Some(bytes),
-            Err(e) => {
-                debug!(
-                    "body_transform: failed to serialize transformed body: {}",
-                    e
-                );
-                None
+        match crate::proxy::response_buffer_budget::bounded_json_vec(&json, ceiling) {
+            Some(bytes) => BoundedResponseBodyConstruction::Replaced(bytes),
+            None => {
+                // A claimed rewrite that cannot fit the retained ceiling (or
+                // cannot serialize) is a capacity construction refusal, not an
+                // ordinary no-op — forwarding the original body would undo the
+                // policy-governed rewrite (GHSA-pwcm-6rh8-f2gh).
+                debug!("body_transform: transformed body was not serialized within its ceiling");
+                BoundedResponseBodyConstruction::CapacityRefused
             }
         }
     } else {
-        None
+        BoundedResponseBodyConstruction::Unchanged
     }
 }
 

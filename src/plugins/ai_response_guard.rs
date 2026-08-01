@@ -778,6 +778,70 @@ impl AiResponseGuard {
         result
     }
 
+    /// [`Self::redact_text`] for a WHOLE client-visible replacement body, written
+    /// through ceiling-bounded sinks.
+    ///
+    /// `redact_text` is fine for one JSON string or one protobuf field — those are
+    /// scalars of an already-charged document. It is not fine for a plain-text or
+    /// unparseable-JSON response body, where its output IS the replacement: a
+    /// placeholder-expanding pattern set would materialise the complete expanded
+    /// `String` and only then be measured (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// The pattern passes stay SEQUENTIAL — pass `n+1` reads pass `n`'s output,
+    /// exactly as `redact_text` does, because a placeholder rendered by one
+    /// pattern may legitimately be rewritten by a later one. Two buffers are
+    /// therefore live at once, so they share ONE ceiling: each pass writes under
+    /// the room its still-live input leaves. That keeps this producer's transient
+    /// scratch inside a single retained ceiling, which is what makes the module's
+    /// two-ceiling peak (old body + one window) true for this path as well.
+    ///
+    /// `None` means a pass was refused; the caller leaves the response unchanged,
+    /// the same outcome an over-ceiling final document already had.
+    fn redact_text_bounded(&self, text: &str, ceiling: usize) -> Option<Vec<u8>> {
+        use crate::proxy::response_buffer_budget::{BoundedResponseBodySink, bounded_vec_from};
+
+        let mut current: Option<Vec<u8>> = None;
+        for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
+            // Pass 1 reads the already-charged response body, so the whole
+            // ceiling is available to it; later passes read a scratch buffer that
+            // is still resident, so only the remainder is. Charge CAPACITY, not
+            // length: geometric growth leaves slack above `len()`, and that
+            // slack is still resident inside the covering window
+            // (GHSA-pwcm-6rh8-f2gh). `checked_sub` fails closed on underflow /
+            // saturation when a prior pass somehow retained more than the
+            // shared ceiling.
+            let room = match current.as_ref() {
+                Some(buffer) => ceiling.checked_sub(buffer.capacity())?,
+                None => ceiling,
+            };
+            let mut sink = BoundedResponseBodySink::with_ceiling(room);
+            {
+                let input: &str = match current.as_deref() {
+                    // Every pass writes UTF-8 (matches land on character
+                    // boundaries and placeholders are `str`), so this cannot
+                    // fail; it is checked rather than assumed.
+                    Some(bytes) => std::str::from_utf8(bytes).ok()?,
+                    None => text,
+                };
+                if !write_pattern_replaced(
+                    &mut sink,
+                    &pattern.regex,
+                    pattern.placeholder.as_str(),
+                    input,
+                ) {
+                    return None;
+                }
+            }
+            current = Some(sink.finish()?);
+        }
+        // No configured pattern: the redactor is the identity, exactly as
+        // `redact_text` is, and the caller's unchanged-comparison handles it.
+        match current {
+            Some(redacted) => Some(redacted),
+            None => bounded_vec_from(text.as_bytes(), ceiling),
+        }
+    }
+
     /// Remove every rendered redaction placeholder from `text`.
     ///
     /// The residual re-scan (`redact_leaves_residual`) runs the detection
@@ -888,17 +952,39 @@ impl AiResponseGuard {
     /// performs, then re-scan the client-visible candidate (with the redactor's
     /// own placeholder markers and preserved structural scalars excluded). If
     /// unrewritable content still matches, the caller must reject.
-    fn redact_sse_leaves_residual(&self, body: &[u8]) -> bool {
+    /// `ceiling` is this response's retained ceiling; the candidate is built
+    /// under a budget window of that size, reserved before it exists.
+    ///
+    /// Returns `None` when the aggregate retained-response budget refused the
+    /// window — the caller must select the shared capacity terminal rather than
+    /// classify the refusal as residual restricted content. `Some(true)` means
+    /// redaction would leave residual detectable content; `Some(false)` means
+    /// the candidate is clean.
+    fn redact_sse_leaves_residual(&self, body: &[u8], ceiling: usize) -> Option<bool> {
         if self.detection_pattern_count == 0 {
-            return false;
+            return Some(false);
         }
+        // The candidate here is a COMPLETE would-be client-visible body, built
+        // during INSPECTION — before any producer phase has opened a transform
+        // window. Building it against the process fallback ceiling would leave a
+        // full-size attacker-shaped replacement resident beside the response body
+        // with nothing charged for it, which is exactly the aggregate-bound
+        // bypass this advisory closes. So a window sized to THIS response's
+        // retained ceiling is reserved first and released as soon as the scan is
+        // done, keeping the peak at the documented two ceilings; a budget that
+        // cannot admit it fails closed as capacity rather than materialising the
+        // candidate anyway (GHSA-pwcm-6rh8-f2gh).
+        let window = crate::proxy::response_buffer_budget::ResponseTransformWindow::open(ceiling)?;
         // Scan the exact bytes the client would receive: transformed output
         // when redaction changed an event, otherwise the original framing.
         // The residual pass masks only preserved top-level structural scalar
         // spans, so duplicate keys and formatting remain visible and matches in
         // cross-event, key, numeric, or non-data content still fail closed.
-        let redacted = self.redact_sse_body(body);
-        self.sse_body_has_residual(redacted.as_deref().unwrap_or(body))
+        let redacted = self.redact_sse_body(body, window.window_bytes());
+        let residual = self.sse_body_has_residual(redacted.as_deref().unwrap_or(body));
+        drop(redacted);
+        drop(window);
+        Some(residual)
     }
 
     /// Re-scan an SSE body produced by [`Self::redact_sse_body`]. Scan-all
@@ -1216,6 +1302,17 @@ impl AiResponseGuard {
                 }
                 ctx.metadata
                     .insert("ai_response_guard_redacted".to_string(), detected.join(","));
+                // `Continue` here is a PROMISE that the producer phase will
+                // install a redacted replacement, not a decision to deliver
+                // these bytes. Record the promise in typed request state so a
+                // producer that returns `None` — refused ceiling, refused
+                // scratch, a representation this plugin's rewriter cannot
+                // address — cannot silently become "unchanged" and forward the
+                // original detected body (GHSA-pwcm-6rh8-f2gh). The instance
+                // discharges its own entry when it installs bytes;
+                // `on_final_response_body` rejects anything still outstanding.
+                ctx.ai_response_guard_pending_redactions
+                    .insert(self.instance_id, detected.join(","));
                 if ctx.finalized_response_replay {
                     ctx.ai_response_guard_replay_redactions
                         .insert(self.instance_id);
@@ -1472,8 +1569,14 @@ impl AiResponseGuard {
         }
     }
 
-    fn redact_sse_event(&self, lines: &[&str]) -> Option<String> {
-        rewrite_sse_json_event(lines, |json| {
+    /// Rewrite one SSE event's JSON `data:` payload into `output`, or report
+    /// that the event is unchanged. `None` is construction refusal.
+    fn redact_sse_event(
+        &self,
+        output: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+        lines: &[&str],
+    ) -> Option<bool> {
+        rewrite_sse_json_event_into(output, lines, |json| {
             if self.scan_mode == ScanMode::All {
                 self.redact_all_strings_with_argument_shield(json);
             } else {
@@ -1488,10 +1591,10 @@ impl AiResponseGuard {
     ///
     /// Rewritten `data:` lines preserve their original CR/LF terminator so
     /// CRLF-encoded streams round-trip without mixing line endings. Frame JSON
-    /// is reserialized compactly by `serde_json::to_string`, which may alter
-    /// whitespace within a frame — clients consuming SSE byte-for-byte should
-    /// not depend on inner-frame formatting.
-    fn redact_sse_body(&self, body: &[u8]) -> Option<Vec<u8>> {
+    /// is reserialized compactly by `serde_json::to_writer` into the bounded
+    /// sink, which may alter whitespace within a frame — clients consuming SSE
+    /// byte-for-byte should not depend on inner-frame formatting.
+    fn redact_sse_body(&self, body: &[u8], ceiling: usize) -> Option<Vec<u8>> {
         let body_str = std::str::from_utf8(body).ok()?;
 
         // Fast-skip the common "redact mode but no PII in the stream" case.
@@ -1514,13 +1617,15 @@ impl AiResponseGuard {
             return None;
         }
 
-        let (output, modified) = rewrite_sse_events(body_str, |lines| self.redact_sse_event(lines));
+        // Assembled eventwise through the ceiling-bounded sink, so the rewritten
+        // stream is never materialised in full before the bound applies
+        // (GHSA-pwcm-6rh8-f2gh). Each event is framed/serialized directly into
+        // that sink — never as a complete would-be event `String` beside it.
+        let (output, modified) = rewrite_sse_events_bounded(body_str, ceiling, |output, lines| {
+            self.redact_sse_event(output, lines)
+        })?;
 
-        if modified {
-            Some(output.into_bytes())
-        } else {
-            None
-        }
+        if modified { Some(output) } else { None }
     }
 
     // ───────────────────────── native gRPC inspection ─────────────────────────
@@ -1677,12 +1782,43 @@ impl AiResponseGuard {
             // boundaries are matchable but not rewritable in any one scalar.
             let key_match = !self.detect_matches(&scan.map_keys).is_empty();
             let cross_boundary_only = self.grpc_match_only_across_boundaries(&scan);
-            let rewritten = self.redacted_grpc_body(ctx, response_headers, body);
-            if key_match || cross_boundary_only || rewritten.is_none() {
+            // This preflight builds a COMPLETE would-be client-visible body
+            // during INSPECTION, before the transform phase has reserved
+            // anything. Building it against nothing would leave a full-size
+            // attacker-shaped replacement resident beside the response body with
+            // no charge covering it, which is the aggregate-bound bypass this
+            // advisory closes. So a window sized to THIS response's retained
+            // ceiling is reserved first and released as soon as the preflight is
+            // done — the same shape `redact_sse_leaves_residual` uses, and the
+            // same documented two-ceiling peak. A budget that cannot admit the
+            // window is a capacity REFUSAL, not residual restricted content
+            // (GHSA-pwcm-6rh8-f2gh).
+            let redaction_verified =
+                match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(
+                    ctx.retained_response_body_ceiling(),
+                ) {
+                    Some(window) => {
+                        let rewritten = self.redacted_grpc_body(
+                            ctx,
+                            response_headers,
+                            body,
+                            window.window_bytes(),
+                        );
+                        let verified = rewritten.is_some();
+                        // The candidate is released BEFORE the window is, so the
+                        // charge covers it for its whole lifetime.
+                        drop(rewritten);
+                        drop(window);
+                        verified
+                    }
+                    None => {
+                        ctx.mark_buffered_response_capacity_refusal_pending();
+                        return PluginResult::Continue;
+                    }
+                };
+            if key_match || cross_boundary_only || !redaction_verified {
                 debug!(
-                    "ai_response_guard: gRPC redaction leaves residual content \
-                     (types: {:?}), rejecting response",
-                    detected
+                    "ai_response_guard: gRPC redaction leaves residual content, rejecting response"
                 );
                 let types_json: Vec<String> = detected
                     .iter()
@@ -1741,6 +1877,7 @@ impl AiResponseGuard {
         ctx: &RequestContext,
         response_headers: &HashMap<String, String>,
         body: &[u8],
+        ceiling: usize,
     ) -> Option<Vec<u8>> {
         let grpc = self.grpc.as_ref()?;
         let method = grpc.method(&Self::grpc_method_path(ctx))?;
@@ -1758,7 +1895,11 @@ impl AiResponseGuard {
         )
         .ok()?;
 
-        let mut rewritten = Vec::with_capacity(body.len());
+        // Frames accumulate into a ceiling-bounded sink, so a redaction that
+        // expands the wire representation past what the transform phase reserved
+        // is refused WHILE it is being built (GHSA-pwcm-6rh8-f2gh).
+        use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+        let mut rewritten = BoundedResponseBodySink::with_ceiling(ceiling);
         let mut changed = false;
         for frame in &frames {
             let payload = frame.payload.as_ref();
@@ -1770,15 +1911,14 @@ impl AiResponseGuard {
                 Some(paths) => redact_paths(&mut message, paths, &mut budget, &mut redact),
             };
             changed |= mutated.ok()?;
-            let encoded = message.encode_to_vec();
-            if encoded.len() > max_bytes {
+            if !push_reframed_grpc_message(&mut rewritten, &message, frame.compressed, max_bytes) {
                 return None;
             }
-            rewritten.extend_from_slice(&encode_grpc_frame(&encoded, frame.compressed)?);
         }
         if !changed {
             return None;
         }
+        let rewritten = rewritten.finish()?;
 
         // Re-verify against the exact bytes the client would receive, using the
         // same selected-field surface and aggregate matching as inspection.
@@ -2185,22 +2325,88 @@ fn decompress_grpc_gzip(
     Ok(decompressed)
 }
 
-/// Re-frame one protobuf payload, re-compressing when the source frame was
-/// compressed so the response stays consistent with its `grpc-encoding`.
-fn encode_grpc_frame(payload: &[u8], compress: bool) -> Option<Vec<u8>> {
-    let body: Cow<'_, [u8]> = if compress {
-        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(payload).ok()?;
-        Cow::Owned(encoder.finish().ok()?)
-    } else {
-        Cow::Borrowed(payload)
+/// Bytes of the gRPC frame header: one compressed flag plus a 4-byte
+/// big-endian message length.
+const GRPC_FRAME_HEADER_BYTES: usize = 5;
+
+/// Re-frame one redacted protobuf message directly INTO the bounded output,
+/// re-compressing when the source frame was compressed so the response stays
+/// consistent with its `grpc-encoding`.
+///
+/// Every byte is constructed inside a bound. The uncompressed case never builds
+/// a payload buffer at all: the encoded length is known before encoding, so the
+/// per-message limit is checked first, the room is reserved in the output, and
+/// `prost` writes the message straight into it. The compressed case must know
+/// the gzip member's length before it can write the frame header, so the payload
+/// and its member are materialised — but each inside a sink bounded by the
+/// per-message limit and by the room this frame has left, never as an unbounded
+/// `Vec` (GHSA-pwcm-6rh8-f2gh).
+///
+/// `false` means the message could not be framed within those bounds; the caller
+/// abandons the whole redaction rather than emitting a partial wire body.
+fn push_reframed_grpc_message(
+    out: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+    message: &DynamicMessage,
+    compress: bool,
+    max_bytes: usize,
+) -> bool {
+    use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+
+    let encoded_len = message.encoded_len();
+    if encoded_len > max_bytes {
+        return false;
+    }
+    let Some(room) = out
+        .ceiling()
+        .checked_sub(out.len())
+        .and_then(|left| left.checked_sub(GRPC_FRAME_HEADER_BYTES))
+    else {
+        return false;
     };
-    let length = u32::try_from(body.len()).ok()?;
-    let mut frame = Vec::with_capacity(5 + body.len());
-    frame.push(u8::from(compress));
-    frame.extend_from_slice(&length.to_be_bytes());
-    frame.extend_from_slice(body.as_ref());
-    Some(frame)
+
+    if !compress {
+        let Ok(length) = u32::try_from(encoded_len) else {
+            return false;
+        };
+        if encoded_len > room {
+            return false;
+        }
+        let mut header = [0u8; GRPC_FRAME_HEADER_BYTES];
+        header[1..].copy_from_slice(&length.to_be_bytes());
+        if !out.push(&header) {
+            return false;
+        }
+        return out.append_with(encoded_len, |buffer| message.encode(buffer));
+    }
+
+    // The compressed branch needs the encoded message before it can be deflated,
+    // so the preimage is one MESSAGE (already bounded by `max_bytes` above), not
+    // a would-be complete replacement, and it is itself built through a sink
+    // sized to exactly that length.
+    let mut payload = BoundedResponseBodySink::with_ceiling(encoded_len);
+    if !payload.append_with(encoded_len, |buffer| message.encode(buffer)) {
+        return false;
+    }
+    let Some(payload) = payload.finish() else {
+        return false;
+    };
+    let mut compressed = BoundedResponseBodySink::with_ceiling(room);
+    {
+        let mut encoder = GzEncoder::new(&mut compressed, flate2::Compression::default());
+        if encoder.write_all(&payload).is_err() || encoder.finish().is_err() {
+            return false;
+        }
+    }
+    let Some(compressed) = compressed.finish() else {
+        return false;
+    };
+    let Ok(length) = u32::try_from(compressed.len()) else {
+        return false;
+    };
+    let mut header = [0u8; GRPC_FRAME_HEADER_BYTES];
+    header[0] = 1;
+    header[1..].copy_from_slice(&length.to_be_bytes());
+    out.push(&header) && out.push(&compressed)
 }
 
 /// Collect every string value and string map key reachable from `message`,
@@ -3078,24 +3284,37 @@ impl Plugin for AiResponseGuard {
                 return PluginResult::Continue;
             }
 
-            if self.action == GuardAction::Redact && self.redact_sse_leaves_residual(body) {
-                debug!(
-                    "ai_response_guard: redact leaves residual SSE content (types: {:?}), rejecting response",
-                    detected
-                );
-                let types_json: Vec<String> = detected
-                    .iter()
-                    .map(|t| format!("\"{}\"", escape_json_string(t)))
-                    .collect();
-                Self::mark_rejected(ctx, detected.join(","));
-                return PluginResult::Reject {
-                    status_code: 502,
-                    body: format!(
-                        r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
-                        types_json.join(","),
-                    ),
-                    headers: HashMap::new(),
-                };
+            let retained_ceiling = ctx.retained_response_body_ceiling();
+            if self.action == GuardAction::Redact {
+                match self.redact_sse_leaves_residual(body, retained_ceiling) {
+                    None => {
+                        // Aggregate retained-memory exhaustion — not restricted
+                        // content. Mark the one-shot pending signal so the
+                        // enclosing on_response_body loop installs the shared
+                        // capacity terminal.
+                        ctx.mark_buffered_response_capacity_refusal_pending();
+                        return PluginResult::Continue;
+                    }
+                    Some(true) => {
+                        debug!(
+                            "ai_response_guard: redact leaves residual SSE content, rejecting response"
+                        );
+                        let types_json: Vec<String> = detected
+                            .iter()
+                            .map(|t| format!("\"{}\"", escape_json_string(t)))
+                            .collect();
+                        Self::mark_rejected(ctx, detected.join(","));
+                        return PluginResult::Reject {
+                            status_code: 502,
+                            body: format!(
+                                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                                types_json.join(","),
+                            ),
+                            headers: HashMap::new(),
+                        };
+                    }
+                    Some(false) => {}
+                }
             }
 
             return self.respond_to_detection(ctx, response_status, &detected);
@@ -3226,30 +3445,52 @@ impl Plugin for AiResponseGuard {
         // so fail closed (reject) when redaction would leave residual
         // detections rather than emit false "redacted" telemetry. Bodies whose
         // PII is fully rewritable fall through to the normal redact path below.
-        let leaves_residual = self.action == GuardAction::Redact
-            && if self.scan_mode == ScanMode::All {
-                self.redact_leaves_residual(&json)
-            } else {
-                self.content_redact_leaves_residual(&json)
-            };
-        if leaves_residual {
-            debug!(
-                "ai_response_guard: redact leaves residual content (types: {:?}), rejecting response",
-                detected
-            );
-            let types_json: Vec<String> = detected
-                .iter()
-                .map(|t| format!("\"{}\"", escape_json_string(t)))
-                .collect();
-            Self::mark_rejected(ctx, detected.join(","));
-            return PluginResult::Reject {
-                status_code: 502,
-                body: format!(
-                    r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
-                    types_json.join(","),
-                ),
-                headers: HashMap::new(),
-            };
+        //
+        // Both residual scans build a COMPLETE redacted candidate (a cloned
+        // document tree, and in scan-all its serialized form) during INSPECTION,
+        // where no producer phase has reserved anything. That candidate is
+        // upstream-shaped and the same order of size as the response, so it is
+        // charged like any other retained allocation: a window sized to this
+        // response's retained ceiling is reserved before the candidate exists
+        // and released as soon as the scan is done, keeping the peak at the
+        // documented two ceilings. A budget that cannot admit the window is a
+        // capacity refusal — not residual restricted content — and must select
+        // the shared health-neutral terminal (GHSA-pwcm-6rh8-f2gh).
+        if self.action == GuardAction::Redact {
+            match crate::proxy::response_buffer_budget::ResponseTransformWindow::open(
+                ctx.retained_response_body_ceiling(),
+            ) {
+                None => {
+                    ctx.mark_buffered_response_capacity_refusal_pending();
+                    return PluginResult::Continue;
+                }
+                Some(window) => {
+                    let leaves_residual = if self.scan_mode == ScanMode::All {
+                        self.redact_leaves_residual(&json)
+                    } else {
+                        self.content_redact_leaves_residual(&json)
+                    };
+                    drop(window);
+                    if leaves_residual {
+                        debug!(
+                            "ai_response_guard: redact leaves residual content, rejecting response"
+                        );
+                        let types_json: Vec<String> = detected
+                            .iter()
+                            .map(|t| format!("\"{}\"", escape_json_string(t)))
+                            .collect();
+                        Self::mark_rejected(ctx, detected.join(","));
+                        return PluginResult::Reject {
+                            status_code: 502,
+                            body: format!(
+                                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                                types_json.join(","),
+                            ),
+                            headers: HashMap::new(),
+                        };
+                    }
+                }
+            }
         }
 
         self.respond_to_detection(ctx, response_status, &detected)
@@ -3264,8 +3505,15 @@ impl Plugin for AiResponseGuard {
     ) -> Option<Vec<u8>> {
         // Protobuf redaction needs the request's gRPC method to select the
         // message descriptor, which only the context carries.
+        // Every replacement this plugin produces is built inside a
+        // materialisation bounded by THIS response's retained ceiling — the same
+        // size as the window the transform phase reserved before invoking it —
+        // so an amplifying redaction is refused during construction rather than
+        // after a larger buffer is resident (GHSA-pwcm-6rh8-f2gh).
+        let ceiling = ctx.retained_response_body_ceiling();
         if self.grpc_transform_applies(ctx, content_type) {
-            return self.redacted_grpc_body(ctx, response_headers, body);
+            let replacement = self.redacted_grpc_body(ctx, response_headers, body, ceiling);
+            return self.discharge_pending_redaction(ctx, replacement);
         }
         // A gRPC or gRPC-Web response body is length-prefixed protobuf framing
         // — or the base64 armoring of it — whatever the response `Content-Type`
@@ -3285,15 +3533,123 @@ impl Plugin for AiResponseGuard {
         if ctx.is_native_grpc_request() || response_is_grpc_framed(ctx, content_type, body) {
             return None;
         }
-        self.transform_response_body(body, content_type, response_headers)
-            .await
+        let replacement = self.redacted_response_body(body, content_type, ceiling);
+        self.discharge_pending_redaction(ctx, replacement)
     }
 
+    /// Context-free entry point. Without a request context there is no
+    /// route-effective ceiling, so it falls back to the process fail-closed
+    /// retained ceiling — still finite, just looser than the per-response one
+    /// production uses through the hook above.
     async fn transform_response_body(
         &self,
         body: &[u8],
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.redacted_response_body(
+            body,
+            content_type,
+            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
+        )
+    }
+
+    fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
+        ctx.ai_response_guard_replay_redactions
+            .contains(&self.instance_id)
+    }
+
+    /// The final verification seam for a promised redaction.
+    ///
+    /// A `redact` detection returns `Continue` from inspection and relies on the
+    /// producer phase to install the replacement. Every way that can fail —
+    /// a refused retained ceiling, a refused scratch pass, a serialization
+    /// error, a representation the rewriter declines — surfaces as `None`, which
+    /// the shared transform loop reads as "unchanged". This hook runs after
+    /// every transform over the bytes the client would actually receive, so an
+    /// undischarged promise here means the original detected body is still in
+    /// flight and must be replaced by a rejection rather than delivered
+    /// (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// The gateway's own capacity terminal is not affected: when the transform
+    /// phase installs it, the response is already replaced and this hook is not
+    /// reached at all.
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        let Some(detected) = ctx
+            .ai_response_guard_pending_redactions
+            .remove(&self.instance_id)
+        else {
+            return PluginResult::Continue;
+        };
+        warn!(
+            "ai_response_guard: detected content was not redacted before delivery (types: {}), rejecting response",
+            detected
+        );
+        Self::mark_rejected(ctx, detected.clone());
+        let types_json: Vec<String> = detected
+            .split(',')
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("\"{}\"", escape_json_string(name)))
+            .collect();
+        PluginResult::Reject {
+            status_code: 502,
+            body: format!(
+                r#"{{"error":"AI response blocked by content guard","detected_types":[{}],"message":"Response contains restricted content that could not be redacted before delivery."}}"#,
+                types_json.join(","),
+            ),
+            headers: HashMap::new(),
+        }
+    }
+
+    fn on_response_body_transformed(
+        &self,
+        _ctx: &mut RequestContext,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        // These values describe the upstream representation and become stale
+        // whenever redaction changes the client-visible bytes. The proxy calls
+        // this hook only after a transform returns `Some`, so clean bodies keep
+        // their validators.
+        response_headers.retain(|key, _| {
+            !RESPONSE_VALIDATORS
+                .iter()
+                .any(|header| key.eq_ignore_ascii_case(header))
+        });
+    }
+}
+
+impl AiResponseGuard {
+    /// Clear this instance's promised-redaction marker when — and only when — a
+    /// replacement was actually produced.
+    ///
+    /// `None` leaves the marker outstanding, so `on_final_response_body` turns
+    /// it into a rejection instead of letting the original detected body be
+    /// forwarded as "unchanged".
+    fn discharge_pending_redaction(
+        &self,
+        ctx: &mut RequestContext,
+        replacement: Option<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        if replacement.is_some() {
+            ctx.ai_response_guard_pending_redactions
+                .remove(&self.instance_id);
+        }
+        replacement
+    }
+
+    /// The single ceiling-bounded materialisation point for this plugin's
+    /// JSON / SSE / text replacement bodies.
+    fn redacted_response_body(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+        ceiling: usize,
     ) -> Option<Vec<u8>> {
         if !self.needs_body_transform {
             return None;
@@ -3315,7 +3671,7 @@ impl Plugin for AiResponseGuard {
 
         if let Some(ct) = content_type {
             if is_text_event_stream_media_type(ct) {
-                let redacted = self.redact_sse_body(body)?;
+                let redacted = self.redact_sse_body(body, ceiling)?;
                 return (!self.sse_body_has_residual(&redacted)).then_some(redacted);
             }
             if !is_json_content_type(ct) {
@@ -3323,8 +3679,11 @@ impl Plugin for AiResponseGuard {
                     return None;
                 }
                 let text = std::str::from_utf8(body).ok()?;
-                let redacted = self.redact_text(text);
-                return (redacted != text).then(|| redacted.into_bytes());
+                let redacted = self.redact_text_bounded(text, ceiling)?;
+                if redacted == text.as_bytes() {
+                    return None;
+                }
+                return Some(redacted);
             }
         }
 
@@ -3332,8 +3691,11 @@ impl Plugin for AiResponseGuard {
             Ok(json) => json,
             Err(_) if self.scan_mode == ScanMode::All => {
                 let text = std::str::from_utf8(body).ok()?;
-                let redacted = self.redact_text(text);
-                return (redacted != text).then(|| redacted.into_bytes());
+                let redacted = self.redact_text_bounded(text, ceiling)?;
+                if redacted == text.as_bytes() {
+                    return None;
+                }
+                return Some(redacted);
             }
             Err(_) => return None,
         };
@@ -3365,29 +3727,32 @@ impl Plugin for AiResponseGuard {
             self.redact_response_json(&mut json);
         }
 
-        serde_json::to_vec(&json).ok()
+        crate::proxy::response_buffer_budget::bounded_json_vec(&json, ceiling)
     }
+}
 
-    fn requires_replay_response_body_transform(&self, ctx: &RequestContext) -> bool {
-        ctx.ai_response_guard_replay_redactions
-            .contains(&self.instance_id)
+/// One `replace_all` pass with a LITERAL replacement, written through `sink`.
+///
+/// Equivalent to `regex.replace_all(text, NoExpand(placeholder))`: `replace_all`
+/// iterates the same non-overlapping match sequence `find_iter` yields, and a
+/// `NoExpand` replacement is emitted verbatim with no capture-group expansion.
+/// The difference is only that the result is written incrementally instead of
+/// being returned as a complete `String` (GHSA-pwcm-6rh8-f2gh).
+fn write_pattern_replaced(
+    sink: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+    regex: &Regex,
+    placeholder: &str,
+    text: &str,
+) -> bool {
+    let bytes = text.as_bytes();
+    let mut last = 0;
+    for matched in regex.find_iter(text) {
+        if !sink.push(&bytes[last..matched.start()]) || !sink.push(placeholder.as_bytes()) {
+            return false;
+        }
+        last = matched.end();
     }
-
-    fn on_response_body_transformed(
-        &self,
-        _ctx: &mut RequestContext,
-        response_headers: &mut HashMap<String, String>,
-    ) {
-        // These values describe the upstream representation and become stale
-        // whenever redaction changes the client-visible bytes. The proxy calls
-        // this hook only after a transform returns `Some`, so clean bodies keep
-        // their validators.
-        response_headers.retain(|key, _| {
-            !RESPONSE_VALIDATORS
-                .iter()
-                .any(|header| key.eq_ignore_ascii_case(header))
-        });
-    }
+    sink.push(&bytes[last..])
 }
 
 /// Blank scalar values under the root response/event keys whose values are
@@ -3403,9 +3768,23 @@ fn blank_top_level_structural_scalars(value: &mut Value) {
     }
 }
 
-/// Parse and rewrite one complete SSE event's joined JSON `data:` payload,
-/// preserving non-data fields and the first data line's terminator.
-fn rewrite_sse_json_event(lines: &[&str], mutate: impl FnOnce(&mut Value)) -> Option<String> {
+/// Rewrite one SSE event's JSON `data:` payload straight into `output`.
+///
+/// Returns:
+/// - `Some(false)` when the event is unchanged (nothing written; caller copies
+///   the original lines);
+/// - `Some(true)` when the rewritten event was framed/serialized into `output`;
+/// - `None` when construction was refused (overflow, serialization failure).
+///
+/// The rewritten JSON and event framing are written THROUGH the ceiling-aware
+/// sink from the first byte — never as a complete would-be event `String`
+/// beside it (GHSA-pwcm-6rh8-f2gh). Placeholder expansion and JSON escaping
+/// that amplify past the ceiling are therefore refused DURING construction.
+fn rewrite_sse_json_event_into(
+    output: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+    lines: &[&str],
+    mutate: impl FnOnce(&mut Value),
+) -> Option<bool> {
     let mut data_lines = Vec::new();
     let mut payloads = Vec::new();
     for (idx, line) in lines.iter().enumerate() {
@@ -3422,41 +3801,52 @@ fn rewrite_sse_json_event(lines: &[&str], mutate: impl FnOnce(&mut Value)) -> Op
         }
     }
     if payloads.is_empty() {
-        return None;
+        return Some(false);
     }
 
     let joined = payloads.join("\n");
     let trimmed = joined.trim();
     if trimmed.is_empty() || trimmed == "[DONE]" {
-        return None;
+        return Some(false);
     }
-    let mut json = serde_json::from_str::<Value>(trimmed).ok()?;
+    let Ok(mut json) = serde_json::from_str::<Value>(trimmed) else {
+        // Unparseable data payloads are left untouched, matching the unbounded
+        // rewriter and the historical no-op semantics for non-JSON frames.
+        return Some(false);
+    };
     let original = json.clone();
     mutate(&mut json);
     if json == original {
-        return None;
+        return Some(false);
     }
 
-    let rewritten = serde_json::to_string(&json).ok()?;
     let first_data_line = data_lines[0];
-    let mut output = String::new();
     for (idx, line) in lines.iter().enumerate() {
         if idx == first_data_line {
-            let ending = if line.ends_with("\r\n") {
-                "\r\n"
+            let ending: &[u8] = if line.ends_with("\r\n") {
+                b"\r\n"
             } else if line.ends_with('\n') {
-                "\n"
+                b"\n"
             } else {
-                ""
+                b""
             };
-            output.push_str("data: ");
-            output.push_str(&rewritten);
-            output.push_str(ending);
-        } else if data_lines.binary_search(&idx).is_err() {
-            output.push_str(line);
+            if !output.push(b"data: ") {
+                return None;
+            }
+            // Serialize the rewritten frame directly into the sink. An amplifying
+            // rewrite (placeholder expansion, JSON escaping) stops at the ceiling
+            // instead of materialising a complete over-budget event first.
+            if serde_json::to_writer(&mut *output, &json).is_err() {
+                return None;
+            }
+            if !ending.is_empty() && !output.push(ending) {
+                return None;
+            }
+        } else if data_lines.binary_search(&idx).is_err() && !output.push(line.as_bytes()) {
+            return None;
         }
     }
-    Some(output)
+    Some(true)
 }
 
 /// Apply an event-level rewrite across a buffered SSE body while preserving
@@ -3496,6 +3886,84 @@ fn rewrite_sse_events<'a>(
 
     let modified = output != body;
     (output, modified)
+}
+
+/// Ceiling-bounded SSE rewrite: each event is serialized/framed into the sink
+/// from the first output byte.
+///
+/// The client-visible replacement is assembled one event at a time, so the only
+/// full-size representation alive at any moment is the bounded output itself —
+/// never a complete rewritten event `String` that a bounded copy would measure
+/// afterwards (GHSA-pwcm-6rh8-f2gh). Per-event parse state is still derived from
+/// the already-charged input and is bounded by one event of that input.
+///
+/// `rewrite_event` returns:
+/// - `Some(false)` when the event is unchanged (caller copies original lines);
+/// - `Some(true)` when the rewriter already wrote the replacement into `output`;
+/// - `None` when construction was refused.
+///
+/// `modified` is true when at least one event was rewritten.
+///
+/// `None` means a write was refused; the caller must leave the response
+/// unchanged / fail closed per its own contract.
+fn rewrite_sse_events_bounded<'a>(
+    body: &'a str,
+    ceiling: usize,
+    mut rewrite_event: impl FnMut(
+        &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+        &[&'a str],
+    ) -> Option<bool>,
+) -> Option<(Vec<u8>, bool)> {
+    use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+
+    fn flush_event(
+        output: &mut BoundedResponseBodySink,
+        modified: &mut bool,
+        event_lines: &[&str],
+        rewritten: Option<bool>,
+    ) -> bool {
+        match rewritten {
+            Some(true) => {
+                *modified = true;
+                true
+            }
+            Some(false) => {
+                for original in event_lines {
+                    if !output.push(original.as_bytes()) {
+                        return false;
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    let mut output = BoundedResponseBodySink::with_ceiling(ceiling);
+    let mut modified = false;
+    let mut event_lines: Vec<&'a str> = Vec::new();
+    for line in body.split_inclusive('\n') {
+        event_lines.push(line);
+        let content = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        if content.is_empty() {
+            let rewritten = rewrite_event(&mut output, &event_lines);
+            if !flush_event(&mut output, &mut modified, &event_lines, rewritten) {
+                return None;
+            }
+            event_lines.clear();
+        }
+    }
+    if !event_lines.is_empty() {
+        let rewritten = rewrite_event(&mut output, &event_lines);
+        if !flush_event(&mut output, &mut modified, &event_lines, rewritten) {
+            return None;
+        }
+    }
+
+    Some((output.finish()?, modified))
 }
 
 /// Return the byte offset immediately after a JSON string beginning at

@@ -1,3 +1,4 @@
+use ferrum_edge::_test_support::take_buffered_response_capacity_refusal_pending_for_test;
 use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::plugins::grpc_web::{GRPC_WEB_CONFIG_KEYS, GrpcWebPlugin};
 use ferrum_edge::plugins::security_headers::SecurityHeaders;
@@ -2482,6 +2483,203 @@ fn test_sync_trailer_frame_short_circuits_when_already_identical() {
     assert!(payload.contains("request-id: mutated\r\n"));
 }
 
+/// Final reconciliation must rebuild binary and text trailer suffixes through a
+/// ceiling-bounded sink without materialising a decoded/encoded body beside it
+/// (GHSA-pwcm-6rh8-f2gh root finding on the final reframe).
+#[test]
+fn final_trailer_reconciliation_is_bounded_for_binary_and_text() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use ferrum_edge::_test_support::{
+        GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY, RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+        build_trailer_frame, store_charged_grpc_web_reframed_body_for_test,
+        sync_translated_body_trailer_frame_into_for_test,
+    };
+
+    let original_trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "abc".to_string()),
+    ]);
+    let mutated = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "mutated".to_string()),
+    ]);
+
+    let mut binary = vec![0x00, 0x00, 0x00, 0x00, 0x04];
+    binary.extend_from_slice(b"pong");
+    binary.extend(build_trailer_frame(&original_trailers));
+
+    // Valid binary replacement under a covering ceiling.
+    let replaced = sync_translated_body_trailer_frame_into_for_test(
+        &binary,
+        Some("application/grpc-web"),
+        &mutated,
+        Some(200),
+        binary.len() + 64,
+        true,
+    )
+    .expect("in-ceiling binary rebuild")
+    .expect("must rebuild when trailers changed");
+    let payload = trailing_grpc_web_trailer_payload(&replaced);
+    assert!(payload.contains("request-id: mutated\r\n"), "{payload}");
+
+    // Exact-ceiling refusal: one byte short of the rebuilt body.
+    let one_byte_short = replaced.len().saturating_sub(1);
+    let err = sync_translated_body_trailer_frame_into_for_test(
+        &binary,
+        Some("application/grpc-web"),
+        &mutated,
+        Some(200),
+        one_byte_short,
+        true,
+    )
+    .expect_err("over-ceiling binary rebuild must overflow");
+    assert!(err, "overflow is distinct from malformed");
+
+    // Malformed binary draft fails closed without rewriting.
+    let mut malformed = vec![0x00, 0x00, 0x00, 0x00, 0x20, 0x01];
+    malformed.extend(build_trailer_frame(&original_trailers));
+    let malformed_err = sync_translated_body_trailer_frame_into_for_test(
+        &malformed,
+        Some("application/grpc-web"),
+        &mutated,
+        Some(200),
+        4096,
+        true,
+    )
+    .expect_err("malformed draft must refuse");
+    assert!(!malformed_err, "malformed is not an overflow");
+
+    // Text mode: valid replacement + identity short-circuit + corrupt armouring.
+    let text = BASE64.encode(&binary).into_bytes();
+    let text_replaced = sync_translated_body_trailer_frame_into_for_test(
+        &text,
+        Some("application/grpc-web-text"),
+        &mutated,
+        Some(200),
+        text.len() + 128,
+        true,
+    )
+    .expect("in-ceiling text rebuild")
+    .expect("must rebuild when trailers changed");
+    let decoded = BASE64.decode(&text_replaced).expect("valid text rebuild");
+    let text_payload = trailing_grpc_web_trailer_payload(&decoded);
+    assert!(
+        text_payload.contains("request-id: mutated\r\n"),
+        "{text_payload}"
+    );
+
+    assert!(
+        sync_translated_body_trailer_frame_into_for_test(
+            &text,
+            Some("application/grpc-web-text"),
+            &original_trailers,
+            Some(200),
+            text.len(),
+            false,
+        )
+        .expect("identical text suffix")
+        .is_none(),
+        "identical trailer suffix must leave the charged original in place"
+    );
+
+    let corrupt = b"!!!!";
+    let corrupt_err = sync_translated_body_trailer_frame_into_for_test(
+        corrupt,
+        Some("application/grpc-web-text"),
+        &mutated,
+        Some(200),
+        64,
+        false,
+    )
+    .expect_err("corrupt text armouring must refuse");
+    assert!(!corrupt_err);
+
+    let admission_err = sync_translated_body_trailer_frame_into_for_test(
+        &binary,
+        Some("application/grpc-web"),
+        &mutated,
+        Some(200),
+        binary.len() + 64,
+        false,
+    )
+    .expect_err("a required replacement must fail when no covering window is admitted");
+    assert!(admission_err, "replacement admission is a capacity refusal");
+
+    // Publication seam: body already above the retained ceiling installs the
+    // neutral, body-framed gRPC-Web capacity terminal and releases the
+    // oversized payload.
+    let mut refusal_ctx = create_grpc_web_context("application/grpc-web");
+    refusal_ctx.metadata.insert(
+        GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
+        "application/grpc-web".to_string(),
+    );
+    let mut refusal_status = 200u16;
+    let mut oversized = bytes::Bytes::from(vec![0u8; 128]);
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    )]);
+    assert!(
+        store_charged_grpc_web_reframed_body_for_test(
+            &mut refusal_ctx,
+            &mut refusal_status,
+            &mut oversized,
+            &mut headers,
+            64,
+            Some("application/grpc-web"),
+            &mutated,
+            Some(200),
+        )
+        .is_none()
+    );
+    assert_eq!(refusal_status, 200);
+    assert_eq!(oversized.first(), Some(&0x80));
+    let refusal_payload = String::from_utf8_lossy(&oversized);
+    assert!(
+        refusal_payload.contains(&format!(
+            "grpc-status: {RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS}"
+        )),
+        "capacity status must ride the gRPC-Web trailer frame: {refusal_payload:?}"
+    );
+    assert!(!headers.contains_key("grpc-status"));
+    assert_eq!(
+        headers
+            .get("content-length")
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(oversized.len())
+    );
+
+    // In-ceiling publication of a binary rebuild keeps content replaceable and
+    // reports the stored length for content-length updates.
+    let mut live_ctx = create_grpc_web_context("application/grpc-web");
+    live_ctx.metadata.insert(
+        GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
+        "application/grpc-web".to_string(),
+    );
+    let mut live_status = 200u16;
+    let mut live = bytes::Bytes::from(binary.clone());
+    let mut live_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    )]);
+    let (stored_len, reframed) = store_charged_grpc_web_reframed_body_for_test(
+        &mut live_ctx,
+        &mut live_status,
+        &mut live,
+        &mut live_headers,
+        4096,
+        Some("application/grpc-web"),
+        &mutated,
+        Some(200),
+    )
+    .expect("in-ceiling publication");
+    assert!(reframed);
+    assert_eq!(stored_len, live.len());
+    let live_payload = trailing_grpc_web_trailer_payload(live.as_ref());
+    assert!(live_payload.contains("request-id: mutated\r\n"));
+}
+
 /// Mesh-mTLS translated path must discard trailer-only names from initial
 /// headers after syncing the body trailer frame (H1/H2/H3 parity).
 #[test]
@@ -3593,6 +3791,10 @@ async fn test_follower_fails_closed_without_owner_staging_on_response_transform(
         "malformed mode staging must fail closed"
     );
     assert!(
+        take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "an owner with corrupt mode staging must select the fail-closed terminal"
+    );
+    assert!(
         follower
             .transform_response_body_with_context(
                 &mut ctx,
@@ -3603,6 +3805,10 @@ async fn test_follower_fails_closed_without_owner_staging_on_response_transform(
             .await
             .is_none(),
         "non-owner must never translate the response body"
+    );
+    assert!(
+        !take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "a non-owner no-op must not mark a refusal"
     );
 }
 
@@ -3635,5 +3841,369 @@ async fn test_owner_requires_namespaced_mode_even_when_shared_mode_is_valid() {
             .await
             .is_none(),
         "owner must not fall back to shared mode after losing its namespaced staging"
+    );
+    assert!(
+        take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "missing owner staging must select the fail-closed terminal"
+    );
+}
+
+#[tokio::test]
+async fn test_owned_translation_never_forwards_raw_body_after_live_content_type_drift() {
+    let owner = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    owner.on_request_received(&mut ctx).await;
+
+    // The owner has already claimed and staged gRPC-Web translation. If a later
+    // response-header hook removes or corrupts the relabelled content type, the
+    // body transformer must not treat that as an ordinary no-op: forwarding the
+    // native gRPC body would violate the client-facing representation contract.
+    let response_headers = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("grpc-status".to_string(), "0".to_string()),
+    ]);
+    assert!(
+        owner
+            .transform_response_body_with_context(
+                &mut ctx,
+                b"\0\0\0\0\0",
+                Some("application/grpc"),
+                &response_headers,
+            )
+            .await
+            .is_none()
+    );
+    assert!(
+        take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "an owned construction failure must select the fail-closed terminal"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Text-mode armouring is streamed into the retained-ceiling sink
+// (GHSA-pwcm-6rh8-f2gh).
+//
+// Text mode used to build a complete binary body, then a complete base64
+// `String`, then copy that into a third bounded buffer — three full-size
+// representations of the same replacement, only the last of which the ceiling
+// governed. The armouring now streams into the bounded sink from the first
+// encoded byte, so the wire bytes must still be exactly the base64 of the binary
+// framing.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_text_mode_streamed_armouring_equals_base64_of_the_binary_framing() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let plugin = create_plugin_default();
+    // Several data-frame lengths so the encoder's 3-byte grouping crosses every
+    // padding residue, and a trailer block with sorted/duplicated metadata.
+    let payloads = vec![
+        "a".to_string(),
+        "ab".to_string(),
+        "abc".to_string(),
+        "abcd".to_string(),
+        "z".repeat(4096),
+    ];
+    for payload in &payloads {
+        let mut body = vec![0x00u8];
+        body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(payload.as_bytes());
+
+        let mut response_headers = HashMap::new();
+        response_headers.insert("grpc-status".to_string(), "0".to_string());
+        response_headers.insert("request-id".to_string(), "one\ntwo".to_string());
+        response_headers.insert("alpha-meta".to_string(), "a".to_string());
+
+        response_headers.insert(
+            "content-type".to_string(),
+            "application/grpc-web".to_string(),
+        );
+        let binary = plugin
+            .transform_response_body(&body, Some("application/grpc-web"), &response_headers)
+            .await
+            .expect("binary transform");
+
+        response_headers.insert(
+            "content-type".to_string(),
+            "application/grpc-web-text".to_string(),
+        );
+        let text = plugin
+            .transform_response_body(&body, Some("application/grpc-web-text"), &response_headers)
+            .await
+            .expect("text transform");
+
+        assert_eq!(
+            String::from_utf8(text).expect("armoured body is ASCII"),
+            BASE64.encode(&binary),
+            "streamed armouring must be byte-identical to encoding the complete \
+             binary framing (payload len {})",
+            payload.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_translation_is_refused_when_the_trailer_frame_cannot_fit_the_ceiling() {
+    let plugin = create_plugin_default();
+    let mut body = vec![0x00u8];
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+    // Room for the data frames but not for the frame header plus trailers: the
+    // trailer payload must be refused while it is being built, not after an
+    // over-ceiling `Vec` of upstream-controlled values already exists.
+    ctx.max_response_body_size_bytes = body.len() + 2;
+    let translated = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc-web"),
+            &response_headers,
+        )
+        .await;
+    assert!(
+        translated.is_none(),
+        "an over-ceiling translation must fail closed rather than materialise \
+         the trailer block first"
+    );
+    assert!(
+        take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "a claimed over-ceiling translation must mark the pending capacity-refusal signal"
+    );
+    assert!(
+        !take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "the pending capacity-refusal signal must be consumed exactly once"
+    );
+
+    // Control: the same staged request with an ample ceiling DOES translate, so
+    // the refusal above is the ceiling and not the ownership gate.
+    let mut roomy = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut roomy).await;
+    let ok = plugin
+        .transform_response_body_with_context(
+            &mut roomy,
+            &body,
+            Some("application/grpc-web"),
+            &response_headers,
+        )
+        .await
+        .expect("an in-ceiling translation must still be produced");
+    assert!(ok.len() > body.len(), "the trailer frame was appended");
+    assert!(
+        !take_buffered_response_capacity_refusal_pending_for_test(&mut roomy),
+        "a successful translation must not mark a capacity refusal"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The trailer frame is emitted twice and retained neither time
+// (GHSA-pwcm-6rh8-f2gh).
+//
+// The reframer used to build a COMPLETE trailer payload — every eligible
+// upstream-controlled `(name, value)` cloned into an owned `Vec` first — and
+// then copy or base64-encode it while that payload was still live. A counting
+// pass now establishes the frame-header length without retaining a value, and a
+// second pass writes the payload straight into the final bounded destination.
+// These pin the observable consequences: the frame is byte-identical to what
+// the retaining implementation produced, in both representations, for a trailer
+// block far larger than any single frame header.
+// ---------------------------------------------------------------------------
+
+fn large_trailer_headers(content_type: &str) -> HashMap<String, String> {
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), content_type.to_string());
+    response_headers.insert("grpc-status".to_string(), " 7 ".to_string());
+    response_headers.insert("grpc-message".to_string(), "denied".to_string());
+    // Deliberately inserted out of alphabetical order, with multi-value
+    // (LF-joined) metadata, so both the sort and the duplicate occurrence order
+    // are exercised.
+    for index in (0..64).rev() {
+        response_headers.insert(
+            format!("x-meta-{index:03}"),
+            format!("{}\n{}", "v".repeat(512), "w".repeat(512)),
+        );
+    }
+    response_headers
+}
+
+#[tokio::test]
+async fn test_large_trailer_block_frames_identically_in_binary_and_text() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let plugin = create_plugin_default();
+    let mut body = vec![0x00u8];
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+
+    let binary = plugin
+        .transform_response_body(
+            &body,
+            Some("application/grpc-web"),
+            &large_trailer_headers("application/grpc-web"),
+        )
+        .await
+        .expect("binary transform");
+    let text = plugin
+        .transform_response_body(
+            &body,
+            Some("application/grpc-web-text"),
+            &large_trailer_headers("application/grpc-web-text"),
+        )
+        .await
+        .expect("text transform");
+
+    // The declared frame length must match the payload the writing pass
+    // produced — the counting pass is only correct if these agree.
+    let payload = trailing_grpc_web_trailer_payload(&binary);
+    assert!(
+        payload.len() > 64 * 1024,
+        "the fixture must exceed any plausible single-frame temporary, got {}",
+        payload.len()
+    );
+    assert_eq!(
+        String::from_utf8(text).expect("armoured body is ASCII"),
+        BASE64.encode(&binary),
+        "the streamed text frame must equal the base64 of the binary frame"
+    );
+
+    // Deterministic ordering: names sorted, duplicate occurrences in order, the
+    // normalized grpc-status emitted exactly once.
+    let lines: Vec<&str> = payload.trim_end_matches("\r\n").split("\r\n").collect();
+    let names: Vec<&str> = lines
+        .iter()
+        .map(|line| line.split(':').next().unwrap_or_default())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "trailer names must stay sorted");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("grpc-status"))
+            .count(),
+        1,
+        "exactly one normalized grpc-status line"
+    );
+    assert!(
+        payload.contains("grpc-status: 7\r\n"),
+        "surrounding whitespace must still be normalized away"
+    );
+    let first_meta = lines
+        .iter()
+        .position(|line| line.starts_with("x-meta-000"))
+        .expect("multi-value metadata is framed");
+    assert!(
+        lines[first_meta].ends_with(&"v".repeat(512))
+            && lines[first_meta + 1].ends_with(&"w".repeat(512)),
+        "duplicate occurrences of one name must keep their relative order"
+    );
+}
+
+#[tokio::test]
+async fn test_large_trailer_block_is_refused_under_a_small_retained_ceiling() {
+    let plugin = create_plugin_default();
+    let mut body = vec![0x00u8];
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+
+    for content_type in ["application/grpc-web", "application/grpc-web-text"] {
+        let mut ctx = create_grpc_web_context(content_type);
+        plugin.on_request_received(&mut ctx).await;
+        ctx.max_response_body_size_bytes = 4096;
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &body,
+                    Some(content_type),
+                    &large_trailer_headers(content_type),
+                )
+                .await
+                .is_none(),
+            "{content_type}: a trailer block above the retained ceiling must be \
+             refused during the counting pass, never materialised first"
+        );
+        assert!(
+            take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+            "{content_type}: capacity refusal must mark the pending transform signal"
+        );
+    }
+}
+
+#[tokio::test]
+async fn capacity_refused_grpc_web_transform_installs_body_framed_terminal() {
+    use ferrum_edge::_test_support::{
+        GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY, RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+        stamp_original_response_metadata_for_test,
+        transform_buffered_response_body_with_deadline_full_for_test,
+    };
+
+    let plugin = create_plugin_default();
+    let mut body = vec![0x00u8];
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+    response_headers.insert("content-length".to_string(), body.len().to_string());
+
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+    ctx.max_response_body_size_bytes = body.len() + 2;
+    ctx.metadata.insert(
+        GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY.to_string(),
+        "application/grpc-web".to_string(),
+    );
+
+    let mut status = 200u16;
+    stamp_original_response_metadata_for_test(&mut ctx, status, &response_headers);
+    let mut body_buf = bytes::Bytes::from(body.clone());
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[plugin],
+        &mut ctx,
+        &mut status,
+        &mut response_headers,
+        &mut body_buf,
+        Some("application/grpc-web"),
+        false,
+    )
+    .await;
+
+    assert!(
+        replaced,
+        "a claimed gRPC-Web capacity refusal must replace the buffered response"
+    );
+    assert_eq!(status, 200, "gRPC-Web capacity terminals keep HTTP 200");
+    assert_eq!(body_buf.first(), Some(&0x80));
+    let payload = trailing_grpc_web_trailer_payload(&body_buf);
+    assert!(
+        payload.contains(&format!(
+            "grpc-status: {RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS}"
+        )),
+        "capacity status must ride the gRPC-Web body trailer frame: {payload:?}"
+    );
+    assert!(
+        !response_headers.contains_key("grpc-status"),
+        "gRPC-Web capacity terminals must not leave grpc-status in headers"
+    );
+    assert!(
+        !take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "the shared transform loop must consume the pending signal"
     );
 }

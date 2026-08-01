@@ -112,8 +112,8 @@ use crate::plugins::utils::{
     wait_until_committed,
 };
 use crate::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginHttpClient, ProxyProtocol, StreamTransactionSummary,
-    TransactionSummary,
+    ALL_PROTOCOLS, Plugin, PluginHttpClient, ProxyProtocol, ResponseBodyProduction,
+    StreamTransactionSummary, TransactionSummary,
 };
 
 const TABLE_NAME: &str = "example_audit_log";
@@ -799,6 +799,15 @@ impl Plugin for ExampleAuditPlugin {
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         ALL_PROTOCOLS
+    }
+
+    /// Observe-only audit logger: never replaces a retained response body.
+    /// Declare `Never` explicitly — custom plugin names are absent from the
+    /// built-in inventory, so the trait default resolves to `Undeclared` and
+    /// the shared producer gate refuses buffered responses when this plugin is
+    /// on the chain (GHSA-pwcm-6rh8-f2gh).
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
     }
 
     fn start_background_tasks(&self) -> Result<(), String> {

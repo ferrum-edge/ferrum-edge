@@ -5040,11 +5040,15 @@ impl Plugin for AiFederation {
         // the operator disabled fail-closed missing/unmatched-model behavior,
         // `ai_federation` must not re-inspect or reject that same `stream:true`
         // request.
-        if ctx
-            .metadata
-            .get("ai_stream_router_claimed")
-            .map(String::as_str)
-            == Some("true")
+        //
+        // A successful claim is read from the PRIVATE typed claim, never from
+        // the public `ai_stream_router_claimed` metadata key: that key is
+        // observability/backward coordination only and a later plugin can
+        // delete or rewrite it, which would make this federation path
+        // re-inspect and re-dispatch a request already bound to a third-party
+        // provider (`GHSA-xhp5-hqj8-3mwg`). Intentional pass-through is a
+        // genuinely UNCLAIMED request, so it still coordinates via metadata.
+        if ctx.has_ai_stream_router_claim()
             || ctx
                 .metadata
                 .get("ai_stream_router_pass_through")

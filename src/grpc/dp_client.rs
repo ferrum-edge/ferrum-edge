@@ -2771,6 +2771,7 @@ mod tests {
             trust_bundles: None,
             mesh: None,
             mesh_revision: None,
+            k8s_mesh_overlay: Default::default(),
         };
 
         let filtered = filter_config_to_namespace(&mut cfg, "production");
@@ -2803,6 +2804,7 @@ mod tests {
             trust_bundles: None,
             mesh: None,
             mesh_revision: None,
+            k8s_mesh_overlay: Default::default(),
         };
         assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
         assert_eq!(cfg.proxies.len(), 1);

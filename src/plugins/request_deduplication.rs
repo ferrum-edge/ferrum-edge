@@ -107,8 +107,9 @@ use std::fmt;
 use std::io::Read;
 use std::mem;
 use std::sync::LazyLock;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -494,6 +495,10 @@ enum DeduplicationEntry {
     /// detection so abandoned in-flight entries don't permanently block retries.
     InFlight {
         started_at: Instant,
+        /// Lease duration captured by the generation that admitted the
+        /// operation. A replacement generation must not shorten an existing
+        /// lease by evaluating it with a newly configured timeout.
+        retention: Duration,
         fingerprint: String,
         owner_token: String,
     },
@@ -758,6 +763,147 @@ pub(crate) fn logical_keys_from_request_context_for_test(ctx: &RequestContext) -
 
 static NEXT_REQUEST_DEDUPLICATION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Registry of local deduplication state keyed by stable policy identity
+/// (`namespace` + plugin-config id).
+///
+/// Values are `Weak`, so an entry only survives while a live plugin instance or
+/// an in-flight request still owns the state. Every insert prunes dead entries,
+/// which bounds the registry to currently configured policies plus retired
+/// semantic generations that still protect in-flight work rather than letting
+/// reload churn accumulate.
+static SHARED_LOCAL_STATES: OnceLock<
+    Mutex<HashMap<String, Vec<Weak<RequestDeduplicationLocalState>>>>,
+> = OnceLock::new();
+
+/// Effective policy fields whose change makes already-retained local
+/// deduplication state unsafe to inherit.
+///
+/// Deliberately narrow. Most configuration fields are already bound into the
+/// logical key by [`RequestDeduplication::build_key`] — `scope_by_consumer` is
+/// framed explicitly and `anonymous_caller_scope` is framed by
+/// `replay_partition::append_caller_partition` as `caller.address_scope` — so a
+/// change there produces different keys instead of colliding with a retained
+/// entry. Retention is captured by each admitted in-flight operation,
+/// completion, or execution barrier, so a replacement generation cannot
+/// shorten an existing protection window; new operations use the replacement
+/// policy. Capacity/size bounds are applied by the live instance without
+/// resetting already-retained protection state.
+///
+/// The fields below are the ones that are not key-bound and do change what a
+/// retained entry means:
+///
+/// * `header_name` decides which request header supplies the idempotency value,
+///   so the same retained key would answer a different operator-visible input;
+/// * whether Redis is the authoritative store, and the outage policy, decide
+///   whether the local map is the enforcement domain or only an explicit
+///   fallback.
+#[derive(Clone, PartialEq, Eq)]
+struct RequestDeduplicationCompatibility {
+    header_name: String,
+    redis_mode: bool,
+    on_redis_unavailable: RedisUnavailablePolicy,
+}
+
+/// Mutable local-mode deduplication state shared by compatible plugin-cache
+/// generations for one policy identity.
+///
+/// Holding this behind an `Arc` is what keeps an active idempotency lease and a
+/// retained completed response alive across a reload that constructs a
+/// replacement plugin instance: the retired instance and the replacement see
+/// the same map, the same accounting counters, and the same eviction cursor.
+pub(crate) struct RequestDeduplicationLocalState {
+    compatibility: RequestDeduplicationCompatibility,
+    /// Local in-memory cache.
+    local_cache: Arc<DashMap<String, DeduplicationEntry>>,
+    completed_count: AtomicUsize,
+    completed_size_bytes: AtomicUsize,
+    inflight_count: AtomicUsize,
+    /// Number of explicit per-key execution barriers. Unlike active in-flight
+    /// work, this durable security state is hard-capped at `max_entries`.
+    execution_barrier_count: AtomicUsize,
+    /// Process-relative monotonic deadline for a single bounded fail-closed
+    /// overflow barrier. When the per-key barrier budget is full, this one
+    /// scalar protects every displaced key without retaining their identities.
+    execution_barrier_overflow_until_ms: AtomicU64,
+    local_inflight_sequence: AtomicU64,
+    completed_sequence: AtomicU64,
+    next_completed_evict_sequence: AtomicU64,
+    completed_order: Arc<DashMap<u64, CompletedOrderEntry>>,
+    accounting_lock: Mutex<()>,
+    eviction_lock: Mutex<()>,
+    /// Monotonic-seconds timestamp (relative to `PROCESS_START`) of the last
+    /// full cleanup scan, used to throttle scans to at most once per
+    /// `CLEANUP_INTERVAL_SECS`. Initialized to `CLEANUP_NEVER` so the first
+    /// applicable request runs a scan.
+    last_cleanup: AtomicU64,
+}
+
+impl RequestDeduplicationLocalState {
+    fn new(compatibility: RequestDeduplicationCompatibility, shard_amount: usize) -> Arc<Self> {
+        Arc::new(Self {
+            compatibility,
+            local_cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            completed_count: AtomicUsize::new(0),
+            completed_size_bytes: AtomicUsize::new(0),
+            inflight_count: AtomicUsize::new(0),
+            execution_barrier_count: AtomicUsize::new(0),
+            execution_barrier_overflow_until_ms: AtomicU64::new(0),
+            local_inflight_sequence: AtomicU64::new(0),
+            completed_sequence: AtomicU64::new(0),
+            next_completed_evict_sequence: AtomicU64::new(0),
+            completed_order: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            accounting_lock: Mutex::new(()),
+            eviction_lock: Mutex::new(()),
+            last_cleanup: AtomicU64::new(CLEANUP_NEVER),
+        })
+    }
+
+    /// Next completed-entry sequence number the bounded eviction sweep will
+    /// consider.
+    fn evict_cursor(&self) -> u64 {
+        self.next_completed_evict_sequence.load(Ordering::Relaxed)
+    }
+}
+
+/// Resolve the shared local state for one policy identity.
+///
+/// A compatible replacement generation inherits the live state. A semantic
+/// change isolates onto fresh state and rebinds the identity, so a retired
+/// generation's late completion lands on the state it acquired its lease from
+/// and can never corrupt the incompatible replacement policy.
+fn retain_shared_local_state(
+    identity: &str,
+    compatibility: RequestDeduplicationCompatibility,
+    shard_amount: usize,
+) -> Arc<RequestDeduplicationLocalState> {
+    let registry = SHARED_LOCAL_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Keep every still-live semantic generation for an identity. A single
+    // last-writer slot is insufficient: A -> B -> A while an A operation is
+    // still in flight must recover A's protection state instead of creating a
+    // third empty domain.
+    guard.retain(|_, states| {
+        states.retain(|weak| weak.strong_count() > 0);
+        !states.is_empty()
+    });
+    if let Some(existing) = guard.get(identity).and_then(|states| {
+        states
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|state| state.compatibility == compatibility)
+    }) {
+        return existing;
+    }
+    let state = RequestDeduplicationLocalState::new(compatibility, shard_amount);
+    guard
+        .entry(identity.to_string())
+        .or_default()
+        .push(Arc::downgrade(&state));
+    state
+}
+
 pub struct RequestDeduplication {
     /// Process-unique ownership key for request-private completion state.
     instance_id: u64,
@@ -798,31 +944,11 @@ pub struct RequestDeduplication {
     /// Behavior when `sync_mode: "redis"` is configured but Redis cannot be
     /// consulted. Only meaningful in Redis mode.
     on_redis_unavailable: RedisUnavailablePolicy,
-    /// Local in-memory cache.
-    local_cache: Arc<DashMap<String, DeduplicationEntry>>,
-    completed_count: AtomicUsize,
-    completed_size_bytes: AtomicUsize,
-    inflight_count: AtomicUsize,
-    /// Number of explicit per-key execution barriers. Unlike active in-flight
-    /// work, this durable security state is hard-capped at `max_entries`.
-    execution_barrier_count: AtomicUsize,
-    /// Process-relative monotonic deadline for a single bounded fail-closed
-    /// overflow barrier. When the per-key barrier budget is full, this one
-    /// scalar protects every displaced key without retaining their identities.
-    execution_barrier_overflow_until_ms: AtomicU64,
-    local_inflight_sequence: AtomicU64,
-    completed_sequence: AtomicU64,
-    next_completed_evict_sequence: AtomicU64,
-    completed_order: Arc<DashMap<u64, CompletedOrderEntry>>,
-    accounting_lock: Mutex<()>,
-    eviction_lock: Mutex<()>,
     /// Optional Redis client for centralized deduplication.
     redis_client: Option<Arc<RedisRateLimitClient>>,
-    /// Monotonic-seconds timestamp (relative to `PROCESS_START`) of the last
-    /// full cleanup scan, used to throttle scans to at most once per
-    /// `CLEANUP_INTERVAL_SECS`. Initialized to `CLEANUP_NEVER` so the first
-    /// applicable request runs a scan.
-    last_cleanup: AtomicU64,
+    /// Mutable local-mode state, shared with compatible reload generations of
+    /// the same policy identity.
+    local: Arc<RequestDeduplicationLocalState>,
 }
 
 impl RequestDeduplication {
@@ -830,10 +956,48 @@ impl RequestDeduplication {
         Self::new_with_instance_id(config, http_client, DEFAULT_INSTANCE_ID)
     }
 
+    /// Construct with isolated local state. Used by validation-only admission
+    /// paths and by callers that have no stable policy identity to share on.
     pub(crate) fn new_with_instance_id(
         config: &Value,
         http_client: PluginHttpClient,
         config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, config_id, None)
+    }
+
+    /// Construct with local deduplication state shared across compatible
+    /// plugin-cache generations for one stable policy identity.
+    ///
+    /// The identity is the configured `(namespace, plugin_config_id)` pair —
+    /// trusted configuration, never request-controlled data and never an
+    /// allocation address or construction order. Two tenants that reuse a bare
+    /// plugin-config id therefore stay in separate protection domains, and a
+    /// scope move (`global` <-> `proxy` <-> `proxy_group`) that keeps the same
+    /// resource id keeps its idempotency leases and retained responses.
+    pub(crate) fn new_with_policy_identity(
+        config: &Value,
+        http_client: PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        Self::from_parts(config, http_client, config_id, Some(namespace))
+    }
+
+    /// Whether this instance shares one protection domain with `other`.
+    ///
+    /// A compatible reload generation for the same policy identity must share;
+    /// an unrelated policy, tenant, or semantically changed policy must not.
+    #[allow(dead_code)] // used only by tests/; dead code in the bin target
+    pub fn shares_local_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.local, &other.local)
+    }
+
+    fn from_parts(
+        config: &Value,
+        http_client: PluginHttpClient,
+        config_id: &str,
+        policy_namespace: Option<&str>,
     ) -> Result<Self, String> {
         let object = config
             .as_object()
@@ -942,6 +1106,26 @@ impl RequestDeduplication {
                 ))
             });
 
+        let compatibility = RequestDeduplicationCompatibility {
+            header_name: header_name.clone(),
+            redis_mode: redis_client.is_some(),
+            on_redis_unavailable,
+        };
+        // A stable policy identity keeps the protection domain across reload
+        // generations. Without one (validation-only admission, direct
+        // construction) the instance owns isolated state, which is the
+        // conservative choice: it can only refuse work, never admit twice
+        // against another policy's accounting.
+        let local = match policy_namespace {
+            Some(namespace) => {
+                // NUL is not representable in a namespace or resource id, so
+                // the two components cannot be re-split ambiguously.
+                let identity = format!("{namespace}\0{config_id}");
+                retain_shared_local_state(&identity, compatibility, shard_amount)
+            }
+            None => RequestDeduplicationLocalState::new(compatibility, shard_amount),
+        };
+
         Ok(Self {
             instance_id: NEXT_REQUEST_DEDUPLICATION_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             // Preserve the configured resource identity byte-for-byte. Trimming
@@ -958,20 +1142,8 @@ impl RequestDeduplication {
             anonymous_caller_scope,
             enforce_required,
             on_redis_unavailable,
-            local_cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
-            completed_count: AtomicUsize::new(0),
-            completed_size_bytes: AtomicUsize::new(0),
-            inflight_count: AtomicUsize::new(0),
-            execution_barrier_count: AtomicUsize::new(0),
-            execution_barrier_overflow_until_ms: AtomicU64::new(0),
-            local_inflight_sequence: AtomicU64::new(0),
-            completed_sequence: AtomicU64::new(0),
-            next_completed_evict_sequence: AtomicU64::new(0),
-            completed_order: Arc::new(DashMap::with_shard_amount(shard_amount)),
-            accounting_lock: Mutex::new(()),
-            eviction_lock: Mutex::new(()),
             redis_client,
-            last_cleanup: AtomicU64::new(CLEANUP_NEVER),
+            local,
         })
     }
 
@@ -996,7 +1168,8 @@ impl RequestDeduplication {
     }
 
     fn try_reserve_execution_barrier(&self) -> bool {
-        self.execution_barrier_count
+        self.local
+            .execution_barrier_count
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 (current < self.max_entries).then_some(current + 1)
             })
@@ -1004,7 +1177,7 @@ impl RequestDeduplication {
     }
 
     fn release_execution_barrier(&self) {
-        decrement_atomic(&self.execution_barrier_count);
+        decrement_atomic(&self.local.execution_barrier_count);
     }
 
     /// Extend the one bounded overflow barrier to cover this completion's
@@ -1020,19 +1193,22 @@ impl RequestDeduplication {
             .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0);
         let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
-        self.execution_barrier_overflow_until_ms
+        self.local
+            .execution_barrier_overflow_until_ms
             .fetch_max(inserted_ms.saturating_add(retention_ms), Ordering::SeqCst);
     }
 
     fn execution_barrier_overflow_active(&self) -> bool {
         monotonic_millis()
             < self
+                .local
                 .execution_barrier_overflow_until_ms
                 .load(Ordering::SeqCst)
     }
 
     fn accounting_guard(&self) -> MutexGuard<'_, ()> {
-        self.accounting_lock
+        self.local
+            .accounting_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -1041,8 +1217,9 @@ impl RequestDeduplication {
         if size == 0 {
             return;
         }
-        let current = self.completed_size_bytes.load(Ordering::Relaxed);
-        self.completed_size_bytes
+        let current = self.local.completed_size_bytes.load(Ordering::Relaxed);
+        self.local
+            .completed_size_bytes
             .store(current.saturating_add(size), Ordering::Relaxed);
     }
 
@@ -1050,19 +1227,22 @@ impl RequestDeduplication {
         if size == 0 {
             return;
         }
-        let current = self.completed_size_bytes.load(Ordering::Relaxed);
-        self.completed_size_bytes
+        let current = self.local.completed_size_bytes.load(Ordering::Relaxed);
+        self.local
+            .completed_size_bytes
             .store(current.saturating_sub(size), Ordering::Relaxed);
     }
 
     fn next_local_inflight_owner_token(&self) -> String {
-        self.local_inflight_sequence
+        self.local
+            .local_inflight_sequence
             .fetch_add(1, Ordering::Relaxed)
             .to_string()
     }
 
     fn actual_completed_size_locked(&self) -> usize {
-        self.local_cache
+        self.local
+            .local_cache
             .iter()
             .map(|entry| match entry.value() {
                 DeduplicationEntry::Completed { cached, .. } => cached.retained_size(),
@@ -1076,7 +1256,7 @@ impl RequestDeduplication {
     pub(crate) fn completed_size_snapshot_for_tests(&self) -> (usize, usize) {
         let _guard = self.accounting_guard();
         (
-            self.completed_size_bytes.load(Ordering::Relaxed),
+            self.local.completed_size_bytes.load(Ordering::Relaxed),
             self.actual_completed_size_locked(),
         )
     }
@@ -1095,7 +1275,7 @@ impl RequestDeduplication {
     pub(crate) fn expire_completed_entries_for_tests(&self) {
         let _guard = self.accounting_guard();
         let now = Instant::now();
-        for mut entry in self.local_cache.iter_mut() {
+        for mut entry in self.local.local_cache.iter_mut() {
             if let DeduplicationEntry::Completed { cached, .. } = entry.value_mut() {
                 // Per-entry retention: an execution-barrier tombstone outlives
                 // `ttl_seconds`, so back-date past its own retention window.
@@ -1104,28 +1284,51 @@ impl RequestDeduplication {
                     .unwrap_or(now);
             }
         }
-        self.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
+        self.local
+            .last_cleanup
+            .store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
     pub(crate) fn expire_inflight_entries_for_tests(&self) {
         let _guard = self.accounting_guard();
-        let expired_at = Instant::now()
-            .checked_sub(self.inflight_ttl.saturating_add(Duration::from_secs(1)))
-            .unwrap_or_else(Instant::now);
-        for mut entry in self.local_cache.iter_mut() {
-            if let DeduplicationEntry::InFlight { started_at, .. } = entry.value_mut() {
-                *started_at = expired_at;
+        let now = Instant::now();
+        for mut entry in self.local.local_cache.iter_mut() {
+            if let DeduplicationEntry::InFlight {
+                started_at,
+                retention,
+                ..
+            } = entry.value_mut()
+            {
+                *started_at = now
+                    .checked_sub(retention.saturating_add(Duration::from_secs(1)))
+                    .unwrap_or(now);
             }
         }
-        self.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
+        self.local
+            .last_cleanup
+            .store(CLEANUP_NEVER, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn backdate_inflight_entries_for_tests(&self, age: Duration) {
+        let _guard = self.accounting_guard();
+        let now = Instant::now();
+        for mut entry in self.local.local_cache.iter_mut() {
+            if let DeduplicationEntry::InFlight { started_at, .. } = entry.value_mut() {
+                *started_at = now.checked_sub(age).unwrap_or(now);
+            }
+        }
+        self.local
+            .last_cleanup
+            .store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
     pub(crate) fn expire_execution_barriers_for_tests(&self) {
         let _guard = self.accounting_guard();
         let now = Instant::now();
-        for mut entry in self.local_cache.iter_mut() {
+        for mut entry in self.local.local_cache.iter_mut() {
             if let DeduplicationEntry::ExecutionBarrier {
                 inserted_at,
                 retention,
@@ -1137,9 +1340,12 @@ impl RequestDeduplication {
                     .unwrap_or(now);
             }
         }
-        self.execution_barrier_overflow_until_ms
+        self.local
+            .execution_barrier_overflow_until_ms
             .store(0, Ordering::SeqCst);
-        self.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
+        self.local
+            .last_cleanup
+            .store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
     /// Build the logical deduplication key from unambiguous framed fields.
@@ -1319,14 +1525,15 @@ impl RequestDeduplication {
         now: Instant,
         owner_token: &str,
     ) -> LocalDeduplicationAction {
-        match self.local_cache.entry(key.to_string()) {
+        match self.local.local_cache.entry(key.to_string()) {
             Entry::Vacant(entry) => {
                 entry.insert(DeduplicationEntry::InFlight {
                     started_at: now,
+                    retention: self.inflight_ttl,
                     fingerprint: fingerprint.to_string(),
                     owner_token: owner_token.to_string(),
                 });
-                self.inflight_count.fetch_add(1, Ordering::Relaxed);
+                self.local.inflight_count.fetch_add(1, Ordering::Relaxed);
                 LocalDeduplicationAction::Fresh
             }
             Entry::Occupied(mut entry) => {
@@ -1364,12 +1571,14 @@ impl RequestDeduplication {
                     }
                     DeduplicationEntry::InFlight {
                         started_at,
+                        retention,
                         fingerprint: cached_fingerprint,
                         ..
                     } => {
-                        if now.duration_since(*started_at) >= self.inflight_ttl {
+                        if now.duration_since(*started_at) >= *retention {
                             entry.insert(DeduplicationEntry::InFlight {
                                 started_at: now,
+                                retention: self.inflight_ttl,
                                 fingerprint: fingerprint.to_string(),
                                 owner_token: owner_token.to_string(),
                             });
@@ -1397,7 +1606,7 @@ impl RequestDeduplication {
         fingerprint: &str,
         now: Instant,
     ) -> Option<CachedResponse> {
-        self.local_cache.get(key).and_then(|entry| {
+        self.local.local_cache.get(key).and_then(|entry| {
             let DeduplicationEntry::Completed {
                 cached,
                 fingerprint: cached_fingerprint,
@@ -1424,14 +1633,15 @@ impl RequestDeduplication {
         owner_token: &str,
     ) -> LocalDeduplicationAction {
         let _guard = self.accounting_guard();
-        match self.local_cache.entry(key.to_string()) {
+        match self.local.local_cache.entry(key.to_string()) {
             Entry::Vacant(entry) => {
                 entry.insert(DeduplicationEntry::InFlight {
                     started_at: now,
+                    retention: self.inflight_ttl,
                     fingerprint: fingerprint.to_string(),
                     owner_token: owner_token.to_string(),
                 });
-                self.inflight_count.fetch_add(1, Ordering::Relaxed);
+                self.local.inflight_count.fetch_add(1, Ordering::Relaxed);
                 LocalDeduplicationAction::Fresh
             }
             Entry::Occupied(mut entry) => match entry.get() {
@@ -1453,10 +1663,11 @@ impl RequestDeduplication {
                         let retained_size = cached.retained_size();
                         self.mark_completed_sequence_pruned(*sequence);
                         self.sub_completed_size_locked(retained_size);
-                        decrement_atomic(&self.completed_count);
-                        self.inflight_count.fetch_add(1, Ordering::Relaxed);
+                        decrement_atomic(&self.local.completed_count);
+                        self.local.inflight_count.fetch_add(1, Ordering::Relaxed);
                         entry.insert(DeduplicationEntry::InFlight {
                             started_at: now,
+                            retention: self.inflight_ttl,
                             fingerprint: fingerprint.to_string(),
                             owner_token: owner_token.to_string(),
                         });
@@ -1483,6 +1694,7 @@ impl RequestDeduplication {
                         self.release_execution_barrier();
                         entry.insert(DeduplicationEntry::InFlight {
                             started_at: now,
+                            retention: self.inflight_ttl,
                             fingerprint: fingerprint.to_string(),
                             owner_token: owner_token.to_string(),
                         });
@@ -1491,12 +1703,14 @@ impl RequestDeduplication {
                 }
                 DeduplicationEntry::InFlight {
                     started_at,
+                    retention,
                     fingerprint: cached_fingerprint,
                     ..
                 } => {
-                    if now.duration_since(*started_at) >= self.inflight_ttl {
+                    if now.duration_since(*started_at) >= *retention {
                         entry.insert(DeduplicationEntry::InFlight {
                             started_at: now,
+                            retention: self.inflight_ttl,
                             fingerprint: fingerprint.to_string(),
                             owner_token: owner_token.to_string(),
                         });
@@ -1870,7 +2084,7 @@ impl RequestDeduplication {
     /// fence rejected, so a non-authoritative result is never replayed locally.
     fn remove_local_completed(&self, key: &str, fingerprint: &str, sequence: u64) {
         let _guard = self.accounting_guard();
-        let Entry::Occupied(entry) = self.local_cache.entry(key.to_string()) else {
+        let Entry::Occupied(entry) = self.local.local_cache.entry(key.to_string()) else {
             return;
         };
         let retained_size = match entry.get() {
@@ -1887,7 +2101,7 @@ impl RequestDeduplication {
         entry.remove();
         self.mark_completed_sequence_pruned(sequence);
         self.sub_completed_size_locked(retained_size);
-        decrement_atomic(&self.completed_count);
+        decrement_atomic(&self.local.completed_count);
     }
 
     fn redis_payload_for_response(
@@ -1947,7 +2161,8 @@ impl RequestDeduplication {
         fingerprint: &str,
         owner_token: &str,
     ) -> Option<usize> {
-        self.local_cache
+        self.local
+            .local_cache
             .remove_if(key, |_, entry| {
                 matches!(
                     entry,
@@ -1958,7 +2173,7 @@ impl RequestDeduplication {
                     } if current == fingerprint && current_owner_token == owner_token
                 )
             })
-            .map(|_| decrement_atomic(&self.inflight_count))
+            .map(|_| decrement_atomic(&self.local.inflight_count))
     }
 
     /// Remove only the execution barrier published by this exact local owner.
@@ -1972,7 +2187,8 @@ impl RequestDeduplication {
         fingerprint: &str,
         owner_token: &str,
     ) -> Option<usize> {
-        self.local_cache
+        self.local
+            .local_cache
             .remove_if(key, |_, entry| {
                 matches!(
                     entry,
@@ -1985,7 +2201,7 @@ impl RequestDeduplication {
             })
             .map(|_| {
                 self.release_execution_barrier();
-                decrement_atomic(&self.inflight_count)
+                decrement_atomic(&self.local.inflight_count)
             })
     }
 
@@ -2046,7 +2262,7 @@ impl RequestDeduplication {
         // itself would have used the shorter configured TTL.
         let execution_barrier_retention = retention.max(self.inflight_ttl);
         let _guard = self.accounting_guard();
-        let mut entry = match self.local_cache.entry(key.to_string()) {
+        let mut entry = match self.local.local_cache.entry(key.to_string()) {
             Entry::Occupied(entry) => entry,
             Entry::Vacant(_) => return LocalCompletionAction::Stale,
         };
@@ -2076,10 +2292,10 @@ impl RequestDeduplication {
                         execution_barrier_retention,
                     );
                 }
-                self.inflight_count.load(Ordering::Relaxed)
+                self.local.inflight_count.load(Ordering::Relaxed)
             } else {
                 entry.remove();
-                decrement_atomic(&self.inflight_count)
+                decrement_atomic(&self.local.inflight_count)
             };
             return LocalCompletionAction::Skipped {
                 inflight_count,
@@ -2088,7 +2304,7 @@ impl RequestDeduplication {
             };
         }
 
-        let current_total = self.completed_size_bytes.load(Ordering::Relaxed);
+        let current_total = self.local.completed_size_bytes.load(Ordering::Relaxed);
         if current_total.saturating_add(entry_size) > self.max_total_size_bytes {
             if publish_execution_barrier_on_skip {
                 let inserted_at = Instant::now();
@@ -2122,9 +2338,9 @@ impl RequestDeduplication {
                 None
             };
             let inflight_count = if redis_candidate.is_some() || publish_execution_barrier_on_skip {
-                self.inflight_count.load(Ordering::Relaxed)
+                self.local.inflight_count.load(Ordering::Relaxed)
             } else {
-                decrement_atomic(&self.inflight_count)
+                decrement_atomic(&self.local.inflight_count)
             };
             return LocalCompletionAction::Skipped {
                 inflight_count,
@@ -2137,7 +2353,8 @@ impl RequestDeduplication {
         }
 
         let sequence = self.next_completed_sequence();
-        self.completed_order
+        self.local
+            .completed_order
             .insert(sequence, CompletedOrderEntry::Pending);
         let cached = CachedResponse {
             status_code,
@@ -2156,13 +2373,14 @@ impl RequestDeduplication {
             retain_barrier_on_eviction,
         });
         self.add_completed_size_locked(entry_size);
-        self.completed_order
+        self.local
+            .completed_order
             .insert(sequence, CompletedOrderEntry::Published(key.to_string()));
         LocalCompletionAction::Published {
             cached: redis_copy,
             sequence,
-            completed_count: self.completed_count.fetch_add(1, Ordering::Relaxed) + 1,
-            inflight_count: decrement_atomic(&self.inflight_count),
+            completed_count: self.local.completed_count.fetch_add(1, Ordering::Relaxed) + 1,
+            inflight_count: decrement_atomic(&self.local.inflight_count),
         }
     }
 
@@ -2173,7 +2391,7 @@ impl RequestDeduplication {
         sequence: u64,
         retain: bool,
     ) {
-        let Some(mut entry) = self.local_cache.get_mut(key) else {
+        let Some(mut entry) = self.local.local_cache.get_mut(key) else {
             return;
         };
         if let DeduplicationEntry::Completed {
@@ -2190,7 +2408,9 @@ impl RequestDeduplication {
     }
 
     fn next_completed_sequence(&self) -> u64 {
-        self.completed_sequence.fetch_add(1, Ordering::Relaxed)
+        self.local
+            .completed_sequence
+            .fetch_add(1, Ordering::Relaxed)
     }
 
     /// Evict expired entries from local cache.
@@ -2213,12 +2433,13 @@ impl RequestDeduplication {
         // no-op: any thread that reaches it loaded a `last` at least
         // CLEANUP_INTERVAL_SECS older than `now_secs` (or the NEVER sentinel),
         // so exactly one thread per interval wins the CAS and runs the scan.
-        let last = self.last_cleanup.load(Ordering::Relaxed);
+        let last = self.local.last_cleanup.load(Ordering::Relaxed);
         let cleanup_interval_secs = CLEANUP_INTERVAL_SECS.min(self.inflight_ttl.as_secs().max(1));
         if !cleanup_due(last, now_secs, cleanup_interval_secs) {
             return;
         }
         if self
+            .local
             .last_cleanup
             .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
@@ -2232,7 +2453,7 @@ impl RequestDeduplication {
         // InFlight markers. Decrement counters for entries actually removed
         // instead of storing a full-scan snapshot, so concurrent inserts cannot
         // be overwritten by stale counts from this cleanup pass.
-        self.local_cache.retain(|_, entry| match entry {
+        self.local.local_cache.retain(|_, entry| match entry {
             DeduplicationEntry::Completed {
                 cached, sequence, ..
             } => {
@@ -2241,7 +2462,7 @@ impl RequestDeduplication {
                     let retained_size = cached.retained_size();
                     self.mark_completed_sequence_pruned(*sequence);
                     self.sub_completed_size_locked(retained_size);
-                    decrement_atomic(&self.completed_count);
+                    decrement_atomic(&self.local.completed_count);
                 }
                 keep
             }
@@ -2253,7 +2474,7 @@ impl RequestDeduplication {
                 let keep = now.duration_since(*inserted_at) < *retention;
                 if !keep {
                     self.release_execution_barrier();
-                    decrement_atomic(&self.inflight_count);
+                    decrement_atomic(&self.local.inflight_count);
                 }
                 keep
             }
@@ -2262,18 +2483,22 @@ impl RequestDeduplication {
             // connection drop) without ever reaching `on_final_response_body`.
             // Without this, duplicate requests would receive 409 Conflict
             // forever.
-            DeduplicationEntry::InFlight { started_at, .. } => {
-                let keep = now.duration_since(*started_at) < self.inflight_ttl;
+            DeduplicationEntry::InFlight {
+                started_at,
+                retention,
+                ..
+            } => {
+                let keep = now.duration_since(*started_at) < *retention;
                 if !keep {
-                    decrement_atomic(&self.inflight_count);
+                    decrement_atomic(&self.local.inflight_count);
                 }
                 keep
             }
         });
 
         self.evict_completed_over_capacity_locked(
-            self.completed_count.load(Ordering::Relaxed),
-            self.inflight_count.load(Ordering::Relaxed),
+            self.local.completed_count.load(Ordering::Relaxed),
+            self.local.inflight_count.load(Ordering::Relaxed),
             false,
         );
         self.advance_completed_evict_cursor_locked();
@@ -2304,12 +2529,12 @@ impl RequestDeduplication {
         }
         // Eviction is opportunistic on proxy paths; if another caller is
         // already trimming, skip instead of parking a Tokio worker.
-        let Ok(_guard) = self.eviction_lock.try_lock() else {
+        let Ok(_guard) = self.local.eviction_lock.try_lock() else {
             return;
         };
         self.evict_completed_over_capacity_guarded(
-            self.completed_count.load(Ordering::Relaxed),
-            self.inflight_count.load(Ordering::Relaxed),
+            self.local.completed_count.load(Ordering::Relaxed),
+            self.local.inflight_count.load(Ordering::Relaxed),
             preserve_one_completed,
         );
     }
@@ -2341,15 +2566,16 @@ impl RequestDeduplication {
             return;
         }
 
-        let mut sequence = self.next_completed_evict_sequence.load(Ordering::Relaxed);
-        let limit = self.completed_sequence.load(Ordering::Relaxed);
+        let mut sequence = self.local.evict_cursor();
+        let limit = self.local.completed_sequence.load(Ordering::Relaxed);
         while to_remove > 0 && sequence < limit {
             let current_sequence = sequence;
             match self.remove_completed_sequence_locked(sequence) {
                 CompletedSequenceRemoval::Removed => {
                     to_remove -= 1;
                     sequence += 1;
-                    self.next_completed_evict_sequence
+                    self.local
+                        .next_completed_evict_sequence
                         .store(sequence, Ordering::Relaxed);
                     self.remove_pruned_completed_order(current_sequence);
                 }
@@ -2360,13 +2586,15 @@ impl RequestDeduplication {
                     // completion is removed and the cardinality target is met
                     // whenever doing so does not discard live security state.
                     sequence += 1;
-                    self.next_completed_evict_sequence
+                    self.local
+                        .next_completed_evict_sequence
                         .store(sequence, Ordering::Relaxed);
                     self.remove_pruned_completed_order(current_sequence);
                 }
                 CompletedSequenceRemoval::Stale => {
                     sequence += 1;
-                    self.next_completed_evict_sequence
+                    self.local
+                        .next_completed_evict_sequence
                         .store(sequence, Ordering::Relaxed);
                     self.remove_pruned_completed_order(current_sequence);
                 }
@@ -2375,19 +2603,20 @@ impl RequestDeduplication {
                 }
             }
         }
-        self.next_completed_evict_sequence
+        self.local
+            .next_completed_evict_sequence
             .store(sequence, Ordering::Relaxed);
     }
 
     fn remove_completed_sequence_locked(&self, sequence: u64) -> CompletedSequenceRemoval {
-        let Some(order_entry) = self.completed_order.get(&sequence) else {
+        let Some(order_entry) = self.local.completed_order.get(&sequence) else {
             return CompletedSequenceRemoval::NotPublished;
         };
         let key = match order_entry.value() {
             CompletedOrderEntry::Pending => return CompletedSequenceRemoval::NotPublished,
             CompletedOrderEntry::Pruned => {
                 drop(order_entry);
-                self.completed_order.remove_if(&sequence, |_, entry| {
+                self.local.completed_order.remove_if(&sequence, |_, entry| {
                     matches!(entry, CompletedOrderEntry::Pruned)
                 });
                 return CompletedSequenceRemoval::Stale;
@@ -2396,7 +2625,7 @@ impl RequestDeduplication {
         };
         drop(order_entry);
 
-        let mut entry = match self.local_cache.entry(key.clone()) {
+        let mut entry = match self.local.local_cache.entry(key.clone()) {
             Entry::Occupied(entry) => entry,
             Entry::Vacant(_) => {
                 self.remove_stale_completed_order(sequence, &key);
@@ -2433,7 +2662,7 @@ impl RequestDeduplication {
         };
 
         self.sub_completed_size_locked(retained_size);
-        decrement_atomic(&self.completed_count);
+        decrement_atomic(&self.local.completed_count);
         let result = if retain_barrier_on_eviction {
             // A distributed lock may still be the only cross-gateway guard for
             // an externally executed response. If the replay cannot remain in
@@ -2446,7 +2675,7 @@ impl RequestDeduplication {
                     fingerprint,
                     owner_token: publisher_owner_token,
                 });
-                self.inflight_count.fetch_add(1, Ordering::Relaxed);
+                self.local.inflight_count.fetch_add(1, Ordering::Relaxed);
                 CompletedSequenceRemoval::Tombstoned
             } else {
                 // The per-key security-state budget is full. Collapse this
@@ -2466,7 +2695,8 @@ impl RequestDeduplication {
     }
 
     fn remove_stale_completed_order(&self, sequence: u64, key: &str) {
-        self.completed_order
+        self.local
+            .completed_order
             .remove_if(&sequence, |_, entry| match entry {
                 CompletedOrderEntry::Pending => false,
                 CompletedOrderEntry::Published(published) => published.as_str() == key,
@@ -2475,36 +2705,37 @@ impl RequestDeduplication {
     }
 
     fn mark_completed_sequence_pruned(&self, sequence: u64) {
-        if sequence < self.next_completed_evict_sequence.load(Ordering::Relaxed) {
-            self.completed_order.remove(&sequence);
+        if sequence < self.local.evict_cursor() {
+            self.local.completed_order.remove(&sequence);
             return;
         }
-        self.completed_order
+        self.local
+            .completed_order
             .insert(sequence, CompletedOrderEntry::Pruned);
-        if sequence < self.next_completed_evict_sequence.load(Ordering::Relaxed) {
+        if sequence < self.local.evict_cursor() {
             self.remove_pruned_completed_order(sequence);
         }
     }
 
     fn remove_pruned_completed_order(&self, sequence: u64) {
-        self.completed_order.remove_if(&sequence, |_, entry| {
+        self.local.completed_order.remove_if(&sequence, |_, entry| {
             matches!(entry, CompletedOrderEntry::Pruned)
         });
     }
 
     fn advance_completed_evict_cursor_locked(&self) {
-        let Ok(_guard) = self.eviction_lock.try_lock() else {
+        let Ok(_guard) = self.local.eviction_lock.try_lock() else {
             return;
         };
         self.advance_completed_evict_cursor_guarded();
     }
 
     fn advance_completed_evict_cursor_guarded(&self) {
-        let mut sequence = self.next_completed_evict_sequence.load(Ordering::Relaxed);
-        let limit = self.completed_sequence.load(Ordering::Relaxed);
+        let mut sequence = self.local.evict_cursor();
+        let limit = self.local.completed_sequence.load(Ordering::Relaxed);
         while sequence < limit {
             let current_sequence = sequence;
-            let Some(order_entry) = self.completed_order.get(&sequence) else {
+            let Some(order_entry) = self.local.completed_order.get(&sequence) else {
                 break;
             };
             if !matches!(order_entry.value(), CompletedOrderEntry::Pruned) {
@@ -2512,6 +2743,7 @@ impl RequestDeduplication {
             }
             drop(order_entry);
             if self
+                .local
                 .completed_order
                 .remove_if(&sequence, |_, entry| {
                     matches!(entry, CompletedOrderEntry::Pruned)
@@ -2519,14 +2751,16 @@ impl RequestDeduplication {
                 .is_some()
             {
                 sequence += 1;
-                self.next_completed_evict_sequence
+                self.local
+                    .next_completed_evict_sequence
                     .store(sequence, Ordering::Relaxed);
                 self.remove_pruned_completed_order(current_sequence);
             } else {
                 break;
             }
         }
-        self.next_completed_evict_sequence
+        self.local
+            .next_completed_evict_sequence
             .store(sequence, Ordering::Relaxed);
     }
 }
@@ -3947,6 +4181,6 @@ impl Plugin for RequestDeduplication {
     }
 
     fn tracked_keys_count(&self) -> Option<usize> {
-        Some(self.local_cache.len())
+        Some(self.local.local_cache.len())
     }
 }

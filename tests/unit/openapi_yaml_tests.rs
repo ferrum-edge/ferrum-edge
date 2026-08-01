@@ -1436,6 +1436,106 @@ fn admin_body_timeout_routes_document_request_timeout_in_openapi() {
     );
 }
 
+/// Store-backed TLS/ACME admin operations that can return `500 Internal Server Error`
+/// when a shared managed or ACME store is unavailable, unreadable, misconfigured,
+/// or when an offloaded store write cannot complete.
+fn admin_tls_store_backed_500_operation_ids() -> BTreeSet<&'static str> {
+    const OPS: &[&str] = &[
+        "listAcmeCertificates",
+        "importAcmeCertificate",
+        "getAcmeCertificate",
+        "updateAcmeCertificate",
+        "deleteAcmeCertificate",
+        "listAcmeOrders",
+        "createAcmeOrder",
+        "listAcmeAccounts",
+        "renewAcmeCertificate",
+        "getAcmeOrder",
+        "deleteAcmeOrder",
+        "finalizeAcmeOrder",
+        "listManagedTlsCertificates",
+        "createManagedTlsCertificate",
+        "getManagedTlsCertificate",
+        "updateManagedTlsCertificate",
+        "deleteManagedTlsCertificate",
+        "listManagedTlsCaBundles",
+        "createManagedTlsCaBundle",
+        "getManagedTlsCaBundle",
+        "updateManagedTlsCaBundle",
+        "deleteManagedTlsCaBundle",
+        "listManagedTlsCrls",
+        "createManagedTlsCrl",
+        "getManagedTlsCrl",
+        "updateManagedTlsCrl",
+        "deleteManagedTlsCrl",
+        "listManagedTlsOcspResponses",
+        "createManagedTlsOcspResponse",
+        "getManagedTlsOcspResponse",
+        "updateManagedTlsOcspResponse",
+        "deleteManagedTlsOcspResponse",
+        "listManagedTlsJwks",
+        "createManagedTlsJwks",
+        "getManagedTlsJwks",
+        "updateManagedTlsJwks",
+        "deleteManagedTlsJwks",
+    ];
+    OPS.iter().copied().collect()
+}
+
+/// TLS admin operations that never consult the managed/ACME stores and must not
+/// document a store-backed `500`.
+fn admin_tls_non_store_operation_ids() -> BTreeSet<&'static str> {
+    const OPS: &[&str] = &[
+        "listTlsInventory",
+        "listTlsEvents",
+        "forceRotateTlsSurface",
+        "validateTlsMaterial",
+    ];
+    OPS.iter().copied().collect()
+}
+
+fn openapi_operation_by_id<'a>(
+    spec: &'a serde_json::Value,
+    operation_id: &str,
+) -> (&'a str, &'a str, &'a serde_json::Value) {
+    for (path, path_item) in spec["paths"].as_object().expect("paths is an object") {
+        let path_item = path_item
+            .as_object()
+            .unwrap_or_else(|| panic!("path item {path} is an object"));
+        for method in OPENAPI_HTTP_METHODS {
+            let Some(operation) = path_item.get(*method) else {
+                continue;
+            };
+            if operation["operationId"].as_str() == Some(operation_id) {
+                return (method, path.as_str(), operation);
+            }
+        }
+    }
+    panic!("operationId `{operation_id}` not found in openapi.yaml");
+}
+
+#[test]
+fn admin_tls_store_backed_operations_document_internal_server_error() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for operation_id in admin_tls_store_backed_500_operation_ids() {
+        let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
+        assert_eq!(
+            operation["responses"]["500"]["$ref"], "#/components/responses/InternalServerError",
+            "{method} {path} ({operation_id}) must document InternalServerError"
+        );
+    }
+
+    for operation_id in admin_tls_non_store_operation_ids() {
+        let (method, path, operation) = openapi_operation_by_id(&spec, operation_id);
+        assert!(
+            operation["responses"].get("500").is_none(),
+            "{method} {path} ({operation_id}) must not document a store-backed 500"
+        );
+    }
+}
+
 fn collect_openapi_inventory(
     value: &serde_json::Value,
     refs: &mut BTreeSet<String>,

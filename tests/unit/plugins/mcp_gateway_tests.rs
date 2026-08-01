@@ -1731,6 +1731,116 @@ async fn aggregate_resource_read_preserves_requested_template_public_uri() {
     );
 }
 
+/// A claimed MCP response rewrite that cannot fit the retained ceiling must
+/// mark the pending capacity-refusal signal. Ordinary ineligible / unchanged
+/// paths must leave that signal clear.
+#[tokio::test]
+async fn claimed_mcp_rewrite_marks_capacity_refusal_distinct_from_noop() {
+    use ferrum_edge::_test_support::take_buffered_response_capacity_refusal_pending_for_test;
+
+    let server = start_mcp_catalog_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (mut template_ctx, mut template_headers) = mcp_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": 41,
+        "method": "resources/templates/list",
+        "params": {}
+    }));
+    template_headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let (_, template_body, _) = reject_json(
+        plugin
+            .before_proxy(&mut template_ctx, &mut template_headers)
+            .await,
+    );
+    let requested_public_uri = template_body["result"]["resourceTemplates"][0]["uriTemplate"]
+        .as_str()
+        .unwrap()
+        .replace("{path}", "README.md");
+
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "resources/read",
+        "params": { "uri": requested_public_uri }
+    });
+    let (mut ctx, mut headers) = mcp_ctx(request_body.clone());
+    headers.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            serde_json::to_vec(&request_body).unwrap().as_slice(),
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("template resource read should be rewritten");
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "result": {
+            "contents": [{
+                "uri": "file:///project/README.md",
+                "mimeType": "text/markdown",
+                "text": "read me"
+            }]
+        }
+    }))
+    .unwrap();
+    assert!(
+        requested_public_uri.len() > "file:///project/README.md".len(),
+        "the fixture must amplify the retained response when the public URI is restored"
+    );
+    // Room for the upstream body but not the public-URI rewrite.
+    ctx.max_response_body_size_bytes = upstream_response.len();
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &upstream_response,
+                Some("application/json"),
+                &known_json_response_headers(&upstream_response),
+            )
+            .await
+            .is_none(),
+        "an over-ceiling claimed MCP rewrite must return None"
+    );
+    assert!(
+        take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "capacity refusal must mark the pending transform signal"
+    );
+
+    // Ineligible content-type is an ordinary no-op with no pending signal.
+    let mut noop_ctx = create_test_context();
+    noop_ctx.max_response_body_size_bytes = 16;
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut noop_ctx,
+                b"not-json",
+                Some("text/plain"),
+                &HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+            )
+            .await
+            .is_none()
+    );
+    assert!(
+        !take_buffered_response_capacity_refusal_pending_for_test(&mut noop_ctx),
+        "ordinary ineligible None must not mark a capacity refusal"
+    );
+}
+
 #[tokio::test]
 async fn aggregate_response_preserves_validators_when_no_uri_is_rewritten() {
     let server = start_mcp_catalog_server().await;

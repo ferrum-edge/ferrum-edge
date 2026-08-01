@@ -1848,11 +1848,13 @@ impl Plugin for MeshRouteDispatch {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if ctx
-            .metadata
-            .get("ai_stream_router_claimed")
-            .is_some_and(|value| value == "true")
-        {
+        // Read the PRIVATE typed claim, not the public
+        // `ai_stream_router_claimed` metadata key: mesh dispatch rewrites
+        // `route_override_*`, so a later plugin deleting that observability
+        // marker must not be able to move a request whose provider credential
+        // is already committed onto a different backend
+        // (`GHSA-xhp5-hqj8-3mwg`).
+        if ctx.has_ai_stream_router_claim() {
             return PluginResult::Continue;
         }
         // Query predicates select a backend, so they are a security decision.

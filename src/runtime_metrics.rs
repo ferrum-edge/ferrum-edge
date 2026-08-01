@@ -103,7 +103,7 @@ const LOG_LEVELS: [LogLevel; 5] = [
     LogLevel::Error,
 ];
 
-const ERROR_CLASSES: [&str; 16] = [
+const ERROR_CLASSES: [&str; 17] = [
     "connection_timeout",
     "connection_refused",
     "connection_reset",
@@ -114,6 +114,7 @@ const ERROR_CLASSES: [&str; 16] = [
     "client_disconnect",
     "protocol_error",
     "response_body_too_large",
+    "gateway_buffer_capacity",
     "request_body_too_large",
     "connection_pool_error",
     "port_exhaustion",
@@ -1456,6 +1457,7 @@ mod tests {
             ErrorClass::ClientDisconnect,
             ErrorClass::ProtocolError,
             ErrorClass::ResponseBodyTooLarge,
+            ErrorClass::GatewayBufferCapacity,
             ErrorClass::RequestBodyTooLarge,
             ErrorClass::ConnectionPoolError,
             ErrorClass::PortExhaustion,

@@ -1934,12 +1934,13 @@ impl Plugin for RequestMirror {
         // byte reservation; carrying it forward transfers ownership to the
         // detached task.
         let staged_admission = ctx.take_request_mirror_admission(self.instance_id);
-        if ctx
-            .metadata
-            .get("ai_stream_router_claimed")
-            .map(String::as_str)
-            == Some("true")
-        {
+        // Read the PRIVATE typed claim, not the public
+        // `ai_stream_router_claimed` metadata key: mirroring is irreversible
+        // egress, so a later plugin deleting that observability marker must not
+        // be able to send a provider-bound request — its committed credential,
+        // model, destination, and query — to a shadow target
+        // (`GHSA-xhp5-hqj8-3mwg`).
+        if ctx.has_ai_stream_router_claim() {
             // The request was claimed after admission. Release the permit and
             // reservation immediately rather than holding them for work that
             // will never be dispatched.

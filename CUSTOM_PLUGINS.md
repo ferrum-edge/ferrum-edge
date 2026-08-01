@@ -113,6 +113,7 @@ use std::sync::Arc;
 
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult, RequestContext,
+    ResponseBodyProduction,
 };
 
 pub struct MyHeaderInjector {
@@ -175,6 +176,13 @@ impl MyHeaderInjector {
 impl Plugin for MyHeaderInjector {
     fn name(&self) -> &str {
         "my_header_injector"  // Must match the file name
+    }
+
+    // Non-producer: declare Never explicitly. Leaving `response_body_production`
+    // undeclared is intentionally fail-closed — the gateway treats the plugin as
+    // `Undeclared` and refuses it as a response-body producer before invocation.
+    fn response_body_production(&self) -> ResponseBodyProduction {
+        ResponseBodyProduction::Never
     }
 
     async fn before_proxy(
@@ -384,6 +392,7 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn should_buffer_response_body(&self, &ctx) -> bool` | Delegates | Per-request refinement. Defaults to `requires_response_body_buffering()` and may skip buffering for irrelevant requests. |
 | `fn should_buffer_response_body_for_content_type(&self, &ctx, content_type, status, &headers) -> bool` | Delegates | Post-header refinement on supported dispatch paths. Inspect status and the full header map (including `Content-Encoding`) when representation metadata affects safety. This is narrowing-only: it may release a response selected for buffering, but cannot force a streaming response to buffer. |
 | `fn may_modify_response_content_type(&self, &ctx, backend_content_type) -> bool` | `false` | Set when `after_proxy` may relabel the backend `Content-Type`; this prevents an unsafe buffer-to-stream downgrade. The answer must match the current request and backend type exactly. |
+| `fn response_body_production(&self) -> ResponseBodyProduction` | `Undeclared` for every custom / out-of-tree name | **Mandatory security contract for retained response bodies.** Non-producers must return `ResponseBodyProduction::Never`. Producers may return `BoundedByRetainedCeiling` only when every replacement is built through `BoundedResponseBodySink` / `bounded_json_vec` (or an equally construction-time ceiling-bounded materialization). Leaving the method undeclared is intentionally fail-closed: the gateway refuses the producer before invocation. Declaring `Never` but returning `Some` from a normalize/transform hook is a contract violation and is refused rather than installed. A post-allocation length check is not a substitute for construction-time bounding. |
 | `fn requires_response_stream_hooks(&self) -> bool` | `false` | Config-time opt-in for streaming response inspection. |
 | `fn response_stream_inspector(&self, &ctx, status, content_type) -> Option<Box<dyn ResponseStreamInspector>>` | `None` | Create state owned by one eligible streaming response, or return `None` for passthrough. |
 | `fn forces_reqwest_dispatch(&self, &ctx) -> bool` | `false` | Optional per-request native-H3 dispatch override when reqwest is operationally preferable; inspectors do not require it for transport coverage. |
@@ -639,9 +648,17 @@ impl Plugin for MyJsonResponseInspector {
 }
 ```
 
-Use `on_final_response_body()` instead when you need the final client-visible body after all `transform_response_body*()` hooks. To replace a buffered body, use the current three-argument signature:
+Use `on_final_response_body()` instead when you need the final client-visible body after all `transform_response_body*()` hooks. To replace a buffered body, first declare the retained-allocation producer contract, then use the current three-argument signature:
 
 ```rust
+fn response_body_production(&self) -> ResponseBodyProduction {
+    // Only when every replacement is constructed through
+    // BoundedResponseBodySink / bounded_json_vec (or an equally
+    // construction-time ceiling-bounded materialization). A post-allocation
+    // length check is not sufficient.
+    ResponseBodyProduction::BoundedByRetainedCeiling
+}
+
 async fn transform_response_body(
     &self,
     body: &[u8],
@@ -649,9 +666,27 @@ async fn transform_response_body(
     response_headers: &HashMap<String, String>,
 ) -> Option<Vec<u8>> {
     let _ = (body, content_type, response_headers);
-    None // Some(new_body) replaces it
+    None // Some(new_body) replaces it — build that Vec through a bounded sink
 }
 ```
+
+**Retained response-body producer contract (GHSA-pwcm-6rh8-f2gh):**
+
+- Header-only, logging, and other non-producers must override
+  `response_body_production()` to return `ResponseBodyProduction::Never`. The
+  quick-start header injector above does this.
+- A response producer may declare `BoundedByRetainedCeiling` only when every
+  replacement is constructed through `BoundedResponseBodySink` /
+  `bounded_json_vec` or an equally construction-time ceiling-bounded
+  materialization. Measuring length after an unbounded allocation does not
+  satisfy the contract.
+- Leaving the method undeclared is intentionally fail-closed: custom and
+  unknown plugin names default to `Undeclared`, and the gateway refuses the
+  producer before invocation (buffered H1/H2 traffic surfaces this as a
+  gateway-local refusal rather than running default response hooks).
+- Declaring `Never` but returning `Some` from `normalize_response_body*` /
+  `transform_response_body*` remains a contract violation: the replacement is
+  refused rather than installed.
 
 Exporters that must observe the response after all rejecting validators should
 also return `true` from `requires_response_committed_hook()` and emit from
@@ -1547,6 +1582,7 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] `requires_prior_request_deduplication()` returns `true` if a terminal external side effect must run after attached deduplication instances
 - [ ] `requires_request_body_buffering()` returns `true` if it reads the request body
 - [ ] Complete-body response plugins declare `requires_response_body_buffering()` and only narrow it in `should_buffer_response_body*()`
+- [ ] Non-producers override `response_body_production()` to return `ResponseBodyProduction::Never`; producers declare `BoundedByRetainedCeiling` only with construction-time bounded sinks (`BoundedResponseBodySink` / `bounded_json_vec`); leaving the method undeclared is fail-closed refusal before invocation
 - [ ] Streaming response plugins declare `requires_response_stream_hooks()` and return a bounded, state-owning `ResponseStreamInspector`
 - [ ] A plugin that relabels response `Content-Type` declares `may_modify_response_content_type()` with the same conditions as `after_proxy()`
 - [ ] `requires_ws_frame_hooks()` returns `true` if it implements `on_ws_frame()` or `on_ws_reassembly_frames()`

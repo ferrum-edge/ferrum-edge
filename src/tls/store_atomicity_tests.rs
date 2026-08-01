@@ -74,6 +74,7 @@ fn sample_acme_order(id: &str, token: &str) -> AcmeOrderRecord {
         }],
         tls_alpn01_challenges: Vec::new(),
         dns01_challenges: Vec::new(),
+        finalization: None,
         error: None,
     })
     .expect("acme order record")
@@ -189,7 +190,12 @@ fn managed_tls_failed_create_update_delete_keep_prior_snapshot() {
         store.get("edge-ca"),
         Err(ManagedTlsError::NotFound(_))
     ));
-    assert!(store.list(ManagedTlsMaterialKind::CaBundle).is_empty());
+    assert!(
+        store
+            .list(ManagedTlsMaterialKind::CaBundle)
+            .expect("list ca bundles")
+            .is_empty()
+    );
     assert_live_matches_reopened_managed(&store, dir.path(), "edge-ca");
 
     // Seed version A.
@@ -260,7 +266,12 @@ fn managed_tls_failed_dir_sync_on_create_leaves_store_empty_and_durable() {
         store.get("edge-ca"),
         Err(ManagedTlsError::NotFound(_))
     ));
-    assert!(store.list(ManagedTlsMaterialKind::CaBundle).is_empty());
+    assert!(
+        store
+            .list(ManagedTlsMaterialKind::CaBundle)
+            .expect("list ca bundles")
+            .is_empty()
+    );
     assert_live_matches_reopened_managed(&store, dir.path(), "edge-ca");
 }
 
@@ -280,7 +291,12 @@ fn acme_certificate_failed_create_update_delete_keep_prior_snapshot() {
         store.get_certificate("edge-cert"),
         Err(AcmeError::NotFound(_))
     ));
-    assert!(store.list_certificates().is_empty());
+    assert!(
+        store
+            .list_certificates()
+            .expect("list acme certificates")
+            .is_empty()
+    );
     assert_live_matches_reopened_acme_cert(&store, dir.path(), "edge-cert");
 
     store

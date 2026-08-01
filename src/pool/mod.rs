@@ -82,6 +82,7 @@ impl SharedPoolCreateKind {
             ErrorClass::ConnectionPoolError => Self::Unavailable,
             ErrorClass::ClientDisconnect
             | ErrorClass::ResponseBodyTooLarge
+            | ErrorClass::GatewayBufferCapacity
             | ErrorClass::RequestBodyTooLarge
             | ErrorClass::GracefulRemoteClose
             | ErrorClass::RequestError => Self::Other,

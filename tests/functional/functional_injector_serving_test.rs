@@ -240,6 +240,7 @@ fn seed_pending_tls_alpn_order(store_dir: &std::path::Path) -> Result<(), String
             key_authorization: ACME_KEY_AUTHORIZATION.to_string(),
         }],
         dns01_challenges: Vec::new(),
+        finalization: None,
         error: None,
     })
     .map_err(|e| format!("build ACME order: {e}"))?;

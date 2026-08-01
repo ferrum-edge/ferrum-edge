@@ -15,13 +15,27 @@
 //! normalized to OpenAI `chat.completion.chunk` SSE on the fly via a
 //! [`ResponseStreamInspector`], never buffering the full response.
 //!
-//! ## Coordination with `ai_federation`
+//! ## Coordination with other built-ins
 //!
-//! `ai_stream_router` runs first and, when it claims a streaming request, sets
-//! `ctx.metadata["ai_stream_router_claimed"] = "true"`. `ai_federation` checks
-//! this at the top of its `before_proxy` and immediately `Continue`s, so the two
-//! plugins compose: `stream: true` is handled here, `stream: false` falls
-//! through to `ai_federation`.
+//! `ai_stream_router` runs first and, when it claims a streaming request,
+//! records the private typed [`AiStreamRouterClaim`] on the request context and
+//! also publishes `ctx.metadata["ai_stream_router_claimed"] = "true"` for
+//! observability and third-party/custom-plugin coordination. Every BUILT-IN
+//! that must stand down on a claimed provider request — `ai_federation`,
+//! `request_mirror`, `serverless_function`, `mcp_gateway`, and
+//! `mesh_route_dispatch` — decides from
+//! [`RequestContext::has_ai_stream_router_claim`], never from that metadata key
+//! (`GHSA-xhp5-hqj8-3mwg`): metadata is a mutable string map, so deleting or
+//! rewriting the marker after a real claim would otherwise let those plugins
+//! re-route, mirror, federate, or invoke a function over a request whose
+//! third-party provider credential, model, destination, and query are already
+//! committed. The two plugin families still compose the same way: `stream: true`
+//! is handled here, `stream: false` falls through to `ai_federation`.
+//!
+//! Intentional PASS-THROUGH is a different state — the request is genuinely
+//! unclaimed because the operator disabled fail-closed missing/unmatched-model
+//! behavior — and still coordinates through
+//! `ctx.metadata["ai_stream_router_pass_through"]`.
 //!
 //! ## MVP scope
 //!
@@ -76,6 +90,97 @@
 //!   against the same effective proxy, rotating only the load-balancer target
 //!   within one upstream. It has no per-attempt re-preparation boundary.
 //!
+//! ## Final provider boundary (`GHSA-xhp5-hqj8-3mwg`)
+//!
+//! Claiming in `before_proxy` at 2984 only orders this plugin ahead of the
+//! plugins that run before it. The generic `request_transformer` runs at 3000,
+//! a `serverless_function` `pre_proxy` backend overlay is merged later still,
+//! and both can add, overwrite, or rename any header — including the credential
+//! this plugin just installed — or rewrite the already-translated provider body.
+//! Two shared lifecycle boundaries close that window, and neither depends on
+//! relative priority:
+//!
+//! - `enforce_final_backend_header_policy` re-strips client/backend credential
+//!   and gateway-identity headers and re-installs ONLY the selected provider's
+//!   credential over the finalized backend-visible header map. The gateway runs
+//!   it after every `before_proxy` pass (including the deferred routing/remaining
+//!   passes) and after an egress header overlay, on H1/H2 and H3 alike.
+//! - `on_final_request_body_with_context` re-parses the backend-visible body
+//!   after every `transform_request_body` hook and fails closed unless the
+//!   provider-visible `model` is still exactly the model recorded in the
+//!   PRIVATE claim — the value that actually selected this provider — and still
+//!   matches that provider's `model_patterns`. The public
+//!   `ai_stream_router.model` metadata key is never consulted: a later plugin
+//!   that rewrites both the final body's model and that key to the same value
+//!   would otherwise satisfy an equality check while bypassing selection. It
+//!   also re-checks the committed destination witness, so the credential and the
+//!   destination cannot drift apart.
+//!
+//! Both fail closed. Neither logs header values, credentials, or body bytes,
+//! and neither echoes the offending value into the client error envelope.
+//!
+//! ### What the claim actually commits
+//!
+//! The credential boundary is not just a header set. A claim commits, and the
+//! final boundary re-asserts or re-checks, ALL of:
+//!
+//! - **Headers** — the owned credential / gateway-identity / provider-protocol
+//!   set listed on [`apply_provider_boundary_headers`]. Headers OUTSIDE that
+//!   fixed set are deliberately untouched, so intended operator transforms still
+//!   reach the provider. Ferrum does not attempt to classify an arbitrary
+//!   unknown custom header as a credential; an operator who routes a bespoke
+//!   secret header to a normal backend must not also configure that rule on a
+//!   proxy that routes to a third-party provider.
+//! - **Model** — the exact model string that matched `model_patterns` and chose
+//!   this provider, this price, and (for `{model}` endpoints) this backend URL.
+//!   Final body enforcement compares against THIS copy, and the claim-owned
+//!   response normalizers stamp the client-visible generation identity from it.
+//!   The `ai_stream_router.model` metadata key is observability only.
+//! - **Query** — the exact backend-visible query, frozen at claim time and
+//!   replayed from private request state at
+//!   `crate::proxy::effective_backend_query_string*`, the single funnel every
+//!   dispatcher and retry attempt reads. `request_transformer` query rules run
+//!   later (3000) and could otherwise append a normal-backend static secret to
+//!   the provider URL.
+//! - **Destination** — scheme, host, port, authority, absolute path, AND the
+//!   routing identity: `route_override_upstream_id` is cleared at claim time and
+//!   must still be clear, so no load balancer can pick the dial target.
+//! - **Transport security** — the exact `route_override_resolved_tls` committed
+//!   at claim time, compared for equality (verification flag, SNI, CA, and mTLS
+//!   client materials). `None` means plaintext HTTP and is a distinct committed
+//!   state.
+//! - **DNS** — the claim revokes any inherited `Proxy.dns_override` through the
+//!   typed `RouteOverrideDnsPolicy::ClearInherited` route override, because a
+//!   same-host pin would otherwise send the provider credential to an operator
+//!   address instead of provider DNS.
+//! - **Instance ownership** — an opaque per-instance identity recorded in
+//!   private request state. Multiple `ai_stream_router` instances are allowed and
+//!   two of them may share a provider NAME while differing in endpoint, key,
+//!   provider type, patterns, and normalization. Exactly one instance claims;
+//!   every claim-dependent request and response hook (request transform, final
+//!   header policy, final body revalidation, response header handling, and
+//!   response stream inspector / normalizer selection) verifies ownership before
+//!   acting. Fail-on-missing-model / fail-on-no-matching-provider still decide an
+//!   UNCLAIMED request in normal plugin order; ownership begins only on a
+//!   successful claim.
+//! - **Request-shape witnesses** — whether this instance's own transform
+//!   actually produced the Anthropic representation, and whether the claimed
+//!   request forbids tool use for this generation. Both gate fail-closed
+//!   decisions, so both are claim state rather than the mirrored
+//!   `ai_stream_router.request_translated` / `ai_stream_router.tool_choice_none`
+//!   observability keys.
+//!
+//! None of the claim state is metadata, and none of it is logged, serialized, or
+//! exported: it holds a query string, the committed model, and an ownership
+//! token. The `ai_stream_router.*` metadata keys remain published for logs and
+//! cross-plugin coordination, and a later plugin may write any of them — no
+//! enforcement point reads them back. The one metadata value a claim-owned hook
+//! still consults is `ai_stream_router.provider_content_encoding`, which is
+//! derived from the PROVIDER's own response headers, decides only how this
+//! instance decodes its own upstream bytes, and is bounded by that decoder's
+//! `NORMALIZE_DECODE_LIMITS`; forging it can fail this instance's
+//! normalization but cannot move a credential, a destination, or a generation.
+//!
 //! A second provider needs a different endpoint/authority, different
 //! credentials, a different backend TLS resolution, a different translated
 //! body, and a different response-normalization decision — none of which are
@@ -93,6 +198,7 @@ use chrono::Utc;
 use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 use url::{Host, Url};
 
@@ -175,22 +281,56 @@ pub const AI_STREAM_ROUTER_FALLBACK_REJECTION: &str = "ai_stream_router: unsuppo
 
 const META_ENABLED: &str = "ai_stream_router.enabled";
 const META_CLAIMED: &str = "ai_stream_router.claimed";
-/// Coordination key read by `ai_federation` to skip an already-claimed request.
+/// OBSERVABILITY / third-party coordination ONLY (`GHSA-xhp5-hqj8-3mwg`).
+///
+/// Published so logs and external/custom plugins can see that a claim happened.
+/// No BUILT-IN reads it back for a routing or egress decision: `ai_federation`,
+/// `request_mirror`, `serverless_function`, `mcp_gateway`, and
+/// `mesh_route_dispatch` all gate on the private typed claim through
+/// `RequestContext::has_ai_stream_router_claim()`, which a later plugin cannot
+/// erase or forge. Do not reintroduce a decision on this key.
 const META_CLAIMED_COORD: &str = "ai_stream_router_claimed";
 /// Coordination key for explicit router pass-through of streaming requests.
 const META_PASSTHROUGH_COORD: &str = "ai_stream_router_pass_through";
 const META_PROVIDER: &str = "ai_stream_router.provider";
 const META_PROVIDER_TYPE: &str = "ai_stream_router.provider_type";
+/// OBSERVABILITY ONLY (`GHSA-xhp5-hqj8-3mwg`). The model that selected the
+/// provider is authorization state, so it is committed to the private claim
+/// (`AiStreamRouterClaim::model`) and read from there by final model
+/// enforcement and by every claim-owned response normalizer. This key is
+/// published for logs and for other plugins, and a later plugin may overwrite
+/// it: nothing reads it back for a policy decision.
 const META_MODEL: &str = "ai_stream_router.model";
 const META_NORMALIZED: &str = "ai_stream_router.normalized_response_stream";
+// NOTE (`GHSA-xhp5-hqj8-3mwg`): the committed model, destination, TLS, DNS
+// decision, backend-visible query, translation witness, and owning instance are
+// deliberately NOT metadata keys. They live in the private, typed
+// `RequestContext::ai_stream_router_claim`, so a later plugin cannot forge them,
+// and a query string (which may hold a relocated credential) never reaches a
+// transaction log.
+/// OBSERVABILITY ONLY. The decisive translation witness is
+/// `AiStreamRouterClaim::request_translated`, written by this instance's own
+/// transform hook on the same context the final body hook reads.
 const META_REQUEST_TRANSLATED: &str = "ai_stream_router.request_translated";
-/// Set when the translated Anthropic request carries `tool_choice: {"type":"none"}`.
-/// Request-local only: the response normalizer fails closed if the provider
-/// nevertheless emits `tool_use` for that generation.
+/// OBSERVABILITY ONLY. Set when the claimed Anthropic request carries
+/// `tool_choice: {"type":"none"}`. The decisive value is
+/// `AiStreamRouterClaim::tool_choice_none`, committed at claim time: the
+/// response normalizer fails closed if the provider nevertheless emits
+/// `tool_use` for that generation, so it must not be disarmable by a later
+/// metadata write.
 const META_TOOL_CHOICE_NONE: &str = "ai_stream_router.tool_choice_none";
 /// Provider `Content-Encoding` that must be decoded before Anthropic SSE
 /// normalization. Stamped in `after_proxy` before representation headers are
 /// repaired so both streaming and buffered normalizers see the same coding.
+///
+/// Deliberately left in metadata and deliberately NOT authorization state
+/// (`GHSA-xhp5-hqj8-3mwg`): it is derived from the PROVIDER's own response
+/// headers rather than from anything the claim committed, it decides only how
+/// this instance's own normalizer decodes its own upstream bytes, and every
+/// value it can take is bounded by [`NORMALIZE_DECODE_LIMITS`]. A forged value
+/// can only make the claim owner's normalization fail (a fixed-cardinality
+/// upstream error body); it cannot move a credential, a destination, or a
+/// generation.
 const META_PROVIDER_ENCODING: &str = "ai_stream_router.provider_content_encoding";
 /// Shared marker (same contract as `ai_prompt_shield` / `ai_semantic_firewall`)
 /// telling response plugins the request asked for a streaming response.
@@ -252,10 +392,19 @@ impl ProviderType {
 }
 
 /// How a provider API key is injected into the forwarded request.
+///
+/// Both variants carry the COMPLETE, ready-to-insert header value. The final
+/// provider-header policy re-runs on every backend-visible header map (each
+/// `before_proxy` pass, each deferred routing pass, each finalized-egress
+/// overlay, and each retry attempt), so the credential value is built once at
+/// construction and only cloned into the outbound map afterwards.
+///
+/// Deliberately no `Debug`: every field is a live provider credential.
 #[derive(Clone)]
 enum ProviderAuth {
-    /// `Authorization: Bearer <api_key>`
-    Bearer { api_key: String },
+    /// `Authorization: <header_value>`, where `header_value` is the complete
+    /// `Bearer <api_key>` string precomputed at construction.
+    Bearer { header_value: String },
     /// A provider-specific header (e.g. `x-api-key` for Anthropic).
     Header { name: String, api_key: String },
 }
@@ -317,6 +466,108 @@ pub struct AiStreamRouter {
     /// Precomputed config-time flag: does any provider need response-stream
     /// normalization (and is normalization enabled)?
     response_stream_hooks: bool,
+    /// Opaque per-INSTANCE owner identity (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// Multiple `ai_stream_router` instances may be effective on one proxy, and
+    /// two of them may legitimately carry the same `provider.name` while
+    /// pointing at different endpoints with different keys, different
+    /// `provider_type`s, and a different normalization decision. Public
+    /// metadata identifies only a provider NAME, so it cannot decide which
+    /// instance owns a claim. Every claim-dependent hook therefore matches this
+    /// value against the winner recorded in private request state instead.
+    ///
+    /// Never rendered into metadata, logs, configuration, OpenAPI, or a
+    /// response: it exists only to make ownership decidable inside the process.
+    owner_id: u64,
+}
+
+/// Source of [`AiStreamRouter::owner_id`] values. Monotonic and process-local;
+/// the value is opaque and never leaves the process.
+static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The private, typed provider claim recorded on [`RequestContext`] by the
+/// winning `ai_stream_router` instance (`GHSA-xhp5-hqj8-3mwg`).
+///
+/// This is the complete witness of what the credential was committed TO,
+/// INCLUDING the generation it was committed FOR. The public
+/// `ai_stream_router.*` metadata keys stay what they always were —
+/// observability and cross-plugin coordination — and are deliberately not
+/// load-bearing here: a later plugin can write metadata, but it cannot reach
+/// this struct.
+///
+/// Nothing in it is ever logged, serialized, echoed, or exported. It holds a
+/// backend-visible query string, which a transform could have moved a
+/// credential into, plus the committed model and the ownership token.
+#[derive(Clone)]
+pub(crate) struct AiStreamRouterClaim {
+    /// Which instance won the claim. Compared against
+    /// [`AiStreamRouter::owner_id`] by every claim-dependent hook.
+    owner: u64,
+    /// Index into the winning instance's own `providers`. An index rather than
+    /// a name so a later plugin rewriting `ai_stream_router.provider` metadata
+    /// cannot redirect credential injection or revalidation.
+    provider_index: usize,
+    /// The EXACT model string that selected `provider_index`, frozen at claim
+    /// time (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// Final request-body enforcement compares the provider-visible `model`
+    /// against this value and re-checks it against the selected provider's
+    /// `model_patterns`; the claim-owned response normalizers stamp the
+    /// client-visible generation identity from it. The public
+    /// `ai_stream_router.model` metadata key is NOT usable for either: a later
+    /// plugin can change the final body's model AND rewrite that key to the
+    /// same value, which would satisfy an equality check against metadata while
+    /// bypassing the selection that chose the provider, the price, and (for
+    /// `{model}` endpoints) the backend URL.
+    model: String,
+    /// Whether the claimed request forbids tool use for this generation
+    /// (`tool_choice: "none"` in the client body, translated to Anthropic
+    /// `tool_choice: {"type":"none"}`). Committed at claim time from the client
+    /// representation the claim selected on, so a later metadata write cannot
+    /// disarm the response normalizer's fail-closed `tool_use` guard. Always
+    /// `false` for providers whose responses this instance does not translate.
+    tool_choice_none: bool,
+    /// Set by this instance's own `transform_request_body` hook once the
+    /// Anthropic representation was produced. Read by
+    /// `on_final_request_body_with_context`, which runs on the SAME context
+    /// object the transform ran on (the proxy builds one hook context for both
+    /// phases), so the witness never has to survive a metadata write-back and
+    /// never has to be forgeable metadata.
+    request_translated: bool,
+    /// Backend-visible destination committed at claim time.
+    scheme: BackendScheme,
+    host: String,
+    port: u16,
+    /// Absolute backend path, including any folded endpoint query.
+    path: String,
+    authority: String,
+    /// Exactly the `route_override_resolved_tls` this claim committed. `None`
+    /// is unambiguous: the committed destination is plaintext HTTP, which is
+    /// also pinned by `scheme`, so a later plugin cannot satisfy the witness by
+    /// clearing a committed HTTPS configuration.
+    resolved_tls: Option<BackendTlsConfig>,
+    /// The exact backend-visible query the dispatch layer may append. Empty
+    /// when the committed `path` already carries every pair.
+    committed_query: String,
+}
+
+impl AiStreamRouterClaim {
+    #[inline]
+    pub(crate) fn committed_query(&self) -> &str {
+        &self.committed_query
+    }
+}
+
+/// Deliberately opaque: `RequestContext` derives `Debug`, and a derived
+/// implementation here would print the committed backend-visible query (which a
+/// transform may have relocated a credential into), the committed model, and
+/// the ownership token into any diagnostic that formats a request context.
+/// Model enforcement is fixed-cardinality and never echoes a model, so the
+/// committed model must not reach a log through `Debug` either.
+impl std::fmt::Debug for AiStreamRouterClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AiStreamRouterClaim(<redacted>)")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -469,16 +720,57 @@ impl AiStreamRouter {
             normalize_response_stream,
             providers,
             response_stream_hooks,
+            owner_id: NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
-    /// First provider (in priority order) whose patterns match `model`.
-    fn select_provider(&self, model: &str) -> Option<&StreamProvider> {
-        self.providers.iter().find(|p| p.matches_model(model))
+    /// First provider (in priority order) whose patterns match `model`, with its
+    /// index for the private claim witness.
+    fn select_provider(&self, model: &str) -> Option<(usize, &StreamProvider)> {
+        self.providers
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.matches_model(model))
     }
 
-    fn provider_by_name(&self, name: &str) -> Option<&StreamProvider> {
-        self.providers.iter().find(|p| p.name == name)
+    /// The claim and provider THIS instance owns for `ctx`, or `None`.
+    ///
+    /// `None` covers three distinct cases that all mean "do nothing here":
+    /// the request was never claimed, another `ai_stream_router` instance won
+    /// the claim (it runs the identical enforcement from the same phase), or
+    /// this instance is disabled. Every claim-dependent request and response
+    /// hook goes through this one gate (`GHSA-xhp5-hqj8-3mwg`), so a second
+    /// instance can never re-inject its own credential, re-transform the body,
+    /// revalidate against its own model policy, or install a second response
+    /// normalizer.
+    fn owned_claim<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+    ) -> Option<(&'a AiStreamRouterClaim, &'a StreamProvider)> {
+        if !self.enabled {
+            return None;
+        }
+        let claim = ctx.ai_stream_router_claim.as_deref()?;
+        if claim.owner != self.owner_id {
+            return None;
+        }
+        // `provider_index` was recorded by this same instance, so the lookup
+        // cannot miss; `get` keeps it total rather than indexing.
+        let provider = self.providers.get(claim.provider_index)?;
+        Some((claim, provider))
+    }
+
+    /// Whether THIS instance owns the claim AND its selected provider's response
+    /// SSE must be normalized.
+    ///
+    /// Every response-side hook gates on this rather than on the public
+    /// `ai_stream_router.normalized_response_stream` marker, so a losing
+    /// instance cannot install a second normalizer over an already-normalized
+    /// stream (`GHSA-xhp5-hqj8-3mwg`).
+    fn normalizes_owned_response(&self, ctx: &RequestContext) -> bool {
+        self.owned_claim(ctx).is_some_and(|(_, provider)| {
+            provider.normalizes_response(self.normalize_response_stream)
+        })
     }
 }
 
@@ -525,7 +817,11 @@ fn build_auth(provider_type: ProviderType, api_key: String) -> ProviderAuth {
             name: "x-goog-api-key".to_string(),
             api_key,
         },
-        ProviderType::OpenAi | ProviderType::OpenAiCompatible => ProviderAuth::Bearer { api_key },
+        // Build the complete `Bearer <key>` header value once, here, so the
+        // final-policy hot path never formats a credential per pass.
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible => ProviderAuth::Bearer {
+            header_value: format!("Bearer {api_key}"),
+        },
     }
 }
 
@@ -1627,6 +1923,60 @@ fn openai_error_response(
     }
 }
 
+/// Whether the live route override is still byte-for-byte the destination the
+/// claim committed (`GHSA-xhp5-hqj8-3mwg`).
+///
+/// A visible host/port match is NOT sufficient. Three things decide where the
+/// provider credential actually goes, and all three are compared here:
+///
+/// * the visible destination (scheme / host / port / authority / absolute path),
+/// * the routing identity — `route_override_upstream_id` must still be clear,
+///   because an upstream override hands target selection to a load balancer
+///   that can dial an address this claim never approved,
+/// * the resolved backend TLS — exact equality over verification, SNI, CA, and
+///   the mTLS client identity, so a later plugin cannot keep the same visible
+///   host while disabling verification, retargeting SNI, or attaching Ferrum's
+///   own client certificate to a third-party connection. `None` (plaintext) is a
+///   distinct committed state, not "unset".
+///
+/// The claim is a private typed struct, not serialized metadata, so none of
+/// these values can be forged by a plugin that can only write metadata.
+fn route_override_still_targets(ctx: &RequestContext, claim: &AiStreamRouterClaim) -> bool {
+    ctx.route_override_upstream_id.is_none()
+        && ctx.route_override_backend_scheme == Some(claim.scheme)
+        && ctx.route_override_backend_port == Some(claim.port)
+        && ctx.route_override_path_is_absolute
+        && ctx.route_override_dns_policy == super::RouteOverrideDnsPolicy::ClearInherited
+        && ctx.route_override_backend_host.as_deref() == Some(claim.host.as_str())
+        && ctx.route_override_authority.as_deref() == Some(claim.authority.as_str())
+        && ctx.route_override_path.as_deref() == Some(claim.path.as_str())
+        && ctx.route_override_resolved_tls == claim.resolved_tls
+}
+
+/// Fail-closed envelope for a broken provider-boundary invariant. Fixed
+/// cardinality: never echoes a model, header, or body value.
+fn provider_policy_violation(message: &str) -> PluginResult {
+    openai_error_response(
+        500,
+        message,
+        "api_error",
+        None,
+        Some("provider_policy_violation"),
+    )
+}
+
+/// Fail-closed envelope for a final provider-visible model that no longer
+/// satisfies the policy that selected the provider.
+fn model_policy_violation(message: &str) -> PluginResult {
+    openai_error_response(
+        400,
+        message,
+        "invalid_request_error",
+        Some("model"),
+        Some("model_policy_violation"),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Plugin impl
 // ---------------------------------------------------------------------------
@@ -1702,6 +2052,18 @@ impl Plugin for AiStreamRouter {
         if !self.enabled || ctx.method != "POST" {
             return PluginResult::Continue;
         }
+        // First claim wins (`GHSA-xhp5-hqj8-3mwg`). Multiple same-type instances
+        // are allowed, and two of them can match the same request. A second
+        // claim would reapply a different credential, repoint the destination
+        // under the first instance's already-installed key, translate the body
+        // twice, and install a second response normalizer. Yielding silently
+        // (rather than rejecting) also keeps `fail_on_missing_model` /
+        // `fail_on_no_matching_provider` meaningful: those decide an UNCLAIMED
+        // request in normal plugin order, and ownership only begins once some
+        // instance has actually claimed.
+        if ctx.ai_stream_router_claim.is_some() {
+            return PluginResult::Continue;
+        }
         let content_type = headers
             .get("content-type")
             .map(String::as_str)
@@ -1749,7 +2111,7 @@ impl Plugin for AiStreamRouter {
         };
 
         // Select a provider by model pattern + priority.
-        let Some(provider) = self.select_provider(&model) else {
+        let Some((provider_index, provider)) = self.select_provider(&model) else {
             if self.fail_on_no_matching_provider {
                 return openai_error_response(
                     404,
@@ -1815,6 +2177,26 @@ impl Plugin for AiStreamRouter {
         // every client parameter for strip — otherwise the forwarded URL would
         // contain a second `?`. Endpoints without a query keep the normal
         // client-query forwarding untouched.
+        // The exact backend-visible query the dispatch layer may append to the
+        // committed target, frozen HERE and re-asserted at every later capture
+        // point (`GHSA-xhp5-hqj8-3mwg`). `request_transformer` runs at 3000 —
+        // after this claim — and its query rules could otherwise append a
+        // normal-backend static secret to the third-party provider URL.
+        //
+        // Two cases, both preserving the pre-existing semantics:
+        //  * an endpoint query is folded into the absolute override path below,
+        //    and every client pair is marked consumed, so the separately
+        //    appended query is committed EMPTY;
+        //  * otherwise the already-safe client query continues — the canonical
+        //    backend-visible query as of this moment, which is the raw wire
+        //    query (or an earlier plugin's published outbound query) after the
+        //    authentication-owned strip markers.
+        let committed_query = if provider.endpoint_query.is_some() {
+            String::new()
+        } else {
+            crate::proxy::effective_backend_query_string(ctx).into_owned()
+        };
+
         if let Some(endpoint_query) = provider.endpoint_query.as_deref() {
             let endpoint_query = if provider.path_has_model_placeholder {
                 endpoint_query.replace("{model}", &model)
@@ -1845,9 +2227,22 @@ impl Plugin for AiStreamRouter {
         ctx.route_override_backend_scheme = Some(provider.scheme);
         ctx.route_override_backend_host = Some(provider.host.clone());
         ctx.route_override_backend_port = Some(provider.port);
-        ctx.route_override_path = Some(backend_path);
+        ctx.route_override_path = Some(backend_path.clone());
         ctx.route_override_path_is_absolute = true;
         ctx.route_override_authority = Some(provider.authority.clone());
+        // This claim commits a DIRECT provider endpoint, never an upstream /
+        // load-balancer identity. Clear any upstream override an earlier plugin
+        // set: leaving one in place would let a load balancer choose the actual
+        // dial target while this plugin's provider credential is installed, and
+        // the final boundary requires it to still be clear
+        // (`GHSA-xhp5-hqj8-3mwg`).
+        ctx.route_override_upstream_id = None;
+        // The provider host must resolve through provider DNS. A `dns_override`
+        // on the selected proxy pins a fixed address, and the generic
+        // "host text changed" rule does not clear it when the configured proxy
+        // host happens to equal the provider host — exactly the case where the
+        // destination identity changed but the text did not.
+        ctx.route_override_dns_policy = super::RouteOverrideDnsPolicy::ClearInherited;
         // Default: public providers verify against the system trust store.
         // `inherit_backend_tls: true` carries the current proxy's resolved
         // backend TLS (custom CA / SNI policy / backend mTLS client cert) to
@@ -1861,41 +2256,59 @@ impl Plugin for AiStreamRouter {
             } else {
                 Some(BackendTlsConfig::default_verify())
             };
+        } else {
+            // Plaintext HTTP provider: no committed TLS configuration at all.
+            // Pinned explicitly so the witness below cannot be satisfied by a
+            // later plugin ADDING one (which would change SNI/verification for
+            // a destination this claim never negotiated TLS with).
+            ctx.route_override_resolved_tls = None;
         }
 
         // --- Rewrite headers: strip client credentials, insert provider auth. ---
-        strip_client_credentials(headers);
-        match &provider.auth {
-            ProviderAuth::Bearer { api_key } => {
-                headers.insert("authorization".to_string(), format!("Bearer {api_key}"));
-            }
-            ProviderAuth::Header { name, api_key } => {
-                headers.insert(name.clone(), api_key.clone());
-            }
-        }
-        if provider.provider_type == ProviderType::Anthropic {
-            headers.insert(
-                "anthropic-version".to_string(),
-                provider.anthropic_version.clone(),
-            );
-        }
-        headers.insert("host".to_string(), provider.authority.clone());
-        headers.insert("content-type".to_string(), "application/json".to_string());
-        // A provider streams SSE; make the intent explicit to the upstream.
-        headers.insert("accept".to_string(), "text/event-stream".to_string());
-
-        // --- Metadata (observability + downstream-hook coordination). ---
+        // This is the FIRST application of the owned header set. It is not the
+        // decisive one: `enforce_final_backend_header_policy` re-applies exactly
+        // the same policy over the finalized backend-visible map after every
+        // later generic header transform (`GHSA-xhp5-hqj8-3mwg`).
         let normalizes = provider.normalizes_response(self.normalize_response_stream);
-        // Normalization parses line-delimited SSE. Strip client content-coding
-        // negotiation and explicitly request identity so the provider does not
-        // return gzip/br octets that the normalizer would misread as plaintext
-        // events. Residual encodings are still handled fail-safe in
-        // `after_proxy` / the normalizer.
-        if normalizes {
-            remove_header_ci(headers, "accept-encoding");
-            headers.insert("accept-encoding".to_string(), "identity".to_string());
-        }
+        apply_provider_boundary_headers(provider, normalizes, headers);
 
+        // --- Private claim: the complete witness of what was committed. ---
+        // Everything the credential boundary depends on lives here, in typed
+        // request-private state, and nowhere in public metadata: the owning
+        // instance, the provider it selected, the MODEL that selected it, the
+        // destination identity, the resolved backend TLS, and the
+        // backend-visible query (`GHSA-xhp5-hqj8-3mwg`).
+        // `on_final_request_body_with_context` requires every one of them to be
+        // unchanged before the request is dispatched.
+        let committed_tls = ctx.route_override_resolved_tls.clone();
+        // Committed from the CLIENT representation this claim selected on, not
+        // from the later translated body: the response normalizer's fail-closed
+        // `tool_use` guard must be armed by what the request actually asked for
+        // and must not be disarmable afterwards. Only meaningful for the
+        // provider type whose SSE this instance translates.
+        let tool_choice_none = provider.provider_type == ProviderType::Anthropic
+            && openai_body.get("tool_choice").and_then(Value::as_str) == Some("none");
+        ctx.ai_stream_router_claim = Some(Box::new(AiStreamRouterClaim {
+            owner: self.owner_id,
+            provider_index,
+            model: model.clone(),
+            tool_choice_none,
+            // The transform hook has not run yet; it sets this on the same
+            // context the final body hook reads.
+            request_translated: false,
+            scheme: provider.scheme,
+            host: provider.host.clone(),
+            port: provider.port,
+            path: backend_path,
+            authority: provider.authority.clone(),
+            resolved_tls: committed_tls,
+            committed_query,
+        }));
+
+        // --- Metadata (observability + downstream-hook coordination ONLY). ---
+        // Nothing below is read back for an authorization or policy decision:
+        // a later plugin can write any of these keys, so every enforcement
+        // point reads the private claim instead (`GHSA-xhp5-hqj8-3mwg`).
         ctx.metadata
             .insert(META_ENABLED.to_string(), "true".to_string());
         ctx.metadata
@@ -1909,9 +2322,10 @@ impl Plugin for AiStreamRouter {
         ctx.metadata
             .insert(META_STREAMING_SHARED.to_string(), "true".to_string());
         // The provider is a third party: the proxy must not append the
-        // gateway-asserted `x-consumer-*` identity headers after the
-        // credential strip below (see the suppression contract on
-        // `RequestContext::backend_consumer_username`).
+        // gateway-asserted `x-consumer-*` identity headers after the credential
+        // strip above (see the suppression contract on
+        // `RequestContext::backend_consumer_username`). The final header policy
+        // additionally strips any that a later generic rule reintroduced.
         ctx.metadata.insert(
             super::SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY.to_string(),
             "true".to_string(),
@@ -1922,6 +2336,7 @@ impl Plugin for AiStreamRouter {
             META_PROVIDER_TYPE.to_string(),
             provider.provider_type.as_str().to_string(),
         );
+        // Observability only: the decisive copy is `claim.model` above.
         ctx.metadata.insert(META_MODEL.to_string(), model);
         ctx.metadata
             .insert(META_NORMALIZED.to_string(), normalizes.to_string());
@@ -1946,17 +2361,27 @@ impl Plugin for AiStreamRouter {
         _content_type: Option<&str>,
         _request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if !self.enabled || ctx.metadata.get(META_CLAIMED).map(String::as_str) != Some("true") {
-            return None;
-        }
-        let provider_name = ctx.metadata.get(META_PROVIDER)?;
-        let provider = self.provider_by_name(provider_name)?;
-        let model = ctx.metadata.get(META_MODEL)?.clone();
+        // Only the instance that won the claim transforms the body. A second
+        // instance running this hook would translate an already-translated
+        // representation, or re-inject usage options into another provider's
+        // body (`GHSA-xhp5-hqj8-3mwg`). The model comes from the private claim,
+        // never from `ai_stream_router.model`: this hook runs at 2984 but a
+        // later plugin's metadata write must not be able to decide which
+        // generation the provider request is translated for.
+        let (provider_type, model) = {
+            let (claim, provider) = self.owned_claim(ctx)?;
+            (provider.provider_type, claim.model.clone())
+        };
 
-        match provider.provider_type {
+        match provider_type {
             ProviderType::Anthropic => {
                 let openai_body: Value = serde_json::from_slice(body).ok()?;
                 let translated = translate_to_anthropic(&openai_body, &model).ok()?;
+                // The decisive witness: private claim state on the very context
+                // `on_final_request_body_with_context` reads.
+                if let Some(claim) = ctx.ai_stream_router_claim.as_deref_mut() {
+                    claim.request_translated = true;
+                }
                 ctx.metadata
                     .insert(META_REQUEST_TRANSLATED.to_string(), "true".to_string());
                 if openai_body.get("tool_choice").and_then(Value::as_str) == Some("none") {
@@ -1979,20 +2404,76 @@ impl Plugin for AiStreamRouter {
         }
     }
 
+    fn enforces_final_backend_header_policy(&self) -> bool {
+        self.enabled
+    }
+
+    /// Re-assert the provider credential boundary over the FINAL backend-visible
+    /// header map (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// `before_proxy` already applied this policy, but a later generic header
+    /// rule (`request_transformer` at 3000), a deferred routing-header hook, or
+    /// a `pre_proxy` function's backend overlay can add/overwrite/rename the
+    /// credential afterwards. The gateway calls this at every point where the
+    /// outbound header map is complete, so the last word is always this policy
+    /// rather than whichever plugin happened to run last.
+    ///
+    /// Ownership is decided by the private claim, never by the public
+    /// `ai_stream_router.provider` metadata key: two instances may carry the
+    /// same provider NAME with different endpoints and different keys, so a
+    /// name match would let the losing instance install the wrong credential.
+    fn enforce_final_backend_header_policy(
+        &self,
+        ctx: &RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        let Some((_, provider)) = self.owned_claim(ctx) else {
+            return;
+        };
+        let normalizes = provider.normalizes_response(self.normalize_response_stream);
+        apply_provider_boundary_headers(provider, normalizes, headers);
+    }
+
+    /// Revalidate the FINAL provider-visible body and route against the policy
+    /// that selected the provider (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// Runs after every `transform_request_body` hook, so `body` is exactly what
+    /// the provider would receive. Every failure is fail-closed and carries a
+    /// fixed-cardinality message: the offending model, header, or body bytes are
+    /// never echoed back or logged, because a later transform could have placed
+    /// a secret there.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
         _headers: &HashMap<String, String>,
-        _body: &[u8],
+        body: &[u8],
     ) -> PluginResult {
-        if ctx.metadata.get(META_CLAIMED).map(String::as_str) == Some("true")
-            && ctx.metadata.get(META_PROVIDER_TYPE).map(String::as_str) == Some("anthropic")
-            && ctx
-                .metadata
-                .get(META_REQUEST_TRANSLATED)
-                .map(String::as_str)
-                != Some("true")
-        {
+        // Ownership and the destination witness both come from the private
+        // claim. Read them in one scope so the shared duplicate-key memo below
+        // can still take the context mutably.
+        let (
+            provider_index,
+            provider_is_anthropic,
+            destination_intact,
+            committed_model,
+            request_translated,
+        ) = {
+            // Not this instance's claim — either the request was never claimed,
+            // or a second effective `ai_stream_router` owns it and runs the
+            // identical revalidation from this same phase.
+            let Some((claim, provider)) = self.owned_claim(ctx) else {
+                return PluginResult::Continue;
+            };
+            (
+                claim.provider_index,
+                provider.provider_type == ProviderType::Anthropic,
+                route_override_still_targets(ctx, claim),
+                claim.model.clone(),
+                claim.request_translated,
+            )
+        };
+
+        if provider_is_anthropic && !request_translated {
             return openai_error_response(
                 400,
                 "The Anthropic request body could not be translated safely",
@@ -2001,15 +2482,81 @@ impl Plugin for AiStreamRouter {
                 Some("invalid_messages"),
             );
         }
+
+        // The credential installed at the boundary is only safe if it is still
+        // going to the destination that claimed it — same visible endpoint, no
+        // upstream/load-balancer identity, byte-identical backend TLS, and the
+        // provider-DNS decision intact. The backend-visible QUERY needs no check
+        // here: it is not read from the context at dispatch but re-asserted from
+        // the claim at the single capture funnel
+        // (`crate::proxy::effective_backend_query_string*`), which every
+        // dispatcher and every retry attempt goes through.
+        if !destination_intact {
+            return provider_policy_violation(
+                "The routed AI provider destination changed after provider selection",
+            );
+        }
+
+        // A duplicate `model` member makes the provider-visible generation
+        // parser-dependent: `serde_json` keeps the last occurrence while a
+        // first-wins provider parser would read the other one, so an equality
+        // check against either value proves nothing. Screen with the shared
+        // bounded scanner (memoized per request body) before parsing.
+        if ctx.json_scan_memo.ambiguity(body).is_some() {
+            return model_policy_violation(
+                "The final AI provider request body has ambiguous duplicate JSON members",
+            );
+        }
+
+        // `committed_model` is the private claim's copy, taken above. The public
+        // `ai_stream_router.model` key is deliberately NOT consulted here
+        // (`GHSA-xhp5-hqj8-3mwg`): a later plugin can rewrite the final body's
+        // model AND that key to the same new value, which would satisfy an
+        // equality check against metadata while bypassing the selection that
+        // chose this provider.
+        //
+        // Recorded by this same instance at claim time, so the lookup cannot
+        // miss; fail closed rather than indexing.
+        let Some(provider) = self.providers.get(provider_index) else {
+            return provider_policy_violation(
+                "The routed AI provider could not be revalidated before dispatch",
+            );
+        };
+
+        // The router committed a JSON provider contract; anything else at this
+        // point means a later transform reshaped the backend-visible body.
+        let Ok(final_body) = serde_json::from_slice::<Value>(body) else {
+            return model_policy_violation(
+                "The final AI provider request body is not valid JSON after request transforms",
+            );
+        };
+        let final_model = match final_body.get("model") {
+            Some(Value::String(model)) if !model.is_empty() => model.as_str(),
+            _ => {
+                return model_policy_violation(
+                    "The final AI provider request body has no usable 'model' field",
+                );
+            }
+        };
+        // Equality pins the exact generation that was priced, allowed, and (for
+        // `{model}` endpoints) baked into the backend URL; the pattern re-check
+        // proves the surviving value is still inside this provider's configured
+        // policy rather than merely unchanged.
+        if final_model != committed_model || !provider.matches_model(final_model) {
+            return model_policy_violation(
+                "The final AI provider request model does not match the routed model policy",
+            );
+        }
+
         PluginResult::Continue
     }
 
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
-        // Force the reqwest streaming path only for claimed requests whose SSE
-        // will be normalized, so the response-stream inspector is guaranteed to
-        // be wired. Requests we pass through unchanged stay on the fast path.
-        self.response_stream_hooks
-            && ctx.metadata.get(META_NORMALIZED).map(String::as_str) == Some("true")
+        // Force the reqwest streaming path only for requests THIS instance
+        // claimed and whose SSE it will normalize, so the response-stream
+        // inspector is guaranteed to be wired. Requests we pass through
+        // unchanged stay on the fast path.
+        self.response_stream_hooks && self.normalizes_owned_response(ctx)
     }
 
     fn response_stream_inspector(
@@ -2021,9 +2568,23 @@ impl Plugin for AiStreamRouter {
         if !self.response_stream_hooks {
             return None;
         }
-        if ctx.metadata.get(META_NORMALIZED).map(String::as_str) != Some("true") {
-            return None;
-        }
+        // Ownership, not the public `normalized_response_stream` marker: two
+        // instances can disagree on `normalize_response_stream` and on provider
+        // type, and only the winner's decision may install a normalizer
+        // (`GHSA-xhp5-hqj8-3mwg`). Double normalization would re-parse already
+        // OpenAI-shaped SSE as if it were provider-native.
+        //
+        // The same lookup yields the generation identity this normalizer stamps
+        // into every client-visible chunk and the fail-closed `tool_use` guard,
+        // both from the private claim rather than from the forgeable
+        // `ai_stream_router.model` / `ai_stream_router.tool_choice_none` keys.
+        let (model, tools_forbidden) = {
+            let (claim, provider) = self.owned_claim(ctx)?;
+            if !provider.normalizes_response(self.normalize_response_stream) {
+                return None;
+            }
+            (claim.model.clone(), claim.tool_choice_none)
+        };
         // Only normalize a successful event stream; a non-2xx/non-SSE body is an
         // error envelope that should reach the client untouched.
         if !(200..300).contains(&response_status) {
@@ -2032,14 +2593,7 @@ impl Plugin for AiStreamRouter {
         if !content_type.is_some_and(is_event_stream_content_type) {
             return None;
         }
-        let model = ctx
-            .metadata
-            .get(META_MODEL)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
         let encoding = ctx.metadata.get(META_PROVIDER_ENCODING).cloned();
-        let tools_forbidden =
-            ctx.metadata.get(META_TOOL_CHOICE_NONE).map(String::as_str) == Some("true");
         Some(wrap_anthropic_normalizer(
             model,
             encoding.as_deref(),
@@ -2058,9 +2612,17 @@ impl Plugin for AiStreamRouter {
         if !self.response_stream_hooks {
             return None;
         }
-        if ctx.metadata.get(META_NORMALIZED).map(String::as_str) != Some("true") {
-            return None;
-        }
+        // Same private-claim read as the streaming inspector: ownership plus the
+        // committed generation identity and tool-use guard
+        // (`GHSA-xhp5-hqj8-3mwg`). Scoped so the claim borrow ends before the
+        // buffered normalization await.
+        let (model, tools_forbidden) = {
+            let (claim, provider) = self.owned_claim(ctx)?;
+            if !provider.normalizes_response(self.normalize_response_stream) {
+                return None;
+            }
+            (claim.model.clone(), claim.tool_choice_none)
+        };
         // Match the streaming normalizer: provider error envelopes reach the
         // client untouched even when a backend labels them as event streams.
         if !(200..300).contains(&response_status) {
@@ -2069,14 +2631,16 @@ impl Plugin for AiStreamRouter {
         if !content_type.is_some_and(is_event_stream_content_type) {
             return None;
         }
-        let model = ctx
-            .metadata
-            .get(META_MODEL)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
+        // Every replacement this normalizer produces is materialised inside a
+        // sink bounded by this response's retained ceiling — the same size as
+        // the window the phase reserved before invoking it
+        // (GHSA-pwcm-6rh8-f2gh). Claim-owned model/tools_forbidden above stay
+        // authoritative (`GHSA-xhp5-hqj8-3mwg`); do not re-read them from
+        // mutable metadata.
+        let ceiling = ctx.retained_response_body_ceiling();
         let header_encoding = match content_encoding_value(response_headers) {
             Ok(encoding) => encoding,
-            Err(message) => return Some(upstream_sse_error_body(&message)),
+            Err(message) => return bounded_upstream_sse_error_body(&message, ceiling),
         };
         let encoding = ctx
             .metadata
@@ -2086,12 +2650,10 @@ impl Plugin for AiStreamRouter {
         let plaintext = match prepare_sse_bytes_for_normalization(body, encoding) {
             Ok(bytes) => bytes,
             Err(message) => {
-                return Some(upstream_sse_error_body(&message));
+                return bounded_upstream_sse_error_body(&message, ceiling);
             }
         };
-        let tools_forbidden =
-            ctx.metadata.get(META_TOOL_CHOICE_NONE).map(String::as_str) == Some("true");
-        normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden).await
+        normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden, ceiling).await
     }
 
     /// Bind every field normalized Anthropic SSE invalidates.
@@ -2122,7 +2684,7 @@ impl Plugin for AiStreamRouter {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.enabled || ctx.metadata.get(META_NORMALIZED).map(String::as_str) != Some("true") {
+        if !self.normalizes_owned_response(ctx) {
             return PluginResult::Continue;
         }
         if !(200..300).contains(&response_status) {
@@ -2177,11 +2739,94 @@ fn strip_client_credentials(headers: &mut HashMap<String, String>) {
         "openai-project",
     ];
     // Header keys in the map are already lowercased by the proxy, but match
-    // case-insensitively to be safe against any future change.
+    // case-insensitively to be safe against any future change. This runs on
+    // every final-policy pass (once per `before_proxy` pass, per deferred
+    // routing pass, per egress overlay, and per retry attempt), so compare in
+    // place rather than allocating a lowercased copy of every header name.
     headers.retain(|k, _| {
-        let lk = k.to_ascii_lowercase();
-        !CREDENTIAL_HEADERS.contains(&lk.as_str())
+        !CREDENTIAL_HEADERS
+            .iter()
+            .any(|candidate| k.eq_ignore_ascii_case(candidate))
     });
+}
+
+/// Gateway-asserted consumer/geo identity must never cross a third-party
+/// provider boundary. `before_proxy` sets
+/// `SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY` so proxy core stops
+/// appending them; this strip additionally removes any value a later generic
+/// header rule reintroduced (`GHSA-xhp5-hqj8-3mwg`).
+fn strip_gateway_identity_assertions(headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case("x-consumer-username")
+            && !name.eq_ignore_ascii_case("x-consumer-custom-id")
+            && !name.eq_ignore_ascii_case("x-geo-country")
+    });
+}
+
+/// The complete set of request headers this plugin owns at the provider
+/// boundary.
+///
+/// Applied twice by design: once when `before_proxy` claims the request, and
+/// again over the FINAL backend-visible header map
+/// (`enforce_final_backend_header_policy`) after every later generic header
+/// transform. It is idempotent, allocation-light, and never logs a value.
+///
+/// The owned set is FIXED and closed: the standard client/proxy credential and
+/// session headers ([`strip_client_credentials`]), the gateway's own consumer /
+/// geo assertions ([`strip_gateway_identity_assertions`]), and the provider
+/// protocol headers installed below (`host`, `content-type`, `accept`, the
+/// provider credential header, `anthropic-version`, and `accept-encoding` when
+/// normalizing).
+///
+/// Headers outside that set are left untouched, so intended non-credential
+/// operator transforms still reach the provider. This is a deliberate limit, not
+/// an omission: Ferrum cannot decide that an arbitrary unknown custom header
+/// carries a secret, so a bespoke normal-backend credential header configured on
+/// the same proxy WILL still be forwarded. Do not configure such a rule on a
+/// proxy that routes to a third-party provider.
+fn apply_provider_boundary_headers(
+    provider: &StreamProvider,
+    normalizes_response: bool,
+    headers: &mut HashMap<String, String>,
+) {
+    strip_client_credentials(headers);
+    strip_gateway_identity_assertions(headers);
+    match &provider.auth {
+        ProviderAuth::Bearer { header_value } => {
+            // `strip_client_credentials` already removed every case variant of
+            // `authorization`, so this insert is the canonical one.
+            headers.insert("authorization".to_string(), header_value.clone());
+        }
+        ProviderAuth::Header { name, api_key } => {
+            // The credential header name is provider-specific and may collide
+            // with a case variant a later rule added; strip every case variant
+            // before installing the canonical one.
+            remove_header_ci(headers, name);
+            headers.insert(name.clone(), api_key.clone());
+        }
+    }
+    if provider.provider_type == ProviderType::Anthropic {
+        headers.insert(
+            "anthropic-version".to_string(),
+            provider.anthropic_version.clone(),
+        );
+    }
+    remove_header_ci(headers, "host");
+    headers.insert("host".to_string(), provider.authority.clone());
+    remove_header_ci(headers, "content-type");
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    // A provider streams SSE; make the intent explicit to the upstream.
+    remove_header_ci(headers, "accept");
+    headers.insert("accept".to_string(), "text/event-stream".to_string());
+    // Normalization parses line-delimited SSE. Strip client content-coding
+    // negotiation and explicitly request identity so the provider does not
+    // return gzip/br octets that the normalizer would misread as plaintext
+    // events. Residual encodings are still handled fail-safe in `after_proxy` /
+    // the normalizer.
+    if normalizes_response {
+        remove_header_ci(headers, "accept-encoding");
+        headers.insert("accept-encoding".to_string(), "identity".to_string());
+    }
 }
 
 fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
@@ -2326,6 +2971,48 @@ fn upstream_sse_error_body(message: &str) -> Vec<u8> {
     });
     format!("data: {err}\n\ndata: [DONE]\n\n").into_bytes()
 }
+
+/// [`upstream_sse_error_body`] under the response's retained ceiling.
+///
+/// The envelope shape is fixed, but `message` is derived from upstream-supplied
+/// material (a rejected `Content-Encoding`, a decode diagnostic), so the whole
+/// body is SERIALIZED THROUGH the bounded sink rather than built as a complete
+/// `Vec` that a bounded copy would only measure afterwards: the JSON string is
+/// written by `serde_json` straight into the sink, which stops at the ceiling
+/// (GHSA-pwcm-6rh8-f2gh). `None` (leave the response alone) is the fail-closed
+/// answer if a pathologically small ceiling cannot hold it.
+///
+/// The bytes are identical to `upstream_sse_error_body`'s: `serde_json`'s
+/// compact object rendering emits `message` before `type` under both insertion
+/// and lexicographic member ordering, and `to_writer` applies the same string
+/// escaping `Value`'s `Display` does.
+fn bounded_upstream_sse_error_body(message: &str, ceiling: usize) -> Option<Vec<u8>> {
+    use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+    let mut sink = BoundedResponseBodySink::with_ceiling(ceiling);
+    if !sink.push(br#"data: {"error":{"message":"#) {
+        return None;
+    }
+    // Only the string value goes through `serde_json`, so the escaping is the
+    // canonical one without an intermediate `Value` copy of `message`.
+    if serde_json::to_writer(&mut sink, message).is_err() {
+        return None;
+    }
+    if !sink.push(br#","type":"upstream_error"}}"#) || !sink.push(b"\n\ndata: [DONE]\n\n") {
+        return None;
+    }
+    sink.finish()
+}
+
+/// Bytes fed to the buffered normalizer per driver call.
+///
+/// This is a WORKING-SET choice, not the memory bound: the bound is
+/// [`NormalizedSseOut`], which every normalized byte is written through from the
+/// first byte under this response's retained ceiling (GHSA-pwcm-6rh8-f2gh).
+/// Slicing the input keeps one call's parse/transcode working set small and
+/// makes the buffered path drive the normalizer exactly as a provider that
+/// chunked its stream this way would, so the shared streaming inspector
+/// contract — cumulative event, byte, and output accounting — is unchanged.
+const BUFFERED_NORMALIZE_CHUNK_BYTES: usize = 16 * 1024;
 
 fn wrap_anthropic_normalizer(
     model: String,
@@ -2479,6 +3166,110 @@ pub const MAX_SSE_EVENT_JSON_DEPTH: usize = 32;
 /// half the buffer) so total copy work stays linear in input size.
 const SSE_BUFFER_COMPACT_THRESHOLD: usize = 8192;
 
+/// The normalizer's output seam: every normalized byte is written through it,
+/// under a ceiling, from the first byte.
+///
+/// The streaming inspector contract hands one emission back per driver call, so
+/// the obvious implementation accumulates that call's output in a `String` and
+/// returns it — which on the BUFFERED path is a complete would-be replacement
+/// materialised outside any bounded sink (GHSA-pwcm-6rh8-f2gh). Slicing the
+/// input smaller does not fix it: the transcoded expansion of one slice is
+/// bounded by a CONSTANT, not by this response's retained ceiling, so a small
+/// route-effective ceiling could still be exceeded by a transient nobody
+/// measured.
+///
+/// So the accumulator itself is the bound. The buffered path constructs ONE of
+/// these at the response's retained ceiling and drives every call into it, so
+/// the producer's whole transient is the output it is building — one ceiling,
+/// not two — and an over-ceiling normalization is refused while it is being
+/// written. The streaming path constructs an unbounded one per call, which is
+/// byte-for-byte what it did before: nothing is retained there.
+///
+/// `begin_call` / `reset_call` exist for one internal seam: the cumulative
+/// normalized-output bound may replace the CURRENT call's emission with a fixed
+/// diagnostic. That rollback must not discard emissions from earlier calls, so
+/// it truncates to the call's start mark rather than clearing the buffer.
+pub(crate) struct NormalizedSseOut {
+    sink: crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+    /// Length at the start of the current driver call.
+    call_start: usize,
+    /// A write was refused. Sticky across the rest of the call, and cleared only
+    /// by a `reset_call` that abandons the emission the refusal belongs to.
+    refused: bool,
+}
+
+impl NormalizedSseOut {
+    /// A per-call accumulator for the STREAMING path, which retains nothing.
+    fn unbounded() -> Self {
+        Self::with_ceiling(usize::MAX)
+    }
+
+    fn with_ceiling(ceiling: usize) -> Self {
+        Self {
+            sink: crate::proxy::response_buffer_budget::BoundedResponseBodySink::with_ceiling(
+                ceiling,
+            ),
+            call_start: 0,
+            refused: false,
+        }
+    }
+
+    /// Mark the start of one driver (`on_chunk` / `on_end`) emission.
+    fn begin_call(&mut self) {
+        self.call_start = self.sink.len();
+    }
+
+    /// Abandon everything this call emitted, keeping earlier calls intact.
+    fn reset_call(&mut self) {
+        self.sink.truncate(self.call_start);
+        self.refused = self.sink.overflowed();
+    }
+
+    fn push_str(&mut self, text: &str) {
+        if !self.sink.push(text.as_bytes()) {
+            self.refused = true;
+        }
+    }
+
+    /// Emit one `data: <json>\n\n` SSE line without building it as a `String`
+    /// first. `serde_json` writes the compact form straight through the sink,
+    /// which is byte-identical to `Value`'s own `Display`.
+    fn write_sse_data_line(&mut self, payload: &Value) {
+        self.push_str("data: ");
+        if serde_json::to_writer(&mut self.sink, payload).is_err() {
+            self.refused = true;
+        }
+        self.push_str("\n\n");
+    }
+
+    /// Bytes emitted so far in THIS call — what the cumulative-output bound
+    /// measures.
+    fn len(&self) -> usize {
+        self.sink.len().saturating_sub(self.call_start)
+    }
+
+    /// Whether any write was refused by the ceiling. The buffered driver treats
+    /// this as fail-closed; the unbounded streaming accumulator cannot set it.
+    fn refused(&self) -> bool {
+        self.refused
+    }
+
+    /// The bytes this call emitted, for the streaming inspector's per-call
+    /// `Bytes`. An unbounded accumulator never refuses, so the `None` arm is a
+    /// checked impossibility rather than an expected outcome.
+    fn take_call_bytes(self) -> Vec<u8> {
+        self.sink.finish().unwrap_or_default()
+    }
+
+    /// The complete accumulated replacement, or `None` when a write was refused.
+    fn finish(self) -> Option<Vec<u8>> {
+        if self.refused {
+            return None;
+        }
+        self.sink.finish()
+    }
+}
+
 /// How a stream reached its terminal OpenAI sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamTerminal {
@@ -2606,8 +3397,14 @@ impl AnthropicSseNormalizer {
         id
     }
 
-    /// Envelope a single OpenAI streaming `choices[0].delta` as an SSE line.
-    fn chunk_line(&mut self, delta: Value, finish_reason: Option<&str>) -> String {
+    /// Envelope a single OpenAI streaming `choices[0].delta` as an SSE line,
+    /// written straight into the bounded accumulator.
+    fn write_chunk_line(
+        &mut self,
+        delta: Value,
+        finish_reason: Option<&str>,
+        out: &mut NormalizedSseOut,
+    ) {
         let id = self.id();
         let payload = json!({
             "id": id,
@@ -2620,12 +3417,13 @@ impl AnthropicSseNormalizer {
                 "finish_reason": finish_reason,
             }],
         });
-        format!("data: {payload}\n\n")
+        out.write_sse_data_line(&payload);
     }
 
-    fn usage_line(&mut self) -> Option<String> {
+    /// The final usage chunk, written through the same bounded accumulator.
+    fn write_usage_line(&mut self, out: &mut NormalizedSseOut) {
         let (Some(p), Some(c)) = (self.prompt_tokens, self.completion_tokens) else {
-            return None;
+            return;
         };
         let id = self.id();
         let payload = json!({
@@ -2640,20 +3438,20 @@ impl AnthropicSseNormalizer {
                 "total_tokens": p + c,
             },
         });
-        Some(format!("data: {payload}\n\n"))
+        out.write_sse_data_line(&payload);
     }
 
-    fn emit_upstream_error(&mut self, message: &str, out: &mut String) {
+    fn emit_upstream_error(&mut self, message: &str, out: &mut NormalizedSseOut) {
         let err = json!({
             "error": {
                 "message": message,
                 "type": "upstream_error",
             }
         });
-        out.push_str(&format!("data: {err}\n\n"));
+        out.write_sse_data_line(&err);
     }
 
-    fn fail_bound(&mut self, message: &'static str, out: &mut String) {
+    fn fail_bound(&mut self, message: &'static str, out: &mut NormalizedSseOut) {
         self.clear_buffer();
         self.emit_upstream_error(message, out);
         self.finish(StreamTerminal::ProviderError, out);
@@ -2661,7 +3459,7 @@ impl AnthropicSseNormalizer {
 
     /// Transcode one Anthropic event JSON into zero or more OpenAI SSE lines.
     /// Returns whether the upstream inspector driver should terminate now.
-    fn transcode_event(&mut self, event: &Value, out: &mut String) -> bool {
+    fn transcode_event(&mut self, event: &Value, out: &mut NormalizedSseOut) -> bool {
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 if self.message_started {
@@ -2685,7 +3483,7 @@ impl AnthropicSseNormalizer {
                 }
                 if !self.role_emitted {
                     self.role_emitted = true;
-                    out.push_str(&self.chunk_line(json!({ "role": "assistant" }), None));
+                    self.write_chunk_line(json!({ "role": "assistant" }), None, out);
                 }
                 false
             }
@@ -2709,7 +3507,7 @@ impl AnthropicSseNormalizer {
                     self.tool_indices.insert(index, tool_index);
                     let id = block.get("id").and_then(Value::as_str).unwrap_or("");
                     let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                    out.push_str(&self.chunk_line(
+                    self.write_chunk_line(
                         json!({
                             "tool_calls": [{
                                 "index": tool_index,
@@ -2719,7 +3517,8 @@ impl AnthropicSseNormalizer {
                             }]
                         }),
                         None,
-                    ));
+                        out,
+                    );
                 }
                 false
             }
@@ -2733,7 +3532,7 @@ impl AnthropicSseNormalizer {
                     Some("text_delta") => {
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
                             self.ensure_role(out);
-                            out.push_str(&self.chunk_line(json!({ "content": text }), None));
+                            self.write_chunk_line(json!({ "content": text }), None, out);
                         }
                     }
                     Some("input_json_delta") => {
@@ -2747,7 +3546,7 @@ impl AnthropicSseNormalizer {
                         }
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                             let tool_index = self.tool_indices.get(&index).copied().unwrap_or(0);
-                            out.push_str(&self.chunk_line(
+                            self.write_chunk_line(
                                 json!({
                                     "tool_calls": [{
                                         "index": tool_index,
@@ -2755,7 +3554,8 @@ impl AnthropicSseNormalizer {
                                     }]
                                 }),
                                 None,
-                            ));
+                                out,
+                            );
                         }
                     }
                     // thinking_delta / signature_delta and unknown deltas carry
@@ -2781,7 +3581,7 @@ impl AnthropicSseNormalizer {
                     return true;
                 }
                 let finish = map_stop_reason(stop_reason);
-                out.push_str(&self.chunk_line(json!({}), Some(finish)));
+                self.write_chunk_line(json!({}), Some(finish), out);
                 false
             }
             Some("message_stop") => {
@@ -2807,14 +3607,14 @@ impl AnthropicSseNormalizer {
         }
     }
 
-    fn ensure_role(&mut self, out: &mut String) {
+    fn ensure_role(&mut self, out: &mut NormalizedSseOut) {
         if !self.role_emitted {
             self.role_emitted = true;
-            out.push_str(&self.chunk_line(json!({ "role": "assistant" }), None));
+            self.write_chunk_line(json!({ "role": "assistant" }), None, out);
         }
     }
 
-    fn require_message_start(&mut self, event_type: &str, out: &mut String) -> bool {
+    fn require_message_start(&mut self, event_type: &str, out: &mut NormalizedSseOut) -> bool {
         if self.message_started {
             return true;
         }
@@ -2828,16 +3628,14 @@ impl AnthropicSseNormalizer {
 
     /// Emit the final usage chunk (when successful) and the OpenAI `[DONE]`
     /// sentinel exactly once.
-    fn finish(&mut self, terminal: StreamTerminal, out: &mut String) {
+    fn finish(&mut self, terminal: StreamTerminal, out: &mut NormalizedSseOut) {
         if self.done_emitted {
             return;
         }
         self.done_emitted = true;
         self.terminal = Some(terminal);
-        if terminal == StreamTerminal::MessageStop
-            && let Some(usage) = self.usage_line()
-        {
-            out.push_str(&usage);
+        if terminal == StreamTerminal::MessageStop {
+            self.write_usage_line(out);
         }
         out.push_str("data: [DONE]\n\n");
     }
@@ -2890,7 +3688,7 @@ impl AnthropicSseNormalizer {
         }
     }
 
-    fn apply_frame_outcome(&mut self, outcome: FrameOutcome, out: &mut String) -> bool {
+    fn apply_frame_outcome(&mut self, outcome: FrameOutcome, out: &mut NormalizedSseOut) -> bool {
         match outcome {
             FrameOutcome::Ignore => false,
             FrameOutcome::Event(event) => self.transcode_event(&event, out),
@@ -2905,7 +3703,7 @@ impl AnthropicSseNormalizer {
     /// Drain every complete in-limit SSE event currently buffered, transcoding
     /// each from a cursor slice (no front-`drain(..).collect()`). Returns
     /// whether the stream should terminate immediately.
-    fn drain_complete(&mut self, out: &mut String) -> bool {
+    fn drain_complete(&mut self, out: &mut NormalizedSseOut) -> bool {
         loop {
             let end = {
                 let scan_start = self.scan_cursor.max(self.cursor).min(self.buf.len());
@@ -2957,7 +3755,7 @@ impl AnthropicSseNormalizer {
         false
     }
 
-    fn normalized_output_exceeded(&mut self, out: &mut String, terminal: bool) -> bool {
+    fn normalized_output_exceeded(&mut self, out: &mut NormalizedSseOut, terminal: bool) -> bool {
         let total = self.normalized_out_bytes.saturating_add(out.len());
         let allowed = if terminal {
             MAX_SSE_NORMALIZED_OUTPUT_BYTES
@@ -2974,7 +3772,13 @@ impl AnthropicSseNormalizer {
         // any provider-controlled error message and an already-appended
         // sentinel, with the fixed bound diagnostic. Prior non-terminal calls
         // always retained enough room for this payload.
-        out.clear();
+        //
+        // On the buffered path the accumulator spans several calls, so this
+        // rolls back to the start of the CURRENT call rather than clearing
+        // everything — the emissions already handed to the client on the
+        // streaming path are the ones a buffered response has already
+        // accumulated, and neither may be rewritten retroactively.
+        out.reset_call();
         self.done_emitted = false;
         self.terminal = None;
         self.fail_bound(SSE_NORMALIZED_OUTPUT_LIMIT_MESSAGE, out);
@@ -2998,7 +3802,7 @@ impl AnthropicSseNormalizer {
 
     /// Ingest `chunk`, enforcing all resource bounds before expensive work.
     /// Returns whether the stream should terminate.
-    fn push_chunk(&mut self, mut chunk: &[u8], out: &mut String) -> bool {
+    fn push_chunk(&mut self, mut chunk: &[u8], out: &mut NormalizedSseOut) -> bool {
         if let Err(message) = self.account_ingested(chunk.len()) {
             self.fail_bound(message, out);
             return true;
@@ -3033,7 +3837,7 @@ impl AnthropicSseNormalizer {
     /// Terminal EOF handling. Always ends the OpenAI stream: every path emits a
     /// terminal frame (or reuses one already emitted), so there is no
     /// "continue reading" outcome to report back.
-    fn finish_stream(&mut self, out: &mut String) {
+    fn finish_stream(&mut self, out: &mut NormalizedSseOut) {
         if self.drain_complete(out) {
             return;
         }
@@ -3108,8 +3912,29 @@ impl AnthropicSseNormalizer {
         let _ = self.normalized_output_exceeded(out, true);
     }
 
-    fn commit_forwarded(&mut self, out: &str) {
+    fn commit_forwarded(&mut self, out: &NormalizedSseOut) {
         self.normalized_out_bytes = self.normalized_out_bytes.saturating_add(out.len());
+    }
+
+    /// One driver call against a caller-owned accumulator. The trait impl below
+    /// binds an unbounded per-call one (streaming retains nothing); the buffered
+    /// path binds ONE ceiling-bounded accumulator across every call, so the
+    /// producer's whole transient is the replacement it is building.
+    ///
+    /// Returns whether the stream should terminate.
+    fn drive_chunk(&mut self, chunk: &[u8], out: &mut NormalizedSseOut) -> bool {
+        out.begin_call();
+        if self.push_chunk(chunk, out) {
+            return true;
+        }
+        self.commit_forwarded(out);
+        false
+    }
+
+    /// [`Self::drive_chunk`] for end-of-stream.
+    fn drive_end(&mut self, out: &mut NormalizedSseOut) {
+        out.begin_call();
+        self.finish_stream(out);
     }
 }
 
@@ -3123,21 +3948,20 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
         if self.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
-        let mut out = String::new();
-        if self.push_chunk(chunk, &mut out) {
-            return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
+        let mut out = NormalizedSseOut::unbounded();
+        if self.drive_chunk(chunk, &mut out) {
+            return ResponseStreamAction::Terminate(Some(Bytes::from(out.take_call_bytes())));
         }
-        self.commit_forwarded(&out);
-        ResponseStreamAction::Forward(Bytes::from(out.into_bytes()))
+        ResponseStreamAction::Forward(Bytes::from(out.take_call_bytes()))
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
         if self.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
-        let mut out = String::new();
-        self.finish_stream(&mut out);
-        ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())))
+        let mut out = NormalizedSseOut::unbounded();
+        self.drive_end(&mut out);
+        ResponseStreamAction::Terminate(Some(Bytes::from(out.take_call_bytes())))
     }
 }
 
@@ -3170,10 +3994,11 @@ impl ContentDecodingNormalizer {
     }
 
     async fn fail_decode(&mut self, message: String) -> ResponseStreamAction {
-        let mut out = String::new();
+        let mut out = NormalizedSseOut::unbounded();
+        out.begin_call();
         self.inner.emit_upstream_error(&message, &mut out);
         self.inner.finish(StreamTerminal::UpstreamFailure, &mut out);
-        ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())))
+        ResponseStreamAction::Terminate(Some(Bytes::from(out.take_call_bytes())))
     }
 }
 
@@ -3280,29 +4105,47 @@ impl ResponseStreamInspector for ImmediateUpstreamErrorNormalizer {
     }
 }
 
+/// Buffered Anthropic→OpenAI SSE normalization, written into a
+/// `ceiling`-bounded accumulator from the FIRST normalized byte
+/// (GHSA-pwcm-6rh8-f2gh).
+///
+/// The accumulator is constructed once and every driver call writes into it, so
+/// there is no per-call `Bytes` that a bounded copy would only measure
+/// afterwards, and no transient whose size is a constant rather than this
+/// response's retained ceiling. The normalizer's own logic is untouched: it is
+/// driven in [`BUFFERED_NORMALIZE_CHUNK_BYTES`] slices through the same
+/// `push_chunk` / `finish_stream` path the streaming inspector uses, with the
+/// same cumulative event/byte/output accounting, and the same per-call rollback
+/// seam for its cumulative-output bound.
+///
+/// `None` — leave the response unchanged — is the fail-closed answer when a
+/// write is refused, exactly as an over-ceiling final document already was.
 async fn normalize_anthropic_sse_buffered(
     model: String,
     body: &[u8],
     tools_forbidden: bool,
+    ceiling: usize,
 ) -> Option<Vec<u8>> {
     let mut normalizer = AnthropicSseNormalizer::new(model, tools_forbidden);
-    let mut out = Vec::new();
-    match normalizer.on_chunk(body).await {
-        ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
-        ResponseStreamAction::Terminate(bytes) => {
-            if let Some(bytes) = bytes {
-                out.extend_from_slice(&bytes);
-            }
-            return Some(out);
+    let mut out = NormalizedSseOut::with_ceiling(ceiling);
+    // `chunks` yields nothing for an empty body, which is the same "no chunk
+    // was ever offered" state a stream that ended immediately presents.
+    for slice in body.chunks(BUFFERED_NORMALIZE_CHUNK_BYTES) {
+        if normalizer.done_emitted {
+            break;
+        }
+        let terminate = normalizer.drive_chunk(slice, &mut out);
+        if out.refused() {
+            return None;
+        }
+        if terminate {
+            return out.finish();
         }
     }
-    match normalizer.on_end().await {
-        ResponseStreamAction::Forward(bytes) | ResponseStreamAction::Terminate(Some(bytes)) => {
-            out.extend_from_slice(&bytes)
-        }
-        ResponseStreamAction::Terminate(None) => {}
+    if !normalizer.done_emitted {
+        normalizer.drive_end(&mut out);
     }
-    Some(out)
+    out.finish()
 }
 
 fn map_stop_reason(reason: Option<&str>) -> &'static str {
@@ -3430,14 +4273,15 @@ mod sse_buffer_tests {
     fn cursor_compaction_stays_linear_for_many_small_events() {
         let mut normalizer = AnthropicSseNormalizer::new("claude-test".to_string(), false);
         let event = b"data: {\"type\":\"ping\"}\n\n";
-        let mut out = String::new();
+        let mut out = NormalizedSseOut::unbounded();
         let iterations = 4_096usize;
         for _ in 0..iterations {
+            out.begin_call();
             assert!(
                 !normalizer.push_chunk(event, &mut out),
                 "ping flood under event-count cap must not terminate"
             );
-            out.clear();
+            out.reset_call();
         }
         assert_eq!(normalizer.events_seen, iterations);
         assert_eq!(normalizer.unread_len(), 0);

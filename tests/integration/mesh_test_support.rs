@@ -448,6 +448,7 @@ pub fn gateway_config_with_mesh(
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
         mesh_revision: None,
+        k8s_mesh_overlay: Default::default(),
     }
 }
 

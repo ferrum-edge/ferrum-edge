@@ -19,8 +19,8 @@ use super::{AdminState, PaginationParams};
 use crate::tls::acme::{AcmeCertificateRecord, AcmeError, AcmeIssuedCertificateInput};
 #[cfg(feature = "acme")]
 use crate::tls::acme::{
-    AcmeDns01ChallengeRecord, AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput, AcmeOrderRecord,
-    AcmeOrderStatus, AcmeTlsAlpn01ChallengeRecord,
+    AcmeDns01ChallengeRecord, AcmeHttp01ChallengeRecord, AcmeHttp01OrderInput,
+    AcmeOrderFinalization, AcmeOrderRecord, AcmeOrderStatus, AcmeTlsAlpn01ChallengeRecord,
 };
 use crate::tls::managed::{ManagedTlsError, ManagedTlsMaterialKind, ManagedTlsRecord};
 
@@ -144,7 +144,10 @@ pub(super) async fn handle_list_managed(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let records = store.list(kind);
+    let records = match store.list(kind) {
+        Ok(records) => records,
+        Err(error) => return Ok(managed_error_response(error)),
+    };
     let body = super::paginate_response(&records, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
@@ -156,7 +159,10 @@ pub(super) async fn handle_list_acme_certificates(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let records = store.list_certificates();
+    let records = match store.list_certificates() {
+        Ok(records) => records,
+        Err(error) => return Ok(acme_error_response(error)),
+    };
     let body = super::paginate_response(&records, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
@@ -184,7 +190,10 @@ pub(super) async fn handle_list_acme_orders(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let records = store.list_orders();
+    let records = match store.list_orders() {
+        Ok(records) => records,
+        Err(error) => return Ok(acme_error_response(error)),
+    };
     let body = super::paginate_response(&records, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
@@ -214,12 +223,28 @@ pub(super) async fn handle_list_acme_accounts(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    let certificates = certificate_store.list_certificates();
-    let persisted_accounts = match acme_account_store_response() {
-        Ok(store) => store.list_accounts(),
-        Err(_) => Vec::new(),
+    let certificates = match certificate_store.list_certificates() {
+        Ok(certificates) => certificates,
+        Err(error) => return Ok(acme_error_response(error)),
     };
-    let accounts = order_store.list_accounts(&certificates, &persisted_accounts);
+    // A *missing* account store file is already a successful empty read inside
+    // the shared store — accounts are also derivable from orders, so an empty
+    // credential set is a legitimate answer. An `Err` from opening the store is
+    // something else entirely: an invalid store path, an unreadable or corrupt
+    // document, a malformed lock-timeout setting. Reporting any of those as
+    // "no persisted credentials" tells an operator their accounts are gone when
+    // in fact they are unreachable, so it fails closed here instead.
+    let persisted_accounts = match acme_account_store_response() {
+        Ok(store) => match store.list_accounts() {
+            Ok(accounts) => accounts,
+            Err(error) => return Ok(acme_error_response(error)),
+        },
+        Err(response) => return Ok(*response),
+    };
+    let accounts = match order_store.list_accounts(&certificates, &persisted_accounts) {
+        Ok(accounts) => accounts,
+        Err(error) => return Ok(acme_error_response(error)),
+    };
     let body = super::paginate_response(&accounts, pagination);
     Ok(super::json_response(StatusCode::OK, &body))
 }
@@ -276,16 +301,7 @@ pub(super) async fn handle_create_certificate(
             ));
         }
     };
-    match store.upsert(record, overwrite) {
-        Ok(record) => {
-            request_managed_source_reloads();
-            Ok(super::json_response(
-                StatusCode::CREATED,
-                &json!(record.summary()),
-            ))
-        }
-        Err(error) => Ok(managed_error_response(error)),
-    }
+    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_update_certificate(
@@ -318,16 +334,7 @@ pub(super) async fn handle_update_certificate(
             ));
         }
     };
-    match store.upsert(record, true) {
-        Ok(record) => {
-            request_managed_source_reloads();
-            Ok(super::json_response(
-                StatusCode::OK,
-                &json!(record.summary()),
-            ))
-        }
-        Err(error) => Ok(managed_error_response(error)),
-    }
+    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
 }
 
 pub(super) async fn handle_create_ca_bundle(
@@ -354,16 +361,7 @@ pub(super) async fn handle_create_ca_bundle(
             ));
         }
     };
-    match store.upsert(record, overwrite) {
-        Ok(record) => {
-            request_managed_source_reloads();
-            Ok(super::json_response(
-                StatusCode::CREATED,
-                &json!(record.summary()),
-            ))
-        }
-        Err(error) => Ok(managed_error_response(error)),
-    }
+    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_update_ca_bundle(
@@ -395,16 +393,7 @@ pub(super) async fn handle_update_ca_bundle(
             ));
         }
     };
-    match store.upsert(record, true) {
-        Ok(record) => {
-            request_managed_source_reloads();
-            Ok(super::json_response(
-                StatusCode::OK,
-                &json!(record.summary()),
-            ))
-        }
-        Err(error) => Ok(managed_error_response(error)),
-    }
+    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
 }
 
 pub(super) async fn handle_create_crl(
@@ -431,16 +420,7 @@ pub(super) async fn handle_create_crl(
             ));
         }
     };
-    match store.upsert(record, overwrite) {
-        Ok(record) => {
-            request_managed_source_reloads();
-            Ok(super::json_response(
-                StatusCode::CREATED,
-                &json!(record.summary()),
-            ))
-        }
-        Err(error) => Ok(managed_error_response(error)),
-    }
+    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_update_crl(
@@ -471,16 +451,7 @@ pub(super) async fn handle_update_crl(
             ));
         }
     };
-    match store.upsert(record, true) {
-        Ok(record) => {
-            request_managed_source_reloads();
-            Ok(super::json_response(
-                StatusCode::OK,
-                &json!(record.summary()),
-            ))
-        }
-        Err(error) => Ok(managed_error_response(error)),
-    }
+    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
 }
 
 pub(super) async fn handle_create_ocsp_response(
@@ -507,16 +478,7 @@ pub(super) async fn handle_create_ocsp_response(
             ));
         }
     };
-    match store.upsert(record, overwrite) {
-        Ok(record) => {
-            request_managed_source_reloads();
-            Ok(super::json_response(
-                StatusCode::CREATED,
-                &json!(record.summary()),
-            ))
-        }
-        Err(error) => Ok(managed_error_response(error)),
-    }
+    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_update_ocsp_response(
@@ -549,16 +511,7 @@ pub(super) async fn handle_update_ocsp_response(
             ));
         }
     };
-    match store.upsert(record, true) {
-        Ok(record) => {
-            request_managed_source_reloads();
-            Ok(super::json_response(
-                StatusCode::OK,
-                &json!(record.summary()),
-            ))
-        }
-        Err(error) => Ok(managed_error_response(error)),
-    }
+    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
 }
 
 pub(super) async fn handle_create_jwks(
@@ -585,16 +538,7 @@ pub(super) async fn handle_create_jwks(
             ));
         }
     };
-    match store.upsert(record, overwrite) {
-        Ok(record) => {
-            request_managed_source_reloads();
-            Ok(super::json_response(
-                StatusCode::CREATED,
-                &json!(record.summary()),
-            ))
-        }
-        Err(error) => Ok(managed_error_response(error)),
-    }
+    Ok(respond_managed_upsert(store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_create_acme_certificate(
@@ -621,16 +565,7 @@ pub(super) async fn handle_create_acme_certificate(
             ));
         }
     };
-    match store.upsert_certificate(record, overwrite) {
-        Ok(record) => {
-            request_managed_source_reloads();
-            Ok(super::json_response(
-                StatusCode::CREATED,
-                &json!(record.summary()),
-            ))
-        }
-        Err(error) => Ok(acme_error_response(error)),
-    }
+    Ok(respond_acme_certificate_upsert(store, record, overwrite, StatusCode::CREATED).await)
 }
 
 pub(super) async fn handle_create_acme_order(
@@ -668,9 +603,17 @@ pub(super) async fn handle_create_acme_order(
                 ));
             }
         };
-        match store.upsert_order(record, overwrite) {
+        let stored = match offload_store_write("acme_order_upsert", move || {
+            store.upsert_order(record, overwrite)
+        })
+        .await
+        {
+            Ok(stored) => stored,
+            Err(response) => return Ok(*response),
+        };
+        match stored {
             Ok(record) => {
-                persist_acme_account_credentials(&record);
+                persist_acme_account_credentials(&record).await;
                 Ok(super::json_response(
                     StatusCode::CREATED,
                     &json!(record.summary()),
@@ -692,7 +635,13 @@ pub(super) async fn handle_delete_acme_order(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    match store.delete_order(id) {
+    let id = id.to_string();
+    let deleted =
+        match offload_store_write("acme_order_delete", move || store.delete_order(&id)).await {
+            Ok(deleted) => deleted,
+            Err(response) => return Ok(*response),
+        };
+    match deleted {
         Ok(record) => Ok(super::json_response(
             StatusCode::OK,
             &json!({"deleted": true, "record": record.summary()}),
@@ -745,11 +694,18 @@ pub(super) async fn handle_finalize_acme_order(
                 ));
             }
         };
-        let account_credentials_json = match order
-            .account_credentials_json
-            .clone()
-            .or_else(|| acme_account_credentials_for_order(&order))
-        {
+        // Only consult the shared account store when the order does not already
+        // carry credentials, and treat a store failure as a store failure: an
+        // unreachable account store must not be reported as "this order has no
+        // credentials", which reads as a client mistake.
+        let persisted_credentials = match order.account_credentials_json.clone() {
+            Some(credentials) => Some(credentials),
+            None => match acme_account_credentials_for_order(&order) {
+                Ok(credentials) => credentials,
+                Err(error) => return Ok(acme_error_response(error)),
+            },
+        };
+        let account_credentials_json = match persisted_credentials {
             Some(account_credentials_json) => account_credentials_json,
             None => {
                 return Ok(super::json_response(
@@ -763,6 +719,22 @@ pub(super) async fn handle_finalize_acme_order(
                 StatusCode::BAD_REQUEST,
                 &json!({"error": "ACME order does not have an order_url"}),
             ));
+        };
+        // Fail closed before any ACME request. The diagnostic is the fixed,
+        // content-free one: this is private-key/CSR material, so the response
+        // must not describe what was found. Nothing here regenerates material —
+        // a replacement key cannot match a certificate the CA may already be
+        // issuing against the original CSR. Structurally corrupt `Some(...)`
+        // is the same 400 as missing material, and both stop before dns-cache,
+        // account restore, or directory work.
+        let finalization = match acme_order_finalization_for_finalize(&order) {
+            Ok(finalization) => finalization,
+            Err(message) => {
+                return Ok(super::json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": message}),
+                ));
+            }
         };
 
         let dns_cache = match acme_dns_cache(state) {
@@ -780,10 +752,12 @@ pub(super) async fn handle_finalize_acme_order(
                 account_credentials_json,
             ),
             order_url: order_url.clone(),
+            domains: order.domains.clone(),
             poll_timeout: Duration::from_secs(
                 request.poll_timeout_seconds.unwrap_or(60).clamp(1, 600),
             ),
             dns_cache,
+            finalization,
         };
         let challenge_type = match acme_order_challenge_type(&order) {
             Ok(challenge_type) => challenge_type,
@@ -807,7 +781,12 @@ pub(super) async fn handle_finalize_acme_order(
         } {
             Ok(completed) => completed,
             Err(error) => {
-                persist_failed_acme_order(&order_store, order.clone(), error.to_string());
+                persist_failed_acme_order(
+                    Arc::clone(&order_store),
+                    order.clone(),
+                    error.to_string(),
+                )
+                .await;
                 return Ok(super::json_response(
                     StatusCode::BAD_GATEWAY,
                     &json!({"error": error.to_string()}),
@@ -823,7 +802,7 @@ pub(super) async fn handle_finalize_acme_order(
                 .cert_expiry_warning_days
                 .unwrap_or(crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS),
         ) {
-            persist_failed_acme_order(&order_store, order.clone(), error.clone());
+            persist_failed_acme_order(Arc::clone(&order_store), order.clone(), error.clone()).await;
             return Ok(super::json_response(
                 StatusCode::BAD_GATEWAY,
                 &json!({"error": error}),
@@ -848,21 +827,41 @@ pub(super) async fn handle_finalize_acme_order(
                 ));
             }
         };
-        let certificate =
-            match certificate_store.upsert_certificate(certificate, request.allow_overwrite) {
-                Ok(record) => record,
-                Err(error) => return Ok(acme_error_response(error)),
-            };
+        let allow_overwrite = request.allow_overwrite;
+        let stored_certificate = match offload_store_write("acme_certificate_upsert", move || {
+            certificate_store.upsert_certificate(certificate, allow_overwrite)
+        })
+        .await
+        {
+            Ok(stored) => stored,
+            Err(response) => return Ok(*response),
+        };
+        let certificate = match stored_certificate {
+            Ok(record) => record,
+            Err(error) => return Ok(acme_error_response(error)),
+        };
 
         let mut updated_order = order;
         updated_order.certificate_id = Some(certificate_id);
         updated_order.status = AcmeOrderStatus::Valid;
         updated_order.error = None;
-        let updated_order = match order_store.upsert_order(updated_order, true) {
+        // The certificate is durably published above and the order is about to
+        // become terminal, so the finalization material has nothing left to
+        // recover. Same retention rule as the renewal path.
+        updated_order.finalization = None;
+        let stored_order = match offload_store_write("acme_order_upsert", move || {
+            order_store.upsert_order(updated_order, true)
+        })
+        .await
+        {
+            Ok(stored) => stored,
+            Err(response) => return Ok(*response),
+        };
+        let updated_order = match stored_order {
             Ok(record) => record,
             Err(error) => return Ok(acme_error_response(error)),
         };
-        persist_acme_account_credentials(&updated_order);
+        persist_acme_account_credentials(&updated_order).await;
         request_managed_source_reloads();
         Ok(super::json_response(
             StatusCode::OK,
@@ -902,16 +901,7 @@ pub(super) async fn handle_update_acme_certificate(
             ));
         }
     };
-    match store.upsert_certificate(record, true) {
-        Ok(record) => {
-            request_managed_source_reloads();
-            Ok(super::json_response(
-                StatusCode::OK,
-                &json!(record.summary()),
-            ))
-        }
-        Err(error) => Ok(acme_error_response(error)),
-    }
+    Ok(respond_acme_certificate_upsert(store, record, true, StatusCode::OK).await)
 }
 
 pub(super) async fn handle_delete_acme_certificate(
@@ -936,7 +926,16 @@ pub(super) async fn handle_delete_acme_certificate(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    match store.delete_certificate(id) {
+    let id = id.to_string();
+    let deleted = match offload_store_write("acme_certificate_delete", move || {
+        store.delete_certificate(&id)
+    })
+    .await
+    {
+        Ok(deleted) => deleted,
+        Err(response) => return Ok(*response),
+    };
+    match deleted {
         Ok(record) => {
             request_managed_source_reloads();
             Ok(super::json_response(
@@ -987,14 +986,24 @@ pub(super) async fn handle_renew_acme_certificate(
             Ok(order) => order,
             Err(error) => return Ok(acme_error_response(error)),
         };
-        let stored_account_credentials_json =
-            certificate.account_id.as_deref().and_then(|account_id| {
-                acme_account_credentials(&certificate.directory_url, account_id)
-            });
-        let existing_account_credentials_json = request
+        let requested_or_order_credentials = request
             .existing_account_credentials_json
-            .or_else(|| existing_order.and_then(|order| order.account_credentials_json))
-            .or(stored_account_credentials_json);
+            .or_else(|| existing_order.and_then(|order| order.account_credentials_json));
+        // Fall back to the shared account store only when nothing nearer
+        // supplied credentials, and surface a store failure rather than
+        // silently continuing as if no account had ever been persisted.
+        let existing_account_credentials_json = match requested_or_order_credentials {
+            Some(credentials) => Some(credentials),
+            None => match certificate.account_id.as_deref() {
+                Some(account_id) => {
+                    match acme_account_credentials(&certificate.directory_url, account_id) {
+                        Ok(credentials) => credentials,
+                        Err(error) => return Ok(acme_error_response(error)),
+                    }
+                }
+                None => None,
+            },
+        };
         let renewal_order_id = match request.id {
             Some(id) => optional_resource_id(Some(&id), "id").and_then(|value| {
                 value.ok_or_else(|| "id must not be empty when provided".to_string())
@@ -1034,9 +1043,17 @@ pub(super) async fn handle_renew_acme_certificate(
                 ));
             }
         };
-        match order_store.upsert_order(record, overwrite) {
+        let stored = match offload_store_write("acme_order_upsert", move || {
+            order_store.upsert_order(record, overwrite)
+        })
+        .await
+        {
+            Ok(stored) => stored,
+            Err(response) => return Ok(*response),
+        };
+        match stored {
             Ok(record) => {
-                persist_acme_account_credentials(&record);
+                persist_acme_account_credentials(&record).await;
                 Ok(super::json_response(
                     StatusCode::CREATED,
                     &json!(record.summary()),
@@ -1075,16 +1092,7 @@ pub(super) async fn handle_update_jwks(
             ));
         }
     };
-    match store.upsert(record, true) {
-        Ok(record) => {
-            request_managed_source_reloads();
-            Ok(super::json_response(
-                StatusCode::OK,
-                &json!(record.summary()),
-            ))
-        }
-        Err(error) => Ok(managed_error_response(error)),
-    }
+    Ok(respond_managed_upsert(store, record, true, StatusCode::OK).await)
 }
 
 pub(super) async fn handle_delete_managed(
@@ -1110,7 +1118,10 @@ pub(super) async fn handle_delete_managed(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    match store.get(id) {
+    // Bound before the match so the store borrow ends here: the delete arm
+    // moves the store handle onto a blocking thread.
+    let existing = store.get(id);
+    match existing {
         Ok(record) if record.kind != kind => Ok(super::json_response(
             StatusCode::BAD_REQUEST,
             &json!({
@@ -1122,16 +1133,26 @@ pub(super) async fn handle_delete_managed(
                 )
             }),
         )),
-        Ok(_) => match store.delete(id) {
-            Ok(record) => {
-                request_managed_source_reloads();
-                Ok(super::json_response(
-                    StatusCode::OK,
-                    &json!({"deleted": true, "record": record.summary()}),
-                ))
+        Ok(_) => {
+            let owned_id = id.to_string();
+            let deleted =
+                match offload_store_write("managed_tls_delete", move || store.delete(&owned_id))
+                    .await
+                {
+                    Ok(deleted) => deleted,
+                    Err(response) => return Ok(*response),
+                };
+            match deleted {
+                Ok(record) => {
+                    request_managed_source_reloads();
+                    Ok(super::json_response(
+                        StatusCode::OK,
+                        &json!({"deleted": true, "record": record.summary()}),
+                    ))
+                }
+                Err(error) => Ok(managed_error_response(error)),
             }
-            Err(error) => Ok(managed_error_response(error)),
-        },
+        }
         Err(error) => Ok(managed_error_response(error)),
     }
 }
@@ -1643,6 +1664,121 @@ fn parse_private_key(field: &'static str, pem: &str) -> Result<PrivateKeyDer<'st
         .ok_or_else(|| format!("{field}: no PEM private key found"))
 }
 
+/// Run a shared-TLS-store mutation off the runtime worker.
+///
+/// Every managed-TLS / ACME mutation is a synchronous read-modify-write that
+/// takes the store's *cross-process* advisory lock, and that lock is bounded
+/// only by `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS` — up to 120 seconds if an
+/// operator raises it. Running one inline on a Tokio worker parks that worker
+/// for the whole wait, so a single wedged shared volume plus a handful of admin
+/// requests can starve the runtime the proxy is also served from. The store's
+/// *reads* are deliberately lock-free (see `tls::shared_store`) and stay on the
+/// runtime; only the locking mutations move here.
+///
+/// A join failure — the blocking task panicked, or the pool is shutting down —
+/// is fail-closed: the caller cannot know whether the mutation landed, so it is
+/// reported as a server error rather than as success. The diagnostic is fixed
+/// text; store contents and record identities never reach it.
+async fn offload_store_write<T, F>(
+    operation: &'static str,
+    work: F,
+) -> Result<T, Box<Response<Full<Bytes>>>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            tracing::warn!(
+                operation = operation,
+                error = %error,
+                "TLS store write could not be driven to a conclusion"
+            );
+            Err(Box::new(super::json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": "TLS store write could not be completed"}),
+            )))
+        }
+    }
+}
+
+/// [`offload_store_write`] for a best-effort *secondary* persistence step.
+///
+/// Secondary persistence (account credentials alongside an order, a failed
+/// order's terminal status) must not fail the primary response, but it must not
+/// be silently dropped either. Returns whether the work ran to a conclusion; the
+/// caller accounts for a failure through the redacted persistence-failure
+/// warning rather than by putting store detail in a response.
+#[cfg(feature = "acme")]
+async fn offload_secondary_store_write<F>(operation: &'static str, work: F) -> bool
+where
+    F: FnOnce() -> bool + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(persisted) => persisted,
+        Err(error) => {
+            tracing::warn!(
+                operation = operation,
+                error = %error,
+                "best-effort TLS store write could not be driven to a conclusion"
+            );
+            false
+        }
+    }
+}
+
+/// Persist a managed TLS record off the runtime worker and render the response.
+///
+/// Every managed create/update handler funnels through here, so the offload and
+/// the fail-closed join handling exist once rather than at ten call sites.
+async fn respond_managed_upsert(
+    store: Arc<crate::tls::managed::ManagedTlsStore>,
+    record: ManagedTlsRecord,
+    overwrite: bool,
+    success: StatusCode,
+) -> Response<Full<Bytes>> {
+    let outcome = match offload_store_write("managed_tls_upsert", move || {
+        store.upsert(record, overwrite)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(response) => return *response,
+    };
+    match outcome {
+        Ok(record) => {
+            request_managed_source_reloads();
+            super::json_response(success, &json!(record.summary()))
+        }
+        Err(error) => managed_error_response(error),
+    }
+}
+
+/// Persist an ACME certificate record off the runtime worker.
+async fn respond_acme_certificate_upsert(
+    store: Arc<crate::tls::acme::AcmeCertificateStore>,
+    record: AcmeCertificateRecord,
+    overwrite: bool,
+    success: StatusCode,
+) -> Response<Full<Bytes>> {
+    let outcome = match offload_store_write("acme_certificate_upsert", move || {
+        store.upsert_certificate(record, overwrite)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(response) => return *response,
+    };
+    match outcome {
+        Ok(record) => {
+            request_managed_source_reloads();
+            super::json_response(success, &json!(record.summary()))
+        }
+        Err(error) => acme_error_response(error),
+    }
+}
+
 fn managed_store_response()
 -> Result<Arc<crate::tls::managed::ManagedTlsStore>, Box<Response<Full<Bytes>>>> {
     crate::tls::managed::global_store().map_err(|error| {
@@ -1713,9 +1849,12 @@ fn managed_error_response(error: ManagedTlsError) -> Response<Full<Bytes>> {
         | ManagedTlsError::InvalidPath(_)
         | ManagedTlsError::MissingMaterial { .. }
         | ManagedTlsError::WrongKind { .. } => StatusCode::BAD_REQUEST,
-        ManagedTlsError::Read(_) | ManagedTlsError::Write(_) | ManagedTlsError::Parse(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        ManagedTlsError::Read(_)
+        | ManagedTlsError::Write(_)
+        | ManagedTlsError::Parse(_)
+        // A misconfigured store is a server-side operator failure; reporting it
+        // as a 4xx would blame the caller for something no request can fix.
+        | ManagedTlsError::InvalidConfiguration(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     super::json_response(status, &json!({"error": error.to_string()}))
 }
@@ -1732,9 +1871,16 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         | AcmeError::InvalidChallengeToken(_)
         | AcmeError::BlockedDirectoryUrl(_)
         | AcmeError::MissingMaterial { .. } => StatusCode::BAD_REQUEST,
-        AcmeError::Read(_) | AcmeError::Write(_) | AcmeError::Parse(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        // The stored order cannot be finalized; no retry of this request can
+        // change that, so it is reported to the caller rather than as an outage.
+        // The rendering names the order and nothing about the material itself.
+        AcmeError::UnusableFinalizationMaterial(_) => StatusCode::BAD_REQUEST,
+        AcmeError::Read(_)
+        | AcmeError::Write(_)
+        | AcmeError::Parse(_)
+        // A misconfigured store is a server-side operator failure; reporting it
+        // as a 4xx would blame the caller for something no request can fix.
+        | AcmeError::InvalidConfiguration(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     super::json_response(status, &json!({"error": error.to_string()}))
 }
@@ -2003,6 +2149,9 @@ async fn acme_order_record_from_request(
             http01_challenges,
             tls_alpn01_challenges,
             dns01_challenges,
+            // Same prepared order type as the renewal path, so an admin-created
+            // order is retryable through the finalize step too.
+            finalization: Some(prepared.finalization),
             error: None,
         })
         .map_err(|error| error.to_string())?,
@@ -2031,8 +2180,16 @@ fn acme_order_challenge_type(order: &AcmeOrderRecord) -> Result<AcmeChallengeTyp
     challenge_type.ok_or_else(|| "ACME order does not contain any challenges".to_string())
 }
 
+/// Mirror an order's account credentials into the shared account store.
+///
+/// Deliberately best effort: the order already carries the credentials, so a
+/// failure here degrades renewal convenience rather than losing the primary
+/// mutation the caller asked for. It is still a locking shared-store write, so
+/// it runs on a blocking thread like every other one, and a failure is
+/// *accounted for* through the redacted persistence-failure warning rather than
+/// discarded — the credentials themselves never reach a log or a response.
 #[cfg(feature = "acme")]
-fn persist_acme_account_credentials(order: &AcmeOrderRecord) {
+async fn persist_acme_account_credentials(order: &AcmeOrderRecord) {
     let (Some(account_id), Some(credentials_json)) = (
         order.account_id.as_deref(),
         order.account_credentials_json.as_deref(),
@@ -2043,28 +2200,45 @@ fn persist_acme_account_credentials(order: &AcmeOrderRecord) {
         warn!("ACME account store is unavailable; renewal will rely on order credentials");
         return;
     };
-    if let Err(_error) = store.upsert_account(
-        account_id.to_string(),
-        order.directory_url.clone(),
-        credentials_json.to_string(),
-    ) {
+    let account_id = account_id.to_string();
+    let directory_url = order.directory_url.clone();
+    let credentials_json = credentials_json.to_string();
+    let persisted = offload_secondary_store_write("acme_account_credentials_persist", move || {
+        store
+            .upsert_account(account_id, directory_url, credentials_json)
+            .is_ok()
+    })
+    .await;
+    if !persisted {
         super::warn_persistence_failure_redacted("acme_account_credentials_persist");
     }
 }
 
 #[cfg(feature = "acme")]
-fn acme_account_credentials_for_order(order: &AcmeOrderRecord) -> Option<String> {
-    let account_id = order.account_id.as_deref()?;
+fn acme_account_credentials_for_order(
+    order: &AcmeOrderRecord,
+) -> Result<Option<String>, AcmeError> {
+    let Some(account_id) = order.account_id.as_deref() else {
+        return Ok(None);
+    };
     acme_account_credentials(&order.directory_url, account_id)
 }
 
+/// Look up persisted credentials for one account.
+///
+/// `Ok(None)` means the shared account store is readable and simply holds no
+/// credentials for this account — a legitimate answer, since credentials also
+/// live on the order. An unreachable, corrupt, or misconfigured store is an
+/// `Err`, so the caller reports a store failure instead of telling the operator
+/// their credentials are absent.
 #[cfg(feature = "acme")]
-fn acme_account_credentials(directory_url: &str, account_id: &str) -> Option<String> {
-    let store = crate::tls::acme::global_account_store().ok()?;
-    store
-        .get_credentials(directory_url, account_id)
-        .ok()
-        .flatten()
+fn acme_account_credentials(
+    directory_url: &str,
+    account_id: &str,
+) -> Result<Option<String>, AcmeError> {
+    let store = crate::tls::acme::global_account_store()
+        .map_err(|error| AcmeError::Read(format!("ACME account store is unavailable: {error}")))?;
+    store.get_credentials(directory_url, account_id)
 }
 
 fn normalize_acme_domains(domains: Vec<String>) -> Result<Vec<String>, String> {
@@ -2148,15 +2322,42 @@ fn acme_finalize_certificate_id(
     Ok(order.id.clone())
 }
 
+/// Resolve usable finalization material for Admin finalize, or the fixed
+/// content-free 400 diagnostic used for both missing and corrupt packages.
+///
+/// Runs before dns-cache / account / directory work so a structurally corrupt
+/// `Some(...)` cannot become a 502 from a later network step.
 #[cfg(feature = "acme")]
-fn persist_failed_acme_order(
-    store: &crate::tls::acme::AcmeOrderStore,
+fn acme_order_finalization_for_finalize(
+    order: &AcmeOrderRecord,
+) -> Result<AcmeOrderFinalization, &'static str> {
+    const MESSAGE: &str = "ACME order finalization material is missing or unusable";
+    let Some(finalization) = order.finalization.as_ref() else {
+        return Err(MESSAGE);
+    };
+    finalization.validate(&order.domains).map_err(|_| MESSAGE)?;
+    Ok(finalization.clone())
+}
+
+/// Record an order's terminal failure. Best effort: the caller is already
+/// returning the underlying failure to the operator, so a store problem here
+/// must not replace that diagnostic — but it is offloaded like every other
+/// locking store write, and a failure is accounted for rather than dropped.
+#[cfg(feature = "acme")]
+async fn persist_failed_acme_order(
+    store: Arc<crate::tls::acme::AcmeOrderStore>,
     mut record: AcmeOrderRecord,
     error: String,
 ) {
     record.status = AcmeOrderStatus::Failed;
     record.error = Some(error);
-    let _ = store.upsert_order(record, true);
+    let persisted = offload_secondary_store_write("acme_failed_order_persist", move || {
+        store.upsert_order(record, true).is_ok()
+    })
+    .await;
+    if !persisted {
+        super::warn_persistence_failure_redacted("acme_failed_order_persist");
+    }
 }
 
 fn validated_optional_acme_string(
@@ -2436,5 +2637,67 @@ mod tests {
         );
         assert_eq!(record.account_id.as_deref(), Some("account-1"));
         assert!(overwrite);
+    }
+
+    #[cfg(feature = "acme")]
+    fn sample_finalize_order(
+        finalization: Option<AcmeOrderFinalization>,
+        domains: Vec<String>,
+    ) -> AcmeOrderRecord {
+        let mut order = AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+            id: "edge-order".to_string(),
+            certificate_id: Some("edge-cert".to_string()),
+            domains: domains.clone(),
+            directory_url: "https://acme.example/directory".to_string(),
+            account_id: None,
+            account_credentials_json: None,
+            order_url: Some("https://acme.example/order/1".to_string()),
+            status: AcmeOrderStatus::PendingChallenges,
+            http01_challenges: Vec::new(),
+            tls_alpn01_challenges: Vec::new(),
+            dns01_challenges: Vec::new(),
+            finalization: None,
+            error: None,
+        })
+        .expect("order");
+        order.finalization = finalization;
+        order.domains = domains;
+        order
+    }
+
+    #[cfg(feature = "acme")]
+    #[test]
+    fn acme_finalize_preflight_accepts_usable_material_and_rejects_missing_or_corrupt() {
+        let domains = vec!["example.com".to_string()];
+        let usable = AcmeOrderFinalization::generate(&domains).expect("generate");
+        let accepted = acme_order_finalization_for_finalize(&sample_finalize_order(
+            Some(usable.clone()),
+            domains.clone(),
+        ))
+        .expect("usable material");
+        assert_eq!(accepted.key_pem(), usable.key_pem());
+
+        let missing =
+            acme_order_finalization_for_finalize(&sample_finalize_order(None, domains.clone()))
+                .expect_err("missing material");
+        assert_eq!(
+            missing,
+            "ACME order finalization material is missing or unusable"
+        );
+
+        let corrupt: AcmeOrderFinalization = serde_json::from_value(serde_json::json!({
+            "key_pem": "-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n",
+            "csr_der_base64": "!!!not-base64!!!",
+        }))
+        .expect("deserialize");
+        // Bypass store validation: build the record field directly.
+        let mut order = sample_finalize_order(Some(usable), domains);
+        order.finalization = Some(corrupt);
+        let rejected = acme_order_finalization_for_finalize(&order).expect_err("corrupt");
+        assert_eq!(rejected, missing);
+        assert!(
+            !rejected.contains("PRIVATE KEY") && !rejected.contains("not-base64"),
+            "admin preflight must stay content-free: {rejected}"
+        );
     }
 }

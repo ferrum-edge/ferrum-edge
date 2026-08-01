@@ -196,6 +196,68 @@ const CACHE_PENDING_INVALIDATE_PATH_SUFFIX: &str = "cache_pending_invalidate_pat
 ///
 /// [`Self::stage_pending_invalidation`]: ResponseCaching::stage_pending_invalidation
 const CACHE_LOOKUP_PATH_SUFFIX: &str = "cache_lookup_path";
+/// Set by `before_proxy` when this request provably has no store path left, so
+/// the response body must NOT be pinned onto the buffered path just because a
+/// cache instance is configured on the proxy (GHSA-pwcm-6rh8-f2gh).
+///
+/// This is a *positive* release marker rather than the absence of staging: the
+/// pre-flight buffering vote runs on every protocol path and must keep its
+/// conservative answer whenever `before_proxy` has not spoken yet.
+const CACHE_RELEASE_RESPONSE_BUFFER_SUFFIX: &str = "cache_release_response_buffer";
+/// Staged outcome of this instance's final response-header phase, so the
+/// buffered `on_final_response_body` can tell "already classified, effects
+/// applied" from "never ran" and never repeat a semantic effect
+/// (GHSA-pwcm-6rh8-f2gh). Instance-namespaced like every other staging key, so
+/// two `response_caching` instances on one proxy stay isolated.
+const CACHE_FINAL_HEADER_DECISION_SUFFIX: &str = "cache_final_header_decision";
+
+/// What the header-only half of the store path decided about one final response.
+///
+/// Every variant except [`Self::BodyDecides`] means the store path provably
+/// reaches no store for this response, and every side effect it would have taken
+/// belongs to the header phase. That is exactly the condition under which the
+/// body may be released to the streaming path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalHeaderDecision {
+    /// The store path returns without evicting, marking, or storing anything.
+    Inert,
+    /// Not storable, and an uncacheable-*resource* signal for the predictor.
+    MarkUncacheable,
+    /// This response supersedes whatever the base key holds: evict it, then mark.
+    InvalidateBaseKey,
+    /// Zero freshness lifetime: run the zero-freshness eviction, then mark.
+    InvalidateZeroFreshness,
+    /// Storable by every header rule, but an origin-selected event stream, which
+    /// this cache never retains.
+    EventStreamNotStored,
+    /// Every header-only gate passed; only the completed body can decide.
+    BodyDecides,
+}
+
+impl FinalHeaderDecision {
+    fn as_metadata_value(self) -> &'static str {
+        match self {
+            Self::Inert => "inert",
+            Self::MarkUncacheable => "mark-uncacheable",
+            Self::InvalidateBaseKey => "invalidate-base-key",
+            Self::InvalidateZeroFreshness => "invalidate-zero-freshness",
+            Self::EventStreamNotStored => "event-stream-not-stored",
+            Self::BodyDecides => "body-decides",
+        }
+    }
+
+    fn from_metadata_value(value: &str) -> Option<Self> {
+        match value {
+            "inert" => Some(Self::Inert),
+            "mark-uncacheable" => Some(Self::MarkUncacheable),
+            "invalidate-base-key" => Some(Self::InvalidateBaseKey),
+            "invalidate-zero-freshness" => Some(Self::InvalidateZeroFreshness),
+            "event-stream-not-stored" => Some(Self::EventStreamNotStored),
+            "body-decides" => Some(Self::BodyDecides),
+            _ => None,
+        }
+    }
+}
 
 static CACHE_CLOCK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static NEXT_RESPONSE_CACHING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1214,6 +1276,10 @@ pub struct ResponseCaching {
     meta_pending_invalidate_path: String,
     /// Precomputed `response_caching.<id>.cache_lookup_path`.
     meta_lookup_path: String,
+    /// Precomputed `response_caching.<id>.cache_release_response_buffer`.
+    meta_release_buffer: String,
+    /// Precomputed `response_caching.<id>.cache_final_header_decision`.
+    meta_final_header_decision: String,
     /// Parsed configuration, including how anonymous callers are partitioned
     /// (`config.anonymous_caller_scope`, see [`AnonymousCallerScope`]). The
     /// scope is deliberately *not* mirrored onto a second field: one owner
@@ -1292,6 +1358,14 @@ impl ResponseCaching {
                 CACHE_PENDING_INVALIDATE_PATH_SUFFIX,
             ),
             meta_lookup_path: staging_metadata_key(instance_id, CACHE_LOOKUP_PATH_SUFFIX),
+            meta_release_buffer: staging_metadata_key(
+                instance_id,
+                CACHE_RELEASE_RESPONSE_BUFFER_SUFFIX,
+            ),
+            meta_final_header_decision: staging_metadata_key(
+                instance_id,
+                CACHE_FINAL_HEADER_DECISION_SUFFIX,
+            ),
             config,
             cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
             vary_index: Arc::new(DashMap::with_shard_amount(shard_amount)),
@@ -1335,6 +1409,296 @@ impl ResponseCaching {
 
     fn cache_status<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
         ctx.metadata.get(&self.meta_status).map(String::as_str)
+    }
+
+    /// Record that this instance has no remaining store path for this request,
+    /// so the proxy may stream the response instead of retaining it.
+    ///
+    /// Only called from `before_proxy` after a decision that no later hook can
+    /// reverse: an uncacheable method, a request that advertises SSE, a request
+    /// that carries a body (no complete replay partition), a refused partition,
+    /// a request `Cache-Control: no-store`, or a variant the uncacheable
+    /// predictor has already learned about. Each of those makes
+    /// `on_final_response_body` a no-op, so the collected body would be
+    /// discarded unread — exactly the amplification GHSA-pwcm-6rh8-f2gh
+    /// describes.
+    fn release_response_buffer(&self, ctx: &mut RequestContext) {
+        ctx.metadata
+            .insert(self.meta_release_buffer.clone(), "1".to_string());
+    }
+
+    fn response_buffer_released(&self, ctx: &RequestContext) -> bool {
+        ctx.metadata.contains_key(&self.meta_release_buffer)
+    }
+
+    /// Classify a final response from its status and headers alone, reproducing
+    /// the store path's decision sequence exactly and in the same order.
+    ///
+    /// Every refusal in `on_final_response_body` up to the `max_entry_size_bytes`
+    /// check is decidable from status + response headers + the request view this
+    /// instance already staged. Naming each of them lets the header phase
+    /// *perform* their side effects, which in turn is what makes releasing the
+    /// body to the streaming path equivalent rather than merely convenient
+    /// (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// Pure by construction: no cache, index, or predictor mutation happens here,
+    /// so the speculative pre-`after_proxy` buffering vote can call it without
+    /// taking an effect for a decision the proxy may never adopt.
+    ///
+    /// The provenance gates (`SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, an unstable
+    /// runtime-overlay policy stamp, an unprovable presentation digest) are
+    /// deliberately NOT part of this classification. Each of them makes the store
+    /// path return with no effect at all, so excluding them can only make this
+    /// answer more conservative than reality — never less. The effect-taking
+    /// half does check them, so an effect is never taken for a response whose
+    /// provenance the store path would have refused.
+    fn classify_final_response_headers(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> FinalHeaderDecision {
+        // No staged base key means this instance never ran its lookup for this
+        // request, so `on_final_response_body` returns immediately.
+        if !ctx.metadata.contains_key(&self.meta_base_key) {
+            return FinalHeaderDecision::Inert;
+        }
+
+        // 1. A status outside `cacheable_status_codes` is an uncacheable-resource
+        //    signal and marks the predictor, but evicts nothing.
+        if !self
+            .config
+            .cacheable_status_codes
+            .contains(&response_status)
+        {
+            return FinalHeaderDecision::MarkUncacheable;
+        }
+
+        // 2. A status whose caching semantics this plugin does not implement, and
+        //    a `Content-Range` partial answer, are refused before any invalidating
+        //    branch and are deliberately NOT predictor signals: the very next
+        //    unconditional request may store the full representation.
+        if !is_supported_cacheable_status(response_status)
+            || response_headers.contains_key("content-range")
+        {
+            return FinalHeaderDecision::Inert;
+        }
+
+        let directives = if self.config.respect_cache_control {
+            response_headers
+                .get("cache-control")
+                .map(|cc| parse_cache_control(cc))
+                .unwrap_or_default()
+        } else {
+            CacheControlDirectives::default()
+        };
+
+        // 3. Response directives that forbid storing also supersede whatever this
+        //    base key holds.
+        if directives.no_store || directives.private || directives.no_cache {
+            return FinalHeaderDecision::InvalidateBaseKey;
+        }
+
+        let freshness_lifetime = self.freshness_lifetime(&directives);
+
+        // 4. Zero freshness — including a configured `ttl_seconds: 0`, where
+        //    EVERY response lands here.
+        if freshness_lifetime.is_zero() {
+            return FinalHeaderDecision::InvalidateZeroFreshness;
+        }
+
+        // 5. `Set-Cookie` is per-client and never stored (RFC 9111 §8).
+        if response_headers.contains_key("set-cookie") {
+            return FinalHeaderDecision::MarkUncacheable;
+        }
+
+        let lookup_headers = self.restore_request_headers_view(ctx);
+
+        // 6. RFC 9111 §3.5 shared-cache authorization admission.
+        if !Self::shared_cache_allows_authorized_response(ctx, &lookup_headers.headers, &directives)
+        {
+            return FinalHeaderDecision::MarkUncacheable;
+        }
+
+        // 7. A representation that is already stale on arrival. Corrected age only
+        //    grows, so evaluating this earlier than the store path can only fail
+        //    to refuse — never refuse something the store path would have kept.
+        let response_time_monotonic = self.now_monotonic();
+        let response_time_wall = self.now_wall();
+        let corrected_initial_age = self.corrected_initial_age(
+            ctx,
+            response_headers,
+            response_time_monotonic,
+            response_time_wall,
+        );
+        if corrected_initial_age >= freshness_lifetime {
+            return FinalHeaderDecision::MarkUncacheable;
+        }
+
+        // 8. A `Vary` this cache cannot key on (`Vary: *`).
+        if self.merged_vary_headers(response_headers).is_none() {
+            return FinalHeaderDecision::InvalidateBaseKey;
+        }
+
+        // 9. An origin-selected event stream. The store path has no refusal for
+        //    it, but retaining one is indefensible on both counts: collection ends
+        //    only when the stream does, so the body is held for the connection's
+        //    whole lifetime against the retained-response budget, and the result
+        //    is not a representation any later request could reuse. Classified
+        //    here — not released quietly at the buffering vote — so the buffered
+        //    path refuses the store too, even when an unrelated plugin keeps the
+        //    body buffered for its own reasons.
+        //
+        //    Read from the BACKEND-selected representation, not the live header
+        //    map: a later `after_proxy` hook may relabel an event stream, and a
+        //    relabel neither bounds those bytes nor makes them reusable by a
+        //    later request. Using the live map here would let adding a
+        //    content-type-rewriting plugin turn the refusal off — the same
+        //    silent reinstatement the release path guards against
+        //    (GHSA-pwcm-6rh8-f2gh). A synthetic response carries no backend
+        //    stamp, so the helper falls back to its live headers.
+        if super::utils::sse::original_response_is_event_stream(ctx, response_headers) {
+            return FinalHeaderDecision::EventStreamNotStored;
+        }
+
+        FinalHeaderDecision::BodyDecides
+    }
+
+    /// Apply the header-only half of the store path for the response the proxy
+    /// actually selected, and stage the outcome for `on_final_response_body`.
+    ///
+    /// This is the whole point of the final response-header phase: every
+    /// invalidation and predictor mark above is decidable without the body, so it
+    /// must not be gated on collecting one. Once these effects are guaranteed,
+    /// releasing the body is equivalent to collecting it and discarding it
+    /// (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// Runs the same provenance gates the store path runs first, so a synthetic
+    /// short-circuit body, a representation of unattributable runtime-overlay
+    /// provenance, and an unprovable presentation policy still take no effect.
+    fn apply_final_response_header_effects(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> FinalHeaderDecision {
+        // Synthetic short-circuit guard. When a request was short-circuited by a
+        // `before_proxy` plugin (including this plugin's own cache
+        // HIT/REVALIDATED surfaced via `RejectBinary`, an `ai_semantic_cache`
+        // hit, a `fault_injection`/`response_mock`/`serverless` abort), the
+        // synthetic body flows back through the response hooks. Running the
+        // store path over a body that never came from the backend would churn
+        // the vary index and the uncacheable predictor — and for a served HIT
+        // the entry is already cached and unchanged, so there is nothing to
+        // store or evict. `apply_synthetic_response_body_hooks` sets this marker
+        // only for the duration of that phase, so its presence is precise; a
+        // genuine backend response never carries it. Mirrors
+        // `request_deduplication`'s synthetic short-circuit guard and
+        // `ai_semantic_cache`'s miss-only buffering key.
+        if ctx
+            .metadata
+            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
+        {
+            return self.stage_final_header_decision(ctx, FinalHeaderDecision::Inert);
+        }
+        // If a runtime-overlay publication landed mid-request the bytes belong to
+        // neither policy, so this representation can neither be stored nor be
+        // trusted to describe what it supersedes. Not an uncacheable-resource
+        // signal, so the predictor is left alone.
+        if !ctx.response_policy_stamp_stable() {
+            debug!(
+                "response_caching: runtime-overlay policy changed mid-request, taking no \
+                 header-phase effect for an unattributable representation"
+            );
+            return self.stage_final_header_decision(ctx, FinalHeaderDecision::Inert);
+        }
+        if ctx.response_presentation_policy_digest.is_none() {
+            debug!(
+                "response_caching: presentation policy is unprovable, taking no header-phase \
+                 effect for an unattributable representation"
+            );
+            return self.stage_final_header_decision(ctx, FinalHeaderDecision::Inert);
+        }
+
+        let decision = self.classify_final_response_headers(ctx, response_status, response_headers);
+        let base_key = ctx.metadata.get(&self.meta_base_key).cloned();
+        // The variant-specific predict key, so uncacheability of one Vary variant
+        // does not suppress lookups for other variants of the same route.
+        let predict_key = ctx.metadata.get(&self.meta_predict_key).cloned();
+        match decision {
+            FinalHeaderDecision::InvalidateBaseKey => {
+                if let Some(base_key) = base_key.as_deref() {
+                    self.invalidate_base_key(base_key);
+                }
+                self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
+            }
+            FinalHeaderDecision::InvalidateZeroFreshness => {
+                if let Some(base_key) = base_key.as_deref() {
+                    let lookup_headers = self.restore_request_headers_view(ctx);
+                    self.invalidate_zero_freshness_response(
+                        base_key,
+                        predict_key.as_deref(),
+                        response_headers,
+                        &lookup_headers,
+                    );
+                }
+                self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
+            }
+            FinalHeaderDecision::MarkUncacheable => {
+                self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
+            }
+            FinalHeaderDecision::Inert
+            | FinalHeaderDecision::EventStreamNotStored
+            | FinalHeaderDecision::BodyDecides => {}
+        }
+        self.stage_final_header_decision(ctx, decision)
+    }
+
+    /// Record this instance's header-phase outcome under its own namespaced key,
+    /// so sibling `response_caching` instances stay isolated and the buffered
+    /// body hook can tell "already classified" from "never ran".
+    fn stage_final_header_decision(
+        &self,
+        ctx: &mut RequestContext,
+        decision: FinalHeaderDecision,
+    ) -> FinalHeaderDecision {
+        ctx.metadata.insert(
+            self.meta_final_header_decision.clone(),
+            decision.as_metadata_value().to_string(),
+        );
+        decision
+    }
+
+    fn staged_final_header_decision(&self, ctx: &RequestContext) -> Option<FinalHeaderDecision> {
+        ctx.metadata
+            .get(&self.meta_final_header_decision)
+            .and_then(|value| FinalHeaderDecision::from_metadata_value(value.as_str()))
+    }
+
+    /// Whether this response's completed body is still semantically required.
+    ///
+    /// The single predicate behind both the header-time buffering refinement and
+    /// the retry-time release confirmation, so the two cannot answer differently
+    /// for the same response.
+    fn final_response_body_is_required(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        content_type: Option<&str>,
+    ) -> bool {
+        if !matches!(
+            self.classify_final_response_headers(ctx, response_status, response_headers),
+            FinalHeaderDecision::BodyDecides
+        ) {
+            return false;
+        }
+        // The refinement is also handed the `Content-Type` the proxy resolved for
+        // this response, which can name an event stream a bare header map does
+        // not. Releasing on it is safe in the same way: the header phase runs
+        // over the final headers regardless, and a body that is never collected
+        // is never stored.
+        !content_type.is_some_and(super::utils::sse::is_text_event_stream_media_type)
     }
 
     /// Drop this instance's lookup/store staging inputs without touching
@@ -2508,7 +2872,160 @@ impl Plugin for ResponseCaching {
         // `on_final_response_body` will not be invoked, so the cache state
         // stays correct without any other code paths needing to special-case
         // SSE.
-        !super::utils::sse::is_sse_request(ctx)
+        //
+        // Every other request-side fact that provably removes the store path is
+        // folded in through the release marker `before_proxy` sets: an
+        // uncacheable method, a request that carries a body, a refused replay
+        // partition, a request `Cache-Control: no-store`, and a variant the
+        // uncacheable predictor already knows about. Those decisions need the
+        // live header view and the built cache key, so they are taken in
+        // `before_proxy` — which runs before this vote on every dispatch path —
+        // rather than re-derived here. An ABSENT marker keeps the conservative
+        // answer, so a path that votes before `before_proxy` ran still buffers
+        // (GHSA-pwcm-6rh8-f2gh).
+        //
+        // This is only the request-side half of the answer. The response-side
+        // half — every refusal that is decidable once the response headers exist
+        // — is `should_buffer_response_body_for_content_type`, which releases far
+        // more because the final response-header phase owns the effects those
+        // refusals imply.
+        !self.response_buffer_released(ctx) && !super::utils::sse::is_sse_request(ctx)
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        if !self.should_buffer_response_body(ctx) {
+            return false;
+        }
+        // Release every response whose store path is decidable from the headers
+        // alone. This is safe — and only safe — because the final
+        // response-header phase runs on both the streaming and buffered paths and
+        // owns every invalidation and predictor mark those refusals imply
+        // (GHSA-pwcm-6rh8-f2gh).
+        //
+        // The vote is taken on the BACKEND response headers, before `after_proxy`
+        // can rewrite them, so it is speculative in exactly one direction: a
+        // later rewrite can turn a released response into one this instance would
+        // have stored. That costs a cache entry, never correctness — the header
+        // phase still classifies over the final headers, and a body that was
+        // never collected is never stored.
+        self.final_response_body_is_required(ctx, response_status, response_headers, content_type)
+    }
+
+    fn should_release_response_body_before_content_type_rewrite(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        // The shared refinement refuses to downgrade buffer -> stream whenever any
+        // plugin *might* rewrite `Content-Type` in a later hook, because a
+        // body-inspecting plugin's decision would then have been taken on a label
+        // the client never sees. That guard does not apply to this instance's
+        // release: the store path this refusal closed does not read `Content-Type`
+        // at all, so no relabel can reopen it.
+        //
+        // The event-stream refusal is included deliberately even though it IS
+        // named by `Content-Type`. Relabelling an unbounded event stream does not
+        // make its bytes bounded, so collecting it would still hold the whole
+        // connection against the retained-response budget — the exact
+        // amplification this advisory is about — and a relabelled stream is still
+        // not a representation a later request can reuse. Without this, adding any
+        // content-type-rewriting plugin to the proxy silently reinstated the
+        // vulnerable behavior (GHSA-pwcm-6rh8-f2gh).
+        if !self.should_buffer_response_body(ctx) {
+            return false;
+        }
+        matches!(
+            self.classify_final_response_headers(ctx, response_status, response_headers),
+            FinalHeaderDecision::Inert
+                | FinalHeaderDecision::MarkUncacheable
+                | FinalHeaderDecision::InvalidateBaseKey
+                | FinalHeaderDecision::InvalidateZeroFreshness
+                | FinalHeaderDecision::EventStreamNotStored
+        )
+    }
+
+    fn should_release_response_body_for_simulated_final_headers(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        final_response_headers: &HashMap<String, String>,
+    ) -> bool {
+        // The same predicate every other release here uses, evaluated over the
+        // SIMULATED final header view rather than the backend one. That is what
+        // lets a later built-in header rule which closes the store path —
+        // `no-store`, `private`, `no-cache`, `max-age=0` / zero freshness, an
+        // unusable `Vary` — release the body instead of collecting a response
+        // whose store path was already decided against it
+        // (GHSA-pwcm-6rh8-f2gh).
+        //
+        // Safe in exactly one direction, which is why this instance may
+        // implement a hook the trait warns is a projection rather than a proof:
+        // every effect the release skips belongs to the final response-header
+        // phase, which runs over the TRUE final headers on both the streaming and
+        // buffered paths. An over-optimistic simulation therefore costs a cache
+        // entry and can never skip an eviction or a predictor mark, nor store a
+        // representation the real headers refuse.
+        self.should_buffer_response_body(ctx)
+            && !self.final_response_body_is_required(
+                ctx,
+                response_status,
+                final_response_headers,
+                None,
+            )
+    }
+
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        // Retry-enabled dispatch buffers by default so a failed attempt stays
+        // replayable, and every active buffering plugin must opt in before the
+        // shared refinement will release. Opt in only while this instance is a
+        // reason for buffering; the confirmation hook below still releases only
+        // a response whose store path is provably a no-op
+        // (GHSA-pwcm-6rh8-f2gh). Without this, a proxy whose ONLY buffering
+        // plugin is `response_caching` kept every response — including an
+        // origin-selected event stream — fully buffered whenever retries were
+        // configured.
+        self.should_buffer_response_body(ctx)
+    }
+
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        // Same predicate as the header-time refinement; the retry decision
+        // context carries no separate `content_type` argument, so it is read
+        // from the response headers the refinement would have derived it from.
+        //
+        // Nothing here mutates cache state, and the header phase that does runs
+        // only from the end of the `after_proxy` chain — i.e. over the response
+        // retry selection actually kept. A discarded attempt therefore cannot
+        // invalidate an entry or teach the predictor anything.
+        self.should_buffer_response_body(ctx)
+            && !self.final_response_body_is_required(ctx, response_status, response_headers, None)
+    }
+
+    fn on_final_response_headers(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) {
+        // The whole header-only half of the store path, completed here for the
+        // selected final response — streaming or buffered. This is what makes the
+        // releases above equivalent to collecting the body and discarding it:
+        // a `no-store` / `private` / `no-cache` / zero-freshness / `Vary: *`
+        // response still evicts what it supersedes, and an uncacheable variant is
+        // still learned, whether or not anyone collected its bytes
+        // (GHSA-pwcm-6rh8-f2gh).
+        self.apply_final_response_header_effects(ctx, response_status, response_headers);
     }
 
     async fn before_proxy(
@@ -2548,12 +3065,14 @@ impl Plugin for ResponseCaching {
             // invalidation host is intentionally retained until origin success
             // is observed (or cleared on a later HIT of a cacheable sibling).
             self.clear_lookup_staging(ctx);
+            self.release_response_buffer(ctx);
             self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
         }
 
         if super::utils::sse::headers_accept_sse(headers) {
             self.clear_lookup_staging(ctx);
+            self.release_response_buffer(ctx);
             self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
         }
@@ -2571,6 +3090,7 @@ impl Plugin for ResponseCaching {
         // for inconsistent or malformed framing views.
         if !ctx.replay_request_body_empty_proven() || request_declares_body(headers) {
             self.clear_lookup_staging(ctx);
+            self.release_response_buffer(ctx);
             self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
         }
@@ -2589,6 +3109,7 @@ impl Plugin for ResponseCaching {
                      caller"
                 );
                 self.clear_lookup_staging(ctx);
+                self.release_response_buffer(ctx);
                 self.set_cache_status(ctx, "BYPASS");
                 return PluginResult::Continue;
             }
@@ -2629,6 +3150,19 @@ impl Plugin for ResponseCaching {
             && let Some(cc) = headers.get("cache-control")
         {
             let directives = parse_cache_control(cc);
+            if directives.no_store {
+                // RFC 9111 §5.2.1.5: a cache MUST NOT store any part of a
+                // request carrying `no-store`, or of the response to it. That
+                // makes the store path unreachable, so the staging goes and the
+                // response body is released rather than collected for a store
+                // that can never happen (GHSA-pwcm-6rh8-f2gh). Pending unsafe
+                // invalidation is retained — the request still contacts the
+                // origin and a successful mutation must still evict peers.
+                self.clear_lookup_staging(ctx);
+                self.release_response_buffer(ctx);
+                self.set_cache_status(ctx, "BYPASS");
+                return PluginResult::Continue;
+            }
             if directives.request_bypasses_cache() {
                 // Keep this instance's staged base/snapshot/predict so a
                 // no-cache refresh can still store the replacement response
@@ -2647,6 +3181,18 @@ impl Plugin for ResponseCaching {
             .uncacheable_predictor
             .is_predicted_cacheable(&cache_key)
         {
+            // The predictor already learned this variant is uncacheable, so the
+            // store path would collect the whole body only to reject it again.
+            // Release it — and retire the mark in the same step so the very next
+            // request for this variant re-learns instead of being starved of a
+            // store attempt forever (`mark_cacheable` is otherwise only reached
+            // from a completed store). Steady state alternates: at most every
+            // other request for a persistently uncacheable variant pays for a
+            // buffer, and a variant that becomes cacheable is picked up on the
+            // next request rather than never.
+            self.uncacheable_predictor.mark_cacheable(&cache_key);
+            self.clear_lookup_staging(ctx);
+            self.release_response_buffer(ctx);
             self.set_cache_status(ctx, "PREDICTED-BYPASS");
             return PluginResult::Continue;
         }
@@ -2798,94 +3344,61 @@ impl Plugin for ResponseCaching {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Synthetic short-circuit guard. When a request was short-circuited by a
-        // `before_proxy` plugin (including this plugin's own cache HIT/REVALIDATED
-        // surfaced via `RejectBinary`, an `ai_semantic_cache` hit, a
-        // `fault_injection`/`response_mock`/`serverless` abort, etc.), the
-        // synthetic body now flows back through the response-body hooks (the
-        // generic 2xx short-circuit path). Re-running the entire store path over a
-        // body that never came from the backend would take `accounting_guard()`,
-        // do a full body copy on every hit (a hot-path regression), and needlessly
-        // churn the vary index / uncacheable predictor — and for a served cache
-        // HIT the entry is already cached and unchanged, so there is nothing to
-        // store. `apply_synthetic_response_body_hooks` sets this marker only for
-        // the duration of the synthetic body-hook phase, so its presence is a
-        // precise signal; a genuine backend response (the only legitimate store /
-        // replacement path) never carries it and falls through to store normally.
-        // Mirrors `request_deduplication`'s synthetic short-circuit guard and
-        // `ai_semantic_cache`'s miss-only buffering key.
-        if ctx
-            .metadata
-            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
-        {
+        // Consume the final response-header phase's decision instead of
+        // re-deriving — and re-applying — the header-only half of the store path
+        // (GHSA-pwcm-6rh8-f2gh).
+        //
+        //   * A staged refusal means the header phase already invalidated what
+        //     this response supersedes and taught the predictor what it had to.
+        //     Repeating either here would be a duplicate semantic effect, and the
+        //     body adds nothing to a decision the headers already settled.
+        //   * A staged `BodyDecides` is re-classified against THESE headers,
+        //     which are the post-normalize/post-transform view rather than the
+        //     post-`after_proxy` one the header phase saw. If the body phases
+        //     changed the representation into a non-storable one, its effects are
+        //     applied now, exactly once.
+        //   * No staged decision at all means the header phase never ran for this
+        //     instance — a direct hook context, or a path that reached the body
+        //     hooks without the `after_proxy` chain. Classify and apply here, so
+        //     this hook remains self-sufficient.
+        //
+        // The synthetic short-circuit guard, the runtime-overlay policy stamp,
+        // and the presentation-policy digest all live inside that shared step, so
+        // a synthetic or unattributable representation still takes no effect.
+        let decision = match self.staged_final_header_decision(ctx) {
+            Some(FinalHeaderDecision::BodyDecides) | None => {
+                self.apply_final_response_header_effects(ctx, response_status, response_headers)
+            }
+            Some(decision) => decision,
+        };
+        if !matches!(decision, FinalHeaderDecision::BodyDecides) {
             return PluginResult::Continue;
         }
 
-        let base_key = match ctx.metadata.get(&self.meta_base_key) {
-            Some(base_key) => base_key.clone(),
-            None => return PluginResult::Continue,
+        // Everything below is reached only for a response the header phase proved
+        // storable, so the refusals it already decided are not repeated. The
+        // remaining early returns are defensive: they can only fire if a value
+        // re-derived here disagrees with the classification (a corrected age that
+        // crossed the freshness boundary in between), and they refuse the store
+        // WITHOUT taking an effect the header phase already owns.
+        let Some(base_key) = ctx.metadata.get(&self.meta_base_key).cloned() else {
+            return PluginResult::Continue;
         };
-
         // Provenance stamp for this representation. `before_proxy` pinned the
         // stamp before any gate read on this request; this hook runs after
         // every response-side transform, so an unchanged atomic publication
-        // identity proves the whole response pipeline saw one policy. If a
-        // publication landed in between, the bytes belong to neither policy —
-        // drop the store rather than cache a representation of unknown provenance.
-        // Not an uncacheable-response signal, so the predictor is left alone.
+        // identity proves the whole response pipeline saw one policy.
         let policy_stamp = ctx.pin_response_policy_stamp().clone();
-        if !ctx.response_policy_stamp_stable() {
-            debug!(
-                "response_caching: runtime-overlay policy changed mid-request, \
-                 skipping store of an unattributable representation"
-            );
-            return PluginResult::Continue;
-        }
         // Record the generation that actually shaped these bytes alongside the
         // publication identity — the request kept its pinned plugin cache for
         // its whole lifetime, so this digest is exact even when the stamp above
         // belongs to a newer publication (GHSA-83rc-23c9-3g9x).
         let Some(presentation_digest) = ctx.response_presentation_policy_digest else {
-            debug!(
-                "response_caching: presentation policy is unprovable, \
-                 skipping store of an unattributable representation"
-            );
             return PluginResult::Continue;
         };
-        // Use the variant-specific predict key (set during before_proxy) for
-        // predictor marking so that uncacheability of one Vary variant does not
-        // suppress cache lookups for other variants of the same route.
-        let predict_key = ctx.metadata.get(&self.meta_predict_key).cloned();
-
-        if !self
-            .config
-            .cacheable_status_codes
-            .contains(&response_status)
-        {
-            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
-            return PluginResult::Continue;
-        }
-
-        // Second, independent gate on the statuses whose caching semantics this
-        // plugin does not implement. Configuration admission already rejects
-        // them, but the runtime refusal is what makes the guarantee
-        // status-driven rather than config-driven, and it also covers a partial
-        // representation that arrives under an allowed status: a caller-chosen
-        // `Range` answered with `Content-Range` describes bytes, not the
-        // resource, and must never become the reusable entry for later
-        // unconditional requests. Neither is an uncacheable *resource* signal —
-        // the very next unconditional request may store the full
-        // representation — so the predictor is deliberately left alone.
-        if !is_supported_cacheable_status(response_status)
-            || response_headers.contains_key("content-range")
-        {
-            debug!(
-                response_status = response_status,
-                "response_caching: refusing to store a partial or validator-only response as a \
-                 reusable representation"
-            );
-            return PluginResult::Continue;
-        }
+        // The variant-specific predict key is no longer read here: every
+        // predictor mark this hook used to take now belongs to the header phase,
+        // which is the only place that can take it for a streamed response too.
 
         let directives = if self.config.respect_cache_control {
             response_headers
@@ -2896,9 +3409,12 @@ impl Plugin for ResponseCaching {
             CacheControlDirectives::default()
         };
 
+        // The header-only refusals below were all settled — and their evictions
+        // and predictor marks taken — by the classification above. They remain as
+        // plain, effect-free early returns so a value that drifts between the two
+        // evaluations can still only lose a store, never store something the
+        // header phase refused.
         if directives.no_store || directives.private || directives.no_cache {
-            self.invalidate_base_key(&base_key);
-            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
@@ -2910,13 +3426,6 @@ impl Plugin for ResponseCaching {
         let freshness_lifetime = self.freshness_lifetime(&directives);
 
         if freshness_lifetime.is_zero() {
-            self.invalidate_zero_freshness_response(
-                &base_key,
-                predict_key.as_deref(),
-                response_headers,
-                &lookup_headers,
-            );
-            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
@@ -2925,7 +3434,6 @@ impl Plugin for ResponseCaching {
         // session cookies to other users (RFC 7234 §8).
         if response_headers.contains_key("set-cookie") {
             debug!("response_caching: skipping cache — response contains Set-Cookie header");
-            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
@@ -2935,7 +3443,6 @@ impl Plugin for ResponseCaching {
                 "response_caching: refusing to store a response to an authorized request without \
                  an explicit shared-cache opt-in"
             );
-            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
@@ -2949,17 +3456,11 @@ impl Plugin for ResponseCaching {
         );
 
         if corrected_initial_age >= freshness_lifetime {
-            self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
 
-        let mut vary_headers = match self.merged_vary_headers(response_headers) {
-            Some(vary_headers) => vary_headers,
-            None => {
-                self.invalidate_base_key(&base_key);
-                self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
-                return PluginResult::Continue;
-            }
+        let Some(mut vary_headers) = self.merged_vary_headers(response_headers) else {
+            return PluginResult::Continue;
         };
 
         // Per RFC 7234 §3.2 / §8, a shared cache MUST NOT serve a stored
@@ -3044,7 +3545,29 @@ impl Plugin for ResponseCaching {
         // path can emit them. The client that produced this miss still receives
         // the untouched `response_headers`.
         sanitize_cached_response_headers(&mut cached_response_headers, &directives);
-        let cached_body = Bytes::copy_from_slice(body);
+        // The entry body is a DISTINCT allocation from the one the collector
+        // charged: the collected body is released when this response finishes,
+        // while the entry stays resident until eviction. It therefore acquires
+        // its OWN charge against the aggregate retained-response budget, owned
+        // by the entry's `Bytes` — so it is held for the entry's whole lifetime
+        // and returned when the last clone (entry + any in-flight replay) drops
+        // (GHSA-pwcm-6rh8-f2gh). Reserving before the copy also means a refusal
+        // never materialises it.
+        //
+        // A refusal skips the store, which is exactly what the
+        // `max_entry_size_bytes` refusal immediately above does: the client
+        // still receives its response, the request is a plain miss, and no
+        // uncharged bytes are retained. It is not an uncacheable-*resource*
+        // signal, so the predictor is deliberately left alone.
+        let Some(cached_body) = crate::proxy::response_buffer_budget::charge_retained_copy(body)
+        else {
+            debug!(
+                body_size = body.len(),
+                "response_caching: aggregate retained-response budget refused the cache entry \
+                 copy, skipping store"
+            );
+            return PluginResult::Continue;
+        };
 
         let (cache_key, entry_size) = {
             // Lock ordering: acquire `accounting_lock` before mutating

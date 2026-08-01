@@ -1,14 +1,51 @@
 //! Private, durable file publication for TLS material stores.
 //!
-//! Writes use `0600` on Unix, `create_new` temps, fsync, rename, and a parent
-//! directory fsync so readers observe either the prior durable file or the fully
-//! committed replacement. Temporary files are removed on every failure path
-//! without masking the primary error. Post-rename durability failures roll the
-//! visible destination back; only after that rollback succeeds is the parent
-//! directory fsynced so the rollback itself is durable. A failed rollback keeps
-//! the primary publish error, appends the restore failure as secondary context,
-//! and does not attempt a parent durability sync that could commit the failed
-//! destination.
+//! Writes use `0600` on Unix, `create_new` temps, fsync, an atomic replacement
+//! of the destination, and a parent directory fsync so readers observe either
+//! the prior durable file or the fully committed replacement. Temporary files
+//! are removed on every failure path without masking the primary error.
+//! Post-replacement durability failures roll the visible destination back; only
+//! after that rollback succeeds is the parent directory fsynced so the rollback
+//! itself is durable. A failed rollback keeps the primary publish error, appends
+//! the restore failure as secondary context, and does not attempt a parent
+//! durability sync that could commit the failed destination.
+//!
+//! # The replacement is atomic on every supported target
+//!
+//! Publication *must* replace an existing destination without ever unlinking
+//! it first: a shared managed-TLS/ACME store is read concurrently by other
+//! replicas and by this process's own lock-free readers, and a remove-then-move
+//! sequence would expose a window in which the store appears absent — which the
+//! shared-store reader is required to interpret as an empty document. So there
+//! is no remove-then-rename fallback anywhere in this module.
+//!
+//! * **Unix** uses `rename(2)`, which POSIX defines to replace an existing
+//!   destination atomically.
+//! * **Windows** uses `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING |
+//!   MOVEFILE_WRITE_THROUGH` (`replace_file_atomically`). This is called
+//!   explicitly rather than through [`std::fs::rename`] for two reasons. The
+//!   replace-existing behaviour becomes a contract of *this* module rather than
+//!   an unspecified platform detail of the standard library — `fs::rename`'s
+//!   overwrite semantics on Windows are documented as platform-specific and are
+//!   not something a TLS-material store should depend on implicitly. And
+//!   `MOVEFILE_WRITE_THROUGH` makes the move reach disk before the call
+//!   returns, which is the only durability barrier available on a platform that
+//!   offers no parent-directory fsync (`sync_parent_dir_inner` is a no-op off
+//!   Unix).
+//!
+//! Windows additionally cannot replace a destination that some handle holds
+//! open without `FILE_SHARE_DELETE`. Rust's [`std::fs::OpenOptions`] does
+//! request that share mode (it defaults to `FILE_SHARE_READ | FILE_SHARE_WRITE
+//! | FILE_SHARE_DELETE`), so a handle this crate retains through
+//! `File::open` does not block a replacement — but that is a property of the
+//! standard library rather than of this module, so it is pinned by a test
+//! (`replacement_succeeds_while_a_reader_holds_the_previous_generation_open`)
+//! instead of assumed. A handle opened by anything that does *not* request
+//! share-delete still blocks the move, which is reported as an ordinary write
+//! failure and fails the mutation closed. Independently of that,
+//! `tls::shared_store` retains a store handle only where the platform exposes a
+//! file identity that makes pinning meaningful (Unix) and drops it elsewhere,
+//! so a non-Unix target holds no long-lived handle on the destination at all.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -224,7 +261,91 @@ fn rename_temp_into_place(tmp_path: &Path, final_path: &Path) -> io::Result<()> 
             final_path.display()
         )));
     }
-    fs::rename(tmp_path, final_path)
+    replace_file_atomically(tmp_path, final_path)
+}
+
+/// Move `tmp_path` onto `final_path`, replacing any existing destination in one
+/// step.
+///
+/// There is deliberately no remove-then-move path: unlinking the destination
+/// first would make the store momentarily absent, and an absent store document
+/// is a *successful empty* read for every reader. See the module header for the
+/// per-target primitives.
+fn replace_file_atomically(tmp_path: &Path, final_path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows_atomic::replace_existing(tmp_path, final_path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(tmp_path, final_path)
+    }
+}
+
+/// Atomic replace-existing move for Windows targets.
+///
+/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` is the documented Win32
+/// primitive for replacing a destination in a single operation;
+/// `MOVEFILE_WRITE_THROUGH` additionally makes it durable before returning,
+/// standing in for the parent-directory fsync Windows does not provide.
+///
+/// Bound directly rather than through a new dependency: this is one function
+/// from `kernel32`, and the store's publication path is exactly where an
+/// unaudited transitive addition is least welcome.
+#[cfg(windows)]
+mod windows_atomic {
+    use std::ffi::OsStr;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    /// NUL-terminated UTF-16 for a path, failing closed on an interior NUL.
+    ///
+    /// An interior NUL would silently truncate the path Win32 acts on, which on
+    /// a publication path means writing somewhere other than the store.
+    fn wide(path: &Path) -> io::Result<Vec<u16>> {
+        let mut encoded: Vec<u16> = OsStr::new(path).encode_wide().collect();
+        if encoded.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private file path contains an interior NUL",
+            ));
+        }
+        encoded.push(0);
+        Ok(encoded)
+    }
+
+    pub(super) fn replace_existing(tmp_path: &Path, final_path: &Path) -> io::Result<()> {
+        let existing = wide(tmp_path)?;
+        let replacement = wide(final_path)?;
+        // SAFETY: both buffers are NUL-terminated UTF-16 owned by this frame and
+        // therefore outlive the call, and the flag values are the documented
+        // `MOVEFILE_*` constants. `MoveFileExW` reads the buffers and does not
+        // retain them.
+        let moved = unsafe {
+            MoveFileExW(
+                existing.as_ptr(),
+                replacement.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 fn sync_parent_dir(parent: &Path) -> io::Result<()> {
@@ -396,7 +517,10 @@ fn restore_private_file_best_effort(final_path: &Path, bytes: &[u8]) -> io::Resu
         Ok(()) => {}
         Err(error) => return remove_path_preserving_primary(&tmp_path, error),
     }
-    match fs::rename(&tmp_path, final_path) {
+    // Same atomic replace-existing primitive as publication: the rollback is
+    // restoring a *live* destination other replicas may be reading, so it must
+    // not expose an absence window either.
+    match replace_file_atomically(&tmp_path, final_path) {
         Ok(()) => Ok(()),
         Err(error) => remove_path_preserving_primary(&tmp_path, error),
     }
@@ -440,6 +564,8 @@ pub(crate) fn private_temp_artifacts_for_tests(dir: &Path) -> io::Result<Vec<Pat
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn with_fault<T>(fault: PrivateFileFault, f: impl FnOnce() -> T) -> T {
         let guard = inject_private_file_fault_for_tests(fault);
@@ -556,6 +682,99 @@ mod tests {
                 .expect("list temps")
                 .is_empty()
         );
+    }
+
+    /// Repeated replacement of an existing destination must keep working.
+    ///
+    /// This is the regression that a Windows target most needs: a publication
+    /// path that can only *create* leaves the first write looking healthy and
+    /// fails every shared-store mutation afterwards. It is a plain
+    /// cross-platform assertion on purpose, so the target-specific primitive
+    /// selected by `replace_file_atomically` is exercised by whichever host CI
+    /// compiles it.
+    #[test]
+    fn replacement_overwrites_an_existing_destination_repeatedly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("store.json");
+
+        for generation in 0..5u8 {
+            let payload = format!("generation-{generation}");
+            replace_private_file(&path, payload.as_bytes()).expect("publish generation");
+            assert_eq!(
+                fs::read(&path).expect("read published generation"),
+                payload.as_bytes()
+            );
+        }
+        assert!(
+            private_temp_artifacts_for_tests(dir.path())
+                .expect("list temps")
+                .is_empty(),
+            "no temp artifacts may survive repeated replacement"
+        );
+    }
+
+    /// The destination is never unlinked, so a reader can never observe its
+    /// absence between two committed generations.
+    #[test]
+    fn replacement_never_exposes_an_absent_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("store.json");
+        replace_private_file(&path, b"generation-a").expect("seed");
+
+        let writing = Arc::new(AtomicBool::new(true));
+        let observer = {
+            let path = path.clone();
+            let writing = Arc::clone(&writing);
+            std::thread::spawn(move || {
+                let mut absent = 0usize;
+                let mut observations = 0usize;
+                while writing.load(Ordering::Relaxed) {
+                    if !path.exists() {
+                        absent += 1;
+                    }
+                    observations += 1;
+                }
+                (absent, observations)
+            })
+        };
+
+        for generation in 0..200u16 {
+            replace_private_file(&path, format!("generation-{generation}").as_bytes())
+                .expect("publish generation");
+        }
+        writing.store(false, Ordering::Relaxed);
+
+        let (absent, observations) = observer.join().expect("observer thread");
+        assert!(
+            observations > 0,
+            "the observer must have sampled the destination at least once"
+        );
+        assert_eq!(
+            absent, 0,
+            "the destination must never be observably absent during replacement"
+        );
+    }
+
+    /// A retained open handle on the destination must not block replacement.
+    ///
+    /// Unix cares because the shared store pins the inode it last read; Windows
+    /// cares far more, because a handle opened without `FILE_SHARE_DELETE`
+    /// makes `MoveFileExW` fail outright. Whichever target CI runs, a store
+    /// mutation must still succeed while a reader holds the previous
+    /// generation open.
+    #[test]
+    fn replacement_succeeds_while_a_reader_holds_the_previous_generation_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("store.json");
+        replace_private_file(&path, b"generation-a").expect("seed");
+
+        let retained = File::open(&path).expect("hold the published generation open");
+
+        replace_private_file(&path, b"generation-b")
+            .expect("replacement must not be blocked by a retained reader handle");
+        assert_eq!(fs::read(&path).expect("read replacement"), b"generation-b");
+
+        drop(retained);
     }
 
     #[test]

@@ -120,6 +120,11 @@ Request In
 └────────────┬────────────┘
              │
              ▼
+┌──────────────────────────────┐
+│ 7b. on_final_response_headers │ Header-only effects for the selected response
+└────────────┬─────────────────┘
+             │
+             ▼
 ┌─────────────────────────┐
 │ 8. normalize_response_body │ Provider/protocol normalization
 └────────────┬────────────┘
@@ -146,6 +151,8 @@ Request In
              │
              │  Streamed non-buffered bodies skip phases 8-12 and call
              │  on_response_stream_terminated here when the body terminates.
+             │  Phase 7b is the last one they DO run, which is why it owns any
+             │  response-side effect that must not depend on collecting a body.
              │
              ▼
 ┌─────────────────────────┐
@@ -274,6 +281,101 @@ keeps final transformed-body provider dispatch outside placeholder-backend
 health accounting without allowing it to bypass backend-effective gRPC method
 policy.
 
+## Final Backend Header Policy
+
+Priority ordering inside `before_proxy` only protects a plugin from the plugins
+that run *before* it. A plugin that strips client credentials and installs a
+third-party credential there — today only `ai_stream_router` (2984) — is still
+followed by the generic `request_transformer` (3000), by a deferred
+routing-header hook, and by a `pre_proxy` function's backend header overlay, any
+of which can add, overwrite, or rename that header afterwards (advisory
+`GHSA-xhp5-hqj8-3mwg`).
+
+A plugin declaring `enforces_final_backend_header_policy()` therefore gets a
+second, decisive application point: the gateway calls
+`enforce_final_backend_header_policy()` — in configured priority order — over
+the **finalized backend-visible header map**, at every site where that map is
+complete:
+
+- after the `before_proxy` pass, and after each deferred routing-header /
+  remaining-deferred pass, on both the H1/H2 ladder (`src/proxy/mod.rs`) and the
+  native HTTP/3 ladder (`src/http3/server.rs`);
+- after a finalized-request-egress header overlay is merged.
+
+Every one of those sites runs the hook *after* the reserved gateway-assertion
+refresh and the egress baggage strip, so the plugin's policy has the last word.
+The hook is synchronous, non-rejecting, and must be idempotent — it re-applies a
+decision already committed in `before_proxy` rather than making a new one. A
+plugin that must *fail* on finalized state does that in `on_final_request_body*`,
+which has rejection plumbing on every dispatcher. The whole pass is gated on the
+precomputed `ENFORCES_FINAL_BACKEND_HEADER_POLICY` capability bit, so chains
+without such a plugin do no extra work.
+
+Because the mutation happens after every `before_proxy` hook, no fingerprint
+taken during that phase can witness it. Plugin-cache construction therefore
+fails closed on `request_deduplication` composed with a plugin declaring this
+capability. `response_caching` needs no separate rule: today's only declarer is
+already refused by its deferred-request-body-transformer rule, and its lookup
+population (GET/HEAD with a transport-proven empty upload) cannot overlap a POST
+JSON claim.
+
+### The rest of the provider boundary
+
+Headers are only one of the things a later plugin can move. `ai_stream_router`
+therefore records a private, typed claim on the request context — never metadata
+— holding an opaque owning-instance identity plus the exact model, destination,
+resolved backend TLS, DNS decision, and backend-visible query it committed:
+
+- The committed **model** is the exact string that matched `model_patterns` and
+  selected the provider, the price, and (for `{model}` endpoints) the backend
+  URL. Final body enforcement compares the provider-visible `model` against that
+  private copy and re-checks it against the selected provider's patterns, and
+  the claim-owned response normalizers stamp the client-visible generation
+  identity from it. The `ai_stream_router.model` metadata key is observability
+  only and is never read back: a later plugin can change the final body's model
+  *and* republish that key as the same value, which would satisfy an equality
+  check against metadata while bypassing selection entirely.
+- The committed **query** is replayed at
+  `crate::proxy::effective_backend_query_string*`, the single funnel every
+  dispatcher and every retry attempt reads, so a later generic query transform
+  cannot append a normal-backend secret to the third-party URL.
+- The committed **destination** witness includes `route_override_upstream_id`
+  (cleared at claim, required to stay clear) and `route_override_resolved_tls`
+  (exact equality), not just scheme/host/port/authority/path — otherwise a later
+  plugin could keep the visible host while changing load-balancer identity or
+  weakening server verification, SNI, or mTLS.
+- A direct provider claim sets `RouteOverrideDnsPolicy::ClearInherited`, a narrow
+  typed route-override knob honored by
+  `RequestContext::apply_route_overrides*`. The generic rule only drops a
+  proxy's `dns_override` when the override changed the backend host *text*,
+  which is `false` exactly when the configured proxy host already equals the
+  selected provider host. Ordinary same-host route rewrites are unaffected: the
+  default policy is `InheritProxy`.
+- **Instance ownership** makes multiple same-type instances safe. Two instances
+  may share a provider name while differing in endpoint, key, provider type,
+  patterns, and normalization, so a name in public metadata cannot decide who
+  owns a claim. The first matching instance claims; later instances leave the
+  route, credential, and body claim alone; and every claim-dependent request and
+  response hook checks the private owner before acting.
+- Two **request-shape witnesses** are claim state for the same reason: whether
+  the owning instance's own transform actually produced the Anthropic
+  representation, and whether the claimed request forbids tool use for this
+  generation (the response normalizer's fail-closed `tool_use` guard). Both gate
+  fail-closed decisions, so neither may be forgeable through the mirrored
+  `ai_stream_router.request_translated` / `ai_stream_router.tool_choice_none`
+  observability keys.
+
+The `ai_stream_router.*` metadata keys stay published for logs and cross-plugin
+coordination, and a later plugin may write any of them — no enforcement point
+reads them back. The one metadata value a claim-owned hook still consults is
+`ai_stream_router.provider_content_encoding`, which is derived from the
+provider's own response headers, decides only how the owning instance decodes
+its own upstream bytes, and is bounded by that decoder's limits.
+
+`on_final_request_body` fails closed on any drift in that witness with a
+fixed-cardinality envelope that echoes no offending value — neither the
+committed model nor the final body's model.
+
 ## Finalized Request Egress
 
 Irreversible outbound request egress is its own phase (advisory
@@ -337,6 +439,16 @@ protocol/integrity validation, WAF/OpenAPI/body/size policy, AI request
 guardrails, and mandatory audit admission. TCP/UDP-only early egress does not
 collide with a stream-enabled WAF's separate stream-inspection advertisement.
 The plugin may not also declare `dispatches_finalized_request_egress()`.
+
+### Retained-allocation bounds on the producer boundary
+
+Phases 8 (`normalize_response_body`) and 10 (`transform_response_body`) are the only lifecycle points at which a plugin hands the gateway a *new* response-body allocation, and that allocation is retained. Three rules keep it inside the aggregate retained-response budget (`GHSA-pwcm-6rh8-f2gh`):
+
+1. **Declared production.** `Plugin::response_body_production()` says whether a plugin can replace a body and whether it constructs bounded. Built-in declarations live in a single table; anything outside the built-in inventory defaults to *undeclared*, and an undeclared plugin is **refused rather than invoked** — invoking it is what would let it allocate without a bound. A chain whose plugins all declare "never" reserves no transform window at all, so validators and header-only plugins do not consume a per-response ceiling.
+2. **A full covering window is a precondition of every invocation.** The window is reserved before the first producer runs, and after each accepted replacement it is refilled only once the caller has installed that replacement — which is when the body it replaced drops its charge. If a full window cannot be re-established, the phase installs the neutral capacity terminal *instead of* calling the next producer, so no producer ever allocates under a partial window.
+3. **Bounded construction.** A producer materialises its replacement through a sink bounded by the same per-response retained ceiling, so an output that would exceed it is refused *while it is being written* rather than allocated in full and rejected afterwards.
+
+Peak accounting follows from (2): while a rewrite runs, the body being read from and the covering window are both charged, so a maximum-size rewritten response peaks at **two** ceilings.
 
 When a plugin returns a replacement body from `transform_response_body`, the core first removes representation metadata that can no longer describe the client-visible bytes: range fields, ETag/Last-Modified validators, content digests/checksums, and content-bound signatures. It then calls that plugin's `on_response_body_transformed` callback before the next transform, allowing the plugin to attach metadata it recomputed for the replacement representation. Neither step runs when the transform returns `None`, so unmodified responses retain their original semantics — with one exception: a body the representation gate **decoded** has already had its client-visible bytes changed (encoded in, identity out), so that same metadata invalidation is applied at the decode itself, whether or not a later rule matches. Otherwise a decoded body no rule happened to change would be served as identity bytes carrying the origin's validator for the encoded ones. `206 Partial Content` and `226 IM Used` responses that no configured body policy claims skip provider normalization and presentation transforms entirely: the buffered bytes are only a selected range or delta, so Ferrum cannot rewrite them into a truthful full representation merely by changing headers or status. When a configured body policy *does* claim such a response, skipping the transform would silently forward protected bytes, so the representation gate described below rejects it instead — see [Buffered response representation gate](#buffered-response-representation-gate). Transform-dependent header hooks also decline these statuses: compression does not attach `Content-Encoding`, gRPC-Web does not relabel native gRPC bytes or expose transformed trailers, and SSE does not force a non-SSE representation into event-stream headers when wrapping cannot run. Inspection hooks still run. If an enforcing policy detects content whose safe disposition requires redaction, it rejects the response instead of forwarding the original bytes with false redaction telemetry. This lifecycle rule is shared by buffered H1, H2, H3, gRPC, and synthetic/rejection response paths rather than delegated to individual transformer implementations.
 
@@ -468,7 +580,9 @@ Connection/Session In
 └─────────────────────────┘
 ```
 
-Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_validator`, `waf`, `ai_semantic_firewall`, `ai_request_guard`, `ai_prompt_shield`, and `ai_prompt_compressor` now pre-buffer only matching request bodies (for example JSON `POST` requests). Non-matching requests can continue on the faster streaming path.
+Body-aware plugins such as `graphql`, request-side `body_validator`, `openapi_validator`, `waf`, `ai_semantic_firewall`, `ai_request_guard`, `ai_prompt_shield`, and `ai_prompt_compressor` now pre-buffer only matching request bodies. Non-matching requests can continue on the faster streaming path.
+
+"Matching" is the plugin's own configured representation, not the request method. `body_validator` in particular selects on `content_types` / `application/grpc` alone: a body-bearing `DELETE`, `PUT`, `PATCH`, `OPTIONS`, `GET`, or non-standard method carrying a governed media type is buffered and validated exactly like a `POST` (advisory `GHSA-2vmr-ww8r-mww3`). Once a configured rule applies, an empty, absent, or non-UTF-8 representation is a rejection rather than a skip; the only exemptions are the ones the protocol defines (empty terminal gRPC *error* replies with a single valid non-zero `grpc-status`, and `1xx` / `204` / `205` / `304` / `HEAD` response semantics). Early `before_proxy` prefers a rewritten UTF-8 metadata view when present, falls back to raw bytes / transport-proven emptiness, and fails closed otherwise; the final request-body hook still validates the exact backend-visible bytes. The gateway still never materializes a body the transport proved absent — H1/H2 validate that proven-empty representation directly, and H3 reaches the same decision from its always-drained empty buffer.
 
 `waf` request metadata inspection (path, query, headers, cookies, and method) runs in the `authorize` phase at priority 2930, after authentication and earlier authorization plugins such as `access_control`, `mesh_authz`, `opa`, and consumer-aware `rate_limiting`. Authenticated proxies that reject during auth/authz therefore avoid WAF scan cost, while public/no-auth proxies still run WAF before backend dispatch. WAF request-body inspection remains on the final backend-visible request body.
 
@@ -770,7 +884,7 @@ Given all built-in plugins enabled, the execution order is:
 | 41 | `ai_semantic_firewall` | 2968 | before_proxy, on_final_request_body, on_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 42 | `ai_request_guard` | 2975 | before_proxy, transform_request_body, on_final_request_body |
 | 43 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
-| 44 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, normalize_response_body, response_stream_inspector |
+| 44 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, enforce_final_backend_header_policy, on_final_request_body, normalize_response_body, response_stream_inspector |
 | 45 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, transform_response_body |
 | 46 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body, response_stream_inspector |
 | 47 | `mesh_route_dispatch` | 2995 | before_proxy |
@@ -782,13 +896,13 @@ Given all built-in plugins enabled, the execution order is:
 | 53 | `load_testing` | 3070 | before_proxy |
 | 54 | `request_mirror` | 3075 | authorize (pre-buffer mirror admission; never rejects), finalized request egress |
 | 55 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
-| 56 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 56 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_headers, on_final_response_body |
 | 57 | `response_transformer` | 4000 | after_proxy, transform_response_body |
 | 58 | `compression` | 4050 | normalize_buffered_request_body_before_before_proxy, before_proxy, after_proxy, transform_request_body, transform_response_body |
 | 59 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body_with_context, on_final_request_body_with_context |
 | 60 | `ai_semantic_cache` | 4057 | on_final_request_body_with_context, after_proxy, on_final_response_body |
 | 61 | `ai_federation` | 4060 | finalized request egress (HTTP only) |
-| 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body |
+| 62 | `ai_response_guard` | 4075 | after_proxy, on_response_body, transform_response_body, on_final_response_body |
 | 63 | `security_headers` | 4080 | after_proxy, initial response-header boundary |
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, on_final_request_body, after_proxy, on_response_body, response_stream_inspector, on_response_stream_terminated |
@@ -917,7 +1031,7 @@ The AI plugins are ordered to compose correctly:
 6. **`ai_stream_router` (2984)** claims streaming OpenAI Chat Completions requests (`"stream": true`) before non-streaming federation. It rewrites the route for provider-native streaming and normalizes provider SSE where needed without full-response buffering.
 7. **`ai_prompt_compressor` (4055)** runs after the guard and after `compression` request decompression. It boundedly shortens prompt text only for admitted OpenAI Chat/Text Completions representations (`messages[].content` for configured roles, plus legacy `prompt`). In `auto`, standard operation paths and body shapes must agree; the original incoming classification path is kept in one private per-request snapshot so a later routing rewrite cannot change eligibility, while fixed-family config is the explicit custom-path opt-in. Its request-time buffering gate stages plaintext `ctx.metadata["request_body"]` rewrites for compatible direct dispatch, privately reuses transformed bodies of at most 65,536 bytes when the wire source is unchanged, and otherwise recomputes against the final pre-compressor wire representation (including opt-in decompression) under the same work budget. Larger prompts therefore retain no second transformed-body copy across provider latency. Final wire counters replace provisional counters and remain instance-scoped before aggregation. Matching-backtick code, URLs, Unicode numbers, common identifiers, nested preserve text, and negations survive; successful changes intentionally reserialize the complete JSON body. Configured preserve markers use a separate non-queuing bounded sanitation lane and representation-preserving fallback when statistical work is saturated/over budget or output would overflow; the context-aware final hook rejects decoded bodies that exceed the hard sanitation bound or cannot enter the sanitation lane. Federation consumes the same final transformed body.
 8. **`ai_semantic_cache` (4057)** performs exact and semantic lookup in `on_final_request_body_with_context`, not `before_proxy`. That places it after every `before_proxy` admission guardrail, after `request_transformer` (3000) header/query rewrites, after every `transform_request_body` hook (`compression` request decode at 4050, `ai_prompt_compressor` at 4055), and after `ai_prompt_compressor`'s final hook enforces its staged marker-sanitization rejection — so a hit can never answer a request the gateway had already decided to refuse, and the replay partition binds the finalized outbound headers, the effective query, the post-routing destination, and the exact prompt bytes the provider would receive. Its decision remains ahead of `ai_federation` (4060), so a hit short-circuits before the later finalized-request-egress phase. Store stays in `on_final_response_body`.
-9. **`ai_federation` (4060)** is HTTP-only and handles non-streaming provider routing from the finalized-request-egress phase, after all request transforms and every final request-policy hook. It translates OpenAI-format requests to the matched provider, normalizes bounded non-streaming responses, and returns via `RejectBinary` before backend egress/admission/transport. Matched requests with `"stream": true` are rejected with `501` unless `ai_stream_router` already claimed the request via `ai_stream_router_claimed=true`. Successful synthetic federation responses pass through the response-side body hooks before the client receives them, including `ai_semantic_firewall`, `ai_response_guard`, response transforms, final-response hooks, and committed observers when configured. `ai_token_metrics` is the deliberate exception: it skips synthetic short-circuit bodies, so `ai_federation` writes token metadata and a trusted typed usage snapshot directly.
+9. **`ai_federation` (4060)** is HTTP-only and handles non-streaming provider routing from the finalized-request-egress phase, after all request transforms and every final request-policy hook. It translates OpenAI-format requests to the matched provider, normalizes bounded non-streaming responses, and returns via `RejectBinary` before backend egress/admission/transport. Matched requests with `"stream": true` are rejected with `501` unless `ai_stream_router` already recorded its private claim for the request (or explicitly passed it through via `ai_stream_router_pass_through=true`). Successful synthetic federation responses pass through the response-side body hooks before the client receives them, including `ai_semantic_firewall`, `ai_response_guard`, response transforms, final-response hooks, and committed observers when configured. `ai_token_metrics` is the deliberate exception: it skips synthetic short-circuit bodies, so `ai_federation` writes token metadata and a trusted typed usage snapshot directly.
 10. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses supported HTTP JSON/SSE provider usage (prompt, completion, total, model) and writes it to `ctx.metadata`. Native gRPC protobuf messages are explicitly unsupported because no generic method/schema contract exists. Provider normalization runs before inspection; origin `gzip`/`br` coding chains are decoded only into a bounded inspection copy, leaving the encoded client response and headers unchanged. Public metadata flows into `TransactionSummary` for downstream logging, while bounded-label `prometheus_metrics` token/cost counters consume a separate typed usage snapshot that backend/operator metadata cannot mint. When several token-metrics instances publish different prefixes, Prometheus selects one most-complete token snapshot and at most one independently selected trusted cost per request instead of summing duplicates. It is observability-only and never enforces budget policy. When `ai_federation` is active, `ai_federation` publishes the same authoritative usage representation directly, and `ai_rate_limiter` reconciles usage from the public metadata on the rejection path.
 11. **`ai_rate_limiter` (4200)** reserves estimated token usage before proxying JSON `POST` requests, based on output-token caps plus estimated prompt tokens. It runs after `ai_token_metrics` on the response body path, reconciles the reservation to actual usage when usage metadata is available, and keeps/rejects/releases unmetered 2xx responses according to `on_unmetered_response`. It requests response-body buffering only for requests it actually has to reconcile, and releases even those to the streaming path once the response headers name a representation it meters in flight: `text/event-stream` and `application/vnd.amazon.eventstream` are decoded by a bounded `response_stream_inspector` that forwards bytes unchanged and settles at `on_response_stream_terminated`, so streams are never buffered. Streamed settlement is fail-closed — reconciliation requires an explicit authoritative usage signal, and a usage-free, malformed, truncated, or disconnected stream applies the configured unmetered posture exactly once (with `reject` degrading to keeping the reservation charged, because the response is already committed). Every reservation field is scoped to the limiter instance, so co-located limiters keep independent budgets and each settles exactly once. Synthetic short-circuit bodies (cache/dedup/mock/etc.) are never charged or released — the limiter exempts them via the internal `ferrum:synthetic_short_circuit` marker. When `ai_federation` is active, the rate limiter uses `applies_after_proxy_on_reject()` to reconcile token usage from federation metadata on the rejection path (the sole federation charger, scoped per limiter instance).
 
@@ -939,7 +1053,7 @@ buffered H3 path without changing `ai_stream_router`'s request-side priority
 (which must remain before `ai_semantic_cache`, so its `route_override_*`
 rewrite is visible to cache keying).
 
-Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`; `ai_federation` checks this at the top of its finalized-request-egress hook and immediately continues, so the two plugins compose cleanly on the same proxy. `ai_stream_router` does not implement provider fallback in any form, and a `fallback` config block is rejected at admission rather than stored inert (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body in `before_proxy`, and the dispatch retry loop replays exactly those prepared bytes and headers against the same effective proxy. No `ai_stream_router.fallback_attempts` metadata is emitted.
+Because `ai_stream_router` runs first, a successful claim records a **private typed claim** on the request context; `ai_federation`, `request_mirror`, `serverless_function`, `mcp_gateway`, and `mesh_route_dispatch` all read that claim (not the public `ai_stream_router_claimed` metadata key, which is observability/backward coordination only) and immediately continue, so the plugins compose cleanly on the same proxy and no later metadata write can re-arm a routing or irreversible-egress decision on a provider-bound request (GHSA-xhp5-hqj8-3mwg). Intentional pass-through of an UNCLAIMED streaming request still coordinates through `ai_stream_router_pass_through`. `ai_stream_router` does not implement provider fallback in any form, and a `fallback` config block is rejected at admission rather than stored inert (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body in `before_proxy`, and the dispatch retry loop replays exactly those prepared bytes and headers against the same effective proxy. No `ai_stream_router.fallback_attempts` metadata is emitted.
 
 ### Transforms after auth (3000+)
 

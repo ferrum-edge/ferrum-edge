@@ -57,6 +57,7 @@ pub mod netns_capture;
 pub mod netns_udp_capture;
 pub(crate) mod node_waypoint_ingress_capture;
 pub mod proxy_protocol;
+pub(crate) mod response_buffer_budget;
 pub mod sni;
 pub mod stream_error;
 pub mod stream_listener;
@@ -1569,6 +1570,61 @@ fn simulate_later_after_proxy_headers(
     }
 }
 
+/// Project the remaining `after_proxy` chain's deterministic response-header
+/// effects, applied cumulatively in configured plugin order, onto the header set
+/// they would produce.
+///
+/// `None` means the projection cannot be trusted: the remaining chain contains a
+/// plugin whose header effects the gateway cannot reproduce (any non-built-in
+/// plugin, whose `simulate_after_proxy_response_headers` is the inert default
+/// while its real `after_proxy` may rewrite anything). Callers must fall back to
+/// the conservative answer rather than treating the unmodified map as final.
+///
+/// Pure with respect to the real request: the context is cloned, so one-shot
+/// state a simulation consumes — `response_transformer` taking
+/// `ctx.route_override_response_transform`, which is how a chain-level route
+/// response-header rule participates here — is taken from the clone and the live
+/// request keeps it for its real hook. That is what keeps a retry attempt the
+/// proxy later discards free of side effects (GHSA-pwcm-6rh8-f2gh).
+fn simulate_final_after_proxy_response_headers(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    response_headers: &HashMap<String, String>,
+) -> Option<HashMap<String, String>> {
+    if plugins
+        .iter()
+        .any(|plugin| !is_builtin_plugin_name(plugin.name()))
+    {
+        return None;
+    }
+    let mut simulated_ctx = ctx.clone();
+    let mut simulated_headers = response_headers.clone();
+    // Mirror the live `run_after_proxy_hooks` / non-retry refine boundary: the
+    // matched route response-header list is applied exactly once after the last
+    // eligible `response_transformer`, not by each transformer's simulate hook.
+    // Without this, a chain-level `Cache-Control: no-store` route rule never
+    // reaches `should_release_response_body_for_simulated_final_headers`
+    // (GHSA-pwcm-6rh8-f2gh).
+    let last_route_response_finalizer = if simulated_ctx.route_override_response_transform.is_some()
+    {
+        plugins
+            .iter()
+            .rposition(|plugin| plugin.participates_in_route_response_header_finalization())
+    } else {
+        None
+    };
+    for (index, plugin) in plugins.iter().enumerate() {
+        plugin.simulate_after_proxy_response_headers(&mut simulated_ctx, &mut simulated_headers);
+        if last_route_response_finalizer == Some(index) {
+            crate::plugins::utils::route_header_transform::finalize_route_override_response_headers(
+                &mut simulated_ctx,
+                &mut simulated_headers,
+            );
+        }
+    }
+    Some(simulated_headers)
+}
+
 /// Refine the pre-flight `stream_response` decision once the backend response
 /// headers — including representation metadata such as `Content-Type` and
 /// `Content-Encoding` — are known.
@@ -1589,11 +1645,30 @@ fn simulate_later_after_proxy_headers(
 /// buffering plugin must explicitly opt an inherently streaming response out
 /// after headers arrive.
 ///
-/// If any plugin can mutate the response `Content-Type` in a later
-/// `after_proxy` hook, the helper keeps the original buffered decision. That
-/// preserves response-body inspection for the final client-visible headers
-/// rather than trusting a backend header value that may be relabeled before
-/// `on_final_response_body` runs.
+/// If a plugin can mutate the response `Content-Type` in a later `after_proxy`
+/// hook, an instance whose body need depends on that label keeps the original
+/// buffered decision. That preserves response-body inspection for the final
+/// client-visible headers rather than trusting a backend header value that may
+/// be relabeled before `on_final_response_body` runs. Both branches apply the
+/// guard PER PLUGIN over the plugins that still run after it, so an instance
+/// that can prove its release independent of the final label
+/// (`should_release_response_body_before_content_type_rewrite`) is not pinned to
+/// the buffered path by an unrelated relabeling plugin elsewhere in the chain.
+///
+/// Both branches also walk the chain in configured order and fold each releasing
+/// plugin's deterministic header effects into a simulated header map, so a later
+/// hook's rules are visible to the decisions that follow. The retry branch
+/// additionally offers each active buffering plugin the PROJECTED final header
+/// view (`should_release_response_body_for_simulated_final_headers`), which is
+/// what lets `response_caching` release a response a later built-in header rule
+/// has already made unstorable — but only while every remaining plugin is a
+/// built-in whose header effects the gateway can reproduce
+/// (GHSA-pwcm-6rh8-f2gh).
+///
+/// Neither branch mutates anything: every simulation runs on a cloned context,
+/// so a retry attempt the proxy later discards takes no cache, index, or
+/// predictor effect. Those belong to the final response-header phase, which runs
+/// once, over the response the proxy actually selected.
 pub(crate) fn refine_stream_response_for_content_type(
     stream_response: bool,
     proxy: &Proxy,
@@ -1621,31 +1696,83 @@ pub(crate) fn refine_stream_response_for_content_type(
         .metadata
         .contains_key(RETRY_RESPONSE_BUFFERING_METADATA_KEY)
     {
-        if plugins
-            .iter()
-            .any(|plugin| plugin.may_modify_response_content_type(ctx, content_type))
-        {
-            return false;
-        }
         let mut saw_retry_release_plugin = false;
-        let all_active_plugins_release = plugins.iter().all(|plugin| {
-            if !plugin.should_buffer_response_body(&simulated_ctx) {
+        let all_active_plugins_release = plugins.iter().enumerate().all(|(index, plugin)| {
+            let can_release = if !plugin.should_buffer_response_body(&simulated_ctx) {
                 true
-            } else if plugin.may_release_response_body_under_retries(&simulated_ctx) {
-                saw_retry_release_plugin = true;
-                plugin.should_release_response_body_under_retries(
-                    &simulated_ctx,
-                    response_status,
-                    response_headers,
-                )
             } else {
-                !plugin.should_buffer_response_body_for_content_type(
-                    &simulated_ctx,
-                    content_type,
-                    response_status,
-                    response_headers,
-                )
+                let later_plugins = &plugins[index + 1..];
+                let simulated_content_type = simulated_response_headers
+                    .get("content-type")
+                    .map(String::as_str);
+                // This plugin's own answer for the representation as it stands at
+                // its position in the chain: every earlier hook's header effects
+                // are already folded into `simulated_response_headers`.
+                let mut released = if plugin.may_release_response_body_under_retries(&simulated_ctx)
+                {
+                    saw_retry_release_plugin = true;
+                    plugin.should_release_response_body_under_retries(
+                        &simulated_ctx,
+                        response_status,
+                        &simulated_response_headers,
+                    )
+                } else {
+                    !plugin.should_buffer_response_body_for_content_type(
+                        &simulated_ctx,
+                        simulated_content_type,
+                        response_status,
+                        &simulated_response_headers,
+                    )
+                };
+                // Otherwise: does the projected FINAL header view already close
+                // this plugin's remaining use for the body? Computed only when it
+                // can change the answer, and refused wholesale when a later
+                // plugin's header effects cannot be reproduced.
+                if !released {
+                    let projected = simulate_final_after_proxy_response_headers(
+                        later_plugins,
+                        &simulated_ctx,
+                        &simulated_response_headers,
+                    );
+                    if let Some(final_response_headers) = projected {
+                        released = plugin.should_release_response_body_for_simulated_final_headers(
+                            &simulated_ctx,
+                            response_status,
+                            &final_response_headers,
+                        );
+                    }
+                }
+                // The content-type relabel guard, applied PER PLUGIN over the
+                // plugins that actually still run rather than as one global early
+                // return. A later relabel invalidates a decision that was taken on
+                // a `Content-Type` the client never sees — but only for a plugin
+                // whose body need depends on that label. An instance that can
+                // prove its release independent of the final label
+                // (`response_caching`: relabelling an unbounded event stream does
+                // not bound it, and the store path it closed never reads
+                // `Content-Type`) keeps releasing, so adding a response
+                // transformer to a proxy no longer silently reinstates full
+                // buffering of a backend-selected event stream under retries
+                // (GHSA-pwcm-6rh8-f2gh).
+                let later_may_rewrite_content_type = later_plugins.iter().any(|later| {
+                    later.may_modify_response_content_type(&simulated_ctx, simulated_content_type)
+                });
+                if released && later_may_rewrite_content_type {
+                    released = plugin.should_release_response_body_before_content_type_rewrite(
+                        &simulated_ctx,
+                        response_status,
+                        &simulated_response_headers,
+                    );
+                }
+                released
+            };
+            if can_release {
+                plugin.simulate_after_proxy_response_headers(
+                    &mut simulated_ctx,
+                    &mut simulated_response_headers,
+                );
             }
+            can_release
         });
         return saw_retry_release_plugin && all_active_plugins_release;
     }
@@ -4736,6 +4863,55 @@ async fn run_finalized_request_egress_hooks_inner(
     }
 }
 
+/// Re-assert every configured backend-boundary header policy over the finalized
+/// outbound header map (`GHSA-xhp5-hqj8-3mwg`).
+///
+/// A plugin that installs a third-party credential from `before_proxy` (today:
+/// `ai_stream_router`) is only protected against plugins ordered before it. The
+/// generic `request_transformer` runs later and can add, overwrite, or rename
+/// any header; a `pre_proxy` function's backend overlay and the deferred
+/// routing-header pass can do the same. This pass runs at every point where the
+/// backend-visible header map is complete — after gateway-assertion refresh and
+/// after the egress baggage strip — so the plugin's policy has the last word
+/// regardless of relative priority.
+///
+/// Non-rejecting by contract: the decision was already committed in
+/// `before_proxy`, and the finalized-state rejection lives in
+/// `on_final_request_body*`, which has rejection plumbing on every dispatcher.
+/// Callers should gate on
+/// [`crate::plugin_cache::PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY`]
+/// where the bitset is already in scope; the internal scan keeps the rarely
+/// reached call sites correct without threading the capability set to them.
+pub(crate) fn run_final_backend_header_policy_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    for plugin in plugins {
+        if plugin.enforces_final_backend_header_policy() {
+            plugin.enforce_final_backend_header_policy(ctx, headers);
+        }
+    }
+}
+
+/// `Option<HashMap>` clone-on-write variant of
+/// [`run_final_backend_header_policy_hooks`] for the H1/H2 dispatch ladder.
+pub(crate) fn run_effective_final_backend_header_policy_hooks(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+) {
+    if let Some(headers) = owned_proxy_headers.as_mut() {
+        run_final_backend_header_policy_hooks(plugins, ctx, headers);
+    } else {
+        // No plugin advertised a header mutation, so nothing has been cloned.
+        // Swap rather than clone to keep this allocation-free.
+        let mut headers = std::mem::take(&mut ctx.headers);
+        run_final_backend_header_policy_hooks(plugins, ctx, &mut headers);
+        ctx.headers = headers;
+    }
+}
+
 /// Merge the finalized-request-egress header overlay into the outbound header
 /// map, then restore gateway-owned assertions and re-apply the egress baggage
 /// policy.
@@ -4745,6 +4921,7 @@ async fn run_finalized_request_egress_hooks_inner(
 /// pass: it can never impersonate `x-consumer-*` / `x-geo-country`, and it
 /// cannot re-add a baggage key the operator configured Ferrum to strip.
 pub(crate) fn apply_finalized_request_egress_header_overlay(
+    plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
     overlay: HashMap<String, String>,
@@ -4763,12 +4940,17 @@ pub(crate) fn apply_finalized_request_egress_header_overlay(
         &ctx.headers,
         strip_baggage_keys,
     );
+    // The overlay is the last thing that can add a backend-visible header, so
+    // a plugin-owned provider credential boundary is re-asserted over it too
+    // (`GHSA-xhp5-hqj8-3mwg`).
+    run_effective_final_backend_header_policy_hooks(plugins, ctx, owned_proxy_headers);
 }
 
 /// Map-based variant of [`apply_finalized_request_egress_header_overlay`] for
 /// the native HTTP/3 frontend, which owns a plain outbound header map instead of
 /// the H1/H2 `Option<HashMap>` clone-on-write shape.
 pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(
+    plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
     headers: &mut HashMap<String, String>,
     overlay: HashMap<String, String>,
@@ -4782,6 +4964,7 @@ pub(crate) fn apply_finalized_request_egress_header_overlay_in_map(
     }
     refresh_backend_gateway_assertion_headers(ctx, headers);
     crate::modes::mesh::hbone::strip_egress_baggage_in_map(headers, strip_baggage_keys);
+    run_final_backend_header_policy_hooks(plugins, ctx, headers);
 }
 
 pub(crate) struct RejectedResponseParts {
@@ -16511,6 +16694,7 @@ async fn run_after_proxy_hooks_on_rejection(
             || ctx
                 .grpc_deadline_at()
                 .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+        let terminal_gateway_capacity = ctx.gateway_capacity_response_selected();
         if terminal_gateway_deadline {
             ctx.mark_gateway_deadline_response_selected();
             replace_rejection_with_gateway_deadline(
@@ -16524,10 +16708,14 @@ async fn run_after_proxy_hooks_on_rejection(
         // response, give non-replacing decorators and cleanup hooks one
         // immediate poll. Pending work continues in order on owned state under
         // the detached cleanup bound and cannot retain the response writer.
-        // Response-replacing hooks are skipped after the terminal deadline is
-        // selected: an already-ready replacer must never overwrite
-        // DEADLINE_EXCEEDED at the boundary.
-        if terminal_gateway_deadline && plugin.may_replace_rejection_response() {
+        // Response-replacing hooks are skipped after either authoritative
+        // gateway terminal is selected: an already-ready replacer must never
+        // overwrite DEADLINE_EXCEEDED or the retained-response capacity
+        // refusal at the publication boundary. Non-replacing decorators and
+        // cleanup hooks still run.
+        if (terminal_gateway_deadline || terminal_gateway_capacity)
+            && plugin.may_replace_rejection_response()
+        {
             continue;
         }
         let result = if terminal_gateway_deadline {
@@ -16916,6 +17104,12 @@ fn enforce_synthetic_response_body_limit(
 ) {
     use crate::plugins::utils::synthetic_response::synthetic_response_omits_body;
 
+    // The shared retained-response terminal is already the authoritative
+    // gateway outcome. A smaller route body-size ceiling must not recategorize
+    // that fixed, redaction-safe error as a backend representation failure.
+    if ctx.gateway_capacity_response_selected() {
+        return;
+    }
     if body.is_empty() || synthetic_response_omits_body(&ctx.method, *status) {
         return;
     }
@@ -17058,7 +17252,8 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     // later final-body validators must not inspect that error payload and replace
     // the original policy decision with a second rejection. Presentation and
     // protocol transforms still run below so the selected response keeps the
-    // correct client wire shape.
+    // correct client wire shape. A retained-response capacity terminal is
+    // already protocol-correct and skips those later mutating phases.
     let mut terminal_body_response_selected = false;
     let mut response_body_reject = None;
     for plugin in plugins.iter() {
@@ -17071,6 +17266,16 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
         .into_plugin_result(ctx);
         match result {
             PluginResult::Continue => {
+                if install_pending_buffered_response_capacity_refusal(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                    InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
+                ) {
+                    terminal_body_response_selected = true;
+                    break;
+                }
                 // Inspect-phase header mutations (e.g. ai_rate_limiter
                 // refreshing usage/remaining after reconcile) must enter
                 // deadline provenance the same way after_proxy mutations do.
@@ -17102,6 +17307,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     // serverless terminate, dedup replay), so there is no upstream snapshot and
     // no hidden origin coding — the live headers are the only description of
     // these bytes, and `GatewayGenerated` reads them directly.
+    // Skip when a capacity terminal is already authoritative.
     let owned_grpc_web_response_content_type =
         crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
     let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
@@ -17109,18 +17315,23 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     // path and applied exactly once by
     // `apply_reject_after_proxy_and_synthetic_body_hooks` over the final
     // response, so running them here would consume one-shot response state twice.
-    let admission = admit_buffered_response_body_transforms(
-        plugins,
-        ctx,
-        crate::plugins::response_representation::RepresentationOrigin::GatewayGenerated,
-        response_status,
-        response_headers,
-        response_body,
-        grpc_web_response_content_type,
-        InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
-        false,
-    )
-    .await;
+    let admission = if ctx.gateway_capacity_response_selected() {
+        terminal_body_response_selected = true;
+        BufferedTransformAdmission::Rejected
+    } else {
+        admit_buffered_response_body_transforms(
+            plugins,
+            ctx,
+            crate::plugins::response_representation::RepresentationOrigin::GatewayGenerated,
+            response_status,
+            response_headers,
+            response_body,
+            grpc_web_response_content_type,
+            InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
+            false,
+        )
+        .await
+    };
     terminal_body_response_selected |= matches!(admission, BufferedTransformAdmission::Rejected);
     // Read after the gate: a decoded body installs fresh representation headers.
     let content_type = response_headers.get("content-type").cloned();
@@ -17153,11 +17364,27 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             {
                 Ok(transformed) => transformed,
                 Err(()) if mandatory_replay_transform => {
+                    let _ = ctx.take_buffered_response_capacity_refusal_pending();
                     mandatory_replay_transform_failed = Some(plugin.name());
                     break;
                 }
-                Err(()) => break,
+                Err(()) => {
+                    let _ = ctx.take_buffered_response_capacity_refusal_pending();
+                    break;
+                }
             };
+            // Claimed transform capacity refusal must install the shared
+            // terminal before later plugins, validators, or publication.
+            if install_pending_buffered_response_capacity_refusal(
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                InitialResponseHeaderPolicySource::ProtocolPlugins(plugins),
+            ) {
+                terminal_body_response_selected = true;
+                break;
+            }
             if let Some(transformed) = transformed {
                 response_headers
                     .insert("content-length".to_string(), transformed.len().to_string());
@@ -17633,6 +17860,25 @@ pub(crate) async fn run_after_proxy_hooks(
     ctx.metadata
         .remove(LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY);
     ctx.metadata.remove(LATER_STRONG_ETAG_RESPONSE_METADATA_KEY);
+
+    // Final response-header phase. Reached only when the whole `after_proxy`
+    // chain accepted this response, which makes `response_headers` the
+    // client-visible header set for the response the proxy actually selected:
+    // retries are already resolved, and every header rule in the chain above has
+    // run. Placed inside this function rather than at its call sites so every
+    // protocol path — H1/H2, buffered and streaming H3, native gRPC, gRPC-Web —
+    // reaches it identically and none can be forgotten
+    // (GHSA-pwcm-6rh8-f2gh).
+    //
+    // A rejected response deliberately does NOT reach it: the backend
+    // representation was discarded, exactly as today's buffered
+    // `on_final_response_body` is skipped for an `after_proxy` reject.
+    crate::plugins::run_final_response_header_hooks(
+        plugins,
+        ctx,
+        response_status,
+        response_headers,
+    );
     None
 }
 
@@ -18724,6 +18970,186 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     StatusCode::OK
 }
 
+/// Replace a buffered response whose replacement allocation the aggregate
+/// retained-response budget refused with the gateway's own transient-capacity
+/// terminal (GHSA-pwcm-6rh8-f2gh).
+///
+/// One helper for every buffered phase that can be refused after the backend
+/// already answered (normalization, body transform), so the client-visible
+/// outcome cannot drift between them — and deliberately built from the SAME
+/// three-branch machinery as [`replace_buffered_grpc_response_with_deadline`]
+/// and `replace_buffered_response_with_representation_error`, because a
+/// hand-rolled terminal gets the protocol shape wrong in two ways that matter:
+///
+/// * **gRPC-Web** carries terminal metadata in a body trailer FRAME, never as
+///   response header fields. Writing `grpc-status` into the header map and
+///   emptying the body would emit unframed terminal metadata a gRPC-Web client
+///   cannot read as the RPC's status.
+/// * **Every gRPC flavor** must shed the backend's terminal metadata, not just
+///   its entity headers: a surviving `grpc-status-details-bin` (or a custom
+///   trailer already merged into the header view) would ship beside
+///   `RESOURCE_EXHAUSTED` while describing a different status.
+///   `retain_deadline_response_gateway_headers` rebuilds from provenance-known
+///   gateway output, so nothing the backend authored can survive by name.
+///
+/// Plain HTTP keeps the narrower discipline it already had: this path does not
+/// re-run the reject-path `after_proxy` decorators, so wholesale-clearing the
+/// map would strip CORS, correlation, and tracing headers with nothing to
+/// restore them. Only the fields describing the discarded representation go.
+///
+/// The native-gRPC branch is selected from the request-scoped inbound flavor
+/// (`ctx.is_native_grpc_request()`), never from a mutable effective
+/// `content-type` that a response hook may have relabelled.
+///
+/// The gateway terminal itself is a small fixed payload (an empty body, a
+/// trailer frame, or [`response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY`])
+/// and is deliberately not charged against the budget — same as every other
+/// gateway-authored terminal. Charging it could only fail, and failing to
+/// install a refusal is the one outcome this path must never produce.
+pub(crate) fn replace_buffered_response_with_capacity_refusal(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) {
+    replace_buffered_response_with_capacity_refusal_with_policy_source(
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
+    );
+}
+
+/// [`replace_buffered_response_with_capacity_refusal`] for a caller that holds
+/// the unfiltered protocol plugin list rather than the precomputed
+/// initial-response policy slice — the shared representation gate, which is
+/// reached from paths with either shape.
+fn replace_buffered_response_with_capacity_refusal_with_policy_source(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
+) {
+    use crate::proxy::response_buffer_budget as budget;
+
+    let owned_grpc_web_response_content_type =
+        crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
+    let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
+    let native_grpc_request = ctx.is_native_grpc_request();
+
+    // Both gRPC branches rebuild from provenance-known gateway output. With no
+    // state recorded this idempotent ensure still makes
+    // `retain_deadline_response_gateway_headers` clear the map wholesale rather
+    // than trusting backend fields by name.
+    if grpc_web_response_content_type.is_some() || native_grpc_request {
+        ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
+    }
+
+    if let Some(content_type) = grpc_web_response_content_type {
+        ctx.retain_deadline_response_gateway_headers(response_headers);
+        let mut response = crate::plugins::grpc_web::error_response_for_content_type(
+            content_type,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+        );
+        response.headers.extend(response_headers.drain());
+        finalize_grpc_web_error_response_headers_with_policy_source(
+            &mut response,
+            initial_response_header_policy_source,
+            None,
+        );
+        *response_headers = response.headers;
+        *response_body = Bytes::from(response.body);
+        *response_status = StatusCode::OK.as_u16();
+        ctx.sync_deadline_response_terminal_headers(response_headers);
+        insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+        );
+    } else if native_grpc_request {
+        ctx.retain_deadline_response_gateway_headers(response_headers);
+        // Same two-step the representation-error terminal uses: apply the
+        // initial-response policy from whichever source this caller has, then
+        // finalize with an empty slice so the policy is applied exactly once.
+        initial_response_header_policy_source.apply(response_headers);
+        grpc_proxy::finalize_grpc_error_response_headers(
+            response_headers,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            &[],
+        );
+        *response_body = Bytes::new();
+        *response_status = StatusCode::OK.as_u16();
+        ctx.sync_deadline_response_terminal_headers(response_headers);
+        insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+            budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+        );
+    } else {
+        // Plain HTTP keeps the narrower discipline: drop exactly the fields that
+        // described the DISCARDED representation — an encoding, framing, byte
+        // range, or validator for bytes the client is not receiving — while
+        // leaving gateway decorations (CORS, correlation, tracing) that this path
+        // does not re-run reject hooks to restore.
+        const STALE_REPRESENTATION_HEADERS: [&str; 6] = [
+            "content-encoding",
+            "content-range",
+            "transfer-encoding",
+            "etag",
+            "digest",
+            "content-digest",
+        ];
+        response_headers.retain(|name, _| {
+            !STALE_REPRESENTATION_HEADERS
+                .iter()
+                .any(|stale| name.eq_ignore_ascii_case(stale))
+        });
+        *response_status = budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
+        *response_body = Bytes::from_static(budget::RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+        response_headers.insert("content-type".to_string(), "application/json".to_string());
+        response_headers.insert(
+            "content-length".to_string(),
+            response_body.len().to_string(),
+        );
+    }
+    // The terminal above is the authoritative client-visible outcome for this
+    // request. Clear any one-shot pending capacity signal defensively and mark
+    // the request so later body/transform/validate/store/trailer phases preserve
+    // these bytes rather than treating normalize's rewrite bool as an ordinary
+    // presentation rewrite (GHSA-pwcm-6rh8-f2gh).
+    let _ = ctx.take_buffered_response_capacity_refusal_pending();
+    ctx.mark_gateway_capacity_response_selected();
+    ctx.record_deadline_response_header_mutations(response_headers);
+}
+
+/// If a response-body inspector marked a one-shot retained-response capacity
+/// refusal pending, install the shared health-neutral terminal and return
+/// `true` so the enclosing `on_response_body` loop stops later hooks.
+pub(crate) fn install_pending_buffered_response_capacity_refusal(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Bytes,
+    initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
+) -> bool {
+    if !ctx.take_buffered_response_capacity_refusal_pending() {
+        return false;
+    }
+    replace_buffered_response_with_capacity_refusal_with_policy_source(
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        initial_response_header_policy_source,
+    );
+    true
+}
+
 /// Client-visible message when a configured response body policy could not be
 /// applied to the representation the backend produced.
 ///
@@ -18953,9 +19379,15 @@ async fn replace_buffered_response_with_representation_error(
 /// through — H1/H2, buffered gRPC, native H3, both H3 cross-protocol bridges,
 /// and the synthetic/replay short-circuit — so the same bytes under the same
 /// configuration cannot be treated differently by frontend protocol. On
-/// `Enforce` with decoded bytes it installs the identity-coded body first, so
-/// every transform in the phase sees exactly the representation the gate proved
-/// inspectable.
+/// `Enforce` with decoded bytes it installs the identity-coded body first — with
+/// the aggregate-budget charge those bytes carry — so every transform in the
+/// phase sees exactly the representation the gate proved inspectable.
+///
+/// The gate has two distinct fail-closed outcomes and they must not be merged.
+/// A representation rejection is about the BYTES (`502` / gRPC `INTERNAL`); a
+/// capacity refusal is about the GATEWAY's own retained-memory budget and takes
+/// the health-neutral, non-retryable transient-capacity terminal instead
+/// (GHSA-pwcm-6rh8-f2gh).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn admit_buffered_response_body_transforms(
     plugins: &[Arc<dyn Plugin>],
@@ -18972,6 +19404,13 @@ pub(crate) async fn admit_buffered_response_body_transforms(
         RepresentationOrigin, ResponseBodyPolicyPosture, evaluate_response_body_policy_posture,
         install_decoded_response_body,
     };
+
+    // An already-installed capacity terminal is authoritative. Check before
+    // clearing any backend snapshot so admission is side-effect free once the
+    // terminal has been selected.
+    if ctx.gateway_capacity_response_selected() {
+        return BufferedTransformAdmission::Rejected;
+    }
 
     // Gateway-generated bytes have replaced whatever the backend sent, so the
     // pre-`after_proxy` snapshot describes a response that is no longer being
@@ -18993,15 +19432,54 @@ pub(crate) async fn admit_buffered_response_body_transforms(
         *response_status,
         response_headers,
         response_body,
+        response_buffer_budget::BudgetRef::global(),
     ) {
         ResponseBodyPolicyPosture::Unprotected => BufferedTransformAdmission::Proceed {
             rewrite_allowed: crate::plugins::response_body_rewrite_allowed(*response_status),
             representation_rewritten: false,
         },
+        ResponseBodyPolicyPosture::CapacityRefused => {
+            // Not a representation fault: the backend answered correctly and the
+            // decode is bounded and legitimate — the GATEWAY is out of retained
+            // memory right now. So this fails closed through the shared
+            // gateway-local capacity terminal (`503` with the fixed
+            // redaction-safe body, `RESOURCE_EXHAUSTED` in the client's gRPC
+            // flavor), which is non-retryable and neutral to circuit breaker,
+            // passive health, and adaptive concurrency, rather than the `502`
+            // representation error that would blame the upstream
+            // (GHSA-pwcm-6rh8-f2gh).
+            warn!("Response representation decode refused: retained-response budget exhausted");
+            replace_buffered_response_with_capacity_refusal_with_policy_source(
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                initial_response_header_policy_source,
+            );
+            BufferedTransformAdmission::Rejected
+        }
         ResponseBodyPolicyPosture::Enforce { decoded } => {
             let representation_rewritten = decoded.is_some();
             if let Some(decoded) = decoded {
-                install_decoded_response_body(ctx, response_headers, response_body, decoded);
+                // The install is fallible for exactly one reason: the decode's
+                // charge must cover the allocation's real capacity before those
+                // bytes become client-visible. A refusal installs nothing, so it
+                // takes the same gateway-local capacity terminal the refused
+                // decode above does — never a forward of the claimed encoded
+                // bytes (GHSA-pwcm-6rh8-f2gh).
+                if !install_decoded_response_body(ctx, response_headers, response_body, decoded) {
+                    warn!(
+                        "Response representation decode refused: retained-response budget exhausted"
+                    );
+                    replace_buffered_response_with_capacity_refusal_with_policy_source(
+                        ctx,
+                        response_status,
+                        response_headers,
+                        response_body,
+                        initial_response_header_policy_source,
+                    );
+                    return BufferedTransformAdmission::Rejected;
+                }
             }
             // A claimed response is never a fragment here: the gate rejects
             // partial and delta representations rather than admitting them, so
@@ -19076,6 +19554,30 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     // `Content-Encoding` after a decode cannot be resurrected by a later rebuild,
     // which replays gateway output only.
     ctx.ensure_buffered_deadline_response_header_provenance(response_headers);
+    // An already-exceeded RPC deadline owns the client-visible outcome. Check it
+    // before the representation gate or any transform window: either one can
+    // need aggregate retained-response capacity, but neither result is eligible
+    // to replace the authoritative DEADLINE_EXCEEDED terminal.
+    if ctx
+        .grpc_deadline_at()
+        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    {
+        *response_status = replace_buffered_grpc_response_with_deadline(
+            ctx,
+            grpc_web_response_content_type,
+            response_headers,
+            response_body,
+            initial_response_header_policy_plugins,
+        )
+        .as_u16();
+        return (true, false);
+    }
+    // A capacity terminal installed by normalize / an earlier body phase is
+    // already protocol-correct. Do not reopen the representation gate or any
+    // producer window against it.
+    if ctx.gateway_capacity_response_selected() {
+        return (true, false);
+    }
     let (rewrite_allowed, representation_rewritten) = match admit_buffered_response_body_transforms(
         plugins,
         ctx,
@@ -19101,8 +19603,72 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     // Read after the gate: a decoded body installs fresh representation headers.
     let content_type = response_headers.get("content-type").cloned();
     let content_type = content_type.as_deref();
+    // A transform allocates its output itself, so the blocks that will pay for
+    // that allocation are reserved BEFORE the first hook can run — charging
+    // afterwards would let arbitrarily many concurrent transform outputs exist
+    // outside the aggregate cap, which is the shape most under a client's
+    // influence. The window is this response's retained ceiling, and each
+    // accepted output transfers its covering blocks out of it
+    // (GHSA-pwcm-6rh8-f2gh).
+    //
+    // Only a chain that can actually produce pays for a window: it is a whole
+    // per-response ceiling held for the length of the phase, and reserving one
+    // for validators/header-only plugins would halve the buffered-response
+    // concurrency the aggregate budget supports without bounding anything. The
+    // declaration is fail-closed — an undeclared plugin is refused below rather
+    // than trusted — so this cannot silently miss a rewriter.
+    let mut window = if plugins.iter().any(|plugin| {
+        plugin
+            .response_body_production()
+            .may_replace_response_body()
+    }) {
+        let ceiling = ctx.effective_max_response_body_size_bytes();
+        match response_buffer_budget::ResponseTransformWindow::open(ceiling) {
+            Some(window) => Some(window),
+            None => {
+                warn!("Response body transform refused: retained-response budget exhausted");
+                replace_buffered_response_with_capacity_refusal(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                    initial_response_header_policy_plugins,
+                );
+                // The gate's own decode (if any) already rewrote the
+                // representation, so report it honestly even though no plugin
+                // transform ran.
+                return (true, representation_rewritten);
+            }
+        }
+    } else {
+        None
+    };
     let mut body_transformed = representation_rewritten;
     for plugin in plugins {
+        // Precondition for EVERY producer invocation: a full covering window
+        // must exist before the producer can allocate into it, and it is
+        // re-established only now — after any previous replacement was installed
+        // and the body it replaced dropped its charge — so the old body and a
+        // fresh full window are never both charged. An out-of-tree plugin that
+        // declares no bounded construction contract is refused instead of being
+        // invoked, because invoking it is what would let it allocate unbounded.
+        if let Some(reason) = crate::plugins::admit_response_body_producer(
+            plugin.response_body_production(),
+            window.as_mut(),
+        ) {
+            warn!(
+                plugin = plugin.name(),
+                reason, "Response body transform refused before invoking the producer"
+            );
+            replace_buffered_response_with_capacity_refusal(
+                ctx,
+                response_status,
+                response_headers,
+                response_body,
+                initial_response_header_policy_plugins,
+            );
+            return (true, body_transformed);
+        }
         let transformed = match crate::plugins::await_grpc_deadline(
             ctx.grpc_deadline_at(),
             plugin.transform_response_body_with_context(
@@ -19116,6 +19682,9 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         {
             Ok(transformed) => transformed,
             Err(()) => {
+                // An elapsed authoritative deadline owns the outcome; discard any
+                // pending transform capacity signal so it cannot leak.
+                let _ = ctx.take_buffered_response_capacity_refusal_pending();
                 *response_status = replace_buffered_grpc_response_with_deadline(
                     ctx,
                     grpc_web_response_content_type,
@@ -19127,9 +19696,56 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                 return (true, body_transformed);
             }
         };
+        // A claimed transform that refused its ceiling marks a pending signal
+        // and returns ordinary `None`. Consume it before later plugins,
+        // encoding reconciliation, or treating the body as unchanged.
+        if install_pending_buffered_response_capacity_refusal(
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            InitialResponseHeaderPolicySource::Prefiltered(initial_response_header_policy_plugins),
+        ) {
+            return (true, body_transformed);
+        }
         if let Some(transformed) = transformed {
-            response_headers.insert("content-length".to_string(), transformed.len().to_string());
-            *response_body = Bytes::from(transformed);
+            // The transform installs a DIFFERENT allocation than the one the
+            // collector charged (and a decode can be far larger than its
+            // input), so the replacement carries its OWN charge, transferred out
+            // of the window reserved above and owned by the replacement
+            // allocation rather than by this request: the permit is returned
+            // when the last handle to those bytes drops, wherever they are
+            // copied or stored (GHSA-pwcm-6rh8-f2gh).
+            //
+            // Refusal fails closed with the shared gateway-capacity terminal —
+            // `503` plus the fixed redaction-safe body, or the gRPC
+            // `RESOURCE_EXHAUSTED` terminal for a gRPC-flavored response —
+            // rather than retaining uncharged bytes. An output larger than the
+            // window is refused for the same reason a backend body that size
+            // would be: it is above this response's retained ceiling.
+            //
+            // A `None` window here means a plugin declared as a non-producer
+            // returned bytes anyway: nothing was reserved for them, so they are
+            // refused rather than installed uncharged.
+            let transformed_len = transformed.len();
+            let Some(charged) = window.as_mut().and_then(|w| w.charge(transformed)) else {
+                warn!(
+                    plugin = plugin.name(),
+                    replacement_bytes = transformed_len,
+                    "Response body transform refused: replacement body is not covered by a \
+                     reserved retained-response window"
+                );
+                replace_buffered_response_with_capacity_refusal(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    response_body,
+                    initial_response_header_policy_plugins,
+                );
+                return (true, true);
+            };
+            response_headers.insert("content-length".to_string(), transformed_len.to_string());
+            *response_body = charged;
             crate::plugins::finalize_response_body_transformation(
                 plugin.as_ref(),
                 ctx,
@@ -22747,6 +23363,18 @@ async fn handle_proxy_request_inner(
         &ctx.headers,
         &state.mesh_egress_strip_baggage_keys,
     );
+    // Backend-boundary header policy — the `before_proxy` phase is complete, so
+    // a plugin that owns a third-party credential boundary re-asserts it here,
+    // after every generic header transform, the gateway-assertion refresh, and
+    // the baggage strip (`GHSA-xhp5-hqj8-3mwg`). The deferred `before_proxy`
+    // passes below re-run it because they can mutate the same map again.
+    if capabilities.has(PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY) {
+        run_effective_final_backend_header_policy_hooks(
+            &plugins,
+            &mut ctx,
+            &mut owned_proxy_headers,
+        );
+    }
     let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
     let maybe_requires_response_body_buffering =
         plugin_cache_view.requires_response_body_buffering();
@@ -22891,6 +23519,15 @@ async fn handle_proxy_request_inner(
                 &ctx.headers,
                 &state.mesh_egress_strip_baggage_keys,
             );
+            // A deferred pass can add or rename headers again, so re-assert the
+            // backend-boundary header policy over the new map.
+            if capabilities.has(PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY) {
+                run_effective_final_backend_header_policy_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &mut owned_proxy_headers,
+                );
+            }
         }
     }
 
@@ -22939,6 +23576,15 @@ async fn handle_proxy_request_inner(
                 &ctx.headers,
                 &state.mesh_egress_strip_baggage_keys,
             );
+            // A deferred pass can add or rename headers again, so re-assert the
+            // backend-boundary header policy over the new map.
+            if capabilities.has(PluginCapabilities::ENFORCES_FINAL_BACKEND_HEADER_POLICY) {
+                run_effective_final_backend_header_policy_hooks(
+                    &plugins,
+                    &mut ctx,
+                    &mut owned_proxy_headers,
+                );
+            }
         }
         match deferred_result {
             PluginResult::Continue => {}
@@ -23208,6 +23854,7 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     apply_finalized_request_egress_header_overlay(
+                        &plugins,
                         &mut ctx,
                         &mut owned_proxy_headers,
                         egress.backend_header_overlay,
@@ -23313,6 +23960,7 @@ async fn handle_proxy_request_inner(
         )
         .await;
         apply_finalized_request_egress_header_overlay(
+            &plugins,
             &mut ctx,
             &mut owned_proxy_headers,
             egress.backend_header_overlay,
@@ -23649,6 +24297,7 @@ async fn handle_proxy_request_inner(
                     )
                     .await;
                     apply_finalized_request_egress_header_overlay(
+                        &plugins,
                         &mut ctx,
                         &mut owned_proxy_headers,
                         egress.backend_header_overlay,
@@ -24329,6 +24978,7 @@ async fn handle_proxy_request_inner(
                 )
                 .await;
                 apply_finalized_request_egress_header_overlay(
+                    &plugins,
                     &mut ctx,
                     &mut owned_proxy_headers,
                     egress.backend_header_overlay,
@@ -25231,10 +25881,15 @@ async fn handle_proxy_request_inner(
                 // ClientDisconnect -> record_neutral. An oversized BACKEND
                 // response is GrpcProxyError::ResponseTooLarge (NOT
                 // ResourceExhausted) and falls to the failure arm below, matching
-                // the HTTP path's ResponseBodyTooLarge -> 502.
+                // the HTTP path's ResponseBodyTooLarge -> 502. An exhausted
+                // GATEWAY retention budget (ResponseBufferCapacity) is neutral
+                // here for the opposite reason: the backend answered correctly
+                // and within every configured ceiling, so a process-global
+                // memory bound must not trip its breaker (GHSA-pwcm-6rh8-f2gh).
                 Err(
                     GrpcProxyError::ClientDeadlineExceeded(_)
                     | GrpcProxyError::ResourceExhausted(_)
+                    | GrpcProxyError::ResponseBufferCapacity(_)
                     | GrpcProxyError::Internal(_),
                 ) => {
                     grpc_probe_guard.disarm();
@@ -25978,7 +26633,7 @@ async fn handle_proxy_request_inner(
                 let mut response_status = grpc_resp.status;
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_trailers: HashMap<String, String> = grpc_resp.trailers;
-                let mut response_body = Bytes::from(grpc_resp.body);
+                let mut response_body = grpc_resp.body;
                 if let Some(grpc_status) =
                     grpc_proxy::grpc_status_from_maps(&response_trailers, &response_headers)
                 {
@@ -26145,60 +26800,88 @@ async fn handle_proxy_request_inner(
                     crate::plugins::normalize_response_body_for_inspection(
                         &plugins,
                         &mut ctx,
-                        response_status,
+                        &mut response_status,
                         &mut plugin_response_headers,
                         &mut response_body,
                         initial_response_header_policy_plugins.as_ref(),
                     )
                     .await;
-                    for plugin in plugins.iter() {
-                        let deadline = ctx.grpc_deadline_at();
-                        let result = crate::plugins::await_request_plugin_deadline_with_provenance(
-                            deadline,
-                            plugin.on_response_body(
-                                &mut ctx,
-                                response_status,
-                                &mut plugin_response_headers,
-                                &response_body,
-                            ),
-                        )
-                        .await
-                        .into_plugin_result(&mut ctx);
-                        match result {
-                            PluginResult::Continue => {
-                                ctx.record_deadline_response_header_plugin(
-                                    plugin.as_ref(),
-                                    &plugin_response_headers,
-                                );
-                            }
-                            reject @ PluginResult::Reject { .. }
-                            | reject @ PluginResult::RejectBinary { .. } => {
-                                let reject = plugin_result_into_reject_parts(reject)
-                                    .expect("reject result should convert to rejection parts");
-                                debug!(
-                                    plugin = plugin.name(),
-                                    status_code = reject.status_code,
-                                    "Plugin rejected gRPC response body"
-                                );
-                                let normalized =
-                                    normalize_grpc_plugin_rejection_with_after_proxy_hooks(
-                                        &plugins, &mut ctx, reject, false,
-                                    )
-                                    .await;
-                                authoritative_trailers_only_terminal_metadata =
-                                    Some(grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
-                                        &normalized.headers,
-                                    ));
-                                response_status = normalized.http_status.as_u16();
-                                response_headers = normalized.headers;
-                                plugin_response_headers = response_headers.clone();
-                                response_trailers.clear();
-                                response_body = normalized.body;
-                                let _ = ctx.take_buffered_initial_response_header_policy();
-                                response_body_rejected = true;
-                                break;
+                    let mut capacity_terminal = ctx.gateway_capacity_response_selected();
+                    if !capacity_terminal {
+                        for plugin in plugins.iter() {
+                            let deadline = ctx.grpc_deadline_at();
+                            let result =
+                                crate::plugins::await_request_plugin_deadline_with_provenance(
+                                    deadline,
+                                    plugin.on_response_body(
+                                        &mut ctx,
+                                        response_status,
+                                        &mut plugin_response_headers,
+                                        &response_body,
+                                    ),
+                                )
+                                .await
+                                .into_plugin_result(&mut ctx);
+                            match result {
+                                PluginResult::Continue => {
+                                    if install_pending_buffered_response_capacity_refusal(
+                                        &mut ctx,
+                                        &mut response_status,
+                                        &mut plugin_response_headers,
+                                        &mut response_body,
+                                        InitialResponseHeaderPolicySource::Prefiltered(
+                                            initial_response_header_policy_plugins.as_ref(),
+                                        ),
+                                    ) {
+                                        capacity_terminal = true;
+                                        break;
+                                    }
+                                    ctx.record_deadline_response_header_plugin(
+                                        plugin.as_ref(),
+                                        &plugin_response_headers,
+                                    );
+                                }
+                                reject @ PluginResult::Reject { .. }
+                                | reject @ PluginResult::RejectBinary { .. } => {
+                                    let reject = plugin_result_into_reject_parts(reject)
+                                        .expect("reject result should convert to rejection parts");
+                                    debug!(
+                                        plugin = plugin.name(),
+                                        status_code = reject.status_code,
+                                        "Plugin rejected gRPC response body"
+                                    );
+                                    let normalized =
+                                        normalize_grpc_plugin_rejection_with_after_proxy_hooks(
+                                            &plugins, &mut ctx, reject, false,
+                                        )
+                                        .await;
+                                    authoritative_trailers_only_terminal_metadata = Some(
+                                        grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                                            &normalized.headers,
+                                        ),
+                                    );
+                                    response_status = normalized.http_status.as_u16();
+                                    response_headers = normalized.headers;
+                                    plugin_response_headers = response_headers.clone();
+                                    response_trailers.clear();
+                                    response_body = normalized.body;
+                                    let _ = ctx.take_buffered_initial_response_header_policy();
+                                    response_body_rejected = true;
+                                    break;
+                                }
                             }
                         }
+                    }
+                    if capacity_terminal {
+                        response_body_rejected = true;
+                        grpc_proxy::select_buffered_grpc_terminal_response(
+                            &plugin_response_headers,
+                            &mut response_trailers,
+                            &mut authoritative_trailers_only_terminal_metadata,
+                        );
+                        let _ = ctx.take_buffered_initial_response_header_policy();
+                        terminal_metadata_is_body_framed |=
+                            grpc_web_response_content_type.is_some();
                     }
                     // Capture normalize / inspect header mutations before the
                     // gRPC-Web transform frames trailers from the live view.
@@ -26217,7 +26900,7 @@ async fn handle_proxy_request_inner(
                 let (
                     mut buffered_initial_response_header_policy_state,
                     defer_application_trailer_discard,
-                ) = if !after_proxy_rejected {
+                ) = if !after_proxy_rejected && !ctx.gateway_capacity_response_selected() {
                     let phase_start = Instant::now();
                     // Keep buffered gRPC-Web conversion keyed to the original
                     // request when the hook-visible response headers are still
@@ -26404,21 +27087,38 @@ async fn handle_proxy_request_inner(
                             .metadata
                             .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
                             .and_then(|value| value.parse::<u16>().ok());
-                        let content_type = plugin_response_headers
-                            .get("content-type")
-                            .map(String::as_str);
-                        let mut owned_body = ResponseBody::take_buffered_vec(&mut response_body);
-                        let synced = crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                            &mut owned_body,
-                            content_type,
+                        // Owned: the reframe runs inside a call that also takes
+                        // `&mut plugin_response_headers` (the refusal terminal
+                        // writes into it), so the content type cannot stay
+                        // borrowed from that map.
+                        let content_type = plugin_response_headers.get("content-type").cloned();
+                        let retained_ceiling = ctx.retained_response_body_ceiling();
+                        // Keep the charged original body alive while the covering
+                        // window builds any replacement through a bounded sink
+                        // (GHSA-pwcm-6rh8-f2gh).
+                        let stored = store_charged_grpc_web_reframed_body(
+                            &mut ctx,
+                            &mut response_status,
+                            &mut response_body,
+                            &mut plugin_response_headers,
+                            retained_ceiling,
+                            content_type.as_deref(),
                             &response_trailers,
                             http_status,
+                            initial_response_header_policy_plugins.as_ref(),
                         );
-                        let synced_len = owned_body.len();
-                        ResponseBody::store_buffered_vec(&mut response_body, owned_body);
-                        if synced {
+                        if let Some((synced_len, true)) = stored {
                             plugin_response_headers
                                 .insert("content-length".to_string(), synced_len.to_string());
+                        } else if stored.is_none() {
+                            // The shared capacity refusal is already a complete
+                            // gRPC-Web body-framed terminal. Do not let the
+                            // backend's old native trailers or policy snapshot
+                            // overwrite it below.
+                            terminal_metadata_is_body_framed = true;
+                            response_trailers.clear();
+                            buffered_initial_response_header_policy_state = None;
+                            let _ = ctx.take_buffered_initial_response_header_policy();
                         }
                     }
                     // Retire compatibility-view application trailers only after
@@ -26706,6 +27406,9 @@ async fn handle_proxy_request_inner(
                     &e,
                     GrpcProxyError::ClientDeadlineExceeded(_)
                         | GrpcProxyError::ResourceExhausted(_)
+                        // Gateway-local retention capacity: the backend did
+                        // nothing wrong, so it trains no backend accounting.
+                        | GrpcProxyError::ResponseBufferCapacity(_)
                         | GrpcProxyError::Internal(_)
                 ) && let Some(permits) = backend_admission_permits.take()
                 {
@@ -26721,6 +27424,7 @@ async fn handle_proxy_request_inner(
                         &e,
                         GrpcProxyError::ClientDeadlineExceeded(_)
                             | GrpcProxyError::ResourceExhausted(_)
+                            | GrpcProxyError::ResponseBufferCapacity(_)
                             | GrpcProxyError::Internal(_)
                     )
                 {
@@ -26754,12 +27458,20 @@ async fn handle_proxy_request_inner(
                     GrpcProxyError::ResourceExhausted(_) | GrpcProxyError::ResponseTooLarge(_) => {
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED
                     }
+                    GrpcProxyError::ResponseBufferCapacity(_) => {
+                        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS
+                    }
                     GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::UNAVAILABLE,
                 };
                 // Use a generic client-facing message to avoid leaking
                 // internal backend details (hostnames, DNS errors, etc.).
                 let msg = match &e {
                     GrpcProxyError::ClientDeadlineExceeded(_) => GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                    // Fixed, redaction-safe, and deliberately distinguishable
+                    // from the backend's own "payload too large" refusal.
+                    GrpcProxyError::ResponseBufferCapacity(_) => {
+                        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE
+                    }
                     _ if grpc_code == grpc_proxy::grpc_status::DEADLINE_EXCEEDED => {
                         "Backend deadline exceeded"
                     }
@@ -28201,7 +28913,7 @@ async fn handle_proxy_request_inner(
         crate::plugins::normalize_response_body_for_inspection(
             &plugins,
             &mut ctx,
-            response_status,
+            &mut response_status,
             &mut response_headers,
             data,
             initial_response_header_policy_plugins.as_ref(),
@@ -28215,16 +28927,18 @@ async fn handle_proxy_request_inner(
     // transforms can emit the correct wire shape, but final-body validators must
     // not replace the selected error. While this is first set by
     // `on_response_body`, it also records a representation-gate or deadline
-    // replacement below.
-    let mut response_body_rejected = false;
+    // replacement below. A retained-response capacity terminal is already
+    // protocol-correct and skips those later mutating phases entirely.
+    let mut response_body_rejected = ctx.gateway_capacity_response_selected();
 
     // on_response_body hooks — only for buffered responses, only when plugins exist.
     // This phase sees the normalized backend body before ordinary response
     // transformations, so guardrails inspect the client-visible protocol shape.
     // A Reject result replaces the response before it reaches the client.
     if !after_proxy_rejected
+        && !response_body_rejected
         && !plugins.is_empty()
-        && let ResponseBody::Buffered(ref data) = response_body
+        && let ResponseBody::Buffered(ref mut data) = response_body
     {
         let phase_start = Instant::now();
         let mut response_body_reject = None;
@@ -28238,6 +28952,18 @@ async fn handle_proxy_request_inner(
             .into_plugin_result(&mut ctx);
             match result {
                 PluginResult::Continue => {
+                    if install_pending_buffered_response_capacity_refusal(
+                        &mut ctx,
+                        &mut response_status,
+                        &mut response_headers,
+                        data,
+                        InitialResponseHeaderPolicySource::Prefiltered(
+                            initial_response_header_policy_plugins.as_ref(),
+                        ),
+                    ) {
+                        response_body_rejected = true;
+                        break;
+                    }
                     ctx.record_deadline_response_header_plugin(plugin.as_ref(), &response_headers);
                 }
                 reject @ PluginResult::Reject { .. }
@@ -28276,7 +29002,10 @@ async fn handle_proxy_request_inner(
     // transform_response_body hooks — only for buffered responses.
     // Allows plugins (e.g., response_transformer with body rules) to rewrite
     // JSON fields in the response body before it is sent to the client.
+    // A capacity terminal is already protocol-correct; do not reopen transforms
+    // or trailer reframing against it.
     if !after_proxy_rejected
+        && !ctx.gateway_capacity_response_selected()
         && !plugins.is_empty()
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
@@ -28318,17 +29047,27 @@ async fn handle_proxy_request_inner(
                 .metadata
                 .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
                 .and_then(|value| value.parse::<u16>().ok());
-            let content_type = response_headers.get("content-type").map(String::as_str);
-            let mut owned_body = ResponseBody::take_buffered_vec(data);
-            let synced = crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                &mut owned_body,
-                content_type,
+            // Owned: the reframe runs inside a call that also takes
+            // `&mut response_headers`, so the content type cannot stay borrowed
+            // from that map.
+            let content_type = response_headers.get("content-type").cloned();
+            // Keep the charged original body alive while the covering window
+            // builds any replacement through a bounded sink; a refusal fails
+            // closed with the neutral gRPC capacity terminal
+            // (GHSA-pwcm-6rh8-f2gh).
+            let retained_ceiling = ctx.retained_response_body_ceiling();
+            let stored = store_charged_grpc_web_reframed_body(
+                &mut ctx,
+                &mut response_status,
+                data,
+                &mut response_headers,
+                retained_ceiling,
+                content_type.as_deref(),
                 &trailers,
                 http_status,
+                initial_response_header_policy_plugins.as_ref(),
             );
-            let synced_len = owned_body.len();
-            ResponseBody::store_buffered_vec(data, owned_body);
-            if synced {
+            if let Some((synced_len, true)) = stored {
                 response_headers.insert("content-length".to_string(), synced_len.to_string());
                 // Mirror H1/H2/H3: after body-framing trailers, retire
                 // trailer-only application metadata from initial headers while
@@ -28338,6 +29077,11 @@ async fn handle_proxy_request_inner(
                     &mut trailers,
                     &shadowed_keys,
                 );
+            }
+            if stored.is_none() {
+                // The shared gRPC-Web body-framed capacity terminal replaced
+                // the body, so no later final-body validator may overwrite it.
+                response_body_rejected = true;
             }
         } else {
             let _ = ctx.take_buffered_initial_response_header_policy();
@@ -30298,15 +31042,29 @@ pub(crate) async fn proxy_to_backend_retry(
                 // streams) and responses without Content-Length (unknown size).
                 let cutoff = state.response_buffer_cutoff_bytes;
                 if cutoff > 0
-                    && content_length.is_some_and(|cl| cl <= cutoff)
+                    && let Some(declared_len) = content_length.filter(|cl| *cl <= cutoff)
                     && !is_streaming_content_type(&resp_headers)
                 {
                     // Content-Length is within cutoff (and within max_response
                     // _body_size_bytes if set, checked above), so eager
-                    // collection is bounded.
-                    let body_read = match crate::plugins::await_grpc_deadline(
+                    // collection is bounded PER RESPONSE. Concurrency still
+                    // multiplies that cutoff, so the bytes are collected through
+                    // the shared charged collector: every growth target is
+                    // charged before it is allocated and the charge is owned by
+                    // the published payload (GHSA-pwcm-6rh8-f2gh). An exhausted
+                    // aggregate budget is the neutral transient capacity
+                    // response, never a backend fault; the streaming arm below is
+                    // untouched and retains nothing.
+                    let retained_ceiling = response_buffer_budget::buffered_response_body_ceiling(
+                        effective_max_response_body_size_bytes,
+                    );
+                    let collected = match crate::plugins::await_grpc_deadline(
                         request_ctx.grpc_deadline_at(),
-                        response.bytes(),
+                        eager_collect_charged_backend_body(
+                            response,
+                            retained_ceiling,
+                            declared_len,
+                        ),
                     )
                     .await
                     {
@@ -30319,11 +31077,14 @@ pub(crate) async fn proxy_to_backend_retry(
                             );
                         }
                     };
-                    buffered_backend_response_from_body_read(
-                        body_read,
+                    buffered_backend_response_from_eager_collect(
+                        collected,
                         status,
                         resp_headers,
                         resolved_ip.clone(),
+                        proxy,
+                        "reqwest-eager-retry",
+                        retained_ceiling,
                     )
                 } else {
                     // Streaming path — the downstream body builder applies
@@ -30342,11 +31103,15 @@ pub(crate) async fn proxy_to_backend_retry(
                     }
                 }
             } else {
-                // Buffered mode: use size-limited collection when a limit is
-                // configured so an oversized chunked response cannot exhaust
-                // memory.
-                if effective_max_response_body_size_bytes > 0 {
-                    let max_size = effective_max_response_body_size_bytes;
+                // Buffered mode: always collect under the buffered ceiling and
+                // the aggregate retention budget. A configured `0` means
+                // "unlimited" for streaming only — retaining an unbounded body
+                // is folded to the fail-closed fallback ceiling here
+                // (GHSA-pwcm-6rh8-f2gh), so there is no unbounded arm left.
+                {
+                    let max_size = response_buffer_budget::buffered_response_body_ceiling(
+                        effective_max_response_body_size_bytes,
+                    );
                     let collected = match crate::plugins::await_grpc_deadline(
                         request_ctx.grpc_deadline_at(),
                         collect_response_with_limit(response, max_size),
@@ -30371,37 +31136,15 @@ pub(crate) async fn proxy_to_backend_retry(
                             backend_resolved_ip: resolved_ip.clone(),
                             error_class: None,
                         },
-                        Err(err_body) => retry::BackendResponse {
-                            status_code: 502,
-                            body: ResponseBody::buffered(err_body),
+                        Err(failure) => retry::BackendResponse {
+                            status_code: failure.status_code,
+                            body: ResponseBody::buffered(failure.body),
                             headers: HashMap::new(),
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
-                            error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                            error_class: Some(failure.error_class),
                         },
                     }
-                } else {
-                    let body_read = match crate::plugins::await_grpc_deadline(
-                        request_ctx.grpc_deadline_at(),
-                        response.bytes(),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(()) => {
-                            return client_grpc_deadline_exceeded_response_for_request(
-                                request_ctx,
-                                headers,
-                                resolved_ip,
-                            );
-                        }
-                    };
-                    buffered_backend_response_from_body_read(
-                        body_read,
-                        status,
-                        resp_headers,
-                        resolved_ip.clone(),
-                    )
                 }
             }
         }
@@ -30557,7 +31300,70 @@ fn record_h2_pool_admission_failure(
     }
 }
 
-/// Build a buffered `BackendResponse` from a reqwest body-read result. A read
+/// Why an eager retained collection failed.
+///
+/// The eager path retains its body, so it uses the SAME
+/// [`response_buffer_budget::ChargedBodyCollector`] the buffered paths use
+/// (GHSA-pwcm-6rh8-f2gh). It deliberately does not await `Response::bytes()`:
+/// that call materialises an allocation of opaque capacity before anything can
+/// measure it, and a declared `Content-Length` is a backend claim rather than an
+/// allocation-capacity proof — so under concurrency many tasks could each hold
+/// such a buffer while only their declared lengths had been charged. Collecting
+/// through the shared collector charges every growth target BEFORE asking the
+/// allocator for it, and the finished charge is owned by the published `Bytes`
+/// for exactly as long as the payload exists.
+///
+/// The two refusals stay distinct because their attributions differ: a body past
+/// the per-response retained ceiling is a BACKEND fault
+/// (`ResponseBodyTooLarge`), while an exhausted aggregate budget is gateway-local
+/// transient capacity and must stay neutral to circuit breaker, passive health,
+/// and adaptive concurrency. A read failure keeps its existing classification
+/// untouched.
+enum EagerRetainFailure {
+    /// Mid-body transport failure after the response headers arrived.
+    Read(reqwest::Error),
+    /// The retained bounds refused the body.
+    Retain(response_buffer_budget::RetainRejection),
+}
+
+/// Eagerly collect a small backend response body under both retained bounds.
+///
+/// `ceiling` is this response's folded retained ceiling and `preallocation_hint`
+/// is the declared `Content-Length`, charged before the preallocation exists so a
+/// flood of responses that advertise a body and then stall cannot each hold
+/// uncharged capacity.
+async fn eager_collect_charged_backend_body(
+    response: reqwest::Response,
+    ceiling: usize,
+    preallocation_hint: usize,
+) -> Result<Bytes, EagerRetainFailure> {
+    use futures_util::StreamExt as _;
+    let mut collector = response_buffer_budget::ChargedBodyCollector::with_preallocation(
+        response_buffer_budget::BudgetRef::global(),
+        ceiling,
+        preallocation_hint,
+    )
+    .map_err(EagerRetainFailure::Retain)?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if let Err(rejection) = collector.append(&chunk) {
+                    return Err(EagerRetainFailure::Retain(rejection));
+                }
+            }
+            Err(e) => return Err(EagerRetainFailure::Read(e)),
+        }
+    }
+    match collector.into_charged_bytes() {
+        Some(charged) => Ok(charged),
+        None => Err(EagerRetainFailure::Retain(
+            response_buffer_budget::RetainRejection::BudgetExhausted,
+        )),
+    }
+}
+
+/// Build a buffered `BackendResponse` from an eager charged collection. A read
 /// failure AFTER the response headers arrived (backend reset/closed/timed out
 /// mid-body) is a backend fault, so it must surface as a 502 with
 /// an error class — NOT the backend's original status with a silently-emptied
@@ -30567,22 +31373,52 @@ fn record_h2_pool_admission_failure(
 /// admission (and passive health) record a mid-body backend failure as a healthy
 /// success and can grow the limit. Mirrors the size-limited buffered read paths
 /// that already classify this.
-fn buffered_backend_response_from_body_read(
-    result: Result<bytes::Bytes, reqwest::Error>,
+fn buffered_backend_response_from_eager_collect(
+    result: Result<Bytes, EagerRetainFailure>,
     status: u16,
     resp_headers: HashMap<String, String>,
     resolved_ip: Option<String>,
+    proxy: &Proxy,
+    transport: &'static str,
+    ceiling: usize,
 ) -> retry::BackendResponse {
+    use response_buffer_budget::RetainRejection;
     match result {
-        Ok(b) => retry::BackendResponse {
+        Ok(charged) => retry::BackendResponse {
             status_code: status,
-            body: ResponseBody::buffered(b),
+            body: ResponseBody::buffered(charged),
             headers: resp_headers,
             connection_error: false,
             backend_resolved_ip: resolved_ip,
             error_class: None,
         },
-        Err(e) => {
+        Err(EagerRetainFailure::Retain(RetainRejection::BudgetExhausted)) => {
+            response_buffer_capacity_response(proxy, resolved_ip, transport)
+        }
+        Err(EagerRetainFailure::Retain(RetainRejection::TooLarge)) => {
+            // Size POLICY, not process capacity: the origin sent more than the
+            // operator allows to be retained. Kept separate from the aggregate
+            // refusal above so telemetry and health accounting stay honest.
+            warn!(
+                proxy_id = %proxy.id,
+                transport,
+                max_response_body_size_bytes = ceiling,
+                "Backend response body exceeded the retained response ceiling while buffering"
+            );
+            retry::BackendResponse {
+                status_code: 502,
+                body: ResponseBody::buffered(
+                    r#"{"error":"Backend response body exceeds maximum size"}"#
+                        .as_bytes()
+                        .to_vec(),
+                ),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+            }
+        }
+        Err(EagerRetainFailure::Read(e)) => {
             let (status_code, error_class) =
                 eager_buffer_body_read_status_and_class(retry::classify_reqwest_error(&e));
             warn!(
@@ -32389,12 +33225,25 @@ async fn proxy_to_backend(
                 if stream_response && content_length.is_some() {
                     let cutoff = state.response_buffer_cutoff_bytes;
                     if cutoff > 0
-                        && content_length.is_some_and(|cl| cl <= cutoff)
+                        && let Some(declared_len) = content_length.filter(|cl| *cl <= cutoff)
                         && !is_streaming_content_type(&resp_headers)
                     {
-                        let body_read = match crate::plugins::await_grpc_deadline(
+                        // Eagerly buffered, therefore RETAINED: collected through
+                        // the shared charged collector so every byte of resident
+                        // capacity is charged before it is allocated and
+                        // concurrency cannot multiply the cutoff
+                        // (GHSA-pwcm-6rh8-f2gh).
+                        let retained_ceiling =
+                            response_buffer_budget::buffered_response_body_ceiling(
+                                effective_max_response_body_size_bytes,
+                            );
+                        let collected = match crate::plugins::await_grpc_deadline(
                             request_ctx.grpc_deadline_at(),
-                            response.bytes(),
+                            eager_collect_charged_backend_body(
+                                response,
+                                retained_ceiling,
+                                declared_len,
+                            ),
                         )
                         .await
                         {
@@ -32412,11 +33261,14 @@ async fn proxy_to_backend(
                             }
                         };
                         return backend_dispatch_response(
-                            buffered_backend_response_from_body_read(
-                                body_read,
+                            buffered_backend_response_from_eager_collect(
+                                collected,
                                 status,
                                 resp_headers,
                                 resolved_ip.clone(),
+                                proxy,
+                                "reqwest-eager",
+                                retained_ceiling,
                             ),
                             retained_body,
                             backend_admission_permits,
@@ -32460,8 +33312,11 @@ async fn proxy_to_backend(
                     );
                 }
 
-                // Buffered mode: stream-collect with size limit
-                let max_size = effective_max_response_body_size_bytes;
+                // Buffered mode: stream-collect under the buffered ceiling and
+                // the aggregate retention budget.
+                let max_size = response_buffer_budget::buffered_response_body_ceiling(
+                    effective_max_response_body_size_bytes,
+                );
                 let collected = match crate::plugins::await_grpc_deadline(
                     request_ctx.grpc_deadline_at(),
                     collect_response_with_limit(response, max_size),
@@ -32490,13 +33345,13 @@ async fn proxy_to_backend(
                         backend_resolved_ip: resolved_ip.clone(),
                         error_class: None,
                     },
-                    Err(err_body) => retry::BackendResponse {
-                        status_code: 502,
-                        body: ResponseBody::buffered(err_body),
+                    Err(failure) => retry::BackendResponse {
+                        status_code: failure.status_code,
+                        body: ResponseBody::buffered(failure.body),
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
-                        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+                        error_class: Some(failure.error_class),
                     },
                 }
             } else if stream_response {
@@ -32510,12 +33365,23 @@ async fn proxy_to_backend(
                     .and_then(|v| v.parse::<usize>().ok());
                 let cutoff = state.response_buffer_cutoff_bytes;
                 if cutoff > 0
-                    && content_length.is_some_and(|cl| cl <= cutoff)
+                    && let Some(declared_len) = content_length.filter(|cl| *cl <= cutoff)
                     && !is_streaming_content_type(&resp_headers)
                 {
-                    let body_read = match crate::plugins::await_grpc_deadline(
+                    // Same eager retention as the limited arm above, and the same
+                    // charged collector: "no configured per-response ceiling" is
+                    // a STREAMING policy only, so a retained body still gets the
+                    // fail-closed fallback ceiling and never means "unbounded
+                    // resident memory" (GHSA-pwcm-6rh8-f2gh).
+                    let retained_ceiling =
+                        response_buffer_budget::buffered_response_body_ceiling(0);
+                    let collected = match crate::plugins::await_grpc_deadline(
                         request_ctx.grpc_deadline_at(),
-                        response.bytes(),
+                        eager_collect_charged_backend_body(
+                            response,
+                            retained_ceiling,
+                            declared_len,
+                        ),
                     )
                     .await
                     {
@@ -32532,11 +33398,14 @@ async fn proxy_to_backend(
                             );
                         }
                     };
-                    buffered_backend_response_from_body_read(
-                        body_read,
+                    buffered_backend_response_from_eager_collect(
+                        collected,
                         status,
                         resp_headers,
                         resolved_ip.clone(),
+                        proxy,
+                        "reqwest-eager-unlimited",
+                        retained_ceiling,
                     )
                 } else {
                     retry::BackendResponse {
@@ -32552,9 +33421,17 @@ async fn proxy_to_backend(
                     }
                 }
             } else {
-                let body_read = match crate::plugins::await_grpc_deadline(
+                // Buffered with no operator ceiling. `0 = unlimited` is a
+                // streaming policy only: retaining the body still gets the
+                // fail-closed fallback ceiling and the aggregate retention
+                // budget, so this arm can no longer grow without bound
+                // (GHSA-pwcm-6rh8-f2gh).
+                let max_size = response_buffer_budget::buffered_response_body_ceiling(
+                    effective_max_response_body_size_bytes,
+                );
+                let collected = match crate::plugins::await_grpc_deadline(
                     request_ctx.grpc_deadline_at(),
-                    response.bytes(),
+                    collect_response_with_limit(response, max_size),
                 )
                 .await
                 {
@@ -32571,12 +33448,24 @@ async fn proxy_to_backend(
                         );
                     }
                 };
-                buffered_backend_response_from_body_read(
-                    body_read,
-                    status,
-                    resp_headers,
-                    resolved_ip.clone(),
-                )
+                match collected {
+                    Ok((resp_body, _)) => retry::BackendResponse {
+                        status_code: status,
+                        body: ResponseBody::buffered(resp_body),
+                        headers: resp_headers,
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: None,
+                    },
+                    Err(failure) => retry::BackendResponse {
+                        status_code: failure.status_code,
+                        body: ResponseBody::buffered(failure.body),
+                        headers: HashMap::new(),
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip.clone(),
+                        error_class: Some(failure.error_class),
+                    },
+                }
             }
         }
         Err(e) => {
@@ -32651,36 +33540,132 @@ fn is_streaming_content_type(resp_headers: &HashMap<String, String>) -> bool {
     })
 }
 
-/// Collect a response body with a size limit, returning Err with error body if exceeded.
+/// Why a buffered collection could not produce a complete body, together with
+/// the response the caller must surface instead.
+///
+/// The aggregate-budget arm is deliberately distinguishable from the
+/// per-response size arm: the backend did nothing wrong when the gateway is out
+/// of retention capacity, so it is a transient `503` rather than a `502`
+/// attributing the refusal to the origin (GHSA-pwcm-6rh8-f2gh).
+pub(crate) struct BufferedCollectFailure {
+    pub(crate) status_code: u16,
+    pub(crate) body: Vec<u8>,
+    pub(crate) error_class: retry::ErrorClass,
+}
+
+impl BufferedCollectFailure {
+    fn too_large() -> Self {
+        Self {
+            status_code: 502,
+            body: r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+            error_class: retry::ErrorClass::ResponseBodyTooLarge,
+        }
+    }
+
+    /// Mid-body read failure. The class is deliberately unchanged from before
+    /// this failure type existed — both former `Err` arms of the collector were
+    /// mapped to `ResponseBodyTooLarge` by every call site. Re-labelling it is a
+    /// telemetry change with no bearing on the buffering bounds, so it is left
+    /// for a separate change.
+    fn read_error() -> Self {
+        Self {
+            status_code: 502,
+            body: r#"{"error":"Backend response read error"}"#.as_bytes().to_vec(),
+            error_class: retry::ErrorClass::ResponseBodyTooLarge,
+        }
+    }
+
+    /// Aggregate buffered-response budget exhausted. Carries the neutral
+    /// gateway-capacity class, NOT `ResponseBodyTooLarge`: the backend behaved
+    /// correctly and stayed within every configured per-response ceiling, so
+    /// this refusal must not ding its passive health, trip its circuit breaker,
+    /// or shrink its adaptive-concurrency permit.
+    fn budget_exhausted() -> Self {
+        Self {
+            status_code: response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
+            body: response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY
+                .as_bytes()
+                .to_vec(),
+            error_class: response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS,
+        }
+    }
+}
+
+/// Collect a backend response body into memory under both buffered-path bounds.
+///
+/// `max_size` must already be the *buffered* ceiling
+/// ([`response_buffer_budget::buffered_response_body_ceiling`]), never the raw
+/// `0 = unlimited` value: retaining an unbounded body is not a policy this path
+/// can honor. Retained bytes are additionally charged against the process-wide
+/// budget as they accumulate.
+///
+/// On success the charge is MOVED into the returned [`Bytes`], whose owner
+/// holds the permit: every cheap clone shares that one charge and the budget is
+/// returned only when the last handle drops. That is what makes the aggregate
+/// cap a bound on *resident* bytes rather than on collection time. On every
+/// failure path — size rejection, read error, or the future being dropped — the
+/// reservation drops and the blocks return immediately.
 async fn collect_response_with_limit(
     response: reqwest::Response,
     max_size: usize,
-) -> Result<(Vec<u8>, usize), Vec<u8>> {
+) -> Result<(Bytes, usize), BufferedCollectFailure> {
     use futures_util::StreamExt as _;
-    let mut body = Vec::new();
+    let mut body = response_buffer_budget::ChargedBodyCollector::new(
+        response_buffer_budget::BudgetRef::global(),
+        max_size,
+    );
     let mut stream = response.bytes_stream();
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => {
-                if body.len() + chunk.len() > max_size {
-                    warn!(
-                        "Backend response truncated: exceeded {} byte limit",
-                        max_size
-                    );
-                    return Err(r#"{"error":"Backend response body exceeds maximum size"}"#
-                        .as_bytes()
-                        .to_vec());
+                // The collector owns BOTH bounds. It charges the growth target
+                // it is about to allocate, not the post-append length, so a
+                // reallocation cannot publish capacity the budget never saw.
+                if let Err(rejection) = body.append(&chunk) {
+                    return Err(buffered_collect_retain_failure(rejection, max_size));
                 }
-                body.extend_from_slice(&chunk);
             }
             Err(e) => {
                 error!("Error reading backend response: {}", e);
-                return Err(r#"{"error":"Backend response read error"}"#.as_bytes().to_vec());
+                return Err(BufferedCollectFailure::read_error());
             }
         }
     }
     let len = body.len();
-    Ok((body, len))
+    match body.into_charged_bytes() {
+        Some(charged) => Ok((charged, len)),
+        None => Err(buffered_collect_retain_failure(
+            response_buffer_budget::RetainRejection::BudgetExhausted,
+            max_size,
+        )),
+    }
+}
+
+/// Map a retained-allocation refusal onto the buffered-collect failure shape.
+///
+/// A ceiling overrun keeps the backend-attributed `ResponseBodyTooLarge`; an
+/// exhausted aggregate budget keeps the neutral gateway-capacity class that must
+/// not feed circuit breaker, passive health, or adaptive concurrency
+/// (GHSA-pwcm-6rh8-f2gh).
+fn buffered_collect_retain_failure(
+    rejection: response_buffer_budget::RetainRejection,
+    max_size: usize,
+) -> BufferedCollectFailure {
+    match rejection {
+        response_buffer_budget::RetainRejection::TooLarge => {
+            warn!(
+                "Backend response truncated: exceeded {} byte limit",
+                max_size
+            );
+            BufferedCollectFailure::too_large()
+        }
+        response_buffer_budget::RetainRejection::BudgetExhausted => {
+            warn!("Response buffering refused: aggregate retained-response budget exhausted");
+            BufferedCollectFailure::budget_exhausted()
+        }
+    }
 }
 
 /// Build a `Set-Cookie` header value for sticky session cookie injection.
@@ -32785,7 +33770,19 @@ pub(crate) fn query_string_after_plugin_strips<'a>(
 /// defense in depth for the no-transform path and any residual marked names.
 /// Ordinary no-transform / no-strip requests borrow the raw string with no
 /// allocation.
+///
+/// A provider claim (`ai_stream_router`, `GHSA-xhp5-hqj8-3mwg`) short-circuits
+/// both of these: it froze the exact safe backend-visible query at claim time,
+/// and every later generic query transform — which runs at a HIGHER priority
+/// than the claim and could otherwise append a normal-backend secret to the
+/// third-party provider URL — is discarded here. This is the single funnel
+/// through which the backend-visible query reaches H1/H2 dispatch, native H3
+/// dispatch, retry replay, and the replay/cache partition builders, so the
+/// re-assertion cannot be bypassed by adding a call site.
 pub(crate) fn effective_backend_query_string<'a>(ctx: &'a RequestContext) -> Cow<'a, str> {
+    if let Some(committed) = ctx.committed_provider_query() {
+        return Cow::Borrowed(committed);
+    }
     let base = match ctx.outbound_query_string() {
         Some(q) => q,
         None => ctx.raw_query_string().unwrap_or(""),
@@ -32803,6 +33800,9 @@ pub(crate) fn effective_backend_query_string_with_raw<'a>(
     ctx: &RequestContext,
     raw_query: &'a str,
 ) -> Cow<'a, str> {
+    if let Some(committed) = ctx.committed_provider_query() {
+        return Cow::Owned(committed.to_string());
+    }
     match ctx.outbound_query_string() {
         Some(query) => Cow::Owned(query_string_after_plugin_strips(ctx, query).into_owned()),
         None => query_string_after_plugin_strips(ctx, raw_query),
@@ -33413,16 +34413,27 @@ fn hbone_hyper_error_response(
 }
 
 enum HyperBodyCollectError {
+    /// The backend's response exceeded the configured per-response ceiling —
+    /// an origin-attributed `502` / `ResponseBodyTooLarge`.
     TooLarge,
+    /// The gateway's process-wide budget for retained response bodies could not
+    /// admit this one. The origin behaved correctly and stayed within every
+    /// configured ceiling, so the direct-H2 / HBONE / mesh-mTLS arms surface
+    /// this as a neutral transient overload refusal rather than a backend fault
+    /// (GHSA-pwcm-6rh8-f2gh) — the same classification the reqwest, H3, and
+    /// gRPC collectors use.
+    BudgetExhausted,
     Read(hyper::Error),
-    ReadTimeout { timeout_ms: u64 },
+    ReadTimeout {
+        timeout_ms: u64,
+    },
 }
 
 async fn collect_hyper_body_with_limit(
     body: Incoming,
     max_size: usize,
     backend_read_timeout_ms: u64,
-) -> Result<Vec<u8>, HyperBodyCollectError> {
+) -> Result<Bytes, HyperBodyCollectError> {
     collect_hyper_body_and_trailers_with_limit(body, max_size, backend_read_timeout_ms)
         .await
         .map(|(body_bytes, _trailers)| body_bytes)
@@ -33438,8 +34449,19 @@ async fn collect_hyper_body_and_trailers_with_limit(
     mut body: Incoming,
     max_size: usize,
     backend_read_timeout_ms: u64,
-) -> Result<(Vec<u8>, Option<hyper::HeaderMap>), HyperBodyCollectError> {
-    let mut body_bytes = Vec::new();
+) -> Result<(Bytes, Option<hyper::HeaderMap>), HyperBodyCollectError> {
+    // This helper only ever RETAINS, so the streaming `0 = unlimited` policy is
+    // folded to the fail-closed fallback ceiling and the retained bytes are
+    // charged against the process-wide aggregate budget. On success the charge
+    // is MOVED into the returned `Bytes`, so it is released when the payload is
+    // dropped rather than when this function returns; on every failure path
+    // (including the caller dropping this future) the reservation drops and the
+    // blocks return immediately (GHSA-pwcm-6rh8-f2gh).
+    let max_size = response_buffer_budget::buffered_response_body_ceiling(max_size);
+    let mut body_bytes = response_buffer_budget::ChargedBodyCollector::new(
+        response_buffer_budget::BudgetRef::global(),
+        max_size,
+    );
     let mut trailers: Option<hyper::HeaderMap> = None;
     loop {
         let next_frame = if backend_read_timeout_ms > 0 {
@@ -33461,10 +34483,13 @@ async fn collect_hyper_body_and_trailers_with_limit(
         };
         let frame = frame.map_err(HyperBodyCollectError::Read)?;
         if let Some(data) = frame.data_ref() {
-            if max_size > 0 && body_bytes.len().saturating_add(data.len()) > max_size {
-                return Err(HyperBodyCollectError::TooLarge);
+            // The collector owns the ceiling check and the aggregate charge, and
+            // charges the growth target BEFORE allocating it, so a reallocation
+            // cannot leave capacity resident outside the budget
+            // (GHSA-pwcm-6rh8-f2gh).
+            if let Err(rejection) = body_bytes.append(data) {
+                return Err(hyper_collect_retain_error(rejection));
             }
-            body_bytes.extend_from_slice(data);
         } else if let Ok(trailer_map) = frame.into_trailers() {
             // A second TRAILERS frame is not legal HTTP/2, but merge whatever
             // hyper surfaces rather than silently dropping trailing metadata.
@@ -33474,7 +34499,220 @@ async fn collect_hyper_body_and_trailers_with_limit(
             }
         }
     }
-    Ok((body_bytes, trailers))
+    match body_bytes.into_charged_bytes() {
+        Some(charged) => Ok((charged, trailers)),
+        None => Err(HyperBodyCollectError::BudgetExhausted),
+    }
+}
+
+/// Map a retained-allocation refusal onto the hyper-collect error shape,
+/// preserving the backend-vs-gateway attribution split
+/// (GHSA-pwcm-6rh8-f2gh).
+fn hyper_collect_retain_error(
+    rejection: response_buffer_budget::RetainRejection,
+) -> HyperBodyCollectError {
+    match rejection {
+        response_buffer_budget::RetainRejection::TooLarge => HyperBodyCollectError::TooLarge,
+        response_buffer_budget::RetainRejection::BudgetExhausted => {
+            warn!("Response buffering refused: aggregate retained-response budget exhausted");
+            HyperBodyCollectError::BudgetExhausted
+        }
+    }
+}
+
+/// The gateway's aggregate budget for RETAINED response bodies refused this
+/// response.
+///
+/// One builder for every plain-HTTP transport that retains a body (direct H2,
+/// HBONE, mesh-mTLS non-gRPC, and — via
+/// [`BufferedCollectFailure::budget_exhausted`] and the H3 arms — reqwest and
+/// HTTP/3), so the classification cannot drift per protocol:
+///
+/// * `503`, not `502`. The origin answered correctly and within every
+///   configured per-response ceiling; only the gateway's own retention capacity
+///   was short. A `502` would attribute a gateway-local memory bound to the
+///   backend.
+/// * A fixed, redaction-safe body naming no route, header, credential, or
+///   response content.
+/// * The health-neutral [`retry::ErrorClass::GatewayBufferCapacity`], so this
+///   refusal trips no circuit breaker, dings no passive health, and shrinks no
+///   adaptive-concurrency permit — the budget is process-global, so counting it
+///   against backends would eject every healthy target at once.
+///
+/// True per-response overflow keeps its own `502` / `ResponseBodyTooLarge`
+/// builders, and backend read/protocol failures keep theirs (GHSA-pwcm-6rh8-f2gh).
+fn response_buffer_capacity_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    transport: &'static str,
+) -> retry::BackendResponse {
+    warn!(
+        proxy_id = %proxy.id,
+        transport = transport,
+        "Response buffering refused: aggregate retained-response budget exhausted"
+    );
+    retry::BackendResponse {
+        status_code: response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
+        body: ResponseBody::buffered(
+            response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY
+                .as_bytes()
+                .to_vec(),
+        ),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
+    }
+}
+
+/// gRPC-flavored counterpart of [`response_buffer_capacity_response`].
+///
+/// Same neutral classification, expressed in the gRPC status mapping:
+/// `RESOURCE_EXHAUSTED` (a resource/capacity condition) rather than
+/// `UNAVAILABLE` (which would claim the backend is down) or `INTERNAL` (which
+/// would claim a gateway defect), riding HTTP 200 like every other gRPC error.
+fn mesh_grpc_response_buffer_capacity_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    warn!(
+        proxy_id = %proxy.id,
+        transport = "mesh-mtls-grpc",
+        "gRPC response buffering refused: aggregate retained-response budget exhausted"
+    );
+    let mut headers = HashMap::with_capacity(3);
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "grpc-status".to_string(),
+        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS.to_string(),
+    );
+    headers.insert(
+        "grpc-message".to_string(),
+        response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
+    );
+    retry::BackendResponse {
+        status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
+        body: ResponseBody::buffered(Vec::new()),
+        headers,
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
+    }
+}
+
+/// Reframe a gRPC-Web buffered body under the retained-response budget.
+///
+/// The original collected [`Bytes`] and its charge stay alive for the whole
+/// reconciliation. The covering [`response_buffer_budget::ResponseTransformWindow`]
+/// is reserved first; the replacement is constructed from its first byte through
+/// a [`response_buffer_budget::BoundedResponseBodySink`] (via
+/// [`crate::plugins::grpc_web::sync_translated_body_trailer_frame_into`]) and only
+/// then transferred out of the window into the charged owner. The old
+/// `take_buffered_vec` + mutate-in-place shape is deliberately absent: that copy
+/// dropped the original permit while the decode/reframe allocations were still
+/// uncharged beside it (GHSA-pwcm-6rh8-f2gh).
+///
+/// `Some((len, reframed))` on success, where `len` is the stored body length and
+/// `reframed` reports whether the trailer suffix was validated (identical or
+/// replaced). `None` means the budget refused: the shared capacity-refusal
+/// builder has replaced the discarded representation with a small, uncharged,
+/// body-framed gRPC-Web terminal — failing closed rather than retaining
+/// uncharged backend bytes.
+#[allow(clippy::too_many_arguments)] // threads protocol terminal state and policy provenance
+pub(crate) fn store_charged_grpc_web_reframed_body(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_body: &mut Bytes,
+    response_headers: &mut HashMap<String, String>,
+    retained_ceiling: usize,
+    content_type: Option<&str>,
+    reconciled_trailers: &HashMap<String, String>,
+    http_status: Option<u16>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Option<(usize, bool)> {
+    // Refuse before opening a window when the already-charged body is above the
+    // ceiling — that keeps the "body was collected under this ceiling" reasoning
+    // true even if an earlier phase installed a larger representation.
+    if response_body.len() > retained_ceiling {
+        grpc_web_reframe_capacity_terminal(
+            ctx,
+            response_status,
+            response_body,
+            response_headers,
+            initial_response_header_policy_plugins,
+        );
+        return None;
+    }
+    let mut window = None;
+    match crate::plugins::grpc_web::sync_translated_body_trailer_frame_into(
+        response_body.as_ref(),
+        content_type,
+        reconciled_trailers,
+        http_status,
+        retained_ceiling,
+        || {
+            window = response_buffer_budget::ResponseTransformWindow::open(retained_ceiling);
+            window.is_some()
+        },
+    ) {
+        crate::plugins::grpc_web::SyncTranslatedTrailerOutcome::Unchanged => {
+            Some((response_body.len(), true))
+        }
+        crate::plugins::grpc_web::SyncTranslatedTrailerOutcome::NoRewrite => {
+            Some((response_body.len(), false))
+        }
+        crate::plugins::grpc_web::SyncTranslatedTrailerOutcome::Overflow => {
+            grpc_web_reframe_capacity_terminal(
+                ctx,
+                response_status,
+                response_body,
+                response_headers,
+                initial_response_header_policy_plugins,
+            );
+            None
+        }
+        crate::plugins::grpc_web::SyncTranslatedTrailerOutcome::Replaced(rebuilt) => {
+            let stored_len = rebuilt.len();
+            match window.as_mut().and_then(|window| window.charge(rebuilt)) {
+                Some(charged) => {
+                    *response_body = charged;
+                    Some((stored_len, true))
+                }
+                None => {
+                    grpc_web_reframe_capacity_terminal(
+                        ctx,
+                        response_status,
+                        response_body,
+                        response_headers,
+                        initial_response_header_policy_plugins,
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Install the shared, protocol-aware capacity terminal for a refused reframe.
+///
+/// The warning and client body are fixed and redaction-safe. The shared builder
+/// retains only response headers already proven gateway-authored, applies the
+/// initial-response policy, and carries gRPC-Web status in a body trailer frame.
+fn grpc_web_reframe_capacity_terminal(
+    ctx: &mut RequestContext,
+    response_status: &mut u16,
+    response_body: &mut Bytes,
+    response_headers: &mut HashMap<String, String>,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) {
+    warn!("gRPC-Web trailer reframing refused: retained-response capacity unavailable");
+    replace_buffered_response_with_capacity_refusal(
+        ctx,
+        response_status,
+        response_headers,
+        response_body,
+        initial_response_header_policy_plugins,
+    );
 }
 
 fn hbone_response_body_too_large_response(
@@ -34438,6 +35676,13 @@ async fn proxy_to_backend_hbone(
                         None,
                         effective_max_response_body_size_bytes,
                     ),
+                    None,
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::BudgetExhausted) => {
+                return (
+                    response_buffer_capacity_response(proxy, resolved_ip, "hbone"),
                     None,
                     None,
                 );
@@ -35514,6 +36759,17 @@ async fn proxy_to_backend_mesh_mtls(
                     None,
                 );
             }
+            Err(HyperBodyCollectError::BudgetExhausted) => {
+                return (
+                    if is_grpc_flavored {
+                        mesh_grpc_response_buffer_capacity_response(proxy, resolved_ip)
+                    } else {
+                        response_buffer_capacity_response(proxy, resolved_ip, "mesh-mtls")
+                    },
+                    None,
+                    None,
+                );
+            }
             Err(HyperBodyCollectError::Read(err)) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
@@ -36230,6 +37486,12 @@ async fn proxy_to_backend_http2(
                         backend_resolved_ip: resolved_ip,
                         error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
                     },
+                    None,
+                );
+            }
+            Err(HyperBodyCollectError::BudgetExhausted) => {
+                return (
+                    response_buffer_capacity_response(proxy, resolved_ip, "direct-h2"),
                     None,
                 );
             }
@@ -37263,6 +38525,13 @@ async fn drain_h3_streaming_response_to_buffered(
                 backend_resolved_ip: resolved_ip,
                 error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
             }
+        }
+        Err(crate::http3::client::H3BodyDrainError::BufferBudgetExhausted) => {
+            debug!(
+                backend_url = %strip_query_params(backend_url),
+                "HTTP/3 response buffering refused by the aggregate retained-response budget"
+            );
+            response_buffer_capacity_response(proxy, resolved_ip, "http3")
         }
         Err(crate::http3::client::H3BodyDrainError::ReadTimeout { timeout_ms }) => {
             warn!(
@@ -39077,6 +40346,11 @@ mod tests {
 
     #[async_trait]
     impl Plugin for SyntheticBodyTransformPlugin {
+        /// Test producer: declares the bounded-construction contract so the
+        /// buffered phases reserve a window for it (GHSA-pwcm-6rh8-f2gh).
+        fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+            crate::plugins::ResponseBodyProduction::BoundedByRetainedCeiling
+        }
         fn name(&self) -> &str {
             "synthetic_body_transform"
         }
@@ -39097,6 +40371,11 @@ mod tests {
 
     #[async_trait]
     impl Plugin for SyntheticNormalizationProbePlugin {
+        /// Test producer: declares the bounded-construction contract so the
+        /// buffered phases reserve a window for it (GHSA-pwcm-6rh8-f2gh).
+        fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+            crate::plugins::ResponseBodyProduction::BoundedByRetainedCeiling
+        }
         fn name(&self) -> &str {
             "synthetic_normalization_probe"
         }
@@ -46664,6 +47943,7 @@ mod tests {
             trust_bundles: None,
             mesh: None,
             mesh_revision: None,
+            k8s_mesh_overlay: Default::default(),
         }
     }
 

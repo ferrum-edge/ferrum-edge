@@ -106,6 +106,7 @@ fn create_mesh_proxy_state_with_config(
         trust_bundles: None,
         mesh: None,
         mesh_revision: None,
+        k8s_mesh_overlay: Default::default(),
     };
     let env_config = EnvConfig {
         mode: OperatingMode::Mesh,

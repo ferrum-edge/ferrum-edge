@@ -5,11 +5,17 @@
 //! certificates, CA bundles, CRLs, OCSP responses, and JWKS. Private key PEM is
 //! persisted because rustls needs it to rebuild configs, but API summaries never
 //! serialize it.
+//!
+//! The document is shared, not process-local (issue #2409): every read
+//! revalidates against the file so a record another replica wrote is visible
+//! without a restart, and every mutation runs as an exclusive-lock
+//! read-modify-write against authoritative state so interleaved writes from
+//! several instances cannot erase one another. See [`crate::tls::shared_store`].
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,6 +25,7 @@ use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
 
 use crate::config::types::validate_resource_id;
+use crate::tls::shared_store::{SharedStoreError, SharedStoreFile, VersionedStoreFile};
 use crate::tls::source::MaterialKind;
 
 const STORE_FILE_NAME: &str = "managed-tls.json";
@@ -156,18 +163,53 @@ pub enum ManagedTlsError {
     Write(String),
     #[error("failed to parse managed TLS store: {0}")]
     Parse(String),
+    /// A gateway setting the store depends on is present but unusable. This is
+    /// an operator configuration failure on the server, not a bad request, and
+    /// is reported as such. Carries only the rule that was broken.
+    #[error("managed TLS store is misconfigured: {0}")]
+    InvalidConfiguration(String),
+}
+
+impl From<SharedStoreError> for ManagedTlsError {
+    fn from(error: SharedStoreError) -> Self {
+        match &error {
+            SharedStoreError::Read { .. } => Self::Read(error.to_string()),
+            SharedStoreError::Parse { .. } => Self::Parse(error.to_string()),
+            // A lock timeout is a write-side ambiguity: the mutation did not
+            // land, and the caller must not treat it as applied.
+            SharedStoreError::Write { .. } | SharedStoreError::LockTimeout { .. } => {
+                Self::Write(error.to_string())
+            }
+            // A store that cannot be opened on the configured settings is a
+            // configuration failure, not a missing record: fail closed with the
+            // rule that was broken so the operator can see it.
+            SharedStoreError::InvalidConfig { .. } => Self::InvalidConfiguration(error.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ManagedTlsStoreFile {
+    /// Monotonic version stamped by every committed shared-store write.
+    #[serde(default)]
+    store_version: u64,
     #[serde(default)]
     records: BTreeMap<String, ManagedTlsRecord>,
 }
 
+impl VersionedStoreFile for ManagedTlsStoreFile {
+    fn store_version(&self) -> u64 {
+        self.store_version
+    }
+
+    fn set_store_version(&mut self, version: u64) {
+        self.store_version = version;
+    }
+}
+
 #[derive(Debug)]
 pub struct ManagedTlsStore {
-    path: PathBuf,
-    records: RwLock<BTreeMap<String, ManagedTlsRecord>>,
+    file: SharedStoreFile<ManagedTlsStoreFile>,
 }
 
 impl ManagedTlsStore {
@@ -179,93 +221,82 @@ impl ManagedTlsStore {
             ));
         }
         std::fs::create_dir_all(&dir).map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-        let path = dir.join(STORE_FILE_NAME);
-        let file = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<ManagedTlsStoreFile>(&bytes)
-                .map_err(|error| ManagedTlsError::Parse(error.to_string()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ManagedTlsStoreFile::default()
-            }
-            Err(error) => return Err(ManagedTlsError::Read(error.to_string())),
-        };
         Ok(Self {
-            path,
-            records: RwLock::new(file.records),
+            file: SharedStoreFile::open(dir.join(STORE_FILE_NAME))?,
         })
     }
 
-    pub fn list(&self, kind: ManagedTlsMaterialKind) -> Vec<ManagedTlsRecordSummary> {
-        match self.records.read() {
-            Ok(records) => records
-                .values()
-                .filter(|record| record.kind == kind)
-                .map(ManagedTlsRecord::summary)
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+    /// Version of the authoritative document behind the last read.
+    ///
+    /// Non-secret; exposed so operators and tests can observe that a write
+    /// committed and that another instance's write became visible.
+    #[allow(dead_code)]
+    pub fn store_version(&self) -> Result<u64, ManagedTlsError> {
+        Ok(self.file.version()?)
+    }
+
+    pub fn list(
+        &self,
+        kind: ManagedTlsMaterialKind,
+    ) -> Result<Vec<ManagedTlsRecordSummary>, ManagedTlsError> {
+        let document = self.file.snapshot()?;
+        let matching = document
+            .records
+            .values()
+            .filter(|record| record.kind == kind)
+            .map(ManagedTlsRecord::summary);
+        Ok(matching.collect())
     }
 
     pub fn get(&self, id: &str) -> Result<ManagedTlsRecord, ManagedTlsError> {
         validate_managed_id(id)?;
-        let records = self
-            .records
-            .read()
-            .map_err(|_| ManagedTlsError::Read("managed TLS store lock is poisoned".to_string()))?;
-        records
-            .get(id)
-            .cloned()
-            .ok_or_else(|| ManagedTlsError::NotFound(id.to_string()))
+        let document = self.file.snapshot()?;
+        let record = document.records.get(id).cloned();
+        record.ok_or_else(|| ManagedTlsError::NotFound(id.to_string()))
     }
 
     pub fn upsert(
         &self,
-        mut record: ManagedTlsRecord,
+        record: ManagedTlsRecord,
         allow_overwrite: bool,
     ) -> Result<ManagedTlsRecord, ManagedTlsError> {
         validate_managed_id(&record.id)?;
-        let mut records = self.records.write().map_err(|_| {
-            ManagedTlsError::Write("managed TLS store lock is poisoned".to_string())
-        })?;
-        let now = Utc::now();
-        if let Some(existing) = records.get(&record.id) {
-            if !allow_overwrite {
-                return Err(ManagedTlsError::AlreadyExists(record.id));
+        // Existence, kind conflicts, and `created_at` preservation are all
+        // decided under the exclusive lock against the authoritative document,
+        // so a record another instance committed is neither invisible nor
+        // silently overwritten.
+        self.file.mutate(move |document| {
+            let mut record = record;
+            let now = Utc::now();
+            if let Some(existing) = document.records.get(&record.id) {
+                if !allow_overwrite {
+                    return Err(ManagedTlsError::AlreadyExists(record.id));
+                }
+                if existing.kind != record.kind {
+                    return Err(ManagedTlsError::KindConflict {
+                        id: record.id,
+                        existing_kind: existing.kind.as_str(),
+                        requested_kind: record.kind.as_str(),
+                    });
+                }
+                record.created_at = existing.created_at;
+                record.updated_at = now;
+            } else {
+                record.created_at = now;
+                record.updated_at = now;
             }
-            if existing.kind != record.kind {
-                return Err(ManagedTlsError::KindConflict {
-                    id: record.id,
-                    existing_kind: existing.kind.as_str(),
-                    requested_kind: record.kind.as_str(),
-                });
-            }
-            record.created_at = existing.created_at;
-            record.updated_at = now;
-        } else {
-            record.created_at = now;
-            record.updated_at = now;
-        }
-        // Persist the candidate snapshot first; publish into the live map only
-        // after durable replacement succeeds so readers never observe a failed
-        // mutation.
-        let mut candidate = records.clone();
-        candidate.insert(record.id.clone(), record.clone());
-        self.persist_locked(&candidate)?;
-        *records = candidate;
-        Ok(record)
+            document.records.insert(record.id.clone(), record.clone());
+            Ok(record)
+        })
     }
 
     pub fn delete(&self, id: &str) -> Result<ManagedTlsRecord, ManagedTlsError> {
         validate_managed_id(id)?;
-        let mut records = self.records.write().map_err(|_| {
-            ManagedTlsError::Write("managed TLS store lock is poisoned".to_string())
-        })?;
-        let mut candidate = records.clone();
-        let removed = candidate
-            .remove(id)
-            .ok_or_else(|| ManagedTlsError::NotFound(id.to_string()))?;
-        self.persist_locked(&candidate)?;
-        *records = candidate;
-        Ok(removed)
+        let id = id.to_string();
+        self.file.mutate(move |document| {
+            let removed = document.records.remove(&id);
+            removed.ok_or(ManagedTlsError::NotFound(id))
+        })
     }
 
     pub fn material(
@@ -276,19 +307,6 @@ impl ManagedTlsStore {
         let reference = ManagedSourceReference::parse(identifier, fallback_kind)?;
         let record = self.get(&reference.id)?;
         reference.material_from(record)
-    }
-
-    fn persist_locked(
-        &self,
-        records: &BTreeMap<String, ManagedTlsRecord>,
-    ) -> Result<(), ManagedTlsError> {
-        let payload = serde_json::to_vec_pretty(&ManagedTlsStoreFile {
-            records: records.clone(),
-        })
-        .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-        crate::tls::private_file::replace_private_file(&self.path, &payload)
-            .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-        Ok(())
     }
 }
 
@@ -761,7 +779,13 @@ mod tests {
         assert_eq!(key.bytes, key_pem.into_bytes());
 
         let reopened = ManagedTlsStore::open(dir.path()).expect("reopen store");
-        assert_eq!(reopened.list(ManagedTlsMaterialKind::Certificate).len(), 1);
+        assert_eq!(
+            reopened
+                .list(ManagedTlsMaterialKind::Certificate)
+                .expect("list certificates")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -803,7 +827,9 @@ mod tests {
         assert_eq!(material.bytes, ocsp_der);
         assert_eq!(material.kind, MaterialKind::Ocsp);
 
-        let summaries = store.list(ManagedTlsMaterialKind::OcspResponse);
+        let summaries = store
+            .list(ManagedTlsMaterialKind::OcspResponse)
+            .expect("list ocsp responses");
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].byte_length, Some(5));
     }

@@ -732,6 +732,41 @@ pub mod _test_support {
         ctx.mark_gateway_deadline_response_selected();
     }
 
+    pub fn gateway_capacity_response_selected_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.gateway_capacity_response_selected()
+    }
+
+    pub fn mark_buffered_response_capacity_refusal_pending_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.mark_buffered_response_capacity_refusal_pending();
+    }
+
+    pub fn take_buffered_response_capacity_refusal_pending_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.take_buffered_response_capacity_refusal_pending()
+    }
+
+    /// Install a pending capacity refusal exactly as every `on_response_body`
+    /// loop does when an inspector marks the one-shot signal.
+    pub fn install_pending_buffered_response_capacity_refusal_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut std::collections::HashMap<String, String>,
+        response_body: &mut bytes::Bytes,
+    ) -> bool {
+        crate::proxy::install_pending_buffered_response_capacity_refusal(
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(&[]),
+        )
+    }
+
     /// Run the buffered request-body stage the way the proxy does: every
     /// `transform_request_body` hook first, then every `on_final_request_body`
     /// hook, over one shared `RequestContext`.
@@ -765,6 +800,19 @@ pub mod _test_support {
         .await
         .into_plugin_result(ctx);
         (transformed, result)
+    }
+
+    /// Run the shared final backend-header-policy pass exactly as every dispatch
+    /// ladder does: after all `before_proxy` header transforms, over the
+    /// finalized backend-visible header map (`GHSA-xhp5-hqj8-3mwg`).
+    ///
+    /// `plugins` must already be sorted by effective priority.
+    pub fn run_final_backend_header_policy_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::run_final_backend_header_policy_hooks(plugins, ctx, headers);
     }
 
     pub async fn run_context_free_final_request_body_hooks_for_test(
@@ -1228,6 +1276,19 @@ pub mod _test_support {
         plugin.mirror_metrics_snapshot_for_test()
     }
 
+    // ── plugins/ai_stream_router ─────────────────────────────────────────────
+    /// Whether an `ai_stream_router` instance successfully claimed this request.
+    ///
+    /// Exposes only the EXISTENCE of the private claim, never its owner, model,
+    /// destination, TLS, DNS decision, query, or credential
+    /// (`GHSA-xhp5-hqj8-3mwg`). Tests use it to distinguish a real claim from
+    /// the public observability marker.
+    pub fn request_has_ai_stream_router_claim_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.has_ai_stream_router_claim()
+    }
+
     // ── plugins/api_chargeback_sink ──────────────────────────────────────────
     pub fn api_chargeback_sink_snapshot_accumulator_for_test(
         plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
@@ -1327,6 +1388,24 @@ pub mod _test_support {
         plugin.compact_excluded_by_emission_lock_for_tests(hold)
     }
 
+    // ── plugins/load_testing ─────────────────────────────────────────────────
+    /// Construct through the identity-aware production path so a test can
+    /// simulate a plugin-cache reload generation for one stable policy
+    /// identity (`namespace` + plugin-config id).
+    pub fn load_testing_with_policy_identity_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<crate::plugins::load_testing::LoadTesting, String> {
+        crate::plugins::load_testing::LoadTesting::new_with_instance_id(
+            config,
+            http_client,
+            namespace,
+            config_id,
+        )
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_with_instance_id_for_test(
         config: &serde_json::Value,
@@ -1338,6 +1417,30 @@ pub mod _test_support {
             http_client,
             instance_id,
         )
+    }
+
+    /// Construct through the identity-aware production path so a test can
+    /// simulate a plugin-cache reload generation for one stable policy
+    /// identity (`namespace` + plugin-config id).
+    pub fn request_deduplication_with_policy_identity_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        namespace: &str,
+        config_id: &str,
+    ) -> Result<crate::plugins::request_deduplication::RequestDeduplication, String> {
+        crate::plugins::request_deduplication::RequestDeduplication::new_with_policy_identity(
+            config,
+            http_client,
+            namespace,
+            config_id,
+        )
+    }
+
+    pub fn request_deduplication_backdate_inflight_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+        age: std::time::Duration,
+    ) {
+        plugin.backdate_inflight_entries_for_tests(age);
     }
 
     pub fn request_deduplication_logical_keys_from_context_for_test(
@@ -3833,6 +3936,62 @@ pub mod _test_support {
         )
     }
 
+    /// Ceiling-bounded final trailer reconciliation (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// `Ok(None)` means the existing body already matched. `Ok(Some(bytes))` is a
+    /// sink-built replacement. `Err(false)` is malformed/non-grpc-web.
+    /// `Err(true)` is a retained-ceiling / frame-length overflow.
+    pub fn sync_translated_body_trailer_frame_into_for_test(
+        body: &[u8],
+        content_type: Option<&str>,
+        reconciled_trailers: &HashMap<String, String>,
+        http_status: Option<u16>,
+        ceiling: usize,
+        admit_replacement: bool,
+    ) -> Result<Option<Vec<u8>>, bool> {
+        use crate::plugins::grpc_web::SyncTranslatedTrailerOutcome;
+        match crate::plugins::grpc_web::sync_translated_body_trailer_frame_into(
+            body,
+            content_type,
+            reconciled_trailers,
+            http_status,
+            ceiling,
+            move || admit_replacement,
+        ) {
+            SyncTranslatedTrailerOutcome::Unchanged => Ok(None),
+            SyncTranslatedTrailerOutcome::Replaced(bytes) => Ok(Some(bytes)),
+            SyncTranslatedTrailerOutcome::NoRewrite => Err(false),
+            SyncTranslatedTrailerOutcome::Overflow => Err(true),
+        }
+    }
+
+    /// Production final-reconciliation publisher: keeps the charged original
+    /// alive, builds any replacement through the covering window's sink, and
+    /// installs the neutral gRPC capacity terminal on refusal.
+    #[allow(clippy::too_many_arguments)] // mirrors the protocol helper's terminal/provenance args
+    pub fn store_charged_grpc_web_reframed_body_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_body: &mut bytes::Bytes,
+        response_headers: &mut HashMap<String, String>,
+        retained_ceiling: usize,
+        content_type: Option<&str>,
+        reconciled_trailers: &HashMap<String, String>,
+        http_status: Option<u16>,
+    ) -> Option<(usize, bool)> {
+        crate::proxy::store_charged_grpc_web_reframed_body(
+            ctx,
+            response_status,
+            response_body,
+            response_headers,
+            retained_ceiling,
+            content_type,
+            reconciled_trailers,
+            http_status,
+            &[],
+        )
+    }
+
     pub fn truncate_trailing_trailer_frames_for_test(data: &mut Vec<u8>) -> bool {
         crate::plugins::grpc_web::truncate_trailing_trailer_frames(data)
     }
@@ -4323,6 +4482,18 @@ pub mod _test_support {
     /// Canonical backend-visible query (transformer outbound + auth strips).
     pub fn effective_backend_query_string_for_test(ctx: &crate::plugins::RequestContext) -> String {
         crate::proxy::effective_backend_query_string(ctx).into_owned()
+    }
+
+    /// The caller-held-raw-query variant the H1/H2 (`proxy/mod.rs`) and native
+    /// HTTP/3 (`http3/server.rs`) ladders actually capture once per request and
+    /// reuse for every retry attempt. Exposed so composition tests can assert
+    /// both funnels agree, including the provider-claim re-assertion
+    /// (`GHSA-xhp5-hqj8-3mwg`).
+    pub fn effective_backend_query_string_with_raw_for_test(
+        ctx: &crate::plugins::RequestContext,
+        raw_query: &str,
+    ) -> String {
+        crate::proxy::effective_backend_query_string_with_raw(ctx, raw_query).into_owned()
     }
 
     pub fn collect_forwardable_websocket_headers_for_test(
@@ -6019,6 +6190,587 @@ pub mod _test_support {
     /// Compose a phase's own buffering cap with the route ceiling.
     pub fn stricter_optional_limit_for_test(a: Option<usize>, b: Option<usize>) -> Option<usize> {
         crate::proxy::stricter_optional_limit(a, b)
+    }
+
+    /// Ceiling a *retained* (buffered) response body is collected under. A
+    /// legacy `0` ("unlimited") folds to the fail-closed fallback rather than
+    /// producing an unbounded buffer (`GHSA-pwcm-6rh8-f2gh`).
+    pub fn buffered_response_body_ceiling_for_test(effective_limit: usize) -> usize {
+        crate::proxy::response_buffer_budget::buffered_response_body_ceiling(effective_limit)
+    }
+
+    /// Blocks the aggregate buffered-response budget would expose for a given
+    /// configuration, without touching the process-global budget.
+    pub fn response_buffer_budget_blocks_for_test(
+        fallback_per_response_bytes: usize,
+        total_bytes: usize,
+    ) -> usize {
+        crate::proxy::response_buffer_budget::available_blocks_for_config(
+            fallback_per_response_bytes,
+            total_bytes,
+        )
+    }
+
+    /// Granularity, in bytes, of one aggregate-budget block.
+    pub const RESPONSE_BUFFER_RESERVATION_UNIT_BYTES: usize =
+        crate::proxy::response_buffer_budget::RESERVATION_UNIT_BYTES;
+
+    /// Conservative heap ceiling the representation gate reserves for one
+    /// `gzip`/`x-gzip` decode pass before it constructs the decoder.
+    pub const RESPONSE_DECODE_GZIP_SCRATCH_BYTES: usize =
+        crate::plugins::response_representation::GZIP_DECODER_SCRATCH_BYTES;
+
+    /// Conservative heap ceiling the representation gate reserves for one `br`
+    /// decode pass before it constructs the decoder.
+    pub const RESPONSE_DECODE_BROTLI_SCRATCH_BYTES: usize =
+        crate::plugins::response_representation::BROTLI_DECODER_SCRATCH_BYTES;
+
+    /// The output-buffer capacity the production decode ends up holding for a
+    /// decoded body of `decoded_len` bytes under `limit`, computed with the
+    /// production growth rule.
+    ///
+    /// External budget tests derive their brackets from this rather than from
+    /// hardcoded block counts, so a change to the growth rule or to a codec's
+    /// output size surfaces as a precise arithmetic mismatch instead of a
+    /// seemingly flaky admission assertion.
+    pub fn projected_decode_output_capacity_for_test(decoded_len: usize, limit: usize) -> usize {
+        crate::plugins::response_representation::projected_decode_output_capacity(
+            decoded_len,
+            limit,
+        )
+    }
+
+    /// The decode ceiling the gate applies when no smaller response-body limit
+    /// is configured — the `limit` argument of
+    /// [`projected_decode_output_capacity_for_test`] on a default deployment.
+    pub const MAX_DECODED_RESPONSE_INSPECTION_BYTES: usize =
+        crate::plugins::response_representation::MAX_DECODED_RESPONSE_INSPECTION_BYTES;
+
+    /// Client-visible HTTP status for an aggregate-capacity refusal.
+    pub const RESPONSE_BUFFER_OVERLOAD_STATUS: u16 =
+        crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS;
+
+    /// gRPC status for the same refusal.
+    pub const RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS: u32 =
+        crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS;
+
+    /// Fixed, redaction-safe client body for the same refusal.
+    pub const RESPONSE_BUFFER_OVERLOAD_BODY: &str =
+        crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY;
+
+    /// Telemetry/retry class every transport uses for the same refusal.
+    pub const RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS: crate::retry::ErrorClass =
+        crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS;
+
+    /// Whether an error class is neutral to circuit-breaker, passive-health, and
+    /// adaptive-concurrency accounting.
+    pub fn error_class_is_health_neutral_for_test(class: crate::retry::ErrorClass) -> bool {
+        crate::proxy::backend_dispatch::client_side_no_backend_signal(Some(class))
+    }
+
+    /// Whether an error class is treated as a post-wire BACKEND failure (which
+    /// shrinks adaptive concurrency and trips the breaker).
+    pub fn error_class_is_backend_failure_for_test(class: crate::retry::ErrorClass) -> bool {
+        crate::proxy::backend_dispatch::error_class_is_post_wire_backend_failure(Some(class))
+    }
+
+    /// An isolated aggregate retained-response budget built from the SAME
+    /// [`crate::proxy::response_buffer_budget`] code the process-global one uses
+    /// — same clamping, same non-blocking admission, same charge attachment —
+    /// but with its own semaphore, so external tests can observe admission and
+    /// release deterministically under a parallel test binary
+    /// (`GHSA-pwcm-6rh8-f2gh`).
+    pub struct ResponseBufferBudgetProbe(crate::proxy::response_buffer_budget::IsolatedBudget);
+
+    /// A growing claim on a [`ResponseBufferBudgetProbe`], mirroring what a
+    /// collector holds while it accumulates a retained body.
+    pub struct ResponseBufferChargeProbe(
+        crate::proxy::response_buffer_budget::ResponseBufferReservation,
+    );
+
+    impl ResponseBufferBudgetProbe {
+        pub fn new(fallback_per_response_bytes: usize, total_bytes: usize) -> Self {
+            Self(crate::proxy::response_buffer_budget::IsolatedBudget::new(
+                fallback_per_response_bytes,
+                total_bytes,
+            ))
+        }
+
+        /// Currently unreserved capacity, in bytes.
+        pub fn available_bytes(&self) -> usize {
+            self.0.available_bytes()
+        }
+
+        /// Retained-path ceiling for an effective per-response limit (`0` folds
+        /// to the fail-closed fallback).
+        pub fn buffered_response_body_ceiling(&self, effective_limit: usize) -> usize {
+            self.0.buffered_response_body_ceiling(effective_limit)
+        }
+
+        /// Charge `bytes` BEFORE allocating them — what the native-H3 and gRPC
+        /// preallocation sites do. `None` when the budget refuses.
+        pub fn try_reserve(&self, bytes: usize) -> Option<ResponseBufferChargeProbe> {
+            self.0.try_reserve(bytes).map(ResponseBufferChargeProbe)
+        }
+
+        /// Grow an existing claim, as a collector does per chunk.
+        pub fn grow(&self, charge: &mut ResponseBufferChargeProbe, bytes: usize) -> bool {
+            self.0.grow(&mut charge.0, bytes)
+        }
+
+        /// Publish a retained body whose charge is attached to the returned
+        /// `Bytes` — the production success path. `None` when the budget
+        /// refuses. Every clone of the result shares the single charge, and the
+        /// budget is returned only when the last clone drops.
+        pub fn charge_retained_body(&self, data: Vec<u8>) -> Option<bytes::Bytes> {
+            self.0.charge_retained_body(data)
+        }
+
+        /// Hand an existing claim to `data`, exactly as the collectors do on
+        /// return. `None` when the claim does not cover the allocation's real
+        /// CAPACITY — the publication gate that keeps a grown `Vec` from
+        /// shipping bytes the budget never saw.
+        pub fn attach(
+            &self,
+            data: Vec<u8>,
+            charge: ResponseBufferChargeProbe,
+        ) -> Option<bytes::Bytes> {
+            crate::proxy::response_buffer_budget::charged_bytes(data, charge.0)
+        }
+
+        /// The PRODUCTION growing collector bound to this isolated budget —
+        /// same ceiling folding, same charge-before-allocate growth, same
+        /// capacity-gated publication.
+        pub fn collector(&self, effective_limit: usize) -> ResponseBufferCollectorProbe<'_> {
+            ResponseBufferCollectorProbe(self.0.collector(effective_limit))
+        }
+
+        /// The same collector with the preallocation hint the native-H3 and
+        /// gRPC sites pass, charged before the allocation exists.
+        pub fn collector_with_preallocation(
+            &self,
+            effective_limit: usize,
+            hint: usize,
+        ) -> Result<ResponseBufferCollectorProbe<'_>, ResponseBufferRetainRejection> {
+            self.0
+                .collector_with_preallocation(effective_limit, hint)
+                .map(ResponseBufferCollectorProbe)
+                .map_err(ResponseBufferRetainRejection::from_internal)
+        }
+
+        /// The PRODUCTION pre-allocation window a plugin-produced replacement
+        /// body is charged out of. `None` when the budget cannot admit the
+        /// window, which is what makes the refusal happen BEFORE the producer
+        /// allocates.
+        pub fn transform_window(
+            &self,
+            effective_limit: usize,
+        ) -> Option<ResponseBufferTransformWindowProbe<'_>> {
+            self.0
+                .transform_window(effective_limit)
+                .map(ResponseBufferTransformWindowProbe)
+        }
+
+        /// Charge a COPY that outlives the request which produced it — the
+        /// `response_caching` entry body. `None` when the budget refuses, which
+        /// is the signal to skip the store rather than retain uncharged bytes.
+        pub fn charge_retained_copy(&self, data: &[u8]) -> Option<bytes::Bytes> {
+            self.0.charge_retained_copy(data)
+        }
+
+        /// Drive the shared representation gate — the PRODUCTION
+        /// `evaluate_response_body_policy_posture` plus the production
+        /// `install_decoded_response_body` — with this isolated budget bound
+        /// where the proxy binds the process-global one.
+        ///
+        /// This is the only way to observe the decode's aggregate accounting
+        /// deterministically: the process-global semaphore is shared by every
+        /// other test in a parallel binary, so an assertion about admission or
+        /// release against it would be a race rather than a proof.
+        ///
+        /// On [`BufferedRepresentationOutcome::Decoded`] the decoded identity
+        /// bytes have been installed into `response_body` and `response_headers`
+        /// exactly as the proxy installs them, carrying the charge that is
+        /// released when the last clone of those bytes drops.
+        pub fn admit_buffered_representation(
+            &self,
+            plugins: &[Arc<dyn Plugin>],
+            ctx: &mut crate::plugins::RequestContext,
+            backend_origin: bool,
+            response_status: u16,
+            response_headers: &mut HashMap<String, String>,
+            response_body: &mut bytes::Bytes,
+        ) -> BufferedRepresentationOutcome {
+            use crate::plugins::response_representation::{
+                RepresentationOrigin, ResponseBodyPolicyPosture,
+                evaluate_response_body_policy_posture, install_decoded_response_body,
+            };
+
+            let origin = if backend_origin {
+                RepresentationOrigin::Backend
+            } else {
+                RepresentationOrigin::GatewayGenerated
+            };
+            let posture = evaluate_response_body_policy_posture(
+                plugins,
+                ctx,
+                origin,
+                response_status,
+                response_headers,
+                response_body,
+                self.0.handle(),
+            );
+            match posture {
+                ResponseBodyPolicyPosture::Unprotected => {
+                    BufferedRepresentationOutcome::Unprotected
+                }
+                ResponseBodyPolicyPosture::CapacityRefused => {
+                    BufferedRepresentationOutcome::CapacityRefused
+                }
+                ResponseBodyPolicyPosture::Reject(rejection) => {
+                    BufferedRepresentationOutcome::Rejected(rejection.reason())
+                }
+                ResponseBodyPolicyPosture::Enforce { decoded } => match decoded {
+                    None => BufferedRepresentationOutcome::EnforcedWithoutDecode,
+                    Some(bytes) => {
+                        // Same two outcomes the proxy distinguishes: an install
+                        // whose charge does not cover the allocation installs
+                        // nothing and becomes the capacity terminal.
+                        if install_decoded_response_body(
+                            ctx,
+                            response_headers,
+                            response_body,
+                            bytes,
+                        ) {
+                            BufferedRepresentationOutcome::Decoded
+                        } else {
+                            BufferedRepresentationOutcome::CapacityRefused
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    /// What the shared representation gate decided for one buffered response,
+    /// projected so external tests can assert on it without reaching into the
+    /// crate-private posture.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BufferedRepresentationOutcome {
+        /// No configured body policy claims these bytes — including the
+        /// claim-WITHDRAWN case, where a decode ran, its plaintext proved the
+        /// policy cannot act on it, and every byte and block the decode took was
+        /// released again.
+        Unprotected,
+        /// Claimed and inspectable with no decode owed.
+        EnforcedWithoutDecode,
+        /// Claimed, decoded, and the identity bytes were installed as the
+        /// client-visible body together with their aggregate-budget charge.
+        Decoded,
+        /// The aggregate retained-response budget could not admit the decode.
+        /// The proxy answers this with the gateway-local transient-capacity
+        /// terminal, never a backend representation error.
+        CapacityRefused,
+        /// Claimed and uninspectable, carrying the gate's low-cardinality
+        /// reason.
+        Rejected(&'static str),
+    }
+
+    impl ResponseBufferChargeProbe {
+        /// Whole reserved blocks expressed in bytes.
+        pub fn reserved_bytes(&self) -> usize {
+            self.0.reserved_bytes()
+        }
+    }
+
+    use crate::proxy::response_buffer_budget::RetainRejection as CrateRetainRejection;
+
+    /// Why a retained allocation was refused, projected for external tests.
+    ///
+    /// The split is load-bearing: `TooLarge` is a BACKEND attribution
+    /// (`ResponseBodyTooLarge`, which feeds passive health), `BudgetExhausted`
+    /// is gateway-local transient capacity and must stay health-neutral
+    /// (`GHSA-pwcm-6rh8-f2gh`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ResponseBufferRetainRejection {
+        TooLarge,
+        BudgetExhausted,
+    }
+
+    impl ResponseBufferRetainRejection {
+        fn from_internal(rejection: CrateRetainRejection) -> Self {
+            match rejection {
+                CrateRetainRejection::TooLarge => Self::TooLarge,
+                CrateRetainRejection::BudgetExhausted => Self::BudgetExhausted,
+            }
+        }
+    }
+
+    /// The PRODUCTION growing retained-response collector every buffered
+    /// transport uses, bound to an isolated budget.
+    pub struct ResponseBufferCollectorProbe<'a>(
+        crate::proxy::response_buffer_budget::ChargedBodyCollector<'a>,
+    );
+
+    impl ResponseBufferCollectorProbe<'_> {
+        /// Bytes collected so far (LENGTH, not capacity).
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.len() == 0
+        }
+
+        /// Append one wire chunk under both bounds, exactly as every buffered
+        /// transport does per frame.
+        pub fn append(&mut self, chunk: &[u8]) -> Result<(), ResponseBufferRetainRejection> {
+            self.0
+                .append(chunk)
+                .map_err(ResponseBufferRetainRejection::from_internal)
+        }
+
+        /// Publish, moving the charge into the returned handle. `None` when the
+        /// charge does not cover the final CAPACITY.
+        pub fn into_charged_bytes(self) -> Option<bytes::Bytes> {
+            self.0.into_charged_bytes()
+        }
+    }
+
+    /// The PRODUCTION pre-allocation window for plugin-produced replacement
+    /// bodies, bound to an isolated budget.
+    pub struct ResponseBufferTransformWindowProbe<'a>(
+        crate::proxy::response_buffer_budget::ResponseTransformWindow<'a>,
+    );
+
+    impl ResponseBufferTransformWindowProbe<'_> {
+        /// Bytes still reserved by the window.
+        pub fn available_bytes(&self) -> usize {
+            self.0.available_bytes()
+        }
+
+        /// The full window size, i.e. this response's retained ceiling.
+        pub fn window_bytes(&self) -> usize {
+            self.0.window_bytes()
+        }
+
+        /// The PRODUCTION precondition every producer invocation must clear:
+        /// re-establish a full covering window after the previous replacement
+        /// was installed. `false` is the signal to install the neutral capacity
+        /// terminal INSTEAD of invoking the next producer.
+        pub fn ensure_covering_window(&mut self) -> bool {
+            self.0.ensure_covering_window()
+        }
+
+        /// The PRODUCTION bounded sink a producer builds its replacement
+        /// through, sized to this window.
+        pub fn sink(&self) -> BoundedResponseBodySinkProbe {
+            BoundedResponseBodySinkProbe(self.0.sink())
+        }
+
+        /// Transfer the blocks covering `data` out of the window and publish it.
+        /// `None` when the producer overran the window (i.e. the per-response
+        /// retained ceiling), which is the fail-closed answer.
+        pub fn charge(&mut self, data: Vec<u8>) -> Option<bytes::Bytes> {
+            self.0.charge(data)
+        }
+    }
+
+    /// The PRODUCTION ceiling-bounded replacement-body sink, so external tests
+    /// can prove an over-ceiling output is refused DURING construction rather
+    /// than allocated and rejected afterwards (`GHSA-pwcm-6rh8-f2gh`).
+    pub struct BoundedResponseBodySinkProbe(
+        crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+    );
+
+    impl BoundedResponseBodySinkProbe {
+        pub fn with_ceiling(ceiling: usize) -> Self {
+            use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+            Self(BoundedResponseBodySink::with_ceiling(ceiling))
+        }
+
+        pub fn ceiling(&self) -> usize {
+            self.0.ceiling()
+        }
+
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        /// Resident allocation capacity currently held by the sink.
+        pub fn capacity(&self) -> usize {
+            self.0.capacity()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.len() == 0
+        }
+
+        pub fn overflowed(&self) -> bool {
+            self.0.overflowed()
+        }
+
+        /// `false` means the write was refused and nothing was appended.
+        pub fn push(&mut self, bytes: &[u8]) -> bool {
+            self.0.push(bytes)
+        }
+
+        /// The PRODUCTION reserve-then-fill seam a producer uses when it knows
+        /// its output length before it can produce the bytes (a protobuf
+        /// re-encode), so it writes into the sink's own buffer instead of
+        /// building a complete replacement beside it.
+        pub fn append_exact(&mut self, bytes: &[u8]) -> bool {
+            self.append_declaring(bytes.len(), bytes)
+        }
+
+        /// The same seam driven by a `fill` that writes a length other than the
+        /// one it was admitted for — which must fail closed rather than publish.
+        ///
+        /// The write mirrors what `prost::Message::encode` does with the limited
+        /// target this seam hands out: check `remaining_mut()` first and refuse
+        /// rather than write past the admitted room, so an over-declaring fill
+        /// is an `Err` and an under-writing one is caught by the length check.
+        pub fn append_declaring(&mut self, declared: usize, bytes: &[u8]) -> bool {
+            self.0.append_with(declared, |buffer| {
+                use bytes::BufMut;
+                if buffer.remaining_mut() < bytes.len() {
+                    return Err(());
+                }
+                buffer.put_slice(bytes);
+                Ok::<(), ()>(())
+            })
+        }
+
+        /// The same seam driven by a `fill` that FAILS.
+        pub fn append_failing(&mut self, declared: usize) -> bool {
+            self.0.append_with(declared, |_buffer| Err::<(), ()>(()))
+        }
+
+        /// The room the limited target actually admits, observed from inside
+        /// `fill` — the proof that a producer cannot address more than the
+        /// bytes it was admitted for.
+        pub fn append_observing_room(&mut self, declared: usize) -> Option<usize> {
+            let mut observed = None;
+            let admitted = self.0.append_with(declared, |buffer| {
+                use bytes::BufMut;
+                observed = Some(buffer.remaining_mut());
+                for _ in 0..declared {
+                    buffer.put_u8(0);
+                }
+                Ok::<(), ()>(())
+            });
+            if admitted { observed } else { None }
+        }
+
+        pub fn finish(self) -> Option<Vec<u8>> {
+            self.0.finish()
+        }
+    }
+
+    /// The PRODUCTION bounded JSON materialisation every JSON-producing response
+    /// transform goes through.
+    pub fn bounded_json_response_body_for_test(
+        value: &serde_json::Value,
+        ceiling: usize,
+    ) -> Option<Vec<u8>> {
+        crate::proxy::response_buffer_budget::bounded_json_vec(value, ceiling)
+    }
+
+    /// The PRODUCTION precondition both buffered producer phases evaluate
+    /// immediately before invoking a plugin's response-body producer hook.
+    ///
+    /// `None` means the hook is invoked. `Some(reason)` means it is NOT invoked
+    /// and the phase installs the neutral capacity terminal instead — which is
+    /// what makes "no producer ever allocates under a partial window" checkable
+    /// deterministically against an isolated budget (`GHSA-pwcm-6rh8-f2gh`).
+    pub fn admit_response_body_producer_for_test(
+        production: crate::plugins::ResponseBodyProduction,
+        window: Option<&mut ResponseBufferTransformWindowProbe<'_>>,
+    ) -> Option<&'static str> {
+        crate::plugins::admit_response_body_producer(production, window.map(|w| &mut w.0))
+    }
+
+    /// Refusal reason: a full covering window could not be re-established.
+    pub const PRODUCER_REFUSED_WINDOW_UNAVAILABLE: &str =
+        crate::plugins::PRODUCER_REFUSED_WINDOW_UNAVAILABLE;
+
+    /// Refusal reason: the plugin declares no bounded replacement contract.
+    pub const PRODUCER_REFUSED_UNDECLARED_CONTRACT: &str =
+        crate::plugins::PRODUCER_REFUSED_UNDECLARED_CONTRACT;
+
+    /// Install the gateway-local retained-response-capacity refusal exactly as
+    /// the buffered normalize / transform phases do when the aggregate budget
+    /// refuses a replacement allocation (`GHSA-pwcm-6rh8-f2gh`).
+    pub fn install_response_buffer_capacity_refusal_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut std::collections::HashMap<String, String>,
+        response_body: &mut bytes::Bytes,
+    ) {
+        crate::proxy::replace_buffered_response_with_capacity_refusal(
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            &[],
+        );
+    }
+
+    /// The exact metadata key that stamps a request as a translated/retained
+    /// gRPC-Web exchange, so a test can drive the gRPC-Web terminal shape through
+    /// the same provenance the proxy uses.
+    pub const GRPC_WEB_RETAINED_RESPONSE_CONTENT_TYPE_METADATA_KEY: &str =
+        crate::plugins::grpc_web::META_GRPC_WEB_ORIGINAL_CT;
+
+    /// Whether ANY active buffering plugin will let the shared retry refinement
+    /// consider releasing this response.
+    ///
+    /// Retry-enabled dispatch buffers by default; this is the gate that decides
+    /// whether the header-time release path is entered at all. A `false` here
+    /// means every response stays fully buffered under retries, no matter what
+    /// the per-response confirmation hook would have said
+    /// (`GHSA-pwcm-6rh8-f2gh`).
+    pub fn plugins_may_release_response_body_under_retries_for_test(
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::proxy::plugins_may_release_response_body_under_retries(plugins, ctx)
+    }
+
+    /// The retry decision context every retry-enabled dispatch path builds before
+    /// consulting the shared header-time refinement.
+    pub fn retry_response_decision_context_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> crate::plugins::RequestContext {
+        crate::proxy::retry_response_decision_context(ctx)
+    }
+
+    /// The shared header-time buffer -> stream refinement, driven exactly as
+    /// every dispatch path drives it. Returns `true` when the response may
+    /// stream (`GHSA-pwcm-6rh8-f2gh`).
+    pub fn refine_stream_response_for_content_type_for_test(
+        proxy: &crate::config::types::Proxy,
+        plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        crate::proxy::refine_stream_response_for_content_type(
+            false,
+            proxy,
+            plugins,
+            Some(ctx),
+            response_status,
+            response_headers,
+        )
+    }
+
+    /// The prospective retained length a collector computes ONCE and reuses for
+    /// its ceiling check, its budget charge, and its allocation. Saturating, so
+    /// a hostile length cannot wrap past a finite ceiling or panic a debug
+    /// build (`GHSA-pwcm-6rh8-f2gh`).
+    pub fn prospective_retained_len_for_test(current: usize, added: usize) -> usize {
+        crate::proxy::response_buffer_budget::prospective_retained_len(current, added)
     }
 
     /// Canonical declared `Content-Length` from a raw header map, honoring

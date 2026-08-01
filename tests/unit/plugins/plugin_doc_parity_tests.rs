@@ -447,3 +447,80 @@ fn special_inventory_classifications_are_documented() {
         "docs must keep the config-only/reserved inventory subsection"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Response-body production declarations (GHSA-pwcm-6rh8-f2gh).
+//
+// The buffered normalize/transform phases reserve a retained-response window
+// only for plugins that can produce a replacement body, and refuse to invoke a
+// plugin that declares no bounded construction contract. Both decisions read
+// one table, so the table has to stay true.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn response_body_production_declarations_match_the_built_in_producers() {
+    use ferrum_edge::plugins::ResponseBodyProduction;
+    use ferrum_edge::plugins::builtin_parity::{
+        BUILTIN_RESPONSE_BODY_PRODUCERS, declared_response_body_production,
+    };
+
+    let inventory: BTreeSet<_> = BUILTIN_PLUGIN_PARITY_META.iter().map(|m| m.name).collect();
+    for producer in BUILTIN_RESPONSE_BODY_PRODUCERS {
+        assert!(
+            inventory.contains(producer),
+            "{producer} is declared a response-body producer but is not a \
+             built-in plugin"
+        );
+        assert_eq!(
+            declared_response_body_production(producer),
+            ResponseBodyProduction::BoundedByRetainedCeiling,
+            "{producer} must declare the bounded construction contract"
+        );
+    }
+
+    // Anything the gateway cannot prove — every out-of-tree plugin — is
+    // fail-closed, so an undeclared rewriter is refused rather than invoked.
+    assert_eq!(
+        declared_response_body_production("__custom_out_of_tree_plugin__"),
+        ResponseBodyProduction::Undeclared,
+        "an unknown plugin must be treated as potentially rewriting AND \
+         potentially unbounded"
+    );
+
+    // Every other built-in is a proven non-producer, and its live `Plugin`
+    // implementation must agree: a minimal-config instance must return `None`
+    // from both producer hooks, because no window is reserved on its account.
+    let headers = std::collections::HashMap::new();
+    for entry in BUILTIN_PLUGIN_PARITY_META {
+        let declared = declared_response_body_production(entry.name);
+        if BUILTIN_RESPONSE_BODY_PRODUCERS.contains(&entry.name) {
+            continue;
+        }
+        assert_eq!(
+            declared,
+            ResponseBodyProduction::Never,
+            "{} is a built-in, so it must declare one of the two proven states",
+            entry.name
+        );
+
+        let config = minimal_plugin_config(entry.name);
+        let Ok(Some(plugin)) = create_plugin(entry.name, &config) else {
+            continue;
+        };
+        assert_eq!(
+            plugin.response_body_production(),
+            ResponseBodyProduction::Never,
+            "{} live declaration drifted from the table",
+            entry.name
+        );
+        assert!(
+            plugin
+                .transform_response_body(br#"{"a":1}"#, Some("application/json"), &headers)
+                .await
+                .is_none(),
+            "{} declares it never replaces a response body, so nothing reserves \
+             a window for it; returning bytes here would be refused at runtime",
+            entry.name
+        );
+    }
+}

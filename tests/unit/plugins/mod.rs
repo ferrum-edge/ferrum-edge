@@ -105,6 +105,7 @@ mod soap_ws_security_tests;
 mod spec_expose_tests;
 mod spiffe_identity_tests;
 mod sse_tests;
+mod stateful_plugin_generation_tests;
 mod statsd_logging_tests;
 mod stdout_logging_tests;
 mod stream_plugin_tests;

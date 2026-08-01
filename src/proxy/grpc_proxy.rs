@@ -1501,6 +1501,15 @@ pub enum GrpcProxyError {
     /// Backend-side — the circuit breaker treats this as a 502-class failure,
     /// mirroring the HTTP path's `ErrorClass::ResponseBodyTooLarge`.
     ResponseTooLarge(String),
+    /// The gateway's process-wide budget for RETAINED response bodies could not
+    /// admit this payload (GHSA-pwcm-6rh8-f2gh). Distinct from
+    /// [`Self::ResponseTooLarge`]: the backend's payload was within every
+    /// configured per-response ceiling and the origin behaved correctly, so this
+    /// is gateway-local transient capacity. It surfaces as `RESOURCE_EXHAUSTED`
+    /// with the health-neutral
+    /// [`crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS`],
+    /// so it trips no circuit breaker and dings no passive health.
+    ResponseBufferCapacity(String),
     Internal(String),
 }
 
@@ -1560,6 +1569,7 @@ impl std::fmt::Display for GrpcProxyError {
             | Self::ClientDeadlineExceeded(message)
             | Self::ResourceExhausted(message)
             | Self::ResponseTooLarge(message)
+            | Self::ResponseBufferCapacity(message)
             | Self::Internal(message) => write!(f, "{}", message),
             Self::BackendTimeout { message, .. } => write!(f, "{}", message),
         }
@@ -1627,6 +1637,7 @@ impl From<crate::pool::SharedPoolCreateError> for GrpcProxyError {
                     | ErrorClass::ReadWriteTimeout
                     | ErrorClass::ClientDisconnect
                     | ErrorClass::ResponseBodyTooLarge
+                    | ErrorClass::GatewayBufferCapacity
                     | ErrorClass::RequestBodyTooLarge
                     | ErrorClass::GracefulRemoteClose
                     | ErrorClass::RequestError => GrpcBackendUnavailableKind::Connect,
@@ -1664,7 +1675,8 @@ impl crate::pool::ShareablePoolCreateError for GrpcProxyError {
             Self::BackendUnavailable { message, .. }
             | Self::ClientDeadlineExceeded(message)
             | Self::ResourceExhausted(message)
-            | Self::ResponseTooLarge(message) => {
+            | Self::ResponseTooLarge(message)
+            | Self::ResponseBufferCapacity(message) => {
                 let kind = match error_class {
                     ErrorClass::DnsLookupError => SharedPoolCreateKind::Dns,
                     ErrorClass::TlsError => SharedPoolCreateKind::Tls,
@@ -2650,7 +2662,11 @@ pub fn build_grpc_error_response(status: u32, message: &str) -> hyper::Response<
 pub struct GrpcResponse {
     pub status: u16,
     pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
+    /// The collected payload, published as cheaply cloneable [`Bytes`] whose
+    /// owner also holds the retained-response budget permit that paid for it
+    /// (GHSA-pwcm-6rh8-f2gh). Cloning shares the one charge; the budget is
+    /// returned when the last handle drops.
+    pub body: Bytes,
     /// Trailers (grpc-status, grpc-message, etc.) forwarded from backend
     pub trailers: HashMap<String, String>,
 }
@@ -3450,14 +3466,37 @@ pub(crate) async fn proxy_grpc_request_core(
     // 16 KiB absorbs most small unary responses in a single allocation
     // and cuts the realloc chain from 14 to 9 for 5 MB responses.
     //
-    // NOTE: `GrpcResponse.body: Vec<u8>` is consumed by plugin hooks that
-    // take `&[u8]`, so staying on `Vec` avoids an extra `BytesMut::freeze
-    // → Vec` copy on the return path. `Vec::with_capacity` uses the same
-    // amortised-doubling growth as `BytesMut::put_slice`, so only the
-    // starting capacity matters for the allocation count — which is the
-    // actual fix.
+    // NOTE: the collected bytes are published as `GrpcResponse.body: Bytes`
+    // whose owner also holds the budget permit, so collecting into a `Vec` and
+    // moving it into that owner stays copy-free on the return path.
+    // `Vec::with_capacity` uses the same amortised-doubling growth as
+    // `BytesMut::put_slice`, so only the starting capacity matters for the
+    // allocation count — which is the actual fix.
+    //
+    // This arm RETAINS the whole gRPC payload, so a `0` ("unlimited") ceiling is
+    // folded to the fail-closed fallback and the retained bytes are charged
+    // against the process-wide aggregate budget (GHSA-pwcm-6rh8-f2gh). The
+    // charge is handed to the returned `Bytes` on success, so it survives for as
+    // long as the payload is resident; on every failure path the reservation
+    // simply drops and the blocks return.
+    use crate::proxy::response_buffer_budget;
+    let max_response_body_size_bytes =
+        response_buffer_budget::buffered_response_body_ceiling(max_response_body_size_bytes);
+
+    // The preallocation is resident memory the instant it is requested, so it
+    // is charged BEFORE the allocation rather than after the first DATA frame.
+    // Otherwise a flood of `content-length`-advertising responses that send no
+    // data (or stall) could each hold up to
+    // `MAX_GRPC_BUFFERED_PREALLOC_CAPACITY` completely uncharged. Growth past
+    // the hint is charged as a delta against this same reservation, so a
+    // preallocated response is never charged twice.
     let body_capacity = grpc_buffered_body_capacity_hint(response.headers());
-    let mut body_bytes = Vec::with_capacity(body_capacity);
+    let mut body_bytes = response_buffer_budget::ChargedBodyCollector::with_preallocation(
+        response_buffer_budget::BudgetRef::global(),
+        max_response_body_size_bytes,
+        body_capacity,
+    )
+    .map_err(|rejection| grpc_body_retain_error(rejection, max_response_body_size_bytes))?;
     let mut trailers = HashMap::new();
 
     let body_collection = async {
@@ -3466,16 +3505,16 @@ pub(crate) async fn proxy_grpc_request_core(
             match frame_result {
                 Ok(frame) => {
                     if let Some(data) = frame.data_ref() {
-                        if max_response_body_size_bytes > 0
-                            && body_bytes.len().saturating_add(data.len())
-                                > max_response_body_size_bytes
-                        {
-                            return Err(GrpcProxyError::ResponseTooLarge(format!(
-                                "gRPC response payload size exceeds maximum of {} bytes",
-                                max_response_body_size_bytes
-                            )));
+                        // The collector owns the ceiling check and the aggregate
+                        // charge, and charges the growth target BEFORE
+                        // allocating it, so a reallocation cannot leave capacity
+                        // resident outside the budget (GHSA-pwcm-6rh8-f2gh).
+                        if let Err(rejection) = body_bytes.append(data) {
+                            return Err(grpc_body_retain_error(
+                                rejection,
+                                max_response_body_size_bytes,
+                            ));
                         }
-                        body_bytes.extend_from_slice(data);
                     } else if let Ok(trailer_map) = frame.into_trailers() {
                         // Strip RFC 9110 §7.6.1 response-direction
                         // hop-by-hop names from gRPC trailers — same
@@ -3557,12 +3596,44 @@ pub(crate) async fn proxy_grpc_request_core(
         body_collection.await?;
     }
 
+    // Hand the charge to the retained allocation. From here the permit is owned
+    // by the `Bytes` (and by every cheap clone of it, exactly once), so it is
+    // returned when the payload is actually dropped rather than when this
+    // function returns. Publication is gated on the charge covering the buffer's
+    // real CAPACITY, so bytes the budget does not bound are never forwarded.
+    let Some(body) = body_bytes.into_charged_bytes() else {
+        return Err(GrpcProxyError::ResponseBufferCapacity(
+            response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
+        ));
+    };
     Ok(GrpcResponseKind::Buffered(GrpcResponse {
         status,
         headers: resp_headers,
-        body: body_bytes,
+        body,
         trailers,
     }))
+}
+
+/// Map a retained-allocation refusal onto the buffered gRPC error shape.
+///
+/// A ceiling overrun stays `ResponseTooLarge` (a backend attribution), while an
+/// exhausted aggregate budget stays `ResponseBufferCapacity`, which the caller
+/// renders as the health-neutral `RESOURCE_EXHAUSTED` terminal
+/// (GHSA-pwcm-6rh8-f2gh).
+fn grpc_body_retain_error(
+    rejection: crate::proxy::response_buffer_budget::RetainRejection,
+    limit: usize,
+) -> GrpcProxyError {
+    use crate::proxy::response_buffer_budget::{self, RetainRejection};
+    match rejection {
+        RetainRejection::TooLarge => GrpcProxyError::ResponseTooLarge(format!(
+            "gRPC response payload size exceeds maximum of {} bytes",
+            limit
+        )),
+        RetainRejection::BudgetExhausted => GrpcProxyError::ResponseBufferCapacity(
+            response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE.to_string(),
+        ),
+    }
 }
 
 /// Drain a backend `HeaderMap` of gRPC trailers into the buffered-response

@@ -64,6 +64,7 @@ mod proxy_protocol_tests;
 mod proxy_tests;
 mod request_context_tests;
 mod response_body_mode_tests;
+mod response_buffer_budget_tests;
 mod response_representation_tests;
 mod response_trailer_policy_tests;
 mod retry_tests;

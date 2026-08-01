@@ -28,6 +28,24 @@ fn example_sources_live_outside_production_discovery_directory() {
 }
 
 #[test]
+fn shipped_opt_in_examples_declare_never_response_body_production() {
+    let example = include_str!("../../custom_plugins/examples/example_plugin.rs");
+    let audit = include_str!("../../custom_plugins/examples/example_audit_plugin.rs");
+    for (name, source) in [("example_plugin", example), ("example_audit_plugin", audit)] {
+        assert!(
+            source.contains("fn response_body_production(&self) -> ResponseBodyProduction")
+                && source.contains("ResponseBodyProduction::Never"),
+            "{name} must explicitly declare ResponseBodyProduction::Never"
+        );
+        assert!(
+            !source.contains("fn transform_response_body")
+                && !source.contains("fn normalize_response_body"),
+            "{name}: Never must stay truthful (no response-body producer hooks)"
+        );
+    }
+}
+
+#[test]
 fn build_script_requires_explicit_opt_in_for_examples() {
     let build = include_str!("../../build.rs");
     assert!(

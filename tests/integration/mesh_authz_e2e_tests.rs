@@ -99,6 +99,7 @@ fn build_mesh_authz_for_workload(
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
         mesh_revision: None,
+        k8s_mesh_overlay: Default::default(),
     };
     let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
     let authz_config = prepared
@@ -1327,6 +1328,7 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
         mesh_revision: None,
+        k8s_mesh_overlay: Default::default(),
     };
     let prepared = prepare_gateway_config_for_mesh(config, &runtime).expect("mesh-prepared");
     let authz_cfg = prepared

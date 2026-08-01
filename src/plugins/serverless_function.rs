@@ -2800,12 +2800,13 @@ impl Plugin for ServerlessFunction {
         body: &[u8],
         backend_header_overlay: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if ctx
-            .metadata
-            .get("ai_stream_router_claimed")
-            .map(String::as_str)
-            == Some("true")
-        {
+        // Read the PRIVATE typed claim, not the public
+        // `ai_stream_router_claimed` metadata key: invoking a function is
+        // irreversible egress of the finalized provider-bound representation,
+        // so a later plugin deleting that observability marker must not be able
+        // to hand the committed provider credential, model, destination, and
+        // query to a function (`GHSA-xhp5-hqj8-3mwg`).
+        if ctx.has_ai_stream_router_claim() {
             return PluginResult::Continue;
         }
 

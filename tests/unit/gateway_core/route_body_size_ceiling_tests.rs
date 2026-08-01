@@ -349,3 +349,67 @@ fn route_ceilings_convert_to_usize_for_folding() {
     assert_eq!(ctx.route_request_body_limit(), Some(1024));
     assert_eq!(ctx.route_response_body_limit(), Some(2048));
 }
+
+// ---------------------------------------------------------------------------
+// GHSA-pwcm-6rh8-f2gh — a legacy `0` ("unlimited") response ceiling must not
+// produce an unbounded RETAINED buffer, and concurrent retained responses must
+// share a finite aggregate budget.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_configured_response_ceiling_is_honored_verbatim_on_the_buffered_path() {
+    for limit in [1usize, 4_096, 10_485_760, 1_073_741_824] {
+        assert_eq!(
+            ferrum_edge::_test_support::buffered_response_body_ceiling_for_test(limit),
+            limit,
+            "an operator-configured ceiling must not be widened or narrowed"
+        );
+    }
+}
+
+#[test]
+fn zero_response_ceiling_becomes_finite_when_the_body_is_retained() {
+    let ceiling = ferrum_edge::_test_support::buffered_response_body_ceiling_for_test(0);
+    assert!(
+        ceiling > 0,
+        "`0 = unlimited` is a streaming policy; a retained buffer must stay bounded"
+    );
+}
+
+#[test]
+fn the_aggregate_budget_is_finite_and_always_admits_one_fallback_sized_response() {
+    let unit = ferrum_edge::_test_support::RESPONSE_BUFFER_RESERVATION_UNIT_BYTES;
+    assert!(unit > 0);
+
+    // A degenerate total must not refuse every response outright.
+    assert!(
+        ferrum_edge::_test_support::response_buffer_budget_blocks_for_test(unit, 0) >= 1,
+        "the aggregate budget is clamped up to at least the FALLBACK per-response ceiling"
+    );
+
+    // Stated exactly: the floor is the FALLBACK ceiling, not an arbitrarily
+    // larger configured per-response ceiling. A 1 GiB fallback floors the total
+    // at 1 GiB...
+    let floored =
+        ferrum_edge::_test_support::response_buffer_budget_blocks_for_test(1_073_741_824, 0);
+    assert_eq!(floored, 1_073_741_824usize.div_ceil(unit));
+
+    // ...but a small configured total is NOT widened to fit a large
+    // *per-response* ceiling the operator set elsewhere. The budget below is
+    // exactly what was asked for (16 MiB), even though a route could configure a
+    // 1 GiB per-response ceiling: such a response is refused rather than
+    // silently uncapping the aggregate bound.
+    let not_widened =
+        ferrum_edge::_test_support::response_buffer_budget_blocks_for_test(unit, 16 * 1024 * 1024);
+    assert_eq!(not_widened, (16 * 1024 * 1024usize).div_ceil(unit));
+
+    // The budget scales with the configured total, in whole blocks.
+    let blocks = ferrum_edge::_test_support::response_buffer_budget_blocks_for_test(
+        10 * 1024 * 1024,
+        256 * 1024 * 1024,
+    );
+    assert_eq!(blocks, (256 * 1024 * 1024usize).div_ceil(unit));
+
+    // And it is finite: no configuration yields an unbounded permit pool.
+    assert!(blocks < usize::MAX);
+}

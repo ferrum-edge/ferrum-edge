@@ -231,37 +231,147 @@ impl SsePlugin {
         is_text_event_stream_media_type(content_type.trim())
     }
 
-    /// Wrap normalized text into one SSE event, preserving terminal newlines.
-    fn wrap_body_as_sse_event(&self, body: &[u8]) -> Vec<u8> {
+    /// Wrap normalized text into one SSE event, preserving terminal newlines,
+    /// inside a ceiling-bounded sink.
+    ///
+    /// `None` means the framed event would not fit the retained-response ceiling
+    /// this response is being rewritten under; the refusal happens while the
+    /// event is being written, so the oversized buffer is never allocated
+    /// (GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// Every byte is written THROUGH the sink: the lossy UTF-8 decode and the
+    /// CR/CRLF normalization run incrementally over the input, so no complete
+    /// `String` copy of the (attacker-chosen) body is ever materialised beside
+    /// the bounded output. The observable framing is unchanged — see
+    /// [`write_lossy_sse_data`] for the exact equivalence.
+    fn wrap_body_as_sse_event(&self, body: &[u8], ceiling: usize) -> Option<Vec<u8>> {
+        use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+        let mut output = BoundedResponseBodySink::with_ceiling(ceiling);
+
+        if let Some(retry_field) = &self.retry_field
+            && !output.push(retry_field)
+        {
+            return None;
+        }
+
         // Per the WHATWG EventSource algorithm, each `data:` field appends its
         // value plus LF to the data buffer, then dispatch removes exactly one
         // trailing LF. A payload that itself ends in LF therefore requires an
-        // empty final `data:` field. `str::lines()` drops a single trailing
-        // terminator, so restore it when the normalized body ends with `\n`.
-        //
-        // Normalize CRLF and lone CR to LF first so no bare CR reaches the wire
-        // (lone CR would reintroduce field-injection boundaries).
-        let body_str = String::from_utf8_lossy(body);
-        let normalized = body_str.replace("\r\n", "\n").replace('\r', "\n");
-        let ends_with_newline = normalized.ends_with('\n');
-        let mut output = Vec::with_capacity(normalized.len() + 64);
-
-        if let Some(retry_field) = &self.retry_field {
-            output.extend_from_slice(retry_field);
-        }
-
-        for line in normalized.lines() {
-            output.extend_from_slice(b"data: ");
-            output.extend_from_slice(line.as_bytes());
-            output.push(b'\n');
-        }
-        if ends_with_newline {
-            output.extend_from_slice(b"data: \n");
+        // empty final `data:` field — which is exactly the empty final piece a
+        // plain LF split yields, so the incremental writer below needs no
+        // separate trailing-newline step. An EMPTY body is the one case where
+        // the two differ (a split would still yield one empty piece), and it
+        // must emit no `data:` field at all, matching `str::lines()`.
+        if !body.is_empty() {
+            if !output.push(SSE_DATA_FIELD_PREFIX) {
+                return None;
+            }
+            if !write_lossy_sse_data(&mut output, body) {
+                return None;
+            }
+            if !output.push(b"\n") {
+                return None;
+            }
         }
         // Blank line terminates the event.
-        output.push(b'\n');
-        output
+        if !output.push(b"\n") {
+            return None;
+        }
+        output.finish()
     }
+}
+
+/// The `data: ` field prefix each normalized line is emitted under.
+const SSE_DATA_FIELD_PREFIX: &[u8] = b"data: ";
+
+/// UTF-8 encoding of U+FFFD REPLACEMENT CHARACTER, the byte sequence
+/// `String::from_utf8_lossy` substitutes for each maximal invalid subpart.
+const UTF8_REPLACEMENT_CHARACTER: &[u8] = &[0xEF, 0xBF, 0xBD];
+
+/// Write `body` into `output` as the values of one or more `data:` fields,
+/// decoding lossily and normalizing line endings as it goes.
+///
+/// The caller has already written the first `data: ` prefix; this writes each
+/// field value and, at every line break, the `\n` that closes the field plus the
+/// `data: ` prefix that opens the next one. The caller writes the final `\n`.
+///
+/// Equivalence with the previous two-copy implementation
+/// (`String::from_utf8_lossy(body).replace("\r\n", "\n").replace('\r', "\n")`
+/// then `lines()`):
+///
+/// * lossy decoding substitutes one U+FFFD per maximal invalid subpart, which is
+///   exactly `Utf8Error::error_len()` (and one for an incomplete trailing
+///   sequence), so the decode is byte-identical;
+/// * `\r\n` and a lone `\r` both collapse to a single `\n`. CR and LF are ASCII,
+///   so a `\r\n` pair can never straddle a valid/invalid segment boundary: a
+///   segment that ends in `\r` is followed by an invalid byte, which is a lone
+///   CR under both implementations;
+/// * splitting the normalized text on `\n` and emitting every piece — including
+///   a trailing empty one — is `lines()` plus the explicit
+///   "ends with newline ⇒ emit an empty `data:` field" step, for every non-empty
+///   body. The caller special-cases the empty body.
+///
+/// No bare CR reaches the wire, so the field-injection boundary protection is
+/// preserved.
+fn write_lossy_sse_data(
+    output: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+    body: &[u8],
+) -> bool {
+    let mut rest = body;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => return write_normalized_sse_text(output, valid.as_bytes()),
+            Err(error) => {
+                let (valid, invalid) = rest.split_at(error.valid_up_to());
+                if !write_normalized_sse_text(output, valid) {
+                    return false;
+                }
+                if !output.push(UTF8_REPLACEMENT_CHARACTER) {
+                    return false;
+                }
+                match error.error_len() {
+                    Some(len) => rest = &invalid[len..],
+                    // An incomplete trailing sequence: one replacement
+                    // character and nothing after it, as lossy decoding does.
+                    None => return true,
+                }
+            }
+        }
+    }
+}
+
+/// Write one valid-UTF-8 run, closing and re-opening a `data:` field at each
+/// `\r\n`, lone `\r`, or `\n`.
+///
+/// Operates on bytes: CR and LF are ASCII, and every continuation byte of a
+/// multi-byte UTF-8 sequence is `>= 0x80`, so scanning for them cannot split a
+/// character.
+fn write_normalized_sse_text(
+    output: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+    text: &[u8],
+) -> bool {
+    let mut start = 0;
+    let mut index = 0;
+    while index < text.len() {
+        let byte = text[index];
+        if byte != b'\r' && byte != b'\n' {
+            index += 1;
+            continue;
+        }
+        if !output.push(&text[start..index])
+            || !output.push(b"\n")
+            || !output.push(SSE_DATA_FIELD_PREFIX)
+        {
+            return false;
+        }
+        index += if byte == b'\r' && text.get(index + 1) == Some(&b'\n') {
+            2
+        } else {
+            1
+        };
+        start = index;
+    }
+    output.push(&text[start..])
 }
 
 /// Remove SSE lifecycle/control metadata from operator-visible transaction logs
@@ -657,7 +767,11 @@ impl super::Plugin for SsePlugin {
             return None;
         }
 
-        let output = self.wrap_body_as_sse_event(body);
+        // Built inside a sink sized to this response's retained ceiling, so an
+        // event that would exceed it is refused during construction rather than
+        // allocated and rejected afterwards (GHSA-pwcm-6rh8-f2gh). A refusal
+        // leaves the original body in place.
+        let output = self.wrap_body_as_sse_event(body, ctx.retained_response_body_ceiling())?;
         debug!(
             plugin = "sse",
             original_bytes = body.len(),

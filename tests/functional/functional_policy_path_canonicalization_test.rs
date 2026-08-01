@@ -804,6 +804,7 @@ fn seed_pending_http01_order(store_dir: &std::path::Path) {
         }],
         tls_alpn01_challenges: Vec::new(),
         dns01_challenges: Vec::new(),
+        finalization: None,
         error: None,
     })
     .expect("build ACME order");

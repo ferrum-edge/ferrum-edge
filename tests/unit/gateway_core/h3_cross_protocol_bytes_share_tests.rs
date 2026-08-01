@@ -228,25 +228,55 @@ fn committed_hook_deadline_boundary_accepts_bytes_without_copy() {
 }
 
 #[test]
-fn buffered_backend_response_from_body_read_keeps_reqwest_bytes() {
+fn eager_backend_collection_publishes_charged_bytes_without_a_copy() {
     let proxy = include_str!("../../../src/proxy/mod.rs");
-    let reader = proxy
-        .split("fn buffered_backend_response_from_body_read(")
+    let collector = proxy
+        .split("async fn eager_collect_charged_backend_body(")
         .nth(1)
-        .expect("buffered backend body reader")
+        .expect("eager charged collector")
+        .split("\nfn buffered_backend_response_from_eager_collect(")
+        .next()
+        .expect("bounded eager charged collector");
+    assert!(
+        collector.contains("ChargedBodyCollector::with_preallocation("),
+        "the eager path must drive the SAME charged collector the buffered paths \
+         use, so every growth is charged before it is allocated instead of \
+         reconciling an opaque read afterwards (GHSA-pwcm-6rh8-f2gh)"
+    );
+    assert!(
+        collector.contains("response.bytes_stream()"),
+        "the eager path must consume the body as a chunk stream; awaiting \
+         `bytes()` materializes an allocation of opaque capacity first"
+    );
+    assert!(
+        collector.contains("into_charged_bytes()"),
+        "the collected body must publish with its charge attached, not with a \
+         collector-local reservation that drops"
+    );
+
+    let reader = proxy
+        .split("\nfn buffered_backend_response_from_eager_collect(")
+        .nth(1)
+        .expect("eager backend response builder")
         .split("fn eager_buffer_body_read_status_and_class(")
         .next()
-        .expect("bounded buffered backend body reader");
+        .expect("bounded eager backend response builder");
     assert!(
-        reader.contains("Result<bytes::Bytes, reqwest::Error>"),
-        "successful reqwest body reads must stay as Bytes"
+        reader.contains("ResponseBody::buffered(charged)"),
+        "buffered backend responses must store the charged Bytes directly"
     );
     assert!(
-        reader.contains("ResponseBody::buffered(b)"),
-        "buffered backend responses must store Bytes directly"
+        !reader.contains("copy_from_slice"),
+        "buffered backend responses must not copy the collected body"
     );
     assert!(
-        !reader.contains("b.to_vec()"),
-        "buffered backend responses must not force Vec conversion"
+        reader.contains("RetainRejection::TooLarge"),
+        "a body past the retained ceiling must keep its BACKEND attribution \
+         rather than being reported as aggregate exhaustion"
+    );
+    assert!(
+        reader.contains("response_buffer_capacity_response(proxy, resolved_ip, transport)"),
+        "an unaffordable eager buffer must fail closed with the shared neutral \
+         gateway-capacity response"
     );
 }

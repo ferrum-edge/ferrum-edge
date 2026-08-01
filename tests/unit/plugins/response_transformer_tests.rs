@@ -2289,3 +2289,205 @@ async fn test_response_transformer_header_mutations_never_log_configured_values(
         "remove should still emit a name-only diagnostic"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GHSA-pwcm-6rh8-f2gh — ordinary representations the body transform provably
+// declines are released once the backend names their media type, rather than
+// collected up to the response ceiling and rejected unread. Ambiguous
+// event-stream lookalikes are the fail-closed exception: they remain bounded so
+// a substring resemblance cannot grant unbounded SSE treatment.
+// ---------------------------------------------------------------------------
+
+fn headers_from(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect()
+}
+
+#[test]
+fn non_transformable_media_types_are_released_after_headers() {
+    let plugin = body_update_plugin();
+    let ctx = make_ctx();
+    assert!(
+        plugin.should_buffer_response_body(&ctx),
+        "the pre-header vote stays conservative"
+    );
+
+    for (content_type, extra) in [
+        ("application/octet-stream", Vec::new()),
+        ("image/png", Vec::new()),
+        ("video/mp4", vec![("content-range", "bytes 0-99/100000000")]),
+        ("text/event-stream", Vec::new()),
+        // Encoded, but not a JSON document: the transform declines it on media
+        // type alone, so nothing was ever going to read these bytes.
+        (
+            "application/octet-stream",
+            vec![("content-encoding", "gzip")],
+        ),
+        // Framed gRPC satisfies `is_json_content_type` via `+json` but carries
+        // length-prefixed frames the transform declines.
+        ("application/grpc+json", Vec::new()),
+    ] {
+        let mut pairs = vec![("content-type", content_type)];
+        pairs.extend(extra.iter().copied());
+        let response_headers = headers_from(&pairs);
+        assert!(
+            !plugin.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some(content_type),
+                200,
+                &response_headers,
+            ),
+            "`{content_type}` is declined by the transform and must not be buffered"
+        );
+    }
+}
+
+#[test]
+fn json_and_untyped_representations_keep_the_buffered_path() {
+    let plugin = body_update_plugin();
+    let ctx = make_ctx();
+
+    let json_headers = headers_from(&[("content-type", "application/json")]);
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &json_headers,
+    ));
+
+    // Encoded JSON stays buffered: releasing opaque wire bytes would forward a
+    // representation past a configured redaction instead of failing closed.
+    let encoded_json = headers_from(&[
+        ("content-type", "application/json"),
+        ("content-encoding", "gzip"),
+    ]);
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &encoded_json,
+    ));
+
+    // An ABSENT Content-Type is treated as JSON by the transform, so it must
+    // still be inspected.
+    let untyped = HashMap::new();
+    assert!(plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &untyped));
+}
+
+#[test]
+fn a_disabled_or_header_only_instance_never_pins_a_body() {
+    // No body rules at all: nothing to collect for.
+    let header_only = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "x-demo", "value": "1"}
+        ]
+    }))
+    .unwrap();
+    let ctx = make_ctx();
+    assert!(!header_only.should_buffer_response_body(&ctx));
+    let headers = headers_from(&[("content-type", "application/json")]);
+    assert!(!header_only.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &headers,
+    ));
+}
+
+/// A claimed JSON rewrite that cannot fit the retained ceiling must mark the
+/// pending capacity-refusal signal. Ordinary unclaimed / semantic no-op paths
+/// must leave that signal clear so the shared transform loop keeps treating
+/// them as no-ops (GHSA-pwcm-6rh8-f2gh).
+#[tokio::test]
+async fn claimed_body_rewrite_marks_capacity_refusal_distinct_from_noop() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_STATUS,
+        stamp_original_response_metadata_for_test,
+        take_buffered_response_capacity_refusal_pending_for_test,
+        transform_buffered_response_body_with_deadline_full_for_test,
+    };
+
+    let amplifying = ResponseTransformer::new(&json!({
+        "rules": [
+            {
+                "operation": "update",
+                "target": "body",
+                "key": "state",
+                "value": "x".repeat(200)
+            }
+        ]
+    }))
+    .unwrap();
+    let body = br#"{"state":"a"}"#;
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+    let mut ctx = make_ctx();
+    ctx.max_response_body_size_bytes = 40;
+    assert!(
+        amplifying
+            .transform_response_body_with_context(
+                &mut ctx,
+                body,
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "an over-ceiling claimed rewrite must return None"
+    );
+    assert!(
+        take_buffered_response_capacity_refusal_pending_for_test(&mut ctx),
+        "capacity refusal must mark the pending transform signal"
+    );
+
+    // Non-JSON media types are unclaimed ordinary None — no pending signal.
+    let mut noop_ctx = make_ctx();
+    noop_ctx.max_response_body_size_bytes = 40;
+    assert!(
+        amplifying
+            .transform_response_body_with_context(
+                &mut noop_ctx,
+                b"<html></html>",
+                Some("text/html"),
+                &HashMap::from([("content-type".to_string(), "text/html".to_string())]),
+            )
+            .await
+            .is_none()
+    );
+    assert!(
+        !take_buffered_response_capacity_refusal_pending_for_test(&mut noop_ctx),
+        "ordinary unclaimed None must not mark a capacity refusal"
+    );
+
+    // Full buffered lifecycle must install the shared HTTP capacity terminal
+    // rather than forwarding the original body after a claimed refusal.
+    let plugin = Arc::new(amplifying) as Arc<dyn Plugin>;
+    let mut loop_ctx = make_ctx();
+    loop_ctx.max_response_body_size_bytes = 40;
+    let mut status = 200u16;
+    let mut loop_headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), body.len().to_string()),
+    ]);
+    stamp_original_response_metadata_for_test(&mut loop_ctx, status, &loop_headers);
+    let mut body_buf = bytes::Bytes::from(body.to_vec());
+    let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
+        &[plugin],
+        &mut loop_ctx,
+        &mut status,
+        &mut loop_headers,
+        &mut body_buf,
+        None,
+        false,
+    )
+    .await;
+    assert!(replaced);
+    assert_eq!(status, RESPONSE_BUFFER_OVERLOAD_STATUS);
+    assert_eq!(&body_buf[..], RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+    assert!(
+        !take_buffered_response_capacity_refusal_pending_for_test(&mut loop_ctx),
+        "the shared transform loop must consume the pending signal"
+    );
+}

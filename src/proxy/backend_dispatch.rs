@@ -750,6 +750,13 @@ pub(crate) fn record_backend_outcome_no_conn_end(
 ///   permit — those would penalize a backend that was never contacted and let
 ///   an overflow burst falsely eject a healthy target. Without this, default
 ///   CB/AC failure classification (which counts 503) would do exactly that.
+/// * `GatewayBufferCapacity` — the process-wide budget for *retained* response
+///   bodies refused this response (GHSA-pwcm-6rh8-f2gh). The backend answered
+///   correctly and within every configured per-response ceiling; the gateway
+///   was simply out of retention capacity at that instant. Counting that 503
+///   against the backend would let a gateway-local memory bound eject healthy
+///   targets — including every target at once, since the budget is
+///   process-global and shared by all of them.
 #[inline]
 pub(crate) fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> bool {
     matches!(
@@ -758,6 +765,7 @@ pub(crate) fn client_side_no_backend_signal(error_class: Option<ErrorClass>) -> 
             ErrorClass::ClientDisconnect
                 | ErrorClass::RequestBodyTooLarge
                 | ErrorClass::DispatchPolicyRejected
+                | ErrorClass::GatewayBufferCapacity
         )
     )
 }

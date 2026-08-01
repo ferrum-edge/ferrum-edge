@@ -568,10 +568,13 @@ fn pre_copy_disconnect_cause(
         // and `NoHealthyTargets` (backend-side); reaching here means the chain
         // has no typed kind, so defer to a conservative recv-side fallback
         // rather than substring-matching. Migrate remaining untyped sites to
-        // `StreamSetupError` to remove this fallback.
-        ErrorClass::DispatchPolicyRejected | ErrorClass::RequestError => {
-            DisconnectCause::RecvError
-        }
+        // `StreamSetupError` to remove this fallback. `GatewayBufferCapacity`
+        // joins them: it is an HTTP-family retained-response refusal with no
+        // stream-family producer at all, routed only because the match is
+        // exhaustive.
+        ErrorClass::DispatchPolicyRejected
+        | ErrorClass::GatewayBufferCapacity
+        | ErrorClass::RequestError => DisconnectCause::RecvError,
     }
 }
 
@@ -610,9 +613,10 @@ fn pre_copy_disconnect_direction(error: &anyhow::Error, class: &ErrorClass) -> D
         }
         // Unknown side — leave it ambiguous so log consumers know the proxy
         // could not attribute the failure.
-        ErrorClass::TlsError | ErrorClass::DispatchPolicyRejected | ErrorClass::RequestError => {
-            Direction::Unknown
-        }
+        ErrorClass::TlsError
+        | ErrorClass::DispatchPolicyRejected
+        | ErrorClass::GatewayBufferCapacity
+        | ErrorClass::RequestError => Direction::Unknown,
     }
 }
 

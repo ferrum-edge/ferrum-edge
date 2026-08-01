@@ -135,6 +135,7 @@ fn create_test_proxy_state(proxies: Vec<Proxy>) -> ProxyState {
         trust_bundles: None,
         mesh: None,
         mesh_revision: None,
+        k8s_mesh_overlay: Default::default(),
     };
     ProxyState::new(config, dns_cache, create_test_env_config(), None, None)
         .unwrap()
@@ -537,6 +538,7 @@ fn create_test_proxy_state_with_env(
         trust_bundles: None,
         mesh: None,
         mesh_revision: None,
+        k8s_mesh_overlay: Default::default(),
     };
     ProxyState::new(config, dns_cache, env_config, None, None)
         .unwrap()

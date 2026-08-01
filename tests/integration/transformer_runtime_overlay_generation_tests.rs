@@ -190,6 +190,7 @@ fn generation(
         trust_bundles: None,
         mesh: None,
         mesh_revision: None,
+        k8s_mesh_overlay: Default::default(),
     };
     materialize_transformer_runtime_overlay_for_test(&mut config, &overlay(gate_key, enabled));
     config.normalize_fields();

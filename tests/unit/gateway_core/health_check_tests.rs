@@ -935,6 +935,7 @@ fn config_with_upstreams(upstreams: Vec<Upstream>) -> GatewayConfig {
         trust_bundles: None,
         mesh: None,
         mesh_revision: None,
+        k8s_mesh_overlay: Default::default(),
     }
 }
 

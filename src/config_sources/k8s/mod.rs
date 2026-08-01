@@ -120,6 +120,22 @@ pub struct K8sTranslationOptions {
     /// default and the slice builder). Egress narrowing has its OWN, looser gate
     /// (`enforced || dry_run`) and is not affected by this.
     pub mesh_sidecar_ingress_enforced: bool,
+    /// Whether this Kubernetes source is an authoritative owner of mesh state
+    /// (issue #2452).
+    ///
+    /// True exactly when the controller watches at least one mesh-contributing
+    /// kind — Istio CRDs, Gateway API (waypoint bindings / mesh services), or
+    /// core Pod/Service/EndpointSlice discovery. Only then may an empty
+    /// translation withdraw previously published Kubernetes mesh objects;
+    /// a controller that watches none of them owns nothing and must never
+    /// withdraw mesh state another source published.
+    ///
+    /// Deliberately derived from CONFIGURATION, not from the current
+    /// snapshot's contents: deriving it from content would revoke authority at
+    /// exactly the moment the last object is deleted, which is the bug this
+    /// flag exists to fix. Defaults to `false` so a caller that has not thought
+    /// about ownership cannot widen Kubernetes authority by accident.
+    pub mesh_overlay_authority: bool,
     source_namespaces: Option<HashSet<String>>,
     pod_source_namespaces: Option<HashSet<String>>,
 }
@@ -181,6 +197,7 @@ impl K8sTranslationOptions {
             cluster_domain: "cluster.local".to_string(),
             pod_discovery_enabled: false,
             mesh_sidecar_ingress_enforced: false,
+            mesh_overlay_authority: false,
             source_namespaces: Some(source_namespaces),
             pod_source_namespaces: Some(pod_source_namespaces),
         }
@@ -198,6 +215,13 @@ impl K8sTranslationOptions {
     /// builder actually materializes.
     pub fn with_mesh_sidecar_ingress_enforced(mut self, enforced: bool) -> Self {
         self.mesh_sidecar_ingress_enforced = enforced;
+        self
+    }
+
+    /// Declare whether this Kubernetes source authoritatively owns mesh state.
+    /// See [`K8sTranslationOptions::mesh_overlay_authority`].
+    pub fn with_mesh_overlay_authority(mut self, authoritative: bool) -> Self {
+        self.mesh_overlay_authority = authoritative;
         self
     }
 
@@ -769,11 +793,22 @@ impl K8sAccumulator {
         self.mesh.proxy_configs.sort_by(|left, right| {
             (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
         });
-        let empty_mesh = MeshConfig {
-            istio_root_namespace: self.mesh.istio_root_namespace.clone(),
-            ..MeshConfig::default()
+        // Claim mesh ownership of this translation. `Authoritative` with an
+        // EMPTY `mesh` is the load-bearing state (issue #2452): it says "this
+        // managed Kubernetes snapshot supplies no mesh objects", which the
+        // merge withdraws, as distinct from `NoAuthority`, which says
+        // "Kubernetes is not a mesh source at all; leave whatever another
+        // source owns alone". A translation has no base layer underneath it —
+        // every object in its `mesh` is Kubernetes-owned by construction.
+        self.config.k8s_mesh_overlay = if self.options.mesh_overlay_authority {
+            crate::config::types::K8sMeshOverlay::authoritative_translation()
+        } else {
+            crate::config::types::K8sMeshOverlay::NoAuthority
         };
-        if self.mesh != empty_mesh {
+        // An empty mesh still serializes as `None` so `mesh.is_some()` keeps
+        // meaning "this deployment has mesh state" for every reader; the
+        // authority marker above, not `mesh`, is what carries the withdrawal.
+        if !self.mesh.is_empty_overlay() {
             self.config.mesh = Some(Box::new(self.mesh));
         }
         let mut known_namespaces: Vec<String> = self.known_namespaces.into_iter().collect();

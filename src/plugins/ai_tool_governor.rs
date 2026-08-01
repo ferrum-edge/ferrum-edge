@@ -3273,6 +3273,11 @@ impl Plugin for AiToolGovernor {
             return None;
         }
         let mut json: Value = serde_json::from_slice(strip_json_bom(body)).ok()?;
+        // The redacted document is serialized through a sink bounded by this
+        // response's retained ceiling as well as the inspectable limit, so an
+        // escaping-amplified rewrite is refused while it is written
+        // (GHSA-pwcm-6rh8-f2gh).
+        let retained_ceiling = ctx.retained_response_body_ceiling();
         // Consume the preflight memo with the rewrite attempt so hostile
         // redacted arguments are not retained after the transform installs
         // them (or after AmplificationFailed clears skip state).
@@ -3281,7 +3286,7 @@ impl Plugin for AiToolGovernor {
             .remove(&self.instance_id);
         match self.redact_response(&mut json, redaction_memos.as_ref()) {
             RedactTransform::Changed => {
-                let rewritten = match serialize_json_bounded(&json) {
+                let rewritten = match serialize_json_bounded(&json, retained_ceiling) {
                     Ok(rewritten) => rewritten,
                     Err(()) => {
                         // A JSON string may require escaping on serialization,
@@ -5530,35 +5535,18 @@ fn push_redaction_bytes(output: &mut String, value: &str) -> Result<(), ()> {
 /// Serialize a transformed JSON response without ever retaining more than the
 /// inspectable body limit. `serde_json::to_vec` would allocate the complete
 /// escaped representation before the caller could reject an oversized result.
-fn serialize_json_bounded(value: &Value) -> Result<Vec<u8>, ()> {
-    struct BoundedWriter {
-        output: Vec<u8>,
-    }
-
-    impl std::io::Write for BoundedWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            let next_len = self.output.len().checked_add(bytes.len()).ok_or_else(|| {
-                std::io::Error::other("ai_tool_governor JSON output length overflow")
-            })?;
-            if next_len > MAX_PARSE_BYTES {
-                return Err(std::io::Error::other(
-                    "ai_tool_governor JSON output exceeds inspectable limit",
-                ));
-            }
-            self.output.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut writer = BoundedWriter {
-        output: Vec::with_capacity(64 * 1024),
-    };
-    serde_json::to_writer(&mut writer, value).map_err(|_| ())?;
-    Ok(writer.output)
+/// Serialize the redacted response document under BOTH bounds: this plugin's
+/// inspectable limit and the response's retained ceiling.
+///
+/// Both are enforced by the shared ceiling-bounded sink, so serialization stops
+/// at the tighter of the two instead of materialising an oversized buffer that a
+/// later check would reject (GHSA-pwcm-6rh8-f2gh).
+fn serialize_json_bounded(value: &Value, retained_ceiling: usize) -> Result<Vec<u8>, ()> {
+    crate::proxy::response_buffer_budget::bounded_json_vec(
+        value,
+        MAX_PARSE_BYTES.min(retained_ceiling),
+    )
+    .ok_or(())
 }
 
 /// Borrow the leading `max_bytes` bytes of `s`, snapped down to a char boundary

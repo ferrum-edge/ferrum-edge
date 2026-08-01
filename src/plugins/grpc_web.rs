@@ -125,7 +125,7 @@ static INSTANCE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Written once by the translation owner; read by proxy/H3 dispatch helpers.
 const META_GRPC_WEB_MODE: &str = "grpc_web_mode";
 /// Metadata key storing the negotiated gRPC-Web response content-type.
-const META_GRPC_WEB_ORIGINAL_CT: &str = "grpc_web_original_ct";
+pub(crate) const META_GRPC_WEB_ORIGINAL_CT: &str = "grpc_web_original_ct";
 /// Metadata key storing the backend HTTP status observed in `after_proxy`.
 ///
 /// `transform_response_body` cannot see response status directly, so the
@@ -873,11 +873,11 @@ fn bytes_are_grpc_web_text_frames(data: &[u8]) -> bool {
 /// segment must itself decode. Anything else answers `None`, leaving the body
 /// claimed. A JSON document still never reaches the decoder — `{`, `[`, and `"`
 /// are outside the alphabet, so the very first group rejects.
-fn decode_grpc_web_text_body(data: &[u8]) -> Option<Vec<u8>> {
-    fn is_base64_alphabet(byte: u8) -> bool {
-        byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
-    }
+fn is_base64_alphabet(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
+}
 
+fn decode_grpc_web_text_body(data: &[u8]) -> Option<Vec<u8>> {
     if data.is_empty() || !data.len().is_multiple_of(4) {
         return None;
     }
@@ -1012,17 +1012,33 @@ impl GrpcWebPlugin {
         response_headers.insert("access-control-expose-headers".to_string(), combined);
     }
 
+    /// Frame a gRPC-Web response body inside a `ceiling`-bounded sink.
+    ///
+    /// The output is the input plus one trailer frame (and, in text mode, the
+    /// base64 armouring of both), so it has a finite bound derived from bytes
+    /// that are already charged — but the bound is ENFORCED rather than assumed:
+    /// every append goes through the sink, which refuses the write that would
+    /// carry the buffer past the retained ceiling instead of allocating it
+    /// (GHSA-pwcm-6rh8-f2gh). A ceiling refusal returns
+    /// [`crate::plugins::BoundedResponseBodyConstruction::CapacityRefused`];
+    /// ordinary ineligibility / integrity failures stay
+    /// [`crate::plugins::BoundedResponseBodyConstruction::Unchanged`].
     fn transform_grpc_web_response_body(
         &self,
         body: &[u8],
         _content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
         provenance: TrailerFrameProvenance,
-    ) -> Option<Vec<u8>> {
+        ceiling: usize,
+    ) -> crate::plugins::BoundedResponseBodyConstruction {
+        use crate::plugins::BoundedResponseBodyConstruction;
+
         // Only transform if response content-type is gRPC-Web (set by after_proxy)
-        let ct = response_headers.get("content-type")?;
+        let Some(ct) = response_headers.get("content-type") else {
+            return BoundedResponseBodyConstruction::Unchanged;
+        };
         if !is_grpc_web_content_type(ct) {
-            return None;
+            return BoundedResponseBodyConstruction::Unchanged;
         }
 
         let is_text = is_grpc_web_text(ct);
@@ -1030,43 +1046,133 @@ impl GrpcWebPlugin {
         // Build the gRPC-Web response:
         // 1. Keep existing data frames from the body
         // 2. Append a trailer frame with gRPC status metadata
-        let mut output = Vec::with_capacity(body.len() + 64);
+        //
+        // Text mode base64-expands by 4/3, so the BINARY pre-image is measured
+        // under the base64 pre-image of the ceiling while the armoured bytes are
+        // written straight into a sink bounded by the ceiling itself. Nothing
+        // holds a second complete copy of the encoded replacement.
+        let binary_ceiling = if is_text { ceiling / 4 * 3 } else { ceiling };
+        use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
 
-        // Copy the original response body (data frames)
-        output.extend_from_slice(body);
-
-        // Build and append trailer frame from response headers. When the
-        // backend omitted a valid grpc-status, synthesize from the stashed
-        // HTTP status (official client mapping). Provenance (when recorded)
-        // keeps initial-header-only fields out of the body trailer block.
-        let trailer_frame = build_trailer_frame_with_full_provenance(
+        // The trailer payload is emitted TWICE and retained neither time
+        // (GHSA-pwcm-6rh8-f2gh). The frame header declares the payload length,
+        // so the length must be known before the payload can be written; the
+        // counting pass below establishes it under the room the data frames and
+        // the frame header leave, WITHOUT holding a single trailer value, and
+        // the writing pass then emits the payload straight into the final
+        // bounded destination (the binary sink, or the base64 encoder streaming
+        // into the text sink). Neither a complete trailer payload nor a complete
+        // binary preimage is ever resident beside the output.
+        //
+        // When the backend omitted a valid grpc-status, the writer synthesizes
+        // from the stashed HTTP status (official client mapping). Provenance
+        // (when recorded) keeps initial-header-only fields out of the body
+        // trailer block. Both passes read the same immutable header map, so they
+        // produce identical bytes; the written length is re-checked below
+        // anyway, so a disagreement fails closed instead of shipping a frame
+        // whose declared length lies.
+        let Some(payload_ceiling) = binary_ceiling
+            .checked_sub(body.len())
+            .and_then(|room| room.checked_sub(GRPC_FRAME_HEADER_BYTES))
+        else {
+            return BoundedResponseBodyConstruction::CapacityRefused;
+        };
+        let mut counted = CountingTrailerPayloadSink::with_ceiling(payload_ceiling);
+        if !write_trailer_frame_payload(
+            &mut counted,
             response_headers,
             provenance.http_status,
             provenance.trailer_name_allowlist,
             provenance.shadowed_trailers,
             provenance.policy_state,
-        );
-        output.extend(trailer_frame);
+        ) {
+            return BoundedResponseBodyConstruction::CapacityRefused;
+        }
+        let payload_len_usize = counted.len;
+        let Some(payload_len) = u32::try_from(payload_len_usize).ok() else {
+            return BoundedResponseBodyConstruction::CapacityRefused;
+        };
+        let mut frame_header = [0u8; GRPC_FRAME_HEADER_BYTES];
+        frame_header[0] = GRPC_FRAME_TRAILER;
+        frame_header[1..].copy_from_slice(&payload_len.to_be_bytes());
+        let binary_len = body.len() + frame_header.len() + payload_len_usize;
 
-        // For text mode, base64-encode the entire output
+        let mut output = BoundedResponseBodySink::with_ceiling(ceiling);
         if is_text {
-            let encoded = BASE64.encode(&output);
+            // Stream the base64 armouring straight into the bounded sink from
+            // the FIRST encoded byte: the encoder writes through the ceiling, so
+            // neither the binary concatenation nor a complete encoded `String`
+            // is ever materialised beside the output.
+            let engine = BASE64;
+            {
+                use std::io::Write;
+                let mut encoder = base64::write::EncoderWriter::new(&mut output, &engine);
+                if encoder.write_all(body).is_err() || encoder.write_all(&frame_header).is_err() {
+                    return BoundedResponseBodyConstruction::CapacityRefused;
+                }
+                if !write_trailer_frame_payload(
+                    &mut WriterTrailerPayloadSink(&mut encoder),
+                    response_headers,
+                    provenance.http_status,
+                    provenance.trailer_name_allowlist,
+                    provenance.shadowed_trailers,
+                    provenance.policy_state,
+                ) {
+                    return BoundedResponseBodyConstruction::CapacityRefused;
+                }
+                if encoder.finish().is_err() {
+                    return BoundedResponseBodyConstruction::CapacityRefused;
+                }
+            }
+            let Some(encoded) = output.finish() else {
+                return BoundedResponseBodyConstruction::CapacityRefused;
+            };
+            // Padded standard base64 is a pure function of the preimage length,
+            // so this proves the writing pass emitted exactly the payload the
+            // counting pass declared in the frame header.
+            let Some(expected_len) = binary_len.div_ceil(3).checked_mul(4) else {
+                return BoundedResponseBodyConstruction::CapacityRefused;
+            };
+            if encoded.len() != expected_len {
+                return BoundedResponseBodyConstruction::Unchanged;
+            }
             debug!(
                 plugin = "grpc_web",
                 instance = %self.instance_id_str,
-                binary_len = output.len(),
+                binary_len,
                 encoded_len = encoded.len(),
                 "Base64-encoded gRPC-Web text response body"
             );
-            Some(encoded.into_bytes())
+            BoundedResponseBodyConstruction::Replaced(encoded)
         } else {
+            for segment in [body, &frame_header[..]] {
+                if !output.push(segment) {
+                    return BoundedResponseBodyConstruction::CapacityRefused;
+                }
+            }
+            if !write_trailer_frame_payload(
+                &mut output,
+                response_headers,
+                provenance.http_status,
+                provenance.trailer_name_allowlist,
+                provenance.shadowed_trailers,
+                provenance.policy_state,
+            ) {
+                return BoundedResponseBodyConstruction::CapacityRefused;
+            }
+            if output.len() != binary_len {
+                return BoundedResponseBodyConstruction::Unchanged;
+            }
+            let Some(framed) = output.finish() else {
+                return BoundedResponseBodyConstruction::CapacityRefused;
+            };
             debug!(
                 plugin = "grpc_web",
                 instance = %self.instance_id_str,
-                body_len = output.len(),
+                body_len = framed.len(),
                 "Built gRPC-Web binary response with trailer frame"
             );
-            Some(output)
+            BoundedResponseBodyConstruction::Replaced(framed)
         }
     }
 }
@@ -2417,12 +2523,17 @@ pub(crate) fn build_trailer_frame_with_provenance(
 /// (reserved terminal metadata stays trailer-authoritative), and a later
 /// genuine rewrite/removal (no remaining policy outcome) follows the live
 /// merged view — including shadowed-name restoration while untouched.
-fn resolve_trailer_frame_value(
+///
+/// The returned slice borrows from `view_value`, `shadowed_trailers`, or
+/// `policy_state` — never a cloned upstream-controlled value — so the
+/// two-pass trailer writer can emit each field straight through without
+/// materialising a complete would-be payload segment beside the sink.
+fn resolve_trailer_frame_value<'a>(
     name: &str,
-    view_value: Option<&str>,
-    shadowed_trailers: Option<&HashMap<String, [String; 2]>>,
-    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
-) -> Option<String> {
+    view_value: Option<&'a str>,
+    shadowed_trailers: Option<&'a HashMap<String, [String; 2]>>,
+    policy_state: Option<&'a BufferedInitialResponseHeaderPolicyState>,
+) -> Option<&'a str> {
     if let Some((pre_policy_value, final_policy_value_present)) = policy_state
         .and_then(|state| state.application_trailer_initial_response_policy_outcome(name))
     {
@@ -2436,10 +2547,10 @@ fn resolve_trailer_frame_value(
                 // Same-name collision: when the pre-policy outcome is the
                 // genuine initial header, keep the true backend trailer.
                 if initial_value.as_str() == pre_policy_value {
-                    return Some(trailer_value.clone());
+                    return Some(trailer_value.as_str());
                 }
             }
-            return Some(pre_policy_value.to_string());
+            return Some(pre_policy_value);
         }
         return None;
     }
@@ -2448,13 +2559,34 @@ fn resolve_trailer_frame_value(
     // supplied the same name in HEADERS and TRAILERS. Use the true trailer
     // value only while that view is untouched. A hook-rewritten value wins,
     // and a removed name stays removed.
-    Some(
-        shadowed_trailers
-            .and_then(|shadowed| shadowed.get(name))
-            .filter(|[initial_value, _]| initial_value.as_str() == view_value)
-            .map(|[_, trailer_value]| trailer_value.clone())
-            .unwrap_or_else(|| view_value.to_string()),
-    )
+    if let Some([_initial_value, trailer_value]) = shadowed_trailers
+        .and_then(|shadowed| shadowed.get(name))
+        .filter(|[initial_value, _]| initial_value.as_str() == view_value)
+    {
+        return Some(trailer_value.as_str());
+    }
+    Some(view_value)
+}
+
+/// Outcome of a ceiling-bounded gRPC-Web trailer-frame reconciliation.
+///
+/// The charged original body stays alive for [`SyncTranslatedTrailerOutcome::Unchanged`]
+/// and [`SyncTranslatedTrailerOutcome::NoRewrite`]. A
+/// [`SyncTranslatedTrailerOutcome::Replaced`] buffer is built entirely through
+/// a [`crate::proxy::response_buffer_budget::BoundedResponseBodySink`] and is
+/// ready for [`crate::proxy::response_buffer_budget::ResponseTransformWindow::charge`].
+#[derive(Debug)]
+pub(crate) enum SyncTranslatedTrailerOutcome {
+    /// Trailer suffix already matched the reconciled trailers; keep the original.
+    Unchanged,
+    /// Replacement bytes constructed under the retained ceiling.
+    Replaced(Vec<u8>),
+    /// Not gRPC-Web, malformed frames, or corrupt text armouring — leave the
+    /// original body untouched.
+    NoRewrite,
+    /// Replacement admission failed, a write would have exceeded the retained
+    /// ceiling, or u32/arithmetic overflow occurred while measuring the frame.
+    Overflow,
 }
 
 /// Replace any trailing gRPC-Web trailer frame(s) in a buffered body with a
@@ -2466,51 +2598,622 @@ fn resolve_trailer_frame_value(
 /// ASCII/binary custom metadata — even when the transform-phase draft frame
 /// still saw the post-policy merged view. Callers that discard application
 /// trailers first leave only reserved terminal keys and rebuild a sparse frame.
-pub fn sync_translated_body_trailer_frame_from_trailers(
+///
+/// Test-facing wrapper around [`sync_translated_body_trailer_frame_into`]: uses a
+/// generous ceiling so behavioural unit tests that do not exercise the budget
+/// keep working. Production final reconciliation goes through
+/// [`crate::proxy::store_charged_grpc_web_reframed_body`], which reserves a real
+/// transform window and publishes only a sink-built replacement
+/// (GHSA-pwcm-6rh8-f2gh).
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) fn sync_translated_body_trailer_frame_from_trailers(
     body: &mut Vec<u8>,
     content_type: Option<&str>,
     reconciled_trailers: &HashMap<String, String>,
     http_status: Option<u16>,
 ) -> bool {
+    let ceiling = body
+        .len()
+        .saturating_mul(2)
+        .saturating_add(16 * 1024)
+        .max(16 * 1024);
+    match sync_translated_body_trailer_frame_into(
+        body.as_slice(),
+        content_type,
+        reconciled_trailers,
+        http_status,
+        ceiling,
+        || true,
+    ) {
+        SyncTranslatedTrailerOutcome::Unchanged => true,
+        SyncTranslatedTrailerOutcome::Replaced(rebuilt) => {
+            *body = rebuilt;
+            true
+        }
+        SyncTranslatedTrailerOutcome::NoRewrite | SyncTranslatedTrailerOutcome::Overflow => false,
+    }
+}
+
+/// Ceiling-bounded trailer-frame sync over an immutable collected body.
+///
+/// Binary and text modes validate a complete frame sequence and replace only the
+/// contiguous trailer-frame suffix at end of stream. Construction writes from
+/// the first replacement byte into a [`BoundedResponseBodySink`]; text mode
+/// stream-decodes with a fixed scratch and stream-encodes through
+/// [`base64::write::EncoderWriter`] so neither a decoded binary preimage, a
+/// separately built trailer frame, nor a complete encoded `String` is ever
+/// resident beside the output (GHSA-pwcm-6rh8-f2gh).
+///
+/// `admit_replacement` is invoked only after a rewrite is proven necessary and
+/// immediately before the bounded sink can allocate. Production uses it to
+/// reserve the covering aggregate-budget window; test-only callers admit
+/// directly while exercising construction bounds.
+pub(crate) fn sync_translated_body_trailer_frame_into(
+    body: &[u8],
+    content_type: Option<&str>,
+    reconciled_trailers: &HashMap<String, String>,
+    http_status: Option<u16>,
+    ceiling: usize,
+    admit_replacement: impl FnOnce() -> bool,
+) -> SyncTranslatedTrailerOutcome {
+    use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+
     let Some(content_type) = content_type.filter(|ct| is_grpc_web_content_type(ct)) else {
-        return false;
+        return SyncTranslatedTrailerOutcome::NoRewrite;
     };
     let is_text = is_grpc_web_text(content_type);
-    let mut binary = if is_text {
-        match BASE64.decode(body.as_slice()) {
-            Ok(decoded) => decoded,
-            // Fail closed: leave the transform-phase body untouched rather than
-            // inventing frames from a corrupt text payload.
-            Err(_) => return false,
-        }
+
+    let Some((suffix_start, binary_len)) = (if is_text {
+        scan_text_grpc_web_trailer_suffix(body)
     } else {
-        std::mem::take(body)
-    };
-    let Some(suffix_start) = trailing_trailer_suffix_start(&binary) else {
+        trailing_trailer_suffix_start(body).map(|start| (start, body.len()))
+    }) else {
         // The body transform always emits a complete trailing frame. Refuse to
-        // append a second frame when that invariant cannot be proven; doing so
-        // would turn malformed backend bytes into an ambiguous frame stream.
-        if !is_text {
-            *body = binary;
-        }
-        return false;
+        // invent frames when that invariant cannot be proven.
+        return SyncTranslatedTrailerOutcome::NoRewrite;
     };
-    let rebuilt = build_trailer_frame(reconciled_trailers, http_status);
-    // Cheap short-circuit: when hooks/policy left the trailer frame
-    // byte-identical, keep the existing body (and avoid a text-mode
-    // re-encode). Any metadata mutation rebuilds below.
-    if binary[suffix_start..] == rebuilt {
-        if !is_text {
-            *body = binary;
+
+    // Measure the rebuilt trailer payload without retaining it. The counting
+    // ceiling is the gRPC u32 frame-length domain (not the output sink): identity
+    // short-circuit must not become a capacity refusal, and the bounded sink
+    // still refuses any over-ceiling write during a real rebuild.
+    let mut counted = CountingTrailerPayloadSink::with_ceiling(u32::MAX as usize);
+    if !write_trailer_frame_payload(
+        &mut counted,
+        reconciled_trailers,
+        http_status,
+        None,
+        None,
+        None,
+    ) {
+        return SyncTranslatedTrailerOutcome::Overflow;
+    }
+    let payload_len_usize = counted.len;
+    let Ok(payload_len) = u32::try_from(payload_len_usize) else {
+        return SyncTranslatedTrailerOutcome::Overflow;
+    };
+    let mut frame_header = [0u8; GRPC_FRAME_HEADER_BYTES];
+    frame_header[0] = GRPC_FRAME_TRAILER;
+    frame_header[1..].copy_from_slice(&payload_len.to_be_bytes());
+    let Some(expected_frame_len) = GRPC_FRAME_HEADER_BYTES.checked_add(payload_len_usize) else {
+        return SyncTranslatedTrailerOutcome::Overflow;
+    };
+    let Some(existing_suffix_len) = binary_len.checked_sub(suffix_start) else {
+        return SyncTranslatedTrailerOutcome::NoRewrite;
+    };
+
+    // Identity short-circuit: when hooks/policy left the trailer frame
+    // byte-identical, keep the existing body (and avoid a text-mode re-encode).
+    if existing_suffix_len == expected_frame_len
+        && trailer_suffix_matches_reconciled(
+            body,
+            is_text,
+            suffix_start,
+            &frame_header,
+            reconciled_trailers,
+            http_status,
+        )
+    {
+        return SyncTranslatedTrailerOutcome::Unchanged;
+    }
+
+    // Refuse a rebuild that cannot fit under the retained ceiling before the
+    // sink materialises any replacement bytes.
+    let binary_ceiling = if is_text { ceiling / 4 * 3 } else { ceiling };
+    let Some(rebuild_binary_len) = suffix_start.checked_add(expected_frame_len) else {
+        return SyncTranslatedTrailerOutcome::Overflow;
+    };
+    if rebuild_binary_len > binary_ceiling {
+        return SyncTranslatedTrailerOutcome::Overflow;
+    }
+    if is_text {
+        let Some(encoded_len) = rebuild_binary_len.div_ceil(3).checked_mul(4) else {
+            return SyncTranslatedTrailerOutcome::Overflow;
+        };
+        if encoded_len > ceiling {
+            return SyncTranslatedTrailerOutcome::Overflow;
         }
+    } else if rebuild_binary_len > ceiling {
+        return SyncTranslatedTrailerOutcome::Overflow;
+    }
+
+    // The caller reserves the covering aggregate-budget window only once a
+    // replacement is proven necessary, and immediately before the sink can
+    // make its first allocation. NoRewrite/Unchanged therefore cannot become
+    // spurious capacity refusals under aggregate pressure.
+    if !admit_replacement() {
+        return SyncTranslatedTrailerOutcome::Overflow;
+    }
+    let mut output = BoundedResponseBodySink::with_ceiling(ceiling);
+    let rebuilt_ok = if is_text {
+        rebuild_text_grpc_web_trailer_suffix(
+            body,
+            suffix_start,
+            &frame_header,
+            reconciled_trailers,
+            http_status,
+            &mut output,
+        )
+    } else {
+        rebuild_binary_grpc_web_trailer_suffix(
+            body,
+            suffix_start,
+            &frame_header,
+            reconciled_trailers,
+            http_status,
+            &mut output,
+        )
+    };
+    if !rebuilt_ok || output.overflowed() {
+        return SyncTranslatedTrailerOutcome::Overflow;
+    }
+    match output.finish() {
+        Some(rebuilt) => SyncTranslatedTrailerOutcome::Replaced(rebuilt),
+        None => SyncTranslatedTrailerOutcome::Overflow,
+    }
+}
+
+/// Stream-decode standard base64 with a fixed 3-byte scratch and drive `consume`
+/// for every decoded group. Rejects alphabet / padding / length errors.
+///
+/// `consume` returns `false` to abort early as a hard failure (caller maps that
+/// to malformed or mismatch). No O(body) allocation is retained.
+fn stream_decode_base64_groups(encoded: &[u8], mut consume: impl FnMut(&[u8]) -> bool) -> bool {
+    if encoded.is_empty() {
         return true;
     }
-    binary.truncate(suffix_start);
-    binary.extend(rebuilt);
+    if !encoded.len().is_multiple_of(4) {
+        return false;
+    }
+    let mut scratch = [0u8; 3];
+    let mut pos = 0usize;
+    while pos < encoded.len() {
+        let group = &encoded[pos..pos + 4];
+        if !is_base64_alphabet(group[0]) || !is_base64_alphabet(group[1]) {
+            return false;
+        }
+        match (group[2], group[3]) {
+            (b'=', b'=') => {}
+            (b'=', _) => return false,
+            (third, b'=') if is_base64_alphabet(third) => {}
+            (third, fourth) if is_base64_alphabet(third) && is_base64_alphabet(fourth) => {}
+            _ => return false,
+        }
+        let Ok(decoded_len) = BASE64.decode_slice(group, &mut scratch) else {
+            return false;
+        };
+        if !consume(&scratch[..decoded_len]) {
+            return false;
+        }
+        pos += 4;
+        // Padding closes a flush segment; subsequent groups remain valid input
+        // (gRPC-Web text permits padding at runtime flush boundaries).
+    }
+    true
+}
+
+/// Locate the trailer-frame suffix start and total binary length of a gRPC-Web
+/// text body by streaming the base64 armouring through a fixed scratch.
+fn scan_text_grpc_web_trailer_suffix(encoded: &[u8]) -> Option<(usize, usize)> {
+    let mut scanner = GrpcWebFrameScanner::new();
+    let ok = stream_decode_base64_groups(encoded, |decoded| scanner.push(decoded));
+    if !ok || !scanner.finish() {
+        return None;
+    }
+    Some((scanner.suffix_start?, scanner.binary_len))
+}
+
+/// Incremental gRPC/gRPC-Web frame scanner used over stream-decoded bytes.
+struct GrpcWebFrameScanner {
+    header: [u8; GRPC_FRAME_HEADER_BYTES],
+    header_filled: usize,
+    /// Binary offset of the first byte of the frame header currently being
+    /// assembled. Meaningful only while `header_filled > 0`.
+    header_frame_start: usize,
+    payload_remaining: usize,
+    current_flag: u8,
+    in_payload: bool,
+    binary_len: usize,
+    suffix_start: Option<usize>,
+    malformed: bool,
+}
+
+impl GrpcWebFrameScanner {
+    fn new() -> Self {
+        Self {
+            header: [0u8; GRPC_FRAME_HEADER_BYTES],
+            header_filled: 0,
+            header_frame_start: 0,
+            payload_remaining: 0,
+            current_flag: 0,
+            in_payload: false,
+            binary_len: 0,
+            suffix_start: None,
+            malformed: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> bool {
+        if self.malformed {
+            return false;
+        }
+        for &byte in bytes {
+            if !self.push_byte(byte) {
+                self.malformed = true;
+                return false;
+            }
+        }
+        true
+    }
+
+    fn push_byte(&mut self, byte: u8) -> bool {
+        let offset = self.binary_len;
+        self.binary_len = match self.binary_len.checked_add(1) {
+            Some(n) => n,
+            None => return false,
+        };
+        if !self.in_payload {
+            if self.header_filled == 0 {
+                self.header_frame_start = offset;
+            }
+            self.header[self.header_filled] = byte;
+            self.header_filled += 1;
+            if self.header_filled < GRPC_FRAME_HEADER_BYTES {
+                return true;
+            }
+            self.current_flag = self.header[0];
+            let len = u32::from_be_bytes([
+                self.header[1],
+                self.header[2],
+                self.header[3],
+                self.header[4],
+            ]) as usize;
+            self.payload_remaining = len;
+            self.header_filled = 0;
+            self.in_payload = true;
+            if self.current_flag == GRPC_FRAME_TRAILER {
+                if self.suffix_start.is_none() {
+                    self.suffix_start = Some(self.header_frame_start);
+                }
+            } else {
+                self.suffix_start = None;
+            }
+            if self.payload_remaining == 0 {
+                self.in_payload = false;
+            }
+            return true;
+        }
+        self.payload_remaining -= 1;
+        if self.payload_remaining == 0 {
+            self.in_payload = false;
+        }
+        true
+    }
+
+    fn finish(&self) -> bool {
+        !self.malformed
+            && !self.in_payload
+            && self.header_filled == 0
+            && self.suffix_start.is_some()
+    }
+}
+
+/// Compare an existing trailer-frame suffix against the reconciled trailers
+/// without retaining a rebuilt frame or a decoded body copy.
+fn trailer_suffix_matches_reconciled(
+    body: &[u8],
+    is_text: bool,
+    suffix_start: usize,
+    frame_header: &[u8; GRPC_FRAME_HEADER_BYTES],
+    reconciled_trailers: &HashMap<String, String>,
+    http_status: Option<u16>,
+) -> bool {
     if is_text {
-        *body = BASE64.encode(&binary).into_bytes();
+        let mut header_pos = 0usize;
+        let mut binary_pos = 0usize;
+        let header_ok = stream_decode_base64_groups(body, |decoded| {
+            for &byte in decoded {
+                if binary_pos < suffix_start {
+                    binary_pos = binary_pos.saturating_add(1);
+                    continue;
+                }
+                if header_pos < GRPC_FRAME_HEADER_BYTES {
+                    if byte != frame_header[header_pos] {
+                        return false;
+                    }
+                    header_pos += 1;
+                    binary_pos = binary_pos.saturating_add(1);
+                    continue;
+                }
+                // Payload bytes are compared by the pull-comparer below; stop
+                // this scan once the header has been validated.
+                return true;
+            }
+            true
+        });
+        if !header_ok || header_pos != GRPC_FRAME_HEADER_BYTES {
+            return false;
+        }
+        let payload_start = match suffix_start.checked_add(GRPC_FRAME_HEADER_BYTES) {
+            Some(n) => n,
+            None => return false,
+        };
+        let mut iter = Base64DecodedByteIter::skipping(body, payload_start);
+        let mut cmp = PullByteComparer {
+            iter: &mut iter,
+            mismatch: false,
+        };
+        if !write_trailer_frame_payload(
+            &mut cmp,
+            reconciled_trailers,
+            http_status,
+            None,
+            None,
+            None,
+        ) {
+            return false;
+        }
+        !cmp.mismatch && iter.next().is_none()
     } else {
-        *body = binary;
+        if suffix_start > body.len() {
+            return false;
+        }
+        let suffix = &body[suffix_start..];
+        if suffix.len() < GRPC_FRAME_HEADER_BYTES
+            || suffix[..GRPC_FRAME_HEADER_BYTES] != frame_header[..]
+        {
+            return false;
+        }
+        let mut cmp = ObservedSliceComparer {
+            observed: &suffix[GRPC_FRAME_HEADER_BYTES..],
+            pos: 0,
+            mismatch: false,
+        };
+        if !write_trailer_frame_payload(
+            &mut cmp,
+            reconciled_trailers,
+            http_status,
+            None,
+            None,
+            None,
+        ) {
+            return false;
+        }
+        !cmp.mismatch && cmp.pos == cmp.observed.len()
+    }
+}
+
+/// Pull-comparer: [`write_trailer_frame_payload`] expected bytes against an
+/// observed byte iterator (text-mode stream decode).
+struct PullByteComparer<'a, I: Iterator<Item = u8>> {
+    iter: &'a mut I,
+    mismatch: bool,
+}
+
+impl<I: Iterator<Item = u8>> TrailerPayloadSink for PullByteComparer<'_, I> {
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        if self.mismatch {
+            return false;
+        }
+        for &expected in bytes {
+            match self.iter.next() {
+                Some(observed) if observed == expected => {}
+                _ => {
+                    self.mismatch = true;
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Slice comparer for binary-mode trailer payloads (random access, no copy).
+struct ObservedSliceComparer<'a> {
+    observed: &'a [u8],
+    pos: usize,
+    mismatch: bool,
+}
+
+impl TrailerPayloadSink for ObservedSliceComparer<'_> {
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        if self.mismatch {
+            return false;
+        }
+        let Some(end) = self.pos.checked_add(bytes.len()) else {
+            self.mismatch = true;
+            return false;
+        };
+        if end > self.observed.len() || self.observed[self.pos..end] != *bytes {
+            self.mismatch = true;
+            return false;
+        }
+        self.pos = end;
+        true
+    }
+}
+
+/// Fixed-scratch iterator over standard-base64-decoded bytes, optionally
+/// skipping a binary prefix so callers can address a trailer payload region
+/// without retaining a decoded body.
+struct Base64DecodedByteIter<'a> {
+    encoded: &'a [u8],
+    enc_pos: usize,
+    scratch: [u8; 3],
+    scratch_len: usize,
+    scratch_pos: usize,
+    binary_emitted: usize,
+    skip_until: usize,
+    failed: bool,
+}
+
+impl<'a> Base64DecodedByteIter<'a> {
+    fn skipping(encoded: &'a [u8], skip_until: usize) -> Self {
+        Self {
+            encoded,
+            enc_pos: 0,
+            scratch: [0u8; 3],
+            scratch_len: 0,
+            scratch_pos: 0,
+            binary_emitted: 0,
+            skip_until,
+            failed: false,
+        }
+    }
+
+    fn refill(&mut self) -> bool {
+        if self.failed {
+            return false;
+        }
+        if self.enc_pos >= self.encoded.len() {
+            return false;
+        }
+        if self.enc_pos + 4 > self.encoded.len() || !self.encoded.len().is_multiple_of(4) {
+            self.failed = true;
+            return false;
+        }
+        let group = &self.encoded[self.enc_pos..self.enc_pos + 4];
+        if !is_base64_alphabet(group[0]) || !is_base64_alphabet(group[1]) {
+            self.failed = true;
+            return false;
+        }
+        match (group[2], group[3]) {
+            (b'=', b'=') => {}
+            (b'=', _) => {
+                self.failed = true;
+                return false;
+            }
+            (third, b'=') if is_base64_alphabet(third) => {}
+            (third, fourth) if is_base64_alphabet(third) && is_base64_alphabet(fourth) => {}
+            _ => {
+                self.failed = true;
+                return false;
+            }
+        }
+        match BASE64.decode_slice(group, &mut self.scratch) {
+            Ok(n) => {
+                self.scratch_len = n;
+                self.scratch_pos = 0;
+                self.enc_pos += 4;
+                true
+            }
+            Err(_) => {
+                self.failed = true;
+                false
+            }
+        }
+    }
+}
+
+impl Iterator for Base64DecodedByteIter<'_> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        loop {
+            if self.failed {
+                return None;
+            }
+            if self.scratch_pos < self.scratch_len {
+                let byte = self.scratch[self.scratch_pos];
+                self.scratch_pos += 1;
+                let at = self.binary_emitted;
+                self.binary_emitted = self.binary_emitted.saturating_add(1);
+                if at < self.skip_until {
+                    continue;
+                }
+                return Some(byte);
+            }
+            if !self.refill() {
+                return None;
+            }
+        }
+    }
+}
+
+fn rebuild_binary_grpc_web_trailer_suffix(
+    body: &[u8],
+    suffix_start: usize,
+    frame_header: &[u8; GRPC_FRAME_HEADER_BYTES],
+    reconciled_trailers: &HashMap<String, String>,
+    http_status: Option<u16>,
+    output: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+) -> bool {
+    if suffix_start > body.len() {
+        return false;
+    }
+    if !output.push(&body[..suffix_start]) {
+        return false;
+    }
+    if !output.push(frame_header) {
+        return false;
+    }
+    write_trailer_frame_payload(output, reconciled_trailers, http_status, None, None, None)
+}
+
+fn rebuild_text_grpc_web_trailer_suffix(
+    encoded: &[u8],
+    suffix_start: usize,
+    frame_header: &[u8; GRPC_FRAME_HEADER_BYTES],
+    reconciled_trailers: &HashMap<String, String>,
+    http_status: Option<u16>,
+    output: &mut crate::proxy::response_buffer_budget::BoundedResponseBodySink,
+) -> bool {
+    use std::io::Write;
+    let engine = BASE64;
+    {
+        let mut encoder = base64::write::EncoderWriter::new(&mut *output, &engine);
+        let mut binary_pos = 0usize;
+        let prefix_ok = stream_decode_base64_groups(encoded, |decoded| {
+            if binary_pos >= suffix_start {
+                return true;
+            }
+            let remaining = suffix_start - binary_pos;
+            let take = remaining.min(decoded.len());
+            if encoder.write_all(&decoded[..take]).is_err() {
+                return false;
+            }
+            binary_pos = binary_pos.saturating_add(take);
+            true
+        });
+        if !prefix_ok || binary_pos != suffix_start {
+            return false;
+        }
+        if encoder.write_all(frame_header).is_err() {
+            return false;
+        }
+        if !write_trailer_frame_payload(
+            &mut WriterTrailerPayloadSink(&mut encoder),
+            reconciled_trailers,
+            http_status,
+            None,
+            None,
+            None,
+        ) {
+            return false;
+        }
+        if encoder.finish().is_err() {
+            return false;
+        }
     }
     true
 }
@@ -2563,6 +3266,99 @@ pub(crate) fn truncate_trailing_trailer_frames(data: &mut Vec<u8>) -> bool {
     true
 }
 
+/// Append-only sink for the trailer-frame payload.
+///
+/// The payload is built exactly once, by [`write_trailer_frame_payload`], for
+/// two very different destinations: the gateway-authored error frames (which are
+/// fixed-shape and unbounded by construction) and the retained producer frame,
+/// whose upstream-controlled trailer values must not be able to materialise a
+/// complete over-ceiling `Vec` before the output bound applies
+/// (GHSA-pwcm-6rh8-f2gh). One writer, two sinks — so the two can never drift.
+trait TrailerPayloadSink {
+    /// `false` means the append was refused and nothing was written.
+    fn append(&mut self, bytes: &[u8]) -> bool;
+}
+
+impl TrailerPayloadSink for Vec<u8> {
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        self.extend_from_slice(bytes);
+        true
+    }
+}
+
+impl TrailerPayloadSink for crate::proxy::response_buffer_budget::BoundedResponseBodySink {
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        self.push(bytes)
+    }
+}
+
+/// Measure the trailer payload without retaining a byte of it.
+///
+/// The frame header carries the payload LENGTH, so the length has to be known
+/// before the payload can be written — and the retained-response bound
+/// (GHSA-pwcm-6rh8-f2gh) forbids learning it by building the payload first and
+/// measuring it afterwards, because that complete payload is upstream-controlled
+/// and would be resident beside the output sink. So the payload is emitted
+/// TWICE from the same writer: once into this counter, once into the final
+/// bounded destination. Both passes read the same immutable header map, so they
+/// cannot disagree — and the caller re-checks the written length anyway.
+///
+/// The counter is itself bounded, so a header block that could not fit the frame
+/// is refused during the counting pass rather than after it.
+struct CountingTrailerPayloadSink {
+    len: usize,
+    ceiling: usize,
+    overflowed: bool,
+}
+
+impl CountingTrailerPayloadSink {
+    fn with_ceiling(ceiling: usize) -> Self {
+        Self {
+            len: 0,
+            ceiling,
+            overflowed: false,
+        }
+    }
+}
+
+impl TrailerPayloadSink for CountingTrailerPayloadSink {
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        if self.overflowed {
+            return false;
+        }
+        // Checked, not saturating: an arithmetic overflow is an impossible total
+        // and must fail closed rather than wrap into an affordable length.
+        let Some(next) = self.len.checked_add(bytes.len()) else {
+            self.overflowed = true;
+            return false;
+        };
+        if next > self.ceiling {
+            self.overflowed = true;
+            return false;
+        }
+        self.len = next;
+        true
+    }
+}
+
+/// Write the payload straight through an [`std::io::Write`] — the base64
+/// encoder that streams into the text-mode output sink.
+///
+/// The encoder writes armoured bytes into the ceiling-bounded sink as they are
+/// produced, so neither a complete binary preimage nor a complete encoded
+/// `String` is ever materialised beside the output.
+struct WriterTrailerPayloadSink<'w, W: std::io::Write>(&'w mut W);
+
+impl<W: std::io::Write> TrailerPayloadSink for WriterTrailerPayloadSink<'_, W> {
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        self.0.write_all(bytes).is_ok()
+    }
+}
+
+/// Bytes of the gRPC frame header: one compressed flag plus a 4-byte
+/// big-endian message length.
+const GRPC_FRAME_HEADER_BYTES: usize = 5;
+
 fn build_trailer_frame_with_full_provenance(
     response_headers: &HashMap<String, String>,
     http_status: Option<u16>,
@@ -2570,8 +3366,48 @@ fn build_trailer_frame_with_full_provenance(
     shadowed_trailers: Option<&HashMap<String, [String; 2]>>,
     policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
 ) -> Vec<u8> {
+    let mut payload: Vec<u8> = Vec::new();
+    // A `Vec` sink never refuses, so this is total for the gateway-authored
+    // callers; the bounded producer path uses `write_trailer_frame_payload`
+    // directly against a ceiling-bounded sink.
+    write_trailer_frame_payload(
+        &mut payload,
+        response_headers,
+        http_status,
+        trailer_name_allowlist,
+        shadowed_trailers,
+        policy_state,
+    );
+    let mut frame = Vec::with_capacity(GRPC_FRAME_HEADER_BYTES + payload.len());
+    frame.push(GRPC_FRAME_TRAILER);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend(payload);
+    frame
+}
+
+/// Write the trailer-frame payload (the `name: value\r\n` block that follows the
+/// 5-byte frame header) into `payload`.
+///
+/// Returns `false` only when the sink refused a write, which the bounded
+/// producer path treats as "no translation" and fails closed on.
+///
+/// Nothing eligible is RETAINED here: names are sorted up front (a stable sort
+/// over names alone reproduces exactly what a stable sort over `(name, value)`
+/// pairs produced, because every occurrence a candidate contributes carries that
+/// candidate's name), and each field's value is borrowed from the immutable
+/// inputs, emitted straight through, and dropped before the next one is
+/// resolved. That is what lets the bounded producer path run this writer against
+/// a counter and then against the final sink without ever holding a complete
+/// trailer payload or a cloned upstream-controlled value (GHSA-pwcm-6rh8-f2gh).
+fn write_trailer_frame_payload<'a, S: TrailerPayloadSink>(
+    payload: &mut S,
+    response_headers: &'a HashMap<String, String>,
+    http_status: Option<u16>,
+    trailer_name_allowlist: Option<&HashSet<String>>,
+    shadowed_trailers: Option<&'a HashMap<String, [String; 2]>>,
+    policy_state: Option<&'a BufferedInitialResponseHeaderPolicyState>,
+) -> bool {
     let connection_listed = parse_connection_listed_from_str_map(response_headers);
-    let mut eligible: Vec<(String, String)> = Vec::new();
     // Candidate names are the live view plus any allowlisted trailer that a
     // final initial-header policy removed from the compatibility view.
     // Reserved terminal metadata must still frame from the pre-policy trailer
@@ -2589,6 +3425,15 @@ fn build_trailer_frame_with_full_provenance(
             }
         }
     }
+    // Deterministic ordering: sort by name, and keep relative occurrence order
+    // for duplicates of the same name. Sorting the NAMES (stably) before
+    // resolution is equivalent to the previous stable sort of resolved
+    // `(name, value)` pairs — all of a candidate's occurrences share its name
+    // and stay contiguous either way — and it is what removes the retained
+    // pair vector.
+    candidate_names.sort();
+
+    let mut has_grpc_status = false;
     for name in candidate_names {
         if connection_listed
             .iter()
@@ -2622,46 +3467,45 @@ fn build_trailer_frame_with_full_provenance(
             continue;
         }
         // Emit each occurrence as its own trailer line and retain the ordinary
-        // printable-ASCII check for every LF-separated value.
+        // printable-ASCII check for every LF-separated value. The occurrence is
+        // written straight through and never accumulated.
         for occurrence in value.split('\n') {
-            if is_valid_trailer_value(occurrence) {
-                eligible.push((name.clone(), occurrence.to_owned()));
-            }
-        }
-    }
-    // Deterministic ordering: sort by name, then keep relative occurrence
-    // order for duplicates of the same name (stable sort).
-    eligible.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut trailer_payload = Vec::new();
-    let mut has_grpc_status = false;
-    for (name, value) in eligible {
-        if name == "grpc-status" {
-            // Only a present, numeric grpc-status is a valid terminal
-            // status. An empty (`grpc-status:`) or non-numeric
-            // (`grpc-status: abc`) value is malformed — skip forwarding it
-            // so the synthesized mapped status below is emitted instead of
-            // passing a bogus status (or duplicating it).
-            let Ok(code) = value.trim().parse::<u32>() else {
-                continue;
-            };
-            // Prefer the first valid grpc-status when duplicates are present.
-            if has_grpc_status {
+            if !is_valid_trailer_value(occurrence) {
                 continue;
             }
-            has_grpc_status = true;
-            // Emit the normalized (parsed) value, not the raw header, so the
-            // forwarded frame is self-consistent with what was validated
-            // (e.g. any surrounding OWS is dropped).
-            trailer_payload.extend_from_slice(b"grpc-status: ");
-            trailer_payload.extend_from_slice(code.to_string().as_bytes());
-            trailer_payload.extend_from_slice(b"\r\n");
-            continue;
+            if name == "grpc-status" {
+                // Only a present, numeric grpc-status is a valid terminal
+                // status. An empty (`grpc-status:`) or non-numeric
+                // (`grpc-status: abc`) value is malformed — skip forwarding it
+                // so the synthesized mapped status below is emitted instead of
+                // passing a bogus status (or duplicating it).
+                let Ok(code) = occurrence.trim().parse::<u32>() else {
+                    continue;
+                };
+                // Prefer the first valid grpc-status when duplicates are present.
+                if has_grpc_status {
+                    continue;
+                }
+                has_grpc_status = true;
+                // Emit the normalized (parsed) value, not the raw header, so the
+                // forwarded frame is self-consistent with what was validated
+                // (e.g. any surrounding OWS is dropped).
+                if !payload.append(b"grpc-status: ")
+                    || !payload.append(code.to_string().as_bytes())
+                    || !payload.append(b"\r\n")
+                {
+                    return false;
+                }
+                continue;
+            }
+            if !payload.append(name.as_bytes())
+                || !payload.append(b": ")
+                || !payload.append(occurrence.as_bytes())
+                || !payload.append(b"\r\n")
+            {
+                return false;
+            }
         }
-        trailer_payload.extend_from_slice(name.as_bytes());
-        trailer_payload.extend_from_slice(b": ");
-        trailer_payload.extend_from_slice(value.as_bytes());
-        trailer_payload.extend_from_slice(b"\r\n");
     }
 
     // A backend response without a present, numeric grpc-status is malformed /
@@ -2670,17 +3514,14 @@ fn build_trailer_frame_with_full_provenance(
     // collapse to UNKNOWN and break retry classification.
     if !has_grpc_status {
         let mapped = http_response_status_to_grpc_status(http_status.unwrap_or(200));
-        trailer_payload.extend_from_slice(b"grpc-status: ");
-        trailer_payload.extend_from_slice(mapped.to_string().as_bytes());
-        trailer_payload.extend_from_slice(b"\r\n");
+        if !payload.append(b"grpc-status: ")
+            || !payload.append(mapped.to_string().as_bytes())
+            || !payload.append(b"\r\n")
+        {
+            return false;
+        }
     }
-
-    let len = trailer_payload.len() as u32;
-    let mut frame = Vec::with_capacity(5 + trailer_payload.len());
-    frame.push(GRPC_FRAME_TRAILER);
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend(trailer_payload);
-    frame
+    true
 }
 
 /// Parse gRPC length-prefixed frames from a byte buffer.
@@ -3320,7 +4161,9 @@ impl Plugin for GrpcWebPlugin {
                 shadowed_trailers: None,
                 policy_state: None,
             },
+            crate::proxy::response_buffer_budget::buffered_response_body_ceiling(0),
         )
+        .into_option()
     }
 
     async fn transform_response_body_with_context(
@@ -3346,6 +4189,7 @@ impl Plugin for GrpcWebPlugin {
                 instance = %self.instance_id_str,
                 "Fail closed: refusing response translation without valid mode staging"
             );
+            ctx.mark_buffered_response_capacity_refusal_pending();
             return None;
         }
 
@@ -3362,7 +4206,7 @@ impl Plugin for GrpcWebPlugin {
             // state. Retain only reserved terminal metadata.
             allowlist = Some(HashSet::new());
         }
-        let translated = self.transform_grpc_web_response_body(
+        let translated = match self.transform_grpc_web_response_body(
             body,
             content_type,
             response_headers,
@@ -3372,7 +4216,21 @@ impl Plugin for GrpcWebPlugin {
                 shadowed_trailers: shadowed_trailers.as_ref(),
                 policy_state: ctx.buffered_initial_response_header_policy(),
             },
-        )?;
+            ctx.retained_response_body_ceiling(),
+        ) {
+            crate::plugins::BoundedResponseBodyConstruction::Replaced(bytes) => bytes,
+            crate::plugins::BoundedResponseBodyConstruction::Unchanged
+            | crate::plugins::BoundedResponseBodyConstruction::CapacityRefused => {
+                // Once this instance owns the translation, every construction
+                // failure is fail-closed. `after_proxy` has already relabelled
+                // the representation as gRPC-Web, so treating a missing live
+                // content type or an internal length/provenance mismatch as an
+                // ordinary no-op would forward raw native-gRPC bytes under the
+                // gRPC-Web media type.
+                ctx.mark_buffered_response_capacity_refusal_pending();
+                return None;
+            }
+        };
         ctx.metadata.insert(
             META_GRPC_WEB_RESPONSE_TRANSLATED.to_string(),
             self.instance_id_str.clone(),

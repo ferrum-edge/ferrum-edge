@@ -661,6 +661,15 @@ pub async fn start_k8s_controller(
         gateway_api_data_plane_service_name: controller_config.gateway_api_data_plane_service_name,
         gateway_api_status_address: controller_config.gateway_api_status_address,
         mesh_sidecar_ingress_enforced: controller_config.mesh_sidecar_ingress_enforced,
+        // Kubernetes owns mesh state only when it actually watches a
+        // mesh-contributing kind (issue #2452): Istio CRDs, Gateway API
+        // (waypoint bindings and Gateway-derived mesh services), or core
+        // Pod/Service/EndpointSlice discovery. A controller watching none of
+        // them owns no mesh objects and must never withdraw mesh state that a
+        // native/file/xDS source published.
+        mesh_overlay_authority: controller_config.watch_istio
+            || controller_config.watch_gateway_api
+            || controller_config.pod_discovery_enabled,
     };
     let gateway_status_writer = controller_config
         .watch_gateway_api

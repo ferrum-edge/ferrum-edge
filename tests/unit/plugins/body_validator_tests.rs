@@ -137,15 +137,24 @@ fn test_request_vs_response_buffering_flags_are_config_sensitive() {
 }
 
 #[test]
-fn test_request_body_buffering_only_for_matching_request_methods_and_types() {
+fn test_request_body_buffering_follows_representation_not_method() {
     let plugin = BodyValidator::new(&json!({"validate_xml": true})).unwrap();
 
     let xml_ctx = make_xml_ctx("<root/>");
     assert!(plugin.should_buffer_request_body(&xml_ctx));
 
-    let mut get_ctx = make_xml_ctx("<root/>");
-    get_ctx.method = "GET".to_string();
-    assert!(!plugin.should_buffer_request_body(&get_ctx));
+    // GHSA-2vmr-ww8r-mww3: a governed representation must never bypass the
+    // validator because of the request method alone.
+    for method in [
+        "GET", "HEAD", "OPTIONS", "DELETE", "PUT", "PATCH", "PROPFIND",
+    ] {
+        let mut ctx = make_xml_ctx("<root/>");
+        ctx.method = method.to_string();
+        assert!(
+            plugin.should_buffer_request_body(&ctx),
+            "method={method} must still buffer a configured representation"
+        );
+    }
 
     let mut json_only_ctx = make_xml_ctx("<root/>");
     json_only_ctx.headers.insert(
@@ -943,9 +952,10 @@ async fn test_xml_empty_body_rejected() {
     let plugin = xml_plugin();
     let mut ctx = make_xml_ctx("");
     let mut headers = make_xml_headers();
-    // Empty body is skipped (returns Continue) because the body.is_empty() check
+    // GHSA-2vmr-ww8r-mww3: an empty body is decided by the configured
+    // representation, and an empty XML document is not well-formed.
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+    assert_reject(result, Some(400));
 }
 
 #[tokio::test]
@@ -958,21 +968,24 @@ async fn test_xml_not_starting_with_angle_bracket() {
 }
 
 #[tokio::test]
-async fn test_xml_get_request_skipped() {
+async fn test_body_bearing_unusual_methods_are_validated() {
+    // GHSA-2vmr-ww8r-mww3: GET, HEAD, OPTIONS, DELETE, and any other method are
+    // no longer exempt. A body-bearing request under a governed representation
+    // is validated exactly like a POST.
     let plugin = xml_plugin();
-    let mut ctx = RequestContext::new(
-        "127.0.0.1".to_string(),
-        "GET".to_string(),
-        "/api/xml".to_string(),
-    );
-    ctx.headers
-        .insert("content-type".to_string(), "application/xml".to_string());
-    ctx.metadata
-        .insert("request_body".to_string(), "not valid xml".to_string());
-    let mut headers = make_xml_headers();
-    // GET requests are skipped
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+    for method in ["GET", "HEAD", "OPTIONS", "DELETE", "PUT", "PATCH", "REPORT"] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            method.to_string(),
+            "/api/xml".to_string(),
+        );
+        ctx.headers
+            .insert("content-type".to_string(), "application/xml".to_string());
+        ctx.request_body_bytes = Some(bytes::Bytes::from_static(b"not valid xml"));
+        let mut headers = make_xml_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_reject(result, Some(400));
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1902,15 +1915,80 @@ async fn test_response_json_invalid_json() {
 }
 
 #[tokio::test]
-async fn test_response_json_empty_body_skipped() {
+async fn test_response_json_empty_body_on_200_fails_closed() {
+    // GHSA-2vmr-ww8r-mww3: 200 is an ordinary body-bearing success. An empty
+    // body is not a JSON document and must not be exempt.
     let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
     let mut ctx = make_response_ctx();
     let headers = response_json_headers();
-    assert_continue(
+    assert_reject(
         plugin
             .on_final_response_body(&mut ctx, 200, &headers, b"")
             .await,
+        Some(502),
     );
+}
+
+/// Only the statuses/methods HTTP itself defines as content-free are exempt.
+#[tokio::test]
+async fn test_response_protocol_no_content_semantics_are_exempt() {
+    let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
+    let headers = response_json_headers();
+
+    for status in [100u16, 101, 199, 204, 205, 304] {
+        let mut ctx = make_response_ctx();
+        assert_continue(
+            plugin
+                .on_final_response_body(&mut ctx, status, &headers, b"")
+                .await,
+        );
+    }
+
+    // A HEAD response legitimately omits the content of an otherwise
+    // body-bearing status.
+    let mut head_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "HEAD".to_string(),
+        "/api/data".to_string(),
+    );
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut head_ctx, 200, &headers, b"")
+            .await,
+    );
+
+    // The exemption is about an ABSENT body only: a 204 that somehow carries
+    // bytes is still validated.
+    let mut ctx = make_response_ctx();
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 204, &headers, b"[]")
+            .await,
+        Some(502),
+    );
+}
+
+/// A response the configured rules cannot decode is not a passing response, and
+/// the client-visible detail never reproduces the offending bytes.
+#[tokio::test]
+async fn test_response_non_utf8_json_fails_closed_without_echoing_bytes() {
+    let plugin = response_schema_plugin(serde_json::json!({"type": "object"}));
+    let mut ctx = make_response_ctx();
+    let headers = response_json_headers();
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, b"{\"a\":\"\xFF\xFE\"}")
+        .await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("not valid UTF-8"), "{body}");
+            assert!(!body.contains('\u{FFFD}'), "{body}");
+            assert!(!body.contains("\\u00ff"), "{body}");
+        }
+        other => panic!("expected reject, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2497,12 +2575,83 @@ async fn test_protobuf_compressed_gzip_response_valid() {
 }
 
 #[tokio::test]
-async fn test_protobuf_empty_body_skipped() {
+async fn test_protobuf_empty_or_short_request_transport_body_fails_closed() {
+    // GHSA-2vmr-ww8r-mww3: a zero-length native-gRPC transport body is not a
+    // frame, and neither is anything shorter than the five-byte frame header.
     let plugin = protobuf_plugin();
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/grpc".to_string());
     headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
-    assert_continue(plugin.on_final_request_body(&headers, &[]).await);
+    for body in [&b""[..], &b"\x00"[..], &b"\x00\x00\x00\x00"[..]] {
+        assert_reject(
+            plugin.on_final_request_body(&headers, body).await,
+            Some(400),
+        );
+    }
+}
+
+/// The response side runs the same frame validation; only a Trailers-Only
+/// *error* reply (single valid non-zero `grpc-status`) legitimately carries no
+/// message. Successful unary replies still need a five-byte frame.
+#[tokio::test]
+async fn test_protobuf_empty_response_transport_body_fails_closed() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_response_type": "test.HelloResponse"
+    }))
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test.Greeter/SayHello".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, b"")
+            .await,
+        Some(502),
+    );
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, b"\x00\x00")
+            .await,
+        Some(502),
+    );
+
+    // Empty successful unary (`grpc-status: 0`) still requires a frame.
+    let mut ok_status = headers.clone();
+    ok_status.insert("grpc-status".to_string(), "0".to_string());
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &ok_status, b"")
+            .await,
+        Some(502),
+    );
+
+    // Malformed / unparsable / LF-joined duplicate values are not exemptions.
+    for bad in ["", "abc", "5\n14", "5\r\n14", "99"] {
+        let mut hostile = headers.clone();
+        hostile.insert("grpc-status".to_string(), bad.to_string());
+        assert_reject(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &hostile, b"")
+                .await,
+            Some(502),
+        );
+    }
+
+    // Terminal error: a single valid non-zero status and no message frame is
+    // the legitimate empty native-gRPC response body.
+    let mut trailers_only = headers.clone();
+    trailers_only.insert("grpc-status".to_string(), "5".to_string());
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &trailers_only, b"")
+            .await,
+    );
 }
 
 #[tokio::test]
@@ -5377,5 +5526,265 @@ async fn protobuf_only_final_request_does_not_json_screen_non_grpc() {
         plugin
             .on_final_request_body(&headers, br#"{"role":"admin","role":"safe"}"#)
             .await,
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GHSA-2vmr-ww8r-mww3 — body-policy representation must never fail open
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Non-UTF-8 JSON fails closed from the raw-byte fallback when no UTF-8
+/// metadata view exists. A body that is not valid UTF-8 has no shared string
+/// copy (the proxy removes it), and used to make the whole policy `Continue`.
+#[tokio::test]
+async fn advisory_2vmr_non_utf8_json_request_fails_closed_without_echoing_bytes() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    // Valid JSON framing, invalid UTF-8 inside the string value.
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(b"{\"name\":\"\xFF\xFE\"}"));
+    let mut headers = ctx.headers.clone();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("not valid UTF-8"), "{body}");
+            assert!(!body.contains('\u{FFFD}'), "{body}");
+        }
+        other => panic!("expected reject, got {other:?}"),
+    }
+
+    // The final backend-visible hook enforces the same rule over raw bytes.
+    assert_reject(
+        plugin
+            .on_final_request_body(&make_json_headers(), b"{\"name\":\"\xFF\xFE\"}")
+            .await,
+        Some(400),
+    );
+}
+
+/// Non-UTF-8 XML is rejected identically.
+#[tokio::test]
+async fn advisory_2vmr_non_utf8_xml_request_fails_closed() {
+    let plugin = xml_plugin();
+    let mut ctx = make_xml_ctx("");
+    ctx.metadata.remove("request_body");
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(b"<root>\xFF\xFE</root>"));
+    let mut headers = make_xml_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    assert_reject(
+        plugin
+            .on_final_request_body(&make_xml_headers(), b"<root>\xFF\xFE</root>")
+            .await,
+        Some(400),
+    );
+}
+
+/// An empty JSON request body is not a JSON document.
+#[tokio::test]
+async fn advisory_2vmr_empty_json_request_fails_closed() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let mut ctx = make_json_ctx("");
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+    assert_reject(
+        plugin
+            .on_final_request_body(&make_json_headers(), b"")
+            .await,
+        Some(400),
+    );
+}
+
+/// Early `before_proxy` validation prefers a downstream-rewritten metadata text
+/// view (as `ai_prompt_shield` redact writes) over the original raw bytes, so
+/// the shielded/redacted representation is what the early hook decides over.
+/// The final request-body hook still validates the exact backend-visible bytes.
+#[tokio::test]
+async fn advisory_2vmr_before_proxy_prefers_transformed_metadata_over_raw_bytes() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    // Original client bytes lack the required field and would reject.
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(br#"{"ssn":"123-45-6789"}"#));
+    // Earlier shield/redact rewrite publishes the admission view in metadata.
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        r#"{"ssn":"[REDACTED:ssn]","name":"ok"}"#.to_string(),
+    );
+    let mut headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // Final hook still decides over the backend-visible bytes independently.
+    assert_reject(
+        plugin
+            .on_final_request_body(&make_json_headers(), br#"{"ssn":"123-45-6789"}"#)
+            .await,
+        Some(400),
+    );
+    assert_continue(
+        plugin
+            .on_final_request_body(
+                &make_json_headers(),
+                br#"{"ssn":"[REDACTED:ssn]","name":"ok"}"#,
+            )
+            .await,
+    );
+}
+
+/// A body-bearing DELETE / PUT reaches the validator and is rejected on the
+/// same terms as a POST.
+#[tokio::test]
+async fn advisory_2vmr_body_bearing_delete_and_put_are_validated() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    for method in ["DELETE", "PUT"] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            method.to_string(),
+            "/api".to_string(),
+        );
+        ctx.headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        ctx.request_body_bytes = Some(bytes::Bytes::from_static(br#"{"other":true}"#));
+        assert!(plugin.should_buffer_request_body(&ctx));
+        let mut headers = ctx.headers.clone();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+
+        // A valid body on the same unusual method still passes.
+        let mut ok_ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            method.to_string(),
+            "/api".to_string(),
+        );
+        ok_ctx
+            .headers
+            .insert("content-type".to_string(), "application/json".to_string());
+        ok_ctx.request_body_bytes = Some(bytes::Bytes::from_static(br#"{"name":"ok"}"#));
+        let mut ok_headers = ok_ctx.headers.clone();
+        assert_continue(plugin.before_proxy(&mut ok_ctx, &mut ok_headers).await);
+    }
+}
+
+/// A governed representation with no buffered body and no transport proof of
+/// emptiness is a gateway inconsistency, and fails closed rather than skipping
+/// the policy. The diagnostic is fixed and value-free.
+#[tokio::test]
+async fn advisory_2vmr_missing_request_representation_fails_closed() {
+    let plugin = BodyValidator::new(&json!({"required_fields": ["name"]})).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    let mut headers = ctx.headers.clone();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 400);
+            assert!(body.contains("representation was unavailable"), "{body}");
+        }
+        other => panic!("expected reject, got {other:?}"),
+    }
+}
+
+/// Media types outside the configured allowlist, and allowlisted types no
+/// configured rule can inspect, still `Continue` — including when empty or
+/// binary. The advisory closes fail-open holes; it does not widen applicability.
+#[tokio::test]
+async fn advisory_2vmr_ungoverned_representations_still_continue() {
+    let plugin = BodyValidator::new(&json!({
+        "required_fields": ["name"],
+        "content_types": ["application/json", "text/plain"]
+    }))
+    .unwrap();
+
+    for (content_type, body) in [
+        ("text/plain", &b""[..]),
+        ("text/plain", &b"\xFF\xFE"[..]),
+        ("application/octet-stream", &b"\xFF\xFE"[..]),
+        ("", &b""[..]),
+    ] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/api".to_string(),
+        );
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+        ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
+        let mut headers = ctx.headers.clone();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+        let mut hook_headers = HashMap::new();
+        hook_headers.insert("content-type".to_string(), content_type.to_string());
+        assert_continue(plugin.on_final_request_body(&hook_headers, body).await);
+    }
+}
+
+/// An empty protobuf message inside a well-formed five-byte frame is
+/// structurally valid for proto3 and must be validated, not skipped.
+#[tokio::test]
+async fn advisory_2vmr_empty_protobuf_message_is_validated_not_skipped() {
+    let plugin = protobuf_plugin();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    assert_continue(
+        plugin
+            .on_final_request_body(&headers, &grpc_frame(&[]))
+            .await,
+    );
+}
+
+/// Two configured instances stay isolated and deterministic: each decides only
+/// its own configured representation over the same request.
+#[tokio::test]
+async fn advisory_2vmr_multiple_instances_remain_isolated() {
+    let json_instance = BodyValidator::new(&json!({
+        "required_fields": ["name"],
+        "content_types": ["application/json"]
+    }))
+    .unwrap();
+    let xml_instance = BodyValidator::new(&json!({
+        "validate_xml": true,
+        "content_types": ["application/xml"]
+    }))
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "DELETE".to_string(),
+        "/api".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.request_body_bytes = Some(bytes::Bytes::from_static(br#"{"other":true}"#));
+
+    assert!(json_instance.should_buffer_request_body(&ctx));
+    assert!(!xml_instance.should_buffer_request_body(&ctx));
+
+    let mut headers = ctx.headers.clone();
+    assert_continue(xml_instance.before_proxy(&mut ctx, &mut headers).await);
+    let mut headers = ctx.headers.clone();
+    assert_reject(
+        json_instance.before_proxy(&mut ctx, &mut headers).await,
+        Some(400),
     );
 }

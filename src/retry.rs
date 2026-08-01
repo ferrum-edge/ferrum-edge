@@ -44,6 +44,19 @@ pub enum ErrorClass {
     ProtocolError,
     /// Backend response body exceeded the configured maximum size.
     ResponseBodyTooLarge,
+    /// The gateway's process-wide budget for *retained* (buffered) response
+    /// bodies could not admit this response
+    /// ([`crate::proxy::response_buffer_budget`], GHSA-pwcm-6rh8-f2gh).
+    ///
+    /// Deliberately distinct from `ResponseBodyTooLarge`: the backend behaved
+    /// correctly and its response was within every configured per-response
+    /// ceiling — the gateway simply had no retention capacity at that instant.
+    /// It is therefore gateway-local and transient, grouped with the other
+    /// `client_side_no_backend_signal` classes so it trips no circuit breaker,
+    /// dings no passive health, and shrinks no adaptive-concurrency permit for
+    /// a backend that did nothing wrong. It is also not retried: another
+    /// upstream would contend for the same process-global budget.
+    GatewayBufferCapacity,
     /// Request body exceeded the configured maximum size.
     RequestBodyTooLarge,
     /// Could not acquire or create an HTTP client from the connection pool.
@@ -87,6 +100,7 @@ impl ErrorClass {
             Self::ClientDisconnect => "client_disconnect",
             Self::ProtocolError => "protocol_error",
             Self::ResponseBodyTooLarge => "response_body_too_large",
+            Self::GatewayBufferCapacity => "gateway_buffer_capacity",
             Self::RequestBodyTooLarge => "request_body_too_large",
             Self::ConnectionPoolError => "connection_pool_error",
             Self::PortExhaustion => "port_exhaustion",
@@ -174,6 +188,7 @@ pub fn error_class_log_kind(class: ErrorClass) -> &'static str {
         ErrorClass::ClientDisconnect => "client_disconnect",
         ErrorClass::RequestBodyTooLarge => "request_body_too_large",
         ErrorClass::ResponseBodyTooLarge => "response_body_too_large",
+        ErrorClass::GatewayBufferCapacity => "gateway_buffer_capacity",
         ErrorClass::GracefulRemoteClose => "graceful_remote_close",
         ErrorClass::DispatchPolicyRejected => "dispatch_policy_rejected",
         ErrorClass::RequestError => "request_error",
@@ -346,6 +361,11 @@ pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -
         }
         GrpcProxyError::ResourceExhausted(_) => ErrorClass::RequestError,
         GrpcProxyError::ResponseTooLarge(_) => ErrorClass::ResponseBodyTooLarge,
+        // Gateway-local retention capacity, not a backend fault — see
+        // `crate::proxy::response_buffer_budget`.
+        GrpcProxyError::ResponseBufferCapacity(_) => {
+            crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS
+        }
         GrpcProxyError::Internal(_) => ErrorClass::RequestError,
     }
 }
@@ -984,9 +1004,9 @@ pub enum ResponseBody {
     ///
     /// Stored as cheaply cloneable [`Bytes`] so cached synthetic short-circuits
     /// (spec exposure, response cache, dedup replay, AI semantic cache) can share
-    /// one immutable allocation across concurrent deliveries. Mutating later
-    /// response-body phases must take ownership and copy only when the buffer is
-    /// still shared — see [`ResponseBody::take_buffered_vec`].
+    /// one immutable allocation across concurrent deliveries. Retained-body
+    /// transforms replace it only with allocations constructed and published
+    /// through the response-buffer budget.
     Buffered(Bytes),
     /// Body is still attached to the backend response and will be streamed
     /// to the client. The status code and headers have already been extracted.
@@ -1009,23 +1029,6 @@ impl ResponseBody {
     #[inline]
     pub fn buffered(data: impl Into<Bytes>) -> Self {
         Self::Buffered(data.into())
-    }
-
-    /// Take a uniquely owned `Vec` for in-place mutation.
-    ///
-    /// Shared `Bytes` (multiple clones of one cached entry) copy once; uniquely
-    /// owned buffers reclaim without copying when the bytes crate can take the
-    /// underlying allocation. Callers must restore via
-    /// [`ResponseBody::store_buffered_vec`] (or assign `Buffered` directly).
-    #[inline]
-    pub fn take_buffered_vec(body: &mut Bytes) -> Vec<u8> {
-        std::mem::take(body).into()
-    }
-
-    /// Restore a previously taken owned buffer as shared [`Bytes`].
-    #[inline]
-    pub fn store_buffered_vec(body: &mut Bytes, owned: Vec<u8>) {
-        *body = Bytes::from(owned);
     }
 }
 
@@ -1112,6 +1115,10 @@ pub fn should_retry(
                 | ErrorClass::DispatchPolicyRejected
                 | ErrorClass::RequestBodyTooLarge
                 | ErrorClass::ResponseBodyTooLarge
+                // Retrying would contend for the same process-global retained
+                // -body budget on the next upstream, so a retry can only
+                // amplify the pressure that caused the refusal.
+                | ErrorClass::GatewayBufferCapacity
         )
     ) {
         return false;

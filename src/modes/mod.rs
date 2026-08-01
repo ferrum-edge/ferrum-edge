@@ -243,6 +243,7 @@ pub(crate) fn start_acme_renewal_scheduler(
                 challenge_type,
                 dns01_hook_command: env_config.acme_dns01_hook_command.clone(),
                 dns01_propagation: Duration::from_secs(env_config.acme_dns01_propagation_seconds),
+                renewal_lease_ttl: Duration::from_secs(env_config.acme_renewal_lease_ttl_seconds),
                 dns_cache,
             },
             shutdown_rx,

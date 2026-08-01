@@ -866,6 +866,15 @@ impl Plugin for CorsFinalizer {
         super::HTTP_GRPC_PROTOCOLS
     }
 
+    /// Cache-internal header-policy sentinel: never replaces a response body.
+    /// Declare `Never` explicitly — the internal name is absent from the public
+    /// built-in inventory, so the trait default would resolve to `Undeclared`
+    /// and the shared producer gate would refuse every buffered response
+    /// (GHSA-pwcm-6rh8-f2gh).
+    fn response_body_production(&self) -> super::ResponseBodyProduction {
+        super::ResponseBodyProduction::Never
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         finalize_cors_request(ctx)
     }

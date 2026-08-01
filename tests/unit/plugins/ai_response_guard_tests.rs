@@ -5054,3 +5054,543 @@ async fn grpc_web_request_with_a_bare_json_document_is_still_inspected() {
     assert!(!rewritten.contains("ops@example.com"));
     assert!(rewritten.contains("[REDACTED:pii:email]"));
 }
+
+// ---------------------------------------------------------------------------
+// Construction-side bounding of the redaction producer (GHSA-pwcm-6rh8-f2gh).
+//
+// Three replacement paths used to build a COMPLETE would-be client body before
+// the retained ceiling was enforced: the rewritten SSE stream, the expanded
+// plain-text redaction, and the re-encoded protobuf frame. They now write
+// through ceiling-bounded sinks from the first byte. These tests pin the
+// observable output those rewrites must keep producing.
+// ---------------------------------------------------------------------------
+
+fn plaintext_redactor() -> AiResponseGuard {
+    make_plugin(json!({
+        "pii_patterns": ["email"],
+        "blocked_phrases": ["classified"],
+        "scan_fields": "all",
+        "action": "redact"
+    }))
+}
+
+#[tokio::test]
+async fn test_plaintext_redaction_applies_every_pattern_pass_in_order() {
+    let plugin = plaintext_redactor();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+
+    let body = b"mail user@example.com about the classified plan, cc ops@example.com";
+    let redacted = plugin
+        .transform_response_body(body, Some("text/plain"), &headers)
+        .await
+        .expect("a matching plain-text body must be rewritten");
+    let redacted = String::from_utf8(redacted).expect("redacted text is UTF-8");
+
+    // Pattern passes stay sequential and in configured order: PII first, then
+    // blocked phrases, exactly as the unbounded `redact_text` applied them.
+    assert_eq!(
+        redacted,
+        "mail [REDACTED:pii:email] about the [REDACTED:blocked_phrase:0] plan, \
+         cc [REDACTED:pii:email]"
+    );
+    assert!(!redacted.contains("example.com"));
+    assert!(!redacted.contains("classified"));
+}
+
+#[tokio::test]
+async fn test_plaintext_redaction_leaves_a_clean_body_untouched() {
+    let plugin = plaintext_redactor();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+
+    assert!(
+        plugin
+            .transform_response_body(b"nothing to see here", Some("text/plain"), &headers)
+            .await
+            .is_none(),
+        "an unchanged redaction must not install a replacement"
+    );
+}
+
+#[tokio::test]
+async fn test_plaintext_redaction_is_refused_when_it_exceeds_the_retained_ceiling() {
+    let plugin = plaintext_redactor();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    // The placeholder is longer than the match it replaces, so a body just under
+    // the ceiling expands past it. The refusal must happen while the replacement
+    // is being written.
+    ctx.max_response_body_size_bytes = 40;
+
+    let body = b"a@b.com a@b.com a@b.com a@b.com a@b.com";
+    assert!(body.len() < 40);
+    assert!(
+        plugin
+            .transform_response_body_with_context(&mut ctx, body, Some("text/plain"), &headers)
+            .await
+            .is_none(),
+        "an amplifying redaction above the retained ceiling must be refused"
+    );
+
+    // Control: an ample ceiling still redacts the same body.
+    let mut roomy = ctx_with_content_type("POST", "application/json");
+    let redacted = plugin
+        .transform_response_body_with_context(&mut roomy, body, Some("text/plain"), &headers)
+        .await
+        .expect("the same body is rewritten under an ordinary ceiling");
+    assert!(!String::from_utf8(redacted).unwrap().contains("a@b.com"));
+}
+
+#[tokio::test]
+async fn test_sse_redaction_is_assembled_eventwise_and_preserves_framing() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+
+    // Two events: only the second carries PII, so the first must survive
+    // byte-for-byte while the stream framing is preserved.
+    let body = concat!(
+        "data: {\"id\":\"1\",\"text\":\"hello\"}\n\n",
+        "data: {\"id\":\"2\",\"text\":\"mail me at user@example.com\"}\n\n",
+    );
+    let redacted = plugin
+        .transform_response_body(body.as_bytes(), Some("text/event-stream"), &headers)
+        .await
+        .expect("an SSE body with PII must be rewritten");
+    let redacted = String::from_utf8(redacted).expect("redacted SSE is UTF-8");
+
+    assert!(
+        redacted.starts_with("data: {\"id\":\"1\",\"text\":\"hello\"}\n\n"),
+        "an unmodified event must be emitted verbatim: {redacted}"
+    );
+    assert!(!redacted.contains("user@example.com"));
+    assert!(redacted.contains("[REDACTED:pii:email]"));
+    assert_eq!(
+        redacted.matches("\n\n").count(),
+        2,
+        "event framing must be preserved: {redacted}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A promised redaction that never produced a replacement must not be delivered
+// (GHSA-pwcm-6rh8-f2gh).
+//
+// `action: redact` detection returns `Continue` and relies on the producer
+// phase to install the redacted bytes. Every construction refusal — a refused
+// retained ceiling most of all — surfaces as `None`, which the shared transform
+// loop reads as "unchanged". Without a final verification seam that is exactly
+// the original detected body being forwarded while the request is recorded as
+// redacted.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_refused_redaction_construction_does_not_serve_the_detected_body() {
+    let plugin = plaintext_redactor();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let body = b"a@b.com a@b.com a@b.com a@b.com a@b.com";
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    // Below the expanded replacement, so the producer is refused mid-construction.
+    ctx.max_response_body_size_bytes = 40;
+
+    // Inspection detects and promises a redaction.
+    let inspected = plugin
+        .on_response_body(&mut ctx, 200, &mut headers, body)
+        .await;
+    assert!(
+        matches!(inspected, PluginResult::Continue),
+        "redact-mode detection continues into the producer phase"
+    );
+    assert!(
+        ctx.metadata.contains_key("ai_response_guard_redacted"),
+        "the detection is recorded"
+    );
+
+    // The producer cannot build the replacement under this ceiling.
+    assert!(
+        plugin
+            .transform_response_body_with_context(&mut ctx, body, Some("text/plain"), &headers)
+            .await
+            .is_none(),
+        "the amplifying redaction must be refused during construction"
+    );
+
+    // The final seam must therefore reject rather than let the original through.
+    let final_result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, body)
+        .await;
+    match final_result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(
+                body.contains("could not be redacted before delivery"),
+                "the rejection must be the fixed-cardinality guard terminal: {body}"
+            );
+            assert!(
+                !body.contains("a@b.com"),
+                "the rejection must never echo the detected body: {body}"
+            );
+        }
+        other => panic!("an undischarged redaction must be rejected, got {other:?}"),
+    }
+    assert!(
+        ctx.metadata.contains_key("ai_response_guard_rejected"),
+        "the rejection is recorded for telemetry"
+    );
+}
+
+#[tokio::test]
+async fn test_completed_redaction_discharges_the_final_seam() {
+    let plugin = plaintext_redactor();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let body = b"mail user@example.com about it";
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, body)
+            .await,
+        PluginResult::Continue
+    ));
+    let redacted = plugin
+        .transform_response_body_with_context(&mut ctx, body, Some("text/plain"), &headers)
+        .await
+        .expect("the redaction is constructible under an ordinary ceiling");
+    assert!(
+        !String::from_utf8(redacted.clone())
+            .unwrap()
+            .contains("user@example.com")
+    );
+
+    assert!(
+        matches!(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, &redacted)
+                .await,
+            PluginResult::Continue
+        ),
+        "an installed replacement discharges the promise"
+    );
+}
+
+#[tokio::test]
+async fn test_clean_and_warn_responses_never_arm_the_final_seam() {
+    // A clean body detects nothing, so nothing is promised.
+    let plugin = plaintext_redactor();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let clean = b"nothing to see here";
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, clean)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, clean)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // Warn mode forwards deliberately and must not be turned into a rejection.
+    let warner = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "warn"
+    }));
+    let mut warn_ctx = ctx_with_content_type("POST", "application/json");
+    let dirty = b"mail user@example.com about it";
+    assert!(matches!(
+        warner
+            .on_response_body(&mut warn_ctx, 200, &mut headers, dirty)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        warner
+            .on_final_response_body(&mut warn_ctx, 200, &headers, dirty)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+/// Sequential whole-body redaction must budget the still-live prior pass by
+/// resident CAPACITY. Geometric growth leaves capacity above length; treating
+/// that slack as free room for the next sink would let two simultaneous
+/// scratch allocations exceed the covering transform window
+/// (GHSA-pwcm-6rh8-f2gh root finding).
+#[tokio::test]
+async fn test_sequential_redaction_capacity_slack_cannot_mint_room() {
+    // Pass 1 replaces each `.` with the one-byte placeholder `a`. Thirty-three
+    // one-byte writes make the sink double from 32 → 64, so capacity == ceiling
+    // while length is only 33. Pass 2 then collapses the `a` run to `b`.
+    //
+    // Capacity-based room for pass 2 is 0 → refuse during construction.
+    // Length-based room would be 31 → enough to write the one-byte `b`, which
+    // is exactly the slack-minting hole this regression seals.
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [
+            {"name": "a", "regex": "\\."},
+            {"name": "b", "regex": "a+"}
+        ],
+        "redaction_placeholder": "{type}",
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let body = b"................................."; // 33 dots
+    assert_eq!(body.len(), 33);
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.max_response_body_size_bytes = 64;
+    assert!(
+        plugin
+            .transform_response_body_with_context(&mut ctx, body, Some("text/plain"), &headers)
+            .await
+            .is_none(),
+        "capacity slack from pass 1 must not mint room for pass 2"
+    );
+
+    // Control: the same body under a ceiling that leaves capacity remainder
+    // after pass 1 still redacts through both passes.
+    let mut roomy = ctx_with_content_type("POST", "application/json");
+    roomy.max_response_body_size_bytes = 256;
+    let redacted = plugin
+        .transform_response_body_with_context(&mut roomy, body, Some("text/plain"), &headers)
+        .await
+        .expect("ample capacity remainder admits both passes");
+    assert_eq!(
+        String::from_utf8(redacted).unwrap(),
+        "b",
+        "both pattern passes must still apply when capacity room remains"
+    );
+}
+
+/// A single SSE event that spans essentially the whole retained body must be
+/// framed/serialized through the ceiling-aware sink — never materialised as a
+/// complete would-be event beside it.
+#[tokio::test]
+async fn test_single_large_sse_event_is_rewritten_under_the_retained_ceiling() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+
+    // One event whose JSON payload is large but still under a modest ceiling
+    // after redaction. The event is the entire retained body.
+    let padding = "x".repeat(2000);
+    let body =
+        format!("event: msg\ndata: {{\"pad\":\"{padding}\",\"mail\":\"user@example.com\"}}\n\n");
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.max_response_body_size_bytes = 8192;
+
+    let redacted = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            body.as_bytes(),
+            Some("text/event-stream"),
+            &headers,
+        )
+        .await
+        .expect("a single large in-ceiling SSE event must be rewritten");
+    let redacted = String::from_utf8(redacted).unwrap();
+    assert!(
+        redacted.starts_with("event: msg\ndata: "),
+        "non-data fields and framing must survive: {redacted}"
+    );
+    assert!(!redacted.contains("user@example.com"));
+    assert!(redacted.contains("[REDACTED:pii:email]"));
+    assert!(redacted.ends_with("\n\n"));
+}
+
+/// Placeholder expansion plus JSON string escaping can amplify a legal SSE
+/// event past the retained ceiling. That amplification must be refused WHILE
+/// the event is being serialized into the sink — not after a complete event
+/// `String` already exists.
+#[tokio::test]
+async fn test_amplifying_sse_redaction_is_refused_during_event_construction() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+
+    // Many short emails expand to the longer `[REDACTED:pii:email]` placeholder,
+    // and JSON escaping of that placeholder keeps every replacement on the
+    // construction path. Size the ceiling just under the amplified event.
+    let emails = (0..40)
+        .map(|i| format!("a{i}@b.co"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let body = format!("data: {{\"t\":\"{emails}\"}}\n\n");
+    let placeholder = "[REDACTED:pii:email]";
+    let amplified_payload = emails
+        .split(' ')
+        .map(|_| placeholder)
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Compact JSON envelope around the amplified text, plus SSE framing.
+    let amplified_event = format!(
+        "data: {{\"t\":\"{}\"}}\n\n",
+        amplified_payload.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    assert!(
+        body.len() < amplified_event.len(),
+        "fixture must amplify: {} → {}",
+        body.len(),
+        amplified_event.len()
+    );
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    // Admit the original event, refuse the amplified rewrite.
+    ctx.max_response_body_size_bytes = body.len() + 8;
+    assert!(
+        body.len() <= ctx.max_response_body_size_bytes,
+        "original must fit the ceiling"
+    );
+    assert!(
+        amplified_event.len() > ctx.max_response_body_size_bytes,
+        "amplified event must exceed the ceiling"
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                body.as_bytes(),
+                Some("text/event-stream"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "an amplifying SSE rewrite must be refused during construction"
+    );
+
+    // Control: an ample ceiling still redacts the same stream.
+    let mut roomy = ctx_with_content_type("POST", "application/json");
+    let redacted = plugin
+        .transform_response_body_with_context(
+            &mut roomy,
+            body.as_bytes(),
+            Some("text/event-stream"),
+            &headers,
+        )
+        .await
+        .expect("the same SSE body redacts under an ordinary ceiling");
+    let redacted = String::from_utf8(redacted).unwrap();
+    assert!(!redacted.contains("@b.co"));
+    assert!(redacted.contains("[REDACTED:pii:email]"));
+}
+
+/// Aggregate retained-memory exhaustion during an AI residual/preflight window
+/// reservation must select the shared capacity terminal — never the ordinary
+/// residual-content 502 that claims restricted content.
+///
+/// Exhausting the process-global budget under parallel CI is unsafe, so this
+/// test drives the pending-signal + shared-installer contract the three
+/// `ResponseTransformWindow::open(None)` sites mark into, and source-parity
+/// locks those sites to the pending signal rather than residual rejection.
+#[tokio::test]
+async fn window_capacity_refusal_selects_capacity_not_restricted_content_502() {
+    use ferrum_edge::_test_support::{
+        RESPONSE_BUFFER_OVERLOAD_BODY, RESPONSE_BUFFER_OVERLOAD_STATUS,
+        gateway_capacity_response_selected_for_test,
+        install_pending_buffered_response_capacity_refusal_for_test,
+        mark_buffered_response_capacity_refusal_pending_for_test,
+        take_buffered_response_capacity_refusal_pending_for_test,
+    };
+
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    mark_buffered_response_capacity_refusal_pending_for_test(&mut ctx);
+    assert!(take_buffered_response_capacity_refusal_pending_for_test(
+        &mut ctx
+    ));
+    // Re-mark: the enclosing on_response_body loop consumes via install_pending.
+    mark_buffered_response_capacity_refusal_pending_for_test(&mut ctx);
+
+    let mut status = 200u16;
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut body = bytes::Bytes::from_static(
+        br#"{"choices":[{"message":{"content":"reach me at user@example.com"}}]}"#,
+    );
+
+    assert!(install_pending_buffered_response_capacity_refusal_for_test(
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+    ));
+    assert_eq!(status, RESPONSE_BUFFER_OVERLOAD_STATUS);
+    assert_eq!(body.as_ref(), RESPONSE_BUFFER_OVERLOAD_BODY.as_bytes());
+    assert!(gateway_capacity_response_selected_for_test(&ctx));
+    assert!(!take_buffered_response_capacity_refusal_pending_for_test(
+        &mut ctx
+    ));
+    let rendered = String::from_utf8(body.to_vec()).expect("utf-8");
+    assert!(
+        !rendered.contains("restricted content"),
+        "capacity must not claim restricted content"
+    );
+    assert!(!rendered.contains("user@example.com"));
+
+    // Ordinary residual content still rejects as 502 restricted content.
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["ssn"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut residual_ctx = ctx_with_content_type("POST", "application/json");
+    let residual_body = br#"{"choices":[{"message":{"ssn":123456789}}]}"#;
+    let mut residual_headers = HashMap::new();
+    residual_headers.insert("content-type".to_string(), "application/json".to_string());
+    let result = plugin
+        .on_response_body(&mut residual_ctx, 200, &mut residual_headers, residual_body)
+        .await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("restricted content"));
+            assert!(
+                !gateway_capacity_response_selected_for_test(&residual_ctx),
+                "ordinary residual must not mark the capacity terminal"
+            );
+        }
+        other => panic!("expected residual 502, got {other:?}"),
+    }
+
+    let guard = include_str!("../../../src/plugins/ai_response_guard.rs");
+    assert_eq!(
+        guard
+            .matches("mark_buffered_response_capacity_refusal_pending()")
+            .count(),
+        3,
+        "SSE residual, JSON/content residual, and native-gRPC preflight must \
+         each mark pending on window refusal"
+    );
+    assert!(
+        guard.contains("ResponseTransformWindow::open(ceiling)?"),
+        "SSE residual must propagate window refusal as Option::None rather than \
+         collapsing it into residual=true"
+    );
+}

@@ -14,7 +14,8 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 
@@ -2728,6 +2729,347 @@ impl MeshConfig {
             &mut self.virtual_service_cors_policies,
             self.multi_cluster.as_mut(),
         );
+    }
+
+    /// Every namespace that owns at least one namespaced mesh object here.
+    ///
+    /// Diagnostics and tests only. Kubernetes overlay ownership is keyed by
+    /// object identity, NOT by namespace (issue #2452) — a namespace can hold
+    /// objects from several sources at once, so withdrawing a namespace would
+    /// erase mesh state Kubernetes never owned. See
+    /// [`Self::overlay_objects_from`].
+    ///
+    /// The `serde(skip)` runtime-only back-projections
+    /// (`node_waypoint_capture_*`, `local_*`) are deliberately excluded: they
+    /// are per-slice derivations, never source-owned configuration, and are
+    /// always default on a control-plane snapshot.
+    pub fn object_namespaces(&self) -> BTreeSet<String> {
+        let mut namespaces = BTreeSet::new();
+        collect_ns(&self.workloads, &mut namespaces);
+        collect_ns(&self.services, &mut namespaces);
+        collect_ns(&self.mesh_policies, &mut namespaces);
+        collect_ns(&self.peer_authentications, &mut namespaces);
+        collect_ns(&self.service_entries, &mut namespaces);
+        collect_ns(&self.request_authentications, &mut namespaces);
+        collect_ns(&self.telemetry_resources, &mut namespaces);
+        collect_ns(&self.destination_rules, &mut namespaces);
+        collect_ns(&self.virtual_service_cors_policies, &mut namespaces);
+        collect_ns(&self.proxy_configs, &mut namespaces);
+        collect_ns(&self.sidecars, &mut namespaces);
+        collect_ns(&self.waypoint_bindings, &mut namespaces);
+        namespaces
+    }
+
+    /// Every namespaced mesh object's full identity, as
+    /// `(collection, namespace, key)`.
+    ///
+    /// Only used by ownership tests; the merge itself works per collection.
+    /// Exposed so the exhaustive-coverage guard can assert that a value placed
+    /// in ANY namespaced collection is actually visible to the ownership
+    /// accounting rather than silently skipped.
+    pub fn object_identities(&self) -> BTreeSet<(&'static str, String, String)> {
+        let mut out = BTreeSet::new();
+        collect_ids("workloads", &self.workloads, &mut out);
+        collect_ids("services", &self.services, &mut out);
+        collect_ids("mesh_policies", &self.mesh_policies, &mut out);
+        collect_ids("peer_authentications", &self.peer_authentications, &mut out);
+        collect_ids("service_entries", &self.service_entries, &mut out);
+        collect_ids(
+            "request_authentications",
+            &self.request_authentications,
+            &mut out,
+        );
+        collect_ids("telemetry_resources", &self.telemetry_resources, &mut out);
+        collect_ids("destination_rules", &self.destination_rules, &mut out);
+        collect_ids(
+            "virtual_service_cors_policies",
+            &self.virtual_service_cors_policies,
+            &mut out,
+        );
+        collect_ids("proxy_configs", &self.proxy_configs, &mut out);
+        collect_ids("sidecars", &self.sidecars, &mut out);
+        collect_ids("waypoint_bindings", &self.waypoint_bindings, &mut out);
+        out
+    }
+
+    /// Layer `overlay`'s namespaced mesh objects ON TOP of this config's.
+    ///
+    /// This is the whole of Kubernetes overlay ownership (issue #2452), and it
+    /// is deliberately keyed by OBJECT IDENTITY rather than by namespace:
+    ///
+    /// * every object in `overlay` is added, and
+    /// * a base object whose `(namespace, key)` collides with an overlay
+    ///   object of the SAME collection is dropped first, so the overlay wins
+    ///   deterministically instead of leaving two ambiguous duplicates.
+    ///
+    /// Nothing else in `self` is touched. A base object that the overlay does
+    /// not name survives even when it sits in the same namespace — or is of
+    /// the same kind — as an overlay object, which is what keeps
+    /// native/file/xDS-authored mesh state alive through a Kubernetes
+    /// publish. Withdrawal is not modeled here at all: the caller recomposes
+    /// from the retained base layer, so an empty overlay simply yields the
+    /// base again and the shadowed base object is restored.
+    ///
+    /// Mesh-global blocks (`trust_bundles`, `multi_cluster`,
+    /// `outbound_traffic_policy`, `extension_configs`, `istio_root_namespace`)
+    /// are NOT namespaced objects and are never layered here — the Kubernetes
+    /// translator does not produce them, so it cannot own them.
+    ///
+    /// Ordering inside each collection is base-then-overlay, so a source that
+    /// emits its objects deterministically keeps that order in the composed
+    /// view.
+    pub fn overlay_objects_from(&mut self, overlay: &MeshConfig) {
+        overlay_ns(&mut self.workloads, &overlay.workloads);
+        overlay_ns(&mut self.services, &overlay.services);
+        overlay_ns(&mut self.mesh_policies, &overlay.mesh_policies);
+        overlay_ns(
+            &mut self.peer_authentications,
+            &overlay.peer_authentications,
+        );
+        overlay_ns(&mut self.service_entries, &overlay.service_entries);
+        overlay_ns(
+            &mut self.request_authentications,
+            &overlay.request_authentications,
+        );
+        overlay_ns(&mut self.telemetry_resources, &overlay.telemetry_resources);
+        overlay_ns(&mut self.destination_rules, &overlay.destination_rules);
+        overlay_ns(
+            &mut self.virtual_service_cors_policies,
+            &overlay.virtual_service_cors_policies,
+        );
+        overlay_ns(&mut self.proxy_configs, &overlay.proxy_configs);
+        overlay_ns(&mut self.sidecars, &overlay.sidecars);
+        overlay_ns(&mut self.waypoint_bindings, &overlay.waypoint_bindings);
+    }
+
+    /// `true` when this config carries nothing beyond its root namespace.
+    ///
+    /// Structural equality against a default config with the same
+    /// `istio_root_namespace`, so a field added to [`MeshConfig`] later is
+    /// covered without touching this predicate. `GatewayConfig.mesh` is
+    /// normalized back to `None` when this holds, which keeps `mesh.is_some()`
+    /// meaning "this deployment has mesh state" everywhere it is read.
+    pub fn is_empty_overlay(&self) -> bool {
+        let empty = MeshConfig {
+            istio_root_namespace: self.istio_root_namespace.clone(),
+            ..MeshConfig::default()
+        };
+        *self == empty
+    }
+}
+
+/// One namespaced mesh object.
+///
+/// Implemented by every [`MeshConfig`] collection element a config source can
+/// own, so Kubernetes overlay ownership accounting
+/// ([`MeshConfig::object_namespaces`], [`MeshConfig::object_identities`],
+/// [`MeshConfig::overlay_objects_from`]) cannot silently miss a collection
+/// (issue #2452).
+pub trait MeshNamespacedObject {
+    /// The namespace that owns this object.
+    fn object_namespace(&self) -> &str;
+
+    /// This object's identity WITHIN its namespace and collection.
+    ///
+    /// Two objects of the same collection sharing `(namespace, object_key)`
+    /// are the same logical resource authored twice, so the overlay layer's
+    /// copy deterministically replaces the base layer's. The key must
+    /// therefore include every field a source uses to distinguish two
+    /// coexisting objects of that kind, and nothing else — an over-specific
+    /// key leaves duplicates, an under-specific one hides a distinct object.
+    fn object_key(&self) -> Cow<'_, str>;
+}
+
+fn collect_ns<T: MeshNamespacedObject>(items: &[T], out: &mut BTreeSet<String>) {
+    for item in items {
+        out.insert(item.object_namespace().to_string());
+    }
+}
+
+fn collect_ids<T: MeshNamespacedObject>(
+    collection: &'static str,
+    items: &[T],
+    out: &mut BTreeSet<(&'static str, String, String)>,
+) {
+    for item in items {
+        out.insert((
+            collection,
+            item.object_namespace().to_string(),
+            item.object_key().into_owned(),
+        ));
+    }
+}
+
+/// Layer one collection: drop base entries the overlay re-authors, then append
+/// the overlay's. See [`MeshConfig::overlay_objects_from`].
+fn overlay_ns<T: MeshNamespacedObject + Clone>(base: &mut Vec<T>, overlay: &[T]) {
+    if overlay.is_empty() {
+        return;
+    }
+    let shadowed: HashSet<(String, String)> = overlay.iter().map(owned_identity).collect();
+    base.retain(|item| !shadowed.contains(&owned_identity(item)));
+    base.extend(overlay.iter().cloned());
+}
+
+fn owned_identity<T: MeshNamespacedObject>(item: &T) -> (String, String) {
+    (
+        item.object_namespace().to_string(),
+        item.object_key().into_owned(),
+    )
+}
+
+impl MeshNamespacedObject for Workload {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// A workload has no `metadata.name` in the mesh model, so its identity is
+    /// TIERED.
+    ///
+    /// * **Pod-backed** (`pod_uid` present and non-empty): the pod UID ALONE.
+    ///   A Kubernetes Pod UID is the stable identity of that logical workload —
+    ///   its addresses, SPIFFE id, service account, locality and node-waypoint
+    ///   metadata all legitimately change while the same Pod object is
+    ///   reconciled. Folding any of those mutable fields into the key would stop
+    ///   the Kubernetes overlay from shadowing the base snapshot's copy of the
+    ///   same pod and leave two logical copies of it in the composed mesh.
+    /// * **Everything else** (WorkloadEntry / VM / native / xDS workloads, which
+    ///   carry no pod identity): the SPIFFE id plus addresses. `Workload` has no
+    ///   stable resource name to key on, so this composite is what keeps two
+    ///   distinct workloads sharing a service account — and therefore a SPIFFE
+    ///   id — from collapsing into one.
+    ///
+    /// An explicitly EMPTY `pod_uid` is treated as absent, not as a real pod
+    /// identity. The Kubernetes translator only ever stamps a non-empty UID,
+    /// but `pod_uid` is a plain deserialized field on the native / file / xDS
+    /// sources, so `Some("")` is reachable — and normalizing it into the pod
+    /// tier would collapse every such workload in a namespace onto one key.
+    ///
+    /// The two tiers live in disjoint key spaces (`uid|…` vs `id|…`) so no
+    /// `pod_uid` value, however malformed, can be made to collide with a
+    /// fallback key.
+    fn object_key(&self) -> Cow<'_, str> {
+        match self.pod_uid.as_deref() {
+            Some(uid) if !uid.is_empty() => Cow::Owned(format!("uid|{uid}")),
+            _ => Cow::Owned(format!(
+                "id|{}|{}",
+                self.spiffe_id,
+                self.addresses.join(",")
+            )),
+        }
+    }
+}
+
+impl MeshNamespacedObject for MeshService {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+}
+
+impl MeshNamespacedObject for MeshPolicy {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+}
+
+impl MeshNamespacedObject for PeerAuthentication {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+}
+
+impl MeshNamespacedObject for ServiceEntry {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+}
+
+impl MeshNamespacedObject for MeshRequestAuthentication {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+}
+
+impl MeshNamespacedObject for MeshTelemetryResource {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+}
+
+impl MeshNamespacedObject for MeshDestinationRule {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// One source resource can yield several rules distinguished by `host`.
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("{}|{}", self.name, self.host))
+    }
+}
+
+impl MeshNamespacedObject for MeshVirtualServiceCorsPolicy {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// One VirtualService carries at most one policy PER HOST, so the host is
+    /// part of the identity.
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("{}|{}", self.name, self.host))
+    }
+}
+
+impl MeshNamespacedObject for MeshProxyConfig {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+}
+
+impl MeshNamespacedObject for MeshSidecar {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+}
+
+impl MeshNamespacedObject for MeshWaypointBinding {
+    fn object_namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    fn object_key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
     }
 }
 

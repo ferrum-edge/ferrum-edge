@@ -231,7 +231,9 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
   http://localhost:9000/admin/tls/acme/orders/edge-order/finalize
 ```
 
-Finalization marks the order's prepared HTTP-01, TLS-ALPN-01, or DNS-01 challenges ready with the ACME directory, waits for authorization/order readiness, finalizes the order, fetches the PEM certificate chain, persists it as the order's `certificate_id`, and asks active TLS source watchers to re-pull. The stored certificate can then be used through `acme://certificates/edge-cert#cert` and `acme://certificates/edge-cert#key`.
+Finalization re-reads the order's current state from the ACME directory and drives it from there: a `pending` order has its prepared HTTP-01, TLS-ALPN-01, or DNS-01 challenges marked ready and is polled to readiness before being finalized; a `ready` order is finalized exactly once with the CSR generated when the order was created; a `processing` or `valid` order is *not* finalized again, because that finalize already landed — its certificate is retrieved and paired with the private key persisted at creation time. An `invalid` order fails closed. Ferrum then fetches the PEM certificate chain, persists it as the order's `certificate_id`, and asks active TLS source watchers to re-pull. The stored certificate can then be used through `acme://certificates/edge-cert#cert` and `acme://certificates/edge-cert#key`.
+
+The private key and CSR are generated when the order is created and stored with the order, which is what makes finalization retryable after a crash. They are never returned by any endpoint and never appear in `GET /admin/tls/acme/orders` output. An order whose material is missing or unusable is rejected with `400` before any directory request using a fixed diagnostic that never describes the material.
 
 To force renewal for an existing ACME certificate record, create a replacement order:
 

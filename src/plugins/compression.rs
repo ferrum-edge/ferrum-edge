@@ -1109,6 +1109,7 @@ impl CompressionPlugin {
         body: &[u8],
         encoding: &str,
         permit: OwnedSemaphorePermit,
+        ceiling: usize,
     ) -> Option<Vec<u8>> {
         let algo = match encoding {
             "gzip" => Algorithm::Gzip,
@@ -1126,8 +1127,8 @@ impl CompressionPlugin {
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             match algo {
-                Algorithm::Gzip => compress_gzip_blocking(&data, gzip_level),
-                Algorithm::Brotli => compress_brotli_blocking(&data, brotli_quality),
+                Algorithm::Gzip => compress_gzip_blocking(&data, gzip_level, ceiling),
+                Algorithm::Brotli => compress_brotli_blocking(&data, brotli_quality, ceiling),
             }
         })
         .await;
@@ -1237,31 +1238,49 @@ fn resolve_max_decompressed_request_size(
     Ok(limit)
 }
 
-fn compress_gzip_blocking(data: &[u8], gzip_level: u32) -> Result<Vec<u8>, String> {
+/// Encode into a sink bounded by this response's retained ceiling.
+///
+/// The encoder writes THROUGH the bound, so an expanding encode (incompressible
+/// or hostile input) is refused mid-stream instead of materialising a buffer
+/// larger than the window the transform phase reserved for it
+/// (GHSA-pwcm-6rh8-f2gh). A refusal surfaces as an encoder error, which the
+/// caller already handles by aborting the encode so the shared transform loop
+/// restores identity (or answers 406 when identity is barred) — never mislabeled
+/// plaintext.
+fn compress_gzip_blocking(data: &[u8], gzip_level: u32, ceiling: usize) -> Result<Vec<u8>, String> {
+    use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
     use flate2::Compression;
     use flate2::write::GzEncoder;
 
-    let mut encoder = GzEncoder::new(
-        Vec::with_capacity(data.len() / 2),
-        Compression::new(gzip_level),
-    );
+    let sink = BoundedResponseBodySink::with_ceiling(ceiling);
+    let mut encoder = GzEncoder::new(sink, Compression::new(gzip_level));
     encoder
         .write_all(data)
         .map_err(|e| format!("gzip compression write failed: {e}"))?;
     encoder
         .finish()
-        .map_err(|e| format!("gzip compression finish failed: {e}"))
+        .map_err(|e| format!("gzip compression finish failed: {e}"))?
+        .finish()
+        .ok_or_else(|| "gzip compression exceeded the retained response ceiling".to_string())
 }
 
-fn compress_brotli_blocking(data: &[u8], brotli_quality: u32) -> Result<Vec<u8>, String> {
-    let mut output = Vec::with_capacity(data.len() / 2);
+fn compress_brotli_blocking(
+    data: &[u8],
+    brotli_quality: u32,
+    ceiling: usize,
+) -> Result<Vec<u8>, String> {
+    use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
+
+    let mut output = BoundedResponseBodySink::with_ceiling(ceiling);
     let params = brotli::enc::BrotliEncoderParams {
         quality: brotli_quality as i32,
         ..Default::default()
     };
     brotli::BrotliCompress(&mut &data[..], &mut output, &params)
         .map_err(|e| format!("brotli compression failed: {e}"))?;
-    Ok(output)
+    output
+        .finish()
+        .ok_or_else(|| "brotli compression exceeded the retained response ceiling".to_string())
 }
 
 fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
@@ -2130,7 +2149,13 @@ impl Plugin for CompressionPlugin {
         // Encoder / join failure marks abort so shared transform loops restore
         // identity (or 406 when identity is barred) with correct headers instead
         // of emitting mislabeled or explicitly refused plaintext.
-        let compressed = self.compress_response_body(body, encoding, permit).await;
+        // The encoder writes into a sink sized to this response's retained
+        // ceiling — the same size as the window the transform phase reserved —
+        // so an expanding encode is refused during construction rather than
+        // after a larger buffer is resident (GHSA-pwcm-6rh8-f2gh).
+        let compressed = self
+            .compress_response_body(body, encoding, permit, ctx.retained_response_body_ceiling())
+            .await;
         // Release the buffer slot only once the compressed copy exists (or the
         // encode failed): from here on nothing further is retained under this
         // request's compression admission.

@@ -169,9 +169,13 @@ fn full_db_reload_reapplies_k8s_overlay_and_mesh() {
 
 #[test]
 fn overlay_slot_preserves_mesh_when_later_translate_omits_it() {
-    // #2982: merge_k8s_translation keeps an existing mesh when a successful
-    // translate omits mesh. The overlay slot must do the same — it is the only
-    // mesh source on CP full-reload re-merge (DB snapshots clear mesh).
+    // #2982: merge_k8s_translation keeps an existing mesh when a translate
+    // with NO mesh authority omits mesh. The overlay slot must do the same —
+    // it is the only mesh source on CP full-reload re-merge (DB snapshots
+    // clear mesh). #2452 narrowed this to the no-authority case: an
+    // AUTHORITATIVE empty translation withdraws instead, covered in
+    // `k8s_mesh_overlay_withdrawal_tests.rs`. These hand-built overlays carry
+    // the default `K8sMeshOverlay::NoAuthority`.
     let overlay_slot = empty_k8s_overlay_slot();
     let managed = BTreeSet::from(["ferrum".to_string()]);
 

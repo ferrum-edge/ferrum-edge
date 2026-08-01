@@ -89,6 +89,11 @@ struct FailingMandatoryReplayTransform;
 
 #[async_trait]
 impl Plugin for FailingMandatoryReplayTransform {
+    /// Test producer: declares the bounded-construction contract so the
+    /// buffered phases reserve a window for it (GHSA-pwcm-6rh8-f2gh).
+    fn response_body_production(&self) -> ferrum_edge::plugins::ResponseBodyProduction {
+        ferrum_edge::plugins::ResponseBodyProduction::BoundedByRetainedCeiling
+    }
     fn name(&self) -> &str {
         "failing_mandatory_replay_transform"
     }
@@ -113,6 +118,11 @@ impl Plugin for FailingMandatoryReplayTransform {
 
 #[async_trait]
 impl Plugin for AppendingResponseTransform {
+    /// Test producer: declares the bounded-construction contract so the
+    /// buffered phases reserve a window for it (GHSA-pwcm-6rh8-f2gh).
+    fn response_body_production(&self) -> ferrum_edge::plugins::ResponseBodyProduction {
+        ferrum_edge::plugins::ResponseBodyProduction::BoundedByRetainedCeiling
+    }
     fn name(&self) -> &str {
         "appending_response_transform"
     }

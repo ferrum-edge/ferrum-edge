@@ -915,30 +915,94 @@ fn reqwest_error_response_for_cross_protocol(
     }
 }
 
+/// Map a retained-allocation refusal onto this bridge's `(status, body, class)`
+/// reject shape.
+///
+/// The attributions stay distinct: a ceiling overrun is the origin's `502` with
+/// `ResponseBodyTooLarge`, while an exhausted aggregate budget is the neutral
+/// gateway-local `503` that must not poison the backend's health accounting
+/// (GHSA-pwcm-6rh8-f2gh).
+fn cross_protocol_retain_rejection(
+    rejection: crate::proxy::response_buffer_budget::RetainRejection,
+) -> (u16, Vec<u8>, Option<ErrorClass>) {
+    use crate::proxy::response_buffer_budget::{self, RetainRejection};
+    match rejection {
+        RetainRejection::TooLarge => (
+            502,
+            r#"{"error":"Backend response body exceeds maximum size"}"#
+                .as_bytes()
+                .to_vec(),
+            Some(ErrorClass::ResponseBodyTooLarge),
+        ),
+        RetainRejection::BudgetExhausted => {
+            warn!(
+                "cross-protocol H3→HTTP: response buffering refused, aggregate \
+                 retained-response budget exhausted"
+            );
+            (
+                response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
+                response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_BODY
+                    .as_bytes()
+                    .to_vec(),
+                Some(response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_ERROR_CLASS),
+            )
+        }
+    }
+}
+
+/// Collect a cross-protocol (H3 client → HTTP/1.1+2 backend) response body
+/// under both buffered-path bounds.
+///
+/// `max_response_body_size_bytes` is the operator's effective ceiling; a `0`
+/// here means "unlimited", which is a streaming policy the retained path cannot
+/// honor, so it is folded to the fail-closed fallback ceiling
+/// (GHSA-pwcm-6rh8-f2gh). Retained bytes are charged against the process-wide
+/// aggregate budget as they accumulate. On success the charge is MOVED into the
+/// returned `Bytes`, so it is released when the payload is dropped rather than
+/// when this function returns; on every failure path (including the caller
+/// dropping this future) the reservation drops and the blocks return.
+///
+/// The failure arm carries the client-visible status because the two refusals
+/// are not the same fault: an oversized body is the origin's (`502`,
+/// `ResponseBodyTooLarge`), while an exhausted retention budget is transient
+/// gateway capacity (`503`, the health-neutral `GatewayBufferCapacity`).
 async fn collect_reqwest_response_body_with_limit(
     mut response: reqwest::Response,
     max_response_body_size_bytes: usize,
-) -> Result<Vec<u8>, (Vec<u8>, Option<ErrorClass>)> {
-    let mut body = Vec::new();
+) -> Result<bytes::Bytes, (u16, Vec<u8>, Option<ErrorClass>)> {
+    use crate::proxy::response_buffer_budget;
+
+    let max_response_body_size_bytes =
+        response_buffer_budget::buffered_response_body_ceiling(max_response_body_size_bytes);
+    let mut body = response_buffer_budget::ChargedBodyCollector::new(
+        response_buffer_budget::BudgetRef::global(),
+        max_response_body_size_bytes,
+    );
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
-                if max_response_body_size_bytes > 0
-                    && body.len() + chunk.len() > max_response_body_size_bytes
-                {
-                    return Err((
-                        r#"{"error":"Backend response body exceeds maximum size"}"#
-                            .as_bytes()
-                            .to_vec(),
-                        Some(ErrorClass::ResponseBodyTooLarge),
-                    ));
+                // The collector owns the ceiling check and the aggregate charge,
+                // and charges the growth target BEFORE allocating it, so a
+                // reallocation cannot leave capacity resident outside the budget
+                // (GHSA-pwcm-6rh8-f2gh).
+                if let Err(rejection) = body.append(&chunk) {
+                    return Err(cross_protocol_retain_rejection(rejection));
                 }
-                body.extend_from_slice(&chunk);
             }
-            Ok(None) => return Ok(body),
+            Ok(None) => {
+                // Hand the charge to the retained allocation so it outlives this
+                // collector, gated on the charge covering its real capacity.
+                return match body.into_charged_bytes() {
+                    Some(charged) => Ok(charged),
+                    None => Err(cross_protocol_retain_rejection(
+                        response_buffer_budget::RetainRejection::BudgetExhausted,
+                    )),
+                };
+            }
             Err(error) => {
                 warn!("cross-protocol H3→HTTP: failed to read buffered response body: {error}");
                 return Err((
+                    502,
                     r#"{"error":"Backend response body read failed"}"#.as_bytes().to_vec(),
                     Some(crate::retry::classify_reqwest_error(&error)),
                 ));
@@ -2729,8 +2793,14 @@ where
         )
         .await
         {
-            Ok(Ok(body)) => bytes::Bytes::from(body),
-            Ok(Err((error_body, error_class))) => {
+            Ok(Ok(body)) => body,
+            Ok(Err((reject_status, error_body, error_class))) => {
+                // `reject_status` distinguishes an origin-attributed refusal
+                // (`502`) from an exhausted gateway retention budget (`503`);
+                // outcome recording follows the same status so passive health
+                // and admission see the classification actually returned.
+                let reject_status_code =
+                    StatusCode::from_u16(reject_status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
                 record_backend_outcome(
                     state,
                     proxy,
@@ -2738,7 +2808,7 @@ where
                     upstream_balancer,
                     current_target.as_deref(),
                     current_cb_target_key.as_deref(),
-                    502,
+                    reject_status,
                     false,
                     error_class,
                     cb_retry_probe_slot_available,
@@ -2747,7 +2817,7 @@ where
                 );
                 record_cross_protocol_backend_admission_outcome(
                     &mut backend_admission_permits,
-                    502,
+                    reject_status,
                     error_class.is_some_and(|class| class != ErrorClass::ClientDisconnect),
                     error_class,
                     backend_admission_elapsed,
@@ -2756,7 +2826,7 @@ where
                 let mut outcome = write_plain_gateway_reject(
                     stream,
                     ctx,
-                    StatusCode::BAD_GATEWAY,
+                    reject_status_code,
                     bytes::Bytes::from(error_body),
                     &empty_headers,
                     backend_start,
@@ -2800,7 +2870,7 @@ where
                 normalize_response_body_for_inspection(
                     plugins,
                     ctx,
-                    response_status,
+                    &mut response_status,
                     &mut response_headers,
                     &mut response_body,
                     initial_response_header_policy_plugins,
@@ -2809,37 +2879,53 @@ where
                 // Set once an earlier body phase selects a gateway-authored
                 // terminal response. Transforms still run so presentation and
                 // protocol encoding stays correct, but final-body validators
-                // must not replace the selected error.
-                let mut response_body_rejected = false;
-                for plugin in plugins {
-                    let result = plugin
-                        .on_response_body(
-                            ctx,
-                            response_status,
-                            &mut response_headers,
-                            &response_body,
-                        )
-                        .await;
-                    match result {
-                        PluginResult::Continue => {
-                            ctx.record_deadline_response_header_plugin(
-                                plugin.as_ref(),
-                                &response_headers,
-                            );
-                        }
-                        reject @ PluginResult::Reject { .. }
-                        | reject @ PluginResult::RejectBinary { .. } => {
-                            apply_buffered_plain_plugin_reject(
-                                plugins,
+                // must not replace the selected error. A retained-response
+                // capacity terminal is already protocol-correct and skips those
+                // later mutating phases.
+                let mut response_body_rejected = ctx.gateway_capacity_response_selected();
+                if !response_body_rejected {
+                    for plugin in plugins {
+                        let result = plugin
+                            .on_response_body(
                                 ctx,
-                                reject,
-                                &mut response_status,
+                                response_status,
                                 &mut response_headers,
-                                &mut response_body,
+                                &response_body,
                             )
                             .await;
-                            response_body_rejected = true;
-                            break;
+                        match result {
+                            PluginResult::Continue => {
+                                if crate::proxy::install_pending_buffered_response_capacity_refusal(
+                                    ctx,
+                                    &mut response_status,
+                                    &mut response_headers,
+                                    &mut response_body,
+                                    crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                                        initial_response_header_policy_plugins,
+                                    ),
+                                ) {
+                                    response_body_rejected = true;
+                                    break;
+                                }
+                                ctx.record_deadline_response_header_plugin(
+                                    plugin.as_ref(),
+                                    &response_headers,
+                                );
+                            }
+                            reject @ PluginResult::Reject { .. }
+                            | reject @ PluginResult::RejectBinary { .. } => {
+                                apply_buffered_plain_plugin_reject(
+                                    plugins,
+                                    ctx,
+                                    reject,
+                                    &mut response_status,
+                                    &mut response_headers,
+                                    &mut response_body,
+                                )
+                                .await;
+                                response_body_rejected = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -2853,20 +2939,27 @@ where
                         .map(str::to_owned);
                 let grpc_web_response_content_type =
                     owned_grpc_web_response_content_type.as_deref();
-                let admission = crate::proxy::admit_buffered_response_body_transforms(
-                    plugins,
-                    ctx,
-                    crate::proxy::buffered_response_representation_origin(response_body_rejected),
-                    &mut response_status,
-                    &mut response_headers,
-                    &mut response_body,
-                    grpc_web_response_content_type,
-                    crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
-                        initial_response_header_policy_plugins,
-                    ),
-                    true,
-                )
-                .await;
+                let admission = if ctx.gateway_capacity_response_selected() {
+                    response_body_rejected = true;
+                    crate::proxy::BufferedTransformAdmission::Rejected
+                } else {
+                    crate::proxy::admit_buffered_response_body_transforms(
+                        plugins,
+                        ctx,
+                        crate::proxy::buffered_response_representation_origin(
+                            response_body_rejected,
+                        ),
+                        &mut response_status,
+                        &mut response_headers,
+                        &mut response_body,
+                        grpc_web_response_content_type,
+                        crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                            initial_response_header_policy_plugins,
+                        ),
+                        true,
+                    )
+                    .await
+                };
                 response_body_rejected |= matches!(
                     admission,
                     crate::proxy::BufferedTransformAdmission::Rejected
@@ -2879,15 +2972,27 @@ where
                     }
                 ) {
                     for plugin in plugins {
-                        if let Some(transformed) = plugin
+                        let transformed = plugin
                             .transform_response_body_with_context(
                                 &mut *ctx,
                                 &response_body,
                                 content_type_of(&response_headers),
                                 &response_headers,
                             )
-                            .await
-                        {
+                            .await;
+                        if crate::proxy::install_pending_buffered_response_capacity_refusal(
+                            ctx,
+                            &mut response_status,
+                            &mut response_headers,
+                            &mut response_body,
+                            crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                                initial_response_header_policy_plugins,
+                            ),
+                        ) {
+                            response_body_rejected = true;
+                            break;
+                        }
+                        if let Some(transformed) = transformed {
                             response_headers.insert(
                                 "content-length".to_string(),
                                 transformed.len().to_string(),
@@ -4943,12 +5048,12 @@ where
             // trailer-only backend `set-cookie` cannot divert it into the wire
             // trailers.
             let mut response_status = resp.status;
-            let mut response_body = bytes::Bytes::from(resp.body);
+            let mut response_body = resp.body;
             let mut response_trailers = resp.trailers;
             if normalize_response_body_for_inspection(
                 plugins,
                 ctx,
-                response_status,
+                &mut response_status,
                 &mut plugin_response_headers,
                 &mut response_body,
                 initial_response_header_policy_plugins,
@@ -4961,6 +5066,14 @@ where
                         &mut response_trailers,
                         &mut authoritative_trailers_only_terminal_metadata,
                     );
+                    terminal_metadata_is_body_framed |= client_terminal_metadata_is_body_framed;
+                } else if ctx.gateway_capacity_response_selected() {
+                    crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                        &plugin_response_headers,
+                        &mut response_trailers,
+                        &mut authoritative_trailers_only_terminal_metadata,
+                    );
+                    let _ = ctx.take_buffered_initial_response_header_policy();
                     terminal_metadata_is_body_framed |= client_terminal_metadata_is_body_framed;
                 } else {
                     // Same ordering contract as the transform phase below: the
@@ -4979,57 +5092,80 @@ where
             // Set once an earlier body phase selects a gateway-authored terminal
             // response. Transforms still run so gRPC-Web can emit the correct
             // client wire shape, but final-body validators must not replace the
-            // selected error.
-            let mut response_body_rejected = false;
-            for plugin in plugins.iter() {
-                let result = match crate::plugins::await_grpc_deadline(
-                    ctx.grpc_deadline_at(),
-                    plugin.on_response_body(
-                        ctx,
-                        response_status,
-                        &mut plugin_response_headers,
-                        &response_body,
-                    ),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(()) => {
-                        ctx.mark_gateway_deadline_response_selected();
-                        crate::plugins::grpc_deadline_exceeded_plugin_result()
-                    }
-                };
-                match result {
-                    PluginResult::Continue => {
-                        ctx.record_deadline_response_header_plugin(
-                            plugin.as_ref(),
-                            &plugin_response_headers,
-                        );
-                    }
-                    reject @ PluginResult::Reject { .. }
-                    | reject @ PluginResult::RejectBinary { .. } => {
-                        debug!(
-                            plugin = plugin.name(),
-                            "Plugin rejected buffered H3 gRPC response body"
-                        );
-                        apply_buffered_grpc_plugin_reject(
-                            plugins,
+            // selected error. A retained-response capacity terminal is already
+            // protocol-correct and skips those later mutating phases.
+            let mut response_body_rejected = ctx.gateway_capacity_response_selected();
+            if !response_body_rejected {
+                for plugin in plugins.iter() {
+                    let result = match crate::plugins::await_grpc_deadline(
+                        ctx.grpc_deadline_at(),
+                        plugin.on_response_body(
                             ctx,
-                            reject,
-                            &mut response_status,
+                            response_status,
                             &mut plugin_response_headers,
-                            &mut response_body,
-                            &mut response_trailers,
-                        )
-                        .await;
-                        crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
-                            &plugin_response_headers,
-                            &mut response_trailers,
-                            &mut authoritative_trailers_only_terminal_metadata,
-                        );
-                        let _ = ctx.take_buffered_initial_response_header_policy();
-                        response_body_rejected = true;
-                        break;
+                            &response_body,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(()) => {
+                            ctx.mark_gateway_deadline_response_selected();
+                            crate::plugins::grpc_deadline_exceeded_plugin_result()
+                        }
+                    };
+                    match result {
+                        PluginResult::Continue => {
+                            if crate::proxy::install_pending_buffered_response_capacity_refusal(
+                                ctx,
+                                &mut response_status,
+                                &mut plugin_response_headers,
+                                &mut response_body,
+                                crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                                    initial_response_header_policy_plugins,
+                                ),
+                            ) {
+                                crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                                    &plugin_response_headers,
+                                    &mut response_trailers,
+                                    &mut authoritative_trailers_only_terminal_metadata,
+                                );
+                                let _ = ctx.take_buffered_initial_response_header_policy();
+                                terminal_metadata_is_body_framed |=
+                                    client_terminal_metadata_is_body_framed;
+                                response_body_rejected = true;
+                                break;
+                            }
+                            ctx.record_deadline_response_header_plugin(
+                                plugin.as_ref(),
+                                &plugin_response_headers,
+                            );
+                        }
+                        reject @ PluginResult::Reject { .. }
+                        | reject @ PluginResult::RejectBinary { .. } => {
+                            debug!(
+                                plugin = plugin.name(),
+                                "Plugin rejected buffered H3 gRPC response body"
+                            );
+                            apply_buffered_grpc_plugin_reject(
+                                plugins,
+                                ctx,
+                                reject,
+                                &mut response_status,
+                                &mut plugin_response_headers,
+                                &mut response_body,
+                                &mut response_trailers,
+                            )
+                            .await;
+                            crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                                &plugin_response_headers,
+                                &mut response_trailers,
+                                &mut authoritative_trailers_only_terminal_metadata,
+                            );
+                            let _ = ctx.take_buffered_initial_response_header_policy();
+                            response_body_rejected = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -5054,20 +5190,25 @@ where
             let owned_grpc_web_response_content_type =
                 crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
             let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
-            let admission = crate::proxy::admit_buffered_response_body_transforms(
-                plugins,
-                ctx,
-                crate::proxy::buffered_response_representation_origin(response_body_rejected),
-                &mut response_status,
-                &mut plugin_response_headers,
-                &mut response_body,
-                grpc_web_response_content_type,
-                crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
-                    initial_response_header_policy_plugins,
-                ),
-                true,
-            )
-            .await;
+            let admission = if ctx.gateway_capacity_response_selected() {
+                response_body_rejected = true;
+                crate::proxy::BufferedTransformAdmission::Rejected
+            } else {
+                crate::proxy::admit_buffered_response_body_transforms(
+                    plugins,
+                    ctx,
+                    crate::proxy::buffered_response_representation_origin(response_body_rejected),
+                    &mut response_status,
+                    &mut plugin_response_headers,
+                    &mut response_body,
+                    grpc_web_response_content_type,
+                    crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                        initial_response_header_policy_plugins,
+                    ),
+                    true,
+                )
+                .await
+            };
             if matches!(
                 admission,
                 crate::proxy::BufferedTransformAdmission::Rejected
@@ -5109,6 +5250,7 @@ where
                     {
                         Ok(transformed) => transformed,
                         Err(()) => {
+                            let _ = ctx.take_buffered_response_capacity_refusal_pending();
                             replace_buffered_grpc_response_with_deadline(
                                 ctx,
                                 &mut response_status,
@@ -5129,6 +5271,26 @@ where
                             break;
                         }
                     };
+                    if crate::proxy::install_pending_buffered_response_capacity_refusal(
+                        ctx,
+                        &mut response_status,
+                        &mut plugin_response_headers,
+                        &mut response_body,
+                        crate::proxy::InitialResponseHeaderPolicySource::Prefiltered(
+                            initial_response_header_policy_plugins,
+                        ),
+                    ) {
+                        crate::proxy::grpc_proxy::select_buffered_grpc_terminal_response(
+                            &plugin_response_headers,
+                            &mut response_trailers,
+                            &mut authoritative_trailers_only_terminal_metadata,
+                        );
+                        let _ = ctx.take_buffered_initial_response_header_policy();
+                        terminal_metadata_is_body_framed |=
+                            grpc_web_response_content_type.is_some();
+                        response_body_rejected = true;
+                        break;
+                    }
                     if let Some(transformed) = transformed {
                         plugin_response_headers
                             .insert("content-length".to_string(), transformed.len().to_string());
@@ -5249,23 +5411,36 @@ where
                     .metadata
                     .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
                     .and_then(|value| value.parse::<u16>().ok());
-                let content_type = plugin_response_headers
-                    .get("content-type")
-                    .map(String::as_str);
-                let mut owned_body =
-                    crate::retry::ResponseBody::take_buffered_vec(&mut response_body);
-                let synced =
-                    crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                        &mut owned_body,
-                        content_type,
-                        &response_trailers,
-                        http_status,
-                    );
-                let synced_len = owned_body.len();
-                crate::retry::ResponseBody::store_buffered_vec(&mut response_body, owned_body);
-                if synced {
+                // Owned: the reframe runs inside a call that also takes
+                // `&mut plugin_response_headers`, so the content type cannot
+                // stay borrowed from that map.
+                let content_type = plugin_response_headers.get("content-type").cloned();
+                // Keep the charged original body alive while the covering window
+                // builds any replacement through a bounded sink
+                // (GHSA-pwcm-6rh8-f2gh).
+                let retained_ceiling = ctx.retained_response_body_ceiling();
+                let stored = crate::proxy::store_charged_grpc_web_reframed_body(
+                    ctx,
+                    &mut response_status,
+                    &mut response_body,
+                    &mut plugin_response_headers,
+                    retained_ceiling,
+                    content_type.as_deref(),
+                    &response_trailers,
+                    http_status,
+                    initial_response_header_policy_plugins,
+                );
+                if let Some((synced_len, true)) = stored {
                     plugin_response_headers
                         .insert("content-length".to_string(), synced_len.to_string());
+                } else if stored.is_none() {
+                    // The shared capacity refusal is already a complete
+                    // gRPC-Web body-framed terminal. Do not let the backend's
+                    // old native trailers or policy snapshot overwrite it.
+                    terminal_metadata_is_body_framed = true;
+                    response_trailers.clear();
+                    buffered_initial_response_header_policy_state = None;
+                    let _ = ctx.take_buffered_initial_response_header_policy();
                 }
             }
             // Retire compatibility-view application trailers only after the
@@ -5651,6 +5826,13 @@ where
                 grpc_proxy::GrpcProxyError::ResponseTooLarge(_) => (
                     grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Response payload exceeded limit",
+                ),
+                // Gateway-local retention capacity, not an oversized payload:
+                // same resource/capacity status, distinct fixed message, and a
+                // health-neutral error class (GHSA-pwcm-6rh8-f2gh).
+                grpc_proxy::GrpcProxyError::ResponseBufferCapacity(_) => (
+                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
                 ),
                 grpc_proxy::GrpcProxyError::Internal(_) => {
                     (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
@@ -6062,6 +6244,13 @@ pub(crate) async fn dispatch_grpc_streaming(
                 grpc_proxy::GrpcProxyError::ResponseTooLarge(_) => (
                     grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
                     "Response payload exceeded limit",
+                ),
+                // Gateway-local retention capacity, not an oversized payload:
+                // same resource/capacity status, distinct fixed message, and a
+                // health-neutral error class (GHSA-pwcm-6rh8-f2gh).
+                grpc_proxy::GrpcProxyError::ResponseBufferCapacity(_) => (
+                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+                    crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
                 ),
                 grpc_proxy::GrpcProxyError::Internal(_) => {
                     (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
@@ -8947,6 +9136,7 @@ mod tests {
             trust_bundles: None,
             mesh: None,
             mesh_revision: None,
+            k8s_mesh_overlay: Default::default(),
         };
         ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)
             .expect("minimal ProxyState should construct")

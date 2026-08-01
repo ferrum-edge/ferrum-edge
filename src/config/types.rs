@@ -2536,6 +2536,95 @@ pub struct GatewayConfig {
     /// has already accepted a revisioned slice.
     #[serde(skip)]
     pub mesh_revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
+    /// Kubernetes mesh-overlay ownership marker (issue #2452).
+    ///
+    /// DERIVED, CP-in-memory only (`#[serde(skip)]`, same contract as
+    /// [`Self::mesh_revision`]): it never rides the ConfigSync `config_json`
+    /// wire, is never persisted, and defaults to
+    /// [`K8sMeshOverlay::NoAuthority`] for every snapshot that did not come
+    /// from a Kubernetes translation.
+    ///
+    /// It is the SOURCE-LAYER marker that makes [`Self::mesh`] decomposable.
+    /// The invariant it asserts is:
+    ///
+    /// * [`K8sMeshOverlay::NoAuthority`] — Kubernetes owns none of `mesh`;
+    ///   every object there belongs to some other source.
+    /// * [`K8sMeshOverlay::Authoritative`] — `mesh` is
+    ///   `base_mesh` (everything owned by native / file / xDS or another
+    ///   non-Kubernetes source; CP database snapshots never carry `mesh`)
+    ///   with the Kubernetes overlay layered on top. Retaining the base layer
+    ///   verbatim is what lets an authoritatively empty Kubernetes snapshot
+    ///   withdraw exactly its own objects — including objects sharing a
+    ///   namespace, a kind, or even a name with another source's — and restore
+    ///   a base object the overlay had been shadowing.
+    ///
+    /// A Kubernetes translation carries `Authoritative { base_mesh: None }`:
+    /// its `mesh` is Kubernetes-owned in its entirety, which is the same
+    /// invariant with an empty base.
+    ///
+    /// Retaining the base costs a second copy of the NON-Kubernetes mesh on
+    /// the control plane only. It is `None` on every data plane (no Kubernetes
+    /// overlay) and on the usual control plane too, because CP database
+    /// snapshots carry no `mesh` of their own; it is non-empty only where an
+    /// operator genuinely runs a second mesh source alongside the Kubernetes
+    /// controller. Nothing on the request path reads it.
+    #[serde(skip)]
+    pub k8s_mesh_overlay: K8sMeshOverlay,
+}
+
+/// Whether a Kubernetes config source claims authority over mesh state, and —
+/// on a composed snapshot — what lies underneath its overlay.
+///
+/// The distinction this type encodes is load-bearing (issue #2452): before it
+/// existed, a managed-but-empty Kubernetes snapshot and "no Kubernetes mesh
+/// source at all" were both represented as `GatewayConfig.mesh == None`, so
+/// deleting the last mesh-contributing Kubernetes object left the previously
+/// published mesh live forever.
+///
+/// Authority is a property of the controller's **configuration** (which kinds
+/// it watches), never of the current snapshot's contents — otherwise deleting
+/// the last object would revoke the very authority needed to withdraw it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum K8sMeshOverlay {
+    /// This source supplies no mesh overlay and owns no mesh objects. A merge
+    /// leaves mesh state owned by other sources exactly as it found it.
+    #[default]
+    NoAuthority,
+    /// Kubernetes authoritatively owns the mesh objects layered on top of
+    /// `base_mesh`.
+    Authoritative {
+        /// The mesh layer owned by every NON-Kubernetes source, kept verbatim
+        /// so the composed view can be rebuilt from scratch on each publish.
+        ///
+        /// `None` on a raw Kubernetes translation (nothing underneath) and on
+        /// a composed snapshot whose other sources contribute nothing.
+        base_mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
+    },
+}
+
+impl K8sMeshOverlay {
+    /// The marker a Kubernetes translation carries: authoritative, with no
+    /// base layer underneath it yet.
+    pub fn authoritative_translation() -> Self {
+        Self::Authoritative { base_mesh: None }
+    }
+
+    /// `true` when Kubernetes owns mesh objects here and may withdraw them.
+    pub fn is_authoritative(&self) -> bool {
+        matches!(self, Self::Authoritative { .. })
+    }
+
+    /// The non-Kubernetes mesh layer underneath a Kubernetes overlay.
+    ///
+    /// `None` both when there is no Kubernetes overlay at all and when the
+    /// overlay sits on an empty base; callers distinguish those with
+    /// [`Self::is_authoritative`].
+    pub fn base_mesh(&self) -> Option<&crate::modes::mesh::config::MeshConfig> {
+        match self {
+            Self::NoAuthority => None,
+            Self::Authoritative { base_mesh } => base_mesh.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

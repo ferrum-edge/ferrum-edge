@@ -764,3 +764,195 @@ When using load balancers:
 3. Issue client certificates to authorized clients
 4. Update client applications to present certificates
 5. Gradually enforce mTLS (start with optional, then required)
+
+## Managed TLS And ACME Across Multiple Replicas
+
+Admin-managed TLS records (`managed://`), ACME certificates/orders/accounts
+(`acme://`), and the ACME renewal claims all live as JSON documents under
+`FERRUM_TLS_MANAGED_STORE_PATH`. Several gateway instances may share that
+directory.
+
+### Deployment contract
+
+- **Shared writable volume — supported.** Point every replica's
+  `FERRUM_TLS_MANAGED_STORE_PATH` at the same directory on a filesystem that
+  supports POSIX advisory locks (`flock`) — a local volume, a
+  `ReadWriteMany` block/POSIX volume, or a host path shared by co-located
+  pods. Reads are revalidated against the file on every access and writes are
+  serialized read-modify-writes, so replicas see each other's records and
+  interleaved updates never overwrite one another.
+- **Per-replica (unshared) storage — single-writer only.** With per-pod
+  volumes there is no shared state to coordinate: a record uploaded through
+  replica A simply does not exist on replica B, and B can reject a config that
+  A can serve. Run exactly one instance with admin mutations and auto-renew
+  enabled, or move to a shared volume.
+- **Network filesystems without working advisory locks** (some NFS setups)
+  are not supported: mutual exclusion depends on `flock`, and without it the
+  store degrades to the unsafe whole-file-rewrite behaviour.
+
+### What is coordinated
+
+| Concern | Mechanism |
+| --- | --- |
+| Cross-instance visibility | Every read revalidates the document against the file's replacement identity and re-reads on change. `managed://` / `acme://` source polling (`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`, or a per-source `?poll=`) therefore picks up another replica's rotation through the ordinary reload path. |
+| Read availability | Reads never wait on the writer lock. Publication is fsync + atomic replacement of the destination (`rename(2)` on Unix; `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH` on Windows), so a reader observes one complete generation or the other and its next read detects the newer one. The destination is never unlinked first, so it is never observably absent — an absent store document reads as an empty one. Challenge lookups and admin reads cannot be stalled by a slow writer. |
+| Runtime isolation of blocking work | Every mutation is a synchronous read-modify-write that can wait on the advisory lock for up to `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`. Admin managed-TLS/ACME writes, account-credential mirroring, failed-order persistence, and every lease operation (acquire, heartbeat, fenced commit, refresh, release) therefore run on the blocking pool, never on a Tokio worker, so a contended or wedged shared volume cannot stall request serving. A write that cannot be driven to a conclusion is reported as a server error, never as success. Reads stay on the runtime because they take no lock. |
+| Lost-update prevention | Each mutation takes an exclusive advisory lock on a sidecar `.<file>.lock`, re-reads the authoritative document under that lock, applies the change, and republishes atomically. Create-without-overwrite and cross-kind ID conflicts are evaluated against authoritative state, so a concurrent create returns `409` rather than silently replacing another instance's record. |
+| Single renewer | Before renewing a certificate, an instance must win that certificate's claim in `tls-leases.json`. Exactly one holder is granted at a time — a live claim excludes *every* other acquirer, including one presenting the same instance identity — so two replicas cannot create duplicate orders or collide on challenge state. The claim is what excludes a second renewer; a persisted in-flight order never is. Every due certificate goes through the claim attempt first, and the authoritative order is read only by the winner. |
+| Ownership for the whole operation | The winner heartbeats its claim at a third of the TTL for as long as the renewal runs, and every stretch of external work (account/order calls, the DNS-01 publication hook, the propagation wait, authorization polling, finalization, certificate download, and the DNS-01 *cleanup* hook) is cancelled if the claim is lost — so a superseded instance never retracts `_acme-challenge` records the new owner is about to revalidate. The cleanup hook additionally *refreshes* the claim under the lease store's own lock before it starts, rather than relying on the heartbeat having already published the loss: a takeover lands in the table before any beat has had a reason to notice it, and a retraction that is ready to run would otherwise complete inside that gap. Refreshing rather than merely re-reading also means the hook starts on a full TTL — a claim confirmed with a sliver of lifetime left could legally expire and be taken over between the check and the hook's first poll. A refresh that cannot be granted (taken over, expired, or a store error) abandons the renewal. |
+| Fenced store commits | Each account/order/certificate write runs *while the lease table's exclusive lock is held*, after re-verifying holder, fence, and liveness under that lock. Acquisition and takeover block on the same lock, so a superseded instance cannot land a stale write alongside the new owner's — a before/after ownership check would detect that race but could not undo it. Final renewal publication persists the already-CA-valid order as `Valid` first and always attempts the certificate store second inside that same lease fence, even when the order write fails. The lease document itself is never rewritten by a commit, so a target-store error propagates without disturbing any holder's claim. The lock is held only across the synchronous write(s), never across a network call, hook, or sleep. Both writes succeed: reload is requested and the renewal counts as renewed. Order succeeds and certificate fails: no reload; prior material remains due; the now-`Valid` order does not block a later retry. Order fails and certificate succeeds: new material is authoritative and reload is requested, but the renewal is still reported as failed; the published certificate's exact non-empty `order_url` is durable completion evidence so a matching stale `Pending`/`Ready`/`Processing` order is not treated as active on a later scan. Both fail: no reload and an explicit combined failure (that storage-outage case may remain fail-closed). Lease loss before entering the fence performs neither write. |
+| Crash recovery | A claim carries `expires_at` (`FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS`) and a monotonic fence. A dead holder runs no heartbeat, so the claim expires and another replica takes over; the dead holder's fence is stale, so it can no longer renew or release the claim if it comes back. The successor then **resumes that holder's authoritative persisted order** rather than skipping the certificate or ordering it again, including the window after the prior holder's finalize request already landed: the certificate key and CSR are generated during preparation and persisted with the order, so a `processing` or `valid` order is retrieved and paired with that key instead of being finalized a second time — see "Resuming a crashed renewer's order" below. |
+| Fail-closed ambiguity | A lock that cannot be taken within `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`, a malformed value for that setting, an unreadable or unparseable document, an unreadable lease table, or any heartbeat error is an error. Admin mutations fail, HTTP-01/TLS-ALPN-01 challenges are not served from stale state, and the renewal is abandoned rather than run twice. A store that is merely *missing* is a successful empty store — that is a real answer, not a failure — but a store that cannot be opened or parsed is never reported as an empty one. |
+
+### Resuming a crashed renewer's order
+
+An ACME renewal persists its order before it can finish it. A holder that dies
+after that fenced write — but before the final certificate/order publication —
+leaves an authoritative order behind in `pending_challenges`, `ready`, or
+`processing`. Its claim then expires and a successor takes over.
+
+The successor **finishes that same order**. It never treats the leftover record
+as a reason to skip the certificate (which would wedge renewal permanently,
+since the record outlives the claim that produced it) and never creates a second
+order with the CA:
+
+- **The finalization material is generated first and persisted with the order.**
+  The certificate private key and the CSR are produced during *preparation* —
+  before the order is created with the CA and before the fenced order upsert —
+  and are stored in the order record. This is what makes the post-finalize crash
+  window recoverable at all. The ACME client's own convenience finalization
+  generates a key *inside* the finalize call and only hands it back after the
+  finalize POST has already succeeded, so a renewer that dies in that window
+  would leave the CA issuing a certificate whose only matching key died with the
+  process — and RFC 8555 does not allow a second finalize for an order that has
+  left `ready`, so the successor could not re-key it either. Ferrum therefore
+  finalizes with the persisted CSR and publishes against the persisted key.
+- **Completion follows the CA's current state, not Ferrum's last-persisted one.**
+  The order is re-fetched from the directory after the account is restored, and:
+  - `pending` — each challenge endpoint is validated; a challenge that is still
+    `pending` is notified ready once, while a challenge already `processing` or
+    `valid` is left alone (a crashed holder can leave the order pending with a
+    challenge already in flight), an `invalid` challenge fails closed, and the
+    order is polled to `ready` under `FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS`,
+    then finalized once;
+  - `ready` — exactly one finalize request is sent, carrying the persisted CSR;
+    no key or CSR is ever generated at this point;
+  - `processing` — the crashed renewer's finalize already landed, so **no second
+    finalize is sent**; the certificate is polled for and paired with the
+    persisted key;
+  - `valid` — likewise no finalize; the certificate is retrieved and paired with
+    the persisted key;
+  - `invalid`, or an unusable/malformed state, fails closed.
+- **Missing or corrupt material fails closed.** A resumable order that no longer
+  carries a usable key/CSR is not completed, not replaced with a second CA
+  order, and never re-keyed after the fact. Usability is checked before any
+  directory request: the package must contain exactly one parseable private key;
+  multiple keys or malformed trailing PEM input are rejected. The CSR DER must
+  consume its entire input and verify its proof-of-possession signature, the
+  private-key public SPKI must match the CSR SPKI, and the CSR DNS SAN set must
+  exactly match the order's normalized domains (including wildcards; non-DNS
+  SANs and duplicate/ambiguous names fail closed). It fails before the DNS-01
+  hook or any directory request runs, and the record is left intact for
+  inspection. Renewal diagnostics may identify the order, while the Admin API
+  uses a fixed `400`; neither describes the material. The
+  persisted finalization key and CSR never appear in a log, an error, a `Debug`
+  rendering, or an Admin response: the material is deliberately absent from
+  `AcmeOrderSummary` (so the Admin order shape and `openapi.yaml` are unchanged
+  by it) and its `Debug` is a fixed placeholder. Existing authenticated order
+  summaries continue to expose the documented challenge-setup fields; account
+  credentials remain excluded.
+- **Retention is tied to resumability.** The material is dropped in the same
+  write that sets the order `Valid`, which is exactly when the order stops being
+  resumable (`Valid` is terminal, so a later scan plans a fresh order with fresh
+  material). All four partial-publication outcomes stay recoverable: the two
+  where the order write lands reach `Valid` and no longer need it, and the two
+  where the order write fails never touch the stored record, so a still-active
+  order keeps the material its successor needs.
+
+- **Claim first, decide second.** The per-certificate claim is attempted for
+  every due certificate. Only after winning it is the latest authoritative order
+  re-read. A replica that is not the renewer is turned away by lease denial and
+  never selects an order at all.
+- **Completed work is still recognised.** If the published certificate's exact,
+  non-empty `order_url` matches the leftover order, that order is finished work
+  (the material-published-but-`Valid`-write-failed case above) and a fresh order
+  is planned instead. A different URL, an empty URL, a missing URL, or a missing
+  certificate record is not completion evidence.
+- **The order's own challenge type is used**, inferred from the challenge
+  records it actually carries — not from whatever
+  `FERRUM_ACME_RENEWAL_CHALLENGE_TYPE` is set to now. Exactly one non-empty
+  challenge family is required; no families or more than one is an explicit
+  failure and the order is left untouched. Diagnostics name the order id only,
+  never a token, key authorization, or account credential.
+- **HTTP-01 and TLS-ALPN-01 need nothing republished.** The shared challenge
+  resolvers answer out of the order store for any order still in an active
+  status, so the prior renewer's tokens keep being served while the successor
+  polls for completion.
+- **DNS-01 is re-presented through the hook.** Those records live in the
+  operator's DNS provider, so the successor republishes the stored challenges
+  with `FERRUM_ACME_DNS01_HOOK_COMMAND`, honours
+  `FERRUM_ACME_DNS01_PROPAGATION_SECONDS`, and runs the same lease-guarded
+  cleanup afterwards. **A resumed DNS-01 order therefore requires the DNS hook
+  to still be configured.** If it is not, the order is skipped explicitly — it
+  is not deleted, not marked complete, and not counted as renewed — and the
+  certificate stays due until a hook is configured again.
+- **Losing the claim mid-resume abandons the work** at exactly the points a
+  newly prepared renewal does: no further store writes, no DNS cleanup, no
+  reload.
+
+Order age is deliberately not consulted. Lease ownership plus persisted state is
+the whole recovery authority.
+
+### Operational notes
+
+- Store files (including `tls-leases.json` and the `.lock` sidecars) are
+  created with owner-only permissions on Unix. The lease table holds only
+  instance identities and timestamps — no certificates, keys, or account
+  credentials.
+- `FERRUM_TLS_STORE_INSTANCE_ID` pins a stable, attributable identity for this
+  replica's claims (for example the pod name). It does **not** let a restarting
+  replica reclaim its own still-live claim: a live claim excludes every
+  acquirer, because two processes can legitimately present the same identity
+  (a duplicated setting, or an overlapping rolling replacement) and letting the
+  newcomer in would start a second renewal while the first is still mid-ACME.
+  A restarted replica waits out the previous claim's expiry, which is the same
+  path a crash takes. The value is validated, never sanitized: an empty,
+  overlong (>128 characters), or otherwise disallowed value fails startup of
+  the store rather than being silently folded onto another identity. Permitted
+  characters are `A-Z a-z 0-9 - _ . :`. Leave the setting unset for a generated
+  per-process identity, which is always valid and always distinct.
+- `FERRUM_ACME_RENEWAL_LEASE_TTL_SECONDS` no longer has to cover a whole ACME
+  cycle, because the heartbeat extends the claim while the renewal runs; it has
+  to cover one heartbeat interval (a third of the TTL) plus scheduling slack,
+  and it is how long a *crashed* holder's certificate stays unrenewable. Note
+  that the TTL by itself guarantees nothing: ACME does not fence side effects
+  for Ferrum, so a renewal that outran a static TTL would previously have
+  overlapped with its successor. Continuous maintenance plus
+  cancel-on-loss — not the TTL value — is what bounds overlap.
+- **DNS-01 hook cancellation stops the process Ferrum started, not its
+  descendants.** A DNS-01 hook is a child process, and cancelling the renewal
+  cancels it: the hook is spawned with kill-on-drop, so losing the claim
+  terminates the running hook instead of leaving it free to publish or retract
+  `_acme-challenge` records the new owner depends on. That guarantee covers the
+  **direct child**. A hook that forks detached descendants — a backgrounded
+  provider client, a shell wrapper that returns before its work finishes — is
+  outside Ferrum's reach on every supported platform, because only the hook
+  itself can put that work in a process group or job object. Write hooks that
+  do their work in the foreground; if a hook must spawn background work, make
+  it idempotent and safe to interleave with another replica performing the same
+  publication.
+- **An abandoned renewal releases its claim off the runtime.** Normal
+  completion settles the heartbeat and then awaits the release, so the claim is
+  observably free when the renewal returns. An *abandoned* renewal — an early
+  return, a panic, a cancelled scheduler — cannot await anything, so the release
+  is handed to the blocking pool instead of running inline; a lock-taking
+  release on a Tokio worker would park that worker for up to
+  `FERRUM_TLS_STORE_LOCK_TIMEOUT_SECONDS`. If it cannot be scheduled at all the
+  claim is simply not released and lapses at `expires_at`, which is the same
+  path a crash takes. Never releasing is safe; stalling the runtime is not.
+- Managed TLS and ACME admin endpoints use the non-topology admin write gate
+  (read-only mode and database-unavailable) only. They deliberately do not
+  acquire a config-database write-topology pin and are not gated by
+  `FERRUM_DB_FAILOVER_ALLOW_WRITES`: these stores are independent of the
+  configuration database, and slow ACME network work must not defer database
+  failover or failback.

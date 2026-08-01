@@ -108,7 +108,8 @@ const INVALID_ADDRESS_LABEL: &str = "invalid-gateway-address";
 
 static PROCESS_ACTIVE_CLIENTS: AtomicU64 = AtomicU64::new(0);
 static PROCESS_RETAINED_BODY_BYTES: AtomicU64 = AtomicU64::new(0);
-static SHARED_STATES: OnceLock<Mutex<HashMap<String, Weak<LoadTestingState>>>> = OnceLock::new();
+static SHARED_STATES: OnceLock<Mutex<HashMap<String, Vec<Weak<LoadTestingState>>>>> =
+    OnceLock::new();
 
 /// Effective policy fields that determine whether a reload generation may
 /// safely inherit an in-flight cohort. Deliberately has no `Debug` or
@@ -630,15 +631,27 @@ fn retain_shared_state(
     let mut guard = registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(existing) = guard.get(identity).and_then(|weak| weak.upgrade())
-        && existing.compatibility == compatibility
-    {
+    // Preserve all still-live semantic generations for one identity. This is
+    // required for A -> B -> A reloads: if A still owns an active cohort, the
+    // reverted generation must recover A's admission flag rather than start a
+    // second run from fresh state.
+    guard.retain(|_, states| {
+        states.retain(|weak| weak.strong_count() > 0);
+        !states.is_empty()
+    });
+    if let Some(existing) = guard.get(identity).and_then(|states| {
+        states
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|state| state.compatibility == compatibility)
+    }) {
         return existing;
     }
     let state = LoadTestingState::new(compatibility);
-    guard.insert(identity.to_string(), Arc::downgrade(&state));
-    // Opportunistically prune dead weak entries.
-    guard.retain(|_, weak| weak.strong_count() > 0);
+    guard
+        .entry(identity.to_string())
+        .or_default()
+        .push(Arc::downgrade(&state));
     state
 }
 

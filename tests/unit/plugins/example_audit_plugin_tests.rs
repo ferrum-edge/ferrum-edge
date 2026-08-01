@@ -10,7 +10,8 @@ use ferrum_edge::custom_plugins::{
     collect_all_custom_plugin_migrations, create_custom_plugin, custom_plugin_names,
 };
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginHttpClient, StreamTransactionSummary, TransactionSummary,
+    ALL_PROTOCOLS, Plugin, PluginHttpClient, ResponseBodyProduction, StreamTransactionSummary,
+    TransactionSummary,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -180,6 +181,37 @@ fn test_supported_protocols_is_all_protocols() {
         .unwrap()
         .expect("plugin instance");
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+}
+
+#[test]
+fn declares_never_response_body_production() {
+    let source = include_str!("../../../custom_plugins/examples/example_audit_plugin.rs");
+    assert!(
+        source.contains("ResponseBodyProduction::Never"),
+        "example_audit_plugin must explicitly declare Never rather than inherit Undeclared"
+    );
+    assert!(
+        source.contains("fn response_body_production(&self) -> ResponseBodyProduction"),
+        "example_audit_plugin must override response_body_production"
+    );
+    assert!(
+        !source.contains("fn transform_response_body")
+            && !source.contains("fn normalize_response_body"),
+        "Never must stay truthful: example_audit_plugin must not add a response-body producer hook"
+    );
+
+    if !example_audit_plugin_registered() {
+        return;
+    }
+
+    let plugin = create_example_audit_plugin(&json!({}))
+        .unwrap()
+        .expect("plugin instance");
+    assert_eq!(
+        plugin.response_body_production(),
+        ResponseBodyProduction::Never,
+        "live trait value must be Never when the opt-in audit example is compiled in"
+    );
 }
 
 #[test]

@@ -1323,3 +1323,116 @@ async fn test_empty_config_defaults() {
     assert!(!plugin.applies_after_proxy_on_reject());
     assert!(plugin.modifies_request_headers());
 }
+
+// ---------------------------------------------------------------------------
+// Incremental SSE event framing (GHSA-pwcm-6rh8-f2gh).
+//
+// The wrapped event used to be framed from two WHOLE-BODY `String` copies — a
+// lossy UTF-8 decode and a CR/CRLF normalization — before the ceiling-bounded
+// sink saw a byte, so a full attacker-chosen replacement was resident outside
+// the reserved window. It is now written incrementally over the input; these
+// tests pin the observable framing that rewrite must preserve.
+// ---------------------------------------------------------------------------
+
+async fn wrap_body_once(config: serde_json::Value, body: &[u8]) -> Option<Vec<u8>> {
+    let plugin = make_plugin(config);
+    let mut ctx = make_sse_ctx();
+    let mut headers = json_response_headers();
+    plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    plugin
+        .transform_response_body_with_context(&mut ctx, body, Some("text/event-stream"), &headers)
+        .await
+}
+
+#[tokio::test]
+async fn test_wrap_preserves_crlf_and_lone_cr_normalization() {
+    let config = json!({"wrap_non_sse_responses": true});
+    for (body, expected) in [
+        (&b"plain"[..], "data: plain\n\n"),
+        (&b"a\r\nb"[..], "data: a\ndata: b\n\n"),
+        (&b"a\rb"[..], "data: a\ndata: b\n\n"),
+        (&b"a\r\r\nb"[..], "data: a\ndata: \ndata: b\n\n"),
+        (&b"a\n\nb"[..], "data: a\ndata: \ndata: b\n\n"),
+        // A payload that itself ends in LF needs the empty final `data:` field
+        // the WHATWG dispatch algorithm's trailing-LF removal consumes.
+        (&b"a\n"[..], "data: a\ndata: \n\n"),
+        (&b"a\r\n"[..], "data: a\ndata: \n\n"),
+        (&b"\n"[..], "data: \ndata: \n\n"),
+    ] {
+        let wrapped = wrap_body_once(config.clone(), body)
+            .await
+            .expect("wrapping must frame the body");
+        assert_eq!(
+            String::from_utf8(wrapped).expect("framed event is UTF-8"),
+            expected,
+            "framing changed for body {body:?}"
+        );
+        assert!(
+            !expected.contains('\r'),
+            "no bare CR may reach the wire: it would reintroduce a field \
+             injection boundary"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_wrap_decodes_invalid_utf8_exactly_like_from_utf8_lossy() {
+    // Asserted against the reference implementation itself, so the incremental
+    // decoder cannot drift from `String::from_utf8_lossy` substitution.
+    for raw in [
+        &b"a\xffb"[..],
+        &b"\xf0\x9f"[..],
+        &b"\xe2\x82"[..],
+        &b"lead\xc3(trail"[..],
+    ] {
+        let wrapped = wrap_body_once(json!({"wrap_non_sse_responses": true}), raw)
+            .await
+            .expect("wrapping must frame the body");
+        let expected = format!("data: {}\n\n", String::from_utf8_lossy(raw));
+        assert_eq!(
+            String::from_utf8(wrapped).expect("framed event is UTF-8"),
+            expected,
+            "lossy decoding drifted for {raw:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_wrap_keeps_the_retry_field_ahead_of_the_data_fields() {
+    let wrapped = wrap_body_once(
+        json!({"wrap_non_sse_responses": true, "retry_ms": 2500}),
+        b"hi\nthere",
+    )
+    .await
+    .expect("wrapping must frame the body");
+    assert_eq!(
+        String::from_utf8(wrapped).expect("framed event is UTF-8"),
+        "retry: 2500\ndata: hi\ndata: there\n\n"
+    );
+}
+
+#[tokio::test]
+async fn test_wrap_is_refused_while_it_is_written_when_it_exceeds_the_ceiling() {
+    let plugin = make_plugin(json!({"wrap_non_sse_responses": true}));
+    let mut ctx = make_sse_ctx();
+    // A tiny route-effective ceiling: the framed event cannot fit, and the
+    // refusal must happen during construction rather than after a larger buffer
+    // exists (GHSA-pwcm-6rh8-f2gh).
+    ctx.max_response_body_size_bytes = 4;
+    let mut headers = json_response_headers();
+    plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+
+    let wrapped = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"a body that cannot fit in four bytes of framing",
+            Some("text/event-stream"),
+            &headers,
+        )
+        .await;
+    assert!(
+        wrapped.is_none(),
+        "an over-ceiling framed event must be refused, leaving the original \
+         body in place"
+    );
+}

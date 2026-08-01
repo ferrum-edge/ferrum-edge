@@ -195,6 +195,10 @@ pub(crate) enum H3BodyDrainError {
     ResponseTooLarge {
         limit: usize,
     },
+    /// The process-wide aggregate budget for retained response bodies could not
+    /// admit this one. The origin behaved correctly, so this is transient
+    /// gateway capacity rather than a backend fault (GHSA-pwcm-6rh8-f2gh).
+    BufferBudgetExhausted,
     ReadTimeout {
         timeout_ms: u64,
     },
@@ -217,6 +221,9 @@ impl std::fmt::Display for H3BodyDrainError {
                     "Backend response body exceeds maximum size of {limit} bytes"
                 )
             }
+            Self::BufferBudgetExhausted => {
+                write!(f, "Response buffering capacity exceeded")
+            }
             Self::ReadTimeout { timeout_ms } => {
                 write!(f, "Backend response read timeout after {timeout_ms}ms")
             }
@@ -238,9 +245,10 @@ impl std::error::Error for H3BodyDrainError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Stream(err) => Some(err),
-            Self::ResponseTooLarge { .. } | Self::ReadTimeout { .. } | Self::Truncated { .. } => {
-                None
-            }
+            Self::ResponseTooLarge { .. }
+            | Self::BufferBudgetExhausted
+            | Self::ReadTimeout { .. }
+            | Self::Truncated { .. } => None,
         }
     }
 }
@@ -248,6 +256,23 @@ impl std::error::Error for H3BodyDrainError {
 impl From<h3::error::StreamError> for H3BodyDrainError {
     fn from(err: h3::error::StreamError) -> Self {
         Self::Stream(err)
+    }
+}
+
+/// Map a retained-allocation refusal onto this transport's error shape.
+///
+/// The two arms are deliberately different attributions and must stay so: a
+/// ceiling overrun is the BACKEND sending more than the operator allows to be
+/// retained, while an exhausted aggregate budget is GATEWAY-LOCAL transient
+/// capacity that must not ding the origin's health (GHSA-pwcm-6rh8-f2gh).
+fn h3_body_retain_error(
+    rejection: crate::proxy::response_buffer_budget::RetainRejection,
+    limit: usize,
+) -> H3BodyDrainError {
+    use crate::proxy::response_buffer_budget::RetainRejection;
+    match rejection {
+        RetainRejection::TooLarge => H3BodyDrainError::ResponseTooLarge { limit },
+        RetainRejection::BudgetExhausted => H3BodyDrainError::BufferBudgetExhausted,
     }
 }
 
@@ -266,7 +291,11 @@ impl From<h3::error::StreamError> for H3BodyDrainError {
 #[derive(Debug)]
 pub struct H3BufferedResponse {
     pub status: u16,
-    pub body: Vec<u8>,
+    /// The drained payload, published as cheaply cloneable [`bytes::Bytes`]
+    /// whose owner also holds the retained-response budget permit that paid for
+    /// it (GHSA-pwcm-6rh8-f2gh). Cloning shares the one charge; the budget is
+    /// returned when the last handle drops.
+    pub body: bytes::Bytes,
     pub headers: HashMap<String, String>,
     pub trailers: Option<http::HeaderMap>,
 }
@@ -304,19 +333,42 @@ pub(crate) async fn drain_h3_response_body(
     content_length: Option<u64>,
     max_response_body_size_bytes: usize,
     backend_read_timeout_ms: u64,
-) -> Result<(Vec<u8>, Option<http::HeaderMap>), H3BodyDrainError> {
-    if max_response_body_size_bytes > 0
-        && content_length.is_some_and(|len| len > max_response_body_size_bytes as u64)
-    {
+) -> Result<(bytes::Bytes, Option<http::HeaderMap>), H3BodyDrainError> {
+    use crate::proxy::response_buffer_budget;
+
+    // This helper only ever RETAINS the body, so the documented streaming
+    // `0 = unlimited` cannot apply here: it is folded to the fail-closed
+    // fallback ceiling, and retained bytes are additionally charged against the
+    // process-wide aggregate budget (GHSA-pwcm-6rh8-f2gh). On success the charge
+    // is handed to the returned `Bytes`, so it lives exactly as long as the
+    // payload does; on every other exit — refusal, timeout, stream error, or the
+    // caller dropping this future — the reservation drops and the blocks return.
+    let max_response_body_size_bytes =
+        response_buffer_budget::buffered_response_body_ceiling(max_response_body_size_bytes);
+    if content_length.is_some_and(|len| len > max_response_body_size_bytes as u64) {
         return Err(H3BodyDrainError::ResponseTooLarge {
             limit: max_response_body_size_bytes,
         });
     }
 
-    let mut body = match content_length {
-        Some(cl) => Vec::with_capacity(cl.min(H3_BODY_PREALLOC_CAP_BYTES) as usize),
-        None => Vec::new(),
+    // Preallocation is resident the instant it is requested, so it is charged
+    // BEFORE the allocation. Without this a flood of responses that advertise a
+    // large `content-length` and then send nothing (or stall) could each hold up
+    // to `H3_BODY_PREALLOC_CAP_BYTES` outside the budget. A declared zero length
+    // allocates nothing and is deliberately left uncharged: rounding every empty
+    // response up to a block would let bodyless traffic consume budget it never
+    // occupies. Later growth is charged as a delta against the same reservation,
+    // so a preallocated response is never charged twice.
+    let prealloc = match content_length {
+        Some(cl) if cl > 0 => cl.min(H3_BODY_PREALLOC_CAP_BYTES) as usize,
+        _ => 0,
     };
+    let mut body = response_buffer_budget::ChargedBodyCollector::with_preallocation(
+        response_buffer_budget::BudgetRef::global(),
+        max_response_body_size_bytes,
+        prealloc,
+    )
+    .map_err(|rejection| h3_body_retain_error(rejection, max_response_body_size_bytes))?;
     loop {
         let recv_result = if backend_read_timeout_ms > 0 {
             match tokio::time::timeout(
@@ -337,15 +389,16 @@ pub(crate) async fn drain_h3_response_body(
         };
         match recv_result {
             Ok(Some(chunk)) => {
-                let chunk = chunk.chunk();
-                if max_response_body_size_bytes > 0
-                    && body.len().saturating_add(chunk.len()) > max_response_body_size_bytes
-                {
-                    return Err(H3BodyDrainError::ResponseTooLarge {
-                        limit: max_response_body_size_bytes,
-                    });
+                // The collector owns both bounds: the per-response ceiling and
+                // the aggregate charge, taken over the growth target it is about
+                // to allocate rather than over the post-append length
+                // (GHSA-pwcm-6rh8-f2gh).
+                if let Err(rejection) = body.append(chunk.chunk()) {
+                    return Err(h3_body_retain_error(
+                        rejection,
+                        max_response_body_size_bytes,
+                    ));
                 }
-                body.extend_from_slice(chunk);
             }
             Ok(None) => {
                 // Clean FIN. A declared Content-Length that the body did NOT
@@ -409,6 +462,14 @@ pub(crate) async fn drain_h3_response_body(
             );
             return Err(e.into());
         }
+    };
+    // Hand the charge to the retained allocation: from here the permit belongs
+    // to the returned `Bytes` (and to every cheap clone of it, exactly once),
+    // so it is returned when the payload is dropped rather than when this
+    // function returns. Publication is gated on the charge covering the buffer's
+    // real CAPACITY, so bytes the budget does not bound are never returned.
+    let Some(body) = body.into_charged_bytes() else {
+        return Err(H3BodyDrainError::BufferBudgetExhausted);
     };
     Ok((body, trailers))
 }
@@ -3225,7 +3286,11 @@ impl Http3Client {
         let (response_body, _trailers) =
             drain_h3_response_body(&mut stream, method, status, content_length, 0, 0).await?;
 
-        Ok((status, response_body, response_headers))
+        // This helper's callers want an owned `Vec`; the shared drain helper
+        // returns budget-charged `Bytes`, so copy out here and let the charge
+        // release with the temporary. This is a diagnostic/integration client,
+        // not a proxy path.
+        Ok((status, response_body.to_vec(), response_headers))
     }
 }
 

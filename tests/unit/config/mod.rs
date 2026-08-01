@@ -27,6 +27,7 @@ mod field_validation_tests;
 mod frontend_tls_tests;
 mod istio_docs_capability_parity_tests;
 mod jwt_secret_separation_tests;
+mod k8s_mesh_overlay_withdrawal_tests;
 mod mesh_types_tests;
 mod mesh_validation_tests;
 mod migration_runner_tests;
