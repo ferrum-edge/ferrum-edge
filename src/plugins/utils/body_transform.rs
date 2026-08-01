@@ -753,7 +753,7 @@ pub fn is_event_stream_content_type(content_type: &str) -> bool {
 /// Shared so request-path marker matching (e.g. `ai_rate_limiter`'s
 /// provider-native streaming-operation detection) can stay allocation-free
 /// instead of lowercasing the path into a fresh `String` per request.
-pub fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
+pub(crate) fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
     let hb = haystack.as_bytes();
     let nb = needle.as_bytes();
     if nb.is_empty() {

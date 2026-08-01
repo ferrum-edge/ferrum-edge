@@ -842,8 +842,9 @@ async fn a_saturated_aggregate_budget_refuses_before_the_backend_and_releases_af
 // GHSA-q2r2 — the deferred (decoded-compressed) pre-admission
 // ============================================================================
 
-/// A proxy where a co-located `compression` plugin (priority 4050) decodes the
-/// request body *before* `ai_rate_limiter` (4200) runs.
+/// A proxy where a co-located `compression` plugin (priority 4050) claims the
+/// request encoding before `ai_rate_limiter` (4200) runs, then decodes the body
+/// in the later request-body transform stage.
 ///
 /// This is the deferred shape: the limiter's `before_proxy` sees no
 /// `content-encoding` and no readable body, so it cannot classify the request
