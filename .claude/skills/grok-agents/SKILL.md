@@ -30,7 +30,10 @@ the Cursor Grok harness has no effort tiers. Do not claim an effort level was ap
 
 Non-negotiables:
 - The launcher pins **`grok-4.5`** with `fast=false` (non-Fast variant, no fast credits) through Conductor's bundled Node + `@cursor/sdk`.
-- `CURSOR_API_KEY` must be available (env or Conductor provider keychain). Do not print it.
+- `CURSOR_API_KEY` must be exported in the terminal environment that invokes the launcher. The
+  launcher passes that inherited value to `@cursor/sdk` as the spawned worker's `apiKey`; Conductor's
+  provider setting may populate the same environment variable before launch. Never print it or put
+  it in prompts, files, arguments, or logs, and do not ask the worker to log in interactively.
 - Run each dispatch as a **background / long-lived task**; prefer one task per agent.
 - **Parallel cap: 7** unless the user sets a lower limit.
 
@@ -81,7 +84,8 @@ checks -> fmt -> push -> ONE review trigger -> EXIT with report."
 ## Known failure modes
 
 - Missing Conductor harness (`.../com.conductor.app/bin/.internal/node` or `cursor-node-worker.mjs`)
-  or missing `CURSOR_API_KEY` — stop and report; do not fall back to another model.
+  or a missing exported `CURSOR_API_KEY` in the dispatch terminal — stop and report; do not
+  attempt an interactive login or fall back to another model.
 - Capacity or transport kills mid-loop — work may already be pushed; check PR state first.
 - Agents may exit claiming "waiting on monitor" — treat every completion as end-of-turn.
 - Nested dispatch: if a completed run's report mentions "dispatching a worker", treat the actual
