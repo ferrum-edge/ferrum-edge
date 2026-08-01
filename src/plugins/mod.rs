@@ -2384,6 +2384,19 @@ pub struct RequestContext {
     /// downstream body is dropped; terminal logging waits on this signal before
     /// draining plugin write-back state.
     response_stream_completion: Option<Arc<ResponseStreamCompletion>>,
+    /// Bounded, request-scoped typed slots for plugin-owned RAII state that is
+    /// acquired in an early hook and must stay alive for the whole request.
+    ///
+    /// This is deliberately NOT a second metadata map: the values are live
+    /// resource reservations (`ai_rate_limiter`'s aggregate stream-accounting
+    /// permit), not strings, and their whole purpose is that the reservation is
+    /// returned when the request context is dropped — on completion, on
+    /// rejection, on error, and on task cancellation alike. Unlike
+    /// [`ResponseStreamHandoff`], which only exists once a streaming inspector
+    /// chain has attached, this is available from the first request hook, which
+    /// is the only place a capacity refusal can still be a gateway-authored
+    /// response instead of an already-committed stream.
+    plugin_request_state: PluginRequestStateSlots,
     /// A2A gateway detection state staged between request and response hooks.
     /// Kept out of public metadata so Agent Card rewriting can work even when
     /// `observability.emit_metadata` is disabled.
@@ -2858,6 +2871,7 @@ impl RequestContext {
             compression_response_encode_aborted: false,
             response_stream_id: None,
             response_stream_completion: None,
+            plugin_request_state: PluginRequestStateSlots::default(),
             a2a_gateway_detected: false,
             a2a_gateway_binding: None,
             a2a_gateway_is_agent_card: false,
@@ -3080,6 +3094,31 @@ impl RequestContext {
     /// chain plus a hard per-request ceiling, and drops with the request
     /// context if terminal processing itself is cancelled; it is never a
     /// process-global tombstone.
+    /// Retain plugin-owned RAII state for the lifetime of this request.
+    ///
+    /// `key` must be a process-unique id from
+    /// [`allocate_response_stream_handoff_id`] (or an equivalent per-instance
+    /// allocator) so two plugin instances can never read back each other's
+    /// reservation. Returns `false` when the key is already occupied or the
+    /// per-request ceiling is reached; a caller that gets `false` must treat its
+    /// acquisition as refused and release whatever it was about to store.
+    pub fn retain_plugin_request_state<T: Any + Send + Sync>(
+        &mut self,
+        key: u64,
+        value: Arc<T>,
+    ) -> bool {
+        self.plugin_request_state.insert(key, value)
+    }
+
+    /// Read back plugin-owned RAII state retained earlier in this request.
+    ///
+    /// Available from `&self` hooks (notably
+    /// [`Plugin::response_stream_inspector`]) so a reservation taken before the
+    /// backend was dialed can be handed to the object that actually consumes it.
+    pub fn plugin_request_state<T: Any + Send + Sync>(&self, key: u64) -> Option<Arc<T>> {
+        self.plugin_request_state.get(key)
+    }
+
     pub fn response_stream_handoff(&self) -> Option<ResponseStreamHandoff> {
         self.response_stream_completion
             .as_ref()
@@ -3803,6 +3842,11 @@ impl RequestContext {
             ),
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
+            // Shared, not moved: the slots hold `Arc`-counted RAII reservations,
+            // so a short-lived clone observing them cannot release anything the
+            // live context still needs. (Contrast the buffer permit above, which
+            // is a moved single-owner slot.)
+            plugin_request_state: self.plugin_request_state.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
             a2a_gateway_binding: self.a2a_gateway_binding,
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
@@ -5015,6 +5059,52 @@ const MAX_RESPONSE_STREAM_HANDOFFS_PER_REQUEST: usize = 256;
 /// stream handoff.
 pub fn allocate_response_stream_handoff_id() -> u64 {
     NEXT_RESPONSE_STREAM_HANDOFF_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Hard ceiling on request-scoped plugin RAII slots, so a pathological plugin
+/// composition cannot grow the per-request footprint without bound.
+const MAX_PLUGIN_REQUEST_STATE_SLOTS: usize = 64;
+
+/// Bounded, request-scoped typed slots backing
+/// [`RequestContext::retain_plugin_request_state`].
+///
+/// A `Vec` rather than a map: the ceiling is 64 and lookups happen at most a
+/// couple of times per request, so a linear scan over a flat allocation beats a
+/// hashed container on every axis that matters here.
+#[derive(Clone, Default)]
+pub(crate) struct PluginRequestStateSlots(Vec<(u64, Arc<dyn Any + Send + Sync>)>);
+
+impl PluginRequestStateSlots {
+    fn insert<T: Any + Send + Sync>(&mut self, key: u64, value: Arc<T>) -> bool {
+        if self.0.iter().any(|(existing, _)| *existing == key) {
+            return false;
+        }
+        if self.0.len() >= MAX_PLUGIN_REQUEST_STATE_SLOTS {
+            return false;
+        }
+        self.0.push((key, value));
+        true
+    }
+
+    fn get<T: Any + Send + Sync>(&self, key: u64) -> Option<Arc<T>> {
+        let value = self
+            .0
+            .iter()
+            .find(|(existing, _)| *existing == key)
+            .map(|(_, value)| Arc::clone(value))?;
+        Arc::downcast::<T>(value).ok()
+    }
+}
+
+impl std::fmt::Debug for PluginRequestStateSlots {
+    /// Opaque by construction: the values are live resource reservations, and
+    /// a `RequestContext` debug rendering can reach diagnostic surfaces.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginRequestStateSlots")
+            .field("len", &self.0.len())
+            .finish()
+    }
 }
 
 type ResponseStreamHandoffEntries = Vec<(u64, Arc<dyn Any + Send + Sync>)>;

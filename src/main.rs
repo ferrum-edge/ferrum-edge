@@ -750,6 +750,14 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         env_config.max_concurrent_fault_delays,
     );
 
+    // Apply the aggregate AI stream-accounting budget for the same reason and
+    // at the same point: it bounds retained incremental usage-scanner state
+    // across every concurrent model stream, so it must be in force before the
+    // first response can attach a scanner (GHSA-q2r2-6r7h-f69x).
+    crate::plugins::utils::ai_stream_accounting::init_stream_accounting_admission(
+        env_config.ai_stream_accounting_max_bytes,
+    );
+
     // Initialize DTLS buffer config from resolved EnvConfig before any DTLS sessions.
     crate::dtls::init_dtls_buf_config(
         env_config.dtls_max_plaintext_bytes,

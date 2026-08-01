@@ -43,6 +43,7 @@ use tracing::{debug, warn};
 use super::utils::ai_providers::{
     AiTokenUsage, detect_response_provider, extract_response_usage, parse_ai_provider,
 };
+use super::utils::ai_stream_accounting::{StreamAccountingPermit, try_admit_stream_accounting};
 use super::utils::ai_stream_usage::{StreamUsageFormat, StreamUsageScanner};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::rate_limit::{
@@ -76,6 +77,13 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const CAPACITY_REJECT_BODY: &str = r#"{"error":"AI token rate limit exceeded","details":"Rate-limit state capacity exceeded (max 100000 keys)"}"#;
+/// Status for a refused aggregate stream-accounting admission. `503` rather
+/// than `429`: this is a gateway resource ceiling, not the caller's token
+/// budget, and conflating the two would tell a client its budget was spent.
+pub(crate) const STREAM_ACCOUNTING_CAPACITY_STATUS: u16 = 503;
+/// Fixed refusal body for a saturated stream-accounting budget. Names no key,
+/// identity, provider, backend, configured value, or response content.
+pub(crate) const STREAM_ACCOUNTING_CAPACITY_BODY: &str = r#"{"error":"Service unavailable","details":"The gateway cannot admit another metered AI response stream right now"}"#;
 /// Base prefix for this instance's typed reservation record (see
 /// [`InstanceReservation`]). The full key appends a process-unique instance id.
 const RESERVATION_RECORD_METADATA_KEY_PREFIX: &str = "ai_ratelimit_reservation";
@@ -233,102 +241,174 @@ impl InstanceReservation {
 }
 
 /// Terminal result of one streamed response's usage scan.
+///
+/// Immutable once published: the inspector builds exactly one of these at
+/// terminal/drop and hands it to the terminal hook through the request-scoped
+/// [`ResponseStreamHandoff`]. Nothing mutable, and no scanner, crosses tasks.
 #[derive(Debug, Clone, Default)]
 struct StreamUsageResult {
     usage: Option<AiTokenUsage>,
     malformed: bool,
+    /// The aggregate stream-accounting budget refused this stream, so no
+    /// scanner was ever allocated. Distinguished from `malformed` so the
+    /// settlement names a gateway capacity bound rather than provider damage.
+    capacity_refused: bool,
 }
 
-/// Request-owned handoff cell carrying a stream scanner from the detached body
-/// task to this instance's terminal hook.
+/// What one `before_proxy` admission pass learned from the buffered inbound
+/// request body.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RequestEstimate {
+    /// The body parsed as JSON and carries a recognized LLM request field.
+    is_ai_request: bool,
+    /// Tokens to pre-reserve. May be `0` for a genuine AI request (see the
+    /// `count_mode` limitations documented in `before_proxy`).
+    reserved_tokens: u64,
+    /// The client asked the provider for an incrementally delivered response,
+    /// so this instance expects to attach a bounded stream scanner and must
+    /// reserve aggregate accounting state up front.
+    declares_streaming: bool,
+}
+
+/// Whether a decoded AI request body asks the provider for a streamed response.
 ///
-/// The inspector runs inside the task that drives the poll-based H1/H2 channel
-/// body (and inside the H3 loop), neither of which can borrow the request
-/// context, so the result is published through the bounded, request-scoped
-/// [`ResponseStreamHandoff`] rather than any process-global map. That keeps
-/// aggregate concurrency state bounded by the in-flight requests themselves —
-/// there is no gateway-wide table of live streams to grow.
-#[derive(Debug)]
-struct StreamUsageSlot {
-    scanner: std::sync::Mutex<StreamUsageScanner>,
-    result: std::sync::Mutex<StreamUsageResult>,
+/// Every provider-native shape this limiter meters spells the request-side
+/// choice the same way — a top-level boolean `stream` (OpenAI, Anthropic,
+/// Mistral, Cohere, TGI, Bedrock `ConverseStream` request bodies proxied
+/// verbatim). Gemini and Bedrock additionally select streaming through the URL
+/// rather than the body; that is handled by
+/// [`path_declares_streaming_response`].
+///
+/// Read as a *hint for reservation*, never as an accounting decision: a body
+/// that omits it still gets a late, fail-closed admission attempt when the
+/// backend turns out to stream anyway.
+fn json_declares_streaming_response(json: &Value) -> bool {
+    json.get("stream").and_then(Value::as_bool).unwrap_or(false)
 }
 
-impl StreamUsageSlot {
-    fn new(scanner: StreamUsageScanner) -> Self {
-        Self {
-            scanner: std::sync::Mutex::new(scanner),
-            result: std::sync::Mutex::new(StreamUsageResult::default()),
-        }
-    }
+/// Whether the request target names a provider-native streaming operation.
+///
+/// Google Gemini streams through `:streamGenerateContent`; Bedrock streams
+/// through `invoke-with-response-stream` and `converse-stream`. Neither carries
+/// a body-level `stream` flag, so the path is the only pre-backend signal.
+/// Matched case-insensitively on the canonical policy path.
+fn path_declares_streaming_response(path: &str) -> bool {
+    const STREAMING_OPERATION_MARKERS: [&str; 3] = [
+        "streamgeneratecontent",
+        "invoke-with-response-stream",
+        "converse-stream",
+    ];
+    let lowered = path.to_ascii_lowercase();
+    STREAMING_OPERATION_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
 
-    fn observe(&self, chunk: &[u8]) {
-        if let Ok(mut scanner) = self.scanner.lock() {
-            scanner.observe(chunk);
-        }
+/// Which wire framing a request target predicts for its streamed response.
+///
+/// Only Bedrock's streaming operations emit `application/vnd.amazon.eventstream`
+/// (the 256 KiB retention class); every other supported provider streams SSE
+/// (64 KiB). Used solely to size the pre-backend reservation — the authoritative
+/// format still comes from the response `Content-Type`.
+fn predicted_stream_format(path: &str) -> StreamUsageFormat {
+    const BEDROCK_STREAM_MARKERS: [&str; 2] = ["invoke-with-response-stream", "converse-stream"];
+    let lowered = path.to_ascii_lowercase();
+    if BEDROCK_STREAM_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        StreamUsageFormat::AwsEventStream
+    } else {
+        StreamUsageFormat::Sse
     }
+}
 
-    /// Finalize the scan and latch its result.
-    ///
-    /// A poisoned lock is treated as a damaged scan (`malformed`), which routes
-    /// the response through the fail-closed unmetered posture instead of
-    /// reporting a usage-free stream.
-    fn finish(&self) {
-        let latched = match self.scanner.lock() {
-            Ok(mut scanner) => {
-                scanner.finish();
-                StreamUsageResult {
-                    usage: scanner.authoritative_usage().cloned(),
-                    malformed: scanner.malformed(),
-                }
-            }
-            Err(_) => StreamUsageResult {
-                usage: None,
-                malformed: true,
-            },
-        };
-        if let Ok(mut result) = self.result.lock() {
-            *result = latched;
-        }
-    }
-
-    fn snapshot(&self) -> StreamUsageResult {
-        match self.result.lock() {
-            Ok(result) => result.clone(),
-            Err(_) => StreamUsageResult {
-                usage: None,
-                malformed: true,
-            },
-        }
-    }
+/// Whether the client asked for an event-stream representation in `Accept`.
+///
+/// This is the only streaming signal available for a request body this instance
+/// cannot inspect (a still-compressed body, Case B in `before_proxy`), so it is
+/// checked alongside the body and path signals rather than instead of them.
+fn accept_declares_event_stream(headers: &HashMap<String, String>) -> bool {
+    headers.get("accept").is_some_and(|accept| {
+        accept
+            .split(',')
+            .any(|entry| super::utils::body_transform::is_event_stream_content_type(entry.trim()))
+    })
 }
 
 /// Per-response streaming usage inspector for one `ai_rate_limiter` instance.
 ///
 /// Purely observational: every chunk is forwarded downstream unchanged and the
 /// bytes are not retained. Only bounded terminal metadata is extracted.
+///
+/// ## Ownership: no lock on the chunk path
+///
+/// Exactly one task drives one response body — the detached H1/H2 channel-body
+/// task, or the H3 send loop — and that task owns this inspector by value, so
+/// the mutable scanner is owned *directly* rather than shared behind a
+/// `Mutex`. A per-chunk lock acquisition on a streaming AI response is an
+/// avoidable hot-path lock under the repository's hot-path invariants, and it
+/// bought nothing: there was never a second observer of the scanner.
+///
+/// The terminal hook DOES run on another task and cannot borrow the inspector,
+/// so exactly one immutable, bounded [`StreamUsageResult`] is published through
+/// the request-scoped [`ResponseStreamHandoff`] at terminal/drop — before
+/// `CompletionNotifyingInspector` signals completion, which is what makes the
+/// publication visible to the waiter. Nothing mutable ever crosses the task
+/// boundary.
 struct AiRateLimitStreamInspector {
-    slot: Arc<StreamUsageSlot>,
+    /// Taken at terminal/drop so the reassembly window is freed as soon as the
+    /// scan is final, and so a second `publish()` cannot re-scan.
+    scanner: Option<StreamUsageScanner>,
+    /// Aggregate accounting-state reservation covering this scanner. Held for
+    /// the inspector's whole life so the budget is returned on clean EOF,
+    /// streaming error, client disconnect, deadline, downstream termination,
+    /// and task cancellation alike. `None` only on the refused path, where
+    /// there is no scanner to cover.
+    _permit: Option<Arc<StreamAccountingPermit<'static>>>,
+    /// The aggregate budget refused this stream. The inspector stays attached as
+    /// a pure passthrough so the terminal hook still learns why.
+    capacity_refused: bool,
     handoff: Option<ResponseStreamHandoff>,
     handoff_id: u64,
     published: bool,
 }
 
 impl AiRateLimitStreamInspector {
-    /// Latch the scan result and hand it to the terminal hook.
+    /// Finalize the scan and hand its immutable result to the terminal hook.
     ///
-    /// Called from both `on_end` (clean completion) and `Drop`/`on_before_drop`
-    /// (client disconnect, deadline, cancelled task), so a stream that dies
-    /// mid-flight still publishes — with whatever it managed to observe, which
-    /// the terminal hook then treats as incomplete and settles fail-closed.
+    /// Called from `on_end` (clean completion), `on_downstream_terminated` (a
+    /// later inspector cut the stream), and `on_before_drop` (client
+    /// disconnect, deadline, cancelled task), so a stream that dies mid-flight
+    /// still publishes — with whatever it managed to observe, which the
+    /// terminal hook then treats as incomplete and settles fail-closed.
+    ///
+    /// Idempotent. A scanner already taken by an earlier publish yields the
+    /// fail-closed `malformed` result rather than a usage-free stream, so no
+    /// ordering of the terminal callbacks can present an unfinished scan as a
+    /// clean "the provider reported nothing".
     fn publish(&mut self) {
         if self.published {
             return;
         }
         self.published = true;
-        self.slot.finish();
+        let result = match self.scanner.take() {
+            Some(mut scanner) => {
+                scanner.finish();
+                StreamUsageResult {
+                    usage: scanner.authoritative_usage().cloned(),
+                    malformed: scanner.malformed(),
+                    capacity_refused: false,
+                }
+            }
+            None => StreamUsageResult {
+                usage: None,
+                malformed: true,
+                capacity_refused: self.capacity_refused,
+            },
+        };
         if let Some(handoff) = self.handoff.as_ref() {
-            handoff.publish(self.handoff_id, Arc::clone(&self.slot));
+            handoff.publish(self.handoff_id, Arc::new(result));
         }
     }
 }
@@ -336,7 +416,10 @@ impl AiRateLimitStreamInspector {
 #[async_trait]
 impl ResponseStreamInspector for AiRateLimitStreamInspector {
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
-        self.slot.observe(chunk);
+        // Directly owned `&mut` scanner: no lock, no shared cell, no contention.
+        if let Some(scanner) = self.scanner.as_mut() {
+            scanner.observe(chunk);
+        }
         ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
     }
 
@@ -479,6 +562,10 @@ pub struct AiRateLimiter {
     /// a streaming response hands its own scanner result to this instance's
     /// terminal hook and never to a sibling's.
     stream_handoff_id: u64,
+    /// Process-unique key for this instance's request-scoped aggregate
+    /// stream-accounting permit slot, so co-located limiter instances each hold
+    /// (and release) their own reservation instead of aliasing one.
+    stream_permit_slot_id: u64,
     limiter: RateLimitBackend<String, AiTokenRateAlgorithm>,
     request_counter: AtomicU64,
     epoch_base: Instant,
@@ -622,6 +709,7 @@ impl AiRateLimiter {
             reservation_record_key,
             meter_flag_key,
             stream_handoff_id: allocate_response_stream_handoff_id(),
+            stream_permit_slot_id: allocate_response_stream_handoff_id(),
             limiter: RateLimitBackend::from_plugin_config_with_config_id(
                 "ai_rate_limiter",
                 config_id,
@@ -979,6 +1067,33 @@ impl AiRateLimiter {
         }
     }
 
+    /// Refusal for "the process-wide incremental stream-accounting budget is
+    /// fully committed".
+    ///
+    /// Issued from `before_proxy` only, i.e. **before the backend is dialed**.
+    /// That placement is the whole point:
+    ///
+    /// * *Gateway-local* — no upstream was contacted, so no connection,
+    ///   circuit-breaker sample, passive-health observation, or adaptive
+    ///   concurrency measurement is produced for it. A saturated accounting
+    ///   budget can never be mistaken for a sick backend.
+    /// * *Redaction-safe* — a fixed body naming no key, identity, consumer,
+    ///   provider, backend, budget value, or response byte. A caller learns only
+    ///   that the gateway declined right now.
+    /// * *Not retroactive* — once a stream's headers and bytes are on the wire a
+    ///   rejection is impossible, which is exactly why admission cannot wait for
+    ///   the response representation.
+    fn reject_stream_accounting_capacity(&self) -> PluginResult {
+        // Metric only, deliberately: this path is reachable by a remote client,
+        // so a per-request warning would be log amplification.
+        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+        PluginResult::Reject {
+            status_code: STREAM_ACCOUNTING_CAPACITY_STATUS,
+            body: STREAM_ACCOUNTING_CAPACITY_BODY.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+
     fn reject_capacity(&self) -> PluginResult {
         // The metric is deliberately the only operational signal here. A
         // warning per attacker-selected new key would turn fail-closed
@@ -1128,6 +1243,8 @@ impl AiRateLimiter {
         delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
     }
 
+    /// What one admission pass learned from the buffered inbound request body.
+    ///
     /// Estimate the tokens to pre-reserve for this request and report whether it
     /// looked like an AI call at all. The returned `bool` is `true` only when the
     /// buffered `request_body` parsed as JSON **and** carries a recognized LLM
@@ -1137,12 +1254,12 @@ impl AiRateLimiter {
     /// be 0 for a genuine AI request (e.g. `completion_tokens` mode with no `max_*`
     /// cap), which is why callers must track the AI-request signal separately from
     /// `reserved_tokens > 0`. Parses the body exactly once.
-    fn estimate_request_tokens(&self, ctx: &RequestContext) -> (bool, u64) {
+    fn estimate_request_tokens(&self, ctx: &RequestContext) -> RequestEstimate {
         let Some(body) = ctx.metadata.get("request_body") else {
-            return (false, 0);
+            return RequestEstimate::default();
         };
         let Ok(json) = serde_json::from_str::<Value>(body) else {
-            return (false, 0);
+            return RequestEstimate::default();
         };
         // Gate the AI-request marker on LLM shape, not mere JSON parseability.
         // The classification is what decides whether this instance meters the
@@ -1150,10 +1267,16 @@ impl AiRateLimiter {
         // (and `charge_estimate` would bill) an ordinary non-LLM JSON `POST` that
         // happens to share the proxy. See `InstanceReservation::ai_request`.
         if !json_looks_like_ai_request(&json) {
-            return (false, 0);
+            // A non-AI JSON body is out of scope entirely, including for stream
+            // admission: this instance will never attach a scanner to it.
+            return RequestEstimate::default();
         }
 
-        (true, self.estimate_request_tokens_from_json(&json))
+        RequestEstimate {
+            is_ai_request: true,
+            reserved_tokens: self.estimate_request_tokens_from_json(&json),
+            declares_streaming: json_declares_streaming_response(&json),
+        }
     }
 
     fn estimate_request_tokens_from_json(&self, json: &Value) -> u64 {
@@ -2272,16 +2395,45 @@ impl Plugin for AiRateLimiter {
             return None;
         }
         let format = StreamUsageFormat::for_content_type(content_type?)?;
+
+        // Aggregate admission, second and last chance. Preferred source is the
+        // reservation `before_proxy` already took for this request; it is reused
+        // as-is whenever it covers this format's retention class, so the common
+        // path allocates no new budget here.
+        //
+        // A request that did not declare streaming (or whose body could not be
+        // inspected) has no pre-admission, and a mispredicted SSE reservation
+        // does not cover an AWS event-stream scanner. Both fall through to a
+        // fresh admission attempt. Refusal here CANNOT reject: the response is
+        // about to be written. It fails closed the only way still available —
+        // no scanner is allocated, so the aggregate bound holds, and the
+        // terminal hook settles the stream through the configured
+        // `on_unmetered_response` posture with a `stream_accounting_capacity`
+        // detail rather than charging zero.
+        let held = ctx
+            .plugin_request_state::<StreamAccountingPermit<'static>>(self.stream_permit_slot_id)
+            .filter(|permit| permit.reserved_bytes() >= format.retained_state_bytes());
+        let permit = match held {
+            Some(permit) => Some(permit),
+            None => try_admit_stream_accounting(format).map(Arc::new),
+        };
+
         let fixed_provider = if self.provider == "auto" {
             None
         } else {
             parse_ai_provider(&self.provider)
         };
+        // On refusal the inspector is still attached, but with no scanner and no
+        // reservation: it forwards bytes untouched and exists only to publish an
+        // explicit `capacity_refused` terminal result, so the settlement names
+        // the real cause instead of degrading into "not meterable".
+        let scanner = permit
+            .is_some()
+            .then(|| StreamUsageScanner::new(format, fixed_provider));
         Some(Box::new(AiRateLimitStreamInspector {
-            slot: Arc::new(StreamUsageSlot::new(StreamUsageScanner::new(
-                format,
-                fixed_provider,
-            ))),
+            capacity_refused: permit.is_none(),
+            scanner,
+            _permit: permit,
             handoff: ctx.response_stream_handoff(),
             handoff_id: self.stream_handoff_id,
             published: false,
@@ -2318,8 +2470,7 @@ impl Plugin for AiRateLimiter {
         // such reservation charged until the window expired.
         let result = ctx
             .response_stream_handoff()
-            .and_then(|handoff| handoff.take::<StreamUsageSlot>(self.stream_handoff_id))
-            .map(|slot| slot.snapshot());
+            .and_then(|handoff| handoff.take::<StreamUsageResult>(self.stream_handoff_id));
 
         // A stream that did not complete cleanly cannot present its absent usage
         // as "the provider reported nothing": the tail that would have carried
@@ -2329,6 +2480,10 @@ impl Plugin for AiRateLimiter {
         let complete = outcome.body_completed && !outcome.client_disconnected;
         let (tokens, detail) = match result {
             None => (None, "stream_not_meterable"),
+            // Checked before completeness: a refused aggregate admission is the
+            // more specific cause, and the operator needs to see a gateway
+            // capacity bound rather than an apparently damaged provider stream.
+            Some(result) if result.capacity_refused => (None, "stream_accounting_capacity"),
             Some(_) if !complete => (None, "stream_incomplete"),
             Some(result) if result.malformed => (None, "stream_malformed_frames"),
             Some(result) => match result
@@ -2428,19 +2583,29 @@ impl Plugin for AiRateLimiter {
                 .metadata
                 .contains_key(COMPRESSION_REQUEST_ENCODING_METADATA_KEY);
         let defer_compressed_classification = decompressed_by_compression && is_post_json;
-        let (is_ai_request, reserved_tokens) = if is_framed_grpc {
+        let estimate = if is_framed_grpc {
             // Framed gRPC-Web: out of scope for this JSON policy entirely.
-            (false, 0)
+            RequestEstimate::default()
         } else if still_compressed {
             // Case B: uninspectable compressed body — fail closed for POST JSON.
-            (is_post_json, 0)
+            // The body cannot be read, so streaming intent is taken from the
+            // request target and `Accept` alone (see the admission block below).
+            RequestEstimate {
+                is_ai_request: is_post_json,
+                ..RequestEstimate::default()
+            }
         } else if defer_compressed_classification {
             // Case A: defer to `on_final_request_body` (decompressed body there).
-            (false, 0)
+            RequestEstimate::default()
         } else {
             // Case C: uncompressed — estimate over the buffered inbound body.
             self.estimate_request_tokens(ctx)
         };
+        let RequestEstimate {
+            is_ai_request,
+            reserved_tokens,
+            declares_streaming,
+        } = estimate;
         // Pre-reservation vs. fall-back-to-check behavior, and two
         // intentional limitations operators must understand:
         //
@@ -2497,6 +2662,49 @@ impl Plugin for AiRateLimiter {
         //    how `ai_request_guard` treats compressed bodies (#1919) and is
         //    documented under `count_mode` / `on_unmetered_response` in
         //    docs/plugins.md.
+        // ── Aggregate stream-accounting admission (GHSA-q2r2-6r7h-f69x) ──
+        //
+        // A bounded per-stream scanner is not an aggregate bound: each live SSE
+        // scanner may retain 64 KiB and each AWS event-stream scanner 256 KiB,
+        // and nothing stops a client from opening many concurrent streams. The
+        // process-wide byte budget in `ai_stream_accounting` is the aggregate
+        // bound, and THIS is the only point in the lifecycle where exhausting it
+        // can still produce a gateway-authored response: `before_proxy` runs
+        // before the backend is dialed, so a refusal contacts no upstream, emits
+        // no circuit-breaker/passive-health/adaptive-concurrency sample, and
+        // commits no response bytes. Once the response is streaming, a rejection
+        // is physically impossible — see `on_response_stream_terminated`.
+        //
+        // Reserved before the token reservation deliberately: a refusal here
+        // must not strand a token reservation that only window/TTL expiry would
+        // reclaim.
+        //
+        // Streaming intent is the client's own declaration, taken from whichever
+        // signals are readable: the body's `stream` flag, a provider-native
+        // streaming operation in the request target, and an event-stream
+        // `Accept`. A request that declares none of them but whose backend
+        // streams anyway is not unmetered — it takes the late, fail-closed
+        // admission in `response_stream_inspector` instead, which can only
+        // decline to meter, never reject.
+        let wants_streamed_response = is_ai_request
+            && (declares_streaming
+                || path_declares_streaming_response(&ctx.path)
+                || accept_declares_event_stream(headers));
+        if wants_streamed_response && !ctx.metadata.contains_key("ai_federation_provider") {
+            // The response representation is unknown here, so charge the format
+            // the request target predicts. A mispredicted (smaller) reservation
+            // is re-admitted for the real format at inspector time rather than
+            // silently under-reserving.
+            let predicted = predicted_stream_format(&ctx.path);
+            let Some(permit) = try_admit_stream_accounting(predicted) else {
+                return self.reject_stream_accounting_capacity();
+            };
+            // Retained for the whole request, so the reservation is returned on
+            // every terminal path — completion, rejection, error, disconnect,
+            // and task cancellation — without any explicit release call.
+            ctx.retain_plugin_request_state(self.stream_permit_slot_id, Arc::new(permit));
+        }
+
         // Advance sampled idle reclamation before admission so an exactly-full
         // map of expired keys cannot remain pinned closed when only new
         // identities arrive. Cleanup never removes live budgets.

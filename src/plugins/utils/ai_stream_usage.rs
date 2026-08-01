@@ -37,6 +37,33 @@
 //! *checked*: a sum that would overflow `u64` yields no total rather than a
 //! saturated one.
 //!
+//! ## Bounded per stream *and* in aggregate
+//!
+//! Per-stream state is O(1) in the stream length, but that alone does not bound
+//! the process: each live SSE scanner may retain [`MAX_SSE_LINE_BYTES`] and each
+//! live AWS scanner [`MAX_EVENT_STREAM_MESSAGE_BYTES`], and a client can open
+//! many concurrent streams. The aggregate bound is therefore a separate,
+//! process-wide byte budget in [`super::ai_stream_accounting`], reserved before
+//! a scanner is constructed and released when its RAII permit drops. Do not
+//! describe request-scoping alone as an aggregate bound.
+//!
+//! ### Why the AWS reassembly window is still whole-message
+//!
+//! The event-stream message CRC-32 covers the complete message except its own
+//! trailing checksum, so nothing in a frame — headers included — is trustworthy
+//! until every byte of it has been hashed. Retaining only the prelude+headers
+//! and stream-hashing discarded payload bytes is possible, but it would buy
+//! almost nothing for the dominant Bedrock streaming API: in
+//! `InvokeModelWithResponseStream` *every* model frame is `:event-type: chunk`,
+//! and `chunk` is usage-bearing (the terminal one carries
+//! `amazon-bedrock-invocationMetrics` inside its base64 `bytes` envelope), so no
+//! ordinary content frame could be discarded. Only `ConverseStream`'s
+//! `messageStart` / `contentBlockDelta` / `messageStop` frames would qualify,
+//! and those are individually small. The retention that actually matters is the
+//! *multiplication* across concurrent streams, and that is what the aggregate
+//! budget bounds. Keeping integrity verification whole-message keeps the
+//! fail-closed CRC/header/payload ordering in one place.
+//!
 //! Damage is reported separately by [`StreamUsageScanner::malformed`], and it is
 //! deliberately ordering-sensitive in *both* formats. A candidate record the
 //! scanner could not decode marks the stream damaged; only a later explicit
@@ -341,6 +368,19 @@ pub enum StreamUsageFormat {
 }
 
 impl StreamUsageFormat {
+    /// Worst-case bytes one live scanner of this format may retain.
+    ///
+    /// This is the charge an admission takes against the process-wide budget in
+    /// [`super::ai_stream_accounting`]. It is the *reassembly window* — the only
+    /// unbounded-by-construction allocation a scanner makes — not the small
+    /// fixed usage snapshot, which is a handful of `u64`s.
+    pub const fn retained_state_bytes(self) -> u64 {
+        match self {
+            Self::Sse => MAX_SSE_LINE_BYTES as u64,
+            Self::AwsEventStream => MAX_EVENT_STREAM_MESSAGE_BYTES as u64,
+        }
+    }
+
     /// Select a decoder for a response content type, or `None` when the
     /// representation carries no format this scanner can meter.
     pub fn for_content_type(content_type: &str) -> Option<Self> {

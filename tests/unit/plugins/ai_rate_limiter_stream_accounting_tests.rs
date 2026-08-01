@@ -2101,3 +2101,171 @@ async fn admission_rejection_is_unchanged_by_the_record_refactor() {
         other => panic!("expected a 429 rejection, got {other:?}"),
     }
 }
+
+// ─── GHSA-q2r2 — aggregate accounting-state admission ───────────────────
+//
+// These exercise a LOCAL `StreamAccountingAdmission` instance rather than the
+// process-wide production budget, so they are deterministic and cannot perturb
+// the streaming tests above (which admit against that global budget). The
+// end-to-end refusal/release behavior on a live gateway is covered by
+// `tests/functional/functional_ai_rate_limiter_stream_accounting_test.rs`.
+
+use ferrum_edge::plugins::utils::ai_stream_accounting::{
+    DEFAULT_MAX_STREAM_ACCOUNTING_BYTES, MIN_STREAM_ACCOUNTING_BYTES, StreamAccountingAdmission,
+};
+use ferrum_edge::plugins::utils::ai_stream_usage::MAX_EVENT_STREAM_MESSAGE_BYTES;
+
+/// The charge is the format's worst-case reassembly window, which is the whole
+/// point of a byte budget: a count-based cap would either under-bound memory
+/// (sized for SSE) or needlessly refuse SSE streams (sized for the AWS framing).
+#[test]
+fn each_format_charges_its_worst_case_retention_window() {
+    assert_eq!(
+        StreamUsageFormat::Sse.retained_state_bytes(),
+        MAX_SSE_LINE_BYTES as u64
+    );
+    assert_eq!(
+        StreamUsageFormat::AwsEventStream.retained_state_bytes(),
+        MAX_EVENT_STREAM_MESSAGE_BYTES as u64
+    );
+    assert!(
+        StreamUsageFormat::AwsEventStream.retained_state_bytes()
+            > StreamUsageFormat::Sse.retained_state_bytes(),
+        "the AWS framing retains strictly more than SSE, so the two must not \
+         share one admission class"
+    );
+}
+
+/// Admission is a real bound, not an accounting fiction: the budget refuses once
+/// committed, and a refusal must not consume any of it.
+#[test]
+fn a_saturated_budget_refuses_and_charges_nothing_for_the_refusal() {
+    let sse = StreamUsageFormat::Sse.retained_state_bytes();
+    let admission = StreamAccountingAdmission::new(sse * 2);
+
+    let first = admission.try_admit(sse).expect("first admission");
+    let second = admission.try_admit(sse).expect("second admission");
+    assert_eq!(admission.in_flight_bytes(), sse * 2);
+
+    assert!(
+        admission.try_admit(sse).is_none(),
+        "a fully committed budget must refuse"
+    );
+    assert_eq!(
+        admission.in_flight_bytes(),
+        sse * 2,
+        "a refused admission must not reserve anything"
+    );
+    assert_eq!(admission.refusals(), 1);
+
+    // A larger class is refused even when a smaller one would still fit.
+    let admission_partial = StreamAccountingAdmission::new(sse * 2);
+    let _held = admission_partial.try_admit(sse).expect("small admission");
+    assert!(
+        admission_partial
+            .try_admit(StreamUsageFormat::AwsEventStream.retained_state_bytes())
+            .is_none(),
+        "the remaining budget is smaller than one AWS scanner, so it must refuse"
+    );
+
+    drop(first);
+    assert_eq!(
+        admission.in_flight_bytes(),
+        sse,
+        "dropping a permit must return exactly its own reservation"
+    );
+    drop(second);
+    assert_eq!(admission.in_flight_bytes(), 0);
+    assert!(
+        admission.try_admit(sse).is_some(),
+        "a fully released budget must admit again"
+    );
+}
+
+/// The permit is RAII, so every abnormal termination path — an early return, a
+/// dropped future, an aborted task — releases without an explicit call. This
+/// asserts the property the streaming inspector depends on.
+#[test]
+fn a_permit_is_released_on_an_early_return_path() {
+    let admission = StreamAccountingAdmission::new(MIN_STREAM_ACCOUNTING_BYTES);
+
+    fn abandon(admission: &StreamAccountingAdmission) -> Option<()> {
+        let _permit = admission.try_admit(MIN_STREAM_ACCOUNTING_BYTES)?;
+        // Simulate a mid-stream failure: return without touching the permit.
+        None
+    }
+
+    assert!(abandon(&admission).is_none());
+    assert_eq!(
+        admission.in_flight_bytes(),
+        0,
+        "an early return must still return the reservation"
+    );
+}
+
+/// The configured bound has no "meter nothing" degenerate value: `0` restores
+/// the compiled-in default and anything positive is raised to at least one
+/// worst-case scanner. A cliff there would turn a typo into silently unmetered
+/// AI streaming.
+#[test]
+fn the_configured_budget_has_no_meter_nothing_degenerate_value() {
+    let admission = StreamAccountingAdmission::new(0);
+
+    admission.set_capacity_bytes(0);
+    assert_eq!(
+        admission.capacity_bytes(),
+        DEFAULT_MAX_STREAM_ACCOUNTING_BYTES,
+        "0 must select the compiled-in default, not disable accounting"
+    );
+
+    admission.set_capacity_bytes(1);
+    assert_eq!(
+        admission.capacity_bytes(),
+        MIN_STREAM_ACCOUNTING_BYTES,
+        "a tiny positive budget is raised to one worst-case scanner"
+    );
+    assert!(
+        admission
+            .try_admit(StreamUsageFormat::AwsEventStream.retained_state_bytes())
+            .is_some(),
+        "the floor must always admit at least one AWS event-stream scanner"
+    );
+
+    admission.set_capacity_bytes(MIN_STREAM_ACCOUNTING_BYTES * 4);
+    assert_eq!(
+        admission.capacity_bytes(),
+        MIN_STREAM_ACCOUNTING_BYTES * 4,
+        "an explicit larger budget is honored verbatim"
+    );
+}
+
+/// The request-scoped slot the pre-backend reservation lives in: keyed per
+/// plugin instance, readable from an `&self` hook, and refusing a duplicate key
+/// so two instances can never alias one reservation.
+#[test]
+fn request_scoped_plugin_state_is_keyed_and_readable_from_a_shared_borrow() {
+    let mut ctx = create_test_context();
+    let first_key = ferrum_edge::plugins::allocate_response_stream_handoff_id();
+    let second_key = ferrum_edge::plugins::allocate_response_stream_handoff_id();
+
+    assert!(ctx.retain_plugin_request_state(first_key, Arc::new(7u64)));
+    assert!(ctx.retain_plugin_request_state(second_key, Arc::new(9u64)));
+    // A second write under the same key is refused rather than silently
+    // replacing (and dropping) a live reservation.
+    assert!(!ctx.retain_plugin_request_state(first_key, Arc::new(11u64)));
+
+    let read: &RequestContext = &ctx;
+    assert_eq!(read.plugin_request_state::<u64>(first_key).as_deref(), Some(&7));
+    assert_eq!(read.plugin_request_state::<u64>(second_key).as_deref(), Some(&9));
+    assert!(
+        read.plugin_request_state::<String>(first_key).is_none(),
+        "a wrong-typed read must not succeed"
+    );
+    assert!(
+        read.plugin_request_state::<u64>(
+            ferrum_edge::plugins::allocate_response_stream_handoff_id()
+        )
+        .is_none(),
+        "an unknown key must read back nothing"
+    );
+}

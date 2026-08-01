@@ -2287,6 +2287,23 @@ pub struct EnvConfig {
     /// injected delays entirely. Exceeding the budget skips the delay rather
     /// than queueing it. Default: 256.
     pub max_concurrent_fault_delays: usize,
+    /// Process-wide ceiling, in bytes, on retained incremental AI
+    /// stream-accounting state (`ai_rate_limiter`'s bounded SSE / AWS
+    /// event-stream usage scanners).
+    ///
+    /// Each live SSE scanner may retain 64 KiB and each live AWS event-stream
+    /// scanner 256 KiB, so per-stream bounds alone do not bound the process:
+    /// concurrent streams multiply them. This is the aggregate bound
+    /// (GHSA-q2r2-6r7h-f69x). A stream that cannot be admitted is refused
+    /// before the backend is dialed, or — if the response is already
+    /// committed — left unmetered and settled through the plugin's configured
+    /// `on_unmetered_response` posture.
+    ///
+    /// Resolution: `0` (default) selects the compiled-in
+    /// `DEFAULT_MAX_STREAM_ACCOUNTING_BYTES` (64 MiB); any positive value is
+    /// raised to at least one worst-case scanner (256 KiB) so the bound can
+    /// never become an accidental "meter nothing" switch. Default: 0.
+    pub ai_stream_accounting_max_bytes: u64,
     /// Maximum entries in the circuit breaker cache. Entries are keyed by
     /// proxy_id::host:port. Stale entries from removed upstream targets are
     /// pruned during config reload. This cap prevents unbounded growth from
@@ -2796,6 +2813,7 @@ impl Default for EnvConfig {
             max_concurrent_requests_per_ip: 0,
             per_ip_cleanup_interval_seconds: 60,
             max_concurrent_fault_delays: DEFAULT_MAX_CONCURRENT_FAULT_DELAYS,
+            ai_stream_accounting_max_bytes: 0,
             circuit_breaker_cache_max_entries: 10_000,
             pool_shard_amount: 0,
             status_counts_max_entries: 200,
@@ -3270,6 +3288,7 @@ impl EnvConfig {
             max_concurrent_requests_per_ip: u64 = "FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP" => 0u64;
             per_ip_cleanup_interval_seconds: u64 = "FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS" => 60u64;
             max_concurrent_fault_delays: usize = "FERRUM_MAX_CONCURRENT_FAULT_DELAYS" => DEFAULT_MAX_CONCURRENT_FAULT_DELAYS;
+            ai_stream_accounting_max_bytes: u64 = "FERRUM_AI_STREAM_ACCOUNTING_MAX_BYTES" => 0u64;
             circuit_breaker_cache_max_entries: usize = "FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES" => 10_000usize;
             pool_shard_amount: usize = "FERRUM_POOL_SHARD_AMOUNT" => 0usize;
             status_counts_max_entries: usize = "FERRUM_STATUS_COUNTS_MAX_ENTRIES" => 200usize;
@@ -3917,6 +3936,7 @@ impl EnvConfig {
             max_concurrent_requests_per_ip,
             per_ip_cleanup_interval_seconds,
             max_concurrent_fault_delays,
+            ai_stream_accounting_max_bytes,
             circuit_breaker_cache_max_entries,
             pool_shard_amount,
             status_counts_max_entries,
