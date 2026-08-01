@@ -23180,6 +23180,12 @@ async fn handle_proxy_request_inner(
                     // maps back, every semantic miss would silently store as exact-only.
                     ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
                     ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
+                    // Plugin-owned RAII slots retained by a final-request-body hook
+                    // (`ai_rate_limiter`'s deferred stream-accounting admission) must
+                    // survive the clone, or the permit would be released before the
+                    // scanner it authorizes is ever constructed. The clone carried the
+                    // pre-existing slots in, so this moves a superset back.
+                    ctx.plugin_request_state = body_hook_ctx.plugin_request_state;
                 }
                 // Irreversible outbound egress runs here and nowhere earlier:
                 // `transformed` is the backend-visible body and every final
@@ -23620,6 +23626,12 @@ async fn handle_proxy_request_inner(
                     // maps back, every semantic miss would silently store as exact-only.
                     ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
                     ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
+                    // Plugin-owned RAII slots retained by a final-request-body hook
+                    // (`ai_rate_limiter`'s deferred stream-accounting admission) must
+                    // survive the clone, or the permit would be released before the
+                    // scanner it authorizes is ever constructed. The clone carried the
+                    // pre-existing slots in, so this moves a superset back.
+                    ctx.plugin_request_state = body_hook_ctx.plugin_request_state;
                 }
                 // Finalized-request-egress boundary (GHSA-4vr5-4wm3-x5xv): the
                 // backend-visible body has been transformed and accepted by every
@@ -24289,6 +24301,12 @@ async fn handle_proxy_request_inner(
                 // maps back, every semantic miss would silently store as exact-only.
                 ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
                 ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
+                // Plugin-owned RAII slots retained by a final-request-body hook
+                // (`ai_rate_limiter`'s deferred stream-accounting admission) must
+                // survive the clone, or the permit would be released before the
+                // scanner it authorizes is ever constructed. The clone carried the
+                // pre-existing slots in, so this moves a superset back.
+                ctx.plugin_request_state = body_hook_ctx.plugin_request_state;
             }
             // Finalized-request-egress boundary for native gRPC
             // (GHSA-4vr5-4wm3-x5xv). `grpc_req_body` is the transformed,
@@ -27222,6 +27240,12 @@ async fn handle_proxy_request_inner(
             // maps back, every semantic miss would silently store as exact-only.
             ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
             ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
+            // Plugin-owned RAII slots retained by a final-request-body hook
+            // (`ai_rate_limiter`'s deferred stream-accounting admission) must
+            // survive the clone, or the permit would be released before the
+            // scanner it authorizes is ever constructed. The clone carried the
+            // pre-existing slots in, so this moves a superset back.
+            ctx.plugin_request_state = body_hook_ctx.plugin_request_state;
         }
         let (mut result, retained_body) = match initial_dispatch {
             BackendDispatchResult::Response {
@@ -27648,6 +27672,12 @@ async fn handle_proxy_request_inner(
             // maps back, every semantic miss would silently store as exact-only.
             ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
             ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
+            // Plugin-owned RAII slots retained by a final-request-body hook
+            // (`ai_rate_limiter`'s deferred stream-accounting admission) must
+            // survive the clone, or the permit would be released before the
+            // scanner it authorizes is ever constructed. The clone carried the
+            // pre-existing slots in, so this moves a superset back.
+            ctx.plugin_request_state = body_hook_ctx.plugin_request_state;
         }
         let resp = match dispatch {
             BackendDispatchResult::Response {

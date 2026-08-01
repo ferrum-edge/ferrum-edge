@@ -2396,7 +2396,14 @@ pub struct RequestContext {
     /// chain has attached, this is available from the first request hook, which
     /// is the only place a capacity refusal can still be a gateway-authored
     /// response instead of an already-committed stream.
-    plugin_request_state: PluginRequestStateSlots,
+    ///
+    /// `pub(crate)` so the proxy can carry slots retained by a final-request-body
+    /// hook back onto the real request context: on H1/H2 that hook runs against
+    /// a lightweight clone, and a reservation taken there (the deferred
+    /// stream-accounting admission in `ai_rate_limiter`) would otherwise be
+    /// released the moment the clone drops, leaving the scanner it authorizes
+    /// unbudgeted.
+    pub(crate) plugin_request_state: PluginRequestStateSlots,
     /// A2A gateway detection state staged between request and response hooks.
     /// Kept out of public metadata so Agent Card rewriting can work even when
     /// `observability.emit_metadata` is disabled.

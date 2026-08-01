@@ -44,8 +44,10 @@ use super::utils::ai_providers::{
     AiTokenUsage, detect_response_provider, extract_response_usage, parse_ai_provider,
 };
 use super::utils::ai_stream_accounting::{StreamAccountingPermit, try_admit_stream_accounting};
-use super::utils::ai_stream_usage::{StreamUsageFormat, StreamUsageScanner};
-use super::utils::body_transform::is_json_content_type;
+use super::utils::ai_stream_usage::{
+    StreamUsageFormat, StreamUsageScanner, is_aws_event_stream_content_type,
+};
+use super::utils::body_transform::{ascii_contains_ignore_case, is_json_content_type};
 use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, ENFORCEMENT_UNAVAILABLE_BODY,
     ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
@@ -281,7 +283,9 @@ struct RequestEstimate {
 ///
 /// Read as a *hint for reservation*, never as an accounting decision: a body
 /// that omits it still gets a late, fail-closed admission attempt when the
-/// backend turns out to stream anyway.
+/// backend turns out to stream anyway. Also read from
+/// `on_final_request_body_with_context` for a body that was still compressed in
+/// `before_proxy`, so the deferred path reserves before backend dispatch too.
 fn json_declares_streaming_response(json: &Value) -> bool {
     json.get("stream").and_then(Value::as_bool).unwrap_or(false)
 }
@@ -292,16 +296,19 @@ fn json_declares_streaming_response(json: &Value) -> bool {
 /// through `invoke-with-response-stream` and `converse-stream`. Neither carries
 /// a body-level `stream` flag, so the path is the only pre-backend signal.
 /// Matched case-insensitively on the canonical policy path.
+///
+/// This runs on the request hot path for every candidate AI request, so the
+/// match is the shared allocation-free ASCII-insensitive substring scan rather
+/// than a per-request lowercased copy of the path.
 fn path_declares_streaming_response(path: &str) -> bool {
     const STREAMING_OPERATION_MARKERS: [&str; 3] = [
         "streamgeneratecontent",
         "invoke-with-response-stream",
         "converse-stream",
     ];
-    let lowered = path.to_ascii_lowercase();
     STREAMING_OPERATION_MARKERS
         .iter()
-        .any(|marker| lowered.contains(marker))
+        .any(|marker| ascii_contains_ignore_case(path, marker))
 }
 
 /// Which wire framing a request target predicts for its streamed response.
@@ -310,12 +317,14 @@ fn path_declares_streaming_response(path: &str) -> bool {
 /// (the 256 KiB retention class); every other supported provider streams SSE
 /// (64 KiB). Used solely to size the pre-backend reservation — the authoritative
 /// format still comes from the response `Content-Type`.
+///
+/// Allocation-free for the same hot-path reason as
+/// [`path_declares_streaming_response`].
 fn predicted_stream_format(path: &str) -> StreamUsageFormat {
     const BEDROCK_STREAM_MARKERS: [&str; 2] = ["invoke-with-response-stream", "converse-stream"];
-    let lowered = path.to_ascii_lowercase();
     if BEDROCK_STREAM_MARKERS
         .iter()
-        .any(|marker| lowered.contains(marker))
+        .any(|marker| ascii_contains_ignore_case(path, marker))
     {
         StreamUsageFormat::AwsEventStream
     } else {
@@ -323,17 +332,62 @@ fn predicted_stream_format(path: &str) -> StreamUsageFormat {
     }
 }
 
-/// Whether the client asked for an event-stream representation in `Accept`.
+/// Which event-stream representation the client asked for in `Accept`, if any.
 ///
 /// This is the only streaming signal available for a request body this instance
 /// cannot inspect (a still-compressed body, Case B in `before_proxy`), so it is
 /// checked alongside the body and path signals rather than instead of them.
-fn accept_declares_event_stream(headers: &HashMap<String, String>) -> bool {
-    headers.get("accept").is_some_and(|accept| {
-        accept
-            .split(',')
-            .any(|entry| super::utils::body_transform::is_event_stream_content_type(entry.trim()))
-    })
+///
+/// Two distinct media types matter and they select **different retention
+/// classes**, so the answer carries the format rather than a bare bool:
+///
+///  * the hyphenated `event-stream` family (`text/event-stream` and the
+///    vendor-prefixed SSE types) — the 64 KiB SSE class; and
+///  * the exact AWS media type `application/vnd.amazon.eventstream`, which has
+///    no hyphen and therefore does not match the SSE classifier at all. Bedrock
+///    clients that spell their streaming intent only in `Accept` were
+///    previously invisible here, and a request that *was* detected some other
+///    way would have pre-reserved the smaller SSE class.
+///
+/// Both are matched case-insensitively and tolerate `Accept` parameters
+/// (`;q=…`), the AWS type through the shared delimiter-aware
+/// [`is_aws_event_stream_content_type`] essence comparison rather than a
+/// substring test.
+fn accept_declares_event_stream(headers: &HashMap<String, String>) -> Option<StreamUsageFormat> {
+    let accept = headers.get("accept")?;
+    let mut declared = None;
+    for entry in accept.split(',') {
+        let entry = entry.trim();
+        // The larger retention class wins outright: nothing later in the header
+        // can make an AWS event-stream scanner fit in the SSE reservation.
+        if is_aws_event_stream_content_type(entry) {
+            return Some(StreamUsageFormat::AwsEventStream);
+        }
+        if super::utils::body_transform::is_event_stream_content_type(entry) {
+            declared = Some(StreamUsageFormat::Sse);
+        }
+    }
+    declared
+}
+
+/// The retention class a pre-backend admission must reserve.
+///
+/// The request target and `Accept` can each predict the wire framing and can
+/// disagree. Reserve the larger class whenever either predicts the AWS framing:
+/// under-reserving would only defer the shortfall to the late admission in
+/// `response_stream_inspector`, where a refusal can no longer reject and the
+/// stream degrades to the unmetered posture instead.
+fn reserved_stream_format(
+    path: &str,
+    accept_format: Option<StreamUsageFormat>,
+) -> StreamUsageFormat {
+    if predicted_stream_format(path) == StreamUsageFormat::AwsEventStream
+        || accept_format == Some(StreamUsageFormat::AwsEventStream)
+    {
+        StreamUsageFormat::AwsEventStream
+    } else {
+        StreamUsageFormat::Sse
+    }
 }
 
 /// Per-response streaming usage inspector for one `ai_rate_limiter` instance.
@@ -723,6 +777,20 @@ impl AiRateLimiter {
         })
     }
 
+    /// Request-scoped slot id this instance's aggregate stream-accounting
+    /// permit is retained under.
+    ///
+    /// A plain accessor for an existing field, with no behavior of its own.
+    /// Exposed so advisory coverage can read the permit back through
+    /// [`RequestContext::plugin_request_state`] and assert *which* retention
+    /// class a pre-backend admission actually reserved — the difference between
+    /// the 64 KiB SSE class and the 256 KiB AWS event-stream class is not
+    /// otherwise observable from outside the plugin.
+    #[doc(hidden)]
+    pub fn stream_permit_slot_id(&self) -> u64 {
+        self.stream_permit_slot_id
+    }
+
     /// Local/fallback DashMap shard count. Test-only; not a production API.
     #[cfg(test)]
     pub(crate) fn local_map_shard_amount(&self) -> usize {
@@ -1092,6 +1160,50 @@ impl AiRateLimiter {
             body: STREAM_ACCOUNTING_CAPACITY_BODY.to_string(),
             headers: HashMap::new(),
         }
+    }
+
+    /// Reserve this request's aggregate stream-accounting state before the
+    /// backend is contacted, or produce the fixed capacity rejection.
+    ///
+    /// Idempotent per instance: a permit this instance already retained for
+    /// this request (a `before_proxy` admission that the deferred final-body
+    /// pass then re-examines) is reused rather than charged twice. Reuse is
+    /// keyed on `stream_permit_slot_id`, which is allocated per plugin
+    /// instance, so a co-located sibling can never satisfy this instance's
+    /// admission.
+    ///
+    /// **Both refusals fail closed.** The budget refusing is the obvious one.
+    /// The typed-slot refusal matters just as much: `retain_plugin_request_state`
+    /// returns `false` for a duplicate key or once the bounded 64-slot
+    /// per-request ceiling is reached, and an unretained permit is released the
+    /// moment this function returns. Treating that as success would let a
+    /// client-declared AI stream reach the backend with no live reservation
+    /// covering the scanner it is about to allocate — exactly the aggregate
+    /// bound this admission exists to hold.
+    fn admit_stream_accounting_state(
+        &self,
+        ctx: &mut RequestContext,
+        format: StreamUsageFormat,
+    ) -> Result<(), PluginResult> {
+        if ctx
+            .plugin_request_state::<StreamAccountingPermit<'static>>(self.stream_permit_slot_id)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let Some(permit) = try_admit_stream_accounting(format) else {
+            return Err(self.reject_stream_accounting_capacity());
+        };
+        // Retained for the whole request, so the reservation is returned on
+        // every terminal path — completion, rejection, error, disconnect, and
+        // task cancellation — without any explicit release call.
+        if !ctx.retain_plugin_request_state(self.stream_permit_slot_id, Arc::new(permit)) {
+            // The slot refused the insertion, so the permit taken just above is
+            // dropped here and its bytes are returned to the budget. The stream
+            // must not proceed unadmitted.
+            return Err(self.reject_stream_accounting_capacity());
+        }
+        Ok(())
     }
 
     fn reject_capacity(&self) -> PluginResult {
@@ -2682,27 +2794,28 @@ impl Plugin for AiRateLimiter {
         // Streaming intent is the client's own declaration, taken from whichever
         // signals are readable: the body's `stream` flag, a provider-native
         // streaming operation in the request target, and an event-stream
-        // `Accept`. A request that declares none of them but whose backend
-        // streams anyway is not unmetered — it takes the late, fail-closed
-        // admission in `response_stream_inspector` instead, which can only
-        // decline to meter, never reject.
+        // `Accept` (SSE or the AWS media type, which also selects the retention
+        // class). A body this pass could not classify (Case A) is not exempt:
+        // `on_final_request_body_with_context` repeats this admission over the
+        // decoded body, and that hook still runs before the backend request is
+        // sent. Only a request that declares nothing anywhere yet whose backend
+        // streams anyway falls through to the late, fail-closed admission in
+        // `response_stream_inspector`, which can only decline to meter, never
+        // reject.
+        let accept_format = accept_declares_event_stream(headers);
         let wants_streamed_response = is_ai_request
             && (declares_streaming
                 || path_declares_streaming_response(&ctx.path)
-                || accept_declares_event_stream(headers));
+                || accept_format.is_some());
         if wants_streamed_response && !ctx.metadata.contains_key("ai_federation_provider") {
-            // The response representation is unknown here, so charge the format
-            // the request target predicts. A mispredicted (smaller) reservation
-            // is re-admitted for the real format at inspector time rather than
-            // silently under-reserving.
-            let predicted = predicted_stream_format(&ctx.path);
-            let Some(permit) = try_admit_stream_accounting(predicted) else {
-                return self.reject_stream_accounting_capacity();
-            };
-            // Retained for the whole request, so the reservation is returned on
-            // every terminal path — completion, rejection, error, disconnect,
-            // and task cancellation — without any explicit release call.
-            ctx.retain_plugin_request_state(self.stream_permit_slot_id, Arc::new(permit));
+            // The response representation is unknown here, so charge the larger
+            // of the classes the request target and `Accept` predict. A
+            // mispredicted (smaller) reservation is re-admitted for the real
+            // format at inspector time rather than silently under-reserving.
+            let predicted = reserved_stream_format(&ctx.path, accept_format);
+            if let Err(rejection) = self.admit_stream_accounting_state(ctx, predicted) {
+                return rejection;
+            }
         }
 
         // Advance sampled idle reclamation before admission so an exactly-full
@@ -2834,37 +2947,84 @@ impl Plugin for AiRateLimiter {
             .get("content-type")
             .map(String::as_str)
             .unwrap_or("");
-        if has_non_identity_content_encoding(headers)
+        // `declares_streaming` is the decoded body's own top-level `stream`
+        // flag. It is only knowable on the inspectable branch; the uninspectable
+        // branch falls back to the request target and `Accept`, exactly as
+        // `before_proxy` does for a still-compressed Case B body.
+        let (is_ai_request, declares_streaming) = if has_non_identity_content_encoding(headers)
             || !is_json_content_type(content_type)
             || is_framed_grpc_content_type(content_type)
         {
-            record.ai_request = true;
-            record.compressed_ai_candidate = true;
-            ctx.metadata
-                .insert(AI_REQUEST_METADATA_KEY.to_string(), "true".to_string());
-            self.store_reservation(ctx, &record);
-            return PluginResult::Continue;
-        }
+            (true, false)
+        } else {
+            // The decompressed body is available now. Mark the request as an AI
+            // call ONLY when it actually parses as one, so a non-AI JSON body on
+            // a shared proxy is never subjected to the `on_unmetered_response`
+            // policy (the false-positive the bare `before_proxy` header check
+            // would cause).
+            match serde_json::from_slice::<Value>(body).ok() {
+                Some(json) if json_looks_like_ai_request(&json) => {
+                    (true, json_declares_streaming_response(&json))
+                }
+                _ => (false, false),
+            }
+        };
 
-        // The decompressed body is available now. Mark the request as an AI call
-        // ONLY when it actually parses as one, so a non-AI JSON body on a shared
-        // proxy is never subjected to the `on_unmetered_response` policy (the
-        // false-positive the bare `before_proxy` header check would cause). Tag it
-        // compressed so the default `charge_estimate` path rejects a usage-less
-        // 2xx — there is no safe pre-request estimate for a compressed body.
-        if serde_json::from_slice::<Value>(body)
-            .ok()
-            .as_ref()
-            .is_some_and(json_looks_like_ai_request)
-        {
+        if is_ai_request {
             record.ai_request = true;
+            // Tag it compressed so the default `charge_estimate` path rejects a
+            // usage-less 2xx — there is no safe pre-request estimate for a
+            // compressed body.
             record.compressed_ai_candidate = true;
             ctx.metadata
                 .insert(AI_REQUEST_METADATA_KEY.to_string(), "true".to_string());
         }
 
         self.store_reservation(ctx, &record);
+
+        // ── Deferred aggregate stream-accounting admission (GHSA-q2r2-6r7h-f69x) ──
+        //
+        // `before_proxy` deliberately could not classify this body, so it took
+        // no reservation for it. This hook is the last point in the lifecycle
+        // that still runs BEFORE the backend request is sent, so it is the last
+        // point at which a saturated aggregate budget can still be answered with
+        // a gateway-authored 503 instead of degrading a committed stream to the
+        // unmetered posture. Without this, a client could evade the aggregate
+        // bound simply by gzipping its request.
+        //
+        // Neutral for everything else: a body that did not parse as an AI
+        // request, and an AI request that declares no streamed response, reserve
+        // nothing and are returned unchanged.
+        if is_ai_request && !ctx.metadata.contains_key("ai_federation_provider") {
+            let accept_format = accept_declares_event_stream(headers);
+            let wants_streamed_response = declares_streaming
+                || path_declares_streaming_response(&ctx.path)
+                || accept_format.is_some();
+            if wants_streamed_response {
+                let predicted = reserved_stream_format(&ctx.path, accept_format);
+                // Reuses this instance's existing permit when `before_proxy`
+                // already reserved one (a deferred body whose path or `Accept`
+                // declared streaming up front), so the two admission points
+                // never double-charge one request. RAII release is unchanged:
+                // the permit lives in the request-scoped slot and is returned on
+                // every terminal and cancellation path.
+                if let Err(rejection) = self.admit_stream_accounting_state(ctx, predicted) {
+                    return rejection;
+                }
+            }
+        }
+
         PluginResult::Continue
+    }
+
+    fn enforces_finalized_request_policy(&self) -> bool {
+        // The deferred stream-accounting admission above can reject the
+        // backend-visible request from `on_final_request_body_with_context`, so
+        // this instance is a final request-body policy plugin for the
+        // early-egress composition gate: a plugin that egresses the request body
+        // before finalization would make that rejection unable to retract a
+        // disclosure it had already sent.
+        true
     }
 
     async fn after_proxy(

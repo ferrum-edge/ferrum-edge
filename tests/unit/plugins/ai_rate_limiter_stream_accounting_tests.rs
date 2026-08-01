@@ -2269,3 +2269,363 @@ fn request_scoped_plugin_state_is_keyed_and_readable_from_a_shared_borrow() {
         "an unknown key must read back nothing"
     );
 }
+
+// ─── GHSA-q2r2 — pre-backend admission must fail closed and reserve the
+// ─── correct retention class
+//
+// These drive the real `before_proxy` / `on_final_request_body_with_context`
+// admission against the process-wide production budget, so they never assert an
+// absolute in-flight figure (concurrent tests share it). They assert what is
+// deterministic: the plugin's own decision, the retention class it reserved, and
+// that a refusal returns every byte it touched.
+
+use ferrum_edge::plugins::utils::ai_stream_accounting::{
+    STREAM_ACCOUNTING_ADMISSION, StreamAccountingPermit,
+};
+
+/// Fill every request-scoped typed slot so the next `retain_plugin_request_state`
+/// is refused by the 64-slot ceiling rather than by a duplicate key.
+fn saturate_plugin_request_state_slots(ctx: &mut RequestContext) {
+    for value in 0u64..64 {
+        assert!(
+            ctx.retain_plugin_request_state(
+                ferrum_edge::plugins::allocate_response_stream_handoff_id(),
+                Arc::new(value),
+            ),
+            "the slot ceiling is 64, so the first 64 insertions must succeed"
+        );
+    }
+    assert!(
+        !ctx.retain_plugin_request_state(
+            ferrum_edge::plugins::allocate_response_stream_handoff_id(),
+            Arc::new(u64::MAX),
+        ),
+        "the 65th slot must be refused"
+    );
+}
+
+fn reserved_class(plugin: &AiRateLimiter, ctx: &RequestContext) -> Option<u64> {
+    ctx.plugin_request_state::<StreamAccountingPermit<'static>>(plugin.stream_permit_slot_id())
+        .map(|permit| permit.reserved_bytes())
+}
+
+fn assert_stream_accounting_capacity_reject(result: PluginResult) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 503, "capacity refusal is a gateway-local 503");
+            assert!(
+                body.contains("cannot admit another metered AI response stream"),
+                "the fixed refusal body must be the stream-accounting one, got {body}"
+            );
+            assert!(
+                !body.contains("token") && !body.contains("limit"),
+                "the refusal body must not leak budget or identity detail, got {body}"
+            );
+        }
+        other => panic!("expected the fixed capacity rejection, got {other:?}"),
+    }
+}
+
+/// A streaming AI request whose typed slot cannot be retained must be REFUSED,
+/// not waved through. `retain_plugin_request_state` returning `false` means the
+/// reservation was not kept, so continuing would put a scanner on the wire with
+/// nothing covering it in the aggregate budget.
+#[tokio::test]
+async fn a_refused_typed_slot_rejects_the_stream_instead_of_proceeding_unadmitted() {
+    let plugin = ip_limiter(1_000_000);
+    let mut ctx = ai_request_ctx(64, "hello");
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64,
+            "stream": true
+        }))
+        .unwrap(),
+    );
+    saturate_plugin_request_state_slots(&mut ctx);
+
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    assert_stream_accounting_capacity_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        reserved_class(&plugin, &ctx).is_none(),
+        "a refused admission must retain nothing"
+    );
+}
+
+/// The refusal above must also return every byte it reserved. A leak would be
+/// invisible per request and fatal in aggregate: the budget would drain to zero
+/// and every later stream would fall to the unmetered posture.
+///
+/// Asserted as a bound rather than an exact figure because the production budget
+/// is process-wide and shared with concurrently running tests: 256 leaked SSE
+/// reservations would be 16 MiB, three orders of magnitude above the slack.
+#[tokio::test]
+async fn a_refused_typed_slot_leaks_no_aggregate_charge() {
+    const ATTEMPTS: u64 = 256;
+    const SLACK_BYTES: u64 = 1024 * 1024;
+
+    let plugin = ip_limiter(1_000_000);
+    let before = STREAM_ACCOUNTING_ADMISSION.in_flight_bytes();
+    for _ in 0..ATTEMPTS {
+        let mut ctx = ai_request_ctx(64, "hello");
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            serde_json::to_string(&json!({
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 64,
+                "stream": true
+            }))
+            .unwrap(),
+        );
+        saturate_plugin_request_state_slots(&mut ctx);
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        assert_stream_accounting_capacity_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+    let after = STREAM_ACCOUNTING_ADMISSION.in_flight_bytes();
+    assert!(
+        after <= before + SLACK_BYTES,
+        "refused admissions must release their reservations; in-flight went from \
+         {before} to {after} over {ATTEMPTS} refusals"
+    );
+}
+
+/// Provider-native streaming operations are matched ASCII case-insensitively
+/// without lowercasing the path into a fresh allocation per request. The
+/// saturated-slot oracle proves detection: only a request the plugin classified
+/// as streaming reaches the admission that the full slot table then refuses.
+#[tokio::test]
+async fn streaming_operation_markers_match_in_mixed_case() {
+    for (path, streaming) in [
+        ("/v1beta/models/gemini-1.5-pro:StreamGenerateContent", true),
+        ("/model/anthropic.claude/Invoke-With-Response-Stream", true),
+        ("/v1/CONVERSE-STREAM", true),
+        ("/v1beta/models/gemini-1.5-pro:generateContent", false),
+        ("/model/anthropic.claude/invoke", false),
+    ] {
+        let plugin = ip_limiter(1_000_000);
+        let mut ctx = ai_request_ctx(64, "hello");
+        ctx.path = path.to_string();
+        saturate_plugin_request_state_slots(&mut ctx);
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        if streaming {
+            assert_stream_accounting_capacity_reject(result);
+        } else {
+            assert_continue(result);
+        }
+    }
+}
+
+/// A Bedrock client that spells its streaming intent only in `Accept` must be
+/// detected, and must reserve the AWS 256 KiB retention class rather than the
+/// 64 KiB SSE class. `application/vnd.amazon.eventstream` has no hyphen, so the
+/// generic `event-stream` classifier never matched it.
+#[tokio::test]
+async fn an_aws_accept_hint_reserves_the_aws_retention_class() {
+    for (accept, expected) in [
+        (
+            "application/vnd.amazon.eventstream",
+            Some(MAX_EVENT_STREAM_MESSAGE_BYTES as u64),
+        ),
+        // Case and parameters are tolerated on the exact media type.
+        (
+            "APPLICATION/VND.AMAZON.EVENTSTREAM; charset=utf-8",
+            Some(MAX_EVENT_STREAM_MESSAGE_BYTES as u64),
+        ),
+        // A list: the larger class wins wherever it appears.
+        (
+            "text/event-stream;q=0.9, application/vnd.amazon.eventstream",
+            Some(MAX_EVENT_STREAM_MESSAGE_BYTES as u64),
+        ),
+        ("Text/Event-Stream", Some(MAX_SSE_LINE_BYTES as u64)),
+        ("application/json", None),
+    ] {
+        let plugin = ip_limiter(1_000_000);
+        let mut ctx = ai_request_ctx(64, "hello");
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert("accept".to_string(), accept.to_string());
+
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            reserved_class(&plugin, &ctx),
+            expected,
+            "Accept: {accept} must select this retention class"
+        );
+    }
+}
+
+// ─── GHSA-q2r2 — the deferred (decompressed) pre-admission ──────────────
+
+/// A POST JSON context whose body `before_proxy` deliberately cannot classify:
+/// a co-located `compression` plugin already decoded it, so `content-encoding`
+/// is gone and the decoded bytes only reach `on_final_request_body`.
+fn deferred_compressed_ctx() -> RequestContext {
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.path = "/v1/chat/completions".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "compression:request_encoding".to_string(),
+        "gzip".to_string(),
+    );
+    ctx
+}
+
+fn json_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers
+}
+
+/// The deferred path is exactly the gap: `before_proxy` reserves nothing because
+/// it cannot read the body, and the decoded body is only available in the final
+/// request-body hook — which still runs before the backend request is sent. A
+/// streamed AI request that arrived compressed must therefore be admitted there,
+/// or gzipping a request would be a way around the aggregate bound entirely.
+#[tokio::test]
+async fn a_decoded_compressed_streamed_request_is_admitted_before_backend_dispatch() {
+    let plugin = ip_limiter(1_000_000);
+    let mut ctx = deferred_compressed_ctx();
+    let headers = json_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+    assert!(
+        reserved_class(&plugin, &ctx).is_none(),
+        "before_proxy cannot classify a deferred body, so it reserves nothing"
+    );
+
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": true
+    }))
+    .unwrap();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &body)
+            .await,
+    );
+    assert_eq!(
+        reserved_class(&plugin, &ctx),
+        Some(MAX_SSE_LINE_BYTES as u64),
+        "the decoded top-level stream flag must take the SSE reservation"
+    );
+}
+
+/// The same hook stays neutral for everything it is not about: a decoded body
+/// that is not an AI request at all, and an AI request that asked for a
+/// buffered response, must both reserve nothing.
+#[tokio::test]
+async fn the_deferred_admission_is_neutral_for_non_streaming_and_non_ai_bodies() {
+    for body in [
+        // AI request, no streamed response asked for.
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+        json!({"model": "m", "messages": [], "stream": false}),
+        // Not an AI request at all — an ordinary JSON POST on a shared proxy.
+        json!({"order_id": 42, "quantity": 2}),
+    ] {
+        let plugin = ip_limiter(1_000_000);
+        let mut ctx = deferred_compressed_ctx();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut ctx,
+                    &json_headers(),
+                    &serde_json::to_vec(&body).unwrap(),
+                )
+                .await,
+        );
+        assert!(
+            reserved_class(&plugin, &ctx).is_none(),
+            "no streamed AI response was declared, so nothing may be reserved: {body}"
+        );
+    }
+}
+
+/// A refusal in the deferred hook is still a real rejection — the hook runs
+/// before the backend request is sent, so the fail-closed answer is the same
+/// fixed 503 `before_proxy` would have produced, not a degraded unmetered
+/// stream.
+#[tokio::test]
+async fn the_deferred_admission_rejects_before_backend_dispatch_when_it_cannot_reserve() {
+    let plugin = ip_limiter(1_000_000);
+    let mut ctx = deferred_compressed_ctx();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+    saturate_plugin_request_state_slots(&mut ctx);
+
+    let body = serde_json::to_vec(&json!({
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": true
+    }))
+    .unwrap();
+    assert_stream_accounting_capacity_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), &body)
+            .await,
+    );
+    assert!(
+        reserved_class(&plugin, &ctx).is_none(),
+        "a refused deferred admission must retain nothing"
+    );
+}
+
+/// The deferred admission sizes itself from the same signals the up-front one
+/// does, so a decoded Bedrock request takes the AWS 256 KiB class — and takes it
+/// exactly once, since the deferred hook reuses this instance's existing
+/// reservation instead of charging a second one.
+#[tokio::test]
+async fn the_deferred_admission_reserves_the_aws_class_exactly_once() {
+    let plugin = ip_limiter(1_000_000);
+    let mut ctx = deferred_compressed_ctx();
+    ctx.path = "/model/anthropic.claude/invoke-with-response-stream".to_string();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+
+    let body = serde_json::to_vec(&json!({
+        "model": "anthropic.claude",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": true
+    }))
+    .unwrap();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), &body)
+            .await,
+    );
+    assert_eq!(
+        reserved_class(&plugin, &ctx),
+        Some(MAX_EVENT_STREAM_MESSAGE_BYTES as u64),
+        "a Bedrock streaming target must take the larger retention class"
+    );
+
+    // A further admission pass over the same request context reuses the permit
+    // this instance already holds instead of charging the budget a second time
+    // — the guard that keeps the two admission points from double-charging one
+    // request. Make the body inspectable so this pass classifies it directly.
+    ctx.metadata.remove("compression:request_encoding");
+    ctx.metadata
+        .insert("request_body".to_string(), String::from_utf8(body).unwrap());
+    let held = STREAM_ACCOUNTING_ADMISSION.in_flight_bytes();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+    assert_eq!(
+        reserved_class(&plugin, &ctx),
+        Some(MAX_EVENT_STREAM_MESSAGE_BYTES as u64),
+        "the existing reservation must be reused, not replaced"
+    );
+    assert!(
+        STREAM_ACCOUNTING_ADMISSION.in_flight_bytes() <= held + MAX_SSE_LINE_BYTES as u64 / 2,
+        "a repeated admission must not take a second reservation"
+    );
+}

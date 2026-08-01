@@ -5,8 +5,11 @@
 //! * **GHSA-q2r2-6r7h-f69x** — unconditional full-response buffering and
 //!   unbounded aggregate accounting state. Covered here by: incremental
 //!   delivery across HTTP/1.1, HTTP/2, and HTTP/3; a never-ending stream that
-//!   the client abandons; and the process-wide accounting-byte budget's
-//!   refusal, release, and error-path release behavior.
+//!   the client abandons; the process-wide accounting-byte budget's refusal,
+//!   release, and error-path release behavior; and the deferred admission for a
+//!   gzipped request body a co-located `compression` plugin decodes, which is
+//!   refused before the backend is contacted on HTTP/1.1, HTTP/2, and HTTP/3
+//!   while non-streaming and non-AI requests pass through untouched.
 //! * **GHSA-rxj9-f483-g53f** — provider-native stream formats bypassing actual
 //!   token accounting. Covered by end-to-end charges from an OpenAI-shaped SSE
 //!   `usage` block, an Anthropic `message_start`/`message_delta` pair, and a
@@ -835,6 +838,278 @@ async fn a_saturated_aggregate_budget_refuses_before_the_backend_and_releases_af
     drop(harness);
 }
 
+// ============================================================================
+// GHSA-q2r2 — the deferred (decoded-compressed) pre-admission
+// ============================================================================
+
+/// A proxy where a co-located `compression` plugin (priority 4050) decodes the
+/// request body *before* `ai_rate_limiter` (4200) runs.
+///
+/// This is the deferred shape: the limiter's `before_proxy` sees no
+/// `content-encoding` and no readable body, so it cannot classify the request
+/// there and reserves nothing. The decoded bytes reach it only in
+/// `on_final_request_body`, which still runs before the backend request is sent.
+fn deferred_compressed_config(backend_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "arl-proxy",
+            "listen_path": "/ai",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "plugins": [
+                {"plugin_config_id": "arl-compress"},
+                {"plugin_config_id": "arl-1"},
+            ],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "arl-compress",
+                "proxy_id": "arl-proxy",
+                "plugin_name": "compression",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {"decompress_request": true},
+            },
+            {
+                "id": "arl-1",
+                "proxy_id": "arl-proxy",
+                "plugin_name": "ai_rate_limiter",
+                "scope": "proxy",
+                "enabled": true,
+                "config": {
+                    "token_limit": 100000,
+                    "window_seconds": 300,
+                    "limit_by": "ip",
+                    "count_mode": "total_tokens",
+                    "expose_headers": true,
+                    "on_unmetered_response": "charge_estimate",
+                },
+            },
+        ],
+    });
+    serde_yaml::to_string(&config).expect("serialize deferred-compression config")
+}
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).expect("gzip request body");
+    encoder.finish().expect("finish gzip request body")
+}
+
+/// A gzipped JSON request body — the only representation these tests send, so
+/// the gateway cannot classify any of them before the final request-body hook.
+fn gzip_json(value: &serde_json::Value) -> Vec<u8> {
+    gzip(&serde_json::to_vec(value).expect("serialize request body"))
+}
+
+/// The same AI request that asks for a buffered response instead of a stream.
+fn non_streaming_ai_body() -> serde_json::Value {
+    json!({
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 8,
+    })
+}
+
+/// An ordinary non-AI JSON POST sharing the proxy.
+fn non_ai_json_body() -> serde_json::Value {
+    json!({"order_id": 42, "quantity": 2})
+}
+
+/// Hold the entire aggregate budget with one never-ending Bedrock-class stream.
+///
+/// The request itself is NOT compressed, so it is classified in `before_proxy`
+/// and its Bedrock streaming target takes the 256 KiB AWS reservation — the
+/// whole configured budget. The backend never finishes, so the reservation is
+/// held for as long as the returned task lives; the caller aborts it at the end.
+/// (Release on completion and on disconnect is asserted by
+/// `a_saturated_aggregate_budget_refuses_before_the_backend_and_releases_after`
+/// and by the abandoned-stream test; this fixture only needs the budget pinned.)
+fn spawn_budget_holder(url: String) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let client = Http1Client::insecure().expect("HTTP/1.1 client");
+        let Ok(response) = client
+            .as_reqwest()
+            .post(url)
+            .header("content-type", "application/json")
+            .body(serde_json::to_string(&ai_body()).expect("serialize"))
+            .send()
+            .await
+        else {
+            return;
+        };
+        let _ = response.bytes().await;
+    })
+}
+
+fn assert_gateway_capacity_refusal(status: u16, body: &str, label: &str) {
+    assert_eq!(
+        status, 503,
+        "{label}: a saturated aggregate budget must refuse the decoded compressed \
+         stream before the backend is contacted, got {status}: {body}"
+    );
+    assert!(
+        body.contains("cannot admit another metered AI response stream"),
+        "{label}: the refusal must be the gateway-local capacity body — the backend \
+         only ever answers 200 on this route — got: {body}"
+    );
+}
+
+/// A streamed AI request that arrived gzipped must still be admitted before the
+/// backend is contacted, so a saturated budget refuses it with the same
+/// gateway-local `503` an uncompressed one gets. Otherwise compressing a request
+/// would be a way around the aggregate bound entirely.
+///
+/// The three requests differ only in the *decoded* body, which is the whole
+/// point: the gateway cannot see any of it until the final request-body hook.
+/// HTTP/1.1 and HTTP/2 are exercised against one gateway; HTTP/3 has its own
+/// test below.
+#[ignore]
+#[tokio::test]
+async fn a_saturated_budget_refuses_a_decoded_compressed_stream_on_h1_and_h2() {
+    let backend_port = spawn_backend(0).await;
+    let harness = GatewayHarness::builder()
+        .file_config(deferred_compressed_config(backend_port))
+        .pool_warmup_enabled(false)
+        .env("FERRUM_AI_STREAM_ACCOUNTING_MAX_BYTES", "262144")
+        .spawn()
+        .await
+        .expect("spawn deferred-compression gateway");
+
+    let holder_url = harness.proxy_url("/ai/model/x/invoke-with-response-stream-hang");
+    let holder = spawn_budget_holder(holder_url);
+    // The holder's backend emits its first event and then never finishes, so
+    // after this settle the whole 256 KiB budget is committed and stays that way
+    // for the rest of the test.
+    sleep(Duration::from_millis(1500)).await;
+
+    let url = harness.proxy_url("/ai/v1/chat/completions");
+    let streamed = gzip_json(&ai_body());
+    let non_streaming = gzip_json(&non_streaming_ai_body());
+    let non_ai = gzip_json(&non_ai_json_body());
+
+    let h1 = Http1Client::insecure().expect("HTTP/1.1 client");
+    let h2 = Http2Client::h2c_prior_knowledge().expect("HTTP/2 client");
+
+    for (label, client) in [("HTTP/1.1", h1.as_reqwest()), ("HTTP/2", h2.as_reqwest())] {
+        let refused = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("content-encoding", "gzip")
+            .body(streamed.clone())
+            .send()
+            .await
+            .expect("gzipped streamed AI request");
+        let status = refused.status().as_u16();
+        let body = refused.text().await.unwrap_or_default();
+        assert_gateway_capacity_refusal(status, &body, label);
+        for leak in ["262144", "gpt-4o-mini", &backend_port.to_string()] {
+            assert!(
+                !body.contains(leak),
+                "{label}: capacity refusal leaked {leak:?}: {body}"
+            );
+        }
+
+        // Neutrality: the same saturated budget must not touch a request that
+        // asked for no streamed response, nor one that is not an AI call at all.
+        for (kind, payload) in [("non-streaming AI", &non_streaming), ("non-AI JSON", &non_ai)] {
+            let response = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("content-encoding", "gzip")
+                .body(payload.clone())
+                .send()
+                .await
+                .expect("gzipped unaffected request");
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            assert_ne!(
+                status, 503,
+                "{label}: a {kind} request declares no stream, so a saturated \
+                 accounting budget must not refuse it, got {status}: {body}"
+            );
+        }
+    }
+
+    holder.abort();
+    drop(harness);
+}
+
+/// HTTP/3 carries the same deferred-admission contract: the decoded body's
+/// `stream` flag is classified before the backend request is sent, so a
+/// saturated budget refuses over QUIC exactly as it does over TCP.
+#[ignore]
+#[tokio::test]
+async fn a_saturated_budget_refuses_a_decoded_compressed_stream_on_h3() {
+    let backend_port = spawn_backend(0).await;
+    let (harness, _tls_dir, https_port) =
+        spawn_h3_gateway_with_budget(deferred_compressed_config(backend_port), "262144").await;
+
+    let holder_url =
+        format!("https://127.0.0.1:{https_port}/ai/model/x/invoke-with-response-stream-hang");
+    let holder = tokio::spawn(async move {
+        let client = Http3Client::insecure().expect("HTTP/3 client");
+        let options = GetOptions::default()
+            .method(http::Method::POST)
+            .header("content-type", "application/json")
+            .body(Bytes::from(
+                serde_json::to_string(&ai_body()).expect("serialize"),
+            ));
+        let _ = client.get_with_options(&holder_url, options).await;
+    });
+    sleep(Duration::from_millis(1500)).await;
+
+    let url = format!("https://127.0.0.1:{https_port}/ai/v1/chat/completions");
+    let h3 = Http3Client::insecure().expect("HTTP/3 client");
+
+    let refused = h3
+        .get_with_options(
+            &url,
+            GetOptions::default()
+                .method(http::Method::POST)
+                .header("content-type", "application/json")
+                .header("content-encoding", "gzip")
+                .body(Bytes::from(gzip_json(&ai_body()))),
+        )
+        .await
+        .expect("gzipped streamed AI request over H3");
+    assert_gateway_capacity_refusal(refused.status.as_u16(), &refused.body_text(), "HTTP/3");
+
+    for (kind, payload) in [
+        ("non-streaming AI", non_streaming_ai_body()),
+        ("non-AI JSON", non_ai_json_body()),
+    ] {
+        let response = h3
+            .get_with_options(
+                &url,
+                GetOptions::default()
+                    .method(http::Method::POST)
+                    .header("content-type", "application/json")
+                    .header("content-encoding", "gzip")
+                    .body(Bytes::from(gzip_json(&payload))),
+            )
+            .await
+            .expect("gzipped unaffected request over H3");
+        assert_ne!(
+            response.status.as_u16(),
+            503,
+            "HTTP/3: a {kind} request declares no stream, so a saturated accounting \
+             budget must not refuse it: {}",
+            response.body_text()
+        );
+    }
+
+    holder.abort();
+    drop(harness);
+}
+
 /// A backend failure that the retry policy absorbs must not leak a reservation.
 ///
 /// The backend aborts the first connection before writing a byte. With the
@@ -1131,6 +1406,21 @@ async fn co_located_instances_settle_one_stream_independently() {
 // ============================================================================
 
 async fn spawn_h3_gateway(config: String) -> (GatewayHarness, TempDir, u16) {
+    spawn_h3_gateway_inner(config, None).await
+}
+
+/// The same H3 gateway with an explicit aggregate stream-accounting budget.
+async fn spawn_h3_gateway_with_budget(
+    config: String,
+    max_bytes: &str,
+) -> (GatewayHarness, TempDir, u16) {
+    spawn_h3_gateway_inner(config, Some(max_bytes.to_string())).await
+}
+
+async fn spawn_h3_gateway_inner(
+    config: String,
+    stream_accounting_max_bytes: Option<String>,
+) -> (GatewayHarness, TempDir, u16) {
     const MAX_ATTEMPTS: u32 = 3;
     let mut last_error = None;
     for attempt in 1..=MAX_ATTEMPTS {
@@ -1146,12 +1436,16 @@ async fn spawn_h3_gateway(config: String) -> (GatewayHarness, TempDir, u16) {
         std::fs::write(&cert_path, cert).expect("write frontend certificate");
         std::fs::write(&key_path, key).expect("write frontend key");
 
-        let result = GatewayHarness::builder()
+        let mut builder = GatewayHarness::builder()
             .file_config(config.clone())
             .pool_warmup_enabled(false)
             .max_attempts(1)
             .env("FERRUM_ENABLE_HTTP3", "true")
-            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string());
+        if let Some(max_bytes) = stream_accounting_max_bytes.as_deref() {
+            builder = builder.env("FERRUM_AI_STREAM_ACCOUNTING_MAX_BYTES", max_bytes);
+        }
+        let result = builder
             .env(
                 "FERRUM_FRONTEND_TLS_CERT_PATH",
                 cert_path.to_string_lossy().into_owned(),
