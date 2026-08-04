@@ -9,7 +9,7 @@
 //! `CNI_ARGS` (for attachment verbs), send a [`CniRpcRequest`] to the
 //! node-agent, and translate the response back into CNI-spec JSON on
 //! stdout. STATUS probes node-agent readiness without attachment fields.
-//! GC carries a bounded `cni.dev/attachments` valid set instead of a
+//! GC carries a bounded `cni.dev/valid-attachments` valid set instead of a
 //! single pod identity.
 //!
 //! Why this is in `src/bin/` and not its own crate:
@@ -143,7 +143,7 @@ mod cni_main {
             return emit_error(
                 &cni_version,
                 &CniError::BadConfig(
-                    "STATUS request must not carry cni.dev/attachments".to_string(),
+                    "STATUS request must not carry cni.dev/valid-attachments".to_string(),
                 ),
             );
         }
@@ -227,7 +227,7 @@ mod cni_main {
         let Some(runtime_attachments) = net_config.valid_attachments.clone() else {
             return emit_error(
                 &cni_version,
-                &CniError::BadConfig("GC request is missing cni.dev/attachments".to_string()),
+                &CniError::BadConfig("GC request is missing cni.dev/valid-attachments".to_string()),
             );
         };
         let valid_attachments = match ingest_valid_attachments(runtime_attachments) {

@@ -524,7 +524,7 @@ async fn ferrum_cni_binary_gc_rejects_pre_1_1_version() {
             "cniVersion": "1.0.0",
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
-            "cni.dev/attachments": []
+            "cni.dev/valid-attachments": []
         })
         .to_string();
         let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
@@ -578,7 +578,7 @@ async fn ferrum_cni_binary_gc_rejects_omitted_valid_attachment_set() {
     assert!(
         payload["msg"]
             .as_str()
-            .is_some_and(|message| message.contains("cni.dev/attachments")),
+            .is_some_and(|message| message.contains("cni.dev/valid-attachments")),
         "unexpected payload: {payload}"
     );
 }
@@ -592,7 +592,7 @@ async fn ferrum_cni_binary_gc_rejects_nonstandard_valid_attachments_key() {
             "cniVersion": "1.1.0",
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
-            "cni.dev/valid-attachments": []
+            "cni.dev/attachments": []
         }))
     })
     .await
@@ -731,7 +731,7 @@ async fn ferrum_cni_binary_gc_exits_zero_on_ok() {
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
             "ferrum": { "socketPath": socket_path_str },
-            "cni.dev/attachments": []
+            "cni.dev/valid-attachments": []
         })
         .to_string();
 
@@ -876,7 +876,7 @@ async fn ferrum_cni_binary_status_rejects_attachment_fields() {
             "cniVersion": "1.1.0",
             "name": "ferrum-mesh-chain",
             "type": "ferrum-cni",
-            "cni.dev/attachments": []
+            "cni.dev/valid-attachments": []
         }))
     })
     .await
@@ -889,7 +889,7 @@ async fn ferrum_cni_binary_status_rejects_attachment_fields() {
     assert!(
         payload["msg"]
             .as_str()
-            .is_some_and(|message| message.contains("cni.dev/attachments")),
+            .is_some_and(|message| message.contains("cni.dev/valid-attachments")),
         "unexpected payload: {payload}"
     );
 }

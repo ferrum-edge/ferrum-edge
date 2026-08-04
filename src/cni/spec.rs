@@ -17,7 +17,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// Hard cap on `cni.dev/attachments` entries accepted for one GC call.
+/// Hard cap on `cni.dev/valid-attachments` entries accepted for one GC call.
 /// Large enough for dense nodes; small enough to keep reconciliation bounded.
 pub const MAX_CNI_GC_ATTACHMENTS: usize = 8192;
 
@@ -382,13 +382,13 @@ pub struct CniNetConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ferrum: Option<FerrumCniOptions>,
     /// Still-valid attachments supplied on GC (CNI 1.1
-    /// `cni.dev/attachments`).
+    /// `cni.dev/valid-attachments`).
     ///
     /// `None` is distinct from an explicitly empty list: the specification
     /// requires the runtime-generated key on GC, and treating omission as an
     /// empty authoritative set would widen cleanup on malformed requests.
     #[serde(
-        rename = "cni.dev/attachments",
+        rename = "cni.dev/valid-attachments",
         default,
         skip_serializing_if = "Option::is_none"
     )]
@@ -435,7 +435,7 @@ impl CniValidAttachment {
 fn validate_attachment_field(field: &str, value: &str) -> Result<(), CniError> {
     if value.is_empty() {
         return Err(CniError::BadConfig(format!(
-            "cni.dev/attachments entry missing {field}"
+            "cni.dev/valid-attachments entry missing {field}"
         )));
     }
     if value.len() > MAX_CNI_ATTACHMENT_FIELD_BYTES {
@@ -508,7 +508,7 @@ pub fn ingest_valid_attachments(
 ) -> Result<Vec<CniValidAttachment>, CniError> {
     if attachments.len() > MAX_CNI_GC_ATTACHMENTS {
         return Err(CniError::BadConfig(format!(
-            "cni.dev/attachments has {} entries; cap is {MAX_CNI_GC_ATTACHMENTS}",
+            "cni.dev/valid-attachments has {} entries; cap is {MAX_CNI_GC_ATTACHMENTS}",
             attachments.len()
         )));
     }
@@ -796,7 +796,7 @@ mod tests {
             "cniVersion": "1.1.0",
             "name": "ferrum-mesh",
             "type": "ferrum-cni",
-            "cni.dev/attachments": [
+            "cni.dev/valid-attachments": [
                 {"containerID": "ctr-alive", "ifname": "eth0"},
                 {"containerID": "ctr-alive", "ifname": "eth0"},
                 {"containerID": "ctr-other", "ifname": "eth1"}
