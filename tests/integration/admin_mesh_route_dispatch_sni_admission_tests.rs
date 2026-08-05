@@ -12,6 +12,7 @@ use ferrum_edge::admin::{
     serve_admin_on_listener,
 };
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::config::types::{PluginConfig, PluginScope, Proxy};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -865,6 +866,138 @@ async fn global_buffering_plugin_write_rejects_existing_sni_route_override() {
         status, 201,
         "global SNI override without buffering must admit: {body:?}"
     );
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/plugins/config",
+        &token,
+        &json!({
+            "id": "global-compression",
+            "plugin_name": "compression",
+            "scope": "global",
+            "enabled": true,
+            "config": {
+                "decompress_request": true,
+                "max_decompressed_request_size": 1024,
+            },
+        }),
+    )
+    .await;
+    assert_sni_buffering_rejection(status, &body, "global-compression");
+}
+
+#[tokio::test]
+async fn invalid_local_buffering_config_does_not_shadow_global_candidate() {
+    // A persisted local that fails construction remains absent from
+    // PluginCache, so it cannot shadow a same-named global. Admission must not
+    // skip this proxy merely because the broken row is enabled and attached.
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let db = state.db.as_ref().expect("test database").clone();
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    seed_plain_and_sni_upstreams(&base_url, &token).await;
+    let (status, body) = admin_post(
+        &base_url,
+        "/plugins/config",
+        &token,
+        &global_mesh_route_dispatch("mrd-sni", "sni-up"),
+    )
+    .await;
+    assert_eq!(status, 201, "global SNI override seed failed: {body:?}");
+
+    let now = chrono::Utc::now();
+    db.create_plugin_config(&PluginConfig {
+        id: "invalid-local-compression".to_string(),
+        plugin_name: "compression".to_string(),
+        namespace: "ferrum".to_string(),
+        config: json!({"unknown_field": true}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("p-sni".to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    })
+    .await
+    .expect("persist invalid local compression fixture");
+    let proxy: Proxy = serde_json::from_value(https_proxy_with_plugins(
+        "p-sni",
+        "plain-up",
+        &["invalid-local-compression"],
+    ))
+    .expect("deserialize persisted proxy fixture");
+    db.create_proxy(&proxy)
+        .await
+        .expect("persist proxy with invalid local compression");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/plugins/config",
+        &token,
+        &json!({
+            "id": "global-compression",
+            "plugin_name": "compression",
+            "scope": "global",
+            "enabled": true,
+            "config": {
+                "decompress_request": true,
+                "max_decompressed_request_size": 1024,
+            },
+        }),
+    )
+    .await;
+    assert_sni_buffering_rejection(status, &body, "global-compression");
+}
+
+#[tokio::test]
+async fn invalid_local_route_dispatch_does_not_shadow_valid_global_route() {
+    // MeshRouteDispatch::new rejects an empty rule set. Such a persisted local
+    // is not in the runtime chain and must not suppress the valid global route
+    // override during SNI admission.
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let db = state.db.as_ref().expect("test database").clone();
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    seed_plain_and_sni_upstreams(&base_url, &token).await;
+    let (status, body) = admin_post(
+        &base_url,
+        "/plugins/config",
+        &token,
+        &global_mesh_route_dispatch("mrd-sni", "sni-up"),
+    )
+    .await;
+    assert_eq!(status, 201, "global SNI override seed failed: {body:?}");
+
+    let now = chrono::Utc::now();
+    db.create_plugin_config(&PluginConfig {
+        id: "invalid-local-mrd".to_string(),
+        plugin_name: "mesh_route_dispatch".to_string(),
+        namespace: "ferrum".to_string(),
+        config: json!({}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("p-sni".to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: now,
+        updated_at: now,
+    })
+    .await
+    .expect("persist invalid local route-dispatch fixture");
+    let proxy: Proxy = serde_json::from_value(https_proxy_with_plugins(
+        "p-sni",
+        "plain-up",
+        &["invalid-local-mrd"],
+    ))
+    .expect("deserialize persisted proxy fixture");
+    db.create_proxy(&proxy)
+        .await
+        .expect("persist proxy with invalid local route dispatcher");
 
     let (status, body) = admin_post(
         &base_url,

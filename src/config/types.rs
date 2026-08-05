@@ -3404,9 +3404,14 @@ pub(crate) fn collect_sni_admission_route_override_destinations<'a>(
         if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
             continue;
         }
-        let Ok(dispatch) = crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value(
-            &plugin.config,
-        ) else {
+        // Mirror MeshRouteDispatch::new exactly. A parseable but invalid local
+        // config (for example an empty rule set) does not construct at runtime
+        // and therefore cannot shadow a valid global route dispatcher.
+        let Ok(dispatch) =
+            crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value_normalized(
+                &plugin.config,
+            )
+        else {
             continue;
         };
         for rule in &dispatch.rules {

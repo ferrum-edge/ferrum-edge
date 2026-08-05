@@ -2486,6 +2486,15 @@ fn local_mesh_route_dispatch_applies(proxy: &Proxy, plugin: &PluginConfig) -> bo
     if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
         return false;
     }
+    // Match PluginCache's construction boundary, not just the persisted shape.
+    // An enabled local whose config cannot construct does not enter the runtime
+    // chain and therefore cannot shadow a valid global mesh_route_dispatch.
+    // This matters for legacy/corrupt persisted rows: admission must continue
+    // screening the global route rather than treating the broken local as an
+    // effective override.
+    if MeshRouteDispatchConfig::from_value_normalized(&plugin.config).is_err() {
+        return false;
+    }
     match plugin.scope {
         PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
         PluginScope::ProxyGroup => plugin.proxy_id.is_none(),
@@ -2523,33 +2532,6 @@ fn applicable_mesh_route_dispatch_from_configs<'a>(
                 && plugin.plugin_name == "mesh_route_dispatch"
         })
         .collect()
-}
-
-/// Whether a same-named local instance shadows `plugin_name` on `proxy` under
-/// the candidate plugin set (PluginCache merge rule for buffering globals).
-fn proxy_shadows_global_plugin_name_from_configs(
-    proxy: &Proxy,
-    plugin_configs: &[PluginConfig],
-    plugin_name: &str,
-) -> bool {
-    for assoc in &proxy.plugins {
-        let Some(plugin) = plugin_configs.iter().find(|plugin| {
-            plugin.namespace == proxy.namespace && plugin.id == assoc.plugin_config_id
-        }) else {
-            continue;
-        };
-        if !plugin.enabled || plugin.plugin_name != plugin_name {
-            continue;
-        }
-        match plugin.scope {
-            PluginScope::Proxy if plugin.proxy_id.as_deref() == Some(proxy.id.as_str()) => {
-                return true;
-            }
-            PluginScope::ProxyGroup if plugin.proxy_id.is_none() => return true,
-            _ => {}
-        }
-    }
-    false
 }
 
 /// Screen one proxy's default upstream and applicable route-override
@@ -2633,8 +2615,8 @@ async fn screen_proxy_sni_admission_delta(
 fn plugin_mutation_may_affect_proxy_sni_admission(
     proxy: &Proxy,
     candidate: &PluginConfig,
-    pre_plugins: &[PluginConfig],
-    post_plugins: &[PluginConfig],
+    _pre_plugins: &[PluginConfig],
+    _post_plugins: &[PluginConfig],
 ) -> bool {
     let attaches = proxy
         .plugins
@@ -2643,35 +2625,15 @@ fn plugin_mutation_may_affect_proxy_sni_admission(
     match candidate.scope {
         PluginScope::Proxy | PluginScope::ProxyGroup => attaches,
         PluginScope::Global => {
-            // Globals apply wherever they are not same-name locally shadowed.
-            // Include proxies that lose or gain that shadow across the
-            // mutation (pre vs post), and proxies that attach this id (scope
-            // transitions from local → global).
-            if attaches {
-                return true;
-            }
-            let pre_shadowed = proxy_shadows_global_plugin_name_from_configs(
-                proxy,
-                pre_plugins,
-                &candidate.plugin_name,
-            );
-            let post_shadowed = proxy_shadows_global_plugin_name_from_configs(
-                proxy,
-                post_plugins,
-                &candidate.plugin_name,
-            );
-            // Also consider the pre-write name when a rename changes shadowing.
-            let pre_name = pre_plugins
-                .iter()
-                .find(|plugin| {
-                    plugin.namespace == candidate.namespace && plugin.id == candidate.id
-                })
-                .map(|plugin| plugin.plugin_name.as_str());
-            let pre_shadowed_old_name = pre_name.is_some_and(|name| {
-                name != candidate.plugin_name
-                    && proxy_shadows_global_plugin_name_from_configs(proxy, pre_plugins, name)
-            });
-            !pre_shadowed || !post_shadowed || pre_shadowed_old_name
+            // A global mutation is a namespace-wide cold-path event. Screen
+            // every proxy and let the construction-aware conflict evaluator
+            // decide whether a same-named local really shadows it. A config-only
+            // predicate here is unsafe: PluginCache does *not* remove a global
+            // when the local instance returns ConstructionFailed, so treating
+            // that row as a shadow would skip a still-effective global and admit
+            // an SNI/direct-H2 outage. The pre/post delta below prevents false
+            // rejection from unrelated existing conflicts.
+            true
         }
     }
 }
