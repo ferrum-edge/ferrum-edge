@@ -68,10 +68,9 @@ async fn build_admin_state(tc: &TestConfig) -> (AdminState, DatabaseStore, tempf
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("mrd_sni_admission.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let store =
-        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
-            .await
-            .expect("DB connect must succeed");
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("DB connect must succeed");
 
     // Intentionally leave `cached_config` empty: plugin-write SNI admission must
     // load plugin configs from the DB rather than trusting a GatewayConfig cache
@@ -936,12 +935,8 @@ async fn invalid_local_buffering_config_does_not_shadow_global_candidate() {
 
     // Respect plugin_configs.proxy_id FK: create the proxy first without the
     // invalid association, persist the broken local, then attach it.
-    let proxy: Proxy = serde_json::from_value(https_proxy_with_plugins(
-        "p-sni",
-        "plain-up",
-        &[],
-    ))
-    .expect("deserialize persisted proxy fixture");
+    let proxy: Proxy = serde_json::from_value(https_proxy_with_plugins("p-sni", "plain-up", &[]))
+        .expect("deserialize persisted proxy fixture");
     db.create_proxy(&proxy)
         .await
         .expect("persist proxy before invalid local compression");
@@ -1019,12 +1014,8 @@ async fn invalid_local_route_dispatch_does_not_shadow_valid_global_route() {
 
     // Respect plugin_configs.proxy_id FK: create the proxy first without the
     // invalid association, persist the broken local, then attach it.
-    let proxy: Proxy = serde_json::from_value(https_proxy_with_plugins(
-        "p-sni",
-        "plain-up",
-        &[],
-    ))
-    .expect("deserialize persisted proxy fixture");
+    let proxy: Proxy = serde_json::from_value(https_proxy_with_plugins("p-sni", "plain-up", &[]))
+        .expect("deserialize persisted proxy fixture");
     db.create_proxy(&proxy)
         .await
         .expect("persist proxy before invalid local route dispatcher");
