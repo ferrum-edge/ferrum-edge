@@ -3467,13 +3467,17 @@ async fn dead_letter_payload_admits_each_append_before_exceeding_spool_quota() {
     let server = MockServer::start().await;
     mount_status_sequence(&server, &[400]).await;
 
-    let event = sample_event("evt-dead-letter-quota");
+    let mut event = sample_event("evt-dead-letter-quota");
+    event.request_id = Some("x".repeat(32 * 1024));
     let encoded = serialize_json_each_row(std::slice::from_ref(&event)).unwrap();
-    let max_bytes = encoded.len() as u64;
+    // The source is larger than half the quota, so requiring duplicate
+    // source+payload space would deadlock replay even though the final
+    // payload+metadata handoff fits.
+    let max_bytes = (encoded.len() as u64).saturating_add(4 * 1024);
     let temp = tempfile::tempdir().unwrap();
     let spool = SpoolManager::for_tests(spool_settings(temp.path(), max_bytes), "node-a").unwrap();
     let source = spool.write_events(&[event]).unwrap();
-    assert_eq!(fs::metadata(&source).unwrap().len(), max_bytes);
+    assert_eq!(fs::metadata(&source).unwrap().len(), encoded.len() as u64);
     let namespace_root = spool.namespace_root_for_tests().to_path_buf();
     let source_parent = source.parent().unwrap().to_path_buf();
     let payload_name = dead_letter_payload_path(&source)
@@ -3504,32 +3508,30 @@ async fn dead_letter_payload_admits_each_append_before_exceeding_spool_quota() {
         observed_for_hook.store(temp_bytes, Ordering::SeqCst);
     })));
 
-    let error = replay_spool_once_for_tests(&spool, &server.uri())
+    replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect_err("the uncompressed dead-letter copy must not exceed spool.max_bytes");
+        .expect("dead-letter handoff must account for the source bytes it replaces");
     set_spool_write_hook_for_tests(None);
 
     assert!(
-        error.contains("cannot fit within spool.max_bytes"),
-        "unexpected quota diagnostic: {error}"
+        !source.exists(),
+        "successful handoff must consume the authoritative replay source"
     );
-    assert!(
-        source.exists(),
-        "quota refusal must restore the authoritative replay source"
+    assert_eq!(
+        fs::read_to_string(dead_letter_payload_path(&source)).unwrap(),
+        encoded,
+        "dead-letter payload must preserve the rejected row"
     );
-    assert!(
-        !dead_letter_payload_path(&source).exists(),
-        "quota refusal must not publish a partial dead-letter payload"
-    );
+    assert_rejected_sidecar(&source, 400, "permanent_http");
     let stats = spool.scan_stats_for_tests().unwrap();
     assert!(
         stats.bytes <= max_bytes,
-        "dead-letter staging exceeded the hard spool quota: {stats:?}"
+        "completed dead-letter handoff must return under the hard spool quota: {stats:?}"
     );
     assert_eq!(
         observed_temp_bytes.load(Ordering::SeqCst),
-        0,
-        "quota admission must run before the first rejected payload byte is written"
+        u64::MAX,
+        "source-replacement admission should not need to evict protected files"
     );
 }
 

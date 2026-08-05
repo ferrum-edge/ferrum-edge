@@ -7251,9 +7251,26 @@ impl SpoolManager {
             .map(|_| ())
     }
 
+    fn evict_until_can_admit_replacing(
+        &self,
+        incoming_len: u64,
+        replaced_path: &Path,
+    ) -> Result<(), String> {
+        self.evict_until_can_admit_with_replaced_path(incoming_len, Some(replaced_path))
+            .map(|_| ())
+    }
+
     fn evict_until_can_admit_with_report(
         &self,
         incoming_len: u64,
+    ) -> Result<QuotaEvictionReport, String> {
+        self.evict_until_can_admit_with_replaced_path(incoming_len, None)
+    }
+
+    fn evict_until_can_admit_with_replaced_path(
+        &self,
+        incoming_len: u64,
+        replaced_path: Option<&Path>,
     ) -> Result<QuotaEvictionReport, String> {
         if incoming_len > self.cfg.max_bytes {
             return Err(format!(
@@ -7278,7 +7295,16 @@ impl SpoolManager {
             if report.inventory_passes == 1 {
                 report.bytes_before = inventory.stats.bytes;
             }
-            let mut remaining_bytes = inventory.stats.bytes;
+            let replaced_len = replaced_path
+                .and_then(|path| {
+                    inventory
+                        .entries
+                        .iter()
+                        .find(|entry| entry.path == path)
+                        .map(|entry| entry.len)
+                })
+                .unwrap_or(0);
+            let mut remaining_bytes = inventory.stats.bytes.saturating_sub(replaced_len);
             if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
                 self.notify_quota_admission_ready_for_tests();
                 return Ok(report);
@@ -7309,7 +7335,9 @@ impl SpoolManager {
                 self.assert_managed_path(&entry.path)?;
                 match fs::remove_file(&entry.path) {
                     Ok(()) => {
-                        remaining_bytes = remaining_bytes.saturating_sub(entry.len);
+                        if replaced_path != Some(entry.path.as_path()) {
+                            remaining_bytes = remaining_bytes.saturating_sub(entry.len);
+                        }
                         report.files_deleted = report.files_deleted.saturating_add(1);
                         report.bytes_freed = report.bytes_freed.saturating_add(entry.len);
                         self.usage.account_sub(1, entry.len);
@@ -8413,6 +8441,7 @@ impl PublishedDeadLetterPayload {
 /// while it is fsynced/renamed. Only after the payload and safe metadata are
 /// both durable does finalization remove the source claim.
 struct DeadLetterPayloadWriter {
+    source_path: PathBuf,
     temp_path: PathBuf,
     final_path: PathBuf,
     file: Option<File>,
@@ -8476,6 +8505,7 @@ impl DeadLetterPayloadWriter {
             )
         })?;
         Ok(Self {
+            source_path: source_path.to_path_buf(),
             temp_path,
             final_path,
             file: Some(file),
@@ -8510,12 +8540,13 @@ impl DeadLetterPayloadWriter {
         spool.assert_managed_path(&self.temp_path)?;
         spool.assert_managed_path(&self.final_path)?;
         // The live temp and authoritative source already appear in the owned
-        // inventory. Admit each bounded replay-batch append before writing it so
-        // a compressed source cannot temporarily expand an uncompressed
-        // rejected payload past the documented hard on-disk quota. Batching the
-        // admission also prevents an all-poison artifact from causing one full
-        // spool walk per hostile row.
-        spool.evict_until_can_admit(incoming_bytes)?;
+        // inventory, but a successful dead-letter handoff atomically replaces
+        // that source with the rejected payload plus small metadata. Admit each
+        // bounded replay-batch append against the post-handoff footprint so an
+        // all-poison source that fits the configured quota cannot permanently
+        // starve behind its own protected replay claim. Batching the admission
+        // also prevents one full spool walk per hostile row.
+        spool.evict_until_can_admit_replacing(incoming_bytes, &self.source_path)?;
         let file = self.file.as_mut().ok_or_else(|| {
             format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
         })?;
@@ -8598,10 +8629,10 @@ impl DeadLetterPayloadWriter {
             }
         }
         // The temp and still-authoritative source are both present in the
-        // inventory. Enforce the hard on-disk ceiling before publishing; if
-        // protected files leave no room, the temp is dropped and the source is
-        // restored for a later/operator-assisted attempt.
-        spool.evict_until_can_admit(0)?;
+        // inventory. Account for the source bytes that this payload will replace
+        // once metadata is durable, rather than requiring duplicate protected
+        // space for source + rejected payload and head-of-line blocking replay.
+        spool.evict_until_can_admit_replacing(0, self.source_path.as_path())?;
         let pre_rename_identity = {
             let file = self.file.as_mut().ok_or_else(|| {
                 format!("{PLUGIN_NAME}: dead-letter payload writer is already closed")
@@ -8925,7 +8956,10 @@ fn write_dead_letter_meta(
     spool.assert_managed_path(&meta_path)?;
     spool.assert_managed_path(&tmp_path)?;
     spool.assert_managed_path(source_path)?;
-    spool.evict_until_can_admit(bytes.len() as u64)?;
+    // Metadata is the final durable sidecar before the source claim is removed,
+    // so admit it against the post-handoff footprint for the same reason as the
+    // rejected payload: the protected source bytes are about to be replaced.
+    spool.evict_until_can_admit_replacing(bytes.len() as u64, source_path)?;
     // Measured after eviction: a reclaim that already deleted this record has
     // accounted for it, so re-measuring here cannot double-subtract.
     let replaced_meta_len = spool_regular_file_len(&meta_path);
