@@ -12,7 +12,7 @@ use ferrum_edge::admin::{
     serve_admin_on_listener,
 };
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
-use ferrum_edge::config::types::{PluginConfig, PluginScope, Proxy};
+use ferrum_edge::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -219,6 +219,30 @@ fn assert_sni_buffering_rejection(status: u16, body: &Value, plugin_id: &str) {
             && err.contains("backend TLS SNI")
             && err.contains(plugin_id),
         "rejection must name the buffering plugin; got: {err}"
+    );
+}
+
+fn assert_api_spec_sni_buffering_rejection(status: u16, body: &Value, plugin_id: &str) {
+    assert_eq!(
+        status, 422,
+        "API-spec SNI + effective buffering must reject: {body:?}"
+    );
+    let joined = body
+        .get("failures")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|failure| failure.get("errors"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        joined.contains("request-body-buffering")
+            && joined.contains("backend TLS SNI")
+            && joined.contains(plugin_id),
+        "API-spec rejection must name the buffering plugin; got: {joined} / {body:?}"
     );
 }
 
@@ -1076,27 +1100,137 @@ async fn api_spec_import_rejects_sni_route_override_with_buffering_plugin() {
         ],
     });
     let (status, body) = admin_post(&base_url, "/api-specs", &token, &spec).await;
-    assert_eq!(
-        status, 422,
-        "API-spec SNI route override + buffering must reject: {body:?}"
-    );
-    let joined = body
-        .get("failures")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|failure| failure.get("errors"))
-        .filter_map(|errors| errors.as_array())
-        .flatten()
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join("; ");
+    assert_api_spec_sni_buffering_rejection(status, &body, "grpc-web-1");
+}
+
+#[tokio::test]
+async fn api_spec_put_screens_the_exact_post_replacement_plugin_set() {
+    // Simulate a legacy persisted conflict that predates this admission gate:
+    // the spec owns an attached buffering plugin plus an MRD route to an SNI
+    // upstream. A PUT that omits the old owned buffering plugin must evaluate
+    // the actual replacement state and repair the object, while a later PUT
+    // that reintroduces the same conflict must still fail closed.
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let db = state.db.as_ref().expect("test database").clone();
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &sni_upstream("sni-up")).await;
+    assert_eq!(status, 201, "hand-managed SNI upstream seed failed: {body:?}");
+
+    let replacement = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Exact SNI replacement", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": "p-sni",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8443,
+            "strip_listen_path": true,
+            "upstream_id": "plain-up",
+            "plugins": [{"plugin_config_id": "mrd-sni"}],
+        },
+        "x-ferrum-upstream": {
+            "id": "plain-up",
+            "name": "plain-up",
+            "targets": [{"host": "127.0.0.1", "port": 8080, "weight": 100}],
+            "algorithm": "round_robin",
+        },
+        "x-ferrum-plugins": [{
+            "id": "mrd-sni",
+            "plugin_name": "mesh_route_dispatch",
+            "config": {
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "sni-up"},
+                }],
+            },
+        }],
+    });
+    let (status, body) = admin_post(&base_url, "/api-specs", &token, &replacement).await;
+    assert_eq!(status, 201, "non-buffering API spec seed failed: {body:?}");
+    let spec_id = body["id"]
+        .as_str()
+        .expect("API-spec response id")
+        .to_string();
+
+    let now = chrono::Utc::now();
+    db.create_plugin_config(&PluginConfig {
+        id: "grpc-web-1".to_string(),
+        plugin_name: "grpc_web".to_string(),
+        namespace: "ferrum".to_string(),
+        config: json!({}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("p-sni".to_string()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: Some(spec_id.clone()),
+        created_at: now,
+        updated_at: now,
+    })
+    .await
+    .expect("persist legacy spec-owned buffering fixture");
+    let mut persisted_proxy = db
+        .get_proxy("ferrum", "p-sni")
+        .await
+        .expect("load API-spec proxy")
+        .expect("API-spec proxy must exist");
+    persisted_proxy.plugins.push(PluginAssociation {
+        plugin_config_id: "grpc-web-1".to_string(),
+    });
     assert!(
-        joined.contains("request-body-buffering")
-            && joined.contains("backend TLS SNI")
-            && joined.contains("grpc-web-1"),
-        "API-spec rejection must name buffering plugin; got: {joined} / {body:?}"
+        db.update_proxy(&persisted_proxy)
+            .await
+            .expect("attach legacy buffering fixture"),
+        "API-spec proxy must still exist"
     );
+
+    let path = format!("/api-specs/{spec_id}");
+    let (status, body) = admin_put(&base_url, &path, &token, &replacement).await;
+    assert_eq!(
+        status, 200,
+        "PUT removing the old owned conflict must use the post-replacement state: {body:?}"
+    );
+    assert!(
+        db.get_plugin_config("ferrum", "grpc-web-1")
+            .await
+            .expect("load removed plugin")
+            .is_none(),
+        "omitted spec-owned buffering plugin must be deleted"
+    );
+    let repaired_proxy = db
+        .get_proxy("ferrum", "p-sni")
+        .await
+        .expect("load repaired proxy")
+        .expect("repaired proxy must exist");
+    assert!(
+        repaired_proxy
+            .plugins
+            .iter()
+            .all(|association| association.plugin_config_id != "grpc-web-1"),
+        "omitted spec-owned plugin association must be deleted"
+    );
+
+    let mut conflicting = replacement.clone();
+    conflicting["x-ferrum-proxy"]["plugins"] = json!([
+        {"plugin_config_id": "grpc-web-1"},
+        {"plugin_config_id": "mrd-sni"},
+    ]);
+    conflicting["x-ferrum-plugins"]
+        .as_array_mut()
+        .expect("plugin array")
+        .insert(
+            0,
+            json!({
+                "id": "grpc-web-1",
+                "plugin_name": "grpc_web",
+                "config": {},
+            }),
+        );
+    let (status, body) = admin_put(&base_url, &path, &token, &conflicting).await;
+    assert_api_spec_sni_buffering_rejection(status, &body, "grpc-web-1");
 }
 
 #[tokio::test]

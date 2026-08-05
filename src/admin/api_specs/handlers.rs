@@ -2122,7 +2122,8 @@ async fn validate_bundle(
 
     // Backend-TLS-SNI / direct-H2 admission for mesh_route_dispatch route
     // overrides carried by this API-spec bundle (issue #3576). Mirrors the
-    // Proxy / batch path with bundle-first upstream and plugin resolution.
+    // Proxy / batch path with bundle-first upstream resolution and the exact
+    // post-create / post-replacement plugin set (owned plugins omitted on PUT).
     if failures.is_empty() {
         let proxy = &bundle.proxy;
         let mut payload_upstreams: std::collections::HashMap<
@@ -2132,33 +2133,23 @@ async fn validate_bundle(
         if let Some(ref upstream) = bundle.upstream {
             payload_upstreams.insert(upstream.id.as_str(), upstream);
         }
-        let mut payload_plugins: std::collections::HashMap<
-            &str,
-            &crate::config::types::PluginConfig,
-        > = std::collections::HashMap::new();
-        for pc in &bundle.plugins {
-            payload_plugins.insert(pc.id.as_str(), pc);
-        }
-        match crate::admin::crud::load_namespace_plugin_configs(db, namespace).await {
-            Ok(mut buffering_plugins) => {
-                for pc in &bundle.plugins {
-                    if let Some(existing) = buffering_plugins
-                        .iter_mut()
-                        .find(|p| p.namespace == pc.namespace && p.id == pc.id)
-                    {
-                        *existing = pc.clone();
-                    } else {
-                        buffering_plugins.push(pc.clone());
-                    }
-                }
+        let replaced_spec_id = put_ctx.as_ref().map(|ctx| ctx.spec.id.as_str());
+        match crate::admin::crud::load_api_spec_bundle_sni_admission_plugin_configs(
+            db,
+            namespace,
+            replaced_spec_id,
+            &bundle.plugins,
+        )
+        .await
+        {
+            Ok(plugin_configs) => {
                 let mut sni_errors = Vec::new();
                 if let Err(err) = crate::admin::crud::validate_proxy_route_override_sni_admission(
                     db,
                     namespace,
                     proxy,
                     &payload_upstreams,
-                    &payload_plugins,
-                    &buffering_plugins,
+                    &plugin_configs,
                     &mut sni_errors,
                 )
                 .await

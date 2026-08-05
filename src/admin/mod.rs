@@ -6716,7 +6716,6 @@ async fn handle_batch_create(
                         namespace,
                         proxy,
                         &batch_upstreams,
-                        &batch_plugin_configs,
                         &post_plugins,
                         &mut validation_errors,
                     )
@@ -6773,12 +6772,6 @@ async fn handle_batch_create(
                             }
                             // Diff pre vs post so pre-existing unrelated
                             // conflicts on this proxy do not false-reject.
-                            // Pre-route-override screening must not consult
-                            // batch payload plugins (those are the post view).
-                            let empty_payload_plugins: std::collections::HashMap<
-                                &str,
-                                &PluginConfig,
-                            > = std::collections::HashMap::new();
                             let mut pre_errors = Vec::new();
                             let mut post_errors = Vec::new();
                             if let Err(err) = crud::validate_proxy_default_upstream_sni_admission(
@@ -6806,7 +6799,6 @@ async fn handle_batch_create(
                                 namespace,
                                 proxy,
                                 &batch_upstreams,
-                                &empty_payload_plugins,
                                 &pre_plugins,
                                 &mut pre_errors,
                             )
@@ -6847,7 +6839,6 @@ async fn handle_batch_create(
                                 namespace,
                                 proxy,
                                 &batch_upstreams,
-                                &batch_plugin_configs,
                                 &post_plugins,
                                 &mut post_errors,
                             )

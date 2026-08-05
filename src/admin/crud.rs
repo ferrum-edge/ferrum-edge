@@ -2448,6 +2448,43 @@ pub(crate) async fn load_namespace_plugin_configs(
     Ok(plugins)
 }
 
+/// Exact post-create / post-replacement plugin-config set for API-spec
+/// backend-TLS-SNI / direct-H2 admission.
+///
+/// Starts from every persisted namespace plugin config, removes every config
+/// owned by `replaced_spec_id` on PUT (so omitted owned plugins cannot
+/// false-reject the replacement), then overlays all incoming bundle plugins.
+/// Manual and differently-owned plugins are retained. DB failures propagate —
+/// never fall back to an empty list that would skip buffering / route-dispatch
+/// screening.
+pub(crate) async fn load_api_spec_bundle_sni_admission_plugin_configs(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    replaced_spec_id: Option<&str>,
+    bundle_plugins: &[PluginConfig],
+) -> Result<Vec<PluginConfig>, AfterValidateError> {
+    let mut plugins = load_namespace_plugin_configs(db, namespace).await?;
+    if let Some(spec_id) = replaced_spec_id {
+        let replaced = db
+            .list_spec_owned_plugin_configs(namespace, spec_id)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        let replaced_ids: HashSet<String> = replaced.into_iter().map(|plugin| plugin.id).collect();
+        plugins.retain(|plugin| !replaced_ids.contains(&plugin.id));
+    }
+    for candidate in bundle_plugins {
+        if let Some(existing) = plugins
+            .iter_mut()
+            .find(|plugin| plugin.namespace == candidate.namespace && plugin.id == candidate.id)
+        {
+            *existing = candidate.clone();
+        } else {
+            plugins.push(candidate.clone());
+        }
+    }
+    Ok(plugins)
+}
+
 /// Exact post-write plugin-config view for a candidate create/update: the
 /// namespace's persisted plugins with `candidate` replacing an existing id or
 /// appended when new. Backend-TLS-SNI / direct-H2 admission on plugin writes
@@ -2543,20 +2580,20 @@ async fn screen_proxy_sni_direct_h2_admission(
     plugin_configs: &[PluginConfig],
     errors: &mut Vec<String>,
 ) -> DbResult<()> {
-    if let Some(upstream_id) = proxy.upstream_id.as_deref() {
-        if let Some(upstream) = db.get_upstream(namespace, upstream_id).await? {
-            let admission_proxy = proxy_for_sni_direct_h2_admission(
-                proxy,
-                &upstream,
-                proxy.upstream_subset.as_deref(),
-                proxy.retry.clone(),
-            );
-            errors.extend(backend_tls_sni_direct_h2_conflict_messages(
-                &admission_proxy,
-                Some(&upstream),
-                plugin_configs,
-            ));
-        }
+    if let Some(upstream_id) = proxy.upstream_id.as_deref()
+        && let Some(upstream) = db.get_upstream(namespace, upstream_id).await?
+    {
+        let admission_proxy = proxy_for_sni_direct_h2_admission(
+            proxy,
+            &upstream,
+            proxy.upstream_subset.as_deref(),
+            proxy.retry.clone(),
+        );
+        errors.extend(backend_tls_sni_direct_h2_conflict_messages(
+            &admission_proxy,
+            Some(&upstream),
+            plugin_configs,
+        ));
     }
 
     let mrd_plugins = applicable_mesh_route_dispatch_from_configs(proxy, plugin_configs);
@@ -2783,85 +2820,24 @@ async fn sni_admission_route_override_destinations(
     ))
 }
 
-/// Build the candidate plugin list a batch/API-spec proxy would see for
-/// SNI route-override admission: attached locals (payload first, else DB)
-/// plus non-shadowed globals (payload globals first, then DB).
-pub(crate) async fn load_sni_admission_candidate_plugins_for_proxy(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    proxy: &Proxy,
-    payload_plugins: &std::collections::HashMap<&str, &PluginConfig>,
-) -> DbResult<Vec<PluginConfig>> {
-    let attached_ids: HashSet<&str> = proxy
-        .plugins
-        .iter()
-        .map(|a| a.plugin_config_id.as_str())
-        .collect();
-
-    let mut resolved: Vec<PluginConfig> = Vec::new();
-    let mut seen_ids: HashSet<String> = HashSet::new();
-    for id in &attached_ids {
-        let pc = if let Some(pc) = payload_plugins.get(*id) {
-            Some((*pc).clone())
-        } else {
-            db.get_plugin_config(namespace, id).await?
-        };
-        if let Some(pc) = pc
-            && seen_ids.insert(pc.id.clone())
-        {
-            resolved.push(pc);
-        }
-    }
-    for pc in payload_plugins.values() {
-        if pc.namespace == namespace && seen_ids.insert(pc.id.clone()) {
-            resolved.push((*pc).clone());
-        }
-    }
-    let mut offset = 0_i64;
-    const PAGE_SIZE: i64 = 1_000;
-    loop {
-        let page = db
-            .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
-            .await?;
-        let items_len = page.items.len() as i64;
-        for plugin in page.items {
-            if seen_ids.insert(plugin.id.clone()) {
-                resolved.push(plugin);
-            }
-        }
-        if items_len == 0 {
-            break;
-        }
-        offset += items_len;
-        if offset >= page.total {
-            break;
-        }
-    }
-    Ok(
-        applicable_mesh_route_dispatch_from_configs(proxy, &resolved)
-            .into_iter()
-            .cloned()
-            .collect(),
-    )
-}
-
 /// Screen one proxy's route-override destinations for backend-TLS-SNI /
 /// direct-H2 conflicts during batch or API-spec admission (issue #3576).
+///
+/// `plugin_configs` must be the exact post-write / post-replacement plugin
+/// set (including payload overlays and, on API-spec PUT, minus plugins owned
+/// by the replaced spec). Route-override discovery and buffering screening
+/// both consume that same set so omitted owned plugins cannot false-reject
+/// while payload upstream resolution stays bundle-first.
 pub(crate) async fn validate_proxy_route_override_sni_admission(
     db: &dyn DatabaseBackend,
     namespace: &str,
     proxy: &Proxy,
     payload_upstreams: &std::collections::HashMap<&str, &Upstream>,
-    payload_plugins: &std::collections::HashMap<&str, &PluginConfig>,
-    // Effective plugin view for buffering screening. Callers typically pass
-    // the post-write candidate list (payload plugins overlaid on DB).
-    buffering_plugin_configs: &[PluginConfig],
+    plugin_configs: &[PluginConfig],
     validation_errors: &mut Vec<String>,
 ) -> DbResult<()> {
-    let candidates =
-        load_sni_admission_candidate_plugins_for_proxy(db, namespace, proxy, payload_plugins)
-            .await?;
-    let override_dests = collect_sni_admission_route_override_destinations(proxy, &candidates);
+    let candidates = applicable_mesh_route_dispatch_from_configs(proxy, plugin_configs);
+    let override_dests = collect_sni_admission_route_override_destinations(proxy, candidates);
     for override_dest in override_dests {
         let resolved = if let Some(u) = payload_upstreams.get(override_dest.upstream_id.as_str()) {
             Some((*u).clone())
@@ -2879,7 +2855,7 @@ pub(crate) async fn validate_proxy_route_override_sni_admission(
             validation_errors.extend(backend_tls_sni_direct_h2_conflict_messages(
                 &admission_proxy,
                 Some(&upstream),
-                buffering_plugin_configs,
+                plugin_configs,
             ));
         }
     }
