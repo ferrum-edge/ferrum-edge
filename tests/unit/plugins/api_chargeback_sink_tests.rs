@@ -8197,12 +8197,13 @@ impl Drop for ClearReplayHookOnDrop {
     }
 }
 
-/// Install a one-shot substitution of the claim pathname at `point`.
+/// Install a one-shot substitution of the observed pathname at `point`.
 ///
 /// The authoritative artifact is renamed out of the managed tree first, so its
 /// inode survives exactly as a hostile racer would leave it, and a *different*
-/// regular file then occupies the claim pathname. Returns the "fired" flag and
-/// the claim pathname the race observed.
+/// regular file then occupies that pathname. Points before the atomic claim
+/// rename observe the DURABLE candidate; later points observe the claim.
+/// Returns the "fired" flag and the pathname the race observed.
 #[cfg(unix)]
 fn install_claim_substitution_hook(
     namespace_root: std::path::PathBuf,
@@ -8386,7 +8387,10 @@ async fn claim_substituted_before_finalization_still_publishes_but_never_mutates
     );
     assert_eq!(
         after.bytes,
-        before.bytes.saturating_add(payload_len).saturating_add(meta_len),
+        before
+            .bytes
+            .saturating_add(payload_len)
+            .saturating_add(meta_len),
         "only the newly published evidence may change owned bytes"
     );
 }
@@ -8410,7 +8414,10 @@ async fn generic_finalize_failure_never_releases_a_substituted_claim() {
     // `replay_keeps_original_when_dead_letter_metadata_cannot_be_written`.
     let meta_temp = meta_path.with_file_name(format!(
         "{}.tmp",
-        meta_path.file_name().and_then(|name| name.to_str()).unwrap()
+        meta_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
     ));
     fs::create_dir(&meta_temp).unwrap();
     let displaced = outside.path().join("displaced-authoritative-source.ndjson");
@@ -8463,6 +8470,232 @@ async fn generic_finalize_failure_never_releases_a_substituted_claim() {
     assert!(
         dead_letter_payload_path(&source).exists(),
         "a payload published before the metadata failure remains recoverable"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn candidate_substituted_before_the_first_preflight_is_never_mutated() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-substitute-before-preflight")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let authoritative_bytes = fs::read(&source).unwrap();
+    let before = spool.cached_stats_for_tests();
+    let displaced = outside.path().join("displaced-authoritative-candidate.ndjson");
+
+    let clear = ClearReplayHookOnDrop;
+    let (fired, substituted) = install_claim_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::AfterCandidatePin,
+    );
+
+    // Authority exists before the FIRST mutation of the handoff, so the refusal
+    // happens while the candidate is still at its durable name and no claim
+    // rename, release, or quarantine has been attempted.
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect("a substituted candidate is refused without aborting the tick");
+    drop(clear);
+
+    assert!(fired.load(Ordering::SeqCst));
+    let observed = substituted
+        .lock()
+        .expect("planted candidate slot")
+        .clone()
+        .expect("the race plants exactly one candidate pathname");
+    assert_eq!(
+        observed, source,
+        "the race must replace the durable candidate itself, before any claim"
+    );
+    assert_eq!(
+        fs::read(&source).unwrap(),
+        PLANTED_CLAIM_SUBSTITUTE,
+        "the planted regular file must be byte- and pathname-identical"
+    );
+    assert!(
+        !spool_day_has_quarantine(&day),
+        "an unproven candidate pathname must never be quarantined"
+    );
+    assert_eq!(
+        fs::read(&displaced).unwrap(),
+        authoritative_bytes,
+        "the displaced authoritative artifact must remain intact"
+    );
+    let after = spool.cached_stats_for_tests();
+    assert!(
+        after.files >= before.files && after.bytes >= before.bytes,
+        "nothing may be accounted out for a candidate that stopped resolving to the pinned artifact"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn candidate_substituted_before_the_claim_rename_is_never_claimed() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-substitute-before-claim-rename")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let authoritative_bytes = fs::read(&source).unwrap();
+    let displaced = outside.path().join("displaced-authoritative-candidate.ndjson");
+
+    let clear = ClearReplayHookOnDrop;
+    let (fired, substituted) = install_claim_substitution_hook(
+        spool.namespace_root_for_tests().to_path_buf(),
+        displaced.clone(),
+        SpoolReplayHookPoint::BeforeBoundedPreflightValidation,
+    );
+
+    // The validated descriptor stays readable, so the complete bounded preflight
+    // still succeeds — but the atomic claim rename is a mutation of a pathname
+    // that no longer resolves to it, and is refused before it happens.
+    let error = replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+        .await
+        .expect_err("the atomic claim rename must refuse a substituted candidate");
+    drop(clear);
+
+    assert!(fired.load(Ordering::SeqCst));
+    assert!(
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "unexpected pre-claim refusal diagnostic: {error}"
+    );
+    let observed = substituted
+        .lock()
+        .expect("planted candidate slot")
+        .clone()
+        .expect("the race plants exactly one candidate pathname");
+    assert_eq!(observed, source);
+    assert_eq!(
+        fs::read(&source).unwrap(),
+        PLANTED_CLAIM_SUBSTITUTE,
+        "the substitute must never be renamed into the claim namespace"
+    );
+    let entries: Vec<String> = fs::read_dir(&day)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![source.file_name().unwrap().to_string_lossy().into_owned()],
+        "no claim, quarantine, or dead-letter pathname may be created: {entries:?}"
+    );
+    assert_eq!(fs::read(&displaced).unwrap(), authoritative_bytes);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn in_place_rewrite_with_restored_mtime_never_authorizes_the_terminal_removal() {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let source = spool
+        .write_events(&[sample_event("evt-in-place-rewrite")])
+        .unwrap();
+    let day = source.parent().unwrap().to_path_buf();
+    let before = spool.cached_stats_for_tests();
+
+    // A same-UID writer rewrites the pinned inode with same-length bytes and
+    // then restores mtime with `utimensat`. Node + length + mtime alone cannot
+    // see that; ctime can, and no userland API can set it back.
+    let namespace_root = spool.namespace_root_for_tests().to_path_buf();
+    let rewritten: Arc<Mutex<Option<(std::path::PathBuf, bool)>>> = Arc::new(Mutex::new(None));
+    let rewritten_for_hook = Arc::clone(&rewritten);
+    set_spool_replay_hook_for_tests(Some(Arc::new(move |point, claimed| {
+        if point != SpoolReplayHookPoint::BeforeReplayFinalize
+            || !claimed.starts_with(&namespace_root)
+        {
+            return;
+        }
+        let mut slot = rewritten_for_hook.lock().expect("in-place rewrite slot");
+        if slot.is_some() {
+            return;
+        }
+        let original = fs::metadata(claimed).expect("the claimed artifact is stat-able");
+        let mut replacement = vec![b' '; original.len() as usize];
+        if let Some(first) = replacement.first_mut() {
+            *first = b'#';
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(claimed)
+            .expect("a same-UID writer can reopen the claimed inode")
+            .write_all(&replacement)
+            .expect("the in-place rewrite keeps the same inode and length");
+        let times = [
+            libc::timespec {
+                tv_sec: original.atime(),
+                tv_nsec: original.atime_nsec(),
+            },
+            libc::timespec {
+                tv_sec: original.mtime(),
+                tv_nsec: original.mtime_nsec(),
+            },
+        ];
+        let raw = std::ffi::CString::new(claimed.as_os_str().as_bytes()).unwrap();
+        let restored =
+            unsafe { libc::utimensat(libc::AT_FDCWD, raw.as_ptr(), times.as_ptr(), 0) } == 0;
+        let now = fs::metadata(claimed).expect("the claimed artifact is stat-able");
+        let same_node = now.len() == original.len() && now.ino() == original.ino();
+        let same_mtime =
+            now.mtime() == original.mtime() && now.mtime_nsec() == original.mtime_nsec();
+        let mtime_defeated = restored && same_node && same_mtime;
+        *slot = Some((claimed.to_path_buf(), mtime_defeated));
+    })));
+    let clear = ClearReplayHookOnDrop;
+
+    let error = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("an in-place rewrite must refuse the terminal claim removal");
+    drop(clear);
+
+    let (claim, mtime_defeated) = rewritten
+        .lock()
+        .expect("in-place rewrite slot")
+        .clone()
+        .expect("the race rewrites exactly one claim pathname");
+    assert!(
+        mtime_defeated,
+        "the regression only proves anything if node, length, and mtime all still match"
+    );
+    assert!(
+        error.contains("no longer resolves to the authoritative claimed artifact"),
+        "an mtime-restored in-place rewrite must still fail closed: {error}"
+    );
+    assert!(
+        claim.exists(),
+        "the rewritten claim must not be unlinked as this handoff's artifact"
+    );
+    assert!(
+        !source.exists(),
+        "the rewritten claim must not be released back to the replayable name"
+    );
+    assert!(
+        !spool_day_has_quarantine(&day),
+        "the terminal refusal must not quarantine either"
+    );
+    let after = spool.cached_stats_for_tests();
+    assert!(
+        after.files >= before.files && after.bytes >= before.bytes,
+        "no owned-file or owned-byte accounting may be released for a rewritten claim"
     );
 }
 
@@ -9663,6 +9896,8 @@ async fn streaming_replay_refuses_a_post_preflight_path_swap_and_continues() {
 
     let namespace_root = spool.namespace_root_for_tests().to_path_buf();
     let replacement_for_hook = replacement.clone();
+    let swapped_claim: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
+    let claim_slot = Arc::clone(&swapped_claim);
     set_spool_replay_hook_for_tests(Some(Arc::new(move |point, claimed| {
         if point != SpoolReplayHookPoint::AfterStreamingPreflight {
             return;
@@ -9670,7 +9905,9 @@ async fn streaming_replay_refuses_a_post_preflight_path_swap_and_continues() {
         if !claimed.starts_with(&namespace_root) {
             return;
         }
-        let _ = fs::rename(&replacement_for_hook, claimed);
+        if fs::rename(&replacement_for_hook, claimed).is_ok() {
+            *claim_slot.lock().expect("swapped claim slot") = Some(claimed.to_path_buf());
+        }
     })));
     struct ClearReplayHook;
     impl Drop for ClearReplayHook {
@@ -9687,14 +9924,31 @@ async fn streaming_replay_refuses_a_post_preflight_path_swap_and_continues() {
         .await;
     replay_spool_once_for_tests(&spool, &server.uri())
         .await
-        .expect("a post-preflight identity change must quarantine and continue the tick");
+        .expect("a post-preflight identity change must refuse and continue the tick");
 
+    // Quarantine is a rename, so it is bound too: the claim pathname now names a
+    // substitute, not the pinned inode, and must therefore be left completely
+    // untouched instead of relabelled under this owner's operator-visible name.
+    let swapped = swapped_claim
+        .lock()
+        .expect("swapped claim slot")
+        .clone()
+        .expect("the swap replaces exactly one claim pathname");
     assert!(
-        fs::read_dir(&day)
+        !fs::read_dir(&day)
             .unwrap()
             .filter_map(Result::ok)
             .any(|entry| entry.file_name().to_string_lossy().ends_with(".corrupt")),
-        "the swapped artifact must be retained under operator quarantine"
+        "a substituted claim pathname must never be quarantined"
+    );
+    assert_eq!(
+        fs::read(&swapped).unwrap(),
+        br#"{"event_id":"smuggled-after-preflight"}"#,
+        "the substitute must be left byte- and pathname-identical"
+    );
+    assert!(
+        !source.exists(),
+        "the substitute must never be released back to the replayable name"
     );
     assert!(
         !newer.exists(),
@@ -9784,7 +10038,9 @@ async fn streaming_replay_defers_when_ceiling_starves_between_preflight_and_reop
 #[cfg(unix)]
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_active_sink)]
-async fn streaming_replay_reports_when_a_changed_artifact_cannot_be_quarantined() {
+async fn streaming_replay_continues_when_an_authorized_quarantine_is_blocked() {
+    use std::os::unix::fs::PermissionsExt;
+
     let temp = tempfile::tempdir().unwrap();
     let spool = test_spool(&temp);
     let day = spool.namespace_root_for_tests().join("20260524");
@@ -9797,18 +10053,21 @@ async fn streaming_replay_reports_when_a_changed_artifact_cannot_be_quarantined(
     .unwrap();
     // Quarantine renames to the durable base name + ".corrupt", never the
     // in-flight claim name. Plant the blocker on that durable path so the
-    // post-preflight identity refusal cannot complete quarantine.
+    // authorized quarantine cannot complete.
     let quarantine = source.with_file_name(format!(
         "{}.corrupt",
         source.file_name().unwrap().to_string_lossy()
     ));
     fs::create_dir(&quarantine).unwrap();
     fs::write(quarantine.join("blocker"), b"x").unwrap();
-    let replacement = temp.path().join("replacement-blocked-quarantine.ndjson");
-    fs::write(&replacement, br#"{"event_id":"changed-after-preflight"}"#).unwrap();
 
+    // The pinned inode is NOT replaced: only its mode changes, so the second
+    // open fails while the claim pathname still resolves to the exact artifact
+    // this replay opened. Quarantine is therefore authorized — and still fails,
+    // because the durable quarantine name is occupied by a directory.
     let namespace_root = spool.namespace_root_for_tests().to_path_buf();
-    let replacement_for_hook = replacement.clone();
+    let claim_slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
+    let claim_for_hook = Arc::clone(&claim_slot);
     set_spool_replay_hook_for_tests(Some(Arc::new(move |point, claimed| {
         if point != SpoolReplayHookPoint::AfterStreamingPreflight {
             return;
@@ -9816,7 +10075,14 @@ async fn streaming_replay_reports_when_a_changed_artifact_cannot_be_quarantined(
         if !claimed.starts_with(&namespace_root) {
             return;
         }
-        let _ = fs::rename(&replacement_for_hook, claimed);
+        let mut slot = claim_for_hook.lock().expect("blocked claim slot");
+        if slot.is_some() {
+            return;
+        }
+        let mut denied = fs::metadata(claimed).unwrap().permissions();
+        denied.set_mode(0o000);
+        fs::set_permissions(claimed, denied).unwrap();
+        *slot = Some(claimed.to_path_buf());
     })));
     struct ClearReplayHook;
     impl Drop for ClearReplayHook {
@@ -9826,15 +10092,32 @@ async fn streaming_replay_reports_when_a_changed_artifact_cannot_be_quarantined(
     }
     let _clear = ClearReplayHook;
 
-    let error = replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
+    // The second open fails before any HTTP attempt, so no backend is needed.
+    replay_spool_once_for_tests(&spool, "http://127.0.0.1:1/")
         .await
-        .expect_err("a changed artifact that cannot be quarantined must fail the tick");
+        .expect("a blocked quarantine reports and continues the tick");
+
+    let blocked = claim_slot
+        .lock()
+        .expect("blocked claim slot")
+        .clone()
+        .expect("the hook blocks exactly one claim pathname");
     assert!(
-        error.contains("failed to quarantine changed spool artifact")
-            || error.contains("changed file identity")
-            || error.contains("quarantine"),
-        "unexpected blocked-quarantine diagnostic: {error}"
+        blocked.exists(),
+        "a quarantine that could not complete must leave the claim exactly where it was"
     );
+    assert_eq!(
+        fs::read(quarantine.join("blocker")).unwrap(),
+        b"x",
+        "the blocking directory must never be replaced by the refused artifact"
+    );
+    assert!(
+        !source.exists(),
+        "a blocked quarantine must not release the claim back to the replayable name"
+    );
+    let mut restore = fs::metadata(&blocked).unwrap().permissions();
+    restore.set_mode(0o600);
+    fs::set_permissions(&blocked, restore).unwrap();
 }
 
 // ---------------------------------------------------------------------------
