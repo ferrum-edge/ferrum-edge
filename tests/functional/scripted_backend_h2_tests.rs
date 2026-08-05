@@ -2219,12 +2219,17 @@ async fn bodyless_direct_h2_sse_response_is_governed() {
     let step_errors = backend.step_errors().await;
     let unexpected_step_errors: Vec<_> = step_errors
         .iter()
-        // Capability warmup may open a speculative H2 connection and drop it
-        // before sending the client preface. The governed response and received
-        // GET above prove the real direct-H2 connection completed; do not treat
-        // that independent probe disconnect as a script failure.
+        // Capability/pool warmup may open a speculative H2 connection and drop
+        // it before sending the client preface. A binary spawn attempt can also
+        // finish the H2 handshake before losing a late listener-bind race; its
+        // shutdown then closes the warmup connection while ExpectHeaders waits,
+        // and the harness retries with fresh listener ports. The governed
+        // response and received GET above prove the real direct-H2 connection
+        // completed, so neither independent startup disconnect is a script
+        // failure for this assertion.
         .filter(|error| {
             !error.starts_with("h2 handshake failed: connection error detected: unspecific protocol error detected")
+                && error.as_str() != "ExpectHeaders: connection closed before any stream arrived"
         })
         .collect();
     assert!(

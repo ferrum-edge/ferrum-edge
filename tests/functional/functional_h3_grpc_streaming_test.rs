@@ -379,6 +379,8 @@ async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
         http::header::AUTHORIZATION,
         http::HeaderValue::from_static("Bearer forged-late-token"),
     );
+    request_trailers.insert("via", http::HeaderValue::from_static("attacker-proxy"));
+    request_trailers.insert("early-data", http::HeaderValue::from_static("1"));
     stream
         .send_request_trailers(request_trailers)
         .await
@@ -416,6 +418,8 @@ async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
                 | "x-geo-country"
                 | "x-forwarded-for"
                 | "forwarded"
+                | "via"
+                | "early-data"
                 | "authorization"
         )),
         "client request trailers must not restate credentials or forge gateway identity"

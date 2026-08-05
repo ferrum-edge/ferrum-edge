@@ -454,9 +454,28 @@ pub(crate) fn is_forbidden_backend_request_trailer_name(name: &str) -> bool {
         || name.starts_with("x-consumer-")
         || name.starts_with("x-ferrum-")
         || name.starts_with("x-path-param-")
+        // `via` and `early-data` are deliberately asymmetric with the header
+        // boundary, and that asymmetry is the point:
+        //
+        // * `early-data` IS gateway-owned on the request path — the H3 bridge
+        //   strips any client value and re-injects `Early-Data: 1` for a 0-RTT
+        //   request (RFC 8470), so a trailer copy could only contradict it.
+        // * `via` is NOT stripped from request headers, and must not be: RFC
+        //   9110 §7.6.3 requires an intermediary to append to `Via` on a
+        //   forwarded request, so a legitimate upstream proxy's value has to
+        //   survive. But `Via` is defined for the header section only; arriving
+        //   in trailers it is never legitimate and is only useful for forging
+        //   an intermediary chain past the point where the gateway has already
+        //   built its own.
+        //
+        // So this is not header/trailer parity — the header path deliberately
+        // keeps `via`. Do not "fix" the inconsistency by adding `via` to
+        // `is_backend_request_strip_header`.
         || matches!(
             name,
-            "proxy-authenticate"
+            "via"
+                | "early-data"
+                | "proxy-authenticate"
                 | "content-type"
                 | "content-encoding"
                 | "host"
@@ -2003,6 +2022,8 @@ mod tests {
             "x-forwarded-proto",
             "x-forwarded-host",
             "forwarded",
+            "via",
+            "early-data",
             "authorization",
             "cookie",
             "x-api-key",
@@ -2052,6 +2073,8 @@ mod tests {
             "authorization",
             http::HeaderValue::from_static("Bearer forged"),
         );
+        trailers.insert("via", http::HeaderValue::from_static("attacker-proxy"));
+        trailers.insert("early-data", http::HeaderValue::from_static("1"));
         trailers.insert("connection", http::HeaderValue::from_static("close"));
         trailers.insert(
             "x-path-param-account",
@@ -2075,6 +2098,8 @@ mod tests {
         assert!(!trailers.contains_key("x-geo-country"));
         assert!(!trailers.contains_key("x-consumer-username"));
         assert!(!trailers.contains_key("authorization"));
+        assert!(!trailers.contains_key("via"));
+        assert!(!trailers.contains_key("early-data"));
         assert!(!trailers.contains_key("connection"));
         assert!(!trailers.contains_key("x-path-param-account"));
         assert_eq!(trailers.len(), 2);

@@ -280,75 +280,20 @@ async fn start_encoded_response_h3_gateway(config: String) -> (GatewayHarness, T
     );
 }
 
-fn gateway_binary_path() -> &'static str {
-    if std::path::Path::new("./target/debug/ferrum-edge").exists() {
-        "./target/debug/ferrum-edge"
-    } else {
-        "./target/release/ferrum-edge"
-    }
-}
-
-fn start_gateway(config_path: &str, proxy_port: u16, admin_port: u16) -> std::process::Child {
-    std::process::Command::new(gateway_binary_path())
-        .env("FERRUM_MODE", "file")
-        .env("FERRUM_FILE_CONFIG_PATH", config_path)
-        .env("FERRUM_PROXY_HTTP_PORT", proxy_port.to_string())
-        .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
-        .env("FERRUM_LOG_LEVEL", "debug")
-        // No backend-hit assertions here, but disable warmup so the startup
-        // HEAD probe doesn't race the single-shot SSE backend.
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+/// Start request-path tests with pre-bound proxy and admin listeners. The old
+/// subprocess helper selected both ports by bind/drop/rebind and considered an
+/// admin health response sufficient proof that the separately selected proxy
+/// port belonged to the same child. Under parallel functional-test load, that
+/// admitted wrong-gateway 404s and connection resets. In-process mode hands the
+/// reserved listeners directly to `file::serve`, so ownership is continuous.
+async fn start_in_process_gateway(config: String) -> GatewayHarness {
+    GatewayHarness::builder()
+        .file_config(config)
+        .mode_in_process()
+        .pool_warmup_enabled(false)
         .spawn()
-        .expect("Failed to start gateway binary")
-}
-
-async fn wait_for_gateway(admin_port: u16) -> bool {
-    let client = reqwest::Client::new();
-    let health_url = format!("http://127.0.0.1:{}/health", admin_port);
-    for _ in 0..60 {
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
-}
-
-/// Start the gateway with retry on port-binding failures, allocating fresh
-/// ephemeral ports each attempt to survive the bind-drop-rebind race.
-async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u16, u16) {
-    const MAX_ATTEMPTS: u32 = 3;
-    for attempt in 1..=MAX_ATTEMPTS {
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_port = proxy_listener.local_addr().unwrap().port();
-        drop(proxy_listener);
-
-        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let admin_port = admin_listener.local_addr().unwrap().port();
-        drop(admin_listener);
-
-        let mut child = start_gateway(config_path, proxy_port, admin_port);
-
-        if wait_for_gateway(admin_port).await {
-            return (child, proxy_port, admin_port);
-        }
-
-        eprintln!(
-            "Gateway startup attempt {}/{} failed (ports: proxy={}, admin={})",
-            attempt, MAX_ATTEMPTS, proxy_port, admin_port
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-        if attempt < MAX_ATTEMPTS {
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
-    panic!("Gateway did not start after {} attempts", MAX_ATTEMPTS);
+        .await
+        .expect("spawn in-process AI semantic firewall gateway")
 }
 
 /// File-mode config: a single proxy with `ai_semantic_firewall` in `buffer`
@@ -414,14 +359,6 @@ fn detect_mode_config(backend_port: u16) -> String {
     )
 }
 
-fn write_config(dir: &TempDir, contents: &str) -> String {
-    let config_path = dir.path().join("config.yaml");
-    let mut file = std::fs::File::create(&config_path).expect("create config");
-    file.write_all(contents.as_bytes()).expect("write config");
-    drop(file);
-    config_path.to_string_lossy().to_string()
-}
-
 // A leaking completion: "my system prompt says ..." (a lexical response_leakage
 // trigger) split across content deltas. Only delta reassembly recovers it.
 const LEAKING_SSE: &str = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n\
@@ -457,20 +394,15 @@ const JSON_LEAK: &str = "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assi
 #[ignore]
 #[tokio::test]
 async fn buffer_mode_blocks_streaming_response_with_leak() {
-    let temp_dir = TempDir::new().expect("temp dir");
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    let config_path = write_config(&temp_dir, &buffer_mode_config(backend_port));
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, LEAKING_SSE));
-    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+    let gateway = start_in_process_gateway(buffer_mode_config(backend_port)).await;
 
     let client = reqwest::Client::new();
     let response = client
-        .post(format!(
-            "http://127.0.0.1:{}/ai/v1/chat/completions",
-            proxy_port
-        ))
+        .post(gateway.proxy_url("/ai/v1/chat/completions"))
         .header("content-type", "application/json")
         .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
         .send()
@@ -480,8 +412,7 @@ async fn buffer_mode_blocks_streaming_response_with_leak() {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    drop(gateway);
     backend.abort();
 
     assert_eq!(
@@ -497,20 +428,15 @@ async fn buffer_mode_blocks_streaming_response_with_leak() {
 #[ignore]
 #[tokio::test]
 async fn buffer_mode_delivers_clean_streaming_response() {
-    let temp_dir = TempDir::new().expect("temp dir");
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    let config_path = write_config(&temp_dir, &buffer_mode_config(backend_port));
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, CLEAN_SSE));
-    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+    let gateway = start_in_process_gateway(buffer_mode_config(backend_port)).await;
 
     let client = reqwest::Client::new();
     let response = client
-        .post(format!(
-            "http://127.0.0.1:{}/ai/v1/chat/completions",
-            proxy_port
-        ))
+        .post(gateway.proxy_url("/ai/v1/chat/completions"))
         .header("content-type", "application/json")
         .body(r#"{"stream":true,"messages":[{"role":"user","content":"weather?"}]}"#)
         .send()
@@ -520,8 +446,7 @@ async fn buffer_mode_delivers_clean_streaming_response() {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    drop(gateway);
     backend.abort();
 
     // Clean completion: the lexical pass finds nothing and the closed provider
@@ -540,20 +465,15 @@ async fn buffer_mode_delivers_clean_streaming_response() {
 #[ignore]
 #[tokio::test]
 async fn inspect_mode_cuts_leaking_stream_midflight() {
-    let temp_dir = TempDir::new().expect("temp dir");
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    let config_path = write_config(&temp_dir, &inspect_mode_config(backend_port));
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, LEAKING_SSE));
-    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+    let gateway = start_in_process_gateway(inspect_mode_config(backend_port)).await;
 
     let client = reqwest::Client::new();
     let response = client
-        .post(format!(
-            "http://127.0.0.1:{}/ai/v1/chat/completions",
-            proxy_port
-        ))
+        .post(gateway.proxy_url("/ai/v1/chat/completions"))
         .header("content-type", "application/json")
         .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
         .send()
@@ -565,8 +485,7 @@ async fn inspect_mode_cuts_leaking_stream_midflight() {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    drop(gateway);
     backend.abort();
 
     assert_eq!(
@@ -588,20 +507,15 @@ async fn inspect_mode_cuts_leaking_stream_midflight() {
 #[ignore]
 #[tokio::test]
 async fn inspect_mode_streams_clean_response() {
-    let temp_dir = TempDir::new().expect("temp dir");
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    let config_path = write_config(&temp_dir, &inspect_mode_config(backend_port));
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, CLEAN_SSE));
-    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+    let gateway = start_in_process_gateway(inspect_mode_config(backend_port)).await;
 
     let client = reqwest::Client::new();
     let response = client
-        .post(format!(
-            "http://127.0.0.1:{}/ai/v1/chat/completions",
-            proxy_port
-        ))
+        .post(gateway.proxy_url("/ai/v1/chat/completions"))
         .header("content-type", "application/json")
         .body(r#"{"stream":true,"messages":[{"role":"user","content":"weather?"}]}"#)
         .send()
@@ -611,8 +525,7 @@ async fn inspect_mode_streams_clean_response() {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    drop(gateway);
     backend.abort();
 
     assert_eq!(
@@ -632,20 +545,15 @@ async fn inspect_mode_streams_clean_response() {
 #[ignore]
 #[tokio::test]
 async fn inspect_mode_cuts_leaking_tool_call_stream() {
-    let temp_dir = TempDir::new().expect("temp dir");
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    let config_path = write_config(&temp_dir, &inspect_mode_config(backend_port));
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, TOOL_LEAK_SSE));
-    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+    let gateway = start_in_process_gateway(inspect_mode_config(backend_port)).await;
 
     let client = reqwest::Client::new();
     let response = client
-        .post(format!(
-            "http://127.0.0.1:{}/ai/v1/chat/completions",
-            proxy_port
-        ))
+        .post(gateway.proxy_url("/ai/v1/chat/completions"))
         .header("content-type", "application/json")
         .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
         .send()
@@ -655,8 +563,7 @@ async fn inspect_mode_cuts_leaking_tool_call_stream() {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    drop(gateway);
     backend.abort();
 
     assert_eq!(status, 200, "streamed response keeps its 200 status");
@@ -675,20 +582,15 @@ async fn inspect_mode_cuts_leaking_tool_call_stream() {
 #[ignore]
 #[tokio::test]
 async fn inspect_detect_mode_forwards_leak_without_cutting() {
-    let temp_dir = TempDir::new().expect("temp dir");
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    let config_path = write_config(&temp_dir, &detect_mode_config(backend_port));
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, LEAKING_SSE));
-    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+    let gateway = start_in_process_gateway(detect_mode_config(backend_port)).await;
 
     let client = reqwest::Client::new();
     let response = client
-        .post(format!(
-            "http://127.0.0.1:{}/ai/v1/chat/completions",
-            proxy_port
-        ))
+        .post(gateway.proxy_url("/ai/v1/chat/completions"))
         .header("content-type", "application/json")
         .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
         .send()
@@ -698,8 +600,7 @@ async fn inspect_detect_mode_forwards_leak_without_cutting() {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    drop(gateway);
     backend.abort();
 
     // detect mode is release-then-detect: it never cuts, so the (leaking) stream
@@ -722,20 +623,15 @@ async fn inspect_mode_buffers_and_blocks_non_sse_json_leak() {
     // A backend that ignored stream:true and returned a JSON completion: inspect
     // mode must BUFFER it (the windowed inspector only handles SSE) and block the
     // leak via on_response_body — not stream it past every check uninspected.
-    let temp_dir = TempDir::new().expect("temp dir");
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
-    let config_path = write_config(&temp_dir, &inspect_mode_config(backend_port));
 
     let backend = tokio::spawn(start_json_backend_on(backend_listener, JSON_LEAK));
-    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+    let gateway = start_in_process_gateway(inspect_mode_config(backend_port)).await;
 
     let client = reqwest::Client::new();
     let response = client
-        .post(format!(
-            "http://127.0.0.1:{}/ai/v1/chat/completions",
-            proxy_port
-        ))
+        .post(gateway.proxy_url("/ai/v1/chat/completions"))
         .header("content-type", "application/json")
         .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
         .send()
@@ -745,8 +641,7 @@ async fn inspect_mode_buffers_and_blocks_non_sse_json_leak() {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    drop(gateway);
     backend.abort();
 
     // Buffered + inspected → blocked with a proper status (not a truncated 200),
@@ -779,6 +674,7 @@ async fn encoded_partial_responses_are_buffered_and_enforced_over_h1_and_h2() {
     let backend = tokio::spawn(start_encoded_range_backend_on(backend_listener));
     let harness = GatewayHarness::builder()
         .file_config(encoded_response_config(backend_port, "/range", "reject"))
+        .mode_in_process()
         .pool_warmup_enabled(false)
         .spawn()
         .await
@@ -883,6 +779,7 @@ async fn decoded_sse_json_preludes_are_inspected_over_h1_h2_and_h3() {
     let config = encoded_response_config(backend_port, "/sse", "allow");
     let harness = GatewayHarness::builder()
         .file_config(config.clone())
+        .mode_in_process()
         .pool_warmup_enabled(false)
         .spawn()
         .await
@@ -962,6 +859,7 @@ async fn decoded_sse_json_preludes_are_inspected_over_h1_h2_and_h3() {
 
     let reject_harness = GatewayHarness::builder()
         .file_config(encoded_response_config(backend_port, "/sse", "reject"))
+        .mode_in_process()
         .pool_warmup_enabled(false)
         .spawn()
         .await
@@ -1066,30 +964,23 @@ plugin_configs:
 #[ignore]
 #[tokio::test]
 async fn inspect_mode_cuts_stream_when_hold_deadline_expires() {
-    let temp_dir = TempDir::new().expect("temp dir");
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let embeddings_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let embeddings_port = embeddings_listener.local_addr().unwrap().port();
-    let config_path = write_config(
-        &temp_dir,
-        &hold_timeout_config(backend_port, embeddings_port, "cut"),
-    );
 
     // CLEAN_SSE never matches lexically, so the firewall must consult the
     // (stalled) semantic provider — the window is genuinely held awaiting a
     // verdict that never arrives.
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, CLEAN_SSE));
     let embeddings = tokio::spawn(start_stalled_embeddings_backend_on(embeddings_listener));
-    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+    let gateway =
+        start_in_process_gateway(hold_timeout_config(backend_port, embeddings_port, "cut")).await;
 
     let client = reqwest::Client::new();
     let started = std::time::Instant::now();
     let response = client
-        .post(format!(
-            "http://127.0.0.1:{}/ai/v1/chat/completions",
-            proxy_port
-        ))
+        .post(gateway.proxy_url("/ai/v1/chat/completions"))
         .header("content-type", "application/json")
         .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
         .send()
@@ -1099,8 +990,7 @@ async fn inspect_mode_cuts_stream_when_hold_deadline_expires() {
     let body = response.text().await.unwrap_or_default();
     let elapsed = started.elapsed();
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    drop(gateway);
     backend.abort();
     embeddings.abort();
 
@@ -1125,27 +1015,24 @@ async fn inspect_mode_cuts_stream_when_hold_deadline_expires() {
 #[ignore]
 #[tokio::test]
 async fn inspect_mode_forwards_held_window_when_configured_to_fail_open() {
-    let temp_dir = TempDir::new().expect("temp dir");
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let embeddings_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let embeddings_port = embeddings_listener.local_addr().unwrap().port();
-    let config_path = write_config(
-        &temp_dir,
-        &hold_timeout_config(backend_port, embeddings_port, "forward"),
-    );
 
     let backend = tokio::spawn(start_sse_backend_on(backend_listener, CLEAN_SSE));
     let embeddings = tokio::spawn(start_stalled_embeddings_backend_on(embeddings_listener));
-    let (mut gateway, proxy_port, _admin_port) = start_gateway_with_retry(&config_path).await;
+    let gateway = start_in_process_gateway(hold_timeout_config(
+        backend_port,
+        embeddings_port,
+        "forward",
+    ))
+    .await;
 
     let client = reqwest::Client::new();
     let started = std::time::Instant::now();
     let response = client
-        .post(format!(
-            "http://127.0.0.1:{}/ai/v1/chat/completions",
-            proxy_port
-        ))
+        .post(gateway.proxy_url("/ai/v1/chat/completions"))
         .header("content-type", "application/json")
         .body(r#"{"stream":true,"messages":[{"role":"user","content":"hello"}]}"#)
         .send()
@@ -1155,8 +1042,7 @@ async fn inspect_mode_forwards_held_window_when_configured_to_fail_open() {
     let body = response.text().await.unwrap_or_default();
     let elapsed = started.elapsed();
 
-    let _ = gateway.kill();
-    let _ = gateway.wait();
+    drop(gateway);
     backend.abort();
     embeddings.abort();
 

@@ -76,6 +76,7 @@ cleanup() {
 trap cleanup EXIT
 
 preflight() {
+  python3 ./tests/k8s/multicluster-poller-partition/verify_signal_reload_guard.py
   for command in docker kind kubectl curl python3 openssl sed; do need "$command"; done
   docker info >/dev/null
   [[ "${FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE:-}" == true ]] || {
@@ -653,7 +654,7 @@ projected_config_withdrawn() {
 }
 
 signal_reload() {
-  local context="$1" pod pid
+  local context="$1" pod
   pod="$( kubectl --context "$context" -n "$NS" --request-timeout=10s \
     get pod -l app=echo --field-selector=status.phase=Running \
       -o jsonpath='{.items[0].metadata.name}')" || return 1
@@ -664,11 +665,47 @@ signal_reload() {
     annotate pod "$pod" \
       "ferrum-edge.io/projected-config-refresh=withdrawal-$SECONDS" --overwrite
   wait_for_projected_withdrawal "projected withdrawn mesh config" 30 "$context"
-  pid="$( kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- \
-    pidof ferrum-edge)" || return 1
-  [[ "$pid" =~ ^[0-9]+$ ]] || { echo "invalid ferrum-edge pid" >&2; return 1; }
-  kubectl --context "$context" -n "$NS" exec deploy/echo -c signal -- \
-    kill -HUP "$pid"
+  # The readiness probe also runs `ferrum-edge health` in this shared process
+  # namespace. `pidof ferrum-edge` can therefore return both the daemon and a
+  # transient probe process. `/proc/<pid>/exe` is an unnecessary identity race,
+  # so select by argv instead. The signal sidecar deliberately runs as the same
+  # non-root UID 1337 as the gateway: Linux credential checks otherwise deny
+  # both `/proc/<pid>/cmdline` reads and signal delivery across containers.
+  # procfs reports cmdline pseudo-files with st_size=0 even when reading them
+  # returns argv, so never gate the scan with `test -s`. Parse the file and
+  # require argv[0] basename
+  # `ferrum-edge` and argv[1] `run`, compare only as data, and discover +
+  # signal exactly one candidate in one exec to minimize the PID lifetime gap.
+  kubectl --context "$context" -n "$NS" exec "pod/$pod" -c signal -- sh -eu -c '
+    found=""
+    for process_dir in /proc/[0-9]*; do
+      [ -r "$process_dir/cmdline" ] || continue
+      argv0=""
+      argv1=""
+      pos=0
+      while IFS= read -r -d "" arg || [ -n "$arg" ]; do
+        case "$pos" in
+          0) argv0="$arg" ;;
+          1) argv1="$arg"; break ;;
+        esac
+        pos=$((pos + 1))
+      done < "$process_dir/cmdline"
+      [ -n "$argv0" ] || continue
+      [ "${argv0##*/}" = "ferrum-edge" ] || continue
+      [ "$argv1" = "run" ] || continue
+      candidate="${process_dir##*/}"
+      if [ -n "$found" ]; then
+        echo "multiple ferrum-edge run processes found: $found $candidate" >&2
+        exit 1
+      fi
+      found="$candidate"
+    done
+    [ -n "$found" ] || {
+      echo "no ferrum-edge run process found" >&2
+      exit 1
+    }
+    kill -HUP "$found"
+  '
 }
 
 deploy_topology() {

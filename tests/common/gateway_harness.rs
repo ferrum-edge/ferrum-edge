@@ -1109,6 +1109,13 @@ async fn build_env(
     env.insert("FERRUM_PROXY_HTTP_PORT".into(), proxy_port.to_string());
     env.insert("FERRUM_ADMIN_HTTP_PORT".into(), admin_port.to_string());
     env.insert("FERRUM_LOG_LEVEL".into(), b.log_level.clone());
+    // A test subprocess gets one accept socket unless the test explicitly
+    // overrides this. Production's auto-sized default enables SO_REUSEPORT;
+    // after the harness's bind/drop port selection, a parallel gateway can
+    // otherwise join the same reuse-port group. Admin identity proves the
+    // child, but requests to its separately selected proxy port may then be
+    // kernel-distributed to the foreign gateway (wrong-route 404/reset).
+    env.insert("FERRUM_ACCEPT_THREADS".into(), "1".into());
     // Tests don't need the 5s warmup stall; pool warmup failures are
     // non-fatal but noisy in test logs.
     env.insert("FERRUM_POOL_WARMUP_ENABLED".into(), "false".into());

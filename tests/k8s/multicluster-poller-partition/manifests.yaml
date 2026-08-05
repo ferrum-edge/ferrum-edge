@@ -352,6 +352,13 @@ spec:
           image: alpine:3.21
           imagePullPolicy: IfNotPresent
           command: ["sh", "-c", "trap : TERM INT; while :; do wait; done"]
+          # The gateway runs as UID 1337. Linux gates /proc/<pid>/cmdline and
+          # signal delivery by process credentials in this shared PID namespace,
+          # so the reload helper must use that same non-root identity.
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
           volumeMounts:
             - {name: mesh-config, mountPath: /mesh, readOnly: true}
       volumes:

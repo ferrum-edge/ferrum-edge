@@ -113,8 +113,30 @@ runs:
           exit 0
         fi
 
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends "${required_packages[@]}"
+        # GitHub-hosted Ubuntu images also enable third-party repositories
+        # (for example Microsoft and Google tooling) that are unrelated to
+        # these packages. An outage or access-policy change in any one of those
+        # repositories must not prevent installing canonical Ubuntu build
+        # dependencies. Refresh only Ubuntu's own source definition and keep
+        # the image's other package indexes out of this required step.
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+          ubuntu_sources=sources.list.d/ubuntu.sources
+        elif [ -f /etc/apt/sources.list ]; then
+          ubuntu_sources=sources.list
+        else
+          echo "::error::canonical Ubuntu apt sources are unavailable"
+          exit 1
+        fi
+        sudo apt-get update \
+          -o "Dir::Etc::sourcelist=${ubuntu_sources}" \
+          -o "Dir::Etc::sourceparts=-" \
+          -o "APT::Get::List-Cleanup=0" \
+          -o "Acquire::Retries=3"
+        sudo apt-get \
+          -o "Dir::Etc::sourcelist=${ubuntu_sources}" \
+          -o "Dir::Etc::sourceparts=-" \
+          -o "Acquire::Retries=3" \
+          install -y --no-install-recommends "${required_packages[@]}"
 
     - name: Install optional fast-linker packages (best-effort)
       if: runner.os == 'Linux'
@@ -143,8 +165,27 @@ runs:
           exit 0
         fi
 
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends "${optional_packages[@]}"
+        # Keep this best-effort optimization independent of unrelated
+        # third-party repositories too. Otherwise a Microsoft/Google outage can
+        # silently remove the fast linker and make CI timing nondeterministic.
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+          ubuntu_sources=sources.list.d/ubuntu.sources
+        elif [ -f /etc/apt/sources.list ]; then
+          ubuntu_sources=sources.list
+        else
+          echo "::warning::canonical Ubuntu apt sources are unavailable"
+          exit 1
+        fi
+        sudo apt-get update \
+          -o "Dir::Etc::sourcelist=${ubuntu_sources}" \
+          -o "Dir::Etc::sourceparts=-" \
+          -o "APT::Get::List-Cleanup=0" \
+          -o "Acquire::Retries=3"
+        sudo apt-get \
+          -o "Dir::Etc::sourcelist=${ubuntu_sources}" \
+          -o "Dir::Etc::sourceparts=-" \
+          -o "Acquire::Retries=3" \
+          install -y --no-install-recommends "${optional_packages[@]}"
 
     - uses: ./.github/actions/setup-fast-linker
       with:
