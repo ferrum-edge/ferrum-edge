@@ -155,11 +155,70 @@ async fn admin_post(base_url: &str, path: &str, token: &str, body: &Value) -> (u
     (status, body)
 }
 
+async fn admin_put(base_url: &str, path: &str, token: &str, body: &Value) -> (u16, Value) {
+    let client = reqwest::Client::new();
+    let resp = client
+        .put(format!("{}{}", base_url, path))
+        .header("authorization", format!("Bearer {}", token))
+        .json(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(json!({}));
+    (status, body)
+}
+
+async fn admin_delete(base_url: &str, path: &str, token: &str) -> (u16, Value) {
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(format!("{}{}", base_url, path))
+        .header("authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(json!({}));
+    (status, body)
+}
+
 fn err_string(body: &Value) -> String {
     body.get("error")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+fn batch_err_string(body: &Value) -> String {
+    let errors = body
+        .get("validation_errors")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let joined = errors
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if joined.is_empty() {
+        err_string(body)
+    } else {
+        joined
+    }
+}
+
+fn assert_sni_buffering_rejection(status: u16, body: &Value, plugin_id: &str) {
+    assert_eq!(
+        status, 400,
+        "SNI + effective buffering must reject: {body:?}"
+    );
+    let err = err_string(body);
+    assert!(
+        err.contains("request-body-buffering")
+            && err.contains("backend TLS SNI")
+            && err.contains(plugin_id),
+        "rejection must name the buffering plugin; got: {err}"
+    );
 }
 
 fn plain_upstream(id: &str) -> Value {
@@ -202,6 +261,22 @@ fn global_mesh_route_dispatch(id: &str, destination_upstream: &str) -> Value {
         "id": id,
         "plugin_name": "mesh_route_dispatch",
         "scope": "global",
+        "enabled": true,
+        "config": {
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": destination_upstream},
+            }],
+        },
+    })
+}
+
+fn proxy_mesh_route_dispatch(id: &str, proxy_id: &str, destination_upstream: &str) -> Value {
+    json!({
+        "id": id,
+        "plugin_name": "mesh_route_dispatch",
+        "scope": "proxy",
+        "proxy_id": proxy_id,
         "enabled": true,
         "config": {
             "rules": [{
@@ -372,21 +447,7 @@ async fn batch_import_rejects_sni_route_override_with_associated_buffering_plugi
         status, 400,
         "batch must fail closed on SNI route override + buffering: {body:?}"
     );
-    let errors = body
-        .get("validation_errors")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let joined = errors
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join("; ");
-    let err = if joined.is_empty() {
-        err_string(&body)
-    } else {
-        joined
-    };
+    let err = batch_err_string(&body);
     assert!(
         err.contains("request-body-buffering")
             && err.contains("backend TLS SNI")
@@ -405,8 +466,13 @@ async fn upstream_reverse_write_rejects_sni_when_reached_only_via_route_override
     let (status, body) =
         admin_post(&base_url, "/upstreams", &token, &plain_upstream("plain-up")).await;
     assert_eq!(status, 201, "plain default upstream seed failed: {body:?}");
-    let (status, body) =
-        admin_post(&base_url, "/upstreams", &token, &plain_upstream("override-up")).await;
+    let (status, body) = admin_post(
+        &base_url,
+        "/upstreams",
+        &token,
+        &plain_upstream("override-up"),
+    )
+    .await;
     assert_eq!(status, 201, "plain override upstream seed failed: {body:?}");
 
     let batch = json!({
@@ -458,4 +524,483 @@ async fn upstream_reverse_write_rejects_sni_when_reached_only_via_route_override
             && err.contains("grpc-web-1"),
         "upstream reverse-write rejection must name the buffering plugin; got: {err}"
     );
+}
+
+#[tokio::test]
+async fn mesh_route_dispatch_scope_change_to_global_rejects_sni_with_buffering() {
+    // Finding 1: changing an attached local mesh_route_dispatch to Global must
+    // compute shadowing from the post-write candidate set. Consulting the stale
+    // pre-write DB row would skip the attached proxy and admit an outage.
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    seed_plain_and_sni_upstreams(&base_url, &token).await;
+
+    let batch = json!({
+        "proxies": [
+            https_proxy_with_plugins("p-sni", "plain-up", &["grpc-web-1", "mrd-local"])
+        ],
+        "plugin_configs": [
+            {
+                "id": "grpc-web-1",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "p-sni",
+                "enabled": true,
+                "config": {},
+            },
+            // Same-upstream override: no SNI conflict while local.
+            proxy_mesh_route_dispatch("mrd-local", "p-sni", "plain-up"),
+        ],
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 201, "proxy + local MRD seed failed: {body:?}");
+
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/mrd-local",
+        &token,
+        &global_mesh_route_dispatch("mrd-local", "sni-up"),
+    )
+    .await;
+    assert_sni_buffering_rejection(status, &body, "grpc-web-1");
+}
+
+#[tokio::test]
+async fn batch_disable_local_mrd_rejects_unshadowed_global_sni_override() {
+    // Finding 2: disabling an attached local mesh_route_dispatch unshadows a
+    // global SNI override; batch must screen even when batch_introduces_mrd
+    // would be false.
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    seed_plain_and_sni_upstreams(&base_url, &token).await;
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/plugins/config",
+        &token,
+        &global_mesh_route_dispatch("mrd-global", "sni-up"),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "global SNI override with no proxies yet must admit: {body:?}"
+    );
+
+    let batch = json!({
+        "proxies": [
+            https_proxy_with_plugins("p-sni", "plain-up", &["grpc-web-1", "mrd-local"])
+        ],
+        "plugin_configs": [
+            {
+                "id": "grpc-web-1",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "p-sni",
+                "enabled": true,
+                "config": {},
+            },
+            // Local same-name shadow keeps the global SNI override inert.
+            proxy_mesh_route_dispatch("mrd-local", "p-sni", "plain-up"),
+        ],
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(
+        status, 201,
+        "local MRD shadow must admit under buffering: {body:?}"
+    );
+
+    let disable = json!({
+        "plugin_configs": [{
+            "id": "mrd-local",
+            "plugin_name": "mesh_route_dispatch",
+            "scope": "proxy",
+            "proxy_id": "p-sni",
+            "enabled": false,
+            "config": {
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"upstream_id": "plain-up"},
+                }],
+            },
+        }],
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &disable).await;
+    assert_eq!(
+        status, 400,
+        "batch disable that unshadows global SNI+buffering must reject: {body:?}"
+    );
+    let err = batch_err_string(&body);
+    assert!(
+        err.contains("request-body-buffering")
+            && err.contains("backend TLS SNI")
+            && err.contains("grpc-web-1"),
+        "batch unshadow rejection must name buffering plugin; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn batch_buffering_mutation_rejects_existing_sni_route_override() {
+    // Finding 2: updating an effective buffering plugin can make an existing
+    // SNI route override undispatchable even when no MRD is in the batch.
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    seed_plain_and_sni_upstreams(&base_url, &token).await;
+
+    let batch = json!({
+        "proxies": [
+            https_proxy_with_plugins("p-sni", "plain-up", &["local-compression"])
+        ],
+        "plugin_configs": [
+            {
+                "id": "local-compression",
+                "plugin_name": "compression",
+                "scope": "proxy",
+                "proxy_id": "p-sni",
+                "enabled": true,
+                // Non-buffering initially.
+                "config": {},
+            },
+            global_mesh_route_dispatch("mrd-sni", "sni-up"),
+        ],
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(
+        status, 201,
+        "SNI override with non-buffering compression must admit: {body:?}"
+    );
+
+    let enable_buffering = json!({
+        "plugin_configs": [{
+            "id": "local-compression",
+            "plugin_name": "compression",
+            "scope": "proxy",
+            "proxy_id": "p-sni",
+            "enabled": true,
+            "config": {
+                "decompress_request": true,
+                "max_decompressed_request_size": 1024,
+            },
+        }],
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &enable_buffering).await;
+    assert_eq!(
+        status, 400,
+        "batch buffering mutation against SNI route override must reject: {body:?}"
+    );
+    let err = batch_err_string(&body);
+    assert!(
+        err.contains("request-body-buffering")
+            && err.contains("backend TLS SNI")
+            && err.contains("local-compression"),
+        "batch buffering mutation rejection must name plugin; got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn plugin_delete_local_mrd_rejects_unshadowed_global_sni_override() {
+    // Finding 3: PluginConfig DELETE of an attached local mesh_route_dispatch
+    // must fail closed when it would unshadow a conflicting global override.
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    seed_plain_and_sni_upstreams(&base_url, &token).await;
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/plugins/config",
+        &token,
+        &global_mesh_route_dispatch("mrd-global", "sni-up"),
+    )
+    .await;
+    assert_eq!(status, 201, "global SNI override seed failed: {body:?}");
+
+    let batch = json!({
+        "proxies": [
+            https_proxy_with_plugins("p-sni", "plain-up", &["grpc-web-1", "mrd-local"])
+        ],
+        "plugin_configs": [
+            {
+                "id": "grpc-web-1",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "p-sni",
+                "enabled": true,
+                "config": {},
+            },
+            proxy_mesh_route_dispatch("mrd-local", "p-sni", "plain-up"),
+        ],
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 201, "local shadow seed failed: {body:?}");
+
+    let (status, body) = admin_delete(&base_url, "/plugins/config/mrd-local", &token).await;
+    assert_sni_buffering_rejection(status, &body, "grpc-web-1");
+}
+
+#[tokio::test]
+async fn non_mrd_buffering_plugin_write_rejects_default_upstream_sni() {
+    // Finding 4: a non-MRD buffering plugin write must screen the proxy's
+    // default upstream SNI against the post-write plugin chain.
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    let (status, body) =
+        admin_post(&base_url, "/upstreams", &token, &sni_upstream("sni-up")).await;
+    assert_eq!(status, 201, "SNI upstream seed failed: {body:?}");
+
+    let batch = json!({
+        "proxies": [
+            https_proxy_with_plugins("p-sni", "sni-up", &[])
+        ],
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(status, 201, "SNI default-upstream proxy seed failed: {body:?}");
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/plugins/config",
+        &token,
+        &json!({
+            "id": "global-compression",
+            "plugin_name": "compression",
+            "scope": "global",
+            "enabled": true,
+            "config": {
+                "decompress_request": true,
+                "max_decompressed_request_size": 1024,
+            },
+        }),
+    )
+    .await;
+    assert_sni_buffering_rejection(status, &body, "global-compression");
+}
+
+#[tokio::test]
+async fn non_mrd_buffering_plugin_write_rejects_existing_sni_route_override() {
+    // Finding 4: a non-MRD buffering plugin update must screen existing
+    // local/global route overrides against the post-write plugin chain.
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    seed_plain_and_sni_upstreams(&base_url, &token).await;
+
+    let batch = json!({
+        "proxies": [
+            https_proxy_with_plugins("p-sni", "plain-up", &["mrd-local", "local-compression"])
+        ],
+        "plugin_configs": [
+            proxy_mesh_route_dispatch("mrd-local", "p-sni", "sni-up"),
+            {
+                "id": "local-compression",
+                "plugin_name": "compression",
+                "scope": "proxy",
+                "proxy_id": "p-sni",
+                "enabled": true,
+                "config": {},
+            },
+        ],
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(
+        status, 201,
+        "local SNI override with non-buffering compression must admit: {body:?}"
+    );
+
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/local-compression",
+        &token,
+        &json!({
+            "id": "local-compression",
+            "plugin_name": "compression",
+            "scope": "proxy",
+            "proxy_id": "p-sni",
+            "enabled": true,
+            "config": {
+                "decompress_request": true,
+                "max_decompressed_request_size": 1024,
+            },
+        }),
+    )
+    .await;
+    assert_sni_buffering_rejection(status, &body, "local-compression");
+}
+
+#[tokio::test]
+async fn global_buffering_plugin_write_rejects_existing_sni_route_override() {
+    // Finding 4: global non-MRD buffering must not early-return; screen
+    // existing route overrides under the post-write chain.
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    seed_plain_and_sni_upstreams(&base_url, &token).await;
+
+    let batch = json!({
+        "proxies": [
+            https_proxy_with_plugins("p-sni", "plain-up", &[])
+        ],
+        "plugin_configs": [
+            global_mesh_route_dispatch("mrd-sni", "sni-up"),
+        ],
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(
+        status, 201,
+        "global SNI override without buffering must admit: {body:?}"
+    );
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/plugins/config",
+        &token,
+        &json!({
+            "id": "global-compression",
+            "plugin_name": "compression",
+            "scope": "global",
+            "enabled": true,
+            "config": {
+                "decompress_request": true,
+                "max_decompressed_request_size": 1024,
+            },
+        }),
+    )
+    .await;
+    assert_sni_buffering_rejection(status, &body, "global-compression");
+}
+
+#[tokio::test]
+async fn api_spec_import_rejects_sni_route_override_with_buffering_plugin() {
+    // Finding 5: API-spec import must fail closed on route-override SNI +
+    // buffering (no redundant fixture bulk — one POST).
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    let (status, body) =
+        admin_post(&base_url, "/upstreams", &token, &sni_upstream("sni-up")).await;
+    assert_eq!(status, 201, "hand-managed SNI upstream seed failed: {body:?}");
+
+    let spec = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "SNI route override admission", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": "p-sni",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": 8443,
+            "strip_listen_path": true,
+            "upstream_id": "plain-up",
+            "plugins": [
+                {"plugin_config_id": "grpc-web-1"},
+                {"plugin_config_id": "mrd-sni"},
+            ],
+        },
+        "x-ferrum-upstream": {
+            "id": "plain-up",
+            "name": "plain-up",
+            "targets": [{"host": "127.0.0.1", "port": 8080, "weight": 100}],
+            "algorithm": "round_robin",
+        },
+        "x-ferrum-plugins": [
+            {
+                "id": "grpc-web-1",
+                "plugin_name": "grpc_web",
+                "config": {},
+            },
+            {
+                "id": "mrd-sni",
+                "plugin_name": "mesh_route_dispatch",
+                "config": {
+                    "rules": [{
+                        "match": {"methods": ["GET"]},
+                        "destination": {"upstream_id": "sni-up"},
+                    }],
+                },
+            },
+        ],
+    });
+    let (status, body) = admin_post(&base_url, "/api-specs", &token, &spec).await;
+    assert_eq!(
+        status, 422,
+        "API-spec SNI route override + buffering must reject: {body:?}"
+    );
+    let joined = body
+        .get("failures")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|failure| failure.get("errors"))
+        .filter_map(|errors| errors.as_array())
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        joined.contains("request-body-buffering")
+            && joined.contains("backend TLS SNI")
+            && joined.contains("grpc-web-1"),
+        "API-spec rejection must name buffering plugin; got: {joined} / {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_reverse_write_rejects_buffering_attach_with_sni_route_override() {
+    // Finding 5: Proxy reverse-write must reject attaching a buffering plugin
+    // when an applicable route override already lands on SNI.
+    let tc = TestConfig::default();
+    let (state, _tmp) = build_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_admin(state).await;
+    let token = make_token(&tc);
+
+    seed_plain_and_sni_upstreams(&base_url, &token).await;
+
+    let batch = json!({
+        "proxies": [
+            https_proxy_with_plugins("p-sni", "plain-up", &[])
+        ],
+        "plugin_configs": [
+            global_mesh_route_dispatch("mrd-sni", "sni-up"),
+            {
+                "id": "grpc-web-1",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "p-sni",
+                "enabled": true,
+                "config": {},
+            },
+        ],
+    });
+    let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
+    assert_eq!(
+        status, 201,
+        "SNI override with staged (unattached) buffering must admit: {body:?}"
+    );
+
+    let (status, body) = admin_put(
+        &base_url,
+        "/proxies/p-sni",
+        &token,
+        &https_proxy_with_plugins("p-sni", "plain-up", &["grpc-web-1"]),
+    )
+    .await;
+    assert_sni_buffering_rejection(status, &body, "grpc-web-1");
 }

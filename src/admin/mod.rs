@@ -6668,37 +6668,56 @@ async fn handle_batch_create(
     }
 
     // Backend-TLS-SNI / direct-H2 admission for mesh_route_dispatch route
-    // overrides (issue #3576). Build the post-batch plugin view once, then
-    // screen every batch proxy plus existing proxies that a new global /
-    // attached override would reach.
-    let batch_introduces_mrd = batch
-        .plugin_configs
-        .iter()
-        .any(|pc| pc.enabled && pc.plugin_name == "mesh_route_dispatch");
-    if !batch.proxies.is_empty() || batch_introduces_mrd {
+    // overrides and default-upstream SNI under post-batch plugin mutations
+    // (issue #3576). Screen the exact post-batch graph for every relevant
+    // plugin mutation — including disable / rename / scope-change that
+    // unshadows globals, and buffering-plugin updates — not only batches
+    // that introduce an enabled mesh_route_dispatch.
+    let batch_mutates_plugins = !batch.plugin_configs.is_empty();
+    if !batch.proxies.is_empty() || batch_mutates_plugins {
         match crud::load_namespace_plugin_configs(db.as_ref(), namespace).await {
-            Ok(mut buffering_plugins) => {
+            Ok(pre_plugins) => {
+                let mut post_plugins = pre_plugins.clone();
                 for pc in &batch.plugin_configs {
-                    if let Some(existing) = buffering_plugins
+                    if let Some(existing) = post_plugins
                         .iter_mut()
                         .find(|p| p.namespace == pc.namespace && p.id == pc.id)
                     {
                         *existing = pc.clone();
                     } else {
-                        buffering_plugins.push(pc.clone());
+                        post_plugins.push(pc.clone());
                     }
                 }
                 let mut screened_proxy_ids: std::collections::HashSet<&str> =
                     std::collections::HashSet::new();
                 for proxy in &batch.proxies {
                     screened_proxy_ids.insert(proxy.id.as_str());
+                    if let Err(err) = crud::validate_proxy_default_upstream_sni_admission(
+                        db.as_ref(),
+                        namespace,
+                        proxy,
+                        &batch_upstreams,
+                        &post_plugins,
+                        &mut validation_errors,
+                    )
+                    .await
+                    {
+                        validation_errors.push(format!(
+                            "Proxy '{}' default-upstream SNI admission check failed: {}",
+                            proxy.id,
+                            redacted_persistence_error_message(
+                                "batch_default_upstream_sni_admission_check",
+                                &err,
+                            )
+                        ));
+                    }
                     if let Err(err) = crud::validate_proxy_route_override_sni_admission(
                         db.as_ref(),
                         namespace,
                         proxy,
                         &batch_upstreams,
                         &batch_plugin_configs,
-                        &buffering_plugins,
+                        &post_plugins,
                         &mut validation_errors,
                     )
                     .await
@@ -6713,7 +6732,7 @@ async fn handle_batch_create(
                         ));
                     }
                 }
-                if batch_introduces_mrd {
+                if batch_mutates_plugins {
                     let mut offset = 0_i64;
                     const PAGE_SIZE: i64 = 1_000;
                     loop {
@@ -6738,14 +6757,58 @@ async fn handle_batch_create(
                             if screened_proxy_ids.contains(proxy.id.as_str()) {
                                 continue;
                             }
+                            let affected = batch.plugin_configs.iter().any(|pc| {
+                                let attaches = proxy
+                                    .plugins
+                                    .iter()
+                                    .any(|assoc| assoc.plugin_config_id == pc.id);
+                                match pc.scope {
+                                    crate::config::types::PluginScope::Proxy
+                                    | crate::config::types::PluginScope::ProxyGroup => attaches,
+                                    crate::config::types::PluginScope::Global => true,
+                                }
+                            });
+                            if !affected {
+                                continue;
+                            }
+                            // Diff pre vs post so pre-existing unrelated
+                            // conflicts on this proxy do not false-reject.
+                            // Pre-route-override screening must not consult
+                            // batch payload plugins (those are the post view).
+                            let empty_payload_plugins: std::collections::HashMap<
+                                &str,
+                                &PluginConfig,
+                            > = std::collections::HashMap::new();
+                            let mut pre_errors = Vec::new();
+                            let mut post_errors = Vec::new();
+                            if let Err(err) = crud::validate_proxy_default_upstream_sni_admission(
+                                db.as_ref(),
+                                namespace,
+                                proxy,
+                                &batch_upstreams,
+                                &pre_plugins,
+                                &mut pre_errors,
+                            )
+                            .await
+                            {
+                                validation_errors.push(format!(
+                                    "Proxy '{}' default-upstream SNI admission check failed: {}",
+                                    proxy.id,
+                                    redacted_persistence_error_message(
+                                        "batch_default_upstream_sni_admission_check",
+                                        &err,
+                                    )
+                                ));
+                                continue;
+                            }
                             if let Err(err) = crud::validate_proxy_route_override_sni_admission(
                                 db.as_ref(),
                                 namespace,
                                 proxy,
                                 &batch_upstreams,
-                                &batch_plugin_configs,
-                                &buffering_plugins,
-                                &mut validation_errors,
+                                &empty_payload_plugins,
+                                &pre_plugins,
+                                &mut pre_errors,
                             )
                             .await
                             {
@@ -6757,6 +6820,53 @@ async fn handle_batch_create(
                                         &err,
                                     )
                                 ));
+                                continue;
+                            }
+                            if let Err(err) = crud::validate_proxy_default_upstream_sni_admission(
+                                db.as_ref(),
+                                namespace,
+                                proxy,
+                                &batch_upstreams,
+                                &post_plugins,
+                                &mut post_errors,
+                            )
+                            .await
+                            {
+                                validation_errors.push(format!(
+                                    "Proxy '{}' default-upstream SNI admission check failed: {}",
+                                    proxy.id,
+                                    redacted_persistence_error_message(
+                                        "batch_default_upstream_sni_admission_check",
+                                        &err,
+                                    )
+                                ));
+                                continue;
+                            }
+                            if let Err(err) = crud::validate_proxy_route_override_sni_admission(
+                                db.as_ref(),
+                                namespace,
+                                proxy,
+                                &batch_upstreams,
+                                &batch_plugin_configs,
+                                &post_plugins,
+                                &mut post_errors,
+                            )
+                            .await
+                            {
+                                validation_errors.push(format!(
+                                    "Proxy '{}' route-override SNI admission check failed: {}",
+                                    proxy.id,
+                                    redacted_persistence_error_message(
+                                        "batch_route_override_sni_admission_check",
+                                        &err,
+                                    )
+                                ));
+                                continue;
+                            }
+                            for error in post_errors {
+                                if !pre_errors.contains(&error) {
+                                    validation_errors.push(error);
+                                }
                             }
                         }
                         if items_len == 0 {
@@ -6782,9 +6892,8 @@ async fn handle_batch_create(
             Err(crud::AfterValidateError::Conflict(msgs)) => {
                 validation_errors.extend(msgs);
             }
-            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
-                "Batch route-override SNI admission plugin load failed".to_string(),
-            ),
+            Err(crud::AfterValidateError::Response(_)) => validation_errors
+                .push("Batch route-override SNI admission plugin load failed".to_string()),
         }
     }
 

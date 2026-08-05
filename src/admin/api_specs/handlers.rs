@@ -2125,13 +2125,17 @@ async fn validate_bundle(
     // Proxy / batch path with bundle-first upstream and plugin resolution.
     if failures.is_empty() {
         let proxy = &bundle.proxy;
-        let mut payload_upstreams: std::collections::HashMap<&str, &crate::config::types::Upstream> =
-            std::collections::HashMap::new();
+        let mut payload_upstreams: std::collections::HashMap<
+            &str,
+            &crate::config::types::Upstream,
+        > = std::collections::HashMap::new();
         if let Some(ref upstream) = bundle.upstream {
             payload_upstreams.insert(upstream.id.as_str(), upstream);
         }
-        let mut payload_plugins: std::collections::HashMap<&str, &crate::config::types::PluginConfig> =
-            std::collections::HashMap::new();
+        let mut payload_plugins: std::collections::HashMap<
+            &str,
+            &crate::config::types::PluginConfig,
+        > = std::collections::HashMap::new();
         for pc in &bundle.plugins {
             payload_plugins.insert(pc.id.as_str(), pc);
         }

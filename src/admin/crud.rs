@@ -2450,177 +2450,240 @@ pub(crate) async fn load_namespace_plugin_configs(
 
 /// Exact post-write plugin-config view for a candidate create/update: the
 /// namespace's persisted plugins with `candidate` replacing an existing id or
-/// appended when new. Backend-TLS-SNI / direct-H2 admission on
-/// `mesh_route_dispatch` plugin writes must see associated buffering plugins
+/// appended when new. Backend-TLS-SNI / direct-H2 admission on plugin writes
+/// must see associated buffering plugins and scope/name/enabled transitions
 /// after the write, not an empty list or a stale GatewayConfig cache.
-async fn load_candidate_plugin_configs_for_write(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
+fn overlay_candidate_plugin_config(
+    plugins: &[PluginConfig],
     candidate: &PluginConfig,
-) -> Result<Vec<PluginConfig>, AfterValidateError> {
-    let mut plugins = load_namespace_plugin_configs(db, namespace).await?;
-    if let Some(existing) = plugins
+) -> Vec<PluginConfig> {
+    let mut out = plugins.to_vec();
+    if let Some(existing) = out
         .iter_mut()
         .find(|plugin| plugin.namespace == candidate.namespace && plugin.id == candidate.id)
     {
         *existing = candidate.clone();
     } else {
-        plugins.push(candidate.clone());
+        out.push(candidate.clone());
     }
-    Ok(plugins)
+    out
 }
 
-/// Reject a `mesh_route_dispatch` plugin write whose route-override destination
-/// requires direct-H2 for backend TLS SNI but cannot dispatch under the rule's
-/// effective retry, an associated request-body-buffering plugin,
-/// `pool_enable_http2: false`, or effective `h2UpgradePolicy: DO_NOT_UPGRADE`
-/// (issue #3576).
-pub(crate) async fn validate_mesh_route_dispatch_plugin_sni_direct_h2_admission(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    plugin_config: &PluginConfig,
-) -> Result<Vec<String>, AfterValidateError> {
-    if !plugin_config.enabled || plugin_config.plugin_name != "mesh_route_dispatch" {
-        // Disabling (or renaming away from `mesh_route_dispatch`) a proxy /
-        // proxy_group instance that the proxy attaches stops it shadowing
-        // global `mesh_route_dispatch` plugins. Re-check newly-unshadowed
-        // globals for SNI / direct-H2 conflicts on attached proxies.
-        if matches!(
-            plugin_config.scope,
-            PluginScope::Proxy | PluginScope::ProxyGroup
-        ) {
-            let plugin_configs =
-                load_candidate_plugin_configs_for_write(db, namespace, plugin_config).await?;
-            return validate_unshadowed_global_sni_admission_for_plugin(
-                db,
-                namespace,
-                plugin_config,
-                &plugin_configs,
-            )
-            .await;
-        }
-        return Ok(Vec::new());
-    }
-    let dispatch = match MeshRouteDispatchConfig::from_value(&plugin_config.config) {
-        Ok(config) => config,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let override_rules: Vec<_> = dispatch
-        .rules
+/// Exact post-delete plugin-config view: namespace plugins with `deleted_id`
+/// removed.
+fn plugin_configs_without_id(plugins: &[PluginConfig], deleted_id: &str) -> Vec<PluginConfig> {
+    plugins
         .iter()
-        .filter(|rule| rule.redirect.is_none() && rule.destination.upstream_id.is_some())
-        .collect();
-    if override_rules.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let plugin_configs =
-        load_candidate_plugin_configs_for_write(db, namespace, plugin_config).await?;
-
-    let mut errors = Vec::new();
-    match plugin_config.scope {
-        PluginScope::Proxy => {
-            // A proxy-scoped instance only runs when the named proxy attaches
-            // this config id — inert/staged configs must not trigger admission.
-            if let Some(proxy_id) = plugin_config.proxy_id.as_deref()
-                && let Some(proxy) = db
-                    .get_proxy(namespace, proxy_id)
-                    .await
-                    .map_err(AfterValidateError::Db)?
-                && proxy
-                    .plugins
-                    .iter()
-                    .any(|assoc| assoc.plugin_config_id == plugin_config.id)
-            {
-                evaluate_mesh_route_dispatch_sni_admission_for_proxy(
-                    db,
-                    namespace,
-                    &proxy,
-                    &override_rules,
-                    &plugin_configs,
-                    &mut errors,
-                )
-                .await
-                .map_err(AfterValidateError::Db)?;
-            }
-        }
-        PluginScope::Global | PluginScope::ProxyGroup => {
-            let mut offset = 0_i64;
-            const PAGE_SIZE: i64 = 1_000;
-            loop {
-                let page = db
-                    .list_proxies_paginated(namespace, PAGE_SIZE, offset)
-                    .await
-                    .map_err(AfterValidateError::Db)?;
-                let items_len = page.items.len() as i64;
-                for proxy in &page.items {
-                    let applies = if plugin_config.scope == PluginScope::Global {
-                        !proxy_shadows_global_mesh_route_dispatch(db, namespace, proxy)
-                            .await
-                            .map_err(AfterValidateError::Db)?
-                    } else {
-                        proxy
-                            .plugins
-                            .iter()
-                            .any(|assoc| assoc.plugin_config_id == plugin_config.id)
-                    };
-                    if applies {
-                        evaluate_mesh_route_dispatch_sni_admission_for_proxy(
-                            db,
-                            namespace,
-                            proxy,
-                            &override_rules,
-                            &plugin_configs,
-                            &mut errors,
-                        )
-                        .await
-                        .map_err(AfterValidateError::Db)?;
-                    }
-                }
-                if items_len == 0 {
-                    break;
-                }
-                offset += items_len;
-                if offset >= page.total {
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(errors)
+        .filter(|plugin| plugin.id != deleted_id)
+        .cloned()
+        .collect()
 }
 
-/// Re-validate SNI / direct-H2 conflicts that a proxy/proxy_group
-/// `mesh_route_dispatch` write unshadows by ceasing to be an enabled
-/// `mesh_route_dispatch` (disabled or renamed).
-async fn validate_unshadowed_global_sni_admission_for_plugin(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    plugin_config: &PluginConfig,
-    plugin_configs: &[PluginConfig],
-) -> Result<Vec<String>, AfterValidateError> {
-    let mut global_dispatch_configs: Vec<MeshRouteDispatchConfig> = Vec::new();
-    for plugin in plugin_configs {
-        if plugin.scope == PluginScope::Global
-            && plugin.enabled
-            && plugin.plugin_name == "mesh_route_dispatch"
-            && let Ok(dispatch) = MeshRouteDispatchConfig::from_value(&plugin.config)
-        {
-            global_dispatch_configs.push(dispatch);
+/// Whether an attached plugin config is an enabled local (`proxy` /
+/// `proxy_group`) `mesh_route_dispatch` that PluginCache would merge onto
+/// `proxy` (and thereby shadow same-named globals).
+fn local_mesh_route_dispatch_applies(proxy: &Proxy, plugin: &PluginConfig) -> bool {
+    if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+        return false;
+    }
+    match plugin.scope {
+        PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
+        PluginScope::ProxyGroup => plugin.proxy_id.is_none(),
+        PluginScope::Global => false,
+    }
+}
+
+/// Enabled `mesh_route_dispatch` plugins that apply to `proxy` under the
+/// candidate plugin set: attached locals first; otherwise non-shadowed globals.
+fn applicable_mesh_route_dispatch_from_configs<'a>(
+    proxy: &Proxy,
+    plugin_configs: &'a [PluginConfig],
+) -> Vec<&'a PluginConfig> {
+    let mut locals: Vec<&PluginConfig> = Vec::new();
+    let mut seen: HashSet<&'a str> = HashSet::new();
+    for assoc in &proxy.plugins {
+        let Some(plugin) = plugin_configs.iter().find(|plugin| {
+            plugin.namespace == proxy.namespace && plugin.id == assoc.plugin_config_id
+        }) else {
+            continue;
+        };
+        if local_mesh_route_dispatch_applies(proxy, plugin) && seen.insert(plugin.id.as_str()) {
+            locals.push(plugin);
         }
     }
-    let global_override_rules: Vec<&crate::plugins::mesh_route_dispatch::RouteRule> =
-        global_dispatch_configs
-            .iter()
-            .flat_map(|dispatch| dispatch.rules.iter())
-            .filter(|rule| rule.redirect.is_none() && rule.destination.upstream_id.is_some())
-            .collect();
-    if global_override_rules.is_empty() {
-        return Ok(Vec::new());
+    if !locals.is_empty() {
+        return locals;
+    }
+    plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.scope == PluginScope::Global
+                && plugin.namespace == proxy.namespace
+                && plugin.enabled
+                && plugin.plugin_name == "mesh_route_dispatch"
+        })
+        .collect()
+}
+
+/// Whether a same-named local instance shadows `plugin_name` on `proxy` under
+/// the candidate plugin set (PluginCache merge rule for buffering globals).
+fn proxy_shadows_global_plugin_name_from_configs(
+    proxy: &Proxy,
+    plugin_configs: &[PluginConfig],
+    plugin_name: &str,
+) -> bool {
+    for assoc in &proxy.plugins {
+        let Some(plugin) = plugin_configs.iter().find(|plugin| {
+            plugin.namespace == proxy.namespace && plugin.id == assoc.plugin_config_id
+        }) else {
+            continue;
+        };
+        if !plugin.enabled || plugin.plugin_name != plugin_name {
+            continue;
+        }
+        match plugin.scope {
+            PluginScope::Proxy if plugin.proxy_id.as_deref() == Some(proxy.id.as_str()) => {
+                return true;
+            }
+            PluginScope::ProxyGroup if plugin.proxy_id.is_none() => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Screen one proxy's default upstream and applicable route-override
+/// destinations for backend-TLS-SNI / direct-H2 conflicts under `plugin_configs`.
+async fn screen_proxy_sni_direct_h2_admission(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: &Proxy,
+    plugin_configs: &[PluginConfig],
+    errors: &mut Vec<String>,
+) -> DbResult<()> {
+    if let Some(upstream_id) = proxy.upstream_id.as_deref() {
+        match db.get_upstream(namespace, upstream_id).await? {
+            Some(upstream) => {
+                let admission_proxy = proxy_for_sni_direct_h2_admission(
+                    proxy,
+                    &upstream,
+                    proxy.upstream_subset.as_deref(),
+                    proxy.retry.clone(),
+                );
+                errors.extend(backend_tls_sni_direct_h2_conflict_messages(
+                    &admission_proxy,
+                    Some(&upstream),
+                    plugin_configs,
+                ));
+            }
+            None => {}
+        }
     }
 
-    let mut errors = Vec::new();
+    let mrd_plugins = applicable_mesh_route_dispatch_from_configs(proxy, plugin_configs);
+    let override_dests = collect_sni_admission_route_override_destinations(proxy, mrd_plugins);
+    for override_dest in override_dests {
+        match db.get_upstream(namespace, &override_dest.upstream_id).await? {
+            Some(upstream) => {
+                let admission_proxy = proxy_for_sni_direct_h2_admission(
+                    proxy,
+                    &upstream,
+                    override_dest.selected_subset.as_deref(),
+                    override_dest.effective_retry.clone(),
+                );
+                errors.extend(backend_tls_sni_direct_h2_conflict_messages(
+                    &admission_proxy,
+                    Some(&upstream),
+                    plugin_configs,
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Emit only conflicts present under `post_plugins` that were absent under
+/// `pre_plugins`, so unrelated pre-existing outages do not false-reject an
+/// unaffected plugin mutation.
+async fn screen_proxy_sni_admission_delta(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: &Proxy,
+    pre_plugins: &[PluginConfig],
+    post_plugins: &[PluginConfig],
+    errors: &mut Vec<String>,
+) -> DbResult<()> {
+    let mut pre_errors = Vec::new();
+    let mut post_errors = Vec::new();
+    screen_proxy_sni_direct_h2_admission(db, namespace, proxy, pre_plugins, &mut pre_errors)
+        .await?;
+    screen_proxy_sni_direct_h2_admission(db, namespace, proxy, post_plugins, &mut post_errors)
+        .await?;
+    for error in post_errors {
+        if !pre_errors.contains(&error) {
+            errors.push(error);
+        }
+    }
+    Ok(())
+}
+
+/// Whether a plugin mutation may change `proxy`'s effective plugin chain for
+/// SNI / buffering admission (cold-path candidate filter).
+fn plugin_mutation_may_affect_proxy_sni_admission(
+    proxy: &Proxy,
+    candidate: &PluginConfig,
+    pre_plugins: &[PluginConfig],
+    post_plugins: &[PluginConfig],
+) -> bool {
+    let attaches = proxy
+        .plugins
+        .iter()
+        .any(|assoc| assoc.plugin_config_id == candidate.id);
+    match candidate.scope {
+        PluginScope::Proxy | PluginScope::ProxyGroup => attaches,
+        PluginScope::Global => {
+            // Globals apply wherever they are not same-name locally shadowed.
+            // Include proxies that lose or gain that shadow across the
+            // mutation (pre vs post), and proxies that attach this id (scope
+            // transitions from local → global).
+            if attaches {
+                return true;
+            }
+            let pre_shadowed = proxy_shadows_global_plugin_name_from_configs(
+                proxy,
+                pre_plugins,
+                &candidate.plugin_name,
+            );
+            let post_shadowed = proxy_shadows_global_plugin_name_from_configs(
+                proxy,
+                post_plugins,
+                &candidate.plugin_name,
+            );
+            // Also consider the pre-write name when a rename changes shadowing.
+            let pre_name = pre_plugins
+                .iter()
+                .find(|plugin| {
+                    plugin.namespace == candidate.namespace && plugin.id == candidate.id
+                })
+                .map(|plugin| plugin.plugin_name.as_str());
+            let pre_shadowed_old_name = pre_name.is_some_and(|name| {
+                name != candidate.plugin_name
+                    && proxy_shadows_global_plugin_name_from_configs(proxy, pre_plugins, name)
+            });
+            !pre_shadowed || !post_shadowed || pre_shadowed_old_name
+        }
+    }
+}
+
+async fn collect_proxies_for_plugin_sni_admission(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    candidate: &PluginConfig,
+    pre_plugins: &[PluginConfig],
+    post_plugins: &[PluginConfig],
+) -> Result<Vec<Proxy>, AfterValidateError> {
+    let mut proxies = Vec::new();
     let mut offset = 0_i64;
     const PAGE_SIZE: i64 = 1_000;
     loop {
@@ -2629,35 +2692,15 @@ async fn validate_unshadowed_global_sni_admission_for_plugin(
             .await
             .map_err(AfterValidateError::Db)?;
         let items_len = page.items.len() as i64;
-        for proxy in &page.items {
-            if !proxy
-                .plugins
-                .iter()
-                .any(|assoc| assoc.plugin_config_id == plugin_config.id)
-            {
-                continue;
+        for proxy in page.items {
+            if plugin_mutation_may_affect_proxy_sni_admission(
+                &proxy,
+                candidate,
+                pre_plugins,
+                post_plugins,
+            ) {
+                proxies.push(proxy);
             }
-            if proxy_shadows_global_mesh_route_dispatch_excluding(
-                db,
-                namespace,
-                proxy,
-                &plugin_config.id,
-            )
-            .await
-            .map_err(AfterValidateError::Db)?
-            {
-                continue;
-            }
-            evaluate_mesh_route_dispatch_sni_admission_for_proxy(
-                db,
-                namespace,
-                proxy,
-                &global_override_rules,
-                plugin_configs,
-                &mut errors,
-            )
-            .await
-            .map_err(AfterValidateError::Db)?;
         }
         if items_len == 0 {
             break;
@@ -2667,95 +2710,82 @@ async fn validate_unshadowed_global_sni_admission_for_plugin(
             break;
         }
     }
+    Ok(proxies)
+}
+
+/// Reject a plugin create/update whose post-write effective plugin chain makes
+/// a plain-HTTPS backend-TLS-SNI destination undispatchable on the direct-H2
+/// pool — covering `mesh_route_dispatch` route overrides and default upstreams
+/// under buffering / retry / `pool_enable_http2` / `h2UpgradePolicy` (issue
+/// #3576). Applicability and local-global shadowing are computed from the
+/// exact post-write candidate set, never from stale pre-write DB rows.
+pub(crate) async fn validate_mesh_route_dispatch_plugin_sni_direct_h2_admission(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    plugin_config: &PluginConfig,
+) -> Result<Vec<String>, AfterValidateError> {
+    let pre_plugins = load_namespace_plugin_configs(db, namespace).await?;
+    let post_plugins = overlay_candidate_plugin_config(&pre_plugins, plugin_config);
+    let proxies = collect_proxies_for_plugin_sni_admission(
+        db,
+        namespace,
+        plugin_config,
+        &pre_plugins,
+        &post_plugins,
+    )
+    .await?;
+
+    let mut errors = Vec::new();
+    for proxy in &proxies {
+        screen_proxy_sni_admission_delta(
+            db,
+            namespace,
+            proxy,
+            &pre_plugins,
+            &post_plugins,
+            &mut errors,
+        )
+        .await
+        .map_err(AfterValidateError::Db)?;
+    }
     Ok(errors)
 }
 
-/// Whether `proxy` attaches an enabled, namespace-local `mesh_route_dispatch`
-/// instance whose id is NOT `excluded_id`.
-async fn proxy_shadows_global_mesh_route_dispatch_excluding(
+/// Reject a plugin delete whose post-delete effective plugin chain unshadows
+/// an undispatchable SNI / direct-H2 combination (for example deleting an
+/// attached local `mesh_route_dispatch` that was shadowing a global override,
+/// or deleting a local non-buffering same-name shadow of a global buffering
+/// plugin). Does not weaken mTLS / composition / transaction-log gates.
+pub(crate) async fn validate_plugin_config_delete_sni_direct_h2_admission(
     db: &dyn DatabaseBackend,
     namespace: &str,
-    proxy: &Proxy,
-    excluded_id: &str,
-) -> DbResult<bool> {
-    for assoc in &proxy.plugins {
-        if assoc.plugin_config_id == excluded_id {
-            continue;
-        }
-        if let Some(plugin) = db
-            .get_plugin_config(namespace, &assoc.plugin_config_id)
-            .await?
-            && plugin.enabled
-            && plugin.plugin_name == "mesh_route_dispatch"
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
+    existing: &PluginConfig,
+) -> Result<Vec<String>, AfterValidateError> {
+    let pre_plugins = load_namespace_plugin_configs(db, namespace).await?;
+    let post_plugins = plugin_configs_without_id(&pre_plugins, &existing.id);
+    let proxies = collect_proxies_for_plugin_sni_admission(
+        db,
+        namespace,
+        existing,
+        &pre_plugins,
+        &post_plugins,
+    )
+    .await?;
 
-/// Whether `proxy` attaches its own enabled, namespace-local
-/// `mesh_route_dispatch` instance (shadows same-named globals).
-async fn proxy_shadows_global_mesh_route_dispatch(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    proxy: &Proxy,
-) -> DbResult<bool> {
-    proxy_shadows_global_mesh_route_dispatch_excluding(db, namespace, proxy, "").await
-}
-
-/// Screen one proxy's upstream-overriding `mesh_route_dispatch` rules for
-/// backend-TLS-SNI / direct-H2 conflicts under each rule's effective retry.
-async fn evaluate_mesh_route_dispatch_sni_admission_for_proxy(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    proxy: &Proxy,
-    override_rules: &[&crate::plugins::mesh_route_dispatch::RouteRule],
-    plugin_configs: &[PluginConfig],
-    errors: &mut Vec<String>,
-) -> DbResult<()> {
-    for rule in override_rules {
-        let Some(override_uid) = rule.destination.upstream_id.as_deref() else {
-            continue;
-        };
-        let rule_changes_retry = rule.retry.is_some() || rule.retry_disabled;
-        let same_upstream_untouched =
-            override_uid == proxy.upstream_id.as_deref().unwrap_or("") && !rule_changes_retry;
-        if same_upstream_untouched {
-            // Default-upstream SNI admission already covers this destination.
-            continue;
-        }
-        let effective_retry = if rule.retry.is_some() {
-            rule.retry.clone()
-        } else if rule.retry_disabled {
-            None
-        } else {
-            proxy.retry.clone()
-        };
-        let selected_subset = if override_uid == proxy.upstream_id.as_deref().unwrap_or("") {
-            proxy.upstream_subset.as_deref()
-        } else {
-            None
-        };
-        match db.get_upstream(namespace, override_uid).await {
-            Ok(Some(upstream)) => {
-                let admission_proxy = proxy_for_sni_direct_h2_admission(
-                    proxy,
-                    &upstream,
-                    selected_subset,
-                    effective_retry,
-                );
-                errors.extend(backend_tls_sni_direct_h2_conflict_messages(
-                    &admission_proxy,
-                    Some(&upstream),
-                    plugin_configs,
-                ));
-            }
-            Ok(None) => {}
-            Err(error) => return Err(error),
-        }
+    let mut errors = Vec::new();
+    for proxy in &proxies {
+        screen_proxy_sni_admission_delta(
+            db,
+            namespace,
+            proxy,
+            &pre_plugins,
+            &post_plugins,
+            &mut errors,
+        )
+        .await
+        .map_err(AfterValidateError::Db)?;
     }
-    Ok(())
+    Ok(errors)
 }
 
 /// Enabled namespace-local `mesh_route_dispatch` plugins that apply to `proxy`
@@ -2766,49 +2796,19 @@ async fn applicable_mesh_route_dispatch_plugins_for_sni(
     namespace: &str,
     proxy: &Proxy,
 ) -> DbResult<Vec<PluginConfig>> {
-    let mut plugins: Vec<PluginConfig> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut shadows_global_dispatch = false;
-    for assoc in &proxy.plugins {
-        if let Some(plugin) = db
-            .get_plugin_config(namespace, &assoc.plugin_config_id)
-            .await?
-            && plugin.enabled
-            && plugin.plugin_name == "mesh_route_dispatch"
-            && seen.insert(plugin.id.clone())
-        {
-            shadows_global_dispatch = true;
-            plugins.push(plugin);
+    let plugins = match load_namespace_plugin_configs(db, namespace).await {
+        Ok(plugins) => plugins,
+        Err(AfterValidateError::Db(error)) => return Err(error),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "plugin load for route-override SNI admission failed"
+            ));
         }
-    }
-    if !shadows_global_dispatch {
-        let mut offset = 0_i64;
-        const PAGE_SIZE: i64 = 1_000;
-        loop {
-            let page = db
-                .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
-                .await?;
-            let items_len = page.items.len() as i64;
-            for plugin in page.items {
-                if plugin.scope == PluginScope::Global
-                    && plugin.namespace == namespace
-                    && plugin.enabled
-                    && plugin.plugin_name == "mesh_route_dispatch"
-                    && seen.insert(plugin.id.clone())
-                {
-                    plugins.push(plugin);
-                }
-            }
-            if items_len == 0 {
-                break;
-            }
-            offset += items_len;
-            if offset >= page.total {
-                break;
-            }
-        }
-    }
-    Ok(plugins)
+    };
+    Ok(applicable_mesh_route_dispatch_from_configs(proxy, &plugins)
+        .into_iter()
+        .cloned()
+        .collect())
 }
 
 /// Route-override destinations that feed SNI / direct-H2 admission for a
@@ -2839,60 +2839,49 @@ pub(crate) async fn load_sni_admission_candidate_plugins_for_proxy(
         .map(|a| a.plugin_config_id.as_str())
         .collect();
 
-    let mut candidates: Vec<PluginConfig> = Vec::new();
-    let mut shadows_global = false;
+    let mut resolved: Vec<PluginConfig> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
     for id in &attached_ids {
         let pc = if let Some(pc) = payload_plugins.get(*id) {
             Some((*pc).clone())
         } else {
             db.get_plugin_config(namespace, id).await?
         };
-        if let Some(pc) = pc {
-            if pc.enabled && pc.plugin_name == "mesh_route_dispatch" {
-                shadows_global = true;
-            }
-            candidates.push(pc);
+        if let Some(pc) = pc
+            && seen_ids.insert(pc.id.clone())
+        {
+            resolved.push(pc);
         }
     }
-
-    if !shadows_global {
-        let mut seen_global_ids: HashSet<String> = HashSet::new();
-        for pc in payload_plugins.values() {
-            if pc.scope == PluginScope::Global
-                && pc.namespace == namespace
-                && pc.enabled
-                && pc.plugin_name == "mesh_route_dispatch"
-                && seen_global_ids.insert(pc.id.clone())
-            {
-                candidates.push((*pc).clone());
-            }
-        }
-        let mut offset = 0_i64;
-        const PAGE_SIZE: i64 = 1_000;
-        loop {
-            let page = db
-                .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
-                .await?;
-            let items_len = page.items.len() as i64;
-            for plugin in page.items {
-                if plugin.scope == PluginScope::Global
-                    && plugin.enabled
-                    && plugin.plugin_name == "mesh_route_dispatch"
-                    && seen_global_ids.insert(plugin.id.clone())
-                {
-                    candidates.push(plugin);
-                }
-            }
-            if items_len == 0 {
-                break;
-            }
-            offset += items_len;
-            if offset >= page.total {
-                break;
-            }
+    for pc in payload_plugins.values() {
+        if pc.namespace == namespace && seen_ids.insert(pc.id.clone()) {
+            resolved.push((*pc).clone());
         }
     }
-    Ok(candidates)
+    let mut offset = 0_i64;
+    const PAGE_SIZE: i64 = 1_000;
+    loop {
+        let page = db
+            .list_plugin_configs_paginated(namespace, PAGE_SIZE, offset)
+            .await?;
+        let items_len = page.items.len() as i64;
+        for plugin in page.items {
+            if seen_ids.insert(plugin.id.clone()) {
+                resolved.push(plugin);
+            }
+        }
+        if items_len == 0 {
+            break;
+        }
+        offset += items_len;
+        if offset >= page.total {
+            break;
+        }
+    }
+    Ok(applicable_mesh_route_dispatch_from_configs(proxy, &resolved)
+        .into_iter()
+        .cloned()
+        .collect())
 }
 
 /// Screen one proxy's route-override destinations for backend-TLS-SNI /
@@ -2916,7 +2905,8 @@ pub(crate) async fn validate_proxy_route_override_sni_admission(
         let resolved = if let Some(u) = payload_upstreams.get(override_dest.upstream_id.as_str()) {
             Some((*u).clone())
         } else {
-            db.get_upstream(namespace, &override_dest.upstream_id).await?
+            db.get_upstream(namespace, &override_dest.upstream_id)
+                .await?
         };
         if let Some(upstream) = resolved {
             let admission_proxy = proxy_for_sni_direct_h2_admission(
@@ -2931,6 +2921,40 @@ pub(crate) async fn validate_proxy_route_override_sni_admission(
                 buffering_plugin_configs,
             ));
         }
+    }
+    Ok(())
+}
+
+/// Screen one proxy's default upstream for backend-TLS-SNI / direct-H2
+/// conflicts under a post-mutation plugin set (batch buffering mutations).
+pub(crate) async fn validate_proxy_default_upstream_sni_admission(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    proxy: &Proxy,
+    payload_upstreams: &std::collections::HashMap<&str, &Upstream>,
+    buffering_plugin_configs: &[PluginConfig],
+    validation_errors: &mut Vec<String>,
+) -> DbResult<()> {
+    let Some(upstream_id) = proxy.upstream_id.as_deref() else {
+        return Ok(());
+    };
+    let resolved = if let Some(u) = payload_upstreams.get(upstream_id) {
+        Some((*u).clone())
+    } else {
+        db.get_upstream(namespace, upstream_id).await?
+    };
+    if let Some(upstream) = resolved {
+        let admission_proxy = proxy_for_sni_direct_h2_admission(
+            proxy,
+            &upstream,
+            proxy.upstream_subset.as_deref(),
+            proxy.retry.clone(),
+        );
+        validation_errors.extend(backend_tls_sni_direct_h2_conflict_messages(
+            &admission_proxy,
+            Some(&upstream),
+            buffering_plugin_configs,
+        ));
     }
     Ok(())
 }
@@ -3642,10 +3666,11 @@ impl AdminResource for PluginConfig {
             return Err(AfterValidateError::BadRequest(upstream_errors));
         }
 
-        // Writing/updating a mesh_route_dispatch plugin can introduce a
-        // route-override destination whose backend TLS SNI cannot use
-        // direct-H2 under the effective retry / buffering /
-        // pool_enable_http2 / h2UpgradePolicy posture (issue #3576).
+        // Writing/updating any plugin can change the effective buffering
+        // chain or mesh_route_dispatch applicability for attached /
+        // inheriting proxies. Screen default-upstream and route-override
+        // SNI destinations against the exact post-write candidate plugin
+        // set (issue #3576).
         let sni_errors =
             validate_mesh_route_dispatch_plugin_sni_direct_h2_admission(db, namespace, resource)
                 .await?;
@@ -3707,6 +3732,17 @@ impl AdminResource for PluginConfig {
             )
             .await?;
         }
+
+        // Deleting an attached local mesh_route_dispatch (or a local
+        // same-name non-buffering shadow) can unshadow global rules /
+        // buffering plugins and make an existing SNI destination
+        // undispatchable (issue #3576).
+        let sni_errors =
+            validate_plugin_config_delete_sni_direct_h2_admission(db, namespace, existing).await?;
+        if !sni_errors.is_empty() {
+            return Err(AfterValidateError::BadRequest(sni_errors));
+        }
+
         Ok(())
     }
 }

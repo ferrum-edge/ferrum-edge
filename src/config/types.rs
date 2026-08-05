@@ -3404,9 +3404,9 @@ pub(crate) fn collect_sni_admission_route_override_destinations<'a>(
         if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
             continue;
         }
-        let Ok(dispatch) =
-            crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value(&plugin.config)
-        else {
+        let Ok(dispatch) = crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value(
+            &plugin.config,
+        ) else {
             continue;
         };
         for rule in &dispatch.rules {
