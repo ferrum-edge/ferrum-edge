@@ -2544,45 +2544,39 @@ async fn screen_proxy_sni_direct_h2_admission(
     errors: &mut Vec<String>,
 ) -> DbResult<()> {
     if let Some(upstream_id) = proxy.upstream_id.as_deref() {
-        match db.get_upstream(namespace, upstream_id).await? {
-            Some(upstream) => {
-                let admission_proxy = proxy_for_sni_direct_h2_admission(
-                    proxy,
-                    &upstream,
-                    proxy.upstream_subset.as_deref(),
-                    proxy.retry.clone(),
-                );
-                errors.extend(backend_tls_sni_direct_h2_conflict_messages(
-                    &admission_proxy,
-                    Some(&upstream),
-                    plugin_configs,
-                ));
-            }
-            None => {}
+        if let Some(upstream) = db.get_upstream(namespace, upstream_id).await? {
+            let admission_proxy = proxy_for_sni_direct_h2_admission(
+                proxy,
+                &upstream,
+                proxy.upstream_subset.as_deref(),
+                proxy.retry.clone(),
+            );
+            errors.extend(backend_tls_sni_direct_h2_conflict_messages(
+                &admission_proxy,
+                Some(&upstream),
+                plugin_configs,
+            ));
         }
     }
 
     let mrd_plugins = applicable_mesh_route_dispatch_from_configs(proxy, plugin_configs);
     let override_dests = collect_sni_admission_route_override_destinations(proxy, mrd_plugins);
     for override_dest in override_dests {
-        match db
+        if let Some(upstream) = db
             .get_upstream(namespace, &override_dest.upstream_id)
             .await?
         {
-            Some(upstream) => {
-                let admission_proxy = proxy_for_sni_direct_h2_admission(
-                    proxy,
-                    &upstream,
-                    override_dest.selected_subset.as_deref(),
-                    override_dest.effective_retry.clone(),
-                );
-                errors.extend(backend_tls_sni_direct_h2_conflict_messages(
-                    &admission_proxy,
-                    Some(&upstream),
-                    plugin_configs,
-                ));
-            }
-            None => {}
+            let admission_proxy = proxy_for_sni_direct_h2_admission(
+                proxy,
+                &upstream,
+                override_dest.selected_subset.as_deref(),
+                override_dest.effective_retry.clone(),
+            );
+            errors.extend(backend_tls_sni_direct_h2_conflict_messages(
+                &admission_proxy,
+                Some(&upstream),
+                plugin_configs,
+            ));
         }
     }
     Ok(())
