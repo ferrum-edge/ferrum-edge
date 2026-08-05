@@ -2120,6 +2120,76 @@ async fn validate_bundle(
         }
     }
 
+    // Backend-TLS-SNI / direct-H2 admission for mesh_route_dispatch route
+    // overrides carried by this API-spec bundle (issue #3576). Mirrors the
+    // Proxy / batch path with bundle-first upstream and plugin resolution.
+    if failures.is_empty() {
+        let proxy = &bundle.proxy;
+        let mut payload_upstreams: std::collections::HashMap<&str, &crate::config::types::Upstream> =
+            std::collections::HashMap::new();
+        if let Some(ref upstream) = bundle.upstream {
+            payload_upstreams.insert(upstream.id.as_str(), upstream);
+        }
+        let mut payload_plugins: std::collections::HashMap<&str, &crate::config::types::PluginConfig> =
+            std::collections::HashMap::new();
+        for pc in &bundle.plugins {
+            payload_plugins.insert(pc.id.as_str(), pc);
+        }
+        match crate::admin::crud::load_namespace_plugin_configs(db, namespace).await {
+            Ok(mut buffering_plugins) => {
+                for pc in &bundle.plugins {
+                    if let Some(existing) = buffering_plugins
+                        .iter_mut()
+                        .find(|p| p.namespace == pc.namespace && p.id == pc.id)
+                    {
+                        *existing = pc.clone();
+                    } else {
+                        buffering_plugins.push(pc.clone());
+                    }
+                }
+                let mut sni_errors = Vec::new();
+                if let Err(err) = crate::admin::crud::validate_proxy_route_override_sni_admission(
+                    db,
+                    namespace,
+                    proxy,
+                    &payload_upstreams,
+                    &payload_plugins,
+                    &buffering_plugins,
+                    &mut sni_errors,
+                )
+                .await
+                {
+                    return Err(classify_db_error(err));
+                }
+                if !sni_errors.is_empty() {
+                    failures.push(ValidationFailure {
+                        resource_type: "proxy",
+                        id: proxy.id.clone(),
+                        errors: sni_errors,
+                    });
+                }
+            }
+            Err(crate::admin::crud::AfterValidateError::Db(error)) => {
+                return Err(classify_db_error(error));
+            }
+            Err(crate::admin::crud::AfterValidateError::BadRequest(errors)) => {
+                failures.push(ValidationFailure {
+                    resource_type: "proxy",
+                    id: proxy.id.clone(),
+                    errors,
+                });
+            }
+            Err(crate::admin::crud::AfterValidateError::Conflict(errors)) => {
+                return Err(ApiSpecError::Conflict(errors.join("; ")));
+            }
+            Err(crate::admin::crud::AfterValidateError::Response(_)) => {
+                return Err(ApiSpecError::Internal(
+                    "Route-override SNI admission returned an unexpected response".to_string(),
+                ));
+            }
+        }
+    }
+
     if failures.is_empty() {
         let validation_result = if let Some(put_ctx) = put_ctx.as_ref() {
             crate::admin::crud::validate_plugin_graph_api_spec_replacement_candidate(

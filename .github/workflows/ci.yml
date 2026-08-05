@@ -736,6 +736,7 @@ jobs:
               integration::admin_mesh_runtime_overlay_tests
               integration::admin_mesh_service_graph_tests
               integration::admin_node_waypoint_identities_tests
+              integration::admin_mesh_route_dispatch_sni_admission_tests
               integration::admin_upstream_proxy_sni_admission_tests
               integration::apply_incremental_outcome_tests
               integration::log_schema_integration_tests

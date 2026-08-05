@@ -3368,6 +3368,90 @@ fn sni_scope_conflicts_with_h2_upgrade_policy(
     }
 }
 
+/// A `mesh_route_dispatch` upstream override destination paired with the
+/// effective retry the runtime applies when that rule matches.
+///
+/// Used only by backend-TLS-SNI / direct-H2 admission (not mesh-transport
+/// conflict screening). Same-upstream rules that leave retry untouched are
+/// omitted — the default-upstream SNI gate already covers them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SniAdmissionRouteOverrideDest {
+    /// Override `upstream_id` (`route_override_upstream_id`).
+    pub(crate) upstream_id: String,
+    /// Retry policy in force for requests this rule routes: the rule's own
+    /// `retry`, `None` when the rule disables retry, or the proxy's base retry
+    /// when the rule leaves retry untouched.
+    pub(crate) effective_retry: Option<RetryConfig>,
+    /// Upstream subset the runtime selects for this override. A same-upstream
+    /// rule preserves `proxy.upstream_subset`; a different-upstream rule drops
+    /// it (`apply_route_overrides_inner`).
+    pub(crate) selected_subset: Option<String>,
+}
+
+/// Collect SNI-admission override destinations from already-applicable
+/// `mesh_route_dispatch` plugin configs for `proxy`.
+///
+/// Callers must supply the exact plugins that would run for this proxy
+/// (attached locals plus non-shadowed globals). Redirect rules and
+/// same-upstream rules that leave retry untouched are skipped.
+pub(crate) fn collect_sni_admission_route_override_destinations<'a>(
+    proxy: &Proxy,
+    plugins: impl IntoIterator<Item = &'a PluginConfig>,
+) -> Vec<SniAdmissionRouteOverrideDest> {
+    let default_uid = proxy.upstream_id.as_deref().unwrap_or("");
+    let mut overrides: Vec<SniAdmissionRouteOverrideDest> = Vec::new();
+    for plugin in plugins {
+        if !plugin.enabled || plugin.plugin_name != "mesh_route_dispatch" {
+            continue;
+        }
+        let Ok(dispatch) =
+            crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig::from_value(&plugin.config)
+        else {
+            continue;
+        };
+        for rule in &dispatch.rules {
+            // Redirect answers before any upstream override is applied.
+            if rule.redirect.is_some() {
+                continue;
+            }
+            let Some(override_uid) = rule.destination.upstream_id.as_deref() else {
+                continue;
+            };
+            let rule_changes_retry = rule.retry.is_some() || rule.retry_disabled;
+            // Same-upstream + untouched retry is covered by the default-upstream
+            // SNI gate; still collect when the rule changes retry because the
+            // runtime overwrites `proxy.retry` via `route_override_retry`.
+            if override_uid == default_uid && !rule_changes_retry {
+                continue;
+            }
+            let effective_retry = if rule.retry.is_some() {
+                rule.retry.clone()
+            } else if rule.retry_disabled {
+                None
+            } else {
+                proxy.retry.clone()
+            };
+            let selected_subset = if override_uid == default_uid {
+                proxy.upstream_subset.clone()
+            } else {
+                None
+            };
+            if !overrides.iter().any(|existing| {
+                existing.upstream_id == override_uid
+                    && existing.effective_retry == effective_retry
+                    && existing.selected_subset == selected_subset
+            }) {
+                overrides.push(SniAdmissionRouteOverrideDest {
+                    upstream_id: override_uid.to_string(),
+                    effective_retry,
+                    selected_subset,
+                });
+            }
+        }
+    }
+    overrides
+}
+
 /// Build a throwaway proxy for backend-TLS-SNI / direct-H2 admission against
 /// one exact `(upstream, selected_subset)` destination. Projects the same
 /// dispatch-port / subset HTTP fallback and resolved TLS the runtime uses
@@ -4540,6 +4624,30 @@ impl GatewayConfig {
                 }
             }
 
+            // Route-level upstream overrides (`mesh_route_dispatch`) can land
+            // matched traffic on a different upstream/subset than
+            // `proxy.upstream_id`. Screen each override destination's effective
+            // backend TLS SNI against the rule's effective retry / buffering /
+            // pool_enable_http2 / h2UpgradePolicy posture (issue #3576).
+            for override_dest in self.sni_admission_route_override_destinations(proxy) {
+                if let Some(upstream) = upstreams_by_key
+                    .get(&(proxy.namespace.as_str(), override_dest.upstream_id.as_str()))
+                    .copied()
+                {
+                    let admission_proxy = proxy_for_sni_direct_h2_admission(
+                        proxy,
+                        upstream,
+                        override_dest.selected_subset.as_deref(),
+                        override_dest.effective_retry.clone(),
+                    );
+                    errors.extend(backend_tls_sni_direct_h2_conflict_messages(
+                        &admission_proxy,
+                        Some(upstream),
+                        &self.plugin_configs,
+                    ));
+                }
+            }
+
             // Backend TLS SNI on plain HTTPS requires direct-H2; reject
             // combinations that cannot dispatch (retry / body-buffering /
             // pool_enable_http2=false / effective DO_NOT_UPGRADE), including
@@ -4561,6 +4669,44 @@ impl GatewayConfig {
         } else {
             Err(errors)
         }
+    }
+
+    /// Collect `mesh_route_dispatch` override destinations that feed
+    /// backend-TLS-SNI / direct-H2 admission for `proxy`.
+    ///
+    /// Considers attached proxy/proxy_group associations and non-shadowed
+    /// same-namespace globals (PluginCache removes globals of the same name
+    /// when a local enabled `mesh_route_dispatch` is attached). Each entry
+    /// carries the rule's effective retry and selected subset so
+    /// [`proxy_for_sni_direct_h2_admission`] mirrors runtime dispatch.
+    pub(crate) fn sni_admission_route_override_destinations(
+        &self,
+        proxy: &Proxy,
+    ) -> Vec<SniAdmissionRouteOverrideDest> {
+        let mut applicable: Vec<&PluginConfig> = Vec::new();
+        let mut shadows_global_dispatch = false;
+        for assoc in &proxy.plugins {
+            if let Some(plugin) = self
+                .plugin_configs
+                .iter()
+                .find(|pc| pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id)
+            {
+                if plugin.enabled && plugin.plugin_name == "mesh_route_dispatch" {
+                    shadows_global_dispatch = true;
+                }
+                applicable.push(plugin);
+            }
+        }
+        if !shadows_global_dispatch {
+            for plugin in &self.plugin_configs {
+                // Namespace-local globals only — matches the buffering SNI
+                // screen and admin DB helpers (issue #3576).
+                if plugin.scope == PluginScope::Global && plugin.namespace == proxy.namespace {
+                    applicable.push(plugin);
+                }
+            }
+        }
+        collect_sni_admission_route_override_destinations(proxy, applicable)
     }
 
     /// Validate plugin resource invariants and proxy/plugin associations.

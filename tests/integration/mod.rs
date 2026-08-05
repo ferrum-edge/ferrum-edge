@@ -10,6 +10,7 @@ mod admin_mesh_config_drift_tests;
 mod admin_mesh_egress_scope_tests;
 mod admin_mesh_policy_denies_tests;
 mod admin_mesh_remote_clusters_tests;
+mod admin_mesh_route_dispatch_sni_admission_tests;
 mod admin_mesh_runtime_overlay_tests;
 mod admin_mesh_service_graph_tests;
 mod admin_mesh_slice_drift_tests;

@@ -3402,6 +3402,77 @@ fn backend_tls_sni_per_port_do_not_upgrade_rejects_only_that_port() {
 }
 
 #[test]
+fn backend_tls_sni_route_override_subset_do_not_upgrade_fails_validate() {
+    let plain = make_upstream("plain-upstream");
+    let mut sni_upstream = subset_sni_upstream(
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+            max_retries: Some(1),
+            http1_max_pending_requests: Some(1),
+        },
+        ResolvedSubsetTrafficPolicy {
+            tls: None,
+            passive_health_check: None,
+            h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+            max_retries: Some(3),
+            http1_max_pending_requests: Some(4),
+        },
+    );
+    // Different-upstream route overrides clear the subset, so stamp DO_NOT_UPGRADE
+    // on the top-level inherited fallback the override destination will use.
+    sni_upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+        h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
+        max_retries: Some(2),
+        http1_max_pending_requests: Some(10),
+        ..UpstreamPortOverride::default()
+    });
+
+    let dispatch = PluginConfig {
+        id: "route-dispatch".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "sni-subset-upstream" } }
+            ]
+        }),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("p1".into()),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("plain-upstream".into());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "route-dispatch".into(),
+    }];
+
+    let mut config = empty_config();
+    config.upstreams = vec![plain, sni_upstream];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![dispatch];
+    config.normalize_fields();
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| {
+            msg.contains("h2UpgradePolicy is DO_NOT_UPGRADE")
+                && msg.contains("backend TLS SNI")
+                && msg.contains("direct HTTP/2")
+        }),
+        "route-override destination with SNI + DO_NOT_UPGRADE must reject, got {err:?}"
+    );
+}
+
+#[test]
 fn selected_subset_http_policy_projects_onto_proxy_fallback_for_admission() {
     // Public normalize/projection path: selected-subset HTTP fields overlay the
     // inherited fallback with port > subset > top-level precedence, using
