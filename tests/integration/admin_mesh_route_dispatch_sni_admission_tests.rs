@@ -758,8 +758,7 @@ async fn non_mrd_buffering_plugin_write_rejects_default_upstream_sni() {
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
-    let (status, body) =
-        admin_post(&base_url, "/upstreams", &token, &sni_upstream("sni-up")).await;
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &sni_upstream("sni-up")).await;
     assert_eq!(status, 201, "SNI upstream seed failed: {body:?}");
 
     let batch = json!({
@@ -768,7 +767,10 @@ async fn non_mrd_buffering_plugin_write_rejects_default_upstream_sni() {
         ],
     });
     let (status, body) = admin_post(&base_url, "/batch", &token, &batch).await;
-    assert_eq!(status, 201, "SNI default-upstream proxy seed failed: {body:?}");
+    assert_eq!(
+        status, 201,
+        "SNI default-upstream proxy seed failed: {body:?}"
+    );
 
     let (status, body) = admin_post(
         &base_url,
@@ -1027,9 +1029,11 @@ async fn api_spec_import_rejects_sni_route_override_with_buffering_plugin() {
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
-    let (status, body) =
-        admin_post(&base_url, "/upstreams", &token, &sni_upstream("sni-up")).await;
-    assert_eq!(status, 201, "hand-managed SNI upstream seed failed: {body:?}");
+    let (status, body) = admin_post(&base_url, "/upstreams", &token, &sni_upstream("sni-up")).await;
+    assert_eq!(
+        status, 201,
+        "hand-managed SNI upstream seed failed: {body:?}"
+    );
 
     let spec = json!({
         "openapi": "3.1.0",

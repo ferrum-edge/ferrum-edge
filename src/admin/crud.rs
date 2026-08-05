@@ -2565,7 +2565,10 @@ async fn screen_proxy_sni_direct_h2_admission(
     let mrd_plugins = applicable_mesh_route_dispatch_from_configs(proxy, plugin_configs);
     let override_dests = collect_sni_admission_route_override_destinations(proxy, mrd_plugins);
     for override_dest in override_dests {
-        match db.get_upstream(namespace, &override_dest.upstream_id).await? {
+        match db
+            .get_upstream(namespace, &override_dest.upstream_id)
+            .await?
+        {
             Some(upstream) => {
                 let admission_proxy = proxy_for_sni_direct_h2_admission(
                     proxy,
@@ -2840,10 +2843,12 @@ pub(crate) async fn load_sni_admission_candidate_plugins_for_proxy(
             break;
         }
     }
-    Ok(applicable_mesh_route_dispatch_from_configs(proxy, &resolved)
-        .into_iter()
-        .cloned()
-        .collect())
+    Ok(
+        applicable_mesh_route_dispatch_from_configs(proxy, &resolved)
+            .into_iter()
+            .cloned()
+            .collect(),
+    )
 }
 
 /// Screen one proxy's route-override destinations for backend-TLS-SNI /
