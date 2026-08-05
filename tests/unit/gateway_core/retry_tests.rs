@@ -1716,6 +1716,51 @@ fn test_eager_buffer_body_read_never_reports_a_pre_wire_class() {
     }
 }
 
+#[test]
+fn mesh_hyper_cancellations_are_post_wire_for_method_safe_retries() {
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    let hbone_mapper = proxy_src
+        .split("fn hbone_hyper_error_response(")
+        .nth(1)
+        .expect("HBONE hyper error mapper")
+        .split("enum HyperBodyCollectError")
+        .next()
+        .expect("bounded HBONE hyper error mapper");
+    assert!(
+        hbone_mapper.contains("let error_class = retry::ErrorClass::ProtocolError;"),
+        "HBONE hyper cancellation must remain post-wire because send_request cancellation \
+         can occur after the backend observed non-idempotent requests"
+    );
+    assert!(
+        !hbone_mapper.contains("err.is_canceled()")
+            && !hbone_mapper.contains("ConnectionPoolError"),
+        "HBONE hyper cancellation must not be mapped to pre-wire ConnectionPoolError"
+    );
+
+    let sidecar_mapper = proxy_src
+        .split("Sidecar mesh-mTLS send_request runs on an established mesh transport")
+        .nth(1)
+        .expect("sidecar mesh-mTLS send_request mapper")
+        .split("let status = response.status().as_u16();")
+        .next()
+        .expect("bounded sidecar mesh-mTLS send_request mapper");
+    assert!(
+        sidecar_mapper.contains("let error_class = retry::ErrorClass::ProtocolError;"),
+        "sidecar mesh-mTLS cancellation must remain post-wire before gRPC/non-gRPC response mapping"
+    );
+    assert!(
+        !sidecar_mapper.contains("err.is_canceled()")
+            && !sidecar_mapper.contains("ConnectionPoolError"),
+        "sidecar mesh-mTLS cancellation must not become a pre-wire connection failure"
+    );
+
+    assert!(
+        ferrum_edge::retry::request_reached_wire(ErrorClass::ProtocolError),
+        "ProtocolError must not set connection_error=true, so retry_on_connect_failure \
+         cannot bypass retryable_methods for mesh cancellations"
+    );
+}
+
 /// Issue #2949 — the retry loop's response-streaming decision must not be
 /// attempt-positional.
 ///

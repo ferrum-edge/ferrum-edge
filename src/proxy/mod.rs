@@ -36812,18 +36812,14 @@ fn hbone_hyper_error_response(
     proxy: &Proxy,
     err: hyper::Error,
     resolved_ip: Option<String>,
-    request_body_replayable: bool,
+    _request_body_replayable: bool,
 ) -> retry::BackendResponse {
     error!(proxy_id = %proxy.id, error = %err, "HBONE tunneled HTTP request failed");
-    // A canceled hyper dispatch with an immutable body proves the request was
-    // rejected by the client connection before it reached the peer stream
-    // (the same pooled-GOAWAY boundary used by direct H2 and gRPC). Other H2/H1
-    // errors may be post-wire and remain conservative protocol failures.
-    let error_class = if request_body_replayable && err.is_canceled() {
-        retry::ErrorClass::ConnectionPoolError
-    } else {
-        retry::ErrorClass::ProtocolError
-    };
+    // Once send_request has been handed a tunneled mesh request, hyper
+    // cancellation is not proof that headers or body bytes stayed client-side.
+    // Treat it as post-wire so retry_on_connect_failure cannot bypass
+    // retryable_methods for non-idempotent methods.
+    let error_class = retry::ErrorClass::ProtocolError;
     retry::BackendResponse {
         status_code: 502,
         body: ResponseBody::buffered(Bytes::from_static(
@@ -38941,11 +38937,11 @@ async fn proxy_to_backend_mesh_mtls(
                     None,
                 );
             }
-            let error_class = if request_body_replayable && err.is_canceled() {
-                retry::ErrorClass::ConnectionPoolError
-            } else {
-                retry::ErrorClass::ProtocolError
-            };
+            // Sidecar mesh-mTLS send_request runs on an established mesh transport;
+            // cancellation before response headers is not proof that the backend
+            // never observed the request. Keep it post-wire so connection-failure
+            // retries remain method-safe.
+            let error_class = retry::ErrorClass::ProtocolError;
             return (
                 if is_grpc_flavored {
                     mesh_grpc_unavailable_response(
