@@ -1117,7 +1117,10 @@ async fn api_spec_put_screens_the_exact_post_replacement_plugin_set() {
     let token = make_token(&tc);
 
     let (status, body) = admin_post(&base_url, "/upstreams", &token, &sni_upstream("sni-up")).await;
-    assert_eq!(status, 201, "hand-managed SNI upstream seed failed: {body:?}");
+    assert_eq!(
+        status, 201,
+        "hand-managed SNI upstream seed failed: {body:?}"
+    );
 
     let replacement = json!({
         "openapi": "3.1.0",
