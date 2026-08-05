@@ -3435,7 +3435,10 @@ fn backend_tls_sni_route_override_subset_do_not_upgrade_fails_validate() {
         plugin_name: "mesh_route_dispatch".into(),
         config: serde_json::json!({
             "rules": [
-                { "match": {}, "destination": { "upstream_id": "sni-subset-upstream" } }
+                {
+                    "match": { "methods": ["GET"] },
+                    "destination": { "upstream_id": "sni-subset-upstream" }
+                }
             ]
         }),
         scope: PluginScope::Proxy,

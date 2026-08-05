@@ -64,19 +64,20 @@ fn make_token(config: &TestConfig) -> String {
     .unwrap()
 }
 
-async fn build_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
+async fn build_admin_state(tc: &TestConfig) -> (AdminState, DatabaseStore, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("mrd_sni_admission.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
-    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
-        .await
-        .expect("DB connect must succeed");
+    let store =
+        DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+            .expect("DB connect must succeed");
 
     // Intentionally leave `cached_config` empty: plugin-write SNI admission must
     // load plugin configs from the DB rather than trusting a GatewayConfig cache
     // (or silently treating a missing cache as an empty plugin list).
     let state = AdminState {
-        db: Some(Arc::new(db)),
+        db: Some(Arc::new(store.clone())),
         jwt_manager: make_jwt_manager(tc),
         metrics_auth: Default::default(),
         cached_config: None,
@@ -113,7 +114,7 @@ async fn build_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
             ferrum_edge::admin::api_specs::DefaultExternalDocumentLoader::default(),
         ),
     };
-    (state, tmp)
+    (state, store, tmp)
 }
 
 async fn start_admin(state: AdminState) -> (String, tokio::sync::watch::Sender<bool>) {
@@ -323,7 +324,7 @@ async fn seed_plain_and_sni_upstreams(base_url: &str, token: &str) {
 #[tokio::test]
 async fn mesh_route_dispatch_plugin_write_rejects_sni_override_with_associated_buffering_plugin() {
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
@@ -376,7 +377,7 @@ async fn mesh_route_dispatch_plugin_write_rejects_sni_override_with_associated_b
 async fn mesh_route_dispatch_plugin_write_admits_sni_override_when_local_non_buffering_shadows_global()
  {
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
@@ -441,7 +442,7 @@ async fn mesh_route_dispatch_plugin_write_admits_sni_override_when_local_non_buf
 #[tokio::test]
 async fn batch_import_rejects_sni_route_override_with_associated_buffering_plugin() {
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
@@ -484,7 +485,7 @@ async fn batch_import_rejects_sni_route_override_with_associated_buffering_plugi
 #[tokio::test]
 async fn upstream_reverse_write_rejects_sni_when_reached_only_via_route_override() {
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
@@ -557,7 +558,7 @@ async fn mesh_route_dispatch_scope_change_to_global_rejects_sni_with_buffering()
     // compute shadowing from the post-write candidate set. Consulting the stale
     // pre-write DB row would skip the attached proxy and admit an outage.
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
@@ -599,7 +600,7 @@ async fn batch_disable_local_mrd_rejects_unshadowed_global_sni_override() {
     // global SNI override; batch must screen even when batch_introduces_mrd
     // would be false.
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
@@ -674,7 +675,7 @@ async fn batch_buffering_mutation_rejects_existing_sni_route_override() {
     // Finding 2: updating an effective buffering plugin can make an existing
     // SNI route override undispatchable even when no MRD is in the batch.
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
@@ -735,7 +736,7 @@ async fn plugin_delete_local_mrd_rejects_unshadowed_global_sni_override() {
     // Finding 3: PluginConfig DELETE of an attached local mesh_route_dispatch
     // must fail closed when it would unshadow a conflicting global override.
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
@@ -778,7 +779,7 @@ async fn non_mrd_buffering_plugin_write_rejects_default_upstream_sni() {
     // Finding 4: a non-MRD buffering plugin write must screen the proxy's
     // default upstream SNI against the post-write plugin chain.
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
@@ -820,7 +821,7 @@ async fn non_mrd_buffering_plugin_write_rejects_existing_sni_route_override() {
     // Finding 4: a non-MRD buffering plugin update must screen existing
     // local/global route overrides against the post-write plugin chain.
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
@@ -873,7 +874,7 @@ async fn global_buffering_plugin_write_rejects_existing_sni_route_override() {
     // Finding 4: global non-MRD buffering must not early-return; screen
     // existing route overrides under the post-write chain.
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
@@ -918,7 +919,7 @@ async fn invalid_local_buffering_config_does_not_shadow_global_candidate() {
     // PluginCache, so it cannot shadow a same-named global. Admission must not
     // skip this proxy merely because the broken row is enabled and attached.
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let db = state.db.as_ref().expect("test database").clone();
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
@@ -932,6 +933,18 @@ async fn invalid_local_buffering_config_does_not_shadow_global_candidate() {
     )
     .await;
     assert_eq!(status, 201, "global SNI override seed failed: {body:?}");
+
+    // Respect plugin_configs.proxy_id FK: create the proxy first without the
+    // invalid association, persist the broken local, then attach it.
+    let proxy: Proxy = serde_json::from_value(https_proxy_with_plugins(
+        "p-sni",
+        "plain-up",
+        &[],
+    ))
+    .expect("deserialize persisted proxy fixture");
+    db.create_proxy(&proxy)
+        .await
+        .expect("persist proxy before invalid local compression");
 
     let now = chrono::Utc::now();
     db.create_plugin_config(&PluginConfig {
@@ -949,15 +962,20 @@ async fn invalid_local_buffering_config_does_not_shadow_global_candidate() {
     })
     .await
     .expect("persist invalid local compression fixture");
-    let proxy: Proxy = serde_json::from_value(https_proxy_with_plugins(
-        "p-sni",
-        "plain-up",
-        &["invalid-local-compression"],
-    ))
-    .expect("deserialize persisted proxy fixture");
-    db.create_proxy(&proxy)
+    let mut attached = db
+        .get_proxy("ferrum", "p-sni")
         .await
-        .expect("persist proxy with invalid local compression");
+        .expect("load proxy")
+        .expect("proxy must exist");
+    attached.plugins.push(PluginAssociation {
+        plugin_config_id: "invalid-local-compression".to_string(),
+    });
+    assert!(
+        db.update_proxy(&attached)
+            .await
+            .expect("attach invalid local compression"),
+        "proxy must still exist after attach"
+    );
 
     let (status, body) = admin_post(
         &base_url,
@@ -984,7 +1002,7 @@ async fn invalid_local_route_dispatch_does_not_shadow_valid_global_route() {
     // is not in the runtime chain and must not suppress the valid global route
     // override during SNI admission.
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let db = state.db.as_ref().expect("test database").clone();
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
@@ -998,6 +1016,18 @@ async fn invalid_local_route_dispatch_does_not_shadow_valid_global_route() {
     )
     .await;
     assert_eq!(status, 201, "global SNI override seed failed: {body:?}");
+
+    // Respect plugin_configs.proxy_id FK: create the proxy first without the
+    // invalid association, persist the broken local, then attach it.
+    let proxy: Proxy = serde_json::from_value(https_proxy_with_plugins(
+        "p-sni",
+        "plain-up",
+        &[],
+    ))
+    .expect("deserialize persisted proxy fixture");
+    db.create_proxy(&proxy)
+        .await
+        .expect("persist proxy before invalid local route dispatcher");
 
     let now = chrono::Utc::now();
     db.create_plugin_config(&PluginConfig {
@@ -1015,15 +1045,20 @@ async fn invalid_local_route_dispatch_does_not_shadow_valid_global_route() {
     })
     .await
     .expect("persist invalid local route-dispatch fixture");
-    let proxy: Proxy = serde_json::from_value(https_proxy_with_plugins(
-        "p-sni",
-        "plain-up",
-        &["invalid-local-mrd"],
-    ))
-    .expect("deserialize persisted proxy fixture");
-    db.create_proxy(&proxy)
+    let mut attached = db
+        .get_proxy("ferrum", "p-sni")
         .await
-        .expect("persist proxy with invalid local route dispatcher");
+        .expect("load proxy")
+        .expect("proxy must exist");
+    attached.plugins.push(PluginAssociation {
+        plugin_config_id: "invalid-local-mrd".to_string(),
+    });
+    assert!(
+        db.update_proxy(&attached)
+            .await
+            .expect("attach invalid local route dispatcher"),
+        "proxy must still exist after attach"
+    );
 
     let (status, body) = admin_post(
         &base_url,
@@ -1049,7 +1084,7 @@ async fn api_spec_import_rejects_sni_route_override_with_buffering_plugin() {
     // Finding 5: API-spec import must fail closed on route-override SNI +
     // buffering (no redundant fixture bulk — one POST).
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
@@ -1111,7 +1146,7 @@ async fn api_spec_put_screens_the_exact_post_replacement_plugin_set() {
     // the actual replacement state and repair the object, while a later PUT
     // that reintroduces the same conflict must still fail closed.
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, store, _tmp) = build_admin_state(&tc).await;
     let db = state.db.as_ref().expect("test database").clone();
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
@@ -1122,7 +1157,7 @@ async fn api_spec_put_screens_the_exact_post_replacement_plugin_set() {
         "hand-managed SNI upstream seed failed: {body:?}"
     );
 
-    let replacement = json!({
+    let seed = json!({
         "openapi": "3.1.0",
         "info": {"title": "Exact SNI replacement", "version": "1.0.0"},
         "x-ferrum-proxy": {
@@ -1152,13 +1187,16 @@ async fn api_spec_put_screens_the_exact_post_replacement_plugin_set() {
             },
         }],
     });
-    let (status, body) = admin_post(&base_url, "/api-specs", &token, &replacement).await;
+    let (status, body) = admin_post(&base_url, "/api-specs", &token, &seed).await;
     assert_eq!(status, 201, "non-buffering API spec seed failed: {body:?}");
     let spec_id = body["id"]
         .as_str()
         .expect("API-spec response id")
         .to_string();
 
+    // Direct admin create_plugin_config never stamps api_spec_id (forged
+    // ownership is forbidden). Tag the legacy conflict as spec-owned via SQL
+    // so replace deletion can see it — matching other API-spec drift fixtures.
     let now = chrono::Utc::now();
     db.create_plugin_config(&PluginConfig {
         id: "grpc-web-1".to_string(),
@@ -1169,12 +1207,27 @@ async fn api_spec_put_screens_the_exact_post_replacement_plugin_set() {
         proxy_id: Some("p-sni".to_string()),
         enabled: true,
         priority_override: None,
-        api_spec_id: Some(spec_id.clone()),
+        api_spec_id: None,
         created_at: now,
         updated_at: now,
     })
     .await
-    .expect("persist legacy spec-owned buffering fixture");
+    .expect("persist legacy buffering fixture row");
+    sqlx::query("UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?")
+        .bind(&spec_id)
+        .bind("ferrum")
+        .bind("grpc-web-1")
+        .execute(&store.pool())
+        .await
+        .expect("tag legacy buffering fixture as spec-owned");
+    let owned = db
+        .list_spec_owned_plugin_configs("ferrum", &spec_id)
+        .await
+        .expect("list spec-owned plugins");
+    assert!(
+        owned.iter().any(|plugin| plugin.id == "grpc-web-1"),
+        "test precondition: injected buffering plugin must be spec-owned"
+    );
     let mut persisted_proxy = db
         .get_proxy("ferrum", "p-sni")
         .await
@@ -1190,6 +1243,10 @@ async fn api_spec_put_screens_the_exact_post_replacement_plugin_set() {
         "API-spec proxy must still exist"
     );
 
+    // Materially change the extracted resource graph so this PUT cannot take
+    // the matching-resource-hash metadata-only no-op; SNI + MRD stay intact.
+    let mut replacement = seed.clone();
+    replacement["x-ferrum-proxy"]["listen_path"] = json!("/api-repaired");
     let path = format!("/api-specs/{spec_id}");
     let (status, body) = admin_put(&base_url, &path, &token, &replacement).await;
     assert_eq!(
@@ -1208,6 +1265,10 @@ async fn api_spec_put_screens_the_exact_post_replacement_plugin_set() {
         .await
         .expect("load repaired proxy")
         .expect("repaired proxy must exist");
+    assert_eq!(
+        repaired_proxy.listen_path, "/api-repaired",
+        "replacement must rewrite the proxy listen_path"
+    );
     assert!(
         repaired_proxy
             .plugins
@@ -1241,7 +1302,7 @@ async fn proxy_reverse_write_rejects_buffering_attach_with_sni_route_override() 
     // Finding 5: Proxy reverse-write must reject attaching a buffering plugin
     // when an applicable route override already lands on SNI.
     let tc = TestConfig::default();
-    let (state, _tmp) = build_admin_state(&tc).await;
+    let (state, _store, _tmp) = build_admin_state(&tc).await;
     let (base_url, _shutdown) = start_admin(state).await;
     let token = make_token(&tc);
 
