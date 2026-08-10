@@ -2239,6 +2239,7 @@ impl MetricsRegistry {
         };
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
+        self.append_grpc_stream_auth_prometheus(&mut output);
         output
     }
 
@@ -2276,6 +2277,16 @@ impl MetricsRegistry {
         );
     }
 
+    fn append_grpc_stream_auth_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        let gateway_ns_label = gateway_namespace_label(&ns_label);
+        crate::grpc::auth::render_stream_auth_metrics(output, &gateway_ns_label);
+    }
+
     /// Render metrics without caching. Used internally and for testing.
     ///
     /// Includes the process-static mesh observability families so this stays a
@@ -2290,6 +2301,7 @@ impl MetricsRegistry {
     pub fn render_uncached(&self) -> String {
         let mut output = self.render_cacheable_body();
         self.append_mesh_observability_prometheus(&mut output);
+        self.append_grpc_stream_auth_prometheus(&mut output);
         output
     }
 

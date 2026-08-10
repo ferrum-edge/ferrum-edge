@@ -56,6 +56,25 @@ fn grpc_jwt_external_token_errors_do_not_disclose_source_path() {
 }
 
 #[test]
+fn grpc_jwt_external_token_is_reread_for_every_connection_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("projected-token");
+    std::fs::write(&source, b"first-token\n").unwrap();
+    let credential = GrpcJwtSecret::new("unused".to_string())
+        .with_token_file(Some(source.to_string_lossy().into_owned()));
+
+    assert_eq!(
+        credential.mint("node-1", Some("default"), None).unwrap(),
+        "first-token"
+    );
+    std::fs::write(&source, b"second-token\n").unwrap();
+    assert_eq!(
+        credential.mint("node-1", Some("default"), None).unwrap(),
+        "second-token"
+    );
+}
+
+#[test]
 fn generate_dp_jwt_produces_valid_token() {
     let token = generate_dp_jwt("test-secret", "node-1").unwrap();
     assert!(!token.is_empty());

@@ -5,6 +5,7 @@ use dashmap::mapref::entry::Entry;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
@@ -24,9 +25,13 @@ use super::translator::translate_mesh_slice_to_snapshot;
 use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
-use crate::grpc::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
+use crate::grpc::auth::{
+    AllowedNamespaces, DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS, StreamAuthSurface,
+    StreamAuthTerminationGuard, StreamAuthorizationLease, VerifiedGrpcIdentity,
+    verify_grpc_jwt_metadata_identity,
+};
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, NamespaceBroadcasts};
-use crate::grpc::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
+use crate::grpc::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
 use crate::grpc::proto::ConfigUpdate;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use crate::xds::carrier::XdsNodeScoping;
@@ -81,7 +86,8 @@ pub struct XdsAdsServer {
     /// Shared with the ConfigSync and mesh servers so ADS enforces the same
     /// namespace-bound verification credentials, not a second authorization
     /// source (advisory GHSA-3f2j-wwqw-grmg).
-    verifier: Arc<CpDpVerifier>,
+    verifier: Arc<CpDpVerifierStore>,
+    max_stream_lifetime: Duration,
     expected_issuer: String,
     namespace: String,
     scope: CpScope,
@@ -277,7 +283,8 @@ impl XdsAdsServer {
             config,
             update_tx,
             namespace_broadcasts: None,
-            verifier: Arc::new(CpDpVerifier::SharedSecret(jwt_secret)),
+            verifier: Arc::new(CpDpVerifierStore::new(CpDpVerifier::SharedSecret(jwt_secret))),
+            max_stream_lifetime: Duration::from_secs(DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS),
             expected_issuer,
             namespace: namespace.clone(),
             scope: CpScope::Single(namespace),
@@ -310,7 +317,17 @@ impl XdsAdsServer {
     /// Replace the seeded shared-secret verifier with the CP's configured
     /// namespace-bound trust bundle.
     pub fn with_verifier(mut self, verifier: Arc<CpDpVerifier>) -> Self {
+        self.verifier = Arc::new(CpDpVerifierStore::from_arc(verifier));
+        self
+    }
+
+    pub fn with_verifier_store(mut self, verifier: Arc<CpDpVerifierStore>) -> Self {
         self.verifier = verifier;
+        self
+    }
+
+    pub fn with_max_stream_lifetime(mut self, lifetime: Duration) -> Self {
+        self.max_stream_lifetime = lifetime;
         self
     }
 
@@ -359,13 +376,15 @@ impl XdsAdsServer {
         &self,
         metadata: &tonic::metadata::MetadataMap,
         extensions: &tonic::Extensions,
-    ) -> Result<AllowedNamespaces, Status> {
-        verify_grpc_jwt_metadata_with_claims(
+    ) -> Result<VerifiedGrpcIdentity, Status> {
+        let verifier = self.verifier.load();
+        verify_grpc_jwt_metadata_identity(
             metadata,
-            &self.verifier,
+            verifier.as_ref(),
             &self.expected_issuer,
             extensions.get::<CpGrpcConnectInfo>(),
         )
+        .and_then(|identity| identity.bind_to_store(&self.verifier))
     }
 
     #[allow(clippy::result_large_err)]
@@ -1613,8 +1632,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         &self,
         request: Request<tonic::Streaming<DiscoveryRequest>>,
     ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
-        let allowed = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
-            Ok(allowed) => allowed,
+        let identity = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
+            Ok(identity) => identity,
             Err(status) => {
                 warn!(
                     method = "xDS.StreamAggregatedResources",
@@ -1632,7 +1651,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 return Err(status);
             }
         };
-        let stream_namespace = match self.resolve_xds_namespace(&allowed) {
+        let stream_namespace = match self.resolve_xds_namespace(&identity.allowed_namespaces) {
             Ok(namespace) => namespace,
             Err(status) => {
                 warn!(
@@ -1661,11 +1680,23 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 
         let mut requests = request.into_inner();
         let mut server = self.clone();
-        server.ambient_udp_source_bearer_namespaces = allowed.effective_namespaces().cloned();
+        server.ambient_udp_source_bearer_namespaces = identity
+            .allowed_namespaces
+            .effective_namespaces()
+            .cloned();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
+        let authorization = StreamAuthorizationLease::new(
+            &identity,
+            self.verifier.clone(),
+            self.max_stream_lifetime,
+        );
 
         tokio::spawn(async move {
+            let authorization_end = authorization.wait_for_end();
+            tokio::pin!(authorization_end);
+            let mut authorization_guard =
+                StreamAuthTerminationGuard::new(StreamAuthSurface::XdsSotw);
             let mut stream_guard = server.stream_guard();
             let mut node_id: Option<String> = None;
             let mut node_state_key: Option<String> = None;
@@ -1679,6 +1710,11 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
             loop {
                 tokio::select! {
+                    reason = &mut authorization_end => {
+                        authorization_guard.set_reason(reason);
+                        let _ = tx.send(Err(reason.status())).await;
+                        return;
+                    }
                     maybe_request = requests.next() => {
                         let Some(request) = maybe_request else {
                             return;
@@ -1899,8 +1935,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         &self,
         request: Request<tonic::Streaming<DeltaDiscoveryRequest>>,
     ) -> Result<Response<Self::DeltaAggregatedResourcesStream>, Status> {
-        let allowed = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
-            Ok(allowed) => allowed,
+        let identity = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
+            Ok(identity) => identity,
             Err(status) => {
                 warn!(
                     method = "xDS.DeltaAggregatedResources",
@@ -1918,7 +1954,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 return Err(status);
             }
         };
-        let stream_namespace = match self.resolve_xds_namespace(&allowed) {
+        let stream_namespace = match self.resolve_xds_namespace(&identity.allowed_namespaces) {
             Ok(namespace) => namespace,
             Err(status) => {
                 warn!(
@@ -1947,11 +1983,23 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 
         let mut requests = request.into_inner();
         let mut server = self.clone();
-        server.ambient_udp_source_bearer_namespaces = allowed.effective_namespaces().cloned();
+        server.ambient_udp_source_bearer_namespaces = identity
+            .allowed_namespaces
+            .effective_namespaces()
+            .cloned();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
+        let authorization = StreamAuthorizationLease::new(
+            &identity,
+            self.verifier.clone(),
+            self.max_stream_lifetime,
+        );
 
         tokio::spawn(async move {
+            let authorization_end = authorization.wait_for_end();
+            tokio::pin!(authorization_end);
+            let mut authorization_guard =
+                StreamAuthTerminationGuard::new(StreamAuthSurface::XdsDelta);
             let mut stream_guard = server.stream_guard();
             let mut node_id: Option<String> = None;
             let mut node_state_key: Option<String> = None;
@@ -1967,6 +2015,11 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 HashMap::new();
             loop {
                 tokio::select! {
+                    reason = &mut authorization_end => {
+                        authorization_guard.set_reason(reason);
+                        let _ = tx.send(Err(reason.status())).await;
+                        return;
+                    }
                     maybe_request = requests.next() => {
                         let Some(request) = maybe_request else {
                             return;

@@ -1337,6 +1337,20 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_grpc_config_stream_terminations_total",
+    "type": "counter",
+    "help": "Authenticated configuration streams ended by fixed surface and reason.",
+    "labels": [
+      "surface",
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "grpc_config",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_kafka_logging_accepting",
     "type": "gauge",
     "help": "Whether the Kafka logging generation still admits new records.",

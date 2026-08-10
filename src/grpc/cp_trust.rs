@@ -64,8 +64,12 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use jsonwebtoken::{Algorithm, DecodingKey};
 use serde::Deserialize;
+use tokio::sync::watch;
+
+use crate::fips::approved::Sha256;
 
 /// Upper bound on the trust-bundle document size. The file is operator-owned,
 /// but a bounded read keeps a mistyped path (a device node, a huge log) from
@@ -230,9 +234,71 @@ pub struct TrustedKey {
     kid: String,
     algorithm: Algorithm,
     decoding_key: DecodingKey,
+    /// Stable, process-internal identity of the accepted verification
+    /// credential. This is derived from the configured key material but is
+    /// never logged or exported. It lets an admitted stream survive an
+    /// overlapping bundle rotation while closing if its exact credential is
+    /// removed.
+    identity: VerificationCredentialIdentity,
     /// Immutable namespace ceiling for every token this key verifies. Sourced
     /// exclusively from trusted CP configuration; a bearer can never change it.
     namespaces: HashSet<String>,
+}
+
+/// Opaque identity of one verification credential.
+///
+/// The digest is deliberately private and has no accessor or value-bearing
+/// `Debug` implementation. It is used only for equality against later trusted
+/// verifier snapshots; token bytes, claims, and key material are never retained
+/// by an admitted stream.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct VerificationCredentialIdentity([u8; 32]);
+
+impl std::fmt::Debug for VerificationCredentialIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VerificationCredentialIdentity(<opaque>)")
+    }
+}
+
+fn credential_identity(
+    kid: Option<&str>,
+    algorithm: Algorithm,
+    material: &[u8],
+) -> VerificationCredentialIdentity {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ferrum-cp-dp-verification-credential-v1\0");
+    hasher.update(algorithm_identity_label(algorithm));
+    hasher.update(b"\0");
+    if let Some(kid) = kid {
+        hasher.update(kid.as_bytes());
+    }
+    hasher.update(b"\0");
+    hasher.update(material);
+    VerificationCredentialIdentity(hasher.finalize())
+}
+
+fn algorithm_identity_label(algorithm: Algorithm) -> &'static [u8] {
+    match algorithm {
+        Algorithm::HS256 => b"HS256",
+        Algorithm::HS384 => b"HS384",
+        Algorithm::HS512 => b"HS512",
+        Algorithm::ES256 => b"ES256",
+        Algorithm::ES384 => b"ES384",
+        Algorithm::RS256 => b"RS256",
+        Algorithm::RS384 => b"RS384",
+        Algorithm::RS512 => b"RS512",
+        Algorithm::PS256 => b"PS256",
+        Algorithm::PS384 => b"PS384",
+        Algorithm::PS512 => b"PS512",
+        Algorithm::EdDSA => b"EdDSA",
+    }
+}
+
+fn canonical_public_key_identity_material(pem: &[u8]) -> Vec<u8> {
+    pem.iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect()
 }
 
 impl std::fmt::Debug for TrustedKey {
@@ -337,6 +403,27 @@ impl CpDpTrustBundle {
         self.keys.len()
     }
 
+    fn configuration_fingerprint(&self) -> [u8; 32] {
+        let mut kids: Vec<&str> = self.keys.keys().map(String::as_str).collect();
+        kids.sort_unstable();
+        let mut hasher = Sha256::new();
+        hasher.update(b"ferrum-cp-dp-trust-bundle-v1\0");
+        for kid in kids {
+            let key = &self.keys[kid];
+            hasher.update(kid.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(key.identity.0);
+            let mut namespaces: Vec<&str> = key.namespaces.iter().map(String::as_str).collect();
+            namespaces.sort_unstable();
+            for namespace in namespaces {
+                hasher.update(namespace.as_bytes());
+                hasher.update(b"\0");
+            }
+            hasher.update(b"\xff");
+        }
+        hasher.finalize()
+    }
+
     /// Every namespace any trusted credential may reach. Startup uses this to
     /// warn about served namespaces no credential can subscribe to.
     pub fn bound_namespaces(&self) -> HashSet<&str> {
@@ -400,6 +487,15 @@ impl std::fmt::Debug for CpDpVerifier {
 }
 
 impl CpDpVerifier {
+    fn configuration_fingerprint(&self) -> [u8; 32] {
+        match self {
+            Self::SharedSecret(secret) => {
+                credential_identity(None, Algorithm::HS256, secret.as_bytes()).0
+            }
+            Self::TrustBundle(bundle) => bundle.configuration_fingerprint(),
+        }
+    }
+
     /// True when this verifier provides server-derived namespace binding.
     pub fn has_namespace_binding(&self) -> bool {
         matches!(self, Self::TrustBundle(_))
@@ -452,7 +548,12 @@ impl CpDpVerifier {
         &self,
         kid: Option<&str>,
         alg: Algorithm,
-        f: impl FnOnce(&DecodingKey, Algorithm, Option<&HashSet<String>>) -> T,
+        f: impl FnOnce(
+            &DecodingKey,
+            Algorithm,
+            Option<&HashSet<String>>,
+            &VerificationCredentialIdentity,
+        ) -> T,
     ) -> Result<T, TenantAuthRejectReason> {
         match self {
             Self::SharedSecret(secret) => {
@@ -472,14 +573,282 @@ impl CpDpVerifier {
                     return Err(TenantAuthRejectReason::TokenValidation);
                 }
                 let key = DecodingKey::from_secret(secret.as_bytes());
-                Ok(f(&key, Algorithm::HS256, None))
+                let identity = credential_identity(None, Algorithm::HS256, secret.as_bytes());
+                Ok(f(&key, Algorithm::HS256, None, &identity))
             }
             Self::TrustBundle(bundle) => {
                 let key = bundle.select(kid, alg)?;
-                Ok(f(&key.decoding_key, key.algorithm, Some(&key.namespaces)))
+                Ok(f(
+                    &key.decoding_key,
+                    key.algorithm,
+                    Some(&key.namespaces),
+                    &key.identity,
+                ))
             }
         }
     }
+
+    /// Whether this verifier snapshot still accepts the exact credential that
+    /// admitted a stream. Namespace changes on a retained credential are not a
+    /// credential removal: the stream remains bound to the already verified
+    /// identity and its original namespace ceiling until its finite lease ends.
+    pub fn contains_credential(&self, identity: &VerificationCredentialIdentity) -> bool {
+        match self {
+            Self::SharedSecret(secret) => {
+                !secret.is_empty()
+                    && credential_identity(None, Algorithm::HS256, secret.as_bytes()) == *identity
+            }
+            Self::TrustBundle(bundle) => bundle
+                .keys
+                .values()
+                .any(|key| key.identity == *identity),
+        }
+    }
+
+    fn credential_identities(&self) -> HashSet<VerificationCredentialIdentity> {
+        match self {
+            Self::SharedSecret(secret) if !secret.is_empty() => [credential_identity(
+                None,
+                Algorithm::HS256,
+                secret.as_bytes(),
+            )]
+            .into_iter()
+            .collect(),
+            Self::SharedSecret(_) => HashSet::new(),
+            Self::TrustBundle(bundle) => bundle
+                .keys
+                .values()
+                .map(|key| key.identity.clone())
+                .collect(),
+        }
+    }
+}
+
+/// Atomically reloadable verifier shared by ConfigSync, MeshSubscribe, and
+/// both ADS services.
+///
+/// Verification takes one immutable snapshot. Streams retain only the opaque
+/// accepted credential identity plus its store generation and subscribe to the
+/// revision counter. A reload wakes every stream, but only streams whose exact
+/// credential generation vanished are revoked; adding an overlapping key does
+/// not churn established streams, while remove-then-readd cannot resurrect an
+/// old stream.
+struct CpDpVerifierSnapshot {
+    verifier: Arc<CpDpVerifier>,
+    credential_generations: HashMap<VerificationCredentialIdentity, u64>,
+    revision: u64,
+}
+
+pub struct CpDpVerifierStore {
+    active: ArcSwap<CpDpVerifierSnapshot>,
+    revision: watch::Sender<u64>,
+    replace_lock: parking_lot::Mutex<()>,
+}
+
+impl std::fmt::Debug for CpDpVerifierStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let active = self.active.load();
+        f.debug_struct("CpDpVerifierStore")
+            .field("active", active.verifier.as_ref())
+            .field(
+                "active_credential_count",
+                &active.credential_generations.len(),
+            )
+            .field("revision", &active.revision)
+            .finish()
+    }
+}
+
+impl CpDpVerifierStore {
+    pub fn new(verifier: CpDpVerifier) -> Self {
+        Self::from_arc(Arc::new(verifier))
+    }
+
+    pub fn from_arc(verifier: Arc<CpDpVerifier>) -> Self {
+        let (revision, _) = watch::channel(0);
+        let credential_generations = verifier
+            .credential_identities()
+            .into_iter()
+            .map(|identity| (identity, 0))
+            .collect();
+        Self {
+            active: ArcSwap::from(Arc::new(CpDpVerifierSnapshot {
+                verifier,
+                credential_generations,
+                revision: 0,
+            })),
+            revision,
+            replace_lock: parking_lot::Mutex::new(()),
+        }
+    }
+
+    pub fn load(&self) -> Arc<CpDpVerifier> {
+        self.active.load().verifier.clone()
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.revision.subscribe()
+    }
+
+    pub fn replace(&self, verifier: CpDpVerifier) {
+        let _replace_guard = self.replace_lock.lock();
+        let current = self.active.load();
+        let revision = current.revision.saturating_add(1);
+        let credential_generations = verifier
+            .credential_identities()
+            .into_iter()
+            .map(|identity| {
+                let generation = current
+                    .credential_generations
+                    .get(&identity)
+                    .copied()
+                    .unwrap_or(revision);
+                (identity, generation)
+            })
+            .collect();
+        let verifier = Arc::new(verifier);
+        self.active.store(Arc::new(CpDpVerifierSnapshot {
+            verifier,
+            credential_generations,
+            revision,
+        }));
+        self.revision.send_replace(revision);
+    }
+
+    pub fn credential_generation(
+        &self,
+        identity: &VerificationCredentialIdentity,
+    ) -> Option<u64> {
+        self.active
+            .load()
+            .credential_generations
+            .get(identity)
+            .copied()
+    }
+
+    pub fn credential_is_active(
+        &self,
+        identity: &VerificationCredentialIdentity,
+        generation: u64,
+    ) -> bool {
+        self.credential_generation(identity) == Some(generation)
+    }
+}
+
+/// Watch a file-backed namespace trust bundle and atomically publish valid
+/// replacements. Invalid or unreadable candidates never replace the last
+/// accepted verifier. Semantic fingerprints include resolved referenced key
+/// material, so quiet sources do not wake streams while a rotated key file is
+/// still detected even when the bundle document itself is unchanged.
+pub fn spawn_trust_bundle_reload(
+    path: String,
+    fleet_secret: Option<String>,
+    verifier: Arc<CpDpVerifierStore>,
+    multi_namespace: bool,
+    interval: std::time::Duration,
+    mut shutdown: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut accepted_fingerprint = verifier.load().configuration_fingerprint();
+        let mut last_failed = false;
+        let mut ticker = tokio::time::interval(interval.max(std::time::Duration::from_secs(1)));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+
+            let raw = match tokio::fs::read(&path).await {
+                Ok(raw) if raw.len() as u64 <= TRUST_BUNDLE_MAX_BYTES => raw,
+                Ok(_) => {
+                    if !last_failed {
+                        tracing::warn!(
+                            audit.event = "cp_dp_trust_bundle_reload_rejected",
+                            reason = "document_too_large",
+                            "CP/DP trust-bundle reload rejected; retaining the active verifier"
+                        );
+                    }
+                    last_failed = true;
+                    continue;
+                }
+                Err(_) => {
+                    if !last_failed {
+                        tracing::warn!(
+                            audit.event = "cp_dp_trust_bundle_reload_rejected",
+                            reason = "read_failed",
+                            "CP/DP trust-bundle reload rejected; retaining the active verifier"
+                        );
+                    }
+                    last_failed = true;
+                    continue;
+                }
+            };
+            let raw = match std::str::from_utf8(&raw) {
+                Ok(raw) => raw,
+                Err(_) => {
+                    if !last_failed {
+                        tracing::warn!(
+                            audit.event = "cp_dp_trust_bundle_reload_rejected",
+                            reason = "invalid_utf8",
+                            "CP/DP trust-bundle reload rejected; retaining the active verifier"
+                        );
+                    }
+                    last_failed = true;
+                    continue;
+                }
+            };
+            let bundle = match CpDpTrustBundle::from_document_str(
+                raw,
+                "live trust-bundle source",
+                fleet_secret.as_deref(),
+            ) {
+                Ok(bundle) => bundle,
+                Err(_) => {
+                    if !last_failed {
+                        tracing::warn!(
+                            audit.event = "cp_dp_trust_bundle_reload_rejected",
+                            reason = "validation_failed",
+                            "CP/DP trust-bundle reload rejected; retaining the active verifier"
+                        );
+                    }
+                    last_failed = true;
+                    continue;
+                }
+            };
+            let candidate = CpDpVerifier::TrustBundle(bundle);
+            if candidate.validate_for_scope(multi_namespace).is_err() {
+                if !last_failed {
+                    tracing::warn!(
+                        audit.event = "cp_dp_trust_bundle_reload_rejected",
+                        reason = "scope_validation_failed",
+                        "CP/DP trust-bundle reload rejected; retaining the active verifier"
+                    );
+                }
+                last_failed = true;
+                continue;
+            }
+            let fingerprint = candidate.configuration_fingerprint();
+            if accepted_fingerprint == fingerprint {
+                last_failed = false;
+                continue;
+            }
+            verifier.replace(candidate);
+            accepted_fingerprint = fingerprint;
+            last_failed = false;
+            tracing::info!(
+                audit.event = "cp_dp_trust_bundle_reloaded",
+                "CP/DP trust bundle reloaded; streams whose accepted credential was removed are closing"
+            );
+        }
+    })
 }
 
 /// Intersect the credential's namespace ceiling with the bearer's `ns` claim
@@ -697,7 +1066,7 @@ impl TrustBundleKeyDocument {
             ));
         }
 
-        let decoding_key = if symmetric {
+        let (decoding_key, identity) = if symmetric {
             let secret = if let Some(inline) = self.secret {
                 inline
             } else if let Some(var) = self.secret_env.as_deref() {
@@ -745,7 +1114,10 @@ impl TrustBundleKeyDocument {
             if fleet_secret.is_some_and(|fleet| !fleet.is_empty() && fleet == secret.as_str()) {
                 return Err(fleet_secret_reuse_error(origin, &kid));
             }
-            DecodingKey::from_secret(secret.as_bytes())
+            (
+                DecodingKey::from_secret(secret.as_bytes()),
+                credential_identity(Some(&kid), algorithm, secret.as_bytes()),
+            )
         } else {
             let pem = if let Some(inline) = self.public_key_pem {
                 inline
@@ -778,18 +1150,22 @@ impl TrustBundleKeyDocument {
                     ));
                 }
             };
-            parsed.map_err(|e| {
+            let decoding_key = parsed.map_err(|e| {
                 format!(
                     "CP/DP trust bundle '{origin}': key '{kid}' public key is not valid PEM for \
                      '{algorithm:?}': {e}"
                 )
-            })?
+            })?;
+            let identity_material = canonical_public_key_identity_material(bytes);
+            let identity = credential_identity(Some(&kid), algorithm, &identity_material);
+            (decoding_key, identity)
         };
 
         Ok(TrustedKey {
             kid,
             algorithm,
             decoding_key,
+            identity,
             namespaces,
         })
     }

@@ -29,11 +29,39 @@
 use jsonwebtoken::{Validation, decode, decode_header};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::{Instant, Interval, Sleep};
 use tonic::Status;
+use tracing::{info, warn};
 
 use super::cp_trust::{
-    CpDpVerifier, CpGrpcConnectInfo, TenantAuthRejectReason, resolve_authorized_namespaces,
+    CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo, TenantAuthRejectReason,
+    VerificationCredentialIdentity, resolve_authorized_namespaces,
 };
+
+/// `jsonwebtoken`'s accepted clock leeway, pinned explicitly so the
+/// post-verification stream deadline uses exactly the same allowance as the
+/// signature/claim verifier instead of silently drifting with a dependency
+/// default.
+pub const GRPC_JWT_LEEWAY_SECONDS: u64 = 60;
+
+/// Default independent server-side ceiling for authenticated configuration
+/// streams. The operator may lower or raise it within the validated bounds,
+/// but cannot disable it.
+pub const DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS: u64 = 3_600;
+pub const MIN_GRPC_MAX_STREAM_LIFETIME_SECONDS: u64 = 60;
+pub const MAX_GRPC_MAX_STREAM_LIFETIME_SECONDS: u64 = 86_400;
+
+const CREDENTIAL_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
+
+fn bounded_server_lifetime(lifetime: Duration) -> Duration {
+    lifetime.min(Duration::from_secs(MAX_GRPC_MAX_STREAM_LIFETIME_SECONDS))
+}
 
 /// Reserved JWT `aud` prefix for cross-cluster mesh **remote-discovery**
 /// tokens. The prefix is what makes the token class self-describing: any
@@ -349,6 +377,349 @@ pub struct VerifiedGrpcIdentity {
     /// Non-empty JWT `sub`. Callers must treat this as the sole trusted node
     /// identity and must not prefer any caller-supplied display field.
     pub subject: String,
+    /// Monotonic authorization deadline derived from the `exp` value in the
+    /// claims object returned by successful signature/issuer/time validation,
+    /// including the verifier's accepted leeway.
+    pub authorization_deadline: Instant,
+    /// Monotonic instant at which verification completed. Server maximum
+    /// lifetime is anchored here, before snapshot construction can consume
+    /// part of the admitted lifetime.
+    admitted_at: Instant,
+    /// Exact credential selected during successful verification. Opaque and
+    /// never logged or exported.
+    pub(crate) credential: VerificationCredentialIdentity,
+    /// Store generation in which this exact credential was admitted. A key
+    /// removed and later re-added receives a new generation, so old streams
+    /// cannot survive by missing a rapid remove/re-add notification.
+    pub(crate) credential_generation: u64,
+}
+
+impl VerifiedGrpcIdentity {
+    pub(crate) fn bind_to_store(
+        mut self,
+        verifier: &CpDpVerifierStore,
+    ) -> Result<Self, Status> {
+        self.credential_generation = verifier
+            .credential_generation(&self.credential)
+            .ok_or_else(|| {
+                Status::permission_denied("Stream verification credential is no longer trusted")
+            })?;
+        Ok(self)
+    }
+}
+
+/// Closed stream classes used by metrics and structured audit records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAuthSurface {
+    ConfigSync,
+    MeshSubscribeLocal,
+    MeshSubscribeRemote,
+    XdsSotw,
+    XdsDelta,
+}
+
+impl StreamAuthSurface {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ConfigSync => "configsync_subscribe",
+            Self::MeshSubscribeLocal => "mesh_subscribe_local",
+            Self::MeshSubscribeRemote => "mesh_subscribe_remote",
+            Self::XdsSotw => "xds_sotw_ads",
+            Self::XdsDelta => "xds_delta_ads",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::ConfigSync => 0,
+            Self::MeshSubscribeLocal => 1,
+            Self::MeshSubscribeRemote => 2,
+            Self::XdsSotw => 3,
+            Self::XdsDelta => 4,
+        }
+    }
+}
+
+/// Why an admitted long-lived configuration stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAuthEndReason {
+    Expired,
+    VerificationKeyRemoved,
+    ServerMaxLifetime,
+    TransportClosed,
+}
+
+impl StreamAuthEndReason {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::VerificationKeyRemoved => "verification_key_removed",
+            Self::ServerMaxLifetime => "server_max_lifetime",
+            Self::TransportClosed => "transport_closed",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Expired => 0,
+            Self::VerificationKeyRemoved => 1,
+            Self::ServerMaxLifetime => 2,
+            Self::TransportClosed => 3,
+        }
+    }
+
+    pub fn status(self) -> Status {
+        match self {
+            Self::Expired => Status::unauthenticated("Stream authorization expired"),
+            Self::VerificationKeyRemoved => {
+                Status::permission_denied("Stream verification credential is no longer trusted")
+            }
+            Self::ServerMaxLifetime => {
+                Status::unauthenticated("Authenticated stream reached server maximum lifetime")
+            }
+            Self::TransportClosed => Status::unavailable("Configuration stream transport closed"),
+        }
+    }
+}
+
+static STREAM_AUTH_ENDS: [[AtomicU64; 4]; 5] = [
+    [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ],
+    [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ],
+    [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ],
+    [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ],
+    [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ],
+];
+
+/// Append the fixed-cardinality stream authorization lifecycle metric.
+pub fn render_stream_auth_metrics(output: &mut String, gateway_ns_label: &str) {
+    output.push_str(
+        "# HELP ferrum_grpc_config_stream_terminations_total Authenticated configuration streams ended by fixed surface and reason.\n",
+    );
+    output.push_str("# TYPE ferrum_grpc_config_stream_terminations_total counter\n");
+    for surface in [
+        StreamAuthSurface::ConfigSync,
+        StreamAuthSurface::MeshSubscribeLocal,
+        StreamAuthSurface::MeshSubscribeRemote,
+        StreamAuthSurface::XdsSotw,
+        StreamAuthSurface::XdsDelta,
+    ] {
+        for reason in [
+            StreamAuthEndReason::Expired,
+            StreamAuthEndReason::VerificationKeyRemoved,
+            StreamAuthEndReason::ServerMaxLifetime,
+            StreamAuthEndReason::TransportClosed,
+        ] {
+            output.push_str(&format!(
+                "ferrum_grpc_config_stream_terminations_total{{surface=\"{}\",reason=\"{}\"{}}} {}\n",
+                surface.label(),
+                reason.label(),
+                gateway_ns_label,
+                STREAM_AUTH_ENDS[surface.index()][reason.index()].load(Ordering::Relaxed),
+            ));
+        }
+    }
+}
+
+/// Records exactly one terminal reason for an admitted stream, including
+/// ordinary client/transport closure when no authorization branch fired.
+pub struct StreamAuthTerminationGuard {
+    surface: StreamAuthSurface,
+    reason: StreamAuthEndReason,
+}
+
+impl StreamAuthTerminationGuard {
+    pub fn new(surface: StreamAuthSurface) -> Self {
+        Self {
+            surface,
+            reason: StreamAuthEndReason::TransportClosed,
+        }
+    }
+
+    pub fn set_reason(&mut self, reason: StreamAuthEndReason) {
+        self.reason = reason;
+    }
+}
+
+impl Drop for StreamAuthTerminationGuard {
+    fn drop(&mut self) {
+        STREAM_AUTH_ENDS[self.surface.index()][self.reason.index()]
+            .fetch_add(1, Ordering::Relaxed);
+        if self.reason == StreamAuthEndReason::TransportClosed {
+            info!(
+                audit.event = "grpc_config_stream_ended",
+                surface = self.surface.label(),
+                reason = self.reason.label(),
+                "Authenticated configuration stream ended"
+            );
+        } else {
+            warn!(
+                audit.event = "grpc_config_stream_authorization_ended",
+                surface = self.surface.label(),
+                reason = self.reason.label(),
+                "Authenticated configuration stream authorization ended"
+            );
+        }
+    }
+}
+
+/// Immutable authorization lease for one admitted bearer stream.
+pub struct StreamAuthorizationLease {
+    authorization_deadline: Instant,
+    server_deadline: Instant,
+    credential: VerificationCredentialIdentity,
+    credential_generation: u64,
+    verifier: Arc<CpDpVerifierStore>,
+}
+
+impl StreamAuthorizationLease {
+    pub fn new(
+        identity: &VerifiedGrpcIdentity,
+        verifier: Arc<CpDpVerifierStore>,
+        max_lifetime: Duration,
+    ) -> Self {
+        let max_lifetime = bounded_server_lifetime(max_lifetime);
+        Self {
+            authorization_deadline: identity.authorization_deadline,
+            server_deadline: identity.admitted_at + max_lifetime,
+            credential: identity.credential.clone(),
+            credential_generation: identity.credential_generation,
+            verifier,
+        }
+    }
+
+    /// Wait without polling. Used by the task-owned bidirectional ADS loops.
+    pub async fn wait_for_end(&self) -> StreamAuthEndReason {
+        let mut revisions = self.verifier.subscribe();
+        if !self
+            .verifier
+            .credential_is_active(&self.credential, self.credential_generation)
+        {
+            return StreamAuthEndReason::VerificationKeyRemoved;
+        }
+        loop {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(self.authorization_deadline) => {
+                    return StreamAuthEndReason::Expired;
+                }
+                _ = tokio::time::sleep_until(self.server_deadline) => {
+                    return StreamAuthEndReason::ServerMaxLifetime;
+                }
+                changed = revisions.changed() => {
+                    if changed.is_err()
+                        || !self.verifier.credential_is_active(
+                            &self.credential,
+                            self.credential_generation,
+                        )
+                    {
+                        return StreamAuthEndReason::VerificationKeyRemoved;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Deadline/revocation wrapper for server-streaming ConfigSync and
+/// MeshSubscribe responses. Timers are fixed at admission; polling inner
+/// traffic and heartbeat activity cannot modify them.
+pub struct AuthorizedResponseStream<S> {
+    inner: Pin<Box<S>>,
+    authorization_sleep: Pin<Box<Sleep>>,
+    server_sleep: Pin<Box<Sleep>>,
+    revocation_checks: Interval,
+    credential: VerificationCredentialIdentity,
+    credential_generation: u64,
+    verifier: Arc<CpDpVerifierStore>,
+    terminal_sent: bool,
+    guard: StreamAuthTerminationGuard,
+}
+
+impl<S> AuthorizedResponseStream<S> {
+    pub fn new(
+        inner: S,
+        identity: &VerifiedGrpcIdentity,
+        verifier: Arc<CpDpVerifierStore>,
+        max_lifetime: Duration,
+        surface: StreamAuthSurface,
+    ) -> Self {
+        let max_lifetime = bounded_server_lifetime(max_lifetime);
+        let server_deadline = identity.admitted_at + max_lifetime;
+        Self {
+            inner: Box::pin(inner),
+            authorization_sleep: Box::pin(tokio::time::sleep_until(
+                identity.authorization_deadline,
+            )),
+            server_sleep: Box::pin(tokio::time::sleep_until(server_deadline)),
+            revocation_checks: tokio::time::interval_at(
+                Instant::now() + CREDENTIAL_RECHECK_INTERVAL,
+                CREDENTIAL_RECHECK_INTERVAL,
+            ),
+            credential: identity.credential.clone(),
+            credential_generation: identity.credential_generation,
+            verifier,
+            terminal_sent: false,
+            guard: StreamAuthTerminationGuard::new(surface),
+        }
+    }
+
+    fn terminate<T>(&mut self, reason: StreamAuthEndReason) -> Poll<Option<Result<T, Status>>> {
+        self.terminal_sent = true;
+        self.guard.set_reason(reason);
+        Poll::Ready(Some(Err(reason.status())))
+    }
+}
+
+impl<S, T> tokio_stream::Stream for AuthorizedResponseStream<S>
+where
+    S: tokio_stream::Stream<Item = Result<T, Status>>,
+{
+    type Item = Result<T, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminal_sent {
+            return Poll::Ready(None);
+        }
+        if self.authorization_sleep.as_mut().poll(cx).is_ready() {
+            return self.terminate(StreamAuthEndReason::Expired);
+        }
+        if self.server_sleep.as_mut().poll(cx).is_ready() {
+            return self.terminate(StreamAuthEndReason::ServerMaxLifetime);
+        }
+        if self.revocation_checks.poll_tick(cx).is_ready()
+            && !self
+                .verifier
+                .credential_is_active(&self.credential, self.credential_generation)
+        {
+            return self.terminate(StreamAuthEndReason::VerificationKeyRemoved);
+        }
+        self.inner.as_mut().poll_next(cx)
+    }
 }
 
 /// Verify the JWT and return any `ns` claim it carried. Use this variant
@@ -377,6 +748,25 @@ pub(crate) fn verify_grpc_jwt_metadata_with_claims(
         peer,
     )
     .map(|identity| identity.allowed_namespaces)
+    .map_err(|(status, _)| status)
+}
+
+/// Reserved-audience verification variant for long-lived ConfigSync and ADS
+/// streams that must retain the trusted post-verification authorization lease.
+#[allow(clippy::result_large_err)]
+pub(crate) fn verify_grpc_jwt_metadata_identity(
+    metadata: &tonic::metadata::MetadataMap,
+    verifier: &CpDpVerifier,
+    expected_issuer: &str,
+    peer: Option<&CpGrpcConnectInfo>,
+) -> Result<VerifiedGrpcIdentity, Status> {
+    verify_grpc_jwt_metadata_with_audience(
+        metadata,
+        verifier,
+        expected_issuer,
+        GrpcAudiencePolicy::ReservedForbidden,
+        peer,
+    )
     .map_err(|(status, _)| status)
 }
 
@@ -421,6 +811,7 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
 
     let mut validation = Validation::new(header.alg);
     validation.validate_exp = true;
+    validation.leeway = GRPC_JWT_LEEWAY_SECONDS;
     validation.required_spec_claims = required_grpc_claims();
     validation.set_issuer(&[expected_issuer]);
     // Audience enforcement is Ferrum's own (`enforce_audience`) so every
@@ -428,17 +819,21 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
     // closed instead of matching on any element.
     validation.validate_aud = false;
 
-    let (decoded, bound_namespaces) = verifier
+    let (decoded, bound_namespaces, credential) = verifier
         .with_decoding_key(
             header.kid.as_deref(),
             header.alg,
-            |key, algorithm, bound| {
+            |key, algorithm, bound, credential| {
                 // `algorithm` is the credential's configured algorithm, which
                 // `with_decoding_key` already proved equal to the header's. Pin the
                 // validation to it rather than to the header so a future selection
                 // change cannot silently widen the accepted algorithm set.
                 validation.algorithms = vec![algorithm];
-                (decode::<Value>(token, key, &validation), bound.cloned())
+                (
+                    decode::<Value>(token, key, &validation),
+                    bound.cloned(),
+                    credential.clone(),
+                )
             },
         )
         .map_err(|reason| {
@@ -467,6 +862,13 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
     }
 
     let subject = extract_subject_claim(&token_data.claims).map_err(|status| (status, None))?;
+    let admitted_at = Instant::now();
+    let authorization_deadline = authorization_deadline_from_verified_claims(
+        &token_data.claims,
+        SystemTime::now(),
+        admitted_at,
+    )
+    .map_err(|status| (status, None))?;
 
     let claim = extract_ns_claim(&token_data.claims).map_err(|status| (status, None))?;
     let claim_present = claim.is_present();
@@ -493,7 +895,40 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
     Ok(VerifiedGrpcIdentity {
         allowed_namespaces: AllowedNamespaces::resolved(claim_present, effective),
         subject,
+        authorization_deadline,
+        admitted_at,
+        credential,
+        credential_generation: 0,
     })
+}
+
+/// Convert the already verified `exp` claim into a monotonic deadline. This
+/// function never sees an unverified decode: callers pass only the claims from
+/// `jsonwebtoken::decode` after signature, issuer, required-claim, and time
+/// validation succeeded.
+fn authorization_deadline_from_verified_claims(
+    claims: &Value,
+    now_wall: SystemTime,
+    now_monotonic: Instant,
+) -> Result<Instant, Status> {
+    let exp = claims
+        .get("exp")
+        .and_then(Value::as_f64)
+        .filter(|exp| exp.is_finite() && *exp >= 0.0)
+        .ok_or_else(|| Status::unauthenticated("Invalid token: expiry claim is malformed"))?;
+    let now_wall = now_wall
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Status::internal("System clock is before the Unix epoch"))?
+        .as_secs_f64();
+    let remaining = (exp + GRPC_JWT_LEEWAY_SECONDS as f64 - now_wall).max(0.0);
+    // The independently enforced server ceiling is at most one day. Bounding
+    // this conversion avoids an `Instant` overflow for a hostile far-future
+    // NumericDate while preserving the exact effective deadline throughout
+    // every lifetime that the server could actually allow.
+    let bounded = remaining.min(MAX_GRPC_MAX_STREAM_LIFETIME_SECONDS as f64 + 1.0);
+    now_monotonic
+        .checked_add(Duration::from_secs_f64(bounded))
+        .ok_or_else(|| Status::unauthenticated("Invalid token: expiry is out of range"))
 }
 
 /// Pull the JWT `sub` claim. `sub` is already in the required-claim set, but

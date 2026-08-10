@@ -2169,7 +2169,6 @@ async fn fetch_remote_slice(
     tls_config: Option<&DpGrpcTlsConfig>,
     request_timeout: Duration,
 ) -> Result<crate::modes::mesh::slice::MeshSlice, String> {
-    use crate::grpc::dp_client::generate_dp_jwt_full_with_key_id;
     use crate::grpc::proto::MeshSubscribeRequest;
     use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
     use crate::modes::mesh::config_consumer::common::tonic_tls_config;
@@ -2207,15 +2206,13 @@ async fn fetch_remote_slice(
         // verification credentials must check this signature
         // (advisory GHSA-3f2j-wwqw-grmg); the audience keeps the token
         // non-transferable between peer clusters.
-        let auth_token = generate_dp_jwt_full_with_key_id(
-            jwt_secret.as_str(),
-            node_id,
-            jwt_secret.issuer(),
-            Some(namespace),
-            Some(audience),
-            jwt_secret.key_id(),
-        )
-        .map_err(|e| format!("mint remote CP JWT: {e}"))?;
+        // `GrpcJwtSecret::mint` also re-reads an externally issued token file
+        // on every polling/reconnect attempt. The external issuer owns its
+        // namespace and audience claims; a node must never decode or rewrite
+        // them locally.
+        let auth_token = jwt_secret
+            .mint(node_id, Some(namespace), Some(audience))
+            .map_err(|e| format!("mint remote CP JWT: {e}"))?;
         let token: MetadataValue<_> = format!("Bearer {auth_token}")
             .parse()
             .map_err(|e| format!("build auth metadata: {e}"))?;
