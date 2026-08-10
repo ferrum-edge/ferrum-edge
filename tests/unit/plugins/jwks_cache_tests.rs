@@ -470,7 +470,10 @@ async fn active_remote_trust_health_transitions_and_excludes_inactive() {
     super::jwks_auth_tests::wait_for_received_request_count(&server, 1).await;
     let populated = std::time::Instant::now() + Duration::from_secs(2);
     while !store.has_keys() {
-        assert!(std::time::Instant::now() < populated, "initial JWKS populate");
+        assert!(
+            std::time::Instant::now() < populated,
+            "initial JWKS populate"
+        );
         tokio::task::yield_now().await;
     }
 
@@ -479,7 +482,10 @@ async fn active_remote_trust_health_transitions_and_excludes_inactive() {
     let inactive = trust_health_snapshot();
     assert!(inactive.ready(tokio::time::Instant::now()));
     assert!(!inactive.degraded(tokio::time::Instant::now()));
-    assert_eq!((inactive.fresh, inactive.grace, inactive.expired), (0, 0, 0));
+    assert_eq!(
+        (inactive.fresh, inactive.grace, inactive.expired),
+        (0, 0, 0)
+    );
 
     retain_active_requirements(&HashMap::from([(
         uri.clone(),
@@ -529,11 +535,17 @@ async fn active_remote_trust_health_transitions_and_excludes_inactive() {
         .await;
     let before = store.refresh_completions();
     let fetched = store.fetch_keys().await;
-    assert!(fetched.is_ok(), "recovery refresh should succeed: {fetched:?}");
+    assert!(
+        fetched.is_ok(),
+        "recovery refresh should succeed: {fetched:?}"
+    );
     store.wait_for_refresh_completion_after(before).await;
     republish_trust_health();
     let recovered = trust_health_snapshot();
-    assert_eq!((recovered.fresh, recovered.grace, recovered.expired), (1, 0, 0));
+    assert_eq!(
+        (recovered.fresh, recovered.grace, recovered.expired),
+        (1, 0, 0)
+    );
     assert!(recovered.ready(tokio::time::Instant::now()));
     assert!(!recovered.degraded(tokio::time::Instant::now()));
 

@@ -126,7 +126,8 @@ static TRUST_HEALTH: OnceLock<arc_swap::ArcSwap<JwksTrustHealthAggregate>> = Onc
 static TRUST_HEALTH_WATCH_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn trust_health_slot() -> &'static arc_swap::ArcSwap<JwksTrustHealthAggregate> {
-    TRUST_HEALTH.get_or_init(|| arc_swap::ArcSwap::from_pointee(JwksTrustHealthAggregate::default()))
+    TRUST_HEALTH
+        .get_or_init(|| arc_swap::ArcSwap::from_pointee(JwksTrustHealthAggregate::default()))
 }
 
 fn ensure_trust_health_hook() {
