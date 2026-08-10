@@ -1083,7 +1083,10 @@ fn http_and_raw_tcp_listeners_sharing_a_port_both_report_conflicted() {
 
     // Reversed listener order must not change status.
     let mut reversed = objects.clone();
-    if let Some(listeners) = reversed[1].spec.get_mut("listeners").and_then(Value::as_array_mut)
+    if let Some(listeners) = reversed[1]
+        .spec
+        .get_mut("listeners")
+        .and_then(Value::as_array_mut)
     {
         listeners.reverse();
     }
@@ -1110,10 +1113,11 @@ fn http_and_raw_tcp_listeners_sharing_a_port_both_report_conflicted() {
             .get(&key)
             .unwrap_or_else(|| panic!("missing conflict for {listener}"));
         assert_eq!(conflict.reason, "ProtocolConflict");
-        assert!(
-            conflict.message.contains("incompatible protocol families"),
-            "status/translation message must describe the family refusal: {}",
-            conflict.message
+        assert_eq!(
+            conflict.message,
+            "Port 8080 is claimed by incompatible protocol families on the same TCP \
+             transport (HTTP-family vs raw stream), so every conflicting claim on this \
+             port is refused (Conflicted)."
         );
     }
     assert!(
