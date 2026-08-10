@@ -674,8 +674,7 @@ async fn verifier_rotation_revokes_only_streams_bound_to_removed_credentials() {
 #[tokio::test(start_paused = true)]
 async fn xds_revocation_preempts_already_buffered_sotw_and_delta_responses() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
-    let (addr, handle) =
-        start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
+    let (addr, handle) = start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
 
     let sotw_token = mint(
         TENANT_A_SECRET,
@@ -760,8 +759,7 @@ async fn xds_revocation_preempts_already_buffered_sotw_and_delta_responses() {
 #[tokio::test(start_paused = true)]
 async fn namespace_binding_narrowing_revokes_stream_using_the_old_ceiling() {
     let verifier = Arc::new(CpDpVerifierStore::new(tenant_a_broad_verifier()));
-    let (addr, handle) =
-        start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
+    let (addr, handle) = start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
     let token = mint(
         TENANT_A_SECRET,
         Some(TENANT_A),

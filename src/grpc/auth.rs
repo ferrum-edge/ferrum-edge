@@ -752,10 +752,8 @@ where
         if self.server_sleep.as_mut().poll(cx).is_ready() {
             return self.terminate(StreamAuthEndReason::ServerMaxLifetime);
         }
-        let verifier_revision = tokio_stream::Stream::poll_next(
-            Pin::new(&mut self.verifier_revisions),
-            cx,
-        );
+        let verifier_revision =
+            tokio_stream::Stream::poll_next(Pin::new(&mut self.verifier_revisions), cx);
         let revoked = match verifier_revision {
             Poll::Ready(Some(_)) => !self
                 .verifier
