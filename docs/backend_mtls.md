@@ -62,7 +62,7 @@ The gateway resolves backend CA trust in the following order:
 2. **Proxy-specific CA** (`backend_tls_server_ca_cert_path`) — verify with **only** that CA. Webpki/system roots are excluded to prevent public CAs from being trusted alongside your internal CA.
 3. **Global CA bundle** (`FERRUM_TLS_CA_BUNDLE_PATH` / `FERRUM_TLS_CA_BUNDLE_SOURCE`) — verify with **only** the global CA. Same exclusivity as proxy-specific.
 4. **Neither set** — verify with **bundled webpki roots** (secure default). The gateway does **not** skip verification when no CA is configured.
-5. **Explicit opt-out** — `backend_tls_verify_server_cert: false` on a per-proxy basis, or `FERRUM_TLS_NO_VERIFY=true` globally, skips all certificate verification. These are the **only** ways to disable verification and should never be used in production.
+5. **Explicit opt-out** — `backend_tls_verify_server_cert: false` on a per-proxy basis, or `FERRUM_TLS_NO_VERIFY=true` globally, skips all certificate verification. These are the **only** ways to disable verification and should never be used in production. Under `FERRUM_MESH_PRODUCTION_MODE=true`, the global `FERRUM_TLS_NO_VERIFY` / `FERRUM_ADMIN_TLS_NO_VERIFY` switches are **refused at startup/validate** (shared `EnvConfig` path, every mesh topology). FIPS enforce independently refuses them as well.
 
 ### `system://` — pinning the built-in trust anchors
 

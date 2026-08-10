@@ -5634,6 +5634,37 @@ impl EnvConfig {
                     }
                 }
                 if crate::identity::production_mode() {
+                    // Refuse gateway-wide TLS verification bypasses under
+                    // production mesh posture before any listener, service-
+                    // discovery poller, health check, plugin client, or admin
+                    // client can start. This is topology-independent (sidecar,
+                    // ambient, waypoints, east-west, egress) and lives in the
+                    // shared EnvConfig path used by both `validate` and runtime
+                    // startup. FIPS independently refuses the same switches;
+                    // keep that defense intact. Outside production the explicit
+                    // development opt-in still only warns (below).
+                    //
+                    // Offenders are collected in fixed name order so dual-flag
+                    // misconfigurations yield a deterministic diagnostic that
+                    // names every offending variable without echoing values.
+                    {
+                        let mut offenders: Vec<&'static str> = Vec::new();
+                        if self.tls_no_verify {
+                            offenders.push("FERRUM_TLS_NO_VERIFY");
+                        }
+                        if self.admin_tls_no_verify {
+                            offenders.push("FERRUM_ADMIN_TLS_NO_VERIFY");
+                        }
+                        if !offenders.is_empty() {
+                            return Err(format!(
+                                "FERRUM_MESH_PRODUCTION_MODE=true refuses TLS verification \
+                                 bypasses: {}. Disable the listed variable(s) and use verified \
+                                 TLS (system roots or FERRUM_TLS_CA_BUNDLE_PATH); these switches \
+                                 are development-only",
+                                offenders.join(", ")
+                            ));
+                        }
+                    }
                     if self.mesh_federation_poll_interval_seconds > 0
                         && self.mesh_federation_max_stale_seconds == 0
                     {

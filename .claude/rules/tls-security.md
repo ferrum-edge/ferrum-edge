@@ -61,6 +61,7 @@ paths:
 
 - Backend CA chain order is proxy `backend_tls_server_ca_cert_path`, then global `FERRUM_TLS_CA_BUNDLE_PATH`, then webpki/system roots.
 - Opt-out is explicit: `backend_tls_verify_server_cert: false` or `FERRUM_TLS_NO_VERIFY=true`.
+- Under `FERRUM_MESH_PRODUCTION_MODE=true`, `FERRUM_TLS_NO_VERIFY` and `FERRUM_ADMIN_TLS_NO_VERIFY` are refused in the shared `EnvConfig` validation path (every mesh topology; `validate` and runtime startup). Outside production they remain warning-only development opt-ins. FIPS enforce refuses them independently — do not weaken or topology-special-case that defense.
 - Proxy backend reqwest paths pass a fully built rustls `ClientConfig` through `use_preconfigured_tls(...)`; trust store construction stays in-house.
 - Custom CA is exclusive and replaces built-in roots. For reqwest use `.tls_certs_only([cert])`; for rustls start with `RootCertStore::empty()`.
 - Reqwest no-custom-CA helper clients use `rustls-platform-verifier` through the bundled `rustls` feature: macOS keychain, Windows cert store, then webpki fallback on Linux.

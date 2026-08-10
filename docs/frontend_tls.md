@@ -356,12 +356,12 @@ export FERRUM_ADMIN_TLS_NO_VERIFY="true"
 ### No-Verify Mode (Testing Only)
 
 #### **Purpose**
-The no-verify mode is designed for development, testing, and isolated environments where certificate verification is not practical.
+The no-verify mode is designed for development, testing, and isolated environments where certificate verification is not practical. Outside production it remains an explicit opt-in that logs a loud warning. Under `FERRUM_MESH_PRODUCTION_MODE=true`, both `FERRUM_TLS_NO_VERIFY` and `FERRUM_ADMIN_TLS_NO_VERIFY` are **refused** by the shared `EnvConfig` validation path used by `ferrum-edge validate` and runtime startup (every mesh topology). FIPS enforce independently refuses them as well.
 
 #### **Risks**
 - **Security Risk**: Disables ALL certificate verification
 - **Man-in-the-Middle**: Vulnerable to certificate spoofing attacks
-- **Production Warning**: NEVER use in production environments
+- **Production Warning**: NEVER use in production environments — mesh production mode and FIPS enforce fail closed rather than warning
 
 #### **Use Cases**
 ```bash
