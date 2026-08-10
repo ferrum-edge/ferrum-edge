@@ -986,7 +986,7 @@ fn listenerset_update_and_delete_withdraw_materialization() {
 }
 
 #[test]
-fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
+fn same_named_gateway_and_listenerset_tls_services_both_materialize() {
     let mut gateway = object(
         "Gateway",
         "shared",
@@ -1044,9 +1044,9 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
         translation.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .all(|service| service.name != "listenerset-shared-same")
+                .any(|service| service.name == "listenerset-shared-same")
         }),
-        "the non-winning ListenerSet must not emit its kind-scoped service"
+        "the ListenerSet must retain its own certificate-backed service now that frontend TLS is listener-scoped"
     );
     let status = translation
         .listenerset_statuses
@@ -1058,8 +1058,8 @@ fn same_named_gateway_service_cannot_program_unmaterialized_listenerset() {
         "the non-conflicting ListenerSet stays accepted"
     );
     assert!(
-        !status.programmed && status.programmed_listeners.is_empty(),
-        "a Gateway-owned mesh service with the same synthetic name must not program the ListenerSet"
+        status.programmed && status.programmed_listeners == ["same"],
+        "the independently certificate-backed ListenerSet listener must report Programmed"
     );
 }
 
@@ -1189,7 +1189,7 @@ fn listenerset_cross_namespace_secret_requires_listenerset_grant() {
 }
 
 #[test]
-fn cross_namespace_listenerset_cannot_revoke_parent_gateway_tls_slot() {
+fn cross_namespace_listenerset_extends_parent_gateway_tls_candidates() {
     let mut gateway = object(
         "Gateway",
         "edge",
@@ -1240,7 +1240,7 @@ fn cross_namespace_listenerset_cannot_revoke_parent_gateway_tls_slot() {
         .with_source_namespaces(vec!["gateway-ns".to_string(), "extension-ns".to_string()]);
     let translation = translate_k8s_objects(&objects, opts.clone()).expect("translate");
 
-    assert_eq!(translation.config.frontend_tls_namespace_sources.len(), 1);
+    assert_eq!(translation.config.frontend_tls_certificate_sources.len(), 2);
     assert_eq!(
         translation.config.frontend_tls_source_namespace.as_deref(),
         Some("gateway-ns")
@@ -1251,13 +1251,13 @@ fn cross_namespace_listenerset_cannot_revoke_parent_gateway_tls_slot() {
             .frontend_tls_cert_path
             .as_deref()
             .is_some_and(|path| path.starts_with("k8s://gateway-ns/gateway-cert#tls.crt?")),
-        "the parent Gateway must retain the physical TLS serving slot"
+        "the parent Gateway must remain the deterministic fallback"
     );
     assert!(translation.config.mesh.as_ref().is_some_and(|mesh| {
         mesh.services
             .iter()
             .any(|service| service.namespace == "gateway-ns" && service.name == "edge-https")
-            && !mesh.services.iter().any(|service| {
+            && mesh.services.iter().any(|service| {
                 service.namespace == "extension-ns"
                     && service.name == "listenerset-extra-https-extra"
             })

@@ -5615,7 +5615,7 @@ mod tests {
     /// shared `select_mesh_inbound_port_route` resolves them with no fork.
     #[test]
     fn mesh_ingress_port_group_selects_sibling_by_listener_port() {
-        use crate::modes::mesh::config::{MeshConfig, ResolvedIngressListener};
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, ResolvedIngressListener};
         // Two ingress listeners: listener 8080 → backend 5000, listener 8443 →
         // backend 6000. The backend ports deliberately do NOT equal the listener
         // ports, proving orig-dst matches the LISTENER port.
@@ -5637,6 +5637,7 @@ mod tests {
                         port: 8080,
                         endpoint_host: "127.0.0.1".to_string(),
                         endpoint_port: 5000,
+                        protocol: AppProtocol::Http,
                         endpoint_unix_path: None,
                         endpoint_unix_h2c: false,
                         owner_namespace: "default".to_string(),
@@ -5646,6 +5647,7 @@ mod tests {
                         port: 8443,
                         endpoint_host: "127.0.0.1".to_string(),
                         endpoint_port: 6000,
+                        protocol: AppProtocol::Http,
                         endpoint_unix_path: None,
                         endpoint_unix_h2c: false,
                         owner_namespace: "default".to_string(),
@@ -5703,7 +5705,7 @@ mod tests {
     /// must not absorb traffic addressed to a different port).
     #[test]
     fn mesh_ingress_single_listener_surfaces_listener_authz_port() {
-        use crate::modes::mesh::config::{MeshConfig, ResolvedIngressListener};
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, ResolvedIngressListener};
         let mut p =
             minimal_default_mesh_proxy_for_routing("__mesh-ingress-default-reviews-8443", "/");
         p.hosts = vec!["reviews".to_string()];
@@ -5715,6 +5717,7 @@ mod tests {
                     port: 8443,
                     endpoint_host: "127.0.0.1".to_string(),
                     endpoint_port: 8080,
+                    protocol: AppProtocol::Http,
                     endpoint_unix_path: None,
                     endpoint_unix_h2c: false,
                     owner_namespace: "default".to_string(),
@@ -5798,7 +5801,7 @@ mod tests {
     /// routed to the surviving sibling and absorbing the skipped listener's traffic.
     #[test]
     fn mesh_ingress_partial_materialization_fails_closed_without_signal() {
-        use crate::modes::mesh::config::{MeshConfig, ResolvedIngressListener};
+        use crate::modes::mesh::config::{AppProtocol, MeshConfig, ResolvedIngressListener};
         // Only listener 8080 resolved; listener 8443 was declared HTTP-family but
         // its endpoint was unroutable, so it is absent from local_ingress_listeners
         // yet counted in declared_ingress_http_ports.
@@ -5813,6 +5816,7 @@ mod tests {
                     port: 8080,
                     endpoint_host: "127.0.0.1".to_string(),
                     endpoint_port: 5000,
+                    protocol: AppProtocol::Http,
                     endpoint_unix_path: None,
                     endpoint_unix_h2c: false,
                     owner_namespace: "default".to_string(),
@@ -6126,6 +6130,42 @@ mod tests {
                 .mesh_tcp_inbound_entry("10.0.0.7:6381".parse().unwrap())
                 .is_none(),
             "raw-TCP inbound never routes by IP or nearby port alone"
+        );
+    }
+
+    #[test]
+    fn mesh_tcp_inbound_ingress_listener_matches_declared_port_not_backend() {
+        // Issue #3260: Sidecar ingress stream listeners key the inbound table by
+        // the declared listener port while dialing a possibly different
+        // defaultEndpoint backend.
+        use crate::modes::mesh::config::{MeshConfig, MeshInboundTcpRoute};
+
+        let ingress_route = MeshInboundTcpRoute {
+            match_port: 16379,
+            backend_addr: "127.0.0.1:6379".parse().unwrap(),
+            namespace: "default".to_string(),
+            service_name: "redis".to_string(),
+            service_fqdn: "redis.default.svc.cluster.local".to_string(),
+            tls_inspect: false,
+            first_bytes_inspect: false,
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                local_inbound_tcp_routes: vec![ingress_route],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let table = RouterCache::new(&config, 100).route_table_for_tests();
+        let entry = table
+            .mesh_tcp_inbound_entry("10.0.0.7:16379".parse().unwrap())
+            .expect("ingress listener port should route");
+        assert_eq!(entry.backend_addr, "127.0.0.1:6379".parse().unwrap());
+        assert!(
+            table
+                .mesh_tcp_inbound_entry("10.0.0.7:6379".parse().unwrap())
+                .is_none(),
+            "backend port alone must not select an ingress stream relay"
         );
     }
 

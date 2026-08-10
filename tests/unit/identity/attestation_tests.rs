@@ -7,7 +7,7 @@ use ferrum_edge::identity::attestation::{
     k8s_psat::{K8sPsatAttestor, K8sPsatAttestorConfig, TokenReviewResult, TokenReviewer},
     spiffe_jwt_svid::{JwtSvidAttestor, JwtSvidAttestorConfig, JwtSvidValidator},
     static_id::{StaticAttestor, StaticAttestorConfig},
-    unix::{UnixAttestor, UnixAttestorConfig, UnixIdentityRule},
+    unix::{UnixAttestor, UnixAttestorConfig, UnixIdentityRule, parse_identity_rule},
 };
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use std::sync::Arc;
@@ -403,4 +403,34 @@ async fn unix_attestor_rejects_rule_outside_trust_domain() {
         }],
     });
     assert!(matches!(result, Err(AttestError::Config(_))));
+}
+
+#[test]
+fn unix_attestor_rejects_sha256_only_identity_rule() {
+    let trust_domain = TrustDomain::new("td").unwrap();
+    let entry = format!(
+        "sha256:{}=spiffe://td/ns/foo/sa/shared-binary",
+        "a".repeat(64)
+    );
+
+    let result = parse_identity_rule(&entry, &trust_domain);
+
+    assert!(matches!(result, Err(AttestError::Config(message)) if message.contains("sha256-only")));
+}
+
+#[test]
+fn unix_attestor_rejects_programmatic_rule_without_uid() {
+    let trust_domain = TrustDomain::new("td").unwrap();
+    let result = UnixAttestor::new(UnixAttestorConfig {
+        trust_domain,
+        rules: vec![UnixIdentityRule {
+            require_uid: None,
+            require_binary_sha256: Some("a".repeat(64)),
+            spiffe_id: SpiffeId::new("spiffe://td/ns/foo/sa/shared-binary").unwrap(),
+        }],
+    });
+
+    assert!(
+        matches!(result, Err(AttestError::Config(message)) if message.contains("kernel-attested uid"))
+    );
 }

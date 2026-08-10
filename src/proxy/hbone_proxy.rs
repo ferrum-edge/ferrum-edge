@@ -29,6 +29,7 @@ use crate::config::types::{Proxy, UpstreamTarget};
 use crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK;
 use crate::load_balancer::LoadBalancerCache;
 use crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID;
+use crate::modes::mesh::MESH_INGRESS_HBONE_RELAY_PROXY_ID;
 use crate::plugins::{Direction, DisconnectCause, Plugin, RequestContext, TransactionSummary};
 use crate::request_epoch::RequestEpoch;
 use crate::retry;
@@ -421,6 +422,35 @@ fn inbound_hbone_relay_effective_destination_allowed(
     inbound_hbone_relay_destination_allowed(app_host, app_port, mesh)
 }
 
+/// Post-plugin re-check for a Sidecar `ingress[]` CONNECT remap (issue #3260).
+///
+/// The remapped relay is NOT covered by
+/// [`inbound_hbone_relay_effective_destination_allowed`]: its destination is the
+/// listener's `defaultEndpoint`, which need not be a declared workload port at
+/// all (that is the whole point of `defaultEndpoint`). Instead the effective
+/// destination must still be EXACTLY the mapping the declared listener resolves
+/// to in the live slice. A `mesh_route_dispatch` route override, an upstream
+/// selection, a mutated backend, or a listener withdrawn between synthesis and
+/// dial therefore all fail closed here, before the dial — this is strictly
+/// narrower than the ordinary open-relay guard, never a widening of it.
+///
+/// `listener_authz_port` is the DECLARED listener port stamped at synthesis. Its
+/// absence means the stamp was lost, which is itself a refusal: without it there
+/// is no mapping to re-check and `mesh_authz` could not have authorized on the
+/// listener port either.
+fn inbound_ingress_relay_effective_destination_allowed(
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+    mesh: Option<&crate::modes::mesh::config::MeshConfig>,
+    listener_authz_port: Option<u16>,
+) -> bool {
+    let (Some(mesh), Some(listener_port)) = (mesh, listener_authz_port) else {
+        return false;
+    };
+    let (app_host, app_port) = effective_hbone_backend_target(proxy, upstream_target);
+    mesh.sidecar_ingress_connect_relay_endpoint_matches(listener_port, app_host, app_port)
+}
+
 fn node_waypoint_inbound_relay_mark_enabled() -> bool {
     crate::config::conf_file::resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").is_some_and(|topology| {
         matches!(
@@ -548,20 +578,33 @@ pub(super) async fn handle_hbone_request(
         .await;
     }
 
-    if proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID
-        && !inbound_hbone_relay_effective_destination_allowed(
+    let relay_destination_denied = if proxy.id == MESH_INBOUND_HBONE_RELAY_PROXY_ID {
+        !inbound_hbone_relay_effective_destination_allowed(
             proxy,
             upstream_target.as_deref(),
             epoch.config.mesh.as_deref(),
         )
-    {
+    } else if proxy.id == MESH_INGRESS_HBONE_RELAY_PROXY_ID {
+        !inbound_ingress_relay_effective_destination_allowed(
+            proxy,
+            upstream_target.as_deref(),
+            epoch.config.mesh.as_deref(),
+            ctx.mesh_inbound_listener_authz_port,
+        )
+    } else {
+        false
+    };
+    if relay_destination_denied {
         let (app_host, app_port) =
             effective_hbone_backend_target(proxy, upstream_target.as_deref());
         warn!(
             proxy_id = %proxy.id,
             app_host,
             app_port,
-            "Rejected HBONE CONNECT whose effective destination is outside the open-relay guard"
+            listener_authz_port = ?ctx.mesh_inbound_listener_authz_port,
+            "Rejected inbound CONNECT whose effective destination is outside the relay guard \
+             (open-relay allowlist, or — for a Sidecar ingress[] remap — the exact declared \
+             listener → defaultEndpoint mapping)"
         );
         ctx.metadata.insert(
             "mesh_authz.deny_policy".to_string(),
@@ -1762,13 +1805,15 @@ mod tests {
     use super::{
         build_hbone_relay_summary, hbone_relay_body_outcome,
         inbound_hbone_relay_effective_destination_allowed,
+        inbound_ingress_relay_effective_destination_allowed,
         registered_pod_target_for_udp_destination, try_reserve_mesh_egress_udp_session,
     };
     use crate::config::types::{Proxy, UpstreamTarget};
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
     use crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID;
+    use crate::modes::mesh::MESH_INGRESS_HBONE_RELAY_PROXY_ID;
     use crate::modes::mesh::config::{
-        AppProtocol, MeshConfig, Workload, WorkloadPort, WorkloadSelector,
+        AppProtocol, MeshConfig, ResolvedIngressListener, Workload, WorkloadPort, WorkloadSelector,
     };
     use crate::plugins::{Direction, RequestContext};
     use crate::proxy::tcp_proxy::{StreamFirstFailure, StreamIoSide};
@@ -1869,6 +1914,78 @@ mod tests {
             &proxy,
             Some(&target("127.0.0.1", 9999)),
             Some(&mesh)
+        ));
+    }
+
+    /// Issue #3260: the Sidecar ingress CONNECT remap dials a `defaultEndpoint`
+    /// that need not be a declared workload port, so it has its OWN post-plugin
+    /// guard — strictly the exact declared mapping, and fail-closed without the
+    /// stamped listener port that also drives `mesh_authz`.
+    #[test]
+    fn ingress_relay_effective_destination_guard_requires_the_exact_declared_mapping() {
+        let mesh = MeshConfig {
+            local_ingress_listeners: vec![ResolvedIngressListener {
+                port: 16379,
+                endpoint_host: "127.0.0.1".to_string(),
+                endpoint_port: 6379,
+                protocol: AppProtocol::Redis,
+                endpoint_unix_path: None,
+                endpoint_unix_h2c: false,
+                owner_namespace: "default".to_string(),
+                owner_service: "redis".to_string(),
+            }],
+            sidecar_ingress_declared: true,
+            local_workload_addresses: vec!["10.244.1.7".parse().unwrap()],
+            ..MeshConfig::default()
+        };
+        let mut proxy = minimal_proxy();
+        proxy.id = MESH_INGRESS_HBONE_RELAY_PROXY_ID.to_string();
+        proxy.backend_host = "127.0.0.1".to_string();
+        proxy.backend_port = 6379;
+
+        assert!(inbound_ingress_relay_effective_destination_allowed(
+            &proxy,
+            None,
+            Some(&mesh),
+            Some(16379)
+        ));
+        // A route override / upstream selection outside the declared mapping.
+        assert!(!inbound_ingress_relay_effective_destination_allowed(
+            &proxy,
+            Some(&target("127.0.0.1", 5432)),
+            Some(&mesh),
+            Some(16379)
+        ));
+        assert!(!inbound_ingress_relay_effective_destination_allowed(
+            &proxy,
+            Some(&target("10.0.0.5", 6379)),
+            Some(&mesh),
+            Some(16379)
+        ));
+        // A lost listener-port stamp is itself a refusal: without it there is no
+        // mapping to re-check and `mesh_authz` could not authorize on it either.
+        assert!(!inbound_ingress_relay_effective_destination_allowed(
+            &proxy,
+            None,
+            Some(&mesh),
+            None
+        ));
+        // Withdrawal between synthesis and dial.
+        assert!(!inbound_ingress_relay_effective_destination_allowed(
+            &proxy,
+            None,
+            Some(&MeshConfig::default()),
+            Some(16379)
+        ));
+        let stale_listener_without_declaration = MeshConfig {
+            local_ingress_listeners: mesh.local_ingress_listeners.clone(),
+            ..MeshConfig::default()
+        };
+        assert!(!inbound_ingress_relay_effective_destination_allowed(
+            &proxy,
+            None,
+            Some(&stale_listener_without_declaration),
+            Some(16379)
         ));
     }
 

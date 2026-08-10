@@ -101,7 +101,7 @@ Ferrum's mesh subsystem is in active build-out. The paths below ship in one bina
 | Capability | Status | Notes |
 |---|---|---|
 | iptables capture (injector init container) | **Beta** | Requires `NET_ADMIN`/`NET_RAW`; rules applied at pod admission, restart needed to pick up new annotations. |
-| eBPF ambient capture | **Dev-only** | Requires a build with `--features ebpf`. The default published image has no aya loader, but enabled eBPF node-agent mode now refuses the mock backend before readiness (`capture_state="unavailable"`, degraded reason `ebpf_feature_disabled`). Helm renders the Linux-only `-ebpf` image variant (`ferrumedge/ferrum-edge:<tag>-ebpf` / `ghcr.io/ferrum-edge/ferrum-edge:<tag>-ebpf`) automatically for `nodeAgent.captureMode=ebpf`, and for the ambient/NodeWaypoint proxy when it is configured for eBPF or `FERRUM_MESH_TOPOLOGY=node_waypoint`. Real capture needs kernel **≥ 5.7** with cgroup v2 and, on kernel **≥ 5.8**, `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`; on the **5.7.x** window use `CAP_SYS_ADMIN` + `CAP_NET_ADMIN`. `node_waypoint` mode also needs `CAP_SYS_ADMIN` on modern kernels for pod-netns `setns()`/veth discovery, so the chart adds it automatically for that topology. The NodeWaypoint ambient proxy additionally receives host PID visibility plus read-only host cgroup and bpffs mounts so it can resolve pod netns, open node-agent-pinned maps, and write per-pod ready markers only after its in-netns listener is attached. CI builds the BPF object (`build-ebpf`), compiles the userspace loader (`build-ebpf-userspace`), load/attach-tests programs on a real kernel (`ebpf-live`), and runs the Docker/kind multi-pod datapath gate (`node-waypoint-ebpf-live`) for capture/identity/chart changes. Inbound TC redirect is deferred; the destination tc direct-inbound guard is implemented, and the iptables fallback is node-global and needs a custom runtime image with `/bin/sh` + `iptables`. |
+| eBPF ambient capture | **Dev-only** | Requires a build with `--features ebpf`. The default published image has no aya loader, but enabled eBPF node-agent mode now refuses the mock backend before readiness (`capture_state="unavailable"`, degraded reason `ebpf_feature_disabled`). Helm renders the Linux-only `-ebpf` image variant (`ferrumedge/ferrum-edge:<tag>-ebpf` / `ghcr.io/ferrum-edge/ferrum-edge:<tag>-ebpf`) automatically for `nodeAgent.captureMode=ebpf`, and for the ambient/NodeWaypoint proxy when it is configured for eBPF or `FERRUM_MESH_TOPOLOGY=node_waypoint`. Real capture needs kernel **≥ 5.7** with cgroup v2 and, on kernel **≥ 5.8**, `CAP_BPF`/`CAP_NET_ADMIN`/`CAP_PERFMON`; on the **5.7.x** window use `CAP_SYS_ADMIN` + `CAP_NET_ADMIN`. `node_waypoint` mode also needs `CAP_SYS_ADMIN` on modern kernels for pod-netns `setns()`/veth discovery, so the chart adds it automatically for that topology. The NodeWaypoint ambient proxy additionally receives host PID visibility plus read-only host cgroup and bpffs mounts so it can resolve pod netns, open node-agent-pinned maps, and write per-pod ready markers only after its in-netns listener is attached. CI builds the BPF object (`build-ebpf`), compiles the userspace loader (`build-ebpf-userspace`), load/attach-tests programs on a real kernel (`ebpf-live`), and runs the Docker/kind multi-pod datapath gate (`node-waypoint-ebpf-live`) for capture/identity/chart changes. The opt-in NodeWaypoint inbound tc redirect is implemented and fail-closed; the destination tc direct-inbound guard is also implemented, while the iptables fallback remains node-global and needs a custom runtime image with `/bin/sh` + `iptables`. |
 | orig-dst → proxy identity bridge (node-waypoint) | **Experimental** | `src/ebpf/orig_dst_bridge.rs` mirrors socket-cookie records into the resolver (+ installs a synchronous accept-path fallback); the **accept-side cookie bridge (GAP-2M) is implemented** in the kernel `sock_ops` program (re-keys orig-dst by connection tuple, re-stamps under the accept-side cookie), and **per-pod identity enrollment is wired** (hash-join of the slice's `workload_spiffe_hash`→SPIFFE index against the eBPF-stamped `(pod_uid, hash)`), so resolution is complete end-to-end with no further proxy-side change — **IPv4 and IPv6**: both bridge paths handle `AF_INET` and `AF_INET6` (v6 ctx address words read element-by-element with verifier-safe volatile loads into `FERRUM_ORIG_DST_BY_TUPLE6`), and the in-netns manager now binds both pod-loopback families. The userspace resolver merges both families by socket cookie. The `node-waypoint-ebpf-live` workflow validates IPv4 and IPv6 end-to-end capture; tuple/byte-order/enrollment misses fail closed (never misattribute), including a cached pod whose workload a later slice removes because `resolve_record` re-validates against the current slice index on every resolve. |
 
 ### Identity / CA maturity
@@ -138,6 +138,20 @@ This section consolidates every known residual gap so operators do not have to r
 - **Node-waypoint destination metadata** — each mesh `Workload` can carry an optional `node_waypoint` object with `address`, `hbone_port` (default `15008`), expected NodeWaypoint `spiffe_id`, and optional `node_name`, `node_uid`, `network`, and `cluster`. Kubernetes pod discovery populates this object for service-backed workloads when their node has a ready host-network NodeWaypoint proxy pod in `FERRUM_K8S_CONTROLLER_NAMESPACE` with `app.kubernetes.io/name=ferrum-mesh-ambient`, service account `ferrum-mesh`, and `FERRUM_MESH_TOPOLOGY=node_waypoint`; scoped workload watches still include that trusted namespace for Pod discovery. The Helm chart sets `FERRUM_K8S_CONTROLLER_NAMESPACE` to the release namespace and requires the ambient NodeWaypoint admin health listener to stay enabled so the DaemonSet has a real readiness probe. The endpoint address comes from the proxy pod IP, `hbone_port` comes from `FERRUM_MESH_HBONE_LISTEN_ADDR` when present (then the named `hbone` container port, then default `15008`), and the expected peer identity comes from `FERRUM_MESH_WORKLOAD_SPIFFE_ID` when present (then the proxy pod's service account SPIFFE ID). Captured Service targets consume this metadata when present: they select the workload first, keep the workload app address and port as the inner CONNECT authority, dial the hosting node's NodeWaypoint endpoint via `mesh.hbone_dial_host`, and pin `mesh.hbone_peer_spiffe_id` instead of synthesizing `podIP:15008`. When the source NodeWaypoint runtime has file SVID material or a mesh CA backend (required by production mode), metadata-absent targets are skipped so the Service route fails closed instead of retaining a plaintext backend. Explicit no-CA/no-identity development runs keep the temporary plaintext fallback; the required live gate uses SPIRE-backed production mode instead.
 - **Node-waypoint UDP/DTLS stream authz is mesh-wide-only** — TCP stream connections through a node-waypoint proxy now scope per source pod via `resolve_node_waypoint_stream_scope()` (socket-cookie → pod identity → `PolicyScopeCache`); when the connect-side resolver returns no identity, the connection fails closed with 403 if any namespace/selector-scoped `AuthorizationPolicy` exists in the mesh (else falls through to mesh-wide-only evaluation). **UDP/DTLS** scope is unresolvable by architecture — eBPF capture is `connect()`-hooked and TCP-only, and a UDP proxy demuxes all clients off one shared frontend socket — so UDP node-waypoint authz is always mesh-wide-only. NodeWaypoint slice preparation accepts scoped policy updates but disables UDP/DTLS service ports and UDP/DTLS proxies when enforcing namespace/selector-scoped policies exist, so UDP/DTLS fails closed instead of continuing under stale no-policy config; mesh-wide policies still evaluate, and audit-only scoped policies do not force suppression.
 - **Inbound TC ingress redirect implemented (IPv4 + IPv6), opt-in and live-gated** — `ferrum_tc_ingress_redirect` (`ebpf/ferrum-ebpf/src/tc_ingress_redirect.rs`) is a tc **ingress** classifier attached to the node capture interfaces named by `FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES` (unset = off, and the whole datapath stays inert). It steers inbound TCP for enrolled workloads into a dedicated **transparent inbound capture listener** with `bpf_sk_assign()` instead of a node-global `nat PREROUTING -j REDIRECT`. **The steer target is NOT the HBONE listener**: HBONE (`:15008`) terminates authenticated HTTP/2 CONNECT over verified mesh mTLS, while captured traffic is ordinary application bytes (possibly the app's own TLS), and `IP_TRANSPARENT` preserves addresses rather than transforming payloads. The capture listener is a separate protocol boundary bound on `FERRUM_MESH_INBOUND_LISTEN_ADDR` (default `0.0.0.0:15006`, unused by NodeWaypoint otherwise) — the single source of truth for the port on both the proxy and the node-agent — and it terminates nothing. **Scope is per workload and per port**: the destination must be in `FERRUM_POD_IPS`/`FERRUM_POD_IPS6` carrying `POD_CAPTURE_FLAG_INBOUND_REDIRECT`, *and* the exact `(pod address, destination port)` pair must be in `FERRUM_POD_INBOUND_PORTS`/`FERRUM_POD_INBOUND_PORTS6` (derived from the pod's declared `containerPorts`); anything else is returned untouched, so unenrolled traffic is never captured. **IPv4 fragments are declined before any port is read** (More-Fragments or non-zero offset), because a non-first fragment's payload bytes would otherwise be parsed as ports and could be made to match a declared pair; IPv6 extension/fragment chains likewise pass through unparsed. **Original destination metadata is preserved without NAT** — addresses are never rewritten, so the capture listener's accepted socket reports the workload's real `podIP:appPort` from `getsockname()` with no conntrack table and no reverse NAT; that one listener (and no other) binds `IP_TRANSPARENT`/`IPV6_TRANSPARENT` on a wildcard address so its replies may be sourced from the captured pod address. **Security posture on the capture path is DESTINATION-EXACT**, because one capture listener serves every enrolled pod on the node: the recovered destination must resolve to exactly one workload in a dedicated **NodeWaypoint capture destination inventory** (address match plus a port the workload declares — no match, an empty inventory, or two records claiming the address with divergent identity all close the connection), and both gates that follow are then properties of *that* workload rather than of the listener. Direct captured plaintext is admitted only where **that workload's own** effective PeerAuthentication posture on the captured app port permits it — resolved from its namespace/labels with the canonical resolver, deliberately not from the listener-wide per-port table, so a `PERMISSIVE` pod can never admit plaintext to a `STRICT` pod sharing the app port; `STRICT` still requires verified mesh transport and refuses direct plaintext.
+
+  **Topology-readiness contract.** The explicit ingress interface set is proved
+  from complete remote PodCIDR/InternalIP route evidence, independent of a
+  peer's transient Ready health; incomplete non-Ready joining/rebooting/draining
+  Nodes are ignored, while incomplete `Ready=True` evidence fails closed. No
+  usable remote evidence (including a single-node cluster) reports
+  `no_remote_topology_evidence`; leave the redirect option unset when there is
+  no off-node path. Route ingestion observes only the procfs main IPv4/IPv6
+  tables, so alternate policy routing and encapsulating CNIs whose inner and
+  outer devices differ are unsupported and remain failed closed. When proof is
+  lost, the node-agent disarms the redirect map, withdraws health/capture
+  readiness, and rejects CNI ADD/CHECK/STATUS. The direct-pod guard remains
+  fail-closed, so existing enrolled workloads can be unreachable until the same
+  explicit proof recovers; capture is never widened or failed open.
 
   **Cross-namespace destination policy (issue #3287).** A NodeWaypoint is typically deployed in an infrastructure namespace (`ferrum`) while the pods it captures for live in application namespaces (`payments`). The ordinary slice views — `workloads`, `peer_authentications` — are narrowed to the subscription namespace, so they can neither name a cross-namespace destination nor carry that destination's `PeerAuthentication`; resolving against them would see no policy and fall back to Istio's `PERMISSIVE` default, admitting direct plaintext to a `STRICT` pod. The capture path therefore consumes **two dedicated, least-privilege slice fields** instead:
 
@@ -1910,14 +1924,104 @@ Istio's `Sidecar` resource has an `ingress[]` block letting a workload declare c
 
 ### Materialization model
 
-Each modeled ingress entry becomes one inbound loopback route:
+Each modeled ingress entry becomes one inbound forward path on the shared
+`:15006` capture listener:
 
-- **hosts** — the union of the local workload's own service FQDN variants (`{name}`, `{name}.{ns}`, `{name}.{ns}.svc`, `{name}.{ns}.svc.{cluster_domain}`). Istio only configures ingress "if and only if the workload is associated with a service"; when no local service resolves (e.g. EndpointSlice lag), the listener is dropped fail-closed (no host-less catch-all route).
+- **HTTP-family** (`http`/`http2`/`grpc`/`https`) — one host-routed loopback
+  route (same sibling machinery as the default service-port inbound routes).
+- **Stream-family** (`tcp`/`tls`/database protocols; issue #3260) — one
+  raw-TCP inbound relay in `local_inbound_tcp_routes`, keyed by the declared
+  listener port and forwarding to `defaultEndpoint`. PeerAuthentication and
+  AuthorizationPolicy still apply on the capture listener / L4 stream chain;
+  authz uses the declared listener port (not the backend port).
+
+Shared fields for both lanes:
+
+- **hosts** (HTTP only) — the union of the local workload's own service FQDN variants (`{name}`, `{name}.{ns}`, `{name}.{ns}.svc`, `{name}.{ns}.svc.{cluster_domain}`). Istio only configures ingress "if and only if the workload is associated with a service"; when no local service resolves (e.g. EndpointSlice lag), the listener is dropped fail-closed (no host-less catch-all route).
 - **backend** — the entry's `defaultEndpoint`, resolved to a loopback `host:port` (see supported forms below).
-- **listen path** — `/` (the route is selected by host, then disambiguated by port).
-- **port disambiguation** — on Ferrum's shared `:15006` inbound listener, the captured original destination (the port the client dialed) **and** a peer sidecar's request authority are matched against the **declared listener port** (not the `defaultEndpoint` port, which is the separate forward target). This reuses `select_mesh_inbound_port_route`: multiple ingress listeners on one workload are siblings disambiguated by listener port, and a request that addresses no declared listener port fails closed with `502` rather than being routed to an arbitrary backend.
+- **listen path** (HTTP only) — `/` (the route is selected by host, then disambiguated by port).
+- **port disambiguation** — on Ferrum's shared `:15006` inbound listener, the captured original destination (the port the client dialed) **and** (HTTP) a peer sidecar's request authority are matched against the **declared listener port** (not the `defaultEndpoint` port, which is the separate forward target). HTTP reuses `select_mesh_inbound_port_route`; stream reuses the `mesh_tcp_inbound` orig-dst table. A request that addresses no declared listener port fails closed rather than being routed to an arbitrary backend.
+- **authorization port** — `mesh_authz` authorizes an ingress listener on its **declared listener port** (e.g. `8443`), not the `defaultEndpoint` backend port (e.g. `8080`). An `AuthorizationPolicy` `to.operation.ports` / `when: destination.port` rule scoped to the listener port therefore matches; authorizing on the backend port would let an ALLOW miss and — worse — a port-scoped **DENY fail open**. (Service-port default inbound routes keep authorizing on the container/backend port, matching Istio inbound authz.)
 
-- **authorization port** — `mesh_authz` authorizes an ingress listener on its **declared listener port** (e.g. `8443`), not the `defaultEndpoint` backend port (e.g. `8080`). An `AuthorizationPolicy` `to.operation.ports` / `when: destination.port` rule scoped to the listener port therefore matches; authorizing on the backend port would let an ALLOW miss and — worse — a port-scoped **DENY fail open**. (Service-port default inbound routes keep authorizing on the container/backend port, matching Istio inbound authz.) The listener port is stamped onto the request at port selection and read by authz; if it is somehow unavailable for an ingress route, authz fails closed (it never falls back to the backend port).
+### Two inbound arrival shapes (both remap to `defaultEndpoint`)
+
+A stream ingress listener is reachable two ways, and both must forward to the
+declared `defaultEndpoint` — not to the listener port:
+
+1. **Direct plaintext capture.** iptables REDIRECT steers the connection into
+   the `:15006` capture listener; `SO_ORIGINAL_DST` recovers the **declared
+   listener port**, which selects the `local_inbound_tcp_routes` entry and
+   relays to `defaultEndpoint`. Stream `mesh_authz` authorizes on the recovered
+   original-destination port (the listener port).
+2. **Identity-protected mesh-mTLS CONNECT.** A peer sidecar's raw-TCP egress
+   opens a **fresh SVID-mTLS HTTP/2 CONNECT** to `:15006` whose `:authority` is
+   the destination `pod-ip:<declared listener port>`. This never touches the
+   REDIRECT capture table, so it is resolved at the CONNECT boundary instead
+   (`build_inbound_hbone_relay_proxy` →
+   `MeshConfig::resolve_sidecar_ingress_connect_relay`): the authority is
+   remapped onto the listener's validated loopback `defaultEndpoint`
+   (`pod-ip:16379` → `127.0.0.1:6379`), and the **declared listener port** is
+   stamped onto the request so `mesh_authz` authorizes on it exactly as in the
+   HTTP ingress case. PeerAuthentication resolves on the `defaultEndpoint` app
+   port on both shapes (direct capture translates the listener port through the
+   pre-handshake alias table; the CONNECT remap arrives with that port already).
+
+The CONNECT remap is deliberately narrow and fails closed before any dial:
+
+- Only for a **byte-stream** CONNECT. A datagram-over-CONNECT (`connect-udp`)
+  is excluded — `ingress[]` stream listeners are TCP and UDP behavior is
+  unchanged.
+- The `:authority` host must belong to the unambiguously resolved local-service
+  workload set **and equal the accepted connection's concrete local IP**. The
+  second check is what distinguishes this pod from sibling replicas that share
+  the same service identity. A sibling replica's IP, a bare loopback authority,
+  or a service FQDN sharing the port number is refused; an unavailable accepted
+  local address also fails closed.
+- Exactly **one** valid, owner-stamped, **stream-family** listener must be
+  declared on that port. Ambiguity (two entries on one port), a missing owner
+  stamp, an off-box/`:0`/unmodeled-protocol endpoint, and an HTTP-family
+  listener are all refused rather than dialed.
+- A declared port that fails any of the above returns a route miss — it never
+  falls back to dialing the listener port the operator replaced.
+- After the plugin chain, the **effective** destination is re-checked against
+  the same declared mapping, so a `mesh_route_dispatch` route override or an
+  upstream selection cannot widen it (and a listener withdrawn between
+  synthesis and dial fails closed).
+- Once an `ingress` block is declared, it replaces the workload's ordinary
+  inbound CONNECT surface as well as its materialized service-port routes.
+  Unlisted ports and explicit-empty, all-unsupported, or carrier-rejected
+  listener sets are refused rather than falling through to the transparent
+  relay. With no declared `ingress` block, ordinary Ambient/Waypoint relay
+  behavior is unchanged.
+- The remap is **`Sidecar`-topology only**, matching the inbound materializer it
+  gates. `FERRUM_MESH_SIDECAR_ENFORCED` is topology-independent, so an
+  Ambient/Waypoint proxy in a mesh that also runs sidecars can receive a slice
+  whose applicable `Sidecar` declares `ingress[]`. Those topologies materialize
+  no inbound routes at all and serve every authenticated inbound through the
+  transparent relay, so the declaration marker is not back-projected there and
+  their relay behavior is unchanged.
+
+#### Live datapath coverage
+
+Two `#[ignore]`d functional tests in `tests/functional/functional_mesh_mode_test.rs`
+drive the shipped `ferrum-edge` binary over this lane (data-plane CI shard):
+
+- `functional_mesh_sidecar_ingress_stream_connect_relays_declared_listener_port`
+  — a Sidecar consuming a slice with one already-resolved stream
+  `local_ingress_listeners` entry. A real SVID-mTLS bare HTTP/2 CONNECT naming
+  `127.0.0.1:<declared listener port>` is relayed to the listener's
+  `defaultEndpoint`, proven by that backend's reply tag rather than the decoy
+  bound on the declared port itself. A CONNECT naming a declared workload port
+  the `ingress[]` block omits is refused, even though a live backend is
+  listening there and the ordinary open-relay guard would have admitted it.
+- `functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener`
+  — the same datapath under `FERRUM_MESH_CONFIG_PROTOCOL=file` with
+  `FERRUM_MESH_SIDECAR_ENFORCED=true`, so the data plane runs the real
+  `Sidecar.ingress[]` resolution and SIGHUP is a deterministic in-test config
+  refresh. An `AuthorizationPolicy` DENY scoped to the **declared listener
+  port** rejects the CONNECT with 403 (authorizing on the `defaultEndpoint`
+  backend port would let it fail open), and a reload that declares a different
+  listener fails the withdrawn port closed while the new one serves.
 
 ### Precedence vs. the default inbound listeners (fail-closed)
 
@@ -1925,7 +2029,9 @@ Per Istio, when `ingress` is **declared** it **replaces** the workload's default
 
 **Omitted vs. explicit-empty `ingress` (Istio-faithful):** an **omitted** `ingress` block keeps the automatic per-service-port inbound defaults, while a **declared** `ingress` — *including an explicit empty `ingress: []`* — configures the workload's inbound listeners explicitly and replaces those defaults. So `ingress: []` suppresses the default inbound routes (the operator declared "no custom inbound listeners"), the same as a non-empty-but-all-unsupported list; it does **not** fall back to the service-port defaults. The K8s translator records `ingress` presence (mirroring `egress`'s omitted-vs-explicit-empty distinction); on the native source a non-empty list always declares, and an explicit `ingress_declared: true` carries the empty-but-declared case. Only a workload whose applicable `Sidecar` **omits** `ingress` entirely keeps the default service-port inbound behavior. This avoids any silent host+path conflict — the two never coexist for one workload. The "ingress was declared" marker is tracked separately from the resolved-listener list and rides its own ECDS carrier so it survives an empty resolved list on the xDS path.
 
-The resolved listeners that ride the slice are **re-validated before dialing**: a `local_ingress_listeners` entry can arrive already resolved over the xDS/native carrier, so the materializer (and the router's sibling grouping) re-check each carried backend against the same allowlists `MeshSidecarIngress::resolve` enforces — a loopback host + nonzero port for a TCP backend, or an admissible absolute socket path for a `unix://` backend. A malformed or hostile carrier pointing a listener at an off-box host, a `:0` backend, or a traversal-like socket path is dropped fail-closed (never dialed), so the carrier path enforces the same invariant as CP-side resolution. A carrier that sets **both** shapes (a `host:port` alongside a socket path) is refused outright, so a TCP fallback can never ride along with a Unix backend.
+The resolved listeners that ride the slice are **re-validated before dialing**: a `local_ingress_listeners` entry can arrive already resolved over the xDS/native carrier, so the materializer (and the router's sibling grouping) re-check each carried backend and protocol against the same allowlists `MeshSidecarIngress::resolve` enforces — a modeled HTTP/stream protocol plus loopback host + nonzero port for a TCP backend, or a modeled HTTP-family protocol plus an admissible absolute socket path for a `unix://` backend. A malformed or hostile carrier pointing a listener at an off-box host, a `:0` backend, an unmodeled protocol, or a traversal-like socket path is dropped fail-closed (never dialed), so the carrier path enforces the same invariant as CP-side resolution. A carrier that sets **both** backend shapes (a `host:port` alongside a socket path) is refused outright, so a TCP fallback can never ride along with a Unix backend.
+
+The carrier's `protocol` field has **no compatibility default**: an omitted `protocol` decodes to `Unknown` and is therefore inert on both lanes, exactly like an explicit `udp`/`unknown`. For Unix backends, the carried HTTP protocol must also agree with the h2c marker derived at resolution. A carrier that cannot consistently say what a listener speaks never gets one — it must not silently become a live listener on the declared port.
 
 ### Supported and deferred `defaultEndpoint` forms
 
@@ -1939,8 +2045,10 @@ The resolved listeners that ride the slice are **re-validated before dialing**: 
 | `unix:///absolute/path.sock` | Modeled **only when the path sits under a configured `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` entry** (default: none, so refused). Dispatched over a `tokio::net::UnixStream` — HTTP/1.1 or h2c per the declared `port.protocol` (see "Unix-socket backends" below). |
 | `unix://` with an inadmissible path (relative, `.`/`..` component, `//`, trailing `/`, NUL / control character, > 103 bytes, surrounding whitespace) | **Deferred** — the `deferred_fields` entry names the exact rule that was broken; the operator-supplied path is never echoed back. A path that is *syntactically* fine but outside the data plane's containment roots is refused at materialization instead (the control plane cannot see the data plane's allowlist). |
 | Arbitrary off-box IP (`10.0.0.5:PORT`) | **Deferred** — Istio forbids arbitrary IPs; Ferrum's loopback-only model will not dial off-box. |
-| Non-HTTP-family `port.protocol` (`tcp`/`tls`/`mongo`/…) | **Deferred** — raw-TCP inbound has no Host/route and is not modeled here. |
-| Missing or **unrecognized** `port.protocol` (e.g. a `HTPS` typo) | **Deferred** — a custom inbound listener routes only *recognized* HTTP-family protocols; a missing protocol (Istio defaults an unset port to TCP) or a mistyped string is **not** guessed as HTTP and is reported as a deferred non-HTTP listener, so it is never exposed on the HTTP request path. (The service-port default path keeps the `unknown → HTTP` convention for auto-discovered ports; this stricter rule applies only to explicitly declared `ingress[]` listeners. On the native source a mistyped `protocol` fails deserialization outright.) |
+| Non-HTTP-family `port.protocol` (`tcp`/`tls`/`mongo`/…) with a supported loopback `defaultEndpoint` | **Modeled** (issue #3260) — materializes a raw-TCP inbound relay keyed by the declared listener port, forwarding to `defaultEndpoint`. Authz uses the listener port. |
+| Missing `port.protocol` (K8s) | **Modeled as TCP** — Istio defaults an unset port protocol to TCP; Ferrum stream-models it the same way (never guesses HTTP). |
+| Unrecognized `port.protocol` (e.g. a `HTPS` typo) | **Deferred** — never guessed as HTTP or as a live TCP listener. (On the native source a mistyped `protocol` fails deserialization outright.) |
+| `Udp` `port.protocol` | **Deferred** — not a REDIRECT-captured TCP stream lane. |
 | Omitted / empty `defaultEndpoint` | **Deferred** — Istio allows omitting it (the native model also accepts an omitted field, defaulting to empty); with no forward target there is nothing to route. |
 
 The status writer reports the count of modeled listeners as `status.ferrum.translation.ingress_modeled` and lists deferral reasons in `deferred_fields`. The HTTP-family classification is shared by translation/resolution and the status writer (one predicate), so a modeled listener is never falsely reported as a deferred non-HTTP listener (and vice-versa). A listener `port` of `0` is a hard validation error (rejected), not a deferral.
@@ -2018,11 +2126,11 @@ Connections are **not pooled** — each request dials its own socket and closes 
 
 A listener that is edited, replaced, or deleted takes effect on the next slice apply exactly like a TCP one: the materialized route and its backing upstream are rebuilt from the new slice, so a removed listener stops routing (leaving no orphaned upstream) and a re-pointed one dials the new socket with no restart.
 
-**Fail-closed transport gate.** The socket path rides the reserved `mesh.unix_socket` tag on the materialized upstream's single target — the same mechanism `mesh.hbone` / `mesh.mtls` use, and the same reserved `mesh.` namespace that is stripped from every operator/workload label copy, so a pod label can never forge it. A target carrying the tag is dialed over a Unix stream **or the request is refused**; it is never downgraded to the target's placeholder `host:port` (which nothing listens on).
+**Fail-closed transport gate.** The socket path rides the reserved `mesh.unix_socket` tag on the materialized upstream's single target — the same mechanism `mesh.hbone` / `mesh.mtls` use, and the same reserved `mesh.` namespace that is stripped from every operator/workload label copy, so a pod label can never forge it. Operator-provided upstream targets are also forbidden from setting any `mesh.*` tag through admin create/update, API-spec import, restore, or file configuration; only Ferrum's trusted mesh projection may stamp those transport markers. A target carrying the tag is dialed over a Unix stream **or the request is refused**; it is never downgraded to the target's placeholder `host:port` (which nothing listens on).
 
 ### `bind` and `captureMode` limitations
 
-- **`bind`** — Ferrum's capture model funnels all inbound through the shared `:15006` listener (matched by captured original destination = the dialed listener port), so a custom `bind` address does **not** open a separate OS listener; it is preserved on the parsed model for observability. Unix-socket `bind` values are invalid (Istio rejects them too).
+- **`bind`** — Ferrum's capture model funnels all inbound through the shared `:15006` listener (matched by captured original destination = the dialed listener port), so a custom `bind` address does **not** open a separate OS listener; it is preserved on the parsed model for observability. Unix-socket `bind` values are invalid (Istio rejects them too). **Issue #3266** tracks dedicated bind-address socket materialization separately; stream-ingress modeling (#3260) intentionally keeps this capture-listener contract and does not absorb custom-bind behavior.
 - **`captureMode`** — Ferrum assumes `IPTABLES`/`DEFAULT` capture (the sidecar redirect model). `captureMode: NONE` (the app handles capture itself) is not separately honored; the listener-port disambiguation relies on the captured original destination or the request authority port being present.
 
 ### xDS / file / native parity
@@ -2619,7 +2727,7 @@ The container runs as `FERRUM_MESH_PROXY_UID` (default 1337) with `allowPrivileg
 |---|---|
 | `explicit` (default) | No automatic capture; applications must explicitly route to the proxy |
 | `iptables` | Inject init container with `NET_ADMIN`/`NET_RAW` capabilities that sets up iptables rules to redirect traffic through the sidecar (inbound to 15006, outbound to 15001) |
-| `ebpf` | eBPF-based capture handled by a node-level agent (requires kernel 5.7+). The injector does not inject a privileged init container for this mode -- the node agent's DaemonSet manages eBPF program attachment. Capture planning infrastructure (`EbpfPlan` with iptables fallback for pre-5.7 kernels) is available in `src/capture/mod.rs` for the node agent path. **Build requirement:** real eBPF attachment needs a binary built with the Cargo `ebpf` feature (`cargo build --features ebpf`, Linux only; Docker `--build-arg FEATURES=cloud-secrets,ebpf`). The **default published image uses a no-op mock backend** (`MockEbpfBackend`) that attaches nothing and sets `ferrum_mesh_node_topology_degraded` — see [Maturity and Support Status](#maturity-and-support-status) |
+| `ebpf` | eBPF-based capture handled by a node-level agent (requires kernel 5.7+). The injector does not inject a privileged init container for this mode -- the node agent's DaemonSet manages eBPF program attachment. Capture planning infrastructure (`EbpfPlan` with iptables fallback for pre-5.7 kernels) is available in `src/capture/mod.rs` for the node agent path. **Build requirement:** real eBPF attachment needs a binary built with the Cargo `ebpf` feature (`cargo build --features ebpf`, Linux only; Docker `--target runtime-ebpf --build-arg FEATURES=cloud-secrets,ebpf`). The **default published image uses a no-op mock backend** (`MockEbpfBackend`) that attaches nothing and sets `ferrum_mesh_node_topology_degraded` — see [Maturity and Support Status](#maturity-and-support-status) |
 
 #### UDP TPROXY capture (F3 §3.3, flag-gated, Stages 2–4 — capture rules + listener + datagram-over-mesh egress, dual-transport)
 
@@ -3263,7 +3371,7 @@ The socket is a credential-adjacent surface — whoever can replace it can imper
 
 **What is not claimed.** A POSIX Unix socket exposes no descriptor-based route to its bound filesystem inode — on Linux `fchmod(2)` on a socket fd addresses the anonymous `sockfs` inode, not the bound name — so these checks operate on pathnames and are not atomic with respect to a concurrent rename of an ancestor by a *trusted* actor (root, or the operator). The publication step is atomic against a competing *entry* at the socket path itself, which is what closes the probe-to-publish window; it is not atomic against an ancestor being moved out from under it. What the ancestor walk removes is the ability of an **untrusted** actor to perform such a rename at all; the bound-identity verification and the inode-checked cleanup bound the damage otherwise. Ferrum never chmods or unlinks a path it has not just confirmed is the object it bound.
 
-Attestation is never permissive. `FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES` maps kernel-attested `SO_PEERCRED` evidence — `uid:<uid>=<spiffe-id>` or `sha256:<hex>=<spiffe-id>` (SHA-256 of the peer binary, Linux only) — to SPIFFE IDs in the local trust domain. A caller matching no rule is refused; the Workload API never invents an identity. With no rules and no dev-only `FERRUM_MESH_ALLOW_STATIC_ID`, enabling the surface fails startup rather than coming up able only to reject.
+Attestation is never permissive. `FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES` maps a kernel-attested `SO_PEERCRED` UID — `uid:<uid>=<spiffe-id>` — to a SPIFFE ID in the local trust domain. Binary-hash-only selectors are rejected because possession of a world-executable binary does not identify the user running it. A caller matching no rule is refused; the Workload API never invents an identity. With no rules and no dev-only `FERRUM_MESH_ALLOW_STATIC_ID`, enabling the surface fails startup rather than coming up able only to reject.
 
 On Kubernetes these are ordinary passthrough env on the mesh chart:
 
@@ -3556,13 +3664,13 @@ and the loop is restarted through the normal guarded apply path instead of the
 node black-holing captured traffic while readiness stays published. An
 operator-requested shutdown is never mistaken for such an exit.
 
-**Placement migration.** This path reaps only host-namespace state. Rules a
-previous per-pod-netns generation installed live inside each pod's namespace and
-are destroyed with it, so switching placement on a running node leaves
-already-running pods diverting UDP to a socket that no longer exists there —
-fail-closed (dropped), but not captured. Roll the workloads, or do one
-transitional rollout with UDP capture disabled so the pod-netns cleanup manager
-reaps them first.
+**Placement migration is runtime-enforced.** Host cleanup cannot enter workload
+network namespaces, and pod cleanup must not guess that host objects are absent.
+Ferrum therefore rejects a stable requested placement that differs from the
+durable node-local owner. The Helm chart also records the rendered target and
+migration tuple in `ferrum-mesh-udp-placement-<release>`; on upgrade it rejects a
+direct target change before accepting a disruptive DaemonSet rollout. The only
+supported change is the explicit cleanup/finalize procedure below.
 
 ### Ambient UDP upgrade notes
 
@@ -3592,6 +3700,168 @@ reconcile (at most 250 ms). Budget roughly 2.5 seconds of fail-closed UDP
 unavailability per node-agent restart; traffic is dropped during the interval,
 not allowed to bypass capture.
 
+#### Ambient UDP placement migration (enforced hard-upgrade guard)
+
+Every placement or enabled-state change uses one operator-chosen generation and
+two explicit releases. The placements are `pod-netns`, `host-netns`, and
+`disabled`; the destination must agree with
+`FERRUM_MESH_CAPTURE_UDP_ENABLED` and
+`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED`. A later transition must choose a
+new generation rather than reusing the most recently completed value.
+
+The Helm-side contract is a live-cluster guard. Run these transitions with
+`helm upgrade` under an identity allowed to read the release namespace: Helm's
+`lookup` must read the installed
+`ferrum-mesh-udp-placement-<release>` ConfigMap. `helm template` does not query
+the cluster. Without `--is-upgrade` it therefore cannot enforce predecessor
+ordering; with `--is-upgrade` its empty lookup is treated as a pre-contract
+release and blocks ordinary upgrades. GitOps/client-render pipelines must add
+an equivalent cluster-state admission gate if they need the Helm-side check.
+The per-node durable runtime guard remains authoritative, fail-closed, and
+independent of that pipeline gate.
+
+1. Render the destination switches plus
+   `FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup`, a new
+   `..._GENERATION`, and exact `..._FROM` / `..._TO` values. Do not use Helm
+   `--wait`: cleanup pods deliberately remain unready. The chart temporarily
+   uses `maxUnavailable: 100%` so that intentional unready state cannot deadlock
+   the DaemonSet rollout. This can restart every Ambient proxy simultaneously,
+   interrupting HBONE and raw TCP as well as UDP; finalize applies the same
+   strategy and can create a second mesh-wide restart. Schedule both releases
+   in a maintenance window sized for complete Ambient data-plane interruption.
+   When the predecessor is `pod-netns` (or the conservative
+   `disabled` case), the cleanup pod retains `hostPID`, `SYS_ADMIN`,
+   `SYS_PTRACE`, and `NET_ADMIN`; stable/final host placement drops the setns
+   privilege set.
+2. Wait for every node's authenticated `/health` detail
+   `mesh.udp_placement_migration.phase` to become `cleanup_complete` (the HTTP
+   status remains 503 because readiness is intentionally false), or for
+   `ferrum_mesh_udp_placement_migration_phase{phase="cleanup_complete"}` to be 1.
+   `ferrum_mesh_udp_placement_migration_outstanding` and the bounded
+   `..._failures_total{reason}` family diagnose progress without generation or
+   pod-UID labels. A cleanup image missing the required setns/iptables tooling
+   reports phase `failed` with reason `pod_cleanup_failed`; the UDP producer and
+   cleanup stay stopped, but admin/HBONE/TCP listeners remain available for
+   diagnosis while readiness stays false. Repair the image or privileges and
+   restart the same cleanup tuple.
+3. Upgrade the same destination with phase `finalize` and the identical
+   generation/from/to tuple. Helm requires the installed cleanup ConfigMap, and
+   each incoming proxy independently requires its node-local durable completion
+   proof before publishing readiness or starting a producer. An early finalize
+   therefore fails closed on only the nodes lacking proof; it never guesses from
+   a missing marker.
+4. After the finalize DaemonSet is ready, remove generation/from/to and return
+   phase to `stable`. The durable active owner remains, so later restarts resume
+   the selected producer without repeating migration. Use a committed values
+   file that omits the three tuple keys for this release; do not carry them
+   forward with `--reuse-values`.
+
+For example, pod-netns to host-netns uses one tuple throughout (replace
+`$GENERATION` with a deployment identifier):
+
+```bash
+helm upgrade ferrum ./charts/ferrum-mesh --reuse-values \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION="$GENERATION" \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns
+
+# After every node reports cleanup_complete:
+helm upgrade ferrum ./charts/ferrum-mesh --reuse-values \
+  --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=finalize
+```
+
+Host-netns to pod-netns reverses `FROM`/`TO` and sets the host switch false in
+the cleanup release. Enabled to disabled sets `TO=disabled` and disables capture
+in that release; disabled to enabled names the incoming placement. A `disabled`
+predecessor conservatively reaps both ownership domains, which covers a legacy
+disabled node. Any pre-contract node with no durable owner record also reaps
+both domains, regardless of the declared predecessor, so a mistaken legacy
+placement claim cannot strand Ferrum-owned rules. Accordingly, the first Helm
+upgrade from any pre-contract release requires an explicit cleanup adoption
+release even when the requested placement appears unchanged or disabled: the
+missing ConfigMap cannot prove whether that older release owned pod- or
+host-netns rules. Initial installs are unaffected.
+
+**Abort and durable-state recovery (maintenance only).** There is deliberately
+no online `cleanup -> stable` or tuple-switch transition. Once cleanup is
+persisted, resuming/finalizing that exact tuple is the only traffic-bearing
+path. If the tuple is wrong, or a node rejects a corrupt/truncated/unsupported,
+non-regular, multiply-linked, foreign-UID, or unreadable
+`.udp-placement-state-v1.json`, use this fail-closed procedure:
+
+1. Enter a maintenance window, cordon every node selected by both the Ambient
+   and node-agent DaemonSets, drain all enrolled workloads, and verify there is
+   no workload UDP, HBONE, or TCP traffic left on those nodes. Do not delete or
+   rewrite either artifact while traffic is active.
+2. Stop both DaemonSets and verify that no Ambient proxy or node-agent pod is
+   running on any affected node. This is the proof that neither the pod-netns
+   nor host-netns producer can start while ownership is repaired.
+3. Repair the Helm artifact first. Set
+   `ferrum-mesh-udp-placement-<release>` back to the known predecessor
+   (`target=<from>`, `phase=stable`, and empty `generation/from/to`) for a true
+   abort, or to the new cleanup-adoption tuple for corrupt/unknown ownership.
+   This ordering prevents the next Helm operation from authorizing a producer
+   before node-local state is repaired.
+4. On **every** node in the DaemonSet scope, repair the registry hostPath named
+   by `nodeAgent.podRegistryDir`. For a true abort, atomically replace
+   `.udp-placement-state-v1.json` with
+   `{"version":1,"active":"<from>","pending":null,"completed":null}`;
+   create the temp file in the same directory, use the mesh container's
+   effective UID and a single link, fsync the file, rename it, then fsync the
+   directory. Retract `.udp-registry-synced` while both processes are stopped.
+   For corrupt or unknown ownership, quarantine the rejected state outside the
+   registry and leave the state path absent, then run a fresh explicit cleanup
+   adoption release; absent state makes cleanup probe **both** ownership
+   domains. Never guess ownership, chown a live file, follow a symlink, or
+   repair only a subset of nodes.
+5. Verify both artifacts and their tuple on every node before resuming the
+   DaemonSets. Apply the matching Helm values only after that verification so
+   the repaired ConfigMap becomes the release contract rather than a transient
+   manual edit. Keep nodes drained until the node-agent has completed its
+   relist, the intended Ambient producer is ready, and authenticated health
+   shows the expected phase. Then uncordon nodes under the normal rollout
+   policy.
+
+A planned `securityContext` UID change must use the same stopped-and-drained
+procedure (or retain the old UID until after the migration); the reader rejects
+old-UID state by design. Re-adopting `host-netns` from absent or rejected state
+always requires cleanup/finalize—stable host startup never fabricates a
+predecessor proof.
+
+**Recovery and churn contract.** Cleanup persists `(generation, from, to)`
+before touching rules. A proxy restart resumes only that tuple; a different or
+stale generation is rejected, and a completed generation cannot bind a later
+transition to a registry marker left by the earlier rollout. Each node-agent
+restart/relist first retracts its
+generation acknowledgement, closes UDP gates, reconstructs the registry from
+the Kubernetes pod list, and then atomically publishes `.udp-registry-synced`
+as a bounded, versioned proof containing that generation and a fresh publication
+identity. Every later pod/CNI capture mutation retracts the marker first and
+republishes a new identity only after the registry and retry state converge. The
+cleanup supervisor requires the exact same proof before and after every pass;
+disappearance or replacement resets both repeated-pass counters and the pod
+registry fingerprint. It checks that proof again immediately before persisting
+completion. Pod-netns cleanup starts only after that proof and requires two
+identical complete registry passes under one publication, so partial per-pod
+cleanup, temporarily unresolvable netns handles, pod deletion/recreation, and a
+crash between any passes simply retry. Pods created after the predecessor stopped
+have no predecessor rules and join the current registry pass; pods removed
+during the phase lose their namespace and cannot retain rules. Cleanup always probes both
+IPv4 and IPv6 exact Ferrum chain/jump/rule/route names, even when the new config
+disables one family, and never flushes a table or sweeps foreign state.
+
+The existing gate acknowledgement remains load-bearing throughout. A missing or
+stale `.udp-not-ready` cannot authorize cleanup because cleanup writes a fresh
+`.udp-ack-required`, removes the stale acknowledgement, and retracts
+`.udp-ready` in that order. Until a fresh acknowledgement arrives, predecessor
+capture or a scope-exact DROP guard remains and the incoming placement stays
+unready. Thus interruption after readiness retraction, partial netns cleanup,
+host cleanup, durable proof publication, or before final producer publication
+costs availability but never opens plaintext egress.
+
 ### Metrics
 
 The node agent exposes Prometheus counters on the read-only admin `/metrics`
@@ -3608,7 +3878,7 @@ the cluster network.
 
 ### Mixed-kernel clusters
 
-Mesh ambient mode requires Linux kernel >= 5.7 with cgroup v2 and bpffs for the per-pod eBPF capture path. The node agent fails fast on degraded nodes by default (`FERRUM_NODE_AGENT_FALLBACK_MODE=fail`), matching the published distroless image. The rest of the mesh data plane (slice apply, `mesh_authz`, `mesh_workload_metrics`, HBONE) is unaffected. Operators with a mix of supported and unsupported kernels should:
+Mesh ambient mode requires Linux kernel >= 5.7 with cgroup v2 and bpffs for the per-pod eBPF capture path. The node agent fails fast on degraded nodes by default (`FERRUM_NODE_AGENT_FALLBACK_MODE=fail`), matching the published distroless `-ebpf` image: it includes `ip` and its runtime libraries for the supported capture path but deliberately omits a shell and the iptables fallback tools. The rest of the mesh data plane (slice apply, `mesh_authz`, `mesh_workload_metrics`, HBONE) is unaffected. Operators with a mix of supported and unsupported kernels should:
 
 1. Alert on node-agent readiness/startup failures, `ferrum_node_agent_capture_state{state!="ready"} == 1`, and `ferrum_mesh_node_topology_degraded == 1` to track the degraded set.
 2. Label degraded nodes (e.g., `ferrum.io/capture-mode=iptables`) and configure the admission webhook (`FERRUM_MODE=injector`) to inject iptables init containers on those nodes.

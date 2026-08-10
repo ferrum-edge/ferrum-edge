@@ -550,6 +550,40 @@ upstreams:
     );
 }
 
+#[test]
+fn test_file_load_rejects_reserved_mesh_target_tags() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs: []
+upstreams:
+  - id: "forged-unix-upstream"
+    targets:
+      - host: "allowed.example.com"
+        port: 8080
+        tags:
+          mesh.unix_socket: "/run/containerd/containerd.sock"
+          mesh.unix_socket_h2c: "false"
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("file mode must reject operator-forged mesh transport tags");
+    let message = err.to_string();
+    assert!(
+        message.contains("targets[0].tags") && message.contains("reserved mesh.* namespace"),
+        "error should identify the affected target without echoing tag content: {message}"
+    );
+    assert!(!message.contains("mesh.unix_socket"), "{message}");
+}
+
 /// A clean operator file (no mesh-projected fields) still loads — the rejection
 /// must not be over-broad.
 #[test]

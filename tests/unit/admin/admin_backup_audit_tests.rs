@@ -467,11 +467,28 @@ fn sample_backup_event() -> AuditEvent {
     .with_outcome(audit::outcome::SUCCESS)
 }
 
+/// Take the in-process fallback mutex for a test.
+///
+/// `#[serial]` orders the tests that reason about this lock, but the mutex is
+/// process-global and unannotated admin tests in the same binary can be inside
+/// their own fallback critical section. Retry rather than turning that
+/// unrelated residue into a failure.
+fn hold_process_lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+    use ferrum_edge::_test_support::hold_audit_local_fallback_process_lock_for_test;
+
+    for _ in 0..600 {
+        match hold_audit_local_fallback_process_lock_for_test() {
+            Ok(guard) => return guard,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    panic!("admin audit local fallback lock never became free");
+}
+
 #[test]
 #[serial_test::serial(admin_audit_local_fallback_lock)]
 fn local_fallback_fails_closed_on_process_lock_contention() {
-    let _holder = ferrum_edge::_test_support::hold_audit_local_fallback_process_lock_for_test()
-        .expect("hold process lock");
+    let _holder = hold_process_lock_for_test();
     let dir = TempDir::new().expect("tempdir");
     // Mutex is not reentrant: same-thread try_lock while held keeps failing
     // until the shared deadline, then fails closed.
@@ -481,6 +498,45 @@ fn local_fallback_fails_closed_on_process_lock_contention() {
         err.to_string().contains("process lock contended"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+#[serial_test::serial(admin_audit_local_fallback_lock)]
+fn local_fallback_waits_out_a_transient_process_lock_holder() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // Regression for issue #3573 stated without racing the clock: a holder that
+    // releases well inside `LOCAL_FALLBACK_LOCK_WAIT` must be waited out, not
+    // failed closed on the first `try_lock`. The hold is a small static
+    // fraction of that deadline, so the outcome depends on neither scheduler
+    // timing nor how long a competing fsync-bearing critical section takes.
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    let (held_tx, held_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let holder = std::thread::spawn(move || {
+        let guard = hold_process_lock_for_test();
+        held_tx.send(()).expect("signal lock held");
+        std::thread::sleep(Duration::from_millis(250));
+        drop(guard);
+    });
+    held_rx.recv().expect("holder must acquire the lock first");
+
+    let appender = std::thread::spawn(move || {
+        let result = append_local_fallback_event(&path, &sample_backup_event());
+        let _ = done_tx.send(result);
+    });
+    let result = done_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("contended append must return within the bound");
+    holder.join().expect("holder thread");
+    appender.join().expect("appender thread");
+    result.expect("a transient holder must not fail the admit closed");
+
+    let listed = list_local_fallback_events(dir.path()).expect("list");
+    assert_eq!(listed.len(), 1);
 }
 
 #[cfg(unix)]
@@ -513,9 +569,11 @@ fn local_fallback_fails_closed_on_cross_process_lock_contention() {
         let _ = tx.send(result);
     });
     // Channel timeout only guards against a hang; admission must fail after
-    // the bounded wait (100 ms), not immediately and not unboundedly.
+    // the bounded wait (`LOCAL_FALLBACK_LOCK_WAIT`), not immediately and not
+    // unboundedly. It is deliberately far above that deadline so this test
+    // never races the production bound it is asserting.
     let result = rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(60))
         .expect("cross-process lock contention must return within bound");
     let elapsed = started.elapsed();
     let err = result.expect_err("contended flock must fail closed after wait");
@@ -557,8 +615,9 @@ fn list_local_fallback_fails_closed_on_cross_process_lock_contention() {
         let result = list_local_fallback_events(&path);
         let _ = tx.send(result);
     });
+    // Well above `LOCAL_FALLBACK_LOCK_WAIT`; only a hang should trip it.
     let result = rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(60))
         .expect("list flock contention must return within bound");
     let err = result.expect_err("contended flock must fail closed on list after wait");
     assert!(
@@ -755,6 +814,13 @@ async fn concurrent_security_sensitive_admits_both_succeed() {
     // Regression for issue #3573: non-blocking lock acquisition turned ordinary
     // in-process contention into a fail-closed error. Both admits against the
     // same fallback directory must succeed under a bounded wait.
+    //
+    // The loser here waits out a complete critical section — read, temp-file
+    // publish, data `fsync`, rename, directory `fsync` — not a lock handoff, so
+    // `LOCAL_FALLBACK_LOCK_WAIT` has to be sized against that, not against a
+    // best-case syscall. It was not, which is why this failed on a loaded
+    // hosted runner; see `local_fallback_waits_out_a_transient_process_lock_holder`
+    // for the timing-independent statement of the same contract.
     let dir = TempDir::new().expect("tempdir");
     let first = AuditEvent::new(
         &admin_actor(),

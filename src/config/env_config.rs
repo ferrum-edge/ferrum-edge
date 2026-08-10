@@ -1509,7 +1509,7 @@ pub struct EnvConfig {
     /// primary with the outgoing key published for verification.
     pub mesh_jwt_key_lifetime_seconds: u64,
     /// Peer-credential attestation rules for the Workload API server, as
-    /// `uid:<uid>=<spiffe-id>` / `sha256:<hex>=<spiffe-id>` entries. A workload
+    /// `uid:<uid>=<spiffe-id>` entries. A workload
     /// that matches no rule is refused: the Workload API never assigns an
     /// identity it was not told to assign.
     pub mesh_workload_api_unix_identity_rules: Vec<String>,

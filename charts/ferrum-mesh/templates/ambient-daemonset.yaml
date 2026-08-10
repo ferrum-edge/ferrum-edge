@@ -15,6 +15,9 @@
 {{- end -}}
 {{- $ambientSpireUsesNodeName := contains "$(FERRUM_K8S_NODE_NAME)" $ambientSpireWorkloadSpiffeId -}}
 {{- $ambientTopology := replace "-" "_" (lower (trim (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY")))) -}}
+{{- if and (eq $ambientTopology "ambient") (not .Values.nodeAgent.enabled) -}}
+{{- fail "ambient topology requires nodeAgent.enabled=true: the UDP placement guard and registry must remain durable even while UDP capture is disabled" -}}
+{{- end -}}
 {{- $nodeWaypointRegistryEnabled := eq $ambientTopology "node_waypoint" -}}
 {{- $nodeWaypointRegistryMountPath := toString .Values.nodeAgent.podRegistryDir -}}
 {{- if hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" -}}
@@ -54,6 +57,11 @@
 {{- if and $ambientUdpHostNetns (ne $ambientTopology "ambient") -}}
 {{- fail "ambient FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true requires FERRUM_MESH_TOPOLOGY=ambient" -}}
 {{- end -}}
+{{- $ambientUdpMigrationPhase := "stable" -}}
+{{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE" -}}
+{{- $ambientUdpMigrationPhase = index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE" | toString | trim -}}
+{{- end -}}
+{{- $ambientUdpMigrationFrom := default "" (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM") | toString | trim -}}
 {{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
 {{- /* Keep registry/cleanup wiring active for every Ambient node-agent pair,
        even when captureMode=iptables. The node-agent must then hit the Rust
@@ -86,7 +94,8 @@
        privileges. Note the disabled-cleanup manager still enters pod netns to
        reap predecessor rules, so the lifecycle term keeps them when UDP capture
        is off. */ -}}
-{{- $ambientSetnsCapture := or $nodeWaypointRegistryEnabled (and $ambientUdpLifecycle (not $ambientUdpHostNetns)) -}}
+{{- $ambientUdpMigrationNeedsSetns := and (eq $ambientUdpMigrationPhase "cleanup") (has $ambientUdpMigrationFrom (list "pod-netns" "disabled")) -}}
+{{- $ambientSetnsCapture := or $nodeWaypointRegistryEnabled (and $ambientUdpLifecycle (or (not $ambientUdpHostNetns) $ambientUdpMigrationNeedsSetns)) -}}
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
 {{- $ambientAdminPort := "9000" -}}
@@ -160,6 +169,15 @@ metadata:
     app.kubernetes.io/name: ferrum-mesh-ambient
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
+  {{- if ne $ambientUdpMigrationPhase "stable" }}
+  # Migration pods intentionally stay unready until cleanup/finalization proof.
+  # Permit the explicit migration rollout to reach every node instead of
+  # deadlocking behind the DaemonSet's default one-unavailable budget.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: ferrum-mesh-ambient

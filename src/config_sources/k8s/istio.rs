@@ -949,9 +949,10 @@ fn peer_authentication(
 ///     and `defaultEndpoint`). Per Istio semantics, when `ingress` is present
 ///     it replaces the workload's default per-service-port inbound listeners;
 ///     the slice builder resolves each entry to a routable loopback target and
-///     the inbound materializer emits routes from them (see
-///     `materialize_sidecar_inbound_proxies`). Unix-socket `defaultEndpoint`s
-///     and non-HTTP-family listeners are parsed but cannot be modeled and stay
+///     the inbound materializer emits HTTP routes or raw-TCP relays from them
+///     (see `materialize_sidecar_inbound_proxies`). Inadmissible Unix-socket
+///     `defaultEndpoint`s, Unix endpoints paired with stream protocols, and
+///     unrecognized/`Udp` protocols are parsed but cannot be modeled and stay
 ///     in the `deferred_fields` report (resolved fail-closed downstream).
 ///   - `spec.outboundTrafficPolicy.mode` → [`MeshSidecar::outbound_traffic_policy`]
 ///     (issue #3262), the workload-scoped override of the mesh-wide policy.
@@ -1037,10 +1038,10 @@ fn sidecar(
     // `port.number`; `defaultEndpoint` and everything else are optional. We
     // translate the entry shape here (parse + validate the required fields) and
     // defer the routable/unsupported decision (admissible vs. inadmissible Unix
-    // paths, non-HTTP-family protocols, arbitrary IPs, or an omitted endpoint)
+    // paths, unrecognized protocols, arbitrary IPs, or an omitted endpoint)
     // to `MeshSidecarIngress::resolve` at slice build, so the status writer can
     // keep unsupported entries in `deferred_fields` while accepting the
-    // resource.
+    // resource. Recognized HTTP and stream protocols are modeled (#3260).
     let mut ingress = Vec::new();
     // Istio distinguishes an OMITTED `ingress` block (keep automatic
     // per-service-port inbound defaults) from a DECLARED one — including an
@@ -1070,10 +1071,11 @@ fn sidecar(
                 )
             })?;
             // Use the ingress-specific classifier (NOT the generic
-            // `app_protocol`): a custom inbound listener routes only recognized
-            // HTTP-family protocols; a missing or mistyped protocol maps to a
-            // non-HTTP `AppProtocol` so resolution defers it fail-closed instead
-            // of exposing it on the HTTP request path (`https` still routes).
+            // `app_protocol`): a custom inbound listener routes recognized
+            // HTTP-family and stream-family protocols; a mistyped protocol maps
+            // to `Unknown` so resolution defers it fail-closed instead of
+            // exposing it on either lane. A missing protocol maps to `Tcp`
+            // (Istio's unset-port default) and is stream-modeled (#3260).
             let protocol =
                 sidecar_ingress_app_protocol(port_obj.get("protocol").and_then(Value::as_str));
             let name = port_obj
@@ -5996,48 +5998,64 @@ pub(crate) fn service_entry_port_protocol_is_udp(protocol: Option<&str>) -> bool
 ///
 /// Unlike the generic [`app_protocol`] (which collapses BOTH `https` and a typo
 /// like `HTPS` — and a missing value — to `AppProtocol::Unknown`, the HTTP-family
-/// catch-all), this classifier is fail-closed for a custom inbound listener: it
-/// routes ONLY explicitly recognized HTTP-family protocol tokens and maps
-/// everything else — recognized non-HTTP (`tcp`/`tls`/db), a MISSING protocol
-/// (Istio defaults an unset port protocol to TCP), and an UNRECOGNIZED string —
-/// to a non-HTTP-family `AppProtocol` so `MeshSidecarIngress::resolve` defers it
-/// (`NonHttpProtocol`) instead of exposing a non-HTTP / mistyped listener on the
-/// HTTP request path. `https` is recognized HTTP-family (a TLS-terminated HTTP
-/// listener) and stays modeled — so the round-1 HTTPS-routing behavior is
-/// preserved while typos and unset protocols fail closed. Never returns
-/// `AppProtocol::Unknown` (no ingress entry relies on the catch-all), keeping
-/// this independent of the service-port `Unknown → HTTP` convention.
+/// catch-all), this classifier is fail-closed for a custom inbound listener:
+///
+/// - Recognized HTTP-family tokens → HTTP/Http2/Grpc (HTTP inbound routes).
+/// - Recognized stream-family tokens (`tcp`/`tls`/db) → their `AppProtocol`
+///   (raw-TCP inbound relays; issue #3260).
+/// - A MISSING protocol → `Tcp` (Istio defaults an unset port protocol to TCP).
+/// - An UNRECOGNIZED string (e.g. `HTPS`) → `Unknown` so `resolve()` defers it
+///   instead of guessing it as HTTP or as a live TCP listener.
+///
+/// `https` is recognized HTTP-family (a TLS-terminated HTTP listener) and stays
+/// modeled. Never returns a stream `AppProtocol` for a typo.
 fn sidecar_ingress_app_protocol(value: Option<&str>) -> AppProtocol {
-    match value.unwrap_or_default().to_ascii_lowercase().as_str() {
-        "http" => AppProtocol::Http,
+    let raw = value.map(str::trim).filter(|s| !s.is_empty());
+    match raw.map(|s| s.to_ascii_lowercase()).as_deref() {
+        None => AppProtocol::Tcp,
+        Some("http") => AppProtocol::Http,
         // `http2`/`h2`, `grpc`/`grpc-web`, and `https` are all HTTP/2-capable,
         // TLS-terminated-or-not HTTP-family listeners that Ferrum models on the
         // HTTP request path.
-        "http2" | "h2" | "https" => AppProtocol::Http2,
-        "grpc" | "grpc-web" => AppProtocol::Grpc,
-        // Recognized non-HTTP protocols defer (raw-TCP inbound is not modeled
-        // here). A MISSING or UNRECOGNIZED protocol also lands here (Istio
-        // defaults an unset port protocol to TCP; a typo must not be guessed as
-        // HTTP), so `resolve()` reports it as a deferred non-HTTP listener.
-        _ => AppProtocol::Tcp,
+        Some("http2" | "h2" | "https") => AppProtocol::Http2,
+        Some("grpc" | "grpc-web") => AppProtocol::Grpc,
+        Some("tcp") => AppProtocol::Tcp,
+        Some("tls") => AppProtocol::Tls,
+        Some("mongo" | "mongodb") => AppProtocol::Mongo,
+        Some("redis") => AppProtocol::Redis,
+        Some("mysql") => AppProtocol::Mysql,
+        Some("postgres" | "postgresql") => AppProtocol::Postgres,
+        // Unrecognized / mistyped — never guess HTTP or TCP.
+        Some(_) => AppProtocol::Unknown,
     }
 }
 
 /// Whether a Sidecar `ingress[].port.protocol` string names an HTTP-family
-/// listener Ferrum materializes (vs. a stream/raw-TCP listener — or a missing /
-/// mistyped protocol — it defers).
+/// listener Ferrum materializes as an HTTP inbound route.
 ///
 /// Routes the raw string through the SAME [`sidecar_ingress_app_protocol`]
 /// mapping the ingress translator stores on [`MeshSidecarIngress`] and the SAME
 /// [`is_http_family_app_protocol`](crate::modes::mesh::config::is_http_family_app_protocol)
 /// predicate `MeshSidecarIngress::resolve` uses, so the translator/resolution
 /// side and the Istio status writer's deferred-field report can never disagree on
-/// whether a listener is modeled. `https` is recognized HTTP-family and reported
-/// as modeled; an unrecognized protocol (`HTPS` typo) or a missing one is
-/// reported as a deferred non-HTTP listener, matching resolution. Shared (like
-/// [`cors_policy_translatable`]) to keep the predicate in one place.
+/// whether a listener is modeled as HTTP.
 pub(crate) fn sidecar_ingress_protocol_is_http_family(protocol: Option<&str>) -> bool {
     crate::modes::mesh::config::is_http_family_app_protocol(sidecar_ingress_app_protocol(protocol))
+}
+
+/// Whether a Sidecar `ingress[].port.protocol` string names a stream-family
+/// listener Ferrum materializes as a raw-TCP inbound relay (issue #3260).
+pub(crate) fn sidecar_ingress_protocol_is_stream_family(protocol: Option<&str>) -> bool {
+    crate::modes::mesh::config::is_stream_family_app_protocol(sidecar_ingress_app_protocol(
+        protocol,
+    ))
+}
+
+/// Whether a Sidecar `ingress[].port.protocol` string is modeled on either the
+/// HTTP or stream inbound lane (vs. deferred `Unknown`/`Udp`).
+pub(crate) fn sidecar_ingress_protocol_is_modeled(protocol: Option<&str>) -> bool {
+    sidecar_ingress_protocol_is_http_family(protocol)
+        || sidecar_ingress_protocol_is_stream_family(protocol)
 }
 
 /// Fail-closed deferral reason: `outboundTrafficPolicy` was present but is not a
@@ -20919,10 +20937,9 @@ extensionProviders:
 
     #[test]
     fn sidecar_ingress_unrecognized_protocol_is_deferred() {
-        // Codex round-2 P2: a TYPO like `HTPS` must NOT be routed as HTTP. The
-        // ingress-specific classifier maps it to a non-HTTP AppProtocol so
-        // resolution defers it (NonHttpProtocol) instead of exposing a
-        // non-modeled listener on the HTTP request path.
+        // A TYPO like `HTPS` must NOT be routed as HTTP or guessed as TCP. The
+        // ingress-specific classifier maps it to `Unknown` so resolution defers
+        // it (`NonHttpProtocol`) instead of exposing a mistyped listener.
         let result = translate_k8s_objects(
             &[object(
                 "Sidecar",
@@ -20935,9 +20952,10 @@ extensionProviders:
         .expect("the resource is still accepted; the entry is deferred");
         let mesh = result.config.mesh.expect("mesh config");
         let entry = &mesh.sidecars[0].ingress[0];
-        assert!(
-            !crate::modes::mesh::config::is_http_family_app_protocol(entry.protocol),
-            "a mistyped protocol must NOT be HTTP-family, got {:?}",
+        assert_eq!(
+            entry.protocol,
+            AppProtocol::Unknown,
+            "a mistyped protocol must land on Unknown, got {:?}",
             entry.protocol
         );
         assert!(
@@ -20945,16 +20963,16 @@ extensionProviders:
                 entry.resolve(),
                 Err(crate::modes::mesh::config::IngressListenerUnsupported::NonHttpProtocol)
             ),
-            "a mistyped protocol must defer as a non-HTTP listener, not route"
+            "a mistyped protocol must defer, not route"
         );
     }
 
     #[test]
-    fn sidecar_ingress_missing_protocol_is_deferred() {
-        // A MISSING protocol on a custom inbound listener defers (Istio defaults
-        // an unset port protocol to TCP; Ferrum fails closed rather than guessing
-        // HTTP for an explicitly declared listener). Distinct from the
-        // service-port default path, where an unknown appProtocol stays HTTP.
+    fn sidecar_ingress_missing_protocol_defaults_to_tcp_stream() {
+        // A MISSING protocol on a custom inbound listener defaults to TCP
+        // (Istio's unset-port default) and is stream-modeled (#3260) rather than
+        // guessed as HTTP. Distinct from the service-port default path, where an
+        // unknown appProtocol stays HTTP.
         let result = translate_k8s_objects(
             &[object(
                 "Sidecar",
@@ -20964,47 +20982,85 @@ extensionProviders:
             )],
             options(),
         )
-        .expect("the resource is accepted; the entry is deferred");
+        .expect("the resource is accepted");
         let mesh = result.config.mesh.expect("mesh config");
         let entry = &mesh.sidecars[0].ingress[0];
-        assert!(
-            !crate::modes::mesh::config::is_http_family_app_protocol(entry.protocol),
-            "a missing protocol must NOT be HTTP-family, got {:?}",
+        assert_eq!(
+            entry.protocol,
+            AppProtocol::Tcp,
+            "a missing protocol defaults to Tcp, got {:?}",
             entry.protocol
         );
-        assert!(matches!(
-            entry.resolve(),
-            Err(crate::modes::mesh::config::IngressListenerUnsupported::NonHttpProtocol)
-        ));
+        let resolved = entry
+            .resolve()
+            .expect("missing protocol + loopback endpoint resolves as stream");
+        assert!(resolved.is_stream_family());
+        assert!(!resolved.is_http_family());
+    }
+
+    #[test]
+    fn sidecar_ingress_tcp_protocol_resolves_as_stream() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Sidecar",
+                serde_json::json!({
+                    "ingress": [{"port": {"number": 6379, "protocol": "TCP"}, "defaultEndpoint": "127.0.0.1:6379"}]
+                }),
+            )],
+            options(),
+        )
+        .expect("accepted");
+        let mesh = result.config.mesh.expect("mesh config");
+        let entry = &mesh.sidecars[0].ingress[0];
+        assert_eq!(entry.protocol, AppProtocol::Tcp);
+        let resolved = entry.resolve().expect("TCP ingress resolves");
+        assert_eq!(resolved.port, 6379);
+        assert_eq!(resolved.endpoint_port, 6379);
+        assert!(resolved.is_stream_family());
     }
 
     #[test]
     fn sidecar_ingress_protocol_classifier_lockstep() {
-        // The status-writer predicate and the translator's carried-protocol
-        // mapping must agree on routability for every class (lock-step).
-        for (proto, want_modeled) in [
-            (Some("HTTP"), true),
-            (Some("http2"), true),
-            (Some("GRPC"), true),
-            (Some("HTTPS"), true),
-            (Some("TCP"), false),
-            (Some("TLS"), false),
-            (Some("HTPS"), false), // typo
-            (Some("nonsense"), false),
-            (None, false), // missing → TCP default → deferred
+        // The status-writer predicates and the translator's carried-protocol
+        // mapping must agree on HTTP / stream / modeled for every class.
+        for (proto, want_http, want_stream) in [
+            (Some("HTTP"), true, false),
+            (Some("http2"), true, false),
+            (Some("GRPC"), true, false),
+            (Some("HTTPS"), true, false),
+            (Some("TCP"), false, true),
+            (Some("TLS"), false, true),
+            (Some("REDIS"), false, true),
+            (Some("HTPS"), false, false), // typo
+            (Some("nonsense"), false, false),
+            (None, false, true), // missing → TCP default → stream-modeled
         ] {
-            let status_says =
-                crate::config_sources::k8s::sidecar_ingress_protocol_is_http_family(proto);
-            let translator_says = crate::modes::mesh::config::is_http_family_app_protocol(
-                sidecar_ingress_app_protocol(proto),
+            let status_http = sidecar_ingress_protocol_is_http_family(proto);
+            let status_stream = sidecar_ingress_protocol_is_stream_family(proto);
+            let status_modeled =
+                crate::config_sources::k8s::sidecar_ingress_protocol_is_modeled(proto);
+            let carried = sidecar_ingress_app_protocol(proto);
+            assert_eq!(
+                status_http,
+                crate::modes::mesh::config::is_http_family_app_protocol(carried),
+                "HTTP lock-step failed for {proto:?}"
             );
             assert_eq!(
-                status_says, translator_says,
-                "status writer and translator disagree on protocol {proto:?}"
+                status_stream,
+                crate::modes::mesh::config::is_stream_family_app_protocol(carried),
+                "stream lock-step failed for {proto:?}"
             );
             assert_eq!(
-                status_says, want_modeled,
-                "protocol {proto:?} routability mismatch"
+                status_modeled,
+                crate::modes::mesh::config::is_modeled_ingress_app_protocol(carried),
+                "modeled lock-step failed for {proto:?}"
+            );
+            assert_eq!(status_http, want_http, "HTTP mismatch for {proto:?}");
+            assert_eq!(status_stream, want_stream, "stream mismatch for {proto:?}");
+            assert_eq!(
+                status_modeled,
+                want_http || want_stream,
+                "modeled mismatch for {proto:?}"
             );
         }
     }

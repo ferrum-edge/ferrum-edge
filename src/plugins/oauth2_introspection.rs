@@ -26,13 +26,17 @@ use super::utils::auth_flow::{
 };
 use super::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
-    emit_claim_headers_to_attempt, parse_claim_headers,
+    normalized_claim_header_values, parse_claim_headers,
 };
 use super::utils::claim_resolver::{
     extract_claim_string, extract_claim_string_exact, parse_claim_path_value,
 };
 use super::utils::introspection_cache::{
-    CacheLookup, CachedIntrospection, IntrospectionCache, TokenKey,
+    CacheLookup, CachedAuthorization, CachedAuthorizationError, CachedClaimHeader,
+    DEFAULT_MAX_CACHE_ENTRIES, DEFAULT_MAX_CACHE_ENTRY_BYTES, DEFAULT_MAX_CACHE_TOTAL_BYTES,
+    HARD_MAX_CACHE_ENTRIES, HARD_MAX_CACHE_ENTRY_BYTES, HARD_MAX_CACHE_TOTAL_BYTES,
+    IntrospectionCache, MIN_MAX_CACHE_ENTRIES, MIN_MAX_CACHE_ENTRY_BYTES,
+    MIN_MAX_CACHE_TOTAL_BYTES, TokenKey,
 };
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
@@ -61,7 +65,7 @@ fn global_introspection_limit() -> Arc<Semaphore> {
     )
 }
 
-type InFlightResult = Result<Arc<CachedIntrospection>, IntrospectionDecision>;
+type InFlightResult = Result<Arc<CachedAuthorization>, IntrospectionDecision>;
 type InFlightCell = OnceCell<InFlightResult>;
 
 struct InFlightEntryGuard {
@@ -246,7 +250,7 @@ impl Oauth2Introspection {
         let shard_amount = http_client.pool_shard_amount();
         let mut providers = Vec::with_capacity(providers_arr.len());
         for (idx, prov_cfg) in providers_arr.iter().enumerate() {
-            let prov_obj = prov_cfg.as_object().ok_or_else(|| {
+        let prov_obj = prov_cfg.as_object().ok_or_else(|| {
                 format!("oauth2_introspection: provider[{idx}] must be an object, got: {prov_cfg}")
             })?;
             reject_unknown_keys(
@@ -264,6 +268,8 @@ impl Oauth2Introspection {
                     "negative_cache_ttl_secs",
                     "request_timeout_ms",
                     "max_cache_entries",
+                    "max_cache_entry_bytes",
+                    "max_cache_total_bytes",
                     "token_hint_param",
                     "required_scopes",
                     "required_roles",
@@ -311,8 +317,37 @@ impl Oauth2Introspection {
                 ranged_provider_u64(prov_obj, "negative_cache_ttl_secs", idx, 10, 0, 300)?;
             let request_timeout_ms =
                 ranged_provider_u64(prov_obj, "request_timeout_ms", idx, 5_000, 100, 30_000)?;
-            let max_cache_entries =
-                ranged_provider_usize(prov_obj, "max_cache_entries", idx, 10_000, 100, 1_000_000)?;
+            let max_cache_entries = ranged_provider_usize(
+                prov_obj,
+                "max_cache_entries",
+                idx,
+                DEFAULT_MAX_CACHE_ENTRIES,
+                MIN_MAX_CACHE_ENTRIES,
+                HARD_MAX_CACHE_ENTRIES,
+            )?;
+            let max_cache_entry_bytes = ranged_provider_usize(
+                prov_obj,
+                "max_cache_entry_bytes",
+                idx,
+                DEFAULT_MAX_CACHE_ENTRY_BYTES,
+                MIN_MAX_CACHE_ENTRY_BYTES,
+                HARD_MAX_CACHE_ENTRY_BYTES,
+            )?;
+            let max_cache_total_bytes = ranged_provider_usize(
+                prov_obj,
+                "max_cache_total_bytes",
+                idx,
+                DEFAULT_MAX_CACHE_TOTAL_BYTES,
+                MIN_MAX_CACHE_TOTAL_BYTES,
+                HARD_MAX_CACHE_TOTAL_BYTES,
+            )?;
+            let minimum_total_bytes = IntrospectionCache::minimum_total_bytes(max_cache_entries)
+                .saturating_add(max_cache_entry_bytes);
+            if max_cache_total_bytes < minimum_total_bytes {
+                return Err(format!(
+                    "oauth2_introspection: 'provider[{idx}].max_cache_total_bytes' must be at least {minimum_total_bytes} for max_cache_entries={max_cache_entries} and max_cache_entry_bytes={max_cache_entry_bytes}"
+                ));
+            }
             let token_hint_param = optional_nullable_string(prov_obj, "token_hint_param", idx)?;
             let claim_headers = parse_claim_headers(
                 prov_obj,
@@ -328,6 +363,8 @@ impl Oauth2Introspection {
             ));
             let cache = Arc::new(IntrospectionCache::new(
                 max_cache_entries,
+                max_cache_entry_bytes,
+                max_cache_total_bytes,
                 Duration::from_secs(positive_cache_ttl_secs),
                 Duration::from_secs(negative_cache_ttl_secs),
                 shard_amount,
@@ -372,7 +409,7 @@ impl Oauth2Introspection {
         }
 
         if !allow_provider_fanout {
-            let mut location_owners: HashMap<String, usize> = HashMap::new();
+        let mut location_owners: HashMap<String, usize> = HashMap::new();
             for (provider_idx, provider) in providers.iter().enumerate() {
                 if provider.token_locations.is_empty() {
                     register_provider_location(
@@ -410,7 +447,7 @@ impl Oauth2Introspection {
                 request_headers_to_redact.push("authorization".to_string());
             }
             for location in &provider.token_locations {
-                let TokenLocation::Header(header) = location else {
+        let TokenLocation::Header(header) = location else {
                     continue;
                 };
                 if !request_headers_to_redact
@@ -466,26 +503,25 @@ impl Oauth2Introspection {
                         "invalid_request",
                     );
                 }
-                let (claims, candidate) = match self.validate_token(&token, &candidates).await {
-                    Ok(result) => result,
-                    Err(rejection) => return rejection.into_plugin_result(),
-                };
+                let (authorization, candidate) =
+                    match self.validate_token(&token, &candidates).await {
+                        Ok(result) => result,
+                        Err(rejection) => return rejection.into_plugin_result(),
+                    };
                 let provider = &self.providers[candidate.provider_idx];
-                if let Err((status, body)) =
-                    self.check_claims_authorization(&claims.claims, provider)
-                {
-                    return reject(status, body);
+                if let Some(error) = &authorization.authorization_error {
+                    return reject(error.status_code, error.body.to_string());
                 }
                 let mut attempt = AuthenticationAttempt::new();
-                self.stage_claim_headers(&mut attempt, &claims.claims, provider);
+                self.stage_claim_headers(&mut attempt, &authorization, provider);
                 if !provider.forward_original_token {
                     self.stage_original_token_stripping(&mut attempt, ctx, &token, candidate);
                 }
-                let deadline = claims
+                let deadline = authorization
                     .expires_at_unix
                     .map(|expiry| credential_deadline_from_unix_seconds(expiry, 0));
                 let outcome = self
-                    .resolve_identity(&claims.claims, provider, consumer_index)
+                    .resolve_identity(&authorization, consumer_index)
                     .with_credential_deadline(deadline);
                 apply_verify_outcome(ctx, attempt, outcome, "oauth2_introspection")
             }
@@ -496,7 +532,7 @@ impl Oauth2Introspection {
         &self,
         token: &str,
         candidates: &[ProviderCandidate],
-    ) -> Result<(Arc<CachedIntrospection>, ProviderCandidate), IntrospectionRejection> {
+    ) -> Result<(Arc<CachedAuthorization>, ProviderCandidate), IntrospectionRejection> {
         // Fan-out is only reachable after explicit shared-trust opt-in or when
         // the request carried the same token in multiple provider-specific
         // locations. If no provider accepts, an unavailable candidate takes
@@ -505,7 +541,7 @@ impl Oauth2Introspection {
         let mut first_auth_error: Option<IntrospectionDecision> = None;
         let mut provider_unavailable = false;
         for &candidate in candidates {
-            let Some(provider) = self.providers.get(candidate.provider_idx) else {
+        let Some(provider) = self.providers.get(candidate.provider_idx) else {
                 continue;
             };
             match self
@@ -538,7 +574,7 @@ impl Oauth2Introspection {
         token: &str,
         provider: &IntrospectionProvider,
         provider_idx: usize,
-    ) -> Result<Arc<CachedIntrospection>, IntrospectionDecision> {
+    ) -> Result<Arc<CachedAuthorization>, IntrospectionDecision> {
         let now = Instant::now();
         match provider.cache.get(token, now) {
             CacheLookup::Active(credential) => {
@@ -573,7 +609,7 @@ impl Oauth2Introspection {
         token: &str,
         provider: &IntrospectionProvider,
         provider_idx: usize,
-    ) -> Result<Arc<CachedIntrospection>, IntrospectionDecision> {
+    ) -> Result<Arc<CachedAuthorization>, IntrospectionDecision> {
         let now = Instant::now();
         // Another completed request can populate the cache between the caller's
         // initial lookup and installation of a new in-flight cell.
@@ -653,7 +689,7 @@ impl Oauth2Introspection {
                 alg,
                 kid,
             } => {
-                let assertion_audience = provider
+        let assertion_audience = provider
                     .assertion_audience
                     .as_deref()
                     .unwrap_or(endpoint.as_str());
@@ -771,12 +807,12 @@ impl Oauth2Introspection {
             ));
         }
         let expires_at_unix = validated_introspection_expiry(&claims)?;
-        let credential = Arc::new(CachedIntrospection {
-            claims: Arc::new(claims),
-            expires_at_unix,
-        });
-        provider.cache.insert_active(token, credential.clone(), now);
-        Ok(credential)
+        let authorization =
+            Arc::new(self.normalize_authorization(&claims, provider, expires_at_unix));
+        provider
+            .cache
+            .insert_active(token, Arc::clone(&authorization), now);
+        Ok(authorization)
     }
 
     fn check_claims_authorization(
@@ -804,12 +840,24 @@ impl Oauth2Introspection {
         )
     }
 
-    fn resolve_identity(
+    fn normalize_authorization(
         &self,
         claims: &Value,
         provider: &IntrospectionProvider,
-        consumer_index: &ConsumerIndex,
-    ) -> VerifyOutcome {
+        expires_at_unix: Option<i64>,
+    ) -> CachedAuthorization {
+        if let Err((status_code, body)) = self.check_claims_authorization(claims, provider) {
+            return CachedAuthorization {
+                authorization_error: Some(CachedAuthorizationError {
+                    status_code,
+                    body: body.into_boxed_str(),
+                }),
+                identity: None,
+                identity_header: None,
+                claim_headers: Box::default(),
+                expires_at_unix,
+            };
+        }
         let identity_claim = provider
             .consumer_identity_claim
             .as_deref()
@@ -824,6 +872,30 @@ impl Oauth2Introspection {
         } else {
             extract_claim_string_exact(claims, header_claim).or_else(|| identity.clone())
         };
+        let claim_headers = normalized_claim_header_values(claims, &provider.claim_headers, ",")
+            .into_iter()
+            .map(|(mapping_index, value)| CachedClaimHeader {
+                mapping_index,
+                value: value.into_boxed_str(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        CachedAuthorization {
+            authorization_error: None,
+            identity: identity.map(String::into_boxed_str),
+            identity_header: header_value.map(String::into_boxed_str),
+            claim_headers,
+            expires_at_unix,
+        }
+    }
+
+    fn resolve_identity(
+        &self,
+        authorization: &CachedAuthorization,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        let identity = authorization.identity.as_deref().map(str::to_string);
+        let header_value = authorization.identity_header.as_deref().map(str::to_string);
         let consumer = identity
             .as_deref()
             .and_then(|id| consumer_index.find_by_identity(id));
@@ -833,13 +905,15 @@ impl Oauth2Introspection {
     fn stage_claim_headers(
         &self,
         attempt: &mut AuthenticationAttempt,
-        claims: &Value,
+        authorization: &CachedAuthorization,
         provider: &IntrospectionProvider,
     ) {
-        if provider.claim_headers.is_empty() {
-            return;
+        for header in authorization.claim_headers.iter() {
+        let Some(mapping) = provider.claim_headers.get(header.mapping_index) else {
+                continue;
+            };
+            attempt.stage_claim_header(mapping.metadata_key.clone(), header.value.to_string());
         }
-        emit_claim_headers_to_attempt(attempt, claims, &provider.claim_headers, ",");
     }
 
     fn stage_original_token_stripping(
@@ -887,7 +961,7 @@ impl Oauth2Introspection {
                     TokenLocationExtract::Credential(ExtractedCredential::BearerToken(token)) => {
                         if self.allow_provider_fanout && is_authorization_bearer_location(location)
                         {
-                            let candidates = self
+        let candidates = self
                                 .providers
                                 .iter()
                                 .enumerate()
@@ -944,7 +1018,7 @@ impl Oauth2Introspection {
                 .map(Oauth2ExtractedCredential::InvalidFormat)
                 .unwrap_or(Oauth2ExtractedCredential::InvalidFormat(body)),
             ExtractedCredential::BearerToken(token) => {
-                let provider_indices: Vec<usize> = if self.allow_provider_fanout {
+        let provider_indices: Vec<usize> = if self.allow_provider_fanout {
                     (0..self.providers.len()).collect()
                 } else {
                     self.providers
@@ -987,7 +1061,7 @@ fn provider_location_extracting_token(
     ctx: &RequestContext,
     expected_token: &str,
 ) -> Option<usize> {
-    token_locations
+        token_locations
         .iter()
         .enumerate()
         .find_map(
@@ -1006,7 +1080,7 @@ fn extract_provider_token_location(
     location: &TokenLocation,
     ctx: &RequestContext,
 ) -> TokenLocationExtract {
-    if is_authorization_bearer_location(location) {
+        if is_authorization_bearer_location(location) {
         return match extract_authorization_bearer(ctx) {
             ExtractedCredential::Missing => TokenLocationExtract::Missing,
             credential => TokenLocationExtract::Credential(credential),
@@ -1020,7 +1094,7 @@ fn register_provider_location(
     key: String,
     provider_idx: usize,
 ) -> Result<(), String> {
-    if let Some(previous_provider_idx) = location_owners.insert(key, provider_idx)
+        if let Some(previous_provider_idx) = location_owners.insert(key, provider_idx)
         && previous_provider_idx != provider_idx
     {
         return Err(
@@ -1032,12 +1106,12 @@ fn register_provider_location(
 }
 
 fn token_location_routing_key(location: &TokenLocation) -> String {
-    match location {
+        match location {
         TokenLocation::Header(_) if is_authorization_bearer_location(location) => {
             "authorization-bearer".to_string()
         }
         TokenLocation::Header(header) => {
-            let prefix = header.prefix.as_deref().unwrap_or("");
+        let prefix = header.prefix.as_deref().unwrap_or("");
             let mut key = String::with_capacity(
                 "header:".len() + header.name.len() + prefix.len().saturating_add(1),
             );
@@ -1048,7 +1122,7 @@ fn token_location_routing_key(location: &TokenLocation) -> String {
             key
         }
         TokenLocation::QueryParam(name) => {
-            let mut key = String::with_capacity("query:".len() + name.len());
+        let mut key = String::with_capacity("query:".len() + name.len());
             key.push_str("query:");
             key.push_str(name);
             key
@@ -1057,7 +1131,7 @@ fn token_location_routing_key(location: &TokenLocation) -> String {
 }
 
 fn is_authorization_bearer_location(location: &TokenLocation) -> bool {
-    let TokenLocation::Header(header) = location else {
+        let TokenLocation::Header(header) = location else {
         return false;
     };
     if !header.name.eq_ignore_ascii_case("authorization") {
@@ -1079,21 +1153,21 @@ enum IntrospectionDecision {
 }
 
 fn credential_expired(expires_at_unix: Option<i64>) -> bool {
-    expires_at_unix.is_some_and(|expiry| expiry <= chrono::Utc::now().timestamp())
+        expires_at_unix.is_some_and(|expiry| expiry <= chrono::Utc::now().timestamp())
 }
 
 /// Resolve an introspection credential's authoritative validity once, at the
 /// provider-response boundary. Relative `expires_in` is converted immediately
 /// so cache hits and single-flight followers cannot slide the deadline.
 fn validated_introspection_expiry(claims: &Value) -> Result<Option<i64>, IntrospectionDecision> {
-    validated_introspection_expiry_at(claims, chrono::Utc::now().timestamp())
+        validated_introspection_expiry_at(claims, chrono::Utc::now().timestamp())
 }
 
 fn validated_introspection_expiry_at(
     claims: &Value,
     now: i64,
 ) -> Result<Option<i64>, IntrospectionDecision> {
-    let mut deadline: Option<i64> = None;
+        let mut deadline: Option<i64> = None;
     for field in ["exp", "active_until"] {
         let Some(value) = claims.get(field) else {
             continue;
@@ -1177,7 +1251,7 @@ trait FormBodyExt {
 }
 
 impl FormBodyExt for reqwest::RequestBuilder {
-    fn with_form_body(
+        fn with_form_body(
         self,
         params: &[(String, String)],
     ) -> Result<reqwest::RequestBuilder, IntrospectionDecision> {
@@ -1301,7 +1375,7 @@ impl super::Plugin for Oauth2Introspection {
             .collect();
         if strip_authorization || !strip_headers.is_empty() {
             headers.retain(|name, _| {
-                let strip_current = (strip_authorization
+        let strip_current = (strip_authorization
                     && name.eq_ignore_ascii_case("authorization"))
                     || strip_headers
                         .iter()
@@ -1343,7 +1417,7 @@ fn apply_verify_outcome(
     outcome: VerifyOutcome,
     auth_method: &'static str,
 ) -> PluginResult {
-    match commit_authentication_attempt(ctx, attempt, outcome, auth_method, true) {
+        match commit_authentication_attempt(ctx, attempt, outcome, auth_method, true) {
         Ok(_) => PluginResult::Continue,
         Err(VerifyOutcome::Forbidden(body)) => reject(403, body),
         Err(VerifyOutcome::InvalidFormat(body)) => reject_bearer(401, body, "invalid_request"),
@@ -1362,7 +1436,7 @@ fn parse_client_auth(
     provider_idx: usize,
     endpoint: Option<&ParsedEndpoint>,
 ) -> Result<ClientAuth, String> {
-    let auth = match config.get("client_auth") {
+        let auth = match config.get("client_auth") {
         Some(value) => value.as_object().cloned().ok_or_else(|| {
             format!("oauth2_introspection: provider[{provider_idx}].client_auth must be an object")
         })?,
@@ -1425,7 +1499,7 @@ fn parse_client_auth(
 
     match method {
         "client_secret_basic" => {
-            let client_id = client_id.ok_or_else(|| {
+        let client_id = client_id.ok_or_else(|| {
                 format!(
                     "oauth2_introspection: provider[{provider_idx}].client_auth.client_id is required"
                 )
@@ -1452,7 +1526,7 @@ fn parse_client_auth(
             )?),
         }),
         "private_key_jwt" => {
-            let client_id = client_id.ok_or_else(|| {
+        let client_id = client_id.ok_or_else(|| {
                 format!(
                     "oauth2_introspection: provider[{provider_idx}].client_auth.client_id is required"
                 )
@@ -1522,7 +1596,7 @@ fn required_auth_string(
     field: &str,
     provider_idx: usize,
 ) -> Result<String, String> {
-    let value = auth.get(field).ok_or_else(|| {
+        let value = auth.get(field).ok_or_else(|| {
         format!("oauth2_introspection: provider[{provider_idx}].client_auth.{field} is required")
     })?;
     let raw = value.as_str().ok_or_else(|| {
@@ -1542,7 +1616,7 @@ fn oauth_basic_authorization_header(
     client_id: &str,
     client_secret: &str,
 ) -> Result<HeaderValue, String> {
-    let encoded_client_id = oauth_form_encode_component(client_id)?;
+        let encoded_client_id = oauth_form_encode_component(client_id)?;
     let encoded_client_secret = oauth_form_encode_component(client_secret)?;
     let mut credential = String::with_capacity(
         encoded_client_id
@@ -1564,7 +1638,7 @@ fn oauth_basic_authorization_header(
 }
 
 fn oauth_form_encode_component(value: &str) -> Result<String, String> {
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     serializer.append_pair("value", value);
     serializer
         .finish()
@@ -1574,7 +1648,7 @@ fn oauth_form_encode_component(value: &str) -> Result<String, String> {
 }
 
 fn parse_private_key_alg(value: Option<&Value>, provider_idx: usize) -> Result<Algorithm, String> {
-    let algorithm = match value {
+        let algorithm = match value {
         Some(value) => value.as_str().ok_or_else(|| {
             format!(
                 "oauth2_introspection: provider[{provider_idx}].client_auth.private_key_jwt_alg must be a string"
@@ -1602,7 +1676,7 @@ fn build_client_assertion(
     alg: Algorithm,
     kid: &Option<String>,
 ) -> Result<String, String> {
-    let now = chrono::Utc::now().timestamp();
+        let now = chrono::Utc::now().timestamp();
     let mut header = Header::new(alg);
     header.kid = kid.clone();
     encode(
@@ -1624,7 +1698,7 @@ fn parse_token_locations(
     config: &Map<String, Value>,
     provider_idx: usize,
 ) -> Result<Vec<TokenLocation>, String> {
-    let mut locations = Vec::new();
+        let mut locations = Vec::new();
     if let Some(value) = config.get("from_headers") {
         let headers = value.as_array().ok_or_else(|| {
             format!(
@@ -1632,7 +1706,7 @@ fn parse_token_locations(
             )
         })?;
         for (idx, header) in headers.iter().enumerate() {
-            let object = header.as_object().ok_or_else(|| {
+        let object = header.as_object().ok_or_else(|| {
                 format!(
                     "oauth2_introspection: 'provider[{provider_idx}].from_headers[{idx}]' must be an object"
                 )
@@ -1686,7 +1760,7 @@ fn optional_claim_path(
     default_value: &str,
     plugin: &str,
 ) -> Result<String, String> {
-    match config.get(field) {
+        match config.get(field) {
         Some(value) => parse_claim_path_value(field, value, plugin),
         None => Ok(default_value.to_string()),
     }
@@ -1697,7 +1771,7 @@ fn reject_unknown_keys(
     allowed: &[&str],
     path: &str,
 ) -> Result<(), String> {
-    if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(format!("{path} contains unknown field '{unknown}'"));
     }
     Ok(())
@@ -1708,7 +1782,7 @@ fn optional_top_level_bool(
     field: &str,
     plugin: &str,
 ) -> Result<Option<bool>, String> {
-    config
+        config
         .get(field)
         .map(|value| {
             value
@@ -1723,7 +1797,7 @@ fn optional_provider_claim_path(
     field: &str,
     provider_idx: usize,
 ) -> Result<Option<String>, String> {
-    let Some(value) = config.get(field) else {
+        let Some(value) = config.get(field) else {
         return Ok(None);
     };
     parse_claim_path_value(
@@ -1739,7 +1813,7 @@ fn optional_non_empty_string(
     field: &str,
     provider_idx: usize,
 ) -> Result<Option<String>, String> {
-    let Some(value) = config.get(field) else {
+        let Some(value) = config.get(field) else {
         return Ok(None);
     };
     let raw = value.as_str().ok_or_else(|| {
@@ -1761,7 +1835,7 @@ fn optional_provider_bool(
     field: &str,
     provider_idx: usize,
 ) -> Result<Option<bool>, String> {
-    config
+        config
         .get(field)
         .map(|value| {
             value.as_bool().ok_or_else(|| {
@@ -1778,7 +1852,7 @@ fn optional_nullable_string(
     field: &str,
     provider_idx: usize,
 ) -> Result<Option<String>, String> {
-    let Some(value) = config.get(field) else {
+        let Some(value) = config.get(field) else {
         return Ok(None);
     };
     if value.is_null() {
@@ -1801,7 +1875,7 @@ fn parse_string_array(
     field: &str,
     provider_idx: usize,
 ) -> Result<Vec<String>, String> {
-    let Some(value) = config.get(field) else {
+        let Some(value) = config.get(field) else {
         return Ok(Vec::new());
     };
     let arr = value.as_array().ok_or_else(|| {
@@ -1833,7 +1907,7 @@ fn ranged_provider_u64(
     min: u64,
     max: u64,
 ) -> Result<u64, String> {
-    let value = config
+        let value = config
         .get(field)
         .map(|value| {
             value.as_u64().ok_or_else(|| {
@@ -1860,7 +1934,7 @@ fn ranged_provider_usize(
     min: usize,
     max: usize,
 ) -> Result<usize, String> {
-    let value = ranged_provider_u64(
+        let value = ranged_provider_u64(
         config,
         field,
         provider_idx,
@@ -1884,7 +1958,7 @@ fn parse_url_field(
     field: &str,
     provider_idx: usize,
 ) -> Result<Option<ParsedEndpoint>, String> {
-    let Some(value) = config.get(field) else {
+        let Some(value) = config.get(field) else {
         return Ok(None);
     };
     let raw = value.as_str().ok_or_else(|| {
@@ -1918,7 +1992,7 @@ fn parse_url_field(
 }
 
 fn hostname_from_parsed_url(parsed: &Url) -> Option<String> {
-    Some(match parsed.host()? {
+        Some(match parsed.host()? {
         Host::Domain(hostname) => hostname.to_string(),
         Host::Ipv4(address) => address.to_string(),
         Host::Ipv6(address) => address.to_string(),
@@ -1926,13 +2000,13 @@ fn hostname_from_parsed_url(parsed: &Url) -> Option<String> {
 }
 
 fn hostname_from_url(url: &str) -> Option<String> {
-    Url::parse(url)
+        Url::parse(url)
         .ok()
         .and_then(|parsed| hostname_from_parsed_url(&parsed))
 }
 
 fn is_local_introspection_host(hostname: &str) -> bool {
-    hostname.eq_ignore_ascii_case("localhost")
+        hostname.eq_ignore_ascii_case("localhost")
         || hostname
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
@@ -1944,11 +2018,11 @@ fn is_local_introspection_host(hostname: &str) -> bool {
 /// gate. The scheme comparison is case-insensitive because `url` lowercases
 /// schemes on parse, but we stay defensive.
 fn is_insecure_credentialed_endpoint(endpoint: &ParsedEndpoint) -> bool {
-    endpoint.scheme.eq_ignore_ascii_case("http") && !is_local_introspection_host(&endpoint.hostname)
+        endpoint.scheme.eq_ignore_ascii_case("http") && !is_local_introspection_host(&endpoint.hostname)
 }
 
 fn audience_matches(claims: &Value, audiences: &[String]) -> bool {
-    if audiences.is_empty() {
+        if audiences.is_empty() {
         return true;
     }
     match claims.get("aud") {
@@ -1969,7 +2043,7 @@ fn stage_credential_source_stripping(
     match source {
         CredentialSource::Authorization => stage_authorization_stripping(attempt),
         CredentialSource::ProviderLocation(location_idx) => {
-            let Some(location) = provider.token_locations.get(location_idx) else {
+        let Some(location) = provider.token_locations.get(location_idx) else {
                 warn!(
                     plugin = "oauth2_introspection",
                     location_idx, "accepted token source no longer exists"
@@ -1982,7 +2056,7 @@ fn stage_credential_source_stripping(
 }
 
 fn authorization_bearer_matches(ctx: &RequestContext, expected_token: &str) -> bool {
-    ctx.headers
+        ctx.headers
         .get("authorization")
         .and_then(|value| strip_auth_scheme(value, "Bearer"))
         .is_some_and(|token| token == expected_token)
@@ -1993,12 +2067,12 @@ fn token_location_matches(
     ctx: &RequestContext,
     expected_token: &str,
 ) -> bool {
-    if is_authorization_bearer_location(location) {
+        if is_authorization_bearer_location(location) {
         return authorization_bearer_matches(ctx, expected_token);
     }
     match location {
         TokenLocation::Header(header) => ctx.headers.get(&header.name).is_some_and(|value| {
-            let token = match header.prefix.as_deref() {
+        let token = match header.prefix.as_deref() {
                 Some(prefix) => value.strip_prefix(prefix),
                 None => Some(value.as_str()),
             };
@@ -2031,7 +2105,7 @@ fn stage_token_location_stripping(attempt: &mut AuthenticationAttempt, location:
 }
 
 fn reject(status_code: u16, body: String) -> PluginResult {
-    PluginResult::Reject {
+        PluginResult::Reject {
         status_code,
         body,
         headers: HashMap::new(),
@@ -2039,7 +2113,7 @@ fn reject(status_code: u16, body: String) -> PluginResult {
 }
 
 fn reject_bearer(status_code: u16, body: String, error: &'static str) -> PluginResult {
-    let mut headers = HashMap::new();
+        let mut headers = HashMap::new();
     headers.insert(
         "www-authenticate".to_string(),
         format!(r#"Bearer error="{error}""#),
@@ -2057,13 +2131,13 @@ fn spawn_discovery_task(
     http_client: PluginHttpClient,
     discovery_url: String,
 ) -> tokio::task::JoinHandle<()> {
-    runtime.spawn(async move {
+        runtime.spawn(async move {
         const INITIAL_BACKOFF_SECS: u64 = 2;
         const MAX_BACKOFF_SECS: u64 = 300;
         let mut attempt: u32 = 0;
         loop {
             if attempt > 0 {
-                let backoff = Duration::from_secs(
+        let backoff = Duration::from_secs(
                     INITIAL_BACKOFF_SECS
                         .saturating_mul(1u64 << (attempt - 1).min(7))
                         .min(MAX_BACKOFF_SECS),
@@ -2096,7 +2170,7 @@ async fn discover_introspection_endpoint(
     http_client: &PluginHttpClient,
     discovery_url: &str,
 ) -> Result<String, String> {
-    let response = http_client
+        let response = http_client
         .execute(
             http_client.get().get(discovery_url),
             "oauth2_introspection_discovery",
@@ -2123,7 +2197,7 @@ fn validate_discovered_endpoint(
     endpoint: &str,
     field: &str,
 ) -> Result<String, String> {
-    let discovery = Url::parse(discovery_url)
+        let discovery = Url::parse(discovery_url)
         .map_err(|e| format!("discovery_url should already be valid: {e}"))?;
     let parsed = Url::parse(endpoint).map_err(|e| format!("discovery {field} is invalid: {e}"))?;
     match parsed.scheme() {

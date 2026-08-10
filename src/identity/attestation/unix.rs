@@ -2,8 +2,9 @@
 //!
 //! Reads `SO_PEERCRED` (PID/UID/GID) on the Unix domain socket the workload
 //! API server is listening on, then walks `/proc/<pid>/exe` and computes a
-//! SHA-256 fingerprint of the binary. Operators map either the UID or the
-//! binary fingerprint to a SPIFFE ID via static config.
+//! SHA-256 fingerprint of the binary. Operators map the kernel-attested UID
+//! to a SPIFFE ID via static config. A binary fingerprint may only strengthen
+//! a UID-bound rule; it is never accepted as a principal on its own.
 //!
 //! Linux-first: macOS exposes `LOCAL_PEERPID` but not `LOCAL_PEEREUID` for
 //! arbitrary sockets, and Windows has no equivalent. On non-Linux, the
@@ -47,7 +48,6 @@ pub struct UnixAttestorConfig {
 /// the local trust domain:
 ///
 /// - `uid:<uid>=spiffe://<trust-domain>/<path>`
-/// - `sha256:<hex>=spiffe://<trust-domain>/<path>`
 ///
 /// Diagnostics describe the expected shape without echoing the configured
 /// value, which may have been populated with credential-like text by mistake.
@@ -58,7 +58,7 @@ pub fn parse_identity_rule(
     let (selector, spiffe_id) = entry.split_once('=').ok_or_else(|| {
         AttestError::Config(
             "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES entries must be \
-             'uid:<uid>=<spiffe-id>' or 'sha256:<hex>=<spiffe-id>'"
+             'uid:<uid>=<spiffe-id>'"
                 .to_string(),
         )
     })?;
@@ -89,23 +89,15 @@ pub fn parse_identity_rule(
             spiffe_id,
         });
     }
-    if let Some(digest) = selector.strip_prefix("sha256:") {
-        let digest = digest.trim().to_ascii_lowercase();
-        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(AttestError::Config(
-                "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES 'sha256:' selector is not a \
-                 64-character hex digest"
-                    .to_string(),
-            ));
-        }
-        return Ok(UnixIdentityRule {
-            require_uid: None,
-            require_binary_sha256: Some(digest),
-            spiffe_id,
-        });
+    if selector.starts_with("sha256:") {
+        return Err(AttestError::Config(
+            "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES does not accept sha256-only selectors; \
+             bind every workload identity to a kernel-attested uid"
+                .to_string(),
+        ));
     }
     Err(AttestError::Config(
-        "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES selector must start with 'uid:' or 'sha256:'"
+        "a FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES selector must start with 'uid:'"
             .to_string(),
     ))
 }
@@ -123,6 +115,12 @@ impl UnixAttestor {
             ));
         }
         for rule in &config.rules {
+            if rule.require_uid.is_none() {
+                return Err(AttestError::Config(
+                    "unix attestor rules must bind the workload identity to a kernel-attested uid"
+                        .to_string(),
+                ));
+            }
             if rule.spiffe_id.trust_domain() != &config.trust_domain {
                 return Err(AttestError::Config(format!(
                     "rule SPIFFE ID '{}' is outside the configured trust domain '{}'",

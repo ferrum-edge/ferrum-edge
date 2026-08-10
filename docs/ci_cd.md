@@ -508,10 +508,13 @@ It builds the normal runtime Docker image from the host-built binary, builds the
 eBPF userspace binary with `FEATURES=cloud-secrets,ebpf`, builds the
 `ferrum-ebpf` BPF ELF with nightly Rust, and packages the `:<tag>-ebpf` runtime
 image from those cached host-built artifacts instead of recompiling inside
-Docker. It then creates a disposable dual-stack kind cluster with two workers,
-mounts bpffs in each kind node, loads both images into the cluster, and installs
-the Istio policy CRDs. The runner must provide Docker and a Linux kernel with
-cgroup v2 and kernel >= 5.7.
+Docker. A separate production-Dockerfile smoke builds the ordinary `runtime`
+target (which must omit `ip`) and the privileged `runtime-ebpf` target (which
+must contain `ip`), then checks normalized filesystem inventories for shells and
+package managers. It then creates a disposable dual-stack kind cluster with two
+workers, mounts bpffs in each kind node, loads both images into the cluster, and
+installs the Istio policy CRDs. The runner must provide Docker and a Linux kernel
+with cgroup v2 and kernel >= 5.7.
 
 The harness renders the Helm chart to assert enabled eBPF topologies select the
 `-ebpf` image, installs NodeWaypoint eBPF mode, checks

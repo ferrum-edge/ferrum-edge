@@ -2963,6 +2963,62 @@ fn ldap_cache_documentation_and_openapi_defaults_match_runtime_constants() {
 }
 
 #[test]
+fn oauth2_introspection_cache_schema_and_docs_match_runtime_constants() {
+    use ferrum_edge::plugins::utils::introspection_cache::{
+        DEFAULT_MAX_CACHE_ENTRIES, DEFAULT_MAX_CACHE_ENTRY_BYTES, DEFAULT_MAX_CACHE_TOTAL_BYTES,
+        HARD_MAX_CACHE_ENTRIES, HARD_MAX_CACHE_ENTRY_BYTES, HARD_MAX_CACHE_TOTAL_BYTES,
+        MIN_MAX_CACHE_ENTRIES, MIN_MAX_CACHE_ENTRY_BYTES, MIN_MAX_CACHE_TOTAL_BYTES,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let properties = spec
+        .pointer(
+            "/components/schemas/Oauth2IntrospectionConfig/properties/providers/items/properties",
+        )
+        .expect("OAuth2 introspection provider properties exist");
+    for (field, default, minimum, maximum) in [
+        (
+            "max_cache_entries",
+            DEFAULT_MAX_CACHE_ENTRIES,
+            MIN_MAX_CACHE_ENTRIES,
+            HARD_MAX_CACHE_ENTRIES,
+        ),
+        (
+            "max_cache_entry_bytes",
+            DEFAULT_MAX_CACHE_ENTRY_BYTES,
+            MIN_MAX_CACHE_ENTRY_BYTES,
+            HARD_MAX_CACHE_ENTRY_BYTES,
+        ),
+        (
+            "max_cache_total_bytes",
+            DEFAULT_MAX_CACHE_TOTAL_BYTES,
+            MIN_MAX_CACHE_TOTAL_BYTES,
+            HARD_MAX_CACHE_TOTAL_BYTES,
+        ),
+    ] {
+        assert_eq!(properties[field]["default"], json!(default));
+        assert_eq!(properties[field]["minimum"], json!(minimum));
+        assert_eq!(properties[field]["maximum"], json!(maximum));
+    }
+
+    let cache_guide = include_str!("../../docs/cache_management.md");
+    assert!(
+        cache_guide
+            .contains("| `oauth2_introspection` | `providers[].max_cache_entries` | `10000` |")
+    );
+    assert!(
+        cache_guide
+            .contains("| `oauth2_introspection` | `providers[].max_cache_entry_bytes` | `16384` |")
+    );
+    assert!(
+        cache_guide.contains(
+            "| `oauth2_introspection` | `providers[].max_cache_total_bytes` | `16777216` |"
+        )
+    );
+}
+
+#[test]
 fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -6300,6 +6356,9 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
         ActionSnapshot, ConnPressure, FdPressure, NodeWaypointDropSnapshot, OverloadLevel,
         OverloadSnapshot, PressureSnapshot, ReqPressure,
     };
+    use ferrum_edge::proxy::udp_placement_migration::{
+        UdpMigrationFailureReason, UdpMigrationStatusPhase, UdpMigrationStatusSnapshot,
+    };
 
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -6362,6 +6421,12 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
         missing_destination_metadata: 1,
         plaintext_fallback_attempts: 1,
     };
+    let udp_placement_migration = UdpMigrationStatusSnapshot {
+        enabled: true,
+        phase: UdpMigrationStatusPhase::CleaningPodNetns,
+        outstanding: 2,
+        failure_reason: UdpMigrationFailureReason::GateAcknowledgementMissing,
+    };
     assert_component_validity(
         &spec,
         "HealthResponse",
@@ -6371,6 +6436,20 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
             "mesh": {
                 "egress_scope": health,
                 "node_waypoint_observability": node_waypoint_observability
+            }
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "HealthResponse",
+        &json!({
+            "status": "ok",
+            "ready": true,
+            "mesh": {
+                "egress_scope": health,
+                "node_waypoint_observability": node_waypoint_observability,
+                "udp_placement_migration": udp_placement_migration
             }
         }),
         true,

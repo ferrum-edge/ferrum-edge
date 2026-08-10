@@ -117,14 +117,22 @@ const AUDIT_LOCAL_FALLBACK_LOCK_FILE_NAME: &str = "admin-audit-fallback.lock";
 const AUDIT_LOCAL_FALLBACK_DEFAULT_DIR: &str = "./ferrum-admin-audit";
 /// Combined bound for in-process + cross-process local-fallback lock waits.
 ///
-/// A successful append is a handful of syscalls (typically well under 1 ms
-/// even under sibling-admin contention). 100 ms is orders of magnitude larger
-/// than that critical section, yet small versus typical admin
-/// request/header timeouts (seconds), so ordinary contention resolves without
-/// turning a stuck holder into a hung admin API. Both lock acquisitions share
-/// one deadline so the caller-visible worst case stays this bound, not the
-/// product of two independent waits.
-const LOCAL_FALLBACK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+/// A waiter is not queued behind a lock handoff: the holder owns both locks
+/// for a complete read/modify/write critical section that reads the retained
+/// store, publishes a temp file, `fsync`s it, renames it into place, and
+/// `fsync`s the parent directory. On loaded, virtualized, or network-backed
+/// storage that is routinely tens to hundreds of milliseconds, and concurrent
+/// admits (every security-sensitive `GET /backup` reaching the fallback
+/// serializes here) each wait for whole critical sections ahead of them. A
+/// sub-second bound therefore cannot distinguish a busy holder from a wedged
+/// one, and refuses an event that was perfectly admissible — the spurious
+/// fail-closed behavior issue #3573 set out to remove. Five seconds is far
+/// above any healthy critical section, still bounds the `spawn_blocking`
+/// thread so a wedged holder cannot hang `GET /backup` unboundedly, and stays
+/// within typical admin request timeouts. Both lock acquisitions share one
+/// deadline so the caller-visible worst case stays this bound, not the product
+/// of two independent waits.
+const LOCAL_FALLBACK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Sleep between non-blocking lock retries. Short enough that a just-released
 /// holder is noticed quickly; long enough to avoid a tight spin.
 const LOCAL_FALLBACK_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(1);

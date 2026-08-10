@@ -63,6 +63,7 @@ pub mod gateway_harness;
 pub mod hmac_helpers;
 pub mod isolated_audit_fallback;
 pub mod protocol_managed_response_headers;
+pub mod trusted_projected_gateway;
 
 pub use backend_availability::{
     IsolatedSqlDatabase, continue_if_backend_available, continue_if_tls_fixture_available,
@@ -89,3 +90,7 @@ pub use hmac_helpers::{
     generate_hmac_signature_with_query, hmac_authority_from_url,
 };
 pub use isolated_audit_fallback::isolated_audit_fallback_dir;
+pub use trusted_projected_gateway::{
+    TrustedProjectedGateway, TrustedProjectedGatewayOptions, run_trusted_projected_gateway_test,
+    trusted_projected_config_from_yaml,
+};
