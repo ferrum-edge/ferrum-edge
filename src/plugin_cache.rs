@@ -4811,8 +4811,7 @@ pub fn request_reject_after_jwks_startup_for_test() {
 }
 
 fn reject_after_jwks_startup_if_requested_for_test() -> Result<(), String> {
-    let requested =
-        REJECT_AFTER_JWKS_STARTUP_FOR_TEST.with(|requested| requested.replace(false));
+    let requested = REJECT_AFTER_JWKS_STARTUP_FOR_TEST.with(|requested| requested.replace(false));
     if requested {
         Err(
             "test-injected rejection after JWKS background startup (unpublished policy must not stick)"

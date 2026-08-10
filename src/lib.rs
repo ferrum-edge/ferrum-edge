@@ -1306,9 +1306,8 @@ pub mod _test_support {
     }
 
     pub fn cached_jwks_refresh_generation_for_test(jwks_uri: &str) -> Option<u64> {
-        crate::plugins::utils::jwks_cache::cached_refresh_state(jwks_uri).map(|(_, generation)| {
-            generation
-        })
+        crate::plugins::utils::jwks_cache::cached_refresh_state(jwks_uri)
+            .map(|(_, generation)| generation)
     }
 
     pub fn oidc_sealed_refresh_session_cookie_for_test(
