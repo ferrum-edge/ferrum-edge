@@ -1511,6 +1511,53 @@ fn malformed_bundles_are_refused_without_echoing_material() {
     }
 }
 
+#[test]
+fn trust_bundle_and_file_backed_material_reads_are_bounded_regular_files() {
+    const FILE_LIMIT: usize = 1024 * 1024;
+
+    let dir = tempfile::tempdir().expect("create bounded-read fixture directory");
+    let oversized = vec![b'x'; FILE_LIMIT + 1];
+
+    let bundle_path = dir.path().join("oversized-bundle.json");
+    std::fs::write(&bundle_path, &oversized).expect("write oversized bundle fixture");
+    let error = CpDpTrustBundle::load_from_path(
+        bundle_path.to_str().expect("UTF-8 bundle fixture path"),
+        None,
+    )
+    .expect_err("an oversized trust bundle must be refused before parsing");
+    assert!(error.contains("above the 1048576-byte limit"), "{error}");
+
+    let secret_path = dir.path().join("oversized-secret");
+    std::fs::write(&secret_path, &oversized).expect("write oversized secret fixture");
+    let document = json!({
+        "keys": [{
+            "kid": "bounded-secret",
+            "algorithm": "HS256",
+            "secret_path": secret_path.display().to_string(),
+            "namespaces": [TENANT_A]
+        }]
+    })
+    .to_string();
+    let error = CpDpTrustBundle::from_document_str(&document, "bounded-material-test", None)
+        .expect_err("oversized file-backed material must be refused");
+    assert!(error.contains("above the 1048576-byte limit"), "{error}");
+
+    let non_file_path = dir.path().join("material-directory");
+    std::fs::create_dir(&non_file_path).expect("create non-file material fixture");
+    let document = json!({
+        "keys": [{
+            "kid": "regular-file-only",
+            "algorithm": "HS256",
+            "secret_path": non_file_path.display().to_string(),
+            "namespaces": [TENANT_A]
+        }]
+    })
+    .to_string();
+    let error = CpDpTrustBundle::from_document_str(&document, "regular-material-test", None)
+        .expect_err("non-regular file-backed material must be refused");
+    assert!(error.contains("is not a regular file"), "{error}");
+}
+
 /// A bound credential backed by the fleet-wide `FERRUM_CP_DP_GRPC_JWT_SECRET`
 /// is structurally valid but semantically identical to the pre-advisory
 /// posture: every data plane already holds that value, so any of them could

@@ -61,6 +61,7 @@
 //! that the operator already wrote into their own configuration.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -75,6 +76,48 @@ use crate::fips::approved::Sha256;
 /// but a bounded read keeps a mistyped path (a device node, a huge log) from
 /// allocating without limit during startup.
 const TRUST_BUNDLE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Apply the same ceiling to file-backed verification material. Public keys
+/// and symmetric secrets are tiny in practice; sharing the document limit
+/// keeps the operator surface simple while preventing a path swap from turning
+/// the periodic reload worker into an unbounded file reader.
+const TRUST_MATERIAL_MAX_BYTES: u64 = TRUST_BUNDLE_MAX_BYTES;
+
+fn read_regular_utf8_file_bounded(
+    path: &str,
+    description: &str,
+    max_bytes: u64,
+) -> Result<String, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open {description} '{path}': {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect {description} '{path}': {e}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{description} '{path}' is not a regular file"));
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{description} '{path}' is {} bytes, above the {max_bytes}-byte limit",
+            metadata.len()
+        ));
+    }
+
+    // The descriptor metadata check is only an allocation hint. Bound the
+    // actual read as well so in-place growth after metadata() cannot bypass
+    // the ceiling or force an unbounded allocation.
+    let mut raw = Vec::with_capacity(metadata.len().min(max_bytes) as usize);
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("failed to read {description} '{path}': {e}"))?;
+    if raw.len() as u64 > max_bytes {
+        return Err(format!(
+            "{description} '{path}' grew above the {max_bytes}-byte limit while it was read"
+        ));
+    }
+    String::from_utf8(raw).map_err(|_| format!("{description} '{path}' is not valid UTF-8"))
+}
 
 /// Upper bound on an operator-authored identifier (`kid`). Bounded so a
 /// hostile-looking bundle cannot smuggle an unbounded string into startup
@@ -357,19 +400,11 @@ impl CpDpTrustBundle {
     /// operator configured one. It is used only to *refuse* a bound credential
     /// backed by that value; it is never rendered.
     pub fn load_from_path(path: &str, fleet_secret: Option<&str>) -> Result<Self, String> {
-        let metadata = std::fs::metadata(path)
-            .map_err(|e| format!("failed to stat CP/DP trust bundle '{path}': {e}"))?;
-        if !metadata.is_file() {
-            return Err(format!("CP/DP trust bundle '{path}' is not a regular file"));
-        }
-        if metadata.len() > TRUST_BUNDLE_MAX_BYTES {
-            return Err(format!(
-                "CP/DP trust bundle '{path}' is {} bytes, above the {TRUST_BUNDLE_MAX_BYTES}-byte limit",
-                metadata.len()
-            ));
-        }
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read CP/DP trust bundle '{path}': {e}"))?;
+        let raw = read_regular_utf8_file_bounded(
+            path,
+            "CP/DP trust bundle",
+            TRUST_BUNDLE_MAX_BYTES,
+        )?;
         Self::from_document_str(&raw, path, fleet_secret)
     }
 
@@ -803,13 +838,26 @@ pub fn spawn_trust_bundle_reload(
                 }
             }
 
-            let raw = match tokio::fs::read(&path).await {
-                Ok(raw) if raw.len() as u64 <= TRUST_BUNDLE_MAX_BYTES => raw,
-                Ok(_) => {
+            // Bundle parsing resolves file-backed key material. Keep every
+            // filesystem operation off Tokio's runtime workers, and use the
+            // same opened-handle type/size checks as startup so a post-startup
+            // path replacement cannot widen the reload boundary.
+            let candidate = match tokio::task::spawn_blocking({
+                let path = path.clone();
+                let fleet_secret = fleet_secret.clone();
+                move || {
+                    CpDpTrustBundle::load_from_path(&path, fleet_secret.as_deref())
+                        .map(CpDpVerifier::TrustBundle)
+                }
+            })
+            .await
+            {
+                Ok(Ok(candidate)) => candidate,
+                Ok(Err(_)) => {
                     if !last_failed {
                         tracing::warn!(
                             audit.event = "cp_dp_trust_bundle_reload_rejected",
-                            reason = "document_too_large",
+                            reason = "read_or_validation_failed",
                             "CP/DP trust-bundle reload rejected; retaining the active verifier"
                         );
                     }
@@ -820,7 +868,7 @@ pub fn spawn_trust_bundle_reload(
                     if !last_failed {
                         tracing::warn!(
                             audit.event = "cp_dp_trust_bundle_reload_rejected",
-                            reason = "read_failed",
+                            reason = "reload_worker_failed",
                             "CP/DP trust-bundle reload rejected; retaining the active verifier"
                         );
                     }
@@ -828,39 +876,6 @@ pub fn spawn_trust_bundle_reload(
                     continue;
                 }
             };
-            let raw = match std::str::from_utf8(&raw) {
-                Ok(raw) => raw,
-                Err(_) => {
-                    if !last_failed {
-                        tracing::warn!(
-                            audit.event = "cp_dp_trust_bundle_reload_rejected",
-                            reason = "invalid_utf8",
-                            "CP/DP trust-bundle reload rejected; retaining the active verifier"
-                        );
-                    }
-                    last_failed = true;
-                    continue;
-                }
-            };
-            let bundle = match CpDpTrustBundle::from_document_str(
-                raw,
-                "live trust-bundle source",
-                fleet_secret.as_deref(),
-            ) {
-                Ok(bundle) => bundle,
-                Err(_) => {
-                    if !last_failed {
-                        tracing::warn!(
-                            audit.event = "cp_dp_trust_bundle_reload_rejected",
-                            reason = "validation_failed",
-                            "CP/DP trust-bundle reload rejected; retaining the active verifier"
-                        );
-                    }
-                    last_failed = true;
-                    continue;
-                }
-            };
-            let candidate = CpDpVerifier::TrustBundle(bundle);
             if candidate.validate_for_scope(multi_namespace).is_err() {
                 if !last_failed {
                     tracing::warn!(
@@ -1122,13 +1137,11 @@ impl TrustBundleKeyDocument {
                     )
                 })?
             } else if let Some(path) = self.secret_path.as_deref() {
-                std::fs::read_to_string(path)
-                    .map_err(|e| {
-                        format!(
-                            "CP/DP trust bundle '{origin}': key '{kid}' secret file '{path}' \
-                             could not be read: {e}"
-                        )
-                    })?
+                read_regular_utf8_file_bounded(
+                    path,
+                    &format!("CP/DP trust bundle '{origin}' key '{kid}' secret file"),
+                    TRUST_MATERIAL_MAX_BYTES,
+                )?
                     .trim()
                     .to_string()
             } else {
@@ -1159,12 +1172,11 @@ impl TrustBundleKeyDocument {
             let pem = if let Some(inline) = self.public_key_pem {
                 inline
             } else if let Some(path) = self.public_key_path.as_deref() {
-                std::fs::read_to_string(path).map_err(|e| {
-                    format!(
-                        "CP/DP trust bundle '{origin}': key '{kid}' public key file '{path}' \
-                         could not be read: {e}"
-                    )
-                })?
+                read_regular_utf8_file_bounded(
+                    path,
+                    &format!("CP/DP trust bundle '{origin}' key '{kid}' public key file"),
+                    TRUST_MATERIAL_MAX_BYTES,
+                )?
             } else {
                 return Err(format!(
                     "CP/DP trust bundle '{origin}': key '{kid}' has no readable public key source"
