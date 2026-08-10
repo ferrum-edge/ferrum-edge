@@ -203,7 +203,7 @@ impl Oauth2Introspection {
             format!("oauth2_introspection: config must be an object, got: {config}")
         })?;
         reject_unknown_keys(
-        config_obj,
+            config_obj,
             &[
                 "providers",
                 "scope_claim",
@@ -387,7 +387,7 @@ impl Oauth2Introspection {
                 introspection_endpoint: endpoint_slot,
                 discovery_url: discovery.as_ref().map(|parsed| parsed.url.clone()),
                 audiences,
-            token_locations,
+                token_locations,
                 required_scopes,
                 required_roles,
                 scope_claim,
@@ -447,7 +447,7 @@ impl Oauth2Introspection {
                 request_headers_to_redact.push("authorization".to_string());
             }
             for location in &provider.token_locations {
-            let TokenLocation::Header(header) = location else {
+                let TokenLocation::Header(header) = location else {
                     continue;
                 };
                 if !request_headers_to_redact
@@ -1255,7 +1255,7 @@ impl FormBodyExt for reqwest::RequestBuilder {
         self,
         params: &[(String, String)],
     ) -> Result<reqwest::RequestBuilder, IntrospectionDecision> {
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
         for (key, value) in params {
             serializer.append_pair(key, value);
         }
