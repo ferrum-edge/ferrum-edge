@@ -621,6 +621,33 @@ impl CpDpVerifier {
     }
 }
 
+/// One immutable verifier revision used for both token verification and
+/// admission-time credential-generation binding.
+///
+/// The fields stay private so callers cannot inspect credential identities or
+/// generations. Keeping the snapshot as the public load result prevents a
+/// verifier from being detached from the generation map that was current when
+/// it was captured.
+pub struct CpDpVerifierSnapshot {
+    verifier: Arc<CpDpVerifier>,
+    credential_generations: HashMap<VerificationCredentialIdentity, u64>,
+    revision: u64,
+    store_identity: Arc<()>,
+}
+
+impl CpDpVerifierSnapshot {
+    pub(crate) fn verifier(&self) -> &CpDpVerifier {
+        self.verifier.as_ref()
+    }
+
+    pub(crate) fn credential_generation(
+        &self,
+        identity: &VerificationCredentialIdentity,
+    ) -> Option<u64> {
+        self.credential_generations.get(identity).copied()
+    }
+}
+
 /// Atomically reloadable verifier shared by ConfigSync, MeshSubscribe, and
 /// both ADS services.
 ///
@@ -630,16 +657,11 @@ impl CpDpVerifier {
 /// credential generation vanished are revoked; adding an overlapping key does
 /// not churn established streams, while remove-then-readd cannot resurrect an
 /// old stream.
-struct CpDpVerifierSnapshot {
-    verifier: Arc<CpDpVerifier>,
-    credential_generations: HashMap<VerificationCredentialIdentity, u64>,
-    revision: u64,
-}
-
 pub struct CpDpVerifierStore {
     active: ArcSwap<CpDpVerifierSnapshot>,
     revision: watch::Sender<u64>,
     replace_lock: Mutex<()>,
+    store_identity: Arc<()>,
 }
 
 impl std::fmt::Debug for CpDpVerifierStore {
@@ -663,6 +685,7 @@ impl CpDpVerifierStore {
 
     pub fn from_arc(verifier: Arc<CpDpVerifier>) -> Self {
         let (revision, _) = watch::channel(0);
+        let store_identity = Arc::new(());
         let credential_generations = verifier
             .credential_identities()
             .into_iter()
@@ -673,14 +696,18 @@ impl CpDpVerifierStore {
                 verifier,
                 credential_generations,
                 revision: 0,
+                store_identity: store_identity.clone(),
             })),
             revision,
             replace_lock: Mutex::new(()),
+            store_identity,
         }
     }
 
-    pub fn load(&self) -> Arc<CpDpVerifier> {
-        self.active.load().verifier.clone()
+    /// Capture the verifier and its credential generations as one immutable
+    /// admission snapshot.
+    pub fn load(&self) -> Arc<CpDpVerifierSnapshot> {
+        self.active.load_full()
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -708,16 +735,13 @@ impl CpDpVerifierStore {
             verifier,
             credential_generations,
             revision,
+            store_identity: self.store_identity.clone(),
         }));
         self.revision.send_replace(revision);
     }
 
     pub fn credential_generation(&self, identity: &VerificationCredentialIdentity) -> Option<u64> {
-        self.active
-            .load()
-            .credential_generations
-            .get(identity)
-            .copied()
+        self.active.load().credential_generation(identity)
     }
 
     pub fn credential_is_active(
@@ -726,6 +750,18 @@ impl CpDpVerifierStore {
         generation: u64,
     ) -> bool {
         self.credential_generation(identity) == Some(generation)
+    }
+
+    pub(crate) fn active_generation_from_snapshot(
+        &self,
+        snapshot: &CpDpVerifierSnapshot,
+        identity: &VerificationCredentialIdentity,
+    ) -> Option<u64> {
+        if !Arc::ptr_eq(&snapshot.store_identity, &self.store_identity) {
+            return None;
+        }
+        let generation = snapshot.credential_generation(identity)?;
+        self.credential_is_active(identity, generation).then_some(generation)
     }
 }
 
@@ -743,7 +779,7 @@ pub fn spawn_trust_bundle_reload(
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut accepted_fingerprint = verifier.load().configuration_fingerprint();
+        let mut accepted_fingerprint = verifier.load().verifier().configuration_fingerprint();
         let mut last_failed = false;
         let mut ticker = tokio::time::interval(interval.max(std::time::Duration::from_secs(1)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

@@ -423,6 +423,38 @@ fn authorize<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<T
     request
 }
 
+/// Admission must bind to the generation carried by the exact immutable
+/// verifier snapshot used for signature and claims verification. Re-reading
+/// generation from the current store would accept here because tenant A's
+/// opaque credential identity is present again after the remove/re-add.
+#[test]
+fn captured_old_verifier_snapshot_cannot_bind_after_remove_then_readd() {
+    let verifier = CpDpVerifierStore::from_arc(two_tenant_bundle());
+    let captured = verifier.load();
+    let token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "captured-snapshot-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let request = authorize(tonic::Request::new(()), &token);
+
+    verifier.replace(tenant_b_only_verifier());
+    verifier.replace(two_tenant_verifier());
+
+    let status = match captured.verify_and_bind_grpc_identity(
+        request.metadata(),
+        TEST_ISSUER,
+        None,
+        &verifier,
+    ) {
+        Ok(_) => panic!("an identity verified by the removed generation must not bind"),
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn finite_server_lease_closes_every_bearer_configuration_stream() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));

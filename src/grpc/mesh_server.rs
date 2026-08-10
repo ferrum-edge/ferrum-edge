@@ -19,7 +19,6 @@ use super::auth::{
     AllowedNamespaces, AudienceRejectReason, AuthorizedResponseStream,
     DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS, GrpcAudiencePolicy, MESH_LOCAL_SUBSCRIBE_AUDIENCE,
     StreamAuthSurface, VerifiedGrpcIdentity, remote_discovery_audience,
-    verify_grpc_jwt_metadata_with_audience,
 };
 use super::cp_server::{CpGrpcServer, CpScope, DEFAULT_CP_DP_JWT_ISSUER};
 use super::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
@@ -394,19 +393,14 @@ impl MeshGrpcServer {
         extensions: &tonic::Extensions,
         remote_discovery: bool,
     ) -> Result<VerifiedGrpcIdentity, (Status, Option<AudienceRejectReason>)> {
-        let verifier = self.verifier.load();
-        verify_grpc_jwt_metadata_with_audience(
+        let verifier_snapshot = self.verifier.load();
+        verifier_snapshot.verify_and_bind_grpc_identity_with_audience(
             metadata,
-            verifier.as_ref(),
             &self.expected_issuer,
             self.audience_policy_for(remote_discovery),
             extensions.get::<CpGrpcConnectInfo>(),
+            &self.verifier,
         )
-        .and_then(|identity| {
-            identity
-                .bind_to_store(&self.verifier)
-                .map_err(|status| (status, None))
-        })
     }
 
     fn filter_config_for_request(

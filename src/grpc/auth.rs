@@ -40,8 +40,8 @@ use tonic::Status;
 use tracing::{info, warn};
 
 use super::cp_trust::{
-    CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo, TenantAuthRejectReason,
-    VerificationCredentialIdentity, resolve_authorized_namespaces,
+    CpDpVerifier, CpDpVerifierSnapshot, CpDpVerifierStore, CpGrpcConnectInfo,
+    TenantAuthRejectReason, VerificationCredentialIdentity, resolve_authorized_namespaces,
 };
 
 /// `jsonwebtoken`'s accepted clock leeway, pinned explicitly so the
@@ -395,13 +395,61 @@ pub struct VerifiedGrpcIdentity {
 }
 
 impl VerifiedGrpcIdentity {
-    pub(crate) fn bind_to_store(mut self, verifier: &CpDpVerifierStore) -> Result<Self, Status> {
-        self.credential_generation = verifier
-            .credential_generation(&self.credential)
+    fn bind_to_store(
+        mut self,
+        snapshot: &CpDpVerifierSnapshot,
+        verifier: &CpDpVerifierStore,
+    ) -> Result<Self, Status> {
+        let generation = verifier
+            .active_generation_from_snapshot(snapshot, &self.credential)
             .ok_or_else(|| {
                 Status::permission_denied("Stream verification credential is no longer trusted")
             })?;
+        self.credential_generation = generation;
         Ok(self)
+    }
+}
+
+impl CpDpVerifierSnapshot {
+    /// Verify under this immutable snapshot and bind the admitted identity to
+    /// the exact credential generation captured with it.
+    ///
+    /// The final current-store comparison fails closed if the credential was
+    /// removed after this snapshot was loaded, including when the same opaque
+    /// credential identity has already been re-added under a new generation.
+    #[allow(clippy::result_large_err)]
+    pub fn verify_and_bind_grpc_identity(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+        expected_issuer: &str,
+        peer: Option<&CpGrpcConnectInfo>,
+        verifier: &CpDpVerifierStore,
+    ) -> Result<VerifiedGrpcIdentity, Status> {
+        verify_grpc_jwt_metadata_identity(metadata, self.verifier(), expected_issuer, peer)
+            .and_then(|identity| identity.bind_to_store(self, verifier))
+    }
+
+    #[allow(clippy::result_large_err, clippy::type_complexity)]
+    pub(crate) fn verify_and_bind_grpc_identity_with_audience(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+        expected_issuer: &str,
+        audience_policy: GrpcAudiencePolicy<'_>,
+        peer: Option<&CpGrpcConnectInfo>,
+        verifier: &CpDpVerifierStore,
+    ) -> Result<VerifiedGrpcIdentity, (Status, Option<AudienceRejectReason>)> {
+        verify_grpc_jwt_metadata_with_audience(
+            metadata,
+            self.verifier(),
+            expected_issuer,
+            audience_policy,
+            peer,
+        )
+        .and_then(|identity| {
+            identity
+                .bind_to_store(self, verifier)
+                .map_err(|status| (status, None))
+        })
     }
 }
 

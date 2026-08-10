@@ -28,7 +28,6 @@ use crate::config::types::GatewayConfig;
 use crate::grpc::auth::{
     AllowedNamespaces, DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS, StreamAuthSurface,
     StreamAuthTerminationGuard, StreamAuthorizationLease, VerifiedGrpcIdentity,
-    verify_grpc_jwt_metadata_identity,
 };
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, NamespaceBroadcasts};
 use crate::grpc::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
@@ -379,14 +378,13 @@ impl XdsAdsServer {
         metadata: &tonic::metadata::MetadataMap,
         extensions: &tonic::Extensions,
     ) -> Result<VerifiedGrpcIdentity, Status> {
-        let verifier = self.verifier.load();
-        verify_grpc_jwt_metadata_identity(
+        let verifier_snapshot = self.verifier.load();
+        verifier_snapshot.verify_and_bind_grpc_identity(
             metadata,
-            verifier.as_ref(),
             &self.expected_issuer,
             extensions.get::<CpGrpcConnectInfo>(),
+            &self.verifier,
         )
-        .and_then(|identity| identity.bind_to_store(&self.verifier))
     }
 
     #[allow(clippy::result_large_err)]

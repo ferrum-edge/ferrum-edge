@@ -53,7 +53,7 @@ use tracing::{error, info, warn};
 
 use super::auth::{
     AllowedNamespaces, AuthorizedResponseStream, DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS,
-    StreamAuthSurface, VerifiedGrpcIdentity, verify_grpc_jwt_metadata_identity,
+    StreamAuthSurface, VerifiedGrpcIdentity,
 };
 use super::configsync_lifecycle::CONFIGSYNC_HEARTBEAT_INTERVAL_SECS;
 use super::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
@@ -743,14 +743,13 @@ impl CpGrpcServer {
         metadata: &tonic::metadata::MetadataMap,
         extensions: &tonic::Extensions,
     ) -> Result<VerifiedGrpcIdentity, Status> {
-        let verifier = self.verifier.load();
-        verify_grpc_jwt_metadata_identity(
+        let verifier_snapshot = self.verifier.load();
+        verifier_snapshot.verify_and_bind_grpc_identity(
             metadata,
-            verifier.as_ref(),
             &self.expected_issuer,
             extensions.get::<CpGrpcConnectInfo>(),
+            &self.verifier,
         )
-        .and_then(|identity| identity.bind_to_store(&self.verifier))
     }
 
     pub fn into_service(self) -> ConfigSyncServer<Self> {
