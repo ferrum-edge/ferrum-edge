@@ -2075,21 +2075,17 @@ pub async fn run(
         cp_dp_verifier.describe()
     );
     let cp_dp_verifier = Arc::new(CpDpVerifierStore::new(cp_dp_verifier));
-    let max_stream_lifetime =
-        Duration::from_secs(env_config.cp_grpc_max_stream_lifetime_seconds);
-    let trust_bundle_reload_handle = env_config
-        .cp_dp_grpc_trust_bundle_path
-        .clone()
-        .map(|path| {
-            crate::grpc::cp_trust::spawn_trust_bundle_reload(
-                path,
-                env_config.cp_dp_grpc_jwt_secret.clone(),
-                cp_dp_verifier.clone(),
-                cp_scope.requires_namespace_claim_by_default(),
-                Duration::from_secs(env_config.secret_refresh_interval_seconds),
-                shutdown_tx.subscribe(),
-            )
-        });
+    let max_stream_lifetime = Duration::from_secs(env_config.cp_grpc_max_stream_lifetime_seconds);
+    let trust_bundle_reload_handle = env_config.cp_dp_grpc_trust_bundle_path.clone().map(|path| {
+        crate::grpc::cp_trust::spawn_trust_bundle_reload(
+            path,
+            env_config.cp_dp_grpc_jwt_secret.clone(),
+            cp_dp_verifier.clone(),
+            cp_scope.requires_namespace_claim_by_default(),
+            Duration::from_secs(env_config.secret_refresh_interval_seconds),
+            shutdown_tx.subscribe(),
+        )
+    });
 
     // Create gRPC server with shared DP node registry. The expected JWT
     // issuer and namespace are threaded in from EnvConfig: DPs must mint

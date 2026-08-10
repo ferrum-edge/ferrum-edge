@@ -283,7 +283,9 @@ impl XdsAdsServer {
             config,
             update_tx,
             namespace_broadcasts: None,
-            verifier: Arc::new(CpDpVerifierStore::new(CpDpVerifier::SharedSecret(jwt_secret))),
+            verifier: Arc::new(CpDpVerifierStore::new(CpDpVerifier::SharedSecret(
+                jwt_secret,
+            ))),
             max_stream_lifetime: Duration::from_secs(DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS),
             expected_issuer,
             namespace: namespace.clone(),
@@ -1680,10 +1682,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 
         let mut requests = request.into_inner();
         let mut server = self.clone();
-        server.ambient_udp_source_bearer_namespaces = identity
-            .allowed_namespaces
-            .effective_namespaces()
-            .cloned();
+        server.ambient_udp_source_bearer_namespaces =
+            identity.allowed_namespaces.effective_namespaces().cloned();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
         let authorization = StreamAuthorizationLease::new(
@@ -1983,10 +1983,8 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 
         let mut requests = request.into_inner();
         let mut server = self.clone();
-        server.ambient_udp_source_bearer_namespaces = identity
-            .allowed_namespaces
-            .effective_namespaces()
-            .cloned();
+        server.ambient_udp_source_bearer_namespaces =
+            identity.allowed_namespaces.effective_namespaces().cloned();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
         let authorization = StreamAuthorizationLease::new(

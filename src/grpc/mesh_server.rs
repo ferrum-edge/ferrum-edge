@@ -17,9 +17,9 @@ use tracing::{error, info, warn};
 
 use super::auth::{
     AllowedNamespaces, AudienceRejectReason, AuthorizedResponseStream,
-    DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS, GrpcAudiencePolicy,
-    MESH_LOCAL_SUBSCRIBE_AUDIENCE, StreamAuthSurface, VerifiedGrpcIdentity,
-    remote_discovery_audience, verify_grpc_jwt_metadata_with_audience,
+    DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS, GrpcAudiencePolicy, MESH_LOCAL_SUBSCRIBE_AUDIENCE,
+    StreamAuthSurface, VerifiedGrpcIdentity, remote_discovery_audience,
+    verify_grpc_jwt_metadata_with_audience,
 };
 use super::cp_server::{CpGrpcServer, CpScope, DEFAULT_CP_DP_JWT_ISSUER};
 use super::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
@@ -153,7 +153,9 @@ impl MeshGrpcServerBuilder {
     fn new(config: Arc<ArcSwap<GatewayConfig>>, jwt_secret: String) -> Self {
         Self {
             config,
-            verifier: Arc::new(CpDpVerifierStore::new(CpDpVerifier::SharedSecret(jwt_secret))),
+            verifier: Arc::new(CpDpVerifierStore::new(CpDpVerifier::SharedSecret(
+                jwt_secret,
+            ))),
             max_stream_lifetime: Duration::from_secs(DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS),
             channel_capacity: 128,
             registry: Arc::new(MeshNodeRegistry::new()),

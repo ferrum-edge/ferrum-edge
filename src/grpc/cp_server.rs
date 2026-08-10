@@ -558,7 +558,9 @@ impl CpGrpcServer {
     pub fn builder(config: Arc<ArcSwap<GatewayConfig>>, jwt_secret: String) -> CpGrpcServerBuilder {
         CpGrpcServerBuilder {
             config,
-            verifier: Arc::new(CpDpVerifierStore::new(CpDpVerifier::SharedSecret(jwt_secret))),
+            verifier: Arc::new(CpDpVerifierStore::new(CpDpVerifier::SharedSecret(
+                jwt_secret,
+            ))),
             max_stream_lifetime: Duration::from_secs(DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS),
             channel_capacity: 128,
             registry: None,

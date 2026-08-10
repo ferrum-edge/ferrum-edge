@@ -395,10 +395,7 @@ pub struct VerifiedGrpcIdentity {
 }
 
 impl VerifiedGrpcIdentity {
-    pub(crate) fn bind_to_store(
-        mut self,
-        verifier: &CpDpVerifierStore,
-    ) -> Result<Self, Status> {
+    pub(crate) fn bind_to_store(mut self, verifier: &CpDpVerifierStore) -> Result<Self, Status> {
         self.credential_generation = verifier
             .credential_generation(&self.credential)
             .ok_or_else(|| {
@@ -567,8 +564,7 @@ impl StreamAuthTerminationGuard {
 
 impl Drop for StreamAuthTerminationGuard {
     fn drop(&mut self) {
-        STREAM_AUTH_ENDS[self.surface.index()][self.reason.index()]
-            .fetch_add(1, Ordering::Relaxed);
+        STREAM_AUTH_ENDS[self.surface.index()][self.reason.index()].fetch_add(1, Ordering::Relaxed);
         if self.reason == StreamAuthEndReason::TransportClosed {
             info!(
                 audit.event = "grpc_config_stream_ended",

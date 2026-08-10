@@ -62,7 +62,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use jsonwebtoken::{Algorithm, DecodingKey};
@@ -598,10 +598,7 @@ impl CpDpVerifier {
                 !secret.is_empty()
                     && credential_identity(None, Algorithm::HS256, secret.as_bytes()) == *identity
             }
-            Self::TrustBundle(bundle) => bundle
-                .keys
-                .values()
-                .any(|key| key.identity == *identity),
+            Self::TrustBundle(bundle) => bundle.keys.values().any(|key| key.identity == *identity),
         }
     }
 
@@ -642,7 +639,7 @@ struct CpDpVerifierSnapshot {
 pub struct CpDpVerifierStore {
     active: ArcSwap<CpDpVerifierSnapshot>,
     revision: watch::Sender<u64>,
-    replace_lock: parking_lot::Mutex<()>,
+    replace_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for CpDpVerifierStore {
@@ -678,7 +675,7 @@ impl CpDpVerifierStore {
                 revision: 0,
             })),
             revision,
-            replace_lock: parking_lot::Mutex::new(()),
+            replace_lock: Mutex::new(()),
         }
     }
 
@@ -691,7 +688,10 @@ impl CpDpVerifierStore {
     }
 
     pub fn replace(&self, verifier: CpDpVerifier) {
-        let _replace_guard = self.replace_lock.lock();
+        let _replace_guard = self
+            .replace_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let current = self.active.load();
         let revision = current.revision.saturating_add(1);
         let credential_generations = verifier
@@ -715,10 +715,7 @@ impl CpDpVerifierStore {
         self.revision.send_replace(revision);
     }
 
-    pub fn credential_generation(
-        &self,
-        identity: &VerificationCredentialIdentity,
-    ) -> Option<u64> {
+    pub fn credential_generation(&self, identity: &VerificationCredentialIdentity) -> Option<u64> {
         self.active
             .load()
             .credential_generations

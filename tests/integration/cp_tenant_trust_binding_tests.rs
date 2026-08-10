@@ -426,8 +426,7 @@ fn authorize<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<T
 #[tokio::test(flavor = "multi_thread")]
 async fn finite_server_lease_closes_every_bearer_configuration_stream() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
-    let (addr, handle) =
-        start_all_stream_surfaces(verifier, Duration::from_millis(150)).await;
+    let (addr, handle) = start_all_stream_surfaces(verifier, Duration::from_millis(150)).await;
 
     let config_token = mint(
         TENANT_A_SECRET,
@@ -559,8 +558,7 @@ async fn finite_server_lease_closes_every_bearer_configuration_stream() {
 #[tokio::test(flavor = "multi_thread")]
 async fn verifier_rotation_revokes_only_streams_bound_to_removed_credentials() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
-    let (addr, handle) =
-        start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
+    let (addr, handle) = start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
 
     let token_a = mint(
         TENANT_A_SECRET,
@@ -594,8 +592,16 @@ async fn verifier_rotation_revokes_only_streams_bound_to_removed_credentials() {
         .await
         .expect("tenant B stream admission")
         .into_inner();
-    stream_a.message().await.unwrap().expect("tenant A initial snapshot");
-    stream_b.message().await.unwrap().expect("tenant B initial snapshot");
+    stream_a
+        .message()
+        .await
+        .unwrap()
+        .expect("tenant A initial snapshot");
+    stream_b
+        .message()
+        .await
+        .unwrap()
+        .expect("tenant B initial snapshot");
 
     verifier.replace(tenant_b_only_verifier());
     // Re-add the exact tenant-A key before either stream observes the watch
@@ -619,8 +625,7 @@ async fn verifier_rotation_revokes_only_streams_bound_to_removed_credentials() {
 #[tokio::test(flavor = "multi_thread")]
 async fn accepted_token_expiry_closes_stream_without_heartbeat_extension() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
-    let (addr, handle) =
-        start_all_stream_surfaces(verifier, Duration::from_secs(5)).await;
+    let (addr, handle) = start_all_stream_surfaces(verifier, Duration::from_secs(5)).await;
     let token = mint_with_exp(
         TENANT_A_SECRET,
         Some(TENANT_A),
