@@ -758,21 +758,19 @@ impl<S> AuthorizedResponseStream<S> {
         if self.server_sleep.as_mut().poll(cx).is_ready() {
             return Some(StreamAuthEndReason::ServerMaxLifetime);
         }
-        let verifier_changed = match tokio_stream::Stream::poll_next(
-            Pin::new(&mut self.verifier_revisions),
-            cx,
-        ) {
-            Poll::Ready(Some(_)) => {
-                // `WatchStream` installs its next `changed()` future only when
-                // it is polled again. Schedule that bounded follow-up poll so
-                // a retained-key reload cannot leave an idle response stream
-                // unwakeable for the next removal.
-                cx.waker().wake_by_ref();
-                true
-            }
-            Poll::Ready(None) => return Some(StreamAuthEndReason::VerificationKeyRemoved),
-            Poll::Pending => false,
-        };
+        let verifier_changed =
+            match tokio_stream::Stream::poll_next(Pin::new(&mut self.verifier_revisions), cx) {
+                Poll::Ready(Some(_)) => {
+                    // `WatchStream` installs its next `changed()` future only when
+                    // it is polled again. Schedule that bounded follow-up poll so
+                    // a retained-key reload cannot leave an idle response stream
+                    // unwakeable for the next removal.
+                    cx.waker().wake_by_ref();
+                    true
+                }
+                Poll::Ready(None) => return Some(StreamAuthEndReason::VerificationKeyRemoved),
+                Poll::Pending => false,
+            };
         if verifier_changed && !self.credential_is_active() {
             Some(StreamAuthEndReason::VerificationKeyRemoved)
         } else {

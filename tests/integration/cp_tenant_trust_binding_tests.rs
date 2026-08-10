@@ -699,12 +699,7 @@ async fn revocation_preempts_buffered_delivery_on_every_configuration_surface() 
         );
         let request = authorize(tonic::Request::new(()), &token);
         let identity = snapshot
-            .verify_and_bind_grpc_identity(
-                request.metadata(),
-                TEST_ISSUER,
-                None,
-                verifier.as_ref(),
-            )
+            .verify_and_bind_grpc_identity(request.metadata(), TEST_ISSUER, None, verifier.as_ref())
             .expect("test identity must bind to the active generation");
         let (tx, rx) = mpsc::channel(1);
         tx.send(Ok::<_, tonic::Status>(()))
@@ -745,12 +740,7 @@ async fn retained_reload_cannot_mask_the_next_revocation_on_an_idle_stream() {
     );
     let request = authorize(tonic::Request::new(()), &token);
     let identity = snapshot
-        .verify_and_bind_grpc_identity(
-            request.metadata(),
-            TEST_ISSUER,
-            None,
-            verifier.as_ref(),
-        )
+        .verify_and_bind_grpc_identity(request.metadata(), TEST_ISSUER, None, verifier.as_ref())
         .expect("test identity must bind to the active generation");
     let (_tx, rx) = mpsc::channel::<Result<(), tonic::Status>>(1);
     let mut stream = AuthorizedResponseStream::new(
@@ -792,12 +782,7 @@ async fn deadlines_preempt_buffered_configuration_output() {
     );
     let request = authorize(tonic::Request::new(()), &token);
     let identity = snapshot
-        .verify_and_bind_grpc_identity(
-            request.metadata(),
-            TEST_ISSUER,
-            None,
-            verifier.as_ref(),
-        )
+        .verify_and_bind_grpc_identity(request.metadata(), TEST_ISSUER, None, verifier.as_ref())
         .expect("test identity must bind to the active generation");
     let (tx, rx) = mpsc::channel(1);
     tx.send(Ok::<_, tonic::Status>(()))
@@ -833,12 +818,7 @@ async fn deadlines_preempt_buffered_configuration_output() {
     );
     let request = authorize(tonic::Request::new(()), &token);
     let identity = snapshot
-        .verify_and_bind_grpc_identity(
-            request.metadata(),
-            TEST_ISSUER,
-            None,
-            verifier.as_ref(),
-        )
+        .verify_and_bind_grpc_identity(request.metadata(), TEST_ISSUER, None, verifier.as_ref())
         .expect("token inside verification leeway must bind");
     let (tx, rx) = mpsc::channel(1);
     tx.send(Ok::<_, tonic::Status>(()))
