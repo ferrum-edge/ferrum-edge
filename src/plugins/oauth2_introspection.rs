@@ -2175,10 +2175,10 @@ mod tests {
             "active_until": 1_200,
             "expires_in": 50
         });
-        assert_eq!(
-            validated_introspection_expiry_at(&claims, 1_000).unwrap(),
-            Some(1_050)
-        );
+        match validated_introspection_expiry_at(&claims, 1_000) {
+            Ok(expiry) => assert_eq!(expiry, Some(1_050)),
+            Err(_) => panic!("valid authoritative expiry claims must be accepted"),
+        }
     }
 
     #[test]
