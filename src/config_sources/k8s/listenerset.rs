@@ -365,12 +365,28 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
             if !candidate.eligible {
                 continue;
             }
-            // Exact duplicate hostnames and incompatible protocols must fail
-            // closed for both Gateway and ListenerSet losers. Distinct Gateway
-            // hostnames (including catch-all plus named siblings) do not
-            // conflict because `hostnames_conflict` only matches equal values.
+            // HostnameConflict keeps precedence (only the later claim loses).
+            // ProtocolConflict is physical: one socket cannot speak two
+            // protocols, so every involved claim is refused — never an
+            // ordering-dependent winner. Distinct Gateway hostnames
+            // (including catch-all plus named siblings) do not conflict
+            // because `hostnames_conflict` only matches equal values.
             if let Some(reason) = conflict_against_accepted(candidate, &accepted) {
                 conflicted.insert(candidate.key.clone(), reason);
+                if reason == "ProtocolConflict" {
+                    let prior_keys: Vec<GatewayApiListenerKey> = accepted
+                        .iter()
+                        .filter(|prior| {
+                            prior.port == candidate.port
+                                && !prior.protocol.eq_ignore_ascii_case(&candidate.protocol)
+                        })
+                        .map(|prior| prior.key.clone())
+                        .collect();
+                    for prior_key in &prior_keys {
+                        conflicted.insert(prior_key.clone(), reason);
+                    }
+                    accepted.retain(|prior| !prior_keys.iter().any(|key| key == &prior.key));
+                }
                 continue;
             }
             accepted.push(candidate);

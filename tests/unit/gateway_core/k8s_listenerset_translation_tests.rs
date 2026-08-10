@@ -873,6 +873,21 @@ fn incompatible_gateway_listener_protocol_fails_closed() {
     assert!(translation.warnings.iter().any(|warning| {
         warning.contains("Gateway default/edge listener b-tcp rejected: ProtocolConflict")
     }));
+    assert!(translation.warnings.iter().any(|warning| {
+        warning.contains("Gateway default/edge listener a-http rejected: ProtocolConflict")
+    }));
+    assert!(
+        translation
+            .config
+            .mesh
+            .as_ref()
+            .map(|mesh| mesh.services.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .all(|service| service.name != "edge-a-http" && service.name != "edge-b-tcp"),
+        "neither protocol-conflicted claim may become a MeshService: {:?}",
+        translation.config.mesh
+    );
 }
 
 #[test]

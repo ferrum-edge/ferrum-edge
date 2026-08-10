@@ -1702,8 +1702,15 @@ fn listener_is_effective_tls_serving_claim(
 /// winner. Translation and Gateway status both call this helper so they share
 /// one decision.
 ///
-/// Listeners that are already non-materializable contribute no claim and are
-/// ignored, so a broken sibling cannot take down a healthy listener.
+/// Unresolved / unsupported listeners contribute no claim, so a broken sibling
+/// cannot take down a healthy listener. Listeners already marked
+/// `ProtocolConflict` by ListenerSet/Gateway precedence admission are the
+/// exception: they were shape-complete competitors withdrawn only because a
+/// sibling claimed the same port with another protocol. Excluding them would
+/// let the remaining claim silently win the socket and program traffic — the
+/// exact one-sided failure this helper exists to prevent. They still count so
+/// every involved claim is recorded in `gateway_api_listener_conflicts` for
+/// Gateway status parity.
 pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) {
     let plan = plan_gateway_frontend_tls_namespace_slots(acc);
     apply_gateway_frontend_tls_namespace_slot_route_limits(acc, &plan);
@@ -1726,7 +1733,8 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
         // protocols `listener_route_kinds_for_protocol` admits HTTPRoute /
         // GRPCRoute on. A TLS-passthrough or L4 listener on the same number is
         // a different datapath entirely and must not be dragged in here.
-        if !policy.materializable
+        let protocol_conflicted = policy.conflict_reason == Some("ProtocolConflict");
+        if (!policy.materializable && !protocol_conflicted)
             || !matches!(
                 policy.protocol.as_str(),
                 "HTTP" | "HTTPS" | "GRPC" | "GRPCS"
@@ -1739,7 +1747,16 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
         };
         let claims = claims_by_port.entry(port).or_default();
         if policy.requires_frontend_tls {
-            if listener_is_effective_tls_serving_claim(key, policy, &plan) {
+            // Precedence admission may have already cleared `materializable`
+            // for a ProtocolConflicted TLS claim, which also drops it from the
+            // namespace serving-slot plan. Count a resolved frontend credential
+            // as a competing TLS shape so plaintext+TLS still fails closed.
+            let effective = if listener_is_effective_tls_serving_claim(key, policy, &plan) {
+                true
+            } else {
+                protocol_conflicted && policy.frontend_tls_source.is_some()
+            };
+            if effective {
                 claims.effective_tls.push(key.clone());
                 claims
                     .effective_tls_namespaces
@@ -1747,8 +1764,10 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                 if let Some(source) = plan
                     .serving_by_namespace
                     .get(gateway_frontend_tls_slot_namespace(key, policy))
+                    .cloned()
+                    .or_else(|| policy.frontend_tls_source.clone())
                 {
-                    claims.effective_tls_credentials.insert(source.clone());
+                    claims.effective_tls_credentials.insert(source);
                 }
             }
         } else {
