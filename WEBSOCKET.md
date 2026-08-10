@@ -65,6 +65,8 @@ All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`
 
 Idle timeout and authorization lifetime are independent. Idle timeout answers “has either peer been quiet?” and can be refreshed by traffic. Authorization lifetime answers “is this upgraded session still allowed to exist?” and is absolute. The H1 Upgrade, H2 Extended CONNECT, and H3 Extended CONNECT paths share the same deadline/cancellation implementation. Expiry or graceful drain closes both relay directions with a fixed, non-secret close reason when frame-aware closure is possible; tunnel mode deterministically drops both transports at the same deadline.
 
+A policy close is not a relay failure. `on_ws_disconnect` reports no `error_class` for it, so `ferrum_websocket_sessions_total` records `result="success"` and the cause is carried by `termination_reason` (`credential_expired`, `max_lifetime`, or `drain`) — a stalled relay stays distinguishable from a session that simply reached its bound. Upgrades refused because the deadline elapsed before the handshake completed are logged as the `websocket_credential_expired` (`401`) or `websocket_max_lifetime` (`503`) rejection phase on all three frontends. Tunnel-mode sessions cancelled at the deadline cannot report their relayed byte totals (the raw copy owns its counters and only publishes them when it returns); use frame mode when byte accounting must survive a forced close.
+
 ## Tunnel Mode
 
 `FERRUM_WEBSOCKET_TUNNEL_MODE` defaults to `false`. When enabled for an

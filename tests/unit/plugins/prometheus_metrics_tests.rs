@@ -308,6 +308,34 @@ fn test_registry_records_websocket_completion_metrics() {
     ));
 }
 
+/// A gateway-initiated policy close (credential expiry, absolute lifetime,
+/// graceful drain) is not a relay fault: it must stay on `result="success"` /
+/// `error_class="none"` and be identified only by `termination_reason`, so
+/// `result="error"` keeps meaning a real transport or hook failure.
+#[test]
+fn test_registry_records_policy_websocket_closes_as_non_error_sessions() {
+    let registry = MetricsRegistry::new();
+    for reason in ["credential_expired", "max_lifetime", "drain"] {
+        let mut policy_close = make_ws_summary("ws-policy");
+        policy_close.metadata.insert(
+            "websocket.termination_reason".to_string(),
+            reason.to_string(),
+        );
+        registry.record_ws_session(&policy_close);
+    }
+
+    let output = registry.render_uncached();
+    for reason in ["credential_expired", "max_lifetime", "drain"] {
+        assert!(
+            output.contains(&format!(
+                r#"ferrum_websocket_sessions_total{{proxy_id="ws-policy",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="{reason}"}} 1"#
+            )),
+            "policy close {reason} must not be counted as a failed session"
+        );
+    }
+    assert!(!output.contains(r#"proxy_id="ws-policy",result="error""#));
+}
+
 #[tokio::test]
 async fn test_registry_ignores_mirror_summary() {
     let registry = MetricsRegistry::new();

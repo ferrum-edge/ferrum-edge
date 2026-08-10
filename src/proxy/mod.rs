@@ -12793,17 +12793,18 @@ async fn handle_websocket_request_authenticated(
                 ws_shutdown_rx.clone(),
                 &state.overload,
             ) => {
+                // No relay ever started, and the stop is a policy decision
+                // rather than a transport failure, so the disconnect carries
+                // only `termination_reason`. Tagging a synthetic
+                // `ReadWriteTimeout` here would count a drain or an elapsed
+                // absolute lifetime as a failed session in metrics and alerts.
                 fire_ws_tunnel_disconnect_hooks_with_reason(
                     &ws_disconnect_plugins,
                     &proxy_id,
                     &session_meta,
                     0,
                     0,
-                    Some((
-                        crate::plugins::Direction::Unknown,
-                        retry::ErrorClass::ReadWriteTimeout,
-                        None,
-                    )),
+                    None,
                     reason,
                 )
                 .await;
@@ -14550,6 +14551,10 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
     .await;
 }
 
+/// [`fire_ws_tunnel_disconnect_hooks`] with an explicit termination
+/// classification. The public wrapper derives the reason from `failure`; the
+/// absolute-deadline and drain stops pass their own reason with no failure,
+/// because a gateway-initiated policy close is not a relay fault.
 async fn fire_ws_tunnel_disconnect_hooks_with_reason(
     ws_disconnect_plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
@@ -14597,6 +14602,16 @@ async fn fire_ws_tunnel_disconnect_hooks_with_reason(
     }
 }
 
+/// Fire `on_ws_disconnect` for the framed (parsed) WebSocket path.
+///
+/// Unlike tunnel mode, framed mode reports real frame counters. Duration still
+/// comes from `session_start_mono` (`Instant`); wall `session_start` is only
+/// used for `timestamp_connected` rendering. Takes `session_meta` by value
+/// because the framed relay consumes it at teardown.
+///
+/// `termination_reason` is the bounded classification published under
+/// [`WS_TERMINATION_METADATA_KEY`]; it always overwrites any same-named key the
+/// request accumulated, so plugin- or peer-influenced metadata cannot forge it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fire_ws_framed_disconnect_hooks_with_reason(
     ws_disconnect_plugins: &[Arc<dyn Plugin>],
@@ -15459,6 +15474,9 @@ where
                     shutdown_rx.clone(),
                     &overload,
                 ) => {
+                    // The residual forward was cut short by policy, not by a
+                    // transport fault, so no failure is attributed; the bytes
+                    // actually handed to the client are still reported.
                     recovered_backend_bytes_written = offset as u64;
                     fire_ws_tunnel_disconnect_hooks_with_reason(
                         &ws_disconnect_plugins,
@@ -15466,11 +15484,7 @@ where
                         &session_meta,
                         0,
                         recovered_backend_bytes_written,
-                        Some((
-                            crate::plugins::Direction::Unknown,
-                            retry::ErrorClass::ReadWriteTimeout,
-                            None,
-                        )),
+                        None,
                         reason,
                     )
                     .await;
@@ -15565,17 +15579,21 @@ where
                     termination_reason = reason.as_str(),
                     "WebSocket tunnel stopped by absolute session policy"
                 );
+                // Cancelling the raw copy forfeits its byte totals:
+                // `bidirectional_copy_for_relay` owns stack-local counters and
+                // only reports them when it returns, so a policy-stopped tunnel
+                // session reports just the pre-relay residual bytes. Frame-
+                // parsed sessions keep exact counts through shared atomics; use
+                // frame mode when byte fidelity across forced closes matters.
+                // No failure is attributed — this is a gateway policy close, not
+                // a relay fault, and `termination_reason` carries the cause.
                 fire_ws_tunnel_disconnect_hooks_with_reason(
                     &ws_disconnect_plugins,
                     proxy_id,
                     &session_meta,
                     0,
                     recovered_backend_bytes_written,
-                    Some((
-                        crate::plugins::Direction::Unknown,
-                        retry::ErrorClass::ReadWriteTimeout,
-                        None,
-                    )),
+                    None,
                     reason,
                 )
                 .await;
@@ -16434,12 +16452,17 @@ where
     let first_completion = tokio::select! {
         biased;
         reason = &mut stop => {
+            // Deliberately NOT a `first_failure`: an absolute-deadline or drain
+            // stop is a gateway-initiated policy close that delivers a real
+            // Close frame in both directions. Recording it as a relay
+            // `ReadWriteTimeout` would publish `result="error"` on
+            // `ferrum_websocket_sessions_total` and resolve to
+            // `DisconnectCause::IdleTimeout` for `proxy_alerts`, so every
+            // session that simply reached `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS`
+            // would look like a stalled relay. `termination_reason` already
+            // carries the real cause. A genuine hang is still recorded below,
+            // when the remaining half misses `WS_DRAIN_GRACE`.
             let _ = termination_reason.set(reason);
-            let _ = first_failure.set((
-                crate::plugins::Direction::Unknown,
-                retry::ErrorClass::ReadWriteTimeout,
-                None,
-            ));
             let _ = publish_ws_policy_close(
                 &policy_close_stop,
                 &cancel,
@@ -16459,12 +16482,10 @@ where
         let remaining_timed_out = tokio::select! {
             biased;
             reason = &mut stop => {
+                // Same reasoning as the first-completion arbiter above: the
+                // policy stop itself is not a relay failure. Only the bounded
+                // close-delivery grace below can attribute one.
                 let _ = termination_reason.set(reason);
-                let _ = first_failure.set((
-                    crate::plugins::Direction::Unknown,
-                    retry::ErrorClass::ReadWriteTimeout,
-                    None,
-                ));
                 let _ = publish_ws_policy_close(
                     &policy_close_stop,
                     &cancel,
@@ -16487,12 +16508,10 @@ where
         let remaining_timed_out = tokio::select! {
             biased;
             reason = &mut stop => {
+                // Same reasoning as the first-completion arbiter above: the
+                // policy stop itself is not a relay failure. Only the bounded
+                // close-delivery grace below can attribute one.
                 let _ = termination_reason.set(reason);
-                let _ = first_failure.set((
-                    crate::plugins::Direction::Unknown,
-                    retry::ErrorClass::ReadWriteTimeout,
-                    None,
-                ));
                 let _ = publish_ws_policy_close(
                     &policy_close_stop,
                     &cancel,

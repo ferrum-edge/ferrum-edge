@@ -557,6 +557,28 @@ pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
     }
 }
 
+/// Status, body, and transaction-log rejection phase for an H3 WebSocket
+/// upgrade refused because its session deadline already elapsed. Mirrors the
+/// H1/H2 mapping in `handle_websocket_request_authenticated` exactly so the
+/// three frontends stay auditable under the same phase names. The bodies are
+/// fixed constants: no claim, token, identity, or deadline value is echoed.
+fn h3_websocket_deadline_rejection(
+    reason: crate::proxy::WsTerminationReason,
+) -> (StatusCode, &'static str, &'static str) {
+    match reason {
+        crate::proxy::WsTerminationReason::CredentialExpired => (
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"Credential expired before WebSocket upgrade"}"#,
+            "websocket_credential_expired",
+        ),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#,
+            "websocket_max_lifetime",
+        ),
+    }
+}
+
 /// H3 WebSocket entry point. Called from `handle_h3_request` when
 /// `HttpFlavor::WebSocket` is detected on an HTTP/3 request and
 /// `FERRUM_HTTP3_WEBSOCKET_ENABLED` is true.
@@ -641,20 +663,20 @@ pub(crate) async fn handle_h3_websocket(
         state.env_config.websocket_max_lifetime_seconds,
     );
     if ws_session_deadline.at <= tokio::time::Instant::now() {
-        let credential_expired = matches!(
-            ws_session_deadline.reason,
-            crate::proxy::WsTerminationReason::CredentialExpired
-        );
-        let status = if credential_expired {
-            StatusCode::UNAUTHORIZED
-        } else {
-            StatusCode::SERVICE_UNAVAILABLE
-        };
-        let body = if credential_expired {
-            r#"{"error":"Credential expired before WebSocket upgrade"}"#
-        } else {
-            r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#
-        };
+        let (status, body, phase) = h3_websocket_deadline_rejection(ws_session_deadline.reason);
+        // Same rejection record the H1/H2 path emits, so a credential-expiry or
+        // maximum-lifetime refusal is auditable on every frontend instead of
+        // only on H1 Upgrade / H2 Extended CONNECT.
+        crate::proxy::log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            status.as_u16(),
+            start_time,
+            phase,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
         send_h3_error_body(
             &mut stream,
             status,
@@ -1257,20 +1279,19 @@ pub(crate) async fn handle_h3_websocket(
     }
 
     if ws_session_deadline.at <= tokio::time::Instant::now() {
-        let credential_expired = matches!(
-            ws_session_deadline.reason,
-            crate::proxy::WsTerminationReason::CredentialExpired
-        );
-        let status = if credential_expired {
-            StatusCode::UNAUTHORIZED
-        } else {
-            StatusCode::SERVICE_UNAVAILABLE
-        };
-        let body = if credential_expired {
-            r#"{"error":"Credential expired before WebSocket upgrade"}"#
-        } else {
-            r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#
-        };
+        let (status, body, phase) = h3_websocket_deadline_rejection(ws_session_deadline.reason);
+        // The breaker already recorded this hop's success above, so only the
+        // rejection record and the request counter are owed here.
+        crate::proxy::log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            status.as_u16(),
+            start_time,
+            phase,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
         send_h3_error_body(
             &mut stream,
             status,
