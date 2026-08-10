@@ -1948,8 +1948,8 @@ pub struct EnvConfig {
     /// Ping/Pong, or transport bytes) for this duration. Activity from EITHER
     /// direction refreshes the shared watermark, so heartbeating clients stay
     /// open. The per-proxy `websocket_idle_timeout_seconds` overrides this.
-    /// `0` = disabled (idle sessions live forever, bounded only by
-    /// `websocket_max_connections`). Default: 300 (5 minutes).
+    /// `0` disables only the idle bound; the absolute WebSocket lifetime still
+    /// applies. Default: 300 (5 minutes).
     ///
     /// HTTP/3 caveat: on QUIC frontends the transport-level connection idle
     /// timeout (`FERRUM_HTTP3_IDLE_TIMEOUT`, default 30s) can close an
@@ -1958,6 +1958,9 @@ pub struct EnvConfig {
     /// `FERRUM_HTTP3_IDLE_TIMEOUT` when isolated H3 WebSockets need a longer
     /// idle window.
     pub websocket_idle_timeout_seconds: u64,
+    /// Absolute lifetime for every accepted WebSocket session, independent of
+    /// traffic and idle activity. Must be 1..=86400 seconds. Default: 3600.
+    pub websocket_max_lifetime_seconds: u64,
     /// Maximum physical WebSocket frames a single fragmented message may consume
     /// before the connection is closed with RFC 6455 code `1008`. Counts the
     /// initial non-final Text/Binary frame plus every continuation frame that
@@ -2983,6 +2986,7 @@ impl Default for EnvConfig {
             websocket_write_buffer_size: 131_072, // 128 KB
             websocket_tunnel_mode: false,
             websocket_idle_timeout_seconds: 300,
+            websocket_max_lifetime_seconds: 3_600,
             websocket_max_incomplete_message_frames: 1_024,
             websocket_max_incomplete_message_seconds: 60,
             max_credentials_per_type: 2,
@@ -3520,6 +3524,7 @@ impl EnvConfig {
             websocket_write_buffer_size: usize = "FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE" => 131_072usize;
             websocket_tunnel_mode: bool = "FERRUM_WEBSOCKET_TUNNEL_MODE" => false;
             websocket_idle_timeout_seconds: u64 = "FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS" => 300u64;
+            websocket_max_lifetime_seconds: u64 = "FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS" => 3_600u64;
             websocket_max_incomplete_message_frames: usize = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES" => 1_024usize;
             websocket_max_incomplete_message_seconds: u64 = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS" => 60u64;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
@@ -4261,6 +4266,7 @@ impl EnvConfig {
             websocket_write_buffer_size,
             websocket_tunnel_mode,
             websocket_idle_timeout_seconds,
+            websocket_max_lifetime_seconds,
             websocket_max_incomplete_message_frames,
             websocket_max_incomplete_message_seconds,
             max_credentials_per_type,
@@ -5258,6 +5264,12 @@ impl EnvConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        if !(1..=86_400).contains(&self.websocket_max_lifetime_seconds) {
+            return Err(
+                "FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS must be between 1 and 86400 seconds"
+                    .into(),
+            );
+        }
         if let Some(gateway_ref) = self.stream_gateway_ref.as_deref() {
             crate::proxy::stream_match::validate_canonical_gateway_ref(gateway_ref)
                 .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;

@@ -97,6 +97,7 @@ pub struct WsSessionKey {
     pub direction: &'static str,
     pub io_side: &'static str,
     pub error_class: &'static str,
+    pub termination_reason: &'static str,
 }
 
 /// Bounded directional WebSocket traffic key.
@@ -293,6 +294,23 @@ fn ws_io_side_label(side: Option<crate::proxy::tcp_proxy::StreamIoSide>) -> &'st
         Some(crate::proxy::tcp_proxy::StreamIoSide::Read) => "read",
         Some(crate::proxy::tcp_proxy::StreamIoSide::Write) => "write",
         None => "unknown",
+    }
+}
+
+fn websocket_termination_reason_label(ctx: &WsDisconnectContext) -> &'static str {
+    match ctx
+        .metadata
+        .get(crate::proxy::WS_TERMINATION_METADATA_KEY)
+        .map(String::as_str)
+    {
+        Some("credential_expired") => "credential_expired",
+        Some("max_lifetime") => "max_lifetime",
+        Some("idle_timeout") => "idle_timeout",
+        Some("drain") => "drain",
+        Some("normal_peer_close") => "normal_peer_close",
+        Some("relay_error") => "relay_error",
+        _ if ctx.error_class.is_some() => "relay_error",
+        _ => "normal_peer_close",
     }
 }
 
@@ -1103,6 +1121,7 @@ impl MetricsRegistry {
                 .as_ref()
                 .map(ErrorClass::as_str)
                 .unwrap_or("none"),
+            termination_reason: websocket_termination_reason_label(ctx),
         };
         self.ws_session_counter
             .entry(session_key.clone())
@@ -3024,12 +3043,13 @@ impl MetricsRegistry {
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let proxy_id = escape_label_value(&key.proxy_id);
                 output.push_str(&format!(
-                    "ferrum_websocket_sessions_total{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\"{}}} {}\n",
+                    "ferrum_websocket_sessions_total{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\"{}}} {}\n",
                     proxy_id,
                     key.result,
                     key.direction,
                     key.io_side,
                     key.error_class,
+                    key.termination_reason,
                     ns_label,
                     count
                 ));
@@ -3941,12 +3961,13 @@ fn render_ws_histogram(
     for (i, boundary) in histogram.boundaries.iter().enumerate() {
         let count = histogram.counts[i].load(Ordering::Relaxed);
         output.push_str(&format!(
-            "ferrum_websocket_session_duration_ms_bucket{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",le=\"{}\"{}}} {}\n",
+            "ferrum_websocket_session_duration_ms_bucket{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\",le=\"{}\"{}}} {}\n",
             proxy_id,
             key.result,
             key.direction,
             key.io_side,
             key.error_class,
+            key.termination_reason,
             boundary,
             ns_label,
             count
@@ -3955,8 +3976,13 @@ fn render_ws_histogram(
     let total_count = histogram.count.load(Ordering::Relaxed);
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
     let labels = format!(
-        "proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\"",
-        proxy_id, key.result, key.direction, key.io_side, key.error_class
+        "proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\"",
+        proxy_id,
+        key.result,
+        key.direction,
+        key.io_side,
+        key.error_class,
+        key.termination_reason
     );
     output.push_str(&format!(
         "ferrum_websocket_session_duration_ms_bucket{{{},le=\"+Inf\"{}}} {}\n",

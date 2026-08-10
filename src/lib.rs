@@ -6419,6 +6419,68 @@ pub mod _test_support {
         .await
     }
 
+    /// Return the shared WebSocket deadline plan used by H1 Upgrade, H2
+    /// Extended CONNECT, and H3 Extended CONNECT. Offsets are monotonic and
+    /// contain no credential material.
+    pub fn websocket_deadline_plan(
+        max_lifetime: std::time::Duration,
+        credential_lifetime: Option<std::time::Duration>,
+    ) -> (std::time::Duration, &'static str) {
+        let now = tokio::time::Instant::now();
+        let mut ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        ctx.grpc_deadline_received_at = now;
+        ctx.credential_deadline_at = credential_lifetime.and_then(|ttl| now.checked_add(ttl));
+        let plan = crate::proxy::effective_websocket_session_deadline(
+            &ctx,
+            max_lifetime.as_secs(),
+        );
+        (plan.at.saturating_duration_since(now), plan.reason.as_str())
+    }
+
+    /// Await the same absolute-deadline/drain arbiter used by every WebSocket
+    /// relay. The inputs are fixed test controls and carry no credential data.
+    pub async fn websocket_stop_reason_for_test(
+        deadline_after: std::time::Duration,
+        credential_deadline: bool,
+        shutdown: bool,
+        draining: bool,
+    ) -> &'static str {
+        use std::sync::atomic::Ordering;
+
+        let overload = crate::overload::OverloadState::new();
+        overload.draining.store(draining, Ordering::Release);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(shutdown);
+        let reason = if credential_deadline {
+            crate::proxy::WsTerminationReason::CredentialExpired
+        } else {
+            crate::proxy::WsTerminationReason::MaxLifetime
+        };
+        let deadline = crate::proxy::WsSessionDeadline {
+            at: tokio::time::Instant::now()
+                .checked_add(deadline_after)
+                .unwrap_or_else(tokio::time::Instant::now),
+            reason,
+        };
+        crate::proxy::wait_for_websocket_session_stop(
+            deadline,
+            Some(shutdown_rx),
+            &overload,
+        )
+        .await
+        .as_str()
+    }
+
+    pub fn request_credential_deadline_remaining(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<std::time::Duration> {
+        ctx.credential_deadline_at
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
     /// Construct a streaming `ProxyBody` for use in unit/integration tests.
     /// Delegates to the crate-private `ProxyBody::streaming` constructor,
     /// keeping that constructor internal while still letting tests exercise

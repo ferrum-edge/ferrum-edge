@@ -23,7 +23,7 @@ use super::utils::PluginHttpClient;
 use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::{
     VerifyOutcome, authentication_attempt_can_commit, commit_authentication_attempt,
-    constant_time_eq, nonblank_identity,
+    constant_time_eq, credential_deadline_from_unix_seconds, nonblank_identity,
 };
 use super::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
@@ -1246,7 +1246,20 @@ impl OidcRelyingParty {
         if let Err((status, body)) = self.check_session_authorization(&payload.claims) {
             return self.reject_with_session_update(ctx, status, body, rolling_cookie);
         }
-        let outcome = self.resolve_identity(&payload.claims, consumer_index);
+        let credential_valid_until = claims_expires_at
+            .saturating_add(leeway)
+            .min(payload.issued_at_unix.saturating_add(self.session.ttl.as_secs() as i64))
+            .min(
+                payload
+                    .last_touch_unix
+                    .saturating_add(self.session.idle_ttl.as_secs() as i64),
+            );
+        let outcome = self
+            .resolve_identity(&payload.claims, consumer_index)
+            .with_credential_deadline(Some(credential_deadline_from_unix_seconds(
+                credential_valid_until,
+                0,
+            )));
         let mut attempt = AuthenticationAttempt::new();
         if authentication_attempt_can_commit(ctx, &outcome, true) {
             if let Some(cookie) = rolling_cookie {
@@ -3567,6 +3580,7 @@ mod tests {
                 consumer,
                 external_identity,
                 external_identity_header,
+                ..
             } = plugin.resolve_identity(&claims, &ConsumerIndex::new(&[]))
             else {
                 panic!("identity resolution should remain non-rejecting");

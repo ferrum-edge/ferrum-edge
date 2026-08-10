@@ -1677,8 +1677,11 @@ exhaustion.
 
 WebSocket teardown exports `ferrum_websocket_sessions_total`,
 `ferrum_websocket_session_duration_ms`, `ferrum_websocket_bytes_total`, and
-`ferrum_websocket_frames_total`. Terminal labels come only from bounded enums;
-peer-supplied close reasons and error messages are never metric labels.
+`ferrum_websocket_frames_total`. Session and duration series include the fixed
+`termination_reason` classes `credential_expired`, `max_lifetime`,
+`idle_timeout`, `drain`, `normal_peer_close`, and `relay_error`. Terminal labels
+come only from bounded enums; peer-supplied close reasons, identities, claims,
+tokens, and error messages are never metric labels.
 
 Certificate inventory keeps absolute validity timestamps internally and derives
 the relative expiry gauge on an uncached render. An unchanged TLS refresh does

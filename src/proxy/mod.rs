@@ -2066,9 +2066,9 @@ fn websocket_idle_disabled_proxy_ids(
 /// Emit the resource-hoarding warning for a set of proxies with a disabled
 /// WebSocket idle bound. An upgraded WebSocket holds a dedicated backend
 /// connection plus a `websocket_max_connections` slot for its entire lifetime;
-/// with the idle timeout disabled, a silent (non-heartbeating) client can hoard
-/// that slot indefinitely. Activity from either direction — including Ping/Pong
-/// — refreshes the timer, so the disabled state is the only exposure.
+/// with the idle timeout disabled, a silent (non-heartbeating) client can retain
+/// that slot until the finite absolute session deadline. Activity from either
+/// direction — including Ping/Pong — refreshes only the idle timer.
 fn emit_websocket_idle_disabled_warning(
     disabled_proxy_ids: &[String],
     global_ws_idle_timeout_seconds: u64,
@@ -2084,10 +2084,10 @@ fn emit_websocket_idle_disabled_warning(
         ws_idle_disabled_proxy_sample = %sample,
         global_websocket_idle_timeout_seconds = global_ws_idle_timeout_seconds,
         "WebSocket idle timeout is disabled (0) for one or more HTTP-family proxies. \
-         Idle upgraded WebSocket sessions will hold a backend connection and a \
-         FERRUM_WEBSOCKET_MAX_CONNECTIONS slot indefinitely (resource-hoarding risk). \
-         Set FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (global) or the per-proxy \
-         websocket_idle_timeout_seconds to a non-zero value to bound idle lifetime."
+         Idle upgraded WebSocket sessions can hold a backend connection and a \
+         FERRUM_WEBSOCKET_MAX_CONNECTIONS slot until the finite absolute session \
+         lifetime. Set FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (global) or the per-proxy \
+         websocket_idle_timeout_seconds to a non-zero value for an earlier idle bound."
     );
 }
 
@@ -6126,6 +6126,7 @@ struct RequestConnectionMetadata {
     /// connection instead of re-parsing the DER on every multiplexed request.
     peer_spiffe_extraction_cache:
         Option<Arc<crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache>>,
+    websocket_shutdown_rx: Option<watch::Receiver<bool>>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -11362,6 +11363,7 @@ async fn handle_connection(
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
+    let websocket_shutdown_rx = shutdown_rx.clone();
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = Arc::clone(&state);
         let addr = remote_addr;
@@ -11375,6 +11377,7 @@ async fn handle_connection(
             mesh_inbound_pre_handshake_app_port,
             // Plaintext connections carry no client certificate.
             peer_spiffe_extraction_cache: None,
+            websocket_shutdown_rx: Some(websocket_shutdown_rx.clone()),
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -11642,6 +11645,46 @@ async fn handle_websocket_request_authenticated(
     // how the caller classified or constructed the request context.
     ctx.set_websocket_response_boundary(true);
     let mut current_cb_target_key = cb_target_key;
+    let ws_session_deadline = effective_websocket_session_deadline(
+        &ctx,
+        state.env_config.websocket_max_lifetime_seconds,
+    );
+    if ws_session_deadline.at <= tokio::time::Instant::now() {
+        let (status, body, phase) = match ws_session_deadline.reason {
+            WsTerminationReason::CredentialExpired => (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"Credential expired before WebSocket upgrade"}"#,
+                "websocket_credential_expired",
+            ),
+            _ => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#,
+                "websocket_max_lifetime",
+            ),
+        };
+        log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            status.as_u16(),
+            start_time,
+            phase,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
+        record_request(&state, status.as_u16());
+        release_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            current_cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
+        return Ok(build_websocket_error_response(
+            status,
+            body,
+            &initial_response_header_policy_plugins,
+        ));
+    }
 
     // Absolute route retry ceiling retained before any DestinationRule target
     // projection. WebSocket retries authorize each attempt/candidate against
@@ -12460,6 +12503,37 @@ async fn handle_websocket_request_authenticated(
         cb.record_success(ws_cb_probe_slot_available);
     }
 
+    if ws_session_deadline.at <= tokio::time::Instant::now() {
+        let (status, body, phase) = match ws_session_deadline.reason {
+            WsTerminationReason::CredentialExpired => (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"Credential expired before WebSocket upgrade"}"#,
+                "websocket_credential_expired",
+            ),
+            _ => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#,
+                "websocket_max_lifetime",
+            ),
+        };
+        log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            status.as_u16(),
+            start_time,
+            phase,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
+        record_request(&state, status.as_u16());
+        return Ok(build_websocket_error_response(
+            status,
+            body,
+            &initial_response_header_policy_plugins,
+        ));
+    }
+
     let ws_lb_guard =
         LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
     if let Some(permits) = backend_admission_permits.as_ref() {
@@ -12641,6 +12715,10 @@ async fn handle_websocket_request_authenticated(
     let ws_tunnel_idle_disabled_safety_cap =
         websocket_tunnel_idle_disabled_safety_cap(state.env_config.tcp_half_close_max_wait_seconds);
     let ws_fragment_policy = WsFragmentPolicy::from_env(&state.env_config);
+    let ws_shutdown_rx = ctx
+        .websocket_shutdown_rx
+        .clone()
+        .or_else(|| state.health_check_shutdown_rx.clone());
     let adaptive_buf = state.adaptive_buffer.clone();
     // Track the upgraded WebSocket session in `OverloadState.active_connections`
     // so graceful drain waits for in-flight WS sessions before exiting.
@@ -12710,7 +12788,32 @@ async fn handle_websocket_request_authenticated(
         // when no cap is configured for the destination port. Dropping it on
         // any session-end path releases the slot exactly once — no leak.
         let _backend_conn_guard = backend_conn_guard;
-        match on_upgrade.await {
+        let upgrade_result = tokio::select! {
+            biased;
+            reason = wait_for_websocket_session_stop(
+                ws_session_deadline,
+                ws_shutdown_rx.clone(),
+                &state.overload,
+            ) => {
+                fire_ws_tunnel_disconnect_hooks_with_reason(
+                    &ws_disconnect_plugins,
+                    &proxy_id,
+                    &session_meta,
+                    0,
+                    0,
+                    Some((
+                        crate::plugins::Direction::Unknown,
+                        retry::ErrorClass::ReadWriteTimeout,
+                        None,
+                    )),
+                    reason,
+                )
+                .await;
+                return;
+            }
+            result = on_upgrade => result,
+        };
+        match upgrade_result {
             Ok(upgraded) => {
                 // H1/H2 frontends adapt hyper's `Upgraded` (which is
                 // `AsyncRead + AsyncWrite` in hyper-1 land) into the
@@ -12749,6 +12852,9 @@ async fn handle_websocket_request_authenticated(
                             // RFC 9220 §5 compliance.
                             false,
                             ws_idle_tracker,
+                            ws_session_deadline,
+                            ws_shutdown_rx,
+                            Arc::clone(&state.overload),
                             ws_fragment_policy,
                             &adaptive_buf,
                         )
@@ -12772,6 +12878,9 @@ async fn handle_websocket_request_authenticated(
                             ws_tunnel_idle_disabled_safety_cap,
                             false,
                             ws_idle_tracker,
+                            ws_session_deadline,
+                            ws_shutdown_rx,
+                            Arc::clone(&state.overload),
                             ws_fragment_policy,
                             &adaptive_buf,
                         )
@@ -14294,6 +14403,120 @@ pub struct WsSessionMeta {
     pub session_start_mono: Instant,
 }
 
+pub(crate) const WS_TERMINATION_METADATA_KEY: &str = "websocket.termination_reason";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WsTerminationReason {
+    CredentialExpired,
+    MaxLifetime,
+    IdleTimeout,
+    Drain,
+    NormalPeerClose,
+    RelayError,
+}
+
+impl WsTerminationReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CredentialExpired => "credential_expired",
+            Self::MaxLifetime => "max_lifetime",
+            Self::IdleTimeout => "idle_timeout",
+            Self::Drain => "drain",
+            Self::NormalPeerClose => "normal_peer_close",
+            Self::RelayError => "relay_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WsSessionDeadline {
+    pub(crate) at: tokio::time::Instant,
+    pub(crate) reason: WsTerminationReason,
+}
+
+pub(crate) fn effective_websocket_session_deadline(
+    ctx: &RequestContext,
+    max_lifetime_seconds: u64,
+) -> WsSessionDeadline {
+    let now = tokio::time::Instant::now();
+    let maximum = ctx
+        .grpc_deadline_received_at
+        .checked_add(Duration::from_secs(max_lifetime_seconds))
+        .unwrap_or(now);
+    match ctx.credential_deadline_at {
+        Some(credential) if credential <= maximum => WsSessionDeadline {
+            at: credential,
+            reason: WsTerminationReason::CredentialExpired,
+        },
+        _ => WsSessionDeadline {
+            at: maximum,
+            reason: WsTerminationReason::MaxLifetime,
+        },
+    }
+}
+
+fn ws_deadline_close_frame(reason: WsTerminationReason) -> CloseFrame {
+    let (code, text) = match reason {
+        WsTerminationReason::CredentialExpired => (CloseCode::Policy, "credential expired"),
+        WsTerminationReason::MaxLifetime => (CloseCode::Policy, "maximum lifetime reached"),
+        WsTerminationReason::Drain => (CloseCode::Away, "gateway draining"),
+        _ => (CloseCode::Away, "session ended"),
+    };
+    CloseFrame {
+        code,
+        reason: text.into(),
+    }
+}
+
+pub(crate) async fn wait_for_websocket_session_stop(
+    deadline: WsSessionDeadline,
+    mut shutdown: Option<watch::Receiver<bool>>,
+    overload: &crate::overload::OverloadState,
+) -> WsTerminationReason {
+    if deadline.at <= tokio::time::Instant::now() {
+        return deadline.reason;
+    }
+    if overload.draining.load(Ordering::Acquire)
+        || shutdown.as_ref().is_some_and(|receiver| *receiver.borrow())
+    {
+        return WsTerminationReason::Drain;
+    }
+    let mut drain_poll = tokio::time::interval(Duration::from_millis(50));
+    drain_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline.at) => return deadline.reason,
+            changed = async {
+                match shutdown.as_mut() {
+                    Some(receiver) => receiver.changed().await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                let _ = changed;
+                return WsTerminationReason::Drain;
+            }
+            _ = drain_poll.tick() => {
+                if overload.draining.load(Ordering::Acquire) {
+                    return WsTerminationReason::Drain;
+                }
+            }
+        }
+    }
+}
+
+fn ws_disconnect_metadata(
+    session_meta: &WsSessionMeta,
+    termination_reason: WsTerminationReason,
+) -> HashMap<String, String> {
+    let mut metadata = session_meta.metadata.clone();
+    metadata.insert(
+        WS_TERMINATION_METADATA_KEY.to_string(),
+        termination_reason.as_str().to_string(),
+    );
+    metadata
+}
+
 /// Fire `on_ws_disconnect` for the tunnel-mode path, where raw
 /// `copy_bidirectional` is used instead of frame-level parsing.
 ///
@@ -14320,11 +14543,42 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         Option<tcp_proxy::StreamIoSide>,
     )>,
 ) {
+    let termination_reason = if failure.is_some() {
+        WsTerminationReason::RelayError
+    } else {
+        WsTerminationReason::NormalPeerClose
+    };
+    fire_ws_tunnel_disconnect_hooks_with_reason(
+        ws_disconnect_plugins,
+        proxy_id,
+        session_meta,
+        bytes_client_to_backend,
+        bytes_backend_to_client,
+        failure,
+        termination_reason,
+    )
+    .await;
+}
+
+async fn fire_ws_tunnel_disconnect_hooks_with_reason(
+    ws_disconnect_plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    session_meta: &WsSessionMeta,
+    bytes_client_to_backend: u64,
+    bytes_backend_to_client: u64,
+    failure: Option<(
+        crate::plugins::Direction,
+        retry::ErrorClass,
+        Option<tcp_proxy::StreamIoSide>,
+    )>,
+    termination_reason: WsTerminationReason,
+) {
     if ws_disconnect_plugins.is_empty() {
         return;
     }
     let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
     let disconnected_at = chrono::Utc::now();
+    let metadata = ws_disconnect_metadata(session_meta, termination_reason);
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace.clone(),
         proxy_id: proxy_id.to_string(),
@@ -14346,7 +14600,7 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         error_class: failure.map(|(_, c, _)| c),
         consumer_username: session_meta.consumer_username.clone(),
         auth_method: session_meta.auth_method,
-        metadata: session_meta.metadata.clone(),
+        metadata,
     };
     for plugin in ws_disconnect_plugins {
         plugin.on_ws_disconnect(&disconnect_ctx).await;
@@ -14375,11 +14629,47 @@ pub async fn fire_ws_framed_disconnect_hooks(
         Option<tcp_proxy::StreamIoSide>,
     )>,
 ) {
+    let termination_reason = if failure.is_some() {
+        WsTerminationReason::RelayError
+    } else {
+        WsTerminationReason::NormalPeerClose
+    };
+    fire_ws_framed_disconnect_hooks_with_reason(
+        ws_disconnect_plugins,
+        proxy_id,
+        session_meta,
+        frames_client_to_backend,
+        frames_backend_to_client,
+        bytes_client_to_backend,
+        bytes_backend_to_client,
+        failure,
+        termination_reason,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fire_ws_framed_disconnect_hooks_with_reason(
+    ws_disconnect_plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    session_meta: WsSessionMeta,
+    frames_client_to_backend: u64,
+    frames_backend_to_client: u64,
+    bytes_client_to_backend: u64,
+    bytes_backend_to_client: u64,
+    failure: Option<(
+        crate::plugins::Direction,
+        retry::ErrorClass,
+        Option<tcp_proxy::StreamIoSide>,
+    )>,
+    termination_reason: WsTerminationReason,
+) {
     if ws_disconnect_plugins.is_empty() {
         return;
     }
     let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
     let disconnected_at = chrono::Utc::now();
+    let metadata = ws_disconnect_metadata(&session_meta, termination_reason);
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace,
         proxy_id: proxy_id.to_string(),
@@ -14401,7 +14691,7 @@ pub async fn fire_ws_framed_disconnect_hooks(
         error_class: failure.map(|(_, c, _)| c),
         consumer_username: session_meta.consumer_username,
         auth_method: session_meta.auth_method,
-        metadata: session_meta.metadata,
+        metadata,
     };
     for plugin in ws_disconnect_plugins {
         plugin.on_ws_disconnect(&disconnect_ctx).await;
@@ -15158,6 +15448,9 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     websocket_tunnel_idle_disabled_safety_cap: Duration,
     accept_unmasked_client_frames: bool,
     ws_idle_tracker: Option<Arc<WsIdleTracker>>,
+    session_deadline: WsSessionDeadline,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+    overload: Arc<crate::overload::OverloadState>,
     fragment_policy: WsFragmentPolicy,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
@@ -15210,26 +15503,50 @@ where
         let pre_relay_failure = {
             use tokio::io::AsyncWriteExt;
             let mut offset = 0usize;
-            let write_result = tokio::time::timeout(residual_write_timeout, async {
-                while offset < backend_read_buffer.len() {
-                    match client_io.write(&backend_read_buffer[offset..]).await {
-                        Ok(0) => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::WriteZero,
-                                "client accepted zero bytes while forwarding WebSocket backend residual bytes",
-                            ));
-                        }
-                        Ok(n) => {
-                            offset = offset.saturating_add(n);
-                        }
-                        Err(err) => {
-                            return Err(err);
+            let write_result = tokio::select! {
+                biased;
+                reason = wait_for_websocket_session_stop(
+                    session_deadline,
+                    shutdown_rx.clone(),
+                    &overload,
+                ) => {
+                    recovered_backend_bytes_written = offset as u64;
+                    fire_ws_tunnel_disconnect_hooks_with_reason(
+                        &ws_disconnect_plugins,
+                        proxy_id,
+                        &session_meta,
+                        0,
+                        recovered_backend_bytes_written,
+                        Some((
+                            crate::plugins::Direction::Unknown,
+                            retry::ErrorClass::ReadWriteTimeout,
+                            None,
+                        )),
+                        reason,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                result = tokio::time::timeout(residual_write_timeout, async {
+                    while offset < backend_read_buffer.len() {
+                        match client_io.write(&backend_read_buffer[offset..]).await {
+                            Ok(0) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::WriteZero,
+                                    "client accepted zero bytes while forwarding WebSocket backend residual bytes",
+                                ));
+                            }
+                            Ok(n) => {
+                                offset = offset.saturating_add(n);
+                            }
+                            Err(err) => {
+                                return Err(err);
+                            }
                         }
                     }
-                }
-                Ok(())
-            })
-            .await;
+                    Ok(())
+                }) => result,
+            };
             recovered_backend_bytes_written = offset as u64;
             match write_result {
                 Ok(Ok(())) => None,
@@ -15286,16 +15603,45 @@ where
         } else {
             None
         };
-        let copy_result = tcp_proxy::bidirectional_copy_for_relay(
-            client_io,
-            backend,
-            websocket_idle_timeout,
-            tunnel_half_close_cap,
-            None,
-            None,
-            buf_size,
-        )
-        .await;
+        let copy_result = tokio::select! {
+            biased;
+            reason = wait_for_websocket_session_stop(
+                session_deadline,
+                shutdown_rx.clone(),
+                &overload,
+            ) => {
+                debug!(
+                    proxy_id = %proxy_id,
+                    connection_id,
+                    termination_reason = reason.as_str(),
+                    "WebSocket tunnel stopped by absolute session policy"
+                );
+                fire_ws_tunnel_disconnect_hooks_with_reason(
+                    &ws_disconnect_plugins,
+                    proxy_id,
+                    &session_meta,
+                    0,
+                    recovered_backend_bytes_written,
+                    Some((
+                        crate::plugins::Direction::Unknown,
+                        retry::ErrorClass::ReadWriteTimeout,
+                        None,
+                    )),
+                    reason,
+                )
+                .await;
+                return Ok(());
+            }
+            result = tcp_proxy::bidirectional_copy_for_relay(
+                client_io,
+                backend,
+                websocket_idle_timeout,
+                tunnel_half_close_cap,
+                None,
+                None,
+                buf_size,
+            ) => result,
+        };
         adaptive_buffer.record_connection(
             &session_meta.namespace,
             proxy_id,
@@ -15324,7 +15670,23 @@ where
         // Fire on_ws_disconnect so plugins that opted into disconnect hooks see
         // the tunnel-mode session teardown. Frame counts are 0 because tunnel
         // mode does raw TCP bidirectional copy — no frames are parsed.
-        fire_ws_tunnel_disconnect_hooks(
+        let termination_reason = if copy_result.first_failure.is_some() {
+            if websocket_idle_timeout.is_some()
+                && copy_result
+                    .first_failure
+                    .as_ref()
+                    .is_some_and(|(_, class, _, _)| {
+                        *class == retry::ErrorClass::ReadWriteTimeout
+                    })
+            {
+                WsTerminationReason::IdleTimeout
+            } else {
+                WsTerminationReason::RelayError
+            }
+        } else {
+            WsTerminationReason::NormalPeerClose
+        };
+        fire_ws_tunnel_disconnect_hooks_with_reason(
             &ws_disconnect_plugins,
             proxy_id,
             &session_meta,
@@ -15333,6 +15695,7 @@ where
                 .bytes_backend_to_client
                 .saturating_add(recovered_backend_bytes_written),
             tunnel_failure,
+            termination_reason,
         )
         .await;
         return Ok(());
@@ -15445,7 +15808,11 @@ where
     let cancel_btc = cancel.clone();
     let policy_close: Arc<std::sync::OnceLock<CloseFrame>> = Arc::new(std::sync::OnceLock::new());
     let policy_close_ctb = Arc::clone(&policy_close);
-    let policy_close_btc = policy_close;
+    let policy_close_btc = Arc::clone(&policy_close);
+    let policy_close_stop = policy_close;
+    let termination_reason = Arc::new(std::sync::OnceLock::new());
+    let termination_reason_ctb = Arc::clone(&termination_reason);
+    let termination_reason_btc = Arc::clone(&termination_reason);
 
     // Forward messages from client to backend
     let client_to_backend = async move {
@@ -15475,6 +15842,8 @@ where
                         WsNextMessage::Item(Some(msg)) => msg,
                         WsNextMessage::Item(None) => break,
                         WsNextMessage::IdleTimeout => {
+                            let _ = termination_reason_ctb
+                                .set(WsTerminationReason::IdleTimeout);
                             debug!(
                                 proxy_id = %proxy_id_ctb,
                                 connection_id,
@@ -15812,6 +16181,8 @@ where
                         WsNextMessage::Item(Some(msg)) => msg,
                         WsNextMessage::Item(None) => break,
                         WsNextMessage::IdleTimeout => {
+                            let _ = termination_reason_btc
+                                .set(WsTerminationReason::IdleTimeout);
                             debug!(
                                 proxy_id = %proxy_id_btc,
                                 connection_id,
@@ -16102,41 +16473,123 @@ where
     // upgraded sockets and `_ws_connection_permit` forever and eventually
     // starve new WebSocket sessions. Race the two halves for first-completion
     // (the exit branch each one runs calls `cancel()` on the opposite token)
-    // then wait on the remaining half with a bounded drain grace. If the
-    // grace expires the remaining future is dropped — in-flight plugin calls
-    // are cancelled and all captured sockets are released.
+    // then wait on the remaining half with a bounded drain grace while still
+    // racing the absolute session stop. If either bound fires, cancellation
+    // is published and the remaining future gets one bounded close-delivery
+    // grace before it is dropped, releasing all captured sockets.
     let mut c2b = Box::pin(client_to_backend);
     let mut b2c = Box::pin(backend_to_client);
-    let client_done = tokio::select! {
-        _ = &mut c2b => true,
-        _ = &mut b2c => false,
+    let mut stop = Box::pin(wait_for_websocket_session_stop(
+        session_deadline,
+        shutdown_rx,
+        &overload,
+    ));
+    let first_completion = tokio::select! {
+        biased;
+        reason = &mut stop => {
+            let _ = termination_reason.set(reason);
+            let _ = first_failure.set((
+                crate::plugins::Direction::Unknown,
+                retry::ErrorClass::ReadWriteTimeout,
+                None,
+            ));
+            let _ = publish_ws_policy_close(
+                &policy_close_stop,
+                &cancel,
+                Some(ws_deadline_close_frame(reason)),
+            );
+            2u8
+        }
+        _ = &mut c2b => 0u8,
+        _ = &mut b2c => 1u8,
     };
     // On grace-timeout the remaining half's future is dropped (in-flight
     // plugin calls cancelled, sockets released). Record that as a failure so
     // `on_ws_disconnect` surfaces `cause=timeout` instead of looking like a
     // clean close. The direction tags which half was still running when the
     // grace expired.
-    if client_done {
-        if tokio::time::timeout(WS_DRAIN_GRACE, b2c).await.is_err() {
+    if first_completion == 0 {
+        let remaining_timed_out = tokio::select! {
+            biased;
+            reason = &mut stop => {
+                let _ = termination_reason.set(reason);
+                let _ = first_failure.set((
+                    crate::plugins::Direction::Unknown,
+                    retry::ErrorClass::ReadWriteTimeout,
+                    None,
+                ));
+                let _ = publish_ws_policy_close(
+                    &policy_close_stop,
+                    &cancel,
+                    Some(ws_deadline_close_frame(reason)),
+                );
+                tokio::time::timeout(WS_DRAIN_GRACE, &mut b2c)
+                    .await
+                    .is_err()
+            }
+            result = tokio::time::timeout(WS_DRAIN_GRACE, &mut b2c) => result.is_err(),
+        };
+        if remaining_timed_out {
             let _ = first_failure.set((
                 crate::plugins::Direction::BackendToClient,
                 retry::ErrorClass::ReadWriteTimeout,
                 None,
             ));
         }
-    } else if tokio::time::timeout(WS_DRAIN_GRACE, c2b).await.is_err() {
+    } else if first_completion == 1 {
+        let remaining_timed_out = tokio::select! {
+            biased;
+            reason = &mut stop => {
+                let _ = termination_reason.set(reason);
+                let _ = first_failure.set((
+                    crate::plugins::Direction::Unknown,
+                    retry::ErrorClass::ReadWriteTimeout,
+                    None,
+                ));
+                let _ = publish_ws_policy_close(
+                    &policy_close_stop,
+                    &cancel,
+                    Some(ws_deadline_close_frame(reason)),
+                );
+                tokio::time::timeout(WS_DRAIN_GRACE, &mut c2b)
+                    .await
+                    .is_err()
+            }
+            result = tokio::time::timeout(WS_DRAIN_GRACE, &mut c2b) => result.is_err(),
+        };
+        if remaining_timed_out {
+            let _ = first_failure.set((
+                crate::plugins::Direction::ClientToBackend,
+                retry::ErrorClass::ReadWriteTimeout,
+                None,
+            ));
+        }
+    } else if tokio::time::timeout(WS_DRAIN_GRACE, async {
+        tokio::join!(c2b, b2c);
+    })
+    .await
+    .is_err()
+    {
         let _ = first_failure.set((
-            crate::plugins::Direction::ClientToBackend,
+            crate::plugins::Direction::Unknown,
             retry::ErrorClass::ReadWriteTimeout,
             None,
         ));
     }
 
+    let termination_reason = termination_reason.get().copied().unwrap_or_else(|| {
+        if first_failure.get().is_some() {
+            WsTerminationReason::RelayError
+        } else {
+            WsTerminationReason::NormalPeerClose
+        }
+    });
+
     // Fire the on_ws_disconnect hook exactly once, after both forward halves
     // have wound down. When no plugin opted in the list is empty and we skip
     // the whole block — zero overhead for deployments that don't observe
     // WebSocket sessions.
-    fire_ws_framed_disconnect_hooks(
+    fire_ws_framed_disconnect_hooks_with_reason(
         &ws_disconnect_plugins,
         proxy_id,
         session_meta,
@@ -16145,6 +16598,7 @@ where
         bytes_c2b.load(Ordering::Relaxed),
         bytes_b2c.load(Ordering::Relaxed),
         first_failure.get().cloned(),
+        termination_reason,
     )
     .await;
 
@@ -17730,6 +18184,7 @@ async fn handle_tls_connection(
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
+    let websocket_shutdown_rx = shutdown_rx.clone();
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = Arc::clone(&state);
         let addr = remote_addr;
@@ -17747,6 +18202,7 @@ async fn handle_tls_connection(
             mesh_inbound_pre_handshake_app_port: tls_connection_metadata
                 .mesh_inbound_pre_handshake_app_port,
             peer_spiffe_extraction_cache: peer_spiffe_extraction_cache.clone(),
+            websocket_shutdown_rx: Some(websocket_shutdown_rx.clone()),
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -24290,6 +24746,7 @@ async fn handle_proxy_request_inner(
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
     ctx.peer_spiffe_extraction_cache = connection_metadata.peer_spiffe_extraction_cache;
+    ctx.websocket_shutdown_rx = connection_metadata.websocket_shutdown_rx;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
         // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
         // identity is the authenticated source workload for policy. It

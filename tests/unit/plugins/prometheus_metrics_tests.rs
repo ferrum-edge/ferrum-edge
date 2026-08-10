@@ -292,10 +292,10 @@ fn test_registry_records_websocket_completion_metrics() {
 
     let output = registry.render_uncached();
     assert!(output.contains(
-        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="success",direction="unknown",io_side="unknown",error_class="none"} 1"#
+        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="normal_peer_close"} 1"#
     ));
     assert!(output.contains(
-        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset"} 1"#
+        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset",termination_reason="relay_error"} 1"#
     ));
     assert!(output.contains(
         r#"ferrum_websocket_bytes_total{proxy_id="ws-metrics",direction="client_to_backend"} 60"#
@@ -304,7 +304,7 @@ fn test_registry_records_websocket_completion_metrics() {
         r#"ferrum_websocket_frames_total{proxy_id="ws-metrics",direction="backend_to_client"} 10"#
     ));
     assert!(output.contains(
-        r#"ferrum_websocket_session_duration_ms_count{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset"} 1"#
+        r#"ferrum_websocket_session_duration_ms_count{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset",termination_reason="relay_error"} 1"#
     ));
 }
 

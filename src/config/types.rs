@@ -2592,8 +2592,8 @@ pub struct Proxy {
     /// H1/H2/H3 frontends.
     /// Per-proxy override; when `None`, uses the global
     /// `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` (default: 300s / 5 min).
-    /// Set to `0` to disable for this proxy (idle sessions live forever, bounded
-    /// only by `FERRUM_WEBSOCKET_MAX_CONNECTIONS`).
+    /// Set to `0` to disable only the idle bound for this proxy; the global
+    /// absolute WebSocket lifetime still applies.
     ///
     /// HTTP/3 caveat: on QUIC frontends the transport-level connection idle
     /// timeout (`FERRUM_HTTP3_IDLE_TIMEOUT`, default 30s) can close an

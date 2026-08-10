@@ -7683,8 +7683,8 @@ components:
             produces activity (frames, including Ping/Pong, or transport bytes) within the
             window; activity from either side keeps it open. When omitted, uses the global
             FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (default: 300s / 5 min). Set to 0 to
-            disable for this proxy (idle sessions then live forever, bounded only by
-            FERRUM_WEBSOCKET_MAX_CONNECTIONS). Maximum 86400 (24h).
+            disable only the idle bound for this proxy; the finite global WebSocket
+            maximum lifetime still applies. Maximum 86400 (24h).
             HTTP/3 caveat: on QUIC frontends the transport idle timeout
             FERRUM_HTTP3_IDLE_TIMEOUT (default 30s) also applies. On an
             otherwise-idle H3 connection, QUIC may close before a longer WebSocket

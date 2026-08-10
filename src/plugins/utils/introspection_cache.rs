@@ -28,7 +28,7 @@ impl TokenKey {
 
 enum Entry {
     Active {
-        claims: Arc<Value>,
+        credential: Arc<CachedIntrospection>,
         expires_at: Instant,
     },
     Negative {
@@ -37,9 +37,17 @@ enum Entry {
 }
 
 pub enum CacheLookup {
-    Active(Arc<Value>),
+    Active(Arc<CachedIntrospection>),
     Negative,
     Miss,
+}
+
+/// Validated provider result retained without the raw bearer token. The
+/// absolute expiry is derived once at provider response time so cache hits and
+/// single-flight followers cannot extend an `expires_in` credential.
+pub struct CachedIntrospection {
+    pub claims: Arc<Value>,
+    pub expires_at_unix: Option<i64>,
 }
 
 pub struct IntrospectionCache {
@@ -70,8 +78,11 @@ impl IntrospectionCache {
         let key = TokenKey::from_token(token);
         let expired = match self.entries.get(&key) {
             Some(entry) => match entry.value() {
-                Entry::Active { claims, expires_at } if *expires_at > now => {
-                    return CacheLookup::Active(claims.clone());
+                Entry::Active {
+                    credential,
+                    expires_at,
+                } if *expires_at > now => {
+                    return CacheLookup::Active(credential.clone());
                 }
                 Entry::Negative { expires_at } if *expires_at > now => {
                     return CacheLookup::Negative;
@@ -86,15 +97,26 @@ impl IntrospectionCache {
         CacheLookup::Miss
     }
 
-    pub fn insert_active(&self, token: &str, claims: Arc<Value>, now: Instant, exp: Option<i64>) {
+    pub fn insert_active(
+        &self,
+        token: &str,
+        credential: Arc<CachedIntrospection>,
+        now: Instant,
+    ) {
         if self.positive_ttl.is_zero() {
             return;
         }
-        let mut expires_at = now + self.positive_ttl;
-        if let Some(exp) = exp {
+        let Some(mut expires_at) = now.checked_add(self.positive_ttl) else {
+            return;
+        };
+        if let Some(exp) = credential.expires_at_unix {
             let unix_now = chrono::Utc::now().timestamp();
             if exp > unix_now {
-                let exp_deadline = now + Duration::from_secs((exp - unix_now) as u64);
+                let Some(exp_deadline) =
+                    now.checked_add(Duration::from_secs((exp - unix_now) as u64))
+                else {
+                    return;
+                };
                 expires_at = expires_at.min(exp_deadline);
             } else {
                 return;
@@ -102,7 +124,10 @@ impl IntrospectionCache {
         }
         self.insert(
             TokenKey::from_token(token),
-            Entry::Active { claims, expires_at },
+            Entry::Active {
+                credential,
+                expires_at,
+            },
             now,
         );
     }
@@ -215,7 +240,14 @@ mod tests {
     fn positive_cache_expires() {
         let cache = IntrospectionCache::new(10, Duration::from_secs(1), Duration::from_secs(1), 4);
         let now = Instant::now();
-        cache.insert_active("token", Arc::new(json!({"active": true})), now, None);
+        cache.insert_active(
+            "token",
+            Arc::new(CachedIntrospection {
+                claims: Arc::new(json!({"active": true})),
+                expires_at_unix: None,
+            }),
+            now,
+        );
         assert!(matches!(cache.get("token", now), CacheLookup::Active(_)));
         assert!(matches!(
             cache.get("token", now + Duration::from_secs(2)),

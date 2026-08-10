@@ -2987,6 +2987,53 @@ fn test_env_config_websocket_idle_timeout_seconds_custom() {
     );
 }
 
+#[test]
+fn test_env_config_websocket_max_lifetime_is_finite_and_configurable() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS");
+            assert_eq!(
+                EnvConfig::from_env().unwrap().websocket_max_lifetime_seconds,
+                3_600
+            );
+        },
+    );
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS", "900"),
+        ],
+        || {
+            assert_eq!(
+                EnvConfig::from_env().unwrap().websocket_max_lifetime_seconds,
+                900
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_websocket_max_lifetime_rejects_unbounded_values() {
+    for value in ["0", "86401"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS", value),
+            ],
+            || {
+                let error = EnvConfig::from_env().unwrap_err();
+                assert!(error.contains("FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS"));
+            },
+        );
+    }
+}
+
 // ============================================================================
 // HTTP Header Read Timeout Tests
 // ============================================================================

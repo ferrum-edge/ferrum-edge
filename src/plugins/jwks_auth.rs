@@ -16,7 +16,7 @@ use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::constant_time_eq;
 use super::utils::auth_flow::{
     AuthMechanism, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
-    nonblank_identity,
+    credential_deadline_from_claims, nonblank_identity,
 };
 use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
@@ -596,6 +596,7 @@ impl JwksAuth {
         };
 
         VerifyOutcome::success(consumer, identity, header_value)
+            .with_credential_deadline(credential_deadline_from_claims(claims, 0))
     }
 
     /// Try to validate a token against the allowed configured providers.

@@ -2200,6 +2200,13 @@ pub struct RequestContext {
     /// `&'static str` because every `AuthMechanism::mechanism_name()` returns a
     /// compiled-in literal — zero allocation on the hot path.
     pub auth_method: Option<&'static str>,
+    /// Monotonic validity deadline supplied by the accepted authentication
+    /// attempt. Contains no token, claim set, subject, or issuer material.
+    pub(crate) credential_deadline_at: Option<tokio::time::Instant>,
+    /// Listener-scoped shutdown signal captured with the accepted connection.
+    /// WebSocket takeover retains it so listener replacement/drain terminates
+    /// upgraded sessions instead of only stopping new accepts.
+    pub(crate) websocket_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     /// SHA-256 of the exact SOAP representation accepted by an
     /// identity-establishing `soap_ws_security` policy. The final request-body
     /// hook compares this private proof with the bytes dispatched to the
@@ -3228,6 +3235,8 @@ impl RequestContext {
             authenticated_identity_header: None,
             backend_geo_country: None,
             auth_method: None,
+            credential_deadline_at: None,
+            websocket_shutdown_rx: None,
             soap_ws_security_authenticated_body_digest: None,
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
@@ -4291,6 +4300,8 @@ impl RequestContext {
             authenticated_identity_header: self.authenticated_identity_header.clone(),
             backend_geo_country: self.backend_geo_country,
             auth_method: self.auth_method,
+            credential_deadline_at: self.credential_deadline_at,
+            websocket_shutdown_rx: self.websocket_shutdown_rx.clone(),
             soap_ws_security_authenticated_body_digest: self
                 .soap_ws_security_authenticated_body_digest,
             timestamp_received: self.timestamp_received,

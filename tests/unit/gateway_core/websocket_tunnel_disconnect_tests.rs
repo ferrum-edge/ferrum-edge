@@ -53,6 +53,7 @@ struct CapturedDisconnect {
     direction: Option<Direction>,
     io_side: Option<StreamIoSide>,
     error_class: Option<ErrorClass>,
+    termination_reason: Option<String>,
 }
 
 impl CapturingDisconnectPlugin {
@@ -96,6 +97,10 @@ impl Plugin for CapturingDisconnectPlugin {
             direction: ctx.direction,
             io_side: ctx.io_side,
             error_class: ctx.error_class,
+            termination_reason: ctx
+                .metadata
+                .get("websocket.termination_reason")
+                .cloned(),
         });
     }
 }
@@ -175,6 +180,33 @@ async fn test_tunnel_disconnect_graceful_close_has_no_failure() {
     let captured = captured.lock().unwrap();
     assert!(captured[0].direction.is_none());
     assert!(captured[0].error_class.is_none());
+    assert_eq!(
+        captured[0].termination_reason.as_deref(),
+        Some("normal_peer_close")
+    );
+}
+
+#[tokio::test]
+async fn test_tunnel_disconnect_overwrites_untrusted_termination_metadata() {
+    let (plugin, captured) = CapturingDisconnectPlugin::new();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin)];
+    let mut meta = session_meta();
+    meta.metadata.insert(
+        "websocket.termination_reason".to_string(),
+        "bearer super-secret-token".to_string(),
+    );
+
+    fire_ws_tunnel_disconnect_hooks(&plugins, "proxy-abc", &meta, 0, 0, None).await;
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(
+        captured[0].termination_reason.as_deref(),
+        Some("normal_peer_close")
+    );
+    assert!(!captured[0]
+        .termination_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("secret")));
 }
 
 #[tokio::test]

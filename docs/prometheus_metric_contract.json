@@ -3055,6 +3055,7 @@
       "direction",
       "io_side",
       "error_class",
+      "termination_reason",
       "le",
       "namespace"
     ],
@@ -3073,6 +3074,7 @@
       "direction",
       "io_side",
       "error_class",
+      "termination_reason",
       "namespace"
     ],
     "subsystem": "websocket",

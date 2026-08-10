@@ -636,6 +636,41 @@ pub(crate) async fn handle_h3_websocket(
         "H3 WebSocket (RFC 9220) upgrade request received"
     );
     let mut ctx = ctx;
+    let ws_session_deadline = crate::proxy::effective_websocket_session_deadline(
+        &ctx,
+        state.env_config.websocket_max_lifetime_seconds,
+    );
+    if ws_session_deadline.at <= tokio::time::Instant::now() {
+        let credential_expired = matches!(
+            ws_session_deadline.reason,
+            crate::proxy::WsTerminationReason::CredentialExpired
+        );
+        let status = if credential_expired {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        let body = if credential_expired {
+            r#"{"error":"Credential expired before WebSocket upgrade"}"#
+        } else {
+            r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#
+        };
+        send_h3_error_body(
+            &mut stream,
+            status,
+            body,
+            &initial_response_header_policy_plugins,
+        )
+        .await;
+        crate::proxy::record_request(&state, status.as_u16());
+        release_h3_ws_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
+        return Ok(());
+    }
 
     // ── Connection admission ─────────────────────────────────────────
     let ws_connection_permit = match crate::proxy::try_acquire_websocket_connection_permit(
@@ -1221,6 +1256,32 @@ pub(crate) async fn handle_h3_websocket(
         cb.record_success(ws_cb_probe_slot_available);
     }
 
+    if ws_session_deadline.at <= tokio::time::Instant::now() {
+        let credential_expired = matches!(
+            ws_session_deadline.reason,
+            crate::proxy::WsTerminationReason::CredentialExpired
+        );
+        let status = if credential_expired {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        let body = if credential_expired {
+            r#"{"error":"Credential expired before WebSocket upgrade"}"#
+        } else {
+            r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#
+        };
+        send_h3_error_body(
+            &mut stream,
+            status,
+            body,
+            &initial_response_header_policy_plugins,
+        )
+        .await;
+        crate::proxy::record_request(&state, status.as_u16());
+        return Ok(());
+    }
+
     // Capture the LB connection guard NOW — before the 200 is sent — so
     // a panic anywhere below still releases the per-target connection
     // count. The guard is moved into the session task below.
@@ -1510,6 +1571,9 @@ pub(crate) async fn handle_h3_websocket(
         // tungstenite's permissive accept-unmasked mode can normalize them.
         true,
         ws_idle_tracker,
+        ws_session_deadline,
+        state.health_check_shutdown_rx.clone(),
+        Arc::clone(&state.overload),
         crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
         &adaptive_buf,
     )

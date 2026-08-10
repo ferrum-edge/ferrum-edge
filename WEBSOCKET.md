@@ -61,6 +61,9 @@ All other headers (including `authorization`, `cookie`, `sec-websocket-protocol`
 - **Max frame size**: `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` (default: 16 MiB / 16,777,216 bytes) per WebSocket frame
 - **Max message size**: 4× the frame limit (default: 64 MiB / 67,108,864 bytes); a message can span multiple frames. Plugins with tighter `ws_message_size_limiting` rules may lower the effective ceiling
 - **Upgrade flood protection**: WebSocket requests go through the normal plugin pipeline before upgrade, so `rate_limiting` and `ip_restriction` can throttle abusive upgrade bursts
+- **Absolute authorization lifetime**: `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS` (default: 3600, valid range: 1–86400) bounds every session from request receipt. When JWT, JWKS, OIDC, or OAuth2 introspection supplies an authoritative expiry, the earlier validated credential deadline wins. JWT/OIDC leeway is included exactly once using the provider's existing validation setting. Traffic, Ping/Pong, and low-rate bidirectional streams never extend this deadline. Credentials without expiry remain bounded by the configured maximum.
+
+Idle timeout and authorization lifetime are independent. Idle timeout answers “has either peer been quiet?” and can be refreshed by traffic. Authorization lifetime answers “is this upgraded session still allowed to exist?” and is absolute. The H1 Upgrade, H2 Extended CONNECT, and H3 Extended CONNECT paths share the same deadline/cancellation implementation. Expiry or graceful drain closes both relay directions with a fixed, non-secret close reason when frame-aware closure is possible; tunnel mode deterministically drops both transports at the same deadline.
 
 ## Tunnel Mode
 
