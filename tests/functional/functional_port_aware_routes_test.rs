@@ -159,6 +159,8 @@ plugin_configs: []
 
     let gateway = TestGateway::builder()
         .mode_file(config)
+        .reserve_listener_port(port_a)
+        .reserve_listener_port(port_b)
         .log_level("warn")
         .spawn()
         .await
@@ -220,6 +222,8 @@ plugin_configs: []
 
     let gateway = TestGateway::builder()
         .mode_file(config)
+        .reserve_listener_port(plain_port)
+        .reserve_listener_port(tls_port)
         .log_level("warn")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
         .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
@@ -308,6 +312,8 @@ plugin_configs: []
 
     let gateway = TestGateway::builder()
         .mode_file(initial)
+        .reserve_listener_port(port_a)
+        .reserve_listener_port(port_b)
         .log_level("warn")
         .spawn()
         .await
@@ -419,6 +425,8 @@ plugin_configs: []
 
     let gateway = TestGateway::builder()
         .mode_file(both)
+        .reserve_listener_port(port_a)
+        .reserve_listener_port(port_b)
         .log_level("warn")
         .env("FERRUM_ENABLE_HTTP3", "true")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
