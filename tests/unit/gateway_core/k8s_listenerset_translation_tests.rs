@@ -1081,7 +1081,11 @@ fn cross_gateway_http_and_tcp_on_same_port_protocol_conflict() {
             objects.push(gateway);
         }
 
-        let translation = translate_k8s_objects(&objects, options()).expect("translate");
+        let translation = translate_k8s_objects(
+            &objects,
+            options().with_source_namespaces(Vec::new()),
+        )
+        .expect("translate");
         let expected_message = "Port 8080 is claimed by incompatible protocol families on the \
              same TCP transport (HTTP-family vs raw stream), so every conflicting claim on this \
              port is refused (Conflicted).";
