@@ -569,7 +569,7 @@
         },
         "ingressRedirectIfaces": {
           "type": "string",
-          "description": "Comma-separated host interfaces where the node agent attaches the optional NodeWaypoint tc ingress redirect; empty keeps redirect disabled."
+          "description": "Comma-separated explicit host interfaces for the optional NodeWaypoint tc ingress redirect (maximum 16); empty disables it. The node agent never auto-selects or broadens this set and keeps readiness false unless the exact set completely covers supported per-family remote PodCIDR/InternalIP route evidence. Complete evidence contributes regardless of peer Ready health; incomplete non-Ready joining/rebooting/draining Nodes are ignored, while incomplete Ready=True evidence fails closed. Single-node/no-remote-evidence and alternate-policy-routing topologies are unsupported; leave empty when there is no off-node path."
         },
         "trustedKubeletProbeSourceIps": {
           "type": "string"
@@ -735,6 +735,44 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ambient": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        "required": [
+          "ambient"
+        ]
+      },
+      "then": {
+        "properties": {
+          "nodeAgent": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": [
+              "enabled"
+            ]
+          }
+        },
+        "required": [
+          "nodeAgent"
+        ]
+      }
+    }
+  ],
   "definitions": {
     "secretSource": {
       "type": "object",

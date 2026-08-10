@@ -10604,7 +10604,11 @@ components:
           default: {}
           additionalProperties:
             type: string
-          description: Arbitrary key-value tags
+          description: |
+            Operator-defined key-value tags. Keys beginning with `mesh.` are
+            reserved for Ferrum's trusted mesh projection and are rejected on
+            upstream create/update, API-spec import, restore, and file-config
+            admission; ordinary operator tag keys remain supported.
         locality:
           type: [string, "null"]
           maxLength: 255
@@ -11432,7 +11436,10 @@ components:
 
     MeshHealthResponse:
       type: object
-      required: [egress_scope, node_waypoint_observability]
+      required:
+        - egress_scope
+        - node_waypoint_observability
+        - udp_placement_migration
       properties:
         egress_scope:
           $ref: "#/components/schemas/MeshEgressScopeHealth"
@@ -11444,6 +11451,48 @@ components:
             `enabled` is true only when `FERRUM_MESH_TOPOLOGY=node_waypoint`.
             Counters are process-static and monotonic across config reload and
             SVID rotation; they reset on NodeWaypoint process restart.
+        udp_placement_migration:
+          $ref: "#/components/schemas/UdpPlacementMigrationStatusSnapshot"
+
+    UdpPlacementMigrationStatusSnapshot:
+      type: object
+      required: [enabled, phase, outstanding, failure_reason]
+      properties:
+        enabled:
+          type: boolean
+          description: True when the Ambient UDP placement guard is active.
+        phase:
+          type: string
+          enum:
+            - stable
+            - waiting_for_registry
+            - waiting_for_gate_ack
+            - cleaning_pod_netns
+            - cleaning_host_netns
+            - cleanup_complete
+            - finalize_blocked
+            - failed
+        outstanding:
+          type: integer
+          format: uint64
+          description: Outstanding pod network namespaces or gate acknowledgements.
+        failure_reason:
+          type: string
+          enum:
+            - none
+            - migration_required
+            - finalize_required
+            - generation_mismatch
+            - predecessor_mismatch
+            - registry_not_synchronized
+            - gate_acknowledgement_missing
+            - pod_netns_unresolved
+            - pod_cleanup_failed
+            - host_cleanup_failed
+            - cleanup_proof_missing
+            - state_persistence_failed
+            - durable_state_rejected
+          description: Closed-set node-local failure reason; never includes pod UIDs or generations.
 
     NodeWaypointObservabilitySnapshot:
       type: object
@@ -16270,7 +16319,36 @@ components:
                 default: 5000
               max_cache_entries:
                 type: integer
+                format: uint64
                 default: 10000
+                minimum: 100
+                maximum: 100000
+                description: >-
+                  Per-provider hard entry ceiling. Active and negative entries
+                  receive independent 75/25 count partitions, so one result
+                  class cannot evict the other class.
+              max_cache_entry_bytes:
+                type: integer
+                format: uint64
+                default: 16384
+                minimum: 256
+                maximum: 65536
+                description: >-
+                  Maximum normalized active authorization-result bytes retained
+                  for one token. A larger valid result is used for the current
+                  request but is not cached.
+              max_cache_total_bytes:
+                type: integer
+                format: uint64
+                default: 16777216
+                minimum: 1048576
+                maximum: 67108864
+                description: >-
+                  Per-provider hard retained-byte ceiling covering fixed
+                  eviction indexes, token digests, entry state, and normalized
+                  authorization data. Must be at least the constructor-reported
+                  minimum footprint for max_cache_entries plus one
+                  max_cache_entry_bytes result.
               token_hint_param:
                 type: [string, "null"]
               required_scopes:

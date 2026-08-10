@@ -192,6 +192,9 @@ injector:
       override: {}
 
 ambient:
+  # Requires nodeAgent.enabled=true. Ambient always shares the node-local
+  # pod-registry hostPath with the node-agent so UDP placement ownership and
+  # cleanup proof remain durable even when UDP capture itself is disabled.
   enabled: false
   inboundPort: 15006
   outboundPort: 15001
@@ -359,6 +362,18 @@ nodeAgent:
   # enrolled workloads a fully eBPF-owned inbound capture path instead of
   # node-global iptables REDIRECT semantics.
   #
+  # The node-agent does not infer this value. It proves at startup from a
+  # bounded projected Node cache, then uses a fixed host-revalidation interval
+  # to require that this exact set equals the complete set selected by remote
+  # PodCIDR/InternalIP routes for every observed capture-capable family.
+  # Complete evidence contributes regardless of remote Ready health; incomplete
+  # non-Ready joining/rebooting/draining Nodes are ignored, while incomplete
+  # Ready=True evidence stays fail-closed. Single-node/no-remote-evidence and
+  # alternate policy-routing topologies are unsupported; leave this empty when
+  # there is no off-node path. Wrong, extra, incomplete, ambiguous, loopback,
+  # down, unsupported, or drifted sets disarm redirect and keep readiness false;
+  # capture is never widened.
+  #
   # NodeWaypoint proxy mode only (a startup error in local_pod mode), and it
   # requires ambient.enabled=true with ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint:
   # the redirect fails closed, so without a capture listener on the node it would
@@ -376,8 +391,8 @@ nodeAgent:
   # same value into the node-agent so the two agree; the address must be a
   # wildcard with a non-zero port or the node-agent refuses to start.
   #
-  # Requires iproute2 (`ip`) in the node-agent image and NET_ADMIN, which the
-  # existing tc attachments already need — this adds no new privilege.
+  # Requires the published eBPF runtime (ordinary images omit `ip`) and
+  # NET_ADMIN, which the existing tc attachments already need.
   # Redirection is scoped per packet to an enrolled, opted-in pod address on one
   # of its declared containerPorts, so unenrolled traffic is never captured.
   ingressRedirectIfaces: ""

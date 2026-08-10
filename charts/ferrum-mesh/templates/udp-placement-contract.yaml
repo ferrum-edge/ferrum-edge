@@ -1,0 +1,102 @@
+{{- if .Values.ambient.enabled -}}
+{{- $env := default dict .Values.ambient.env -}}
+{{- $topology := replace "-" "_" (lower (trim (toString (index $env "FERRUM_MESH_TOPOLOGY")))) -}}
+{{- if eq $topology "ambient" -}}
+{{- $enabled := false -}}
+{{- if hasKey $env "FERRUM_MESH_CAPTURE_UDP_ENABLED" -}}
+{{- $enabled = has (lower (trim (toString (index $env "FERRUM_MESH_CAPTURE_UDP_ENABLED")))) (list "true" "1") -}}
+{{- end -}}
+{{- $host := false -}}
+{{- if hasKey $env "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED" -}}
+{{- $host = has (lower (trim (toString (index $env "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED")))) (list "true" "1") -}}
+{{- end -}}
+{{- $target := "disabled" -}}
+{{- if $enabled -}}{{- $target = ternary "host-netns" "pod-netns" $host -}}{{- end -}}
+{{- $phase := "stable" -}}
+{{- if hasKey $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE" -}}
+{{- $phase = index $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE" | toString | trim -}}
+{{- end -}}
+{{- $generation := "" -}}
+{{- if hasKey $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION" -}}
+{{- $generation = index $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION" | toString -}}
+{{- end -}}
+{{- $from := default "" (index $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM") | toString | trim -}}
+{{- $to := default "" (index $env "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO") | toString | trim -}}
+{{- if not (has $phase (list "stable" "cleanup" "finalize")) -}}
+{{- fail "ambient FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE must be stable, cleanup, or finalize" -}}
+{{- end -}}
+{{- if eq $phase "stable" -}}
+{{- if or $generation $from $to -}}
+{{- fail "ambient stable UDP placement must omit FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION/FROM/TO" -}}
+{{- end -}}
+{{- else -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" $generation) -}}
+{{- fail "ambient UDP migration generation must be 1..=64 ASCII alphanumeric/./_/- characters and start alphanumeric" -}}
+{{- end -}}
+{{- if not (has $from (list "pod-netns" "host-netns" "disabled")) -}}
+{{- fail "ambient UDP migration FROM must be pod-netns, host-netns, or disabled" -}}
+{{- end -}}
+{{- if not (has $to (list "pod-netns" "host-netns" "disabled")) -}}
+{{- fail "ambient UDP migration TO must be pod-netns, host-netns, or disabled" -}}
+{{- end -}}
+{{- if eq $from $to -}}{{- fail "ambient UDP migration FROM and TO must differ" -}}{{- end -}}
+{{- if ne $to $target -}}{{- fail "ambient UDP migration TO must match the rendered capture-enabled/host-netns target" -}}{{- end -}}
+{{- end -}}
+{{- $contractName := printf "ferrum-mesh-udp-placement-%s" .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- $previous := dict -}}
+{{- if .Release.IsUpgrade -}}
+{{- $existing := lookup "v1" "ConfigMap" .Release.Namespace $contractName -}}
+{{- if $existing -}}{{- $previous = default dict $existing.data -}}{{- end -}}
+{{- end -}}
+{{- if eq $phase "stable" -}}
+{{- if and (not .Release.IsUpgrade) (eq $target "host-netns") -}}
+{{- fail "initial host-netns Ambient UDP placement requires an explicit cleanup phase so runtime can establish durable predecessor proof" -}}
+{{- end -}}
+{{- if .Release.IsUpgrade -}}
+{{- if $previous -}}
+{{- if ne (toString (index $previous "target")) $target -}}
+{{- fail "unsafe one-step Ambient UDP placement change rejected before DaemonSet rollout; render phase=cleanup with an explicit generation first" -}}
+{{- end -}}
+{{- if eq (toString (index $previous "phase")) "cleanup" -}}
+{{- fail "Ambient UDP cleanup phase cannot be skipped; render phase=finalize with the same generation before returning to stable" -}}
+{{- end -}}
+{{- else -}}
+{{- fail "pre-contract Ambient UDP upgrade requires an explicit cleanup phase before DaemonSet rollout, regardless of requested placement" -}}
+{{- end -}}
+{{- end -}}
+{{- else if eq $phase "cleanup" -}}
+{{- if and .Release.IsUpgrade $previous -}}
+{{- $previousPhase := toString (index $previous "phase") -}}
+{{- $resume := and (eq $previousPhase "cleanup") (eq (toString (index $previous "generation")) $generation) (eq (toString (index $previous "from")) $from) (eq (toString (index $previous "to")) $to) -}}
+{{- $start := and (has $previousPhase (list "stable" "finalize")) (eq (toString (index $previous "target")) $from) -}}
+{{- if not (or $resume $start) -}}
+{{- fail "Ambient UDP cleanup predecessor/generation does not match the installed placement contract" -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- if not .Release.IsUpgrade -}}
+{{- fail "Ambient UDP finalize is valid only after an installed cleanup release" -}}
+{{- end -}}
+{{- if not $previous -}}
+{{- fail "Ambient UDP finalize requires the installed cleanup placement contract" -}}
+{{- end -}}
+{{- if or (ne (toString (index $previous "phase")) "cleanup") (ne (toString (index $previous "generation")) $generation) (ne (toString (index $previous "from")) $from) (ne (toString (index $previous "to")) $to) -}}
+{{- fail "Ambient UDP finalize generation/from/to must exactly match the installed cleanup phase" -}}
+{{- end -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $contractName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: ferrum-mesh-udp-placement
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  target: {{ $target | quote }}
+  phase: {{ $phase | quote }}
+  generation: {{ $generation | quote }}
+  from: {{ $from | quote }}
+  to: {{ $to | quote }}
+{{- end -}}
+{{- end -}}

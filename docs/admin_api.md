@@ -92,11 +92,20 @@ In mesh mode, authenticated health detail includes
 `mesh.node_waypoint_observability` (ADR counters for HBONE handshake phases,
 asserted-identity decisions, destination-policy rejections, missing destination
 metadata, and blocked plaintext fallback attempts; `enabled` is true only for
-`node_waypoint` topology). The authenticated `/overload`
+`node_waypoint` topology), and `mesh.udp_placement_migration` (bounded phase,
+outstanding count, and closed-set failure reason for the node-local Ambient UDP
+placement guard; no generation or pod UID is exposed). The authenticated `/overload`
 snapshot also includes `node_waypoint_drops`, with monotonic counters for
 missing/unknown socket-cookie metadata, missing pod/workload identity data,
 unknown pods, and workload-hash mismatches. These fields are omitted from the
 coarse unauthenticated responses.
+
+Ambient UDP placement rejection, unreadable/corrupt durable state, early
+finalize, and cleanup-tooling preflight failure disable only the UDP producer
+and keep mesh admin/control listeners running. Readiness remains false, so
+authenticated `/health` and `/metrics` expose the process-static bounded phase
+and reason needed for node-local repair while HBONE/TCP control remains
+diagnosable.
 
 In database **and control-plane** mode, if a **full** config load is rejected by the runtime-config validation contract (a reachable backend served a semantically-invalid snapshot — e.g. a partial/direct-DB write) **or by typed SQL row decoding** (a reachable backend served an undecodable row — e.g. malformed JSON in a column) the gateway keeps serving the last known-good config **and keeps the admin API writable**: `db_available` stays true because admin writes are the in-band repair path for the offending resource. Re-enabling writes is gated on any deferred schema migration applying first, so a reachable backend whose schema is still pending keeps writes blocked while `config_rejected` stays set. The rejection also skips failover (the same invalid snapshot lives on every replica). The authenticated `/health` detail then carries `config_rejected: true` and `status: "degraded"` (the boolean detail is authenticated-only; the coarse `degraded` status is also visible unauthenticated). The flag is sticky and clears only after an accepted authoritative **full** reload (an accepted incremental poll does not clear it). While the backend is later unreachable (`admin_writes_enabled` false) the `config_rejected` detail is suppressed so it never advertises the writable repair path during an outage, even though the underlying flag remains set. A genuine connectivity failure is unaffected and still flips `admin_writes_enabled` to false. Startup still fails loudly for undecodable rows (backup bootstrap is not eligible), matching the non-transient decode policy.
 

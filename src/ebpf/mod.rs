@@ -10,6 +10,7 @@
 pub mod bpf_metrics;
 pub mod cgroup;
 pub mod event_consumer;
+pub mod ingress_topology;
 pub mod kernel_probe;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub mod loader;
@@ -41,6 +42,8 @@ pub const NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED: &str = "partially_attache
 pub const NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE: &str =
     "identity_bridge_unavailable";
 pub const NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK: &str = "node_global_fallback";
+pub const NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE: &str =
+    "interface_topology_unavailable";
 pub const NODE_AGENT_CAPTURE_STATES: &[&str] = &[
     NODE_AGENT_CAPTURE_STATE_STARTING,
     NODE_AGENT_CAPTURE_STATE_READY,
@@ -48,6 +51,7 @@ pub const NODE_AGENT_CAPTURE_STATES: &[&str] = &[
     NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
     NODE_AGENT_CAPTURE_STATE_IDENTITY_BRIDGE_UNAVAILABLE,
     NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK,
+    NODE_AGENT_CAPTURE_STATE_INTERFACE_TOPOLOGY_UNAVAILABLE,
 ];
 
 pub const DEFAULT_NODE_AGENT_SOCKET_PATH: &str = "/run/ferrum/node-agent.sock";
@@ -402,6 +406,22 @@ impl CaptureContract {
             .with_node_waypoint_ingress_redirect_mark(ingress_redirect_mark)
             .with_node_waypoint_ingress_capture_port(ingress_capture_port)
     }
+
+    /// Build the capture-map value for the current topology-proof state.
+    /// Outbound capture and the direct-pod authorization guard stay intact,
+    /// while the node-level ingress redirect mark/port are published only once
+    /// the route proof is Ready. This is the runtime quarantine used during
+    /// startup, watch recovery, and route/link drift.
+    pub fn bpf_capture_config_for_topology(&self, topology_ready: bool) -> BpfCaptureConfig {
+        let config = self.bpf_capture_config();
+        if topology_ready {
+            config
+        } else {
+            config
+                .with_node_waypoint_ingress_redirect_mark(0)
+                .with_node_waypoint_ingress_capture_port(0)
+        }
+    }
 }
 
 /// Metrics tracked by the node agent.
@@ -436,9 +456,13 @@ pub struct NodeAgentMetrics {
     /// Bounded operational state for the capture backend. This is separate from
     /// `topology_degraded_reason`: the reason explains the first fault, while
     /// this state is an alerting-friendly condition that distinguishes startup,
-    /// ready, unavailable, partially attached, identity-bridge unavailable, and
-    /// explicit node-global fallback.
+    /// ready, unavailable, partially attached, identity-bridge unavailable,
+    /// interface-topology unavailable, and explicit node-global fallback.
     pub capture_state: ArcSwap<&'static str>,
+    /// Coherent, bounded validation state for the optional NodeWaypoint
+    /// ingress-interface topology. Interface names never enter this snapshot:
+    /// metrics expose only closed state/reason labels and bounded counts.
+    pub ingress_topology: ArcSwap<ingress_topology::IngressTopologyStatus>,
     /// CNI plugin RPC counts split by `(verb, outcome)` where verb is one
     /// of `add`/`del`/`check`/`status`/`gc` and outcome is
     /// `success`/`rejected`/`error`. Bounded cardinality (5 × 3 = 15 series
@@ -461,6 +485,7 @@ pub struct NodeAgentMetricsSnapshot {
     pub pod_annotation_updates_failed: u64,
     pub topology_degraded_reason: Option<&'static str>,
     pub capture_state: &'static str,
+    pub ingress_topology: ingress_topology::IngressTopologyStatus,
     /// Snapshot of [`NodeAgentMetrics::cni_calls`]. Same `[verb][outcome]`
     /// layout as the source atomics. The outer axis is verb
     /// (`add`/`del`/`check`/`status`/`gc`); the inner axis is outcome
@@ -584,6 +609,7 @@ impl NodeAgentMetrics {
                 .load(Ordering::Relaxed),
             topology_degraded_reason: *self.topology_degraded_reason.load_full().as_ref(),
             capture_state: self.capture_state.load_full().as_ref(),
+            ingress_topology: *self.ingress_topology.load_full(),
             cni_calls,
             cni_socket_lifecycle,
         }
@@ -608,6 +634,10 @@ impl NodeAgentMetrics {
     /// [`NODE_AGENT_CAPTURE_STATES`] to keep Prometheus cardinality bounded.
     pub fn set_capture_state(&self, state: &'static str) {
         self.capture_state.store(Arc::new(state));
+    }
+
+    pub fn set_ingress_topology(&self, status: ingress_topology::IngressTopologyStatus) {
+        self.ingress_topology.store(Arc::new(status));
     }
 
     pub fn record_attach_error(&self) {
@@ -636,6 +666,9 @@ impl Default for NodeAgentMetrics {
             pod_annotation_updates_failed: AtomicU64::new(0),
             topology_degraded_reason: ArcSwap::from_pointee(None),
             capture_state: ArcSwap::from_pointee(NODE_AGENT_CAPTURE_STATE_STARTING),
+            ingress_topology: ArcSwap::from_pointee(
+                ingress_topology::IngressTopologyStatus::disabled(),
+            ),
             cni_calls: [
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
@@ -1001,6 +1034,8 @@ pub struct MockEbpfBackend {
     pub cidr_includes: Vec<String>,
     pub port_excludes: Vec<u16>,
     pub capture_config: Option<BpfCaptureConfig>,
+    /// Ordered capture-map publications for topology transition tests.
+    pub capture_config_updates: Vec<BpfCaptureConfig>,
     /// Per-cgroup `includeOutboundPorts` writes ordered by the order the
     /// node-agent issued them. Insert overwrites the previous entry for
     /// the same `cgroup_id`. Tests assert on this map to verify a pod's
@@ -1113,6 +1148,7 @@ impl EbpfBackend for MockEbpfBackend {
             return Err("capture config update failed".to_string());
         }
         self.capture_config = Some(*config);
+        self.capture_config_updates.push(*config);
         Ok(())
     }
 

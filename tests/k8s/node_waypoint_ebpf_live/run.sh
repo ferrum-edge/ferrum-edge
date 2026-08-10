@@ -30,6 +30,7 @@ DEFAULT_CHART_IMAGE_TAG="${FERRUM_LIVE_DEFAULT_IMAGE_TAG:-0.9.0}"
 BPFTOOL_IMAGE="${FERRUM_LIVE_BPFTOOL_IMAGE:-quay.io/cilium/cilium:v1.16.5}"
 REQUIRE_DUAL_STACK="${FERRUM_LIVE_REQUIRE_DUAL_STACK:-false}"
 DOCKER_NODE_EVIDENCE="${FERRUM_LIVE_DOCKER_NODE_EVIDENCE:-false}"
+LIVE_TESTS_REQUIRED="${FERRUM_LIVE_TESTS_REQUIRED:-0}"
 NODE_WAYPOINT_REGISTRY_DIR="${FERRUM_LIVE_NODE_WAYPOINT_REGISTRY_DIR:-/run/ferrum/node-waypoint-pods}"
 AMBIENT_ADMIN_PORT="${FERRUM_LIVE_AMBIENT_ADMIN_PORT:-19010}"
 NODE_AGENT_ADMIN_PORT="${FERRUM_LIVE_NODE_AGENT_ADMIN_PORT:-19090}"
@@ -50,9 +51,16 @@ fi
 LIVE_ASSERTIONS_INITIALIZED=false
 RECORDED_LIVE_ASSERTIONS=" "
 TRUSTED_KUBELET_PROBE_IPS=""
+INGRESS_REDIRECT_IFACES=""
+TOPOLOGY_ROUTE_MUTATED=false
+TOPOLOGY_ROUTE_NODE=""
+TOPOLOGY_ROUTE_STATE_FILE=""
 REQUIRED_LIVE_ASSERTIONS=(
   node_waypoint.ebpf.chart_profile
   node_waypoint.ebpf.capture_ready
+  node_waypoint.ebpf.ingress_topology_valid
+  node_waypoint.ebpf.ingress_topology_wrong_interface_startup
+  node_waypoint.ebpf.ingress_topology_route_drift
   node_waypoint.ebpf.bpf_attached
   node_waypoint.ebpf.registry_ready
   node_waypoint.mesh_slice.accepted
@@ -75,6 +83,7 @@ fi
 if [[ "$REQUIRE_DUAL_STACK" == "true" ]]; then
   REQUIRED_LIVE_ASSERTIONS+=(
     node_waypoint.ebpf.registry_ready_ipv6
+    node_waypoint.ebpf.ingress_topology_dual_family
     node_waypoint.ipv6.service_allow
     node_waypoint.ipv6.service_deny
     node_waypoint.ipv6.pod_ip_bypass_guard
@@ -122,6 +131,9 @@ if [[ -z "$KUBE_CONTEXT" ]]; then
 fi
 if [[ "$DOCKER_NODE_EVIDENCE" == "true" ]]; then
   require_cmd docker
+elif [[ "$LIVE_TESTS_REQUIRED" == "1" ]]; then
+  echo "FERRUM_LIVE_TESTS_REQUIRED=1 requires Docker node access for ingress-topology validation" >&2
+  exit 1
 fi
 
 log() {
@@ -815,6 +827,90 @@ print(",".join(out))
   log "trusted kubelet probe source IPs: $TRUSTED_KUBELET_PROBE_IPS"
 }
 
+topology_targets_for_node() {
+  local local_node="$1"
+  local remote_filter="${2:-}"
+  kubectl get nodes -o json | python3 -c '
+import ipaddress
+import json
+import sys
+
+local_node = sys.argv[1]
+require_v6 = sys.argv[2] == "true"
+remote_filter = sys.argv[3]
+data = json.load(sys.stdin)
+for node in data.get("items") or []:
+    name = (node.get("metadata") or {}).get("name")
+    if name == local_node or (remote_filter and name != remote_filter):
+        continue
+    spec = node.get("spec") or {}
+    cidrs = spec.get("podCIDRs") or ([spec["podCIDR"]] if spec.get("podCIDR") else [])
+    if not cidrs:
+        raise SystemExit("remote Node has no PodCIDR evidence")
+    for raw in cidrs:
+        network = ipaddress.ip_network(raw, strict=False)
+        if network.version == 6 and not require_v6:
+            continue
+        target = next(network.hosts(), network.network_address)
+        print(f"cidr|{network.version}|{network}|{target}")
+    addresses = (node.get("status") or {}).get("addresses") or []
+    seen = False
+    for item in addresses:
+        if item.get("type") != "InternalIP":
+            continue
+        address = ipaddress.ip_address(item.get("address", ""))
+        if address.version == 6 and not require_v6:
+            continue
+        seen = True
+        prefix = 32 if address.version == 4 else 128
+        print(f"address|{address.version}|{address}/{prefix}|{address}")
+    if not seen:
+        raise SystemExit("remote Ready Node has no usable InternalIP evidence")
+' "$local_node" "$REQUIRE_DUAL_STACK" "$remote_filter"
+}
+
+discover_ingress_redirect_ifaces() {
+  if [[ "$DOCKER_NODE_EVIDENCE" != "true" ]]; then
+    if [[ "$LIVE_TESTS_REQUIRED" == "1" ]]; then
+      echo "live ingress topology requires Docker access to the kind node route tables" >&2
+      exit 1
+    fi
+    return
+  fi
+  log "deriving the explicit ingress redirect interface set for the live kind topology"
+  local common_set="" node version target route_output iface node_set
+  for node in "$NODE_A" "$NODE_B"; do
+    local -a discovered=()
+    while IFS='|' read -r _kind version _prefix target; do
+      [[ -n "$target" ]] || continue
+      if [[ "$version" == "6" ]]; then
+        route_output="$(docker exec "$node" ip -6 route get "$target")"
+      else
+        route_output="$(docker exec "$node" ip -4 route get "$target")"
+      fi
+      iface="$(awk '{for (i=1;i<=NF;i++) if ($i == "dev") {print $(i+1); exit}}' <<<"$route_output")"
+      if [[ -z "$iface" ]]; then
+        echo "could not resolve a route device on $node for a required family-$version topology target" >&2
+        exit 1
+      fi
+      discovered+=("$iface")
+    done < <(topology_targets_for_node "$node")
+    node_set="$(printf '%s\n' "${discovered[@]}" | sort -u | paste -sd, -)"
+    if [[ -z "$node_set" ]]; then
+      echo "no ingress redirect interface could be proved for $node" >&2
+      exit 1
+    fi
+    if [[ -z "$common_set" ]]; then
+      common_set="$node_set"
+    elif [[ "$common_set" != "$node_set" ]]; then
+      echo "the chart's shared ingressRedirectIfaces value cannot represent differing node sets ($common_set vs $node_set)" >&2
+      exit 1
+    fi
+  done
+  INGRESS_REDIRECT_IFACES="$common_set"
+  log "explicit ingress redirect interface set: $INGRESS_REDIRECT_IFACES"
+}
+
 node_waypoint_spiffe_template() {
   printf 'spiffe://%s/ns/%s/sa/ferrum-mesh/node/$(FERRUM_K8S_NODE_NAME)' "$TRUST_DOMAIN" "$MESH_NS"
 }
@@ -955,11 +1051,13 @@ install_ferrum() {
     --set ambient.env.FERRUM_LOG_LEVEL=info \
     "${identity_args[@]}" \
     --set ambient.env.FERRUM_MESH_HBONE_LISTEN_ADDR=0.0.0.0:15008 \
+    --set-string 'ambient.env.FERRUM_MESH_INBOUND_LISTEN_ADDR=[::]:15006' \
     --set nodeAgent.enabled=true \
     --set-string "nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32" \
     --set nodeAgent.captureMode=ebpf \
     --set-string "nodeAgent.admin.port=$NODE_AGENT_ADMIN_PORT" \
     --set nodeAgent.proxyMode=node_waypoint \
+    --set-string "nodeAgent.ingressRedirectIfaces=$(helm_set_string_escape "$INGRESS_REDIRECT_IFACES")" \
     --set nodeAgent.env.FERRUM_LOG_LEVEL=info \
     --set-string "nodeAgent.env.FERRUM_K8S_TRUST_DOMAIN=$TRUST_DOMAIN" \
     --set-string "nodeAgent.trustedKubeletProbeSourceIps=$trusted_probe_ips_helm" \
@@ -1219,6 +1317,11 @@ assert_node_agent_ready_metric() {
   fi
   grep -q 'ferrum_node_agent_capture_state{state="ready"} 1' "$metrics_file"
   grep -q 'ferrum_mesh_node_topology_degraded{reason="none"} 0' "$metrics_file"
+  grep -q 'ferrum_node_agent_ingress_interface_topology{state="ready",reason="valid"} 1' "$metrics_file"
+  grep -Eq '^ferrum_node_agent_ingress_interface_configured_interfaces [1-9][0-9]*$' "$metrics_file"
+  grep -Eq '^ferrum_node_agent_ingress_interface_expected_interfaces [1-9][0-9]*$' "$metrics_file"
+  grep -q 'ferrum_node_agent_ingress_interface_family_required{family="ipv4"} 1' "$metrics_file"
+  grep -q 'ferrum_node_agent_ingress_interface_family_covered{family="ipv4"} 1' "$metrics_file"
   mkdir -p "$RESULTS_DIR/node-agent-metrics"
   cp "$metrics_file" "$RESULTS_DIR/node-agent-metrics/ready-check.prom"
   record_live_assertion \
@@ -1230,6 +1333,205 @@ assert_node_agent_ready_metric() {
     "" \
     "" \
     "node-agent-metrics/ready-check.prom"
+  record_live_assertion \
+    node_waypoint.ebpf.ingress_topology_valid \
+    pass \
+    "" \
+    "" \
+    "configured-interface-set-exactly-proved" \
+    "" \
+    "" \
+    "node-agent-metrics/ready-check.prom"
+  if [[ "$REQUIRE_DUAL_STACK" == "true" ]]; then
+    grep -q 'ferrum_node_agent_ingress_interface_family_required{family="ipv6"} 1' "$metrics_file"
+    grep -q 'ferrum_node_agent_ingress_interface_family_covered{family="ipv6"} 1' "$metrics_file"
+    record_live_assertion \
+      node_waypoint.ebpf.ingress_topology_dual_family \
+      pass \
+      "" \
+      "" \
+      "ipv4-and-ipv6-route-families-proved" \
+      "" \
+      "" \
+      "node-agent-metrics/ready-check.prom"
+  fi
+}
+
+fetch_node_agent_metrics_on_node() {
+  local node="$1"
+  local output="$2"
+  local pod port_forward_pid fetched=false
+  pod="$(kubectl -n "$MESH_NS" get pod \
+    -l app.kubernetes.io/name=ferrum-mesh-node-agent \
+    --field-selector "spec.nodeName=$node" \
+    --sort-by=.metadata.creationTimestamp \
+    -o jsonpath='{.items[-1:].metadata.name}')"
+  [[ -n "$pod" ]] || return 1
+  kubectl -n "$MESH_NS" port-forward "pod/$pod" "19551:$NODE_AGENT_ADMIN_PORT" \
+    >"$RESULTS_DIR/topology-port-forward.log" 2>&1 &
+  port_forward_pid=$!
+  for _ in $(seq 1 30); do
+    if curl -fsS http://127.0.0.1:19551/metrics >"$output"; then
+      fetched=true
+      break
+    fi
+    sleep 0.5
+  done
+  kill "$port_forward_pid" 2>/dev/null || true
+  wait "$port_forward_pid" 2>/dev/null || true
+  [[ "$fetched" == "true" ]]
+}
+
+inject_wrong_ingress_routes() {
+  local node="$1"
+  local remote_node="$2"
+  local state_file="$3"
+  : >"$state_file"
+  TOPOLOGY_ROUTE_NODE="$node"
+  TOPOLOGY_ROUTE_STATE_FILE="$state_file"
+  TOPOLOGY_ROUTE_MUTATED=true
+  docker exec "$node" ip link add ferrumwrong0 type veth peer name ferrumwrong1
+  docker exec "$node" ip link set ferrumwrong0 up
+  docker exec "$node" ip link set ferrumwrong1 up
+  local version prefix target original
+  while IFS='|' read -r _kind version prefix target; do
+    [[ -n "$target" ]] || continue
+    if [[ "$version" == "6" ]]; then
+      original="$(docker exec "$node" ip -6 route show exact "$prefix")"
+    else
+      original="$(docker exec "$node" ip -4 route show exact "$prefix")"
+    fi
+    printf '%s|%s|%s\n' "$version" "$prefix" "$original" >>"$state_file"
+    if [[ "$version" == "6" ]]; then
+      docker exec "$node" ip -6 route replace "$prefix" dev ferrumwrong0
+    else
+      docker exec "$node" ip -4 route replace "$prefix" dev ferrumwrong0
+    fi
+  done < <(topology_targets_for_node "$node" "$remote_node")
+}
+
+restore_ingress_routes() {
+  local node="$1"
+  local state_file="$2"
+  local version prefix original
+  while IFS='|' read -r version prefix original; do
+    [[ -n "$prefix" ]] || continue
+    if [[ -n "$original" ]]; then
+      if [[ "$version" == "6" ]]; then
+        # Intentional word splitting reconstructs the kernel-produced `ip route`
+        # argument vector; no untrusted value is evaluated as shell code.
+        docker exec "$node" ip -6 route replace $original
+      else
+        docker exec "$node" ip -4 route replace $original
+      fi
+    elif [[ "$version" == "6" ]]; then
+      docker exec "$node" ip -6 route del "$prefix" dev ferrumwrong0 2>/dev/null || true
+    else
+      docker exec "$node" ip -4 route del "$prefix" dev ferrumwrong0 2>/dev/null || true
+    fi
+  done <"$state_file"
+  docker exec "$node" ip link del ferrumwrong0 2>/dev/null || true
+  TOPOLOGY_ROUTE_MUTATED=false
+  TOPOLOGY_ROUTE_NODE=""
+  TOPOLOGY_ROUTE_STATE_FILE=""
+}
+
+wait_for_node_agent_topology_state() {
+  local node="$1"
+  local expected_state="$2"
+  local output="$3"
+  for _ in $(seq 1 40); do
+    if fetch_node_agent_metrics_on_node "$node" "$output" \
+      && grep -q "ferrum_node_agent_ingress_interface_topology{state=\"$expected_state\"" "$output"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+run_ingress_topology_negative_and_drift_checks() {
+  if [[ "$DOCKER_NODE_EVIDENCE" != "true" ]]; then
+    if [[ "$LIVE_TESTS_REQUIRED" == "1" ]]; then
+      echo "required ingress-topology live cases need Docker node access" >&2
+      exit 1
+    fi
+    return
+  fi
+  log "checking wrong-interface startup and runtime route drift readiness withdrawal"
+  mkdir -p "$RESULTS_DIR/ingress-topology"
+  local state_file="$RESULTS_DIR/ingress-topology/routes-before.txt"
+  local metrics_file="$RESULTS_DIR/ingress-topology/wrong-startup.prom"
+  local startup_log="$RESULTS_DIR/ingress-topology/wrong-startup.log"
+  local old_pod new_pod
+  old_pod="$(kubectl -n "$MESH_NS" get pod \
+    -l app.kubernetes.io/name=ferrum-mesh-node-agent \
+    --field-selector "spec.nodeName=$NODE_A" \
+    -o jsonpath='{.items[0].metadata.name}')"
+
+  inject_wrong_ingress_routes "$NODE_A" "$NODE_B" "$state_file"
+  kubectl -n "$MESH_NS" delete "pod/$old_pod" --wait=false
+  new_pod=""
+  for _ in $(seq 1 60); do
+    new_pod="$(kubectl -n "$MESH_NS" get pod \
+      -l app.kubernetes.io/name=ferrum-mesh-node-agent \
+      --field-selector "spec.nodeName=$NODE_A" \
+      --sort-by=.metadata.creationTimestamp \
+      -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || true)"
+    if [[ -n "$new_pod" && "$new_pod" != "$old_pod" ]]; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ -z "$new_pod" || "$new_pod" == "$old_pod" ]] \
+    || ! wait_for_node_agent_topology_state "$NODE_A" unavailable "$metrics_file"; then
+    restore_ingress_routes "$NODE_A" "$state_file"
+    echo "replacement node-agent did not expose unavailable topology for an existing wrong route device" >&2
+    exit 1
+  fi
+  grep -q 'ferrum_node_agent_capture_state{state="interface_topology_unavailable"} 1' "$metrics_file"
+  grep -q 'reason="incomplete_interface_set"' "$metrics_file"
+  if ! kubectl -n "$MESH_NS" logs "pod/$new_pod" >"$startup_log" \
+    || ! grep -Fq 'NodeWaypoint inbound tc ingress redirect attached' "$startup_log"; then
+    restore_ingress_routes "$NODE_A" "$state_file"
+    echo "replacement did not prove tc attach success on the topologically wrong interface" >&2
+    exit 1
+  fi
+  if kubectl -n "$MESH_NS" get "pod/$new_pod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q '^True$'; then
+    restore_ingress_routes "$NODE_A" "$state_file"
+    echo "node-agent remained Ready with a wrong ingress interface topology" >&2
+    exit 1
+  fi
+  record_live_assertion \
+    node_waypoint.ebpf.ingress_topology_wrong_interface_startup \
+    pass "" "" "replacement-started-not-ready-on-existing-wrong-route-device" "" "" \
+    "ingress-topology/wrong-startup.prom"
+
+  restore_ingress_routes "$NODE_A" "$state_file"
+  kubectl -n "$MESH_NS" wait --for=condition=Ready "pod/$new_pod" --timeout=120s
+
+  inject_wrong_ingress_routes "$NODE_A" "$NODE_B" "$state_file"
+  metrics_file="$RESULTS_DIR/ingress-topology/runtime-drift.prom"
+  if ! wait_for_node_agent_topology_state "$NODE_A" unavailable "$metrics_file"; then
+    restore_ingress_routes "$NODE_A" "$state_file"
+    echo "running node-agent did not withdraw readiness after route drift" >&2
+    exit 1
+  fi
+  # The node-agent withdraws /health readiness synchronously with the topology
+  # state above, but kubelet observes that change on its configured probe
+  # cadence. Wait for the Pod condition instead of racing the next probe.
+  if ! kubectl -n "$MESH_NS" wait \
+    --for=condition=Ready=false "pod/$new_pod" --timeout=30s; then
+    restore_ingress_routes "$NODE_A" "$state_file"
+    echo "running node-agent stayed Ready after its proved route topology drifted" >&2
+    exit 1
+  fi
+  record_live_assertion \
+    node_waypoint.ebpf.ingress_topology_route_drift \
+    pass "" "" "route-drift-withdrew-readiness" "" "" \
+    "ingress-topology/runtime-drift.prom"
+  restore_ingress_routes "$NODE_A" "$state_file"
+  kubectl -n "$MESH_NS" wait --for=condition=Ready "pod/$new_pod" --timeout=120s
 }
 
 collect_bpf_evidence() {
@@ -3658,6 +3960,10 @@ run_ipv6_checks() {
 }
 
 cleanup() {
+  if [[ "$TOPOLOGY_ROUTE_MUTATED" == "true" && -n "$TOPOLOGY_ROUTE_NODE" \
+    && -f "$TOPOLOGY_ROUTE_STATE_FILE" ]]; then
+    restore_ingress_routes "$TOPOLOGY_ROUTE_NODE" "$TOPOLOGY_ROUTE_STATE_FILE" || true
+  fi
   if [[ "${FERRUM_LIVE_KEEP_RESOURCES:-false}" != "true" ]]; then
     kubectl --context "$KUBE_CONTEXT" delete namespace "$UNMANAGED_NS" --ignore-not-found=true >/dev/null 2>&1 || true
     kubectl --context "$KUBE_CONTEXT" delete namespace "$WORKLOAD_NS" --ignore-not-found=true >/dev/null 2>&1 || true
@@ -3676,10 +3982,12 @@ render_chart_assertions
 validate_cluster
 label_nodes
 discover_trusted_kubelet_probe_ips
+discover_ingress_redirect_ifaces
 install_spire_production_identity
 install_ferrum
 verify_ambient_spire_identity
 assert_node_agent_ready_metric
+run_ingress_topology_negative_and_drift_checks
 collect_bpf_evidence
 apply_workloads
 wait_for_node_waypoint_ready_markers

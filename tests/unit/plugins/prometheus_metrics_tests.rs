@@ -570,6 +570,14 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
     assert!(output.contains("# TYPE ferrum_node_agent_capture_state gauge"));
     assert!(output.contains("ferrum_node_agent_capture_state{state=\"starting\"} 1"));
     assert!(output.contains("ferrum_node_agent_capture_state{state=\"ready\"} 0"));
+    assert!(output.contains(
+        "ferrum_node_agent_ingress_interface_topology{state=\"disabled\",reason=\"disabled\"} 1"
+    ));
+    assert!(output.contains("ferrum_node_agent_ingress_interface_configured_interfaces 0"));
+    assert!(output.contains("ferrum_node_agent_ingress_interface_expected_interfaces 0"));
+    assert!(
+        output.contains("ferrum_node_agent_ingress_interface_family_required{family=\"ipv4\"} 0")
+    );
     // Nominal topology: gauge emitted as 0 with reason=none so dashboards
     // can always pin the expected value.
     assert!(output.contains("# TYPE ferrum_mesh_node_topology_degraded gauge"));

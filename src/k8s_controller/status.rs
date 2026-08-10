@@ -12,7 +12,7 @@ use crate::config_sources::k8s::backend_tls_policy::{
     MAX_POLICY_ANCESTORS, policy_status_ancestor_capacity, policy_status_ancestor_services,
 };
 use crate::config_sources::k8s::{
-    GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus,
+    GatewayApiAllowedRoutesNamespaces, GatewayApiBackendTlsPolicyStatus, GatewayApiListenerKey,
     GatewayApiListenerParentKind, GatewayApiMaterializedRouteParent, GatewayApiRouteAttachment,
     GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sObject, K8sResourceKey,
     K8sTranslateError, K8sTranslation, K8sTranslationOptions, UNSUPPORTED_SHAPE_MARKER,
@@ -1130,12 +1130,6 @@ impl ListenerReferenceStatus {
         reason: "InvalidCertificateRef",
         message: "Ferrum could not resolve this listener certificateRef",
     };
-
-    const UNSUPPORTED_CERTIFICATE_REFS: Self = Self {
-        resolved: false,
-        reason: "UnsupportedValue",
-        message: "Ferrum currently supports one Gateway TLS certificateRef per data plane",
-    };
 }
 
 fn gateway_reference_status(
@@ -1214,12 +1208,6 @@ fn listener_reference_status(
         }
     }
 
-    if listener_is_terminating_tls(listener)
-        && parent_has_multiple_distinct_tls_certificate_refs(parent, indexes)
-    {
-        return ListenerReferenceStatus::UNSUPPORTED_CERTIFICATE_REFS;
-    }
-
     ListenerReferenceStatus::RESOLVED
 }
 
@@ -1236,83 +1224,6 @@ fn listener_is_terminating_tls(listener: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or("Terminate")
         .eq_ignore_ascii_case("Terminate")
-}
-
-fn parent_has_multiple_distinct_tls_certificate_refs(
-    parent: &K8sObject,
-    indexes: &GatewayApiStatusIndexes<'_>,
-) -> bool {
-    let Some(listeners) = parent.spec.get("listeners").and_then(Value::as_array) else {
-        return false;
-    };
-    let mut selected: Option<(String, String)> = None;
-    for identity in listeners
-        .iter()
-        .filter(|listener| listener_is_terminating_tls(listener))
-        .flat_map(|listener| listener_tls_certificate_ref_identities(parent, listener, indexes))
-    {
-        if selected
-            .as_ref()
-            .is_some_and(|existing| existing != &identity)
-        {
-            return true;
-        }
-        selected.get_or_insert(identity);
-    }
-    false
-}
-
-fn listener_tls_certificate_ref_identities(
-    parent: &K8sObject,
-    listener: &Value,
-    indexes: &GatewayApiStatusIndexes<'_>,
-) -> Vec<(String, String)> {
-    let from_kind = match parent.kind.as_str() {
-        "ListenerSet" => "ListenerSet",
-        _ => "Gateway",
-    };
-    listener
-        .get("tls")
-        .and_then(|tls| tls.get("certificateRefs"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|certificate_ref| {
-            let group = certificate_ref
-                .get("group")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let kind = certificate_ref
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("Secret");
-            if !group.is_empty() || kind != "Secret" {
-                return None;
-            }
-            let name = certificate_ref.get("name").and_then(Value::as_str)?;
-            let namespace = certificate_ref
-                .get("namespace")
-                .and_then(Value::as_str)
-                .unwrap_or(&parent.metadata.namespace);
-            if namespace != parent.metadata.namespace
-                && !reference_grant_allows_secret_indexed(
-                    indexes,
-                    &parent.metadata.namespace,
-                    from_kind,
-                    namespace,
-                    name,
-                )
-            {
-                return None;
-            }
-            let secret = indexes
-                .secrets_by_ns_name
-                .get(&(namespace, name))
-                .copied()?;
-            secret_object_is_valid_tls_certificate(secret)
-                .then(|| (namespace.to_string(), name.to_string()))
-        })
-        .collect()
 }
 
 fn reference_grant_allows_secret_indexed(
@@ -1918,12 +1829,30 @@ fn gateway_listener_statuses(
             let route_kinds = listener_route_kind_status(protocol, listener);
             let listener_validation_error =
                 validate_gateway_listener_allowed_routes(listener).err();
+            // A listener that lost a Gateway TLS SNI hostname collision keeps
+            // its Accepted/ResolvedRefs status — its own references are valid —
+            // but serves no route traffic, exactly as the translator withdrew
+            // it. Reported as `Conflicted`, the Gateway API condition for it.
+            let hostname_conflict_winner = translation.and_then(|translation| {
+                translation.frontend_tls_hostname_conflicts.get(&GatewayApiListenerKey {
+                    namespace: gateway.metadata.namespace.clone(),
+                    parent_kind: GatewayApiListenerParentKind::Gateway,
+                    gateway: gateway.metadata.name.clone(),
+                    listener: listener_name.to_string(),
+                })
+            });
+            let hostname_conflict_message = hostname_conflict_winner.map(|winner| {
+                format!(
+                    "Listener hostname is already served with a different certificate by Gateway {}/{} listener {}",
+                    winner.namespace, winner.gateway, winner.listener
+                )
+            });
             // A listener the translator refused for a physical same-port shape
             // conflict is unservable no matter how valid its own spec is: it
             // reports `Conflicted=True`, `Accepted=False`/`PortUnavailable`,
             // and `Programmed=False`. `ResolvedRefs` still describes the
             // listener's own references, which the conflict does not touch.
-            let conflict = translation.and_then(|translation| {
+            let physical_conflict = translation.and_then(|translation| {
                 translation
                     .listener_conflicts
                     .get(&crate::config_sources::k8s::GatewayApiListenerKey {
@@ -1936,12 +1865,16 @@ fn gateway_listener_statuses(
             let spec_accepted = gateway_accepted
                 && route_kinds.protocol_supported
                 && listener_validation_error.is_none();
-            let accepted = spec_accepted && conflict.is_none();
+            let accepted = spec_accepted && physical_conflict.is_none();
             let resolved_refs =
                 spec_accepted && references.resolved && route_kinds.route_kinds_valid;
             let materialized = config
                 .is_some_and(|config| gateway_listener_programmed(gateway, listener, config));
-            let programmed = resolved_refs && materialized && data_plane_ready && conflict.is_none();
+            let programmed = resolved_refs
+                && materialized
+                && data_plane_ready
+                && physical_conflict.is_none()
+                && hostname_conflict_winner.is_none();
             let unresolved_reason = if listener_validation_error.is_some() {
                 "Invalid"
             } else if !route_kinds.route_kinds_valid {
@@ -1963,7 +1896,7 @@ fn gateway_listener_statuses(
                 "UnsupportedProtocol"
             } else if listener_validation_error.is_some() {
                 "Invalid"
-            } else if conflict.is_some() {
+            } else if physical_conflict.is_some() {
                 // The listener spec is valid; the PORT cannot be allocated for
                 // it because a sibling listener claims it with an
                 // incompatible frontend shape.
@@ -1977,7 +1910,7 @@ fn gateway_listener_statuses(
                 "Ferrum supports protocol TLS only with spec.listeners[].tls.mode=Passthrough"
             } else if !route_kinds.protocol_supported {
                 "Ferrum does not support this listener protocol"
-            } else if let Some(conflict) = conflict {
+            } else if let Some(conflict) = physical_conflict {
                 conflict.message.as_str()
             } else {
                 validation_message
@@ -2022,12 +1955,14 @@ fn gateway_listener_statuses(
                     programmed,
                     if programmed {
                         "Programmed"
-                    } else if conflict.is_some() {
+                    } else if physical_conflict.is_some() {
                         "Invalid"
                     } else if accepted && !resolved_refs {
                         unresolved_reason
                     } else if listener_validation_error.is_some() {
                         "Invalid"
+                    } else if hostname_conflict_winner.is_some() {
+                        "HostnameConflict"
                     } else if accepted && !materialized {
                         "NoListeners"
                     } else if accepted {
@@ -2037,12 +1972,14 @@ fn gateway_listener_statuses(
                     },
                     if programmed {
                         "Ferrum programmed this listener"
-                    } else if let Some(conflict) = conflict {
+                    } else if let Some(conflict) = physical_conflict {
                         conflict.message.as_str()
                     } else if (accepted && !resolved_refs)
                         || listener_validation_error.is_some()
                     {
                         unresolved_message
+                    } else if let Some(message) = hostname_conflict_message.as_deref() {
+                        message
                     } else if accepted && !materialized {
                         "Ferrum accepted this listener but found no materialized listener"
                     } else if accepted {
@@ -2055,10 +1992,20 @@ fn gateway_listener_statuses(
                     gateway,
                     existing_listener_conditions,
                     "Conflicted",
-                    conflict.is_some(),
-                    conflict.map_or("NoConflicts", |conflict| conflict.reason),
-                    conflict.map_or(
-                        "No Gateway API listener conflicts detected by Ferrum",
+                    physical_conflict.is_some() || hostname_conflict_winner.is_some(),
+                    if let Some(conflict) = physical_conflict {
+                        conflict.reason
+                    } else if hostname_conflict_winner.is_some() {
+                        "HostnameConflict"
+                    } else {
+                        "NoConflicts"
+                    },
+                    physical_conflict.map_or_else(
+                        || {
+                            hostname_conflict_message.as_deref().unwrap_or(
+                                "No Gateway API listener conflicts detected by Ferrum",
+                            )
+                        },
                         |conflict| conflict.message.as_str(),
                     ),
                 ),
@@ -4820,7 +4767,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_listener_status_reports_multiple_certificate_refs_unsupported() {
+    fn gateway_listener_status_accepts_multiple_distinct_certificate_refs() {
         let gateway_class = ferrum_gateway_class();
         let gateway = object(
             "Gateway",
@@ -4832,12 +4779,14 @@ mod tests {
                         "name": "https-a",
                         "port": 443,
                         "protocol": "HTTPS",
+                        "hostname": "a.example.com",
                         "tls": {"certificateRefs": [{"name": "certificate-a"}]}
                     },
                     {
                         "name": "https-b",
                         "port": 8443,
                         "protocol": "HTTPS",
+                        "hostname": "b.example.com",
                         "tls": {"certificateRefs": [{"name": "certificate-b"}]}
                     }
                 ]
@@ -4848,25 +4797,150 @@ mod tests {
 
         let updates = plan_status_updates(&[gateway_class, gateway, secret_a, secret_b], options());
 
+        // Issue #3267: distinct certificateRefs on one Gateway are served by
+        // SNI, not refused as an unsupported value.
         let gateway_update = update_for(&updates, "Gateway", "edge");
         let conditions = gateway_update.status["conditions"].as_array().unwrap();
-        assert_condition(conditions, "ResolvedRefs", "False");
-        assert_eq!(
-            find_condition(conditions, "ResolvedRefs")["reason"].as_str(),
-            Some("UnsupportedValue")
-        );
+        assert_condition(conditions, "ResolvedRefs", "True");
         let listeners = gateway_update.status["listeners"].as_array().unwrap();
-        let listener = listener_status_by_name(listeners, "https-a");
-        let listener_conditions = listener["conditions"].as_array().unwrap();
-        assert_condition(listener_conditions, "ResolvedRefs", "False");
+        for listener_name in ["https-a", "https-b"] {
+            let listener = listener_status_by_name(listeners, listener_name);
+            let listener_conditions = listener["conditions"].as_array().unwrap();
+            assert_condition(listener_conditions, "ResolvedRefs", "True");
+            assert_condition(listener_conditions, "Conflicted", "False");
+        }
+    }
+
+    #[test]
+    fn gateway_listener_status_reports_a_tls_hostname_collision_as_conflicted() {
+        let gateway_class = ferrum_gateway_class();
+        let mut older = object(
+            "Gateway",
+            "edge-old",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "hostname": "shop.example.com",
+                    "tls": {"certificateRefs": [{"name": "certificate-a"}]}
+                }]
+            }),
+        );
+        older.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut younger = object(
+            "Gateway",
+            "edge-new",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "shop.example.com",
+                    "tls": {"certificateRefs": [{"name": "certificate-b"}]}
+                }]
+            }),
+        );
+        younger.metadata.creation_timestamp = Some("2026-06-01T00:00:00Z".to_string());
+        let secret_a = tls_secret("certificate-a", "default", true);
+        let secret_b = tls_secret("certificate-b", "default", true);
+
+        let updates = plan_status_updates(
+            &[gateway_class, younger, older, secret_a, secret_b],
+            options(),
+        );
+
+        let winner = update_for(&updates, "Gateway", "edge-old");
+        let winner_listener =
+            listener_status_by_name(winner.status["listeners"].as_array().unwrap(), "https");
+        let winner_conditions = winner_listener["conditions"].as_array().unwrap();
+        assert_condition(winner_conditions, "Conflicted", "False");
+
+        let loser = update_for(&updates, "Gateway", "edge-new");
+        let loser_listener =
+            listener_status_by_name(loser.status["listeners"].as_array().unwrap(), "https");
+        let loser_conditions = loser_listener["conditions"].as_array().unwrap();
+        // Its own references are fine; what it lost is the contested hostname.
+        assert_condition(loser_conditions, "ResolvedRefs", "True");
+        assert_condition(loser_conditions, "Conflicted", "True");
         assert_eq!(
-            find_condition(listener_conditions, "ResolvedRefs")["reason"].as_str(),
-            Some("UnsupportedValue")
+            find_condition(loser_conditions, "Conflicted")["reason"].as_str(),
+            Some("HostnameConflict")
+        );
+        assert_condition(loser_conditions, "Programmed", "False");
+        assert_eq!(
+            find_condition(loser_conditions, "Programmed")["reason"].as_str(),
+            Some("HostnameConflict")
         );
     }
 
     #[test]
-    fn same_namespace_gateway_tls_slot_programs_only_winner() {
+    fn unsupported_tls_terminate_listener_cannot_claim_an_https_hostname() {
+        let gateway_class = ferrum_gateway_class();
+        let mut unsupported = object(
+            "Gateway",
+            "edge-unsupported",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "tls-terminate",
+                    "port": 443,
+                    "protocol": "TLS",
+                    "hostname": "shop.example.com",
+                    "tls": {
+                        "mode": "Terminate",
+                        "certificateRefs": [{"name": "certificate-a"}]
+                    }
+                }]
+            }),
+        );
+        unsupported.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut valid = object(
+            "Gateway",
+            "edge-valid",
+            json!({
+                "gatewayClassName": "ferrum",
+                "listeners": [{
+                    "name": "https",
+                    "port": 8443,
+                    "protocol": "HTTPS",
+                    "hostname": "shop.example.com",
+                    "tls": {"certificateRefs": [{"name": "certificate-b"}]}
+                }]
+            }),
+        );
+        valid.metadata.creation_timestamp = Some("2026-06-01T00:00:00Z".to_string());
+        let secret_a = tls_secret("certificate-a", "default", true);
+        let secret_b = tls_secret("certificate-b", "default", true);
+
+        let updates = plan_status_updates(
+            &[gateway_class, unsupported, valid, secret_a, secret_b],
+            options(),
+        );
+
+        let unsupported = update_for(&updates, "Gateway", "edge-unsupported");
+        let unsupported_listener = listener_status_by_name(
+            unsupported.status["listeners"].as_array().unwrap(),
+            "tls-terminate",
+        );
+        assert_condition(
+            unsupported_listener["conditions"].as_array().unwrap(),
+            "Accepted",
+            "False",
+        );
+
+        let valid = update_for(&updates, "Gateway", "edge-valid");
+        let valid_listener =
+            listener_status_by_name(valid.status["listeners"].as_array().unwrap(), "https");
+        let conditions = valid_listener["conditions"].as_array().unwrap();
+        assert_condition(conditions, "ResolvedRefs", "True");
+        assert_condition(conditions, "Conflicted", "False");
+    }
+
+    #[test]
+    fn same_namespace_gateway_tls_listeners_are_both_programmed() {
         let gateway_class = ferrum_gateway_class();
         let gateway_a = object(
             "Gateway",
@@ -4906,15 +4980,7 @@ mod tests {
             let gateway_update = update_for(&updates, "Gateway", gateway_name);
             let conditions = gateway_update.status["conditions"].as_array().unwrap();
             assert_condition(conditions, "ResolvedRefs", "True");
-            assert_condition(
-                conditions,
-                "Programmed",
-                if gateway_name == "edge-a" {
-                    "True"
-                } else {
-                    "False"
-                },
-            );
+            assert_condition(conditions, "Programmed", "True");
 
             let listeners = gateway_update.status["listeners"].as_array().unwrap();
             let listener = listener_status_by_name(
@@ -4927,21 +4993,7 @@ mod tests {
             );
             let listener_conditions = listener["conditions"].as_array().unwrap();
             assert_condition(listener_conditions, "ResolvedRefs", "True");
-            assert_condition(
-                listener_conditions,
-                "Programmed",
-                if gateway_name == "edge-a" {
-                    "True"
-                } else {
-                    "False"
-                },
-            );
-            if gateway_name == "edge-b" {
-                assert_eq!(
-                    find_condition(listener_conditions, "Programmed")["reason"].as_str(),
-                    Some("NoListeners")
-                );
-            }
+            assert_condition(listener_conditions, "Programmed", "True");
         }
     }
 

@@ -2015,7 +2015,7 @@ pub async fn recover_and_reap_stale_host_udp_state(
     }
 }
 
-async fn recover_and_reap_once(recovery: &mut HostUdpStaleGenerationRecovery) -> bool {
+pub(crate) async fn recover_and_reap_once(recovery: &mut HostUdpStaleGenerationRecovery) -> bool {
     if !recovery.poll_once(STALE_RECOVERY_ACK_WAIT).await {
         return false;
     }

@@ -29,11 +29,12 @@ pub use istio::{MAX_L4_CANDIDATE_PROXIES, MAX_PROJECTED_L4_PROXIES};
 // the translator's "emit cors plugin vs. leave unprojected" decision and the
 // status writer's deferred-field reporting use one predicate and never diverge.
 pub(crate) use istio::cors_policy_translatable;
-// Shared with the Istio status writer the same way: the Sidecar `ingress[]`
-// HTTP-family classification used by resolution and by deferred-field reporting
-// is one predicate, so an HTTPS (→ Unknown → HTTP-family) listener is never
-// modeled by resolution yet reported as a deferred non-HTTP listener.
-pub(crate) use istio::sidecar_ingress_protocol_is_http_family;
+// Shared with the Istio status writer the same way: Sidecar `ingress[]`
+// classification used by resolution and deferred-field reporting is one
+// predicate, so modeled HTTP and stream listeners cannot be reported deferred.
+pub(crate) use istio::{
+    sidecar_ingress_protocol_is_http_family, sidecar_ingress_protocol_is_modeled,
+};
 // Shared with the Istio status writer the same way (issue #3262): the Sidecar
 // `outboundTrafficPolicy` classification that decides the ENFORCED workload-scoped
 // policy is the same one that produces the reported `deferred_fields` reason, so a
@@ -401,6 +402,14 @@ pub struct K8sTranslation {
     /// `Accepted=True` / `NoConflicts`.
     pub listener_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerConflict>,
+    /// Gateway/ListenerSet listeners withdrawn because another admitted
+    /// listener owns the same explicit SNI hostname with a different complete
+    /// certificate set. Unlike physical port conflicts, a Gateway loser keeps
+    /// `Accepted=True`; status consumes this exact post-admission map so a
+    /// listener removed earlier by physical arbitration cannot remain a stale
+    /// hostname winner.
+    pub frontend_tls_hostname_conflicts:
+        std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
     /// Route claims this translation refused because two different Gateway API
     /// listeners materialize one physical `(namespace, hosts, listen path,
     /// listen port)` route slot. Runtime materialization is withdrawn on both
@@ -422,8 +431,8 @@ pub struct K8sTranslation {
 pub struct GatewayApiListenerConflict {
     /// Gateway API `ListenerConditionReason` for `Conflicted=True` —
     /// `ProtocolConflict` when the port is claimed both plaintext and an
-    /// effective TLS-serving namespace slot, `HostnameConflict` when effective
-    /// per-namespace TLS serving slots on one socket resolve to different
+    /// effective TLS-serving namespace plan, `HostnameConflict` when complete
+    /// per-namespace TLS serving sets on one socket resolve to different
     /// credentials.
     pub reason: &'static str,
     pub message: String,
@@ -826,14 +835,10 @@ pub(crate) struct GatewayApiListenerPolicy {
     /// For `ListenerSet` listeners: the managed Gateway `(namespace, name)`
     /// this entry attaches to after `allowedListeners` + parentRef checks.
     pub parent_gateway: Option<(String, String)>,
-    /// Resolved `(cert_path, key_path)` this listener would terminate with.
-    /// `None` for plaintext listeners and for TLS listeners whose
-    /// `certificateRefs` did not resolve to exactly one usable credential.
-    ///
-    /// Same-port physical conflicts compare the *effective* per-namespace
-    /// serving credential from the shared TLS-slot plan, not every raw
-    /// value collected here — a non-winning same-namespace sibling must not
-    /// manufacture a cross-namespace `HostnameConflict`.
+    /// First resolved `(cert_path, key_path)` for compatibility metadata.
+    /// The authoritative listener-owned set lives in
+    /// `gateway_api_frontend_tls_listeners`; this projection never limits a
+    /// multi-certificate listener or selects the runtime SNI candidates.
     pub frontend_tls_source: Option<(String, String)>,
 }
 
@@ -913,12 +918,20 @@ pub(crate) struct K8sAccumulator {
     pub(crate) gateway_api_refused_route_attachments: HashSet<GatewayApiRouteAttachment>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
+    /// Terminating-TLS listeners whose `certificateRefs` all resolved, awaiting
+    /// snapshot-wide finalization in `finish()`. Collision winners, the default
+    /// certificate, and the snapshot cap are decided over the whole set so the
+    /// result never depends on informer/list order (#3267 / #3268).
+    pub(crate) gateway_api_frontend_tls_listeners: Vec<gateway_api::PendingFrontendTlsListener>,
     /// Listeners refused by physical same-port shape arbitration, with the
     /// operator-facing reason. Projected onto `Gateway.status.listeners[]` as
     /// `Conflicted=True` / `Programmed=False` so status can never claim a
     /// listener this translator explicitly refused.
     pub(crate) gateway_api_listener_conflicts:
         std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerConflict>,
+    /// Post-admission explicit-SNI collision losers and their winners.
+    pub(crate) gateway_api_frontend_tls_hostname_conflicts:
+        std::collections::BTreeMap<GatewayApiListenerKey, GatewayApiListenerKey>,
     /// Pre-pass index of observed GatewayClass names → whether Ferrum owns the
     /// class (`controllerName == ferrum.io/gateway-controller`). Presence is
     /// key membership; the bool is ownership only — interoperable waypoint
@@ -984,7 +997,9 @@ impl K8sAccumulator {
             gateway_api_materialized_route_attachments: HashMap::new(),
             gateway_api_refused_route_attachments: HashSet::new(),
             gateway_api_listener_policies: HashMap::new(),
+            gateway_api_frontend_tls_listeners: Vec::new(),
             gateway_api_listener_conflicts: std::collections::BTreeMap::new(),
+            gateway_api_frontend_tls_hostname_conflicts: std::collections::BTreeMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
             namespace_labels: HashMap::new(),
             gateway_api_route_conflicts: Vec::new(),
@@ -1515,6 +1530,7 @@ impl K8sAccumulator {
             backend_tls_policy_statuses: self.backend_tls_policy_statuses,
             listenerset_statuses: self.listenerset_statuses,
             listener_conflicts: self.gateway_api_listener_conflicts,
+            frontend_tls_hostname_conflicts: self.gateway_api_frontend_tls_hostname_conflicts,
             refused_route_attachments,
         }
     }
@@ -1599,9 +1615,12 @@ fn collect_gateway_api_status_context(objects: &[K8sObject], acc: &mut K8sAccumu
     let included: Vec<&K8sObject> = objects.iter().collect();
     let _ = listenerset::collect_listenersets_from_snapshot(acc, &included);
     // Keep status-context listener admission identical to the translation
-    // pass (shared namespace TLS-slot plan + same-port physical refusal), or a
+    // pass (ListenerSet precedence + same-port physical refusal), or a
     // route's status would arbitrate against a listener the data plane refused.
     gateway_api::refuse_incompatible_same_port_listeners(acc);
+    // Certificate ownership is decided only after every listener admission
+    // gate above has become authoritative.
+    gateway_api::finalize_frontend_tls_certificates(acc);
 }
 
 /// Build the Gateway API status-context accumulator once per reconcile/plan.
@@ -1731,15 +1750,18 @@ where
             }
         }
     }
-
     // ListenerSets attach after Gateway listener policies exist so conflict
     // resolution can prefer parent Gateway listeners.
     listenerset::collect_listenersets_from_snapshot(&mut acc, &included_objects)?;
-    // Every listener policy is now known, so the shared namespace TLS-slot plan
-    // and same-port physical compatibility can be decided before any route
-    // arbitrates or materializes against a listener that could never have been
-    // bound or that cannot occupy its namespace serving credential.
+    // Every listener policy is now known, so same-port physical compatibility
+    // can be decided before any route arbitrates or materializes against a
+    // listener that could never have been bound.
     gateway_api::refuse_incompatible_same_port_listeners(&mut acc);
+    // Resolve frontend TLS over the WHOLE admitted listener snapshot before
+    // any route is translated. Hostname collisions and the resident-source
+    // cap withdraw listener traffic atomically and cannot depend on object
+    // iteration order.
+    gateway_api::finalize_frontend_tls_certificates(&mut acc);
 
     let gateway_api_route_conflicts =
         gateway_api::route_conflicts(included_objects.iter().copied(), &acc.options, Some(&acc));

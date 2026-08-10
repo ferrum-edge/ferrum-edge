@@ -31,6 +31,7 @@ mod acme_renewal_resume_tests;
 #[allow(dead_code)]
 pub mod lease;
 pub mod managed;
+pub mod multi_cert;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;
 pub(crate) mod private_file;
@@ -970,6 +971,38 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
         tls_policy.crypto_provider.as_ref(),
     )?;
 
+    finish_frontend_server_config(
+        cert_resolver,
+        client_ca_bundle_source,
+        no_verify,
+        tls_policy,
+        cert_expiry_warning_days,
+        crls,
+        &cert_material.display_source_id,
+        &key_source_id,
+    )
+}
+
+/// Build the frontend/admin rustls `ServerConfig` around an already-constructed
+/// certificate resolver.
+///
+/// Split out so the single-certificate path and the Gateway multi-certificate
+/// SNI path (`crate::tls::multi_cert`) share ONE definition of client-auth
+/// admission, CRL wiring, ALPN, resumption, and the `max_early_data_size = 0`
+/// default. Only the resolver differs between them; letting the two diverge
+/// would mean a Gateway-delivered listener silently getting different client
+/// verification or 0-RTT posture from an operator-configured one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_frontend_server_config(
+    cert_resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+    client_ca_bundle_source: Option<&CertSource>,
+    no_verify: bool,
+    tls_policy: &TlsPolicy,
+    cert_expiry_warning_days: u64,
+    crls: &[CertificateRevocationListDer<'static>],
+    cert_source_display: &str,
+    key_source_display: &str,
+) -> Result<Arc<ServerConfig>, anyhow::Error> {
     let builder = ServerConfig::builder_with_provider(tls_policy.crypto_provider.clone())
         .with_protocol_versions(&tls_policy.protocol_versions)
         .map_err(|e| anyhow::anyhow!("Failed to set TLS protocol versions: {}", e))?;
@@ -999,7 +1032,7 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
         // No verification mode (for testing only)
         warn!(
             "TLS configuration loaded with certificate verification DISABLED (testing mode) from cert source: {}, key source: {}",
-            cert_material.display_source_id, key_source_id
+            cert_source_display, key_source_display
         );
 
         builder
@@ -1008,8 +1041,8 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
     } else if let Some((ca_material, client_auth_roots)) = client_ca {
         info!(
             "TLS configuration loaded with client certificate verification from cert source: {}, key source: {}, client CA source: {} (roots: {})",
-            cert_material.display_source_id,
-            key_source_id,
+            cert_source_display,
+            key_source_display,
             ca_material.display_source_id,
             client_auth_roots.len()
         );
@@ -1037,7 +1070,7 @@ pub fn load_tls_config_with_client_auth_from_sources_and_ocsp(
         // No client certificate verification
         info!(
             "TLS configuration loaded without client certificate verification from cert source: {}, key source: {}",
-            cert_material.display_source_id, key_source_id
+            cert_source_display, key_source_display
         );
 
         builder

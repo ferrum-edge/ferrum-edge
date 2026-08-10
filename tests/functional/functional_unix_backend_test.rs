@@ -4,32 +4,29 @@
 //! upstream target carries the reserved `mesh.unix_socket` tag, the HTTP path
 //! must dial a `tokio::net::UnixStream` (never the placeholder `host:port`),
 //! preserve the request target and headers, fail closed on an absent socket, and
-//! survive reload/update/delete. They express that runtime shape directly in
-//! file-mode config so a transport regression is caught without spawning a mesh
-//! control plane.
+//! survive reload/update/delete.
 //!
-//! **They are NOT the translation coverage.** Because they hand-author the
-//! reserved tag, they deliberately bypass the `Sidecar` `ingress[]` boundary. The
-//! end-to-end path — a real `Sidecar` `defaultEndpoint: unix://…` translated
-//! through the supported source, materialized, and then serving live HTTP/1.1,
-//! h2c, and gRPC traffic, plus the containment allowlist and the WebSocket /
-//! HTTP-1.1-gRPC refusals — is covered by
-//! `functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic` in
-//! `functional_mesh_mode_test.rs`. Keep both: this file pins the transport, that
-//! one pins the boundary.
+//! Tags are applied through the **trusted projection** boundary
+//! (`TrustedProjectedGateway` → in-process `file::serve` /
+//! `ProxyState::update_config`), the same path production mesh materialization
+//! uses. Operator file-mode / admin inputs must continue rejecting every
+//! `mesh.*` tag; that fail-closed contract is covered by unit tests under
+//! `tests/unit/config/`. The end-to-end Sidecar `ingress[]` translation path
+//! remains in `functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic`.
 //!
-//! Every test configures `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` to its own temp
-//! directory. That is not incidental setup — with no roots configured the
-//! containment gate refuses every Unix backend, which is the shipped default.
-//! The temp path is canonicalized first because the dial-time gate compares the
-//! SYMLINK-RESOLVED path against the roots (macOS `/var` → `/private/var` would
-//! otherwise read as an escape).
+//! Every test configures `FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` (via env
+//! config) to its own temp directory. With no roots configured the containment
+//! gate refuses every Unix backend, which is the shipped default. The temp path
+//! is canonicalized first because the dial-time gate compares the
+//! SYMLINK-RESOLVED path against the roots (macOS `/var` → `/private/var`
+//! would otherwise read as an escape).
 //!
-//! Unix-only: there is no Unix-domain socket transport (nor file-mode SIGHUP
-//! reload) on Windows.
+//! Unix-only: there is no Unix-domain socket transport on Windows.
 
-use crate::common::TestGateway;
+use crate::common::{TrustedProjectedGateway, TrustedProjectedGatewayOptions};
 
+use ferrum_edge::config::EnvConfig;
+use ferrum_edge::proxy::ConfigApplyOutcome;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -82,9 +79,6 @@ async fn serve_unix_backend(listener: UnixListener, name: &'static str, hits: Ar
             };
             let request = String::from_utf8_lossy(&buf[..n]).into_owned();
             hits.fetch_add(1, Ordering::SeqCst);
-            // Echo back the request line plus the Host the gateway forwarded, so
-            // the test can assert the request target and header regeneration
-            // survived the transport swap.
             let request_line = request.lines().next().unwrap_or("").to_string();
             let host = request
                 .lines()
@@ -103,15 +97,17 @@ async fn serve_unix_backend(listener: UnixListener, name: &'static str, hits: Ar
     }
 }
 
-/// File-mode config: one HTTP route per named upstream, each upstream's single
-/// target carrying the `mesh.unix_socket` tag for `socket_path`.
+/// Trusted-projected fixture YAML: one HTTP route per named upstream, each
+/// upstream's single target carrying the `mesh.unix_socket` tag for
+/// `socket_path`.
 ///
 /// `backend_host`/`backend_port` are the same never-dialed placeholder the mesh
 /// materializer stamps: a bound-but-unused loopback port. If the Unix transport
 /// gate ever regressed to a TCP fallback, the request would hit that port
 /// instead — which is exactly why the tests below assert on the socket's own
 /// response body rather than merely on a 200.
-fn build_config(entries: &[(&str, &str, &str)], placeholder_port: u16) -> String {
+fn build_config(entries: &[(&str, &str, &str)], placeholder_port: u16, generation: u32) -> String {
+    let stamp = format!("2026-08-08T00:00:{generation:02}Z");
     let mut proxies = String::new();
     let mut upstreams = String::new();
     for (id, listen_path, socket_path) in entries {
@@ -125,12 +121,14 @@ fn build_config(entries: &[(&str, &str, &str)], placeholder_port: u16) -> String
     strip_listen_path: false
     preserve_host_header: true
     pool_enable_http2: false
+    updated_at: "{stamp}"
 "#
         ));
         upstreams.push_str(&format!(
             r#"  - id: "{id}-upstream"
     name: "{id}-upstream"
     algorithm: round_robin
+    updated_at: "{stamp}"
     targets:
       - host: "127.0.0.1"
         port: {placeholder_port}
@@ -153,9 +151,6 @@ plugin_configs: []
     )
 }
 
-/// Poll the live data path until `ready` accepts a response body, or fail with
-/// the last observation. Waits on the behavior under test rather than guessing
-/// how long a reload needs on a loaded runner.
 async fn wait_for_body(
     client: &reqwest::Client,
     url: &str,
@@ -182,24 +177,38 @@ async fn wait_for_body(
     }
 }
 
-/// The containment root for a test: the temp dir, CANONICALIZED so the
-/// dial-time symlink-resolved containment check agrees with the configured
-/// root on platforms where the temp dir sits behind a symlink.
 fn containment_root(temp: &TempDir) -> PathBuf {
     temp.path()
         .canonicalize()
         .expect("canonicalize temp dir for the unix-socket containment root")
 }
 
-/// A loopback TCP port that is bound for the lifetime of the test but never
-/// served. Any request that reached it instead of the Unix socket would hang and
-/// then fail, making a silent TCP fallback impossible to mistake for success.
 async fn reserve_placeholder_port() -> (u16, tokio::net::TcpListener) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind placeholder port");
     let port = listener.local_addr().expect("placeholder addr").port();
     (port, listener)
+}
+
+async fn spawn_unix_gateway(config: String, root: &Path) -> TrustedProjectedGateway {
+    let env = EnvConfig {
+        pool_warmup_enabled: false,
+        log_level: "warn".into(),
+        ..Default::default()
+    };
+    TrustedProjectedGateway::spawn_from_yaml(
+        &config,
+        TrustedProjectedGatewayOptions {
+            env,
+            mesh_unix_socket_allowed_roots: vec![
+                root.to_str().expect("utf-8 containment root").to_string(),
+            ],
+            ..TrustedProjectedGatewayOptions::default()
+        },
+    )
+    .await
+    .expect("start trusted projected unix gateway")
 }
 
 #[tokio::test]
@@ -217,22 +226,9 @@ async fn unix_socket_backend_serves_requests_over_a_real_socket() {
             backend.path.to_str().expect("utf-8 socket path"),
         )],
         placeholder_port,
+        0,
     );
-    let gateway = TestGateway::builder()
-        .mode_file(config)
-        .log_level("warn")
-        // Keep startup deterministic: the placeholder loopback port is bound but
-        // never served, so a warmup dial against it would only add noise.
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        // Containment is fail-closed with no configured roots, so the test's own
-        // socket directory has to be admitted explicitly.
-        .env(
-            "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS",
-            root.to_str().expect("utf-8 containment root"),
-        )
-        .spawn()
-        .await
-        .expect("start gateway");
+    let mut gateway = spawn_unix_gateway(config, &root).await;
     gateway
         .wait_for_proxy_port(Duration::from_secs(10))
         .await
@@ -261,6 +257,7 @@ async fn unix_socket_backend_serves_requests_over_a_real_socket() {
         "the gateway forwards a Host header to the unix backend, got {body:?}"
     );
     assert!(backend.hits() >= 1, "the unix socket observed the request");
+    gateway.shutdown().await;
 }
 
 #[tokio::test]
@@ -268,10 +265,6 @@ async fn unix_socket_backend_serves_requests_over_a_real_socket() {
 async fn unix_socket_backend_fails_closed_when_the_socket_is_absent() {
     let temp = TempDir::new().expect("temp dir");
     let root = containment_root(&temp);
-    // Deliberately never bound: `connect(2)` yields ENOENT, which must surface
-    // as a pre-wire backend failure and NEVER as a fallback TCP dial to the
-    // placeholder port. The path IS inside the containment root, so the refusal
-    // under test is the absent socket rather than the allowlist.
     let missing = root.join("absent.sock");
     let (placeholder_port, _placeholder) = reserve_placeholder_port().await;
 
@@ -282,22 +275,9 @@ async fn unix_socket_backend_fails_closed_when_the_socket_is_absent() {
             missing.to_str().expect("utf-8 socket path"),
         )],
         placeholder_port,
+        0,
     );
-    let gateway = TestGateway::builder()
-        .mode_file(config)
-        .log_level("warn")
-        // Keep startup deterministic: the placeholder loopback port is bound but
-        // never served, so a warmup dial against it would only add noise.
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        // Containment is fail-closed with no configured roots, so the test's own
-        // socket directory has to be admitted explicitly.
-        .env(
-            "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS",
-            root.to_str().expect("utf-8 containment root"),
-        )
-        .spawn()
-        .await
-        .expect("start gateway");
+    let mut gateway = spawn_unix_gateway(config, &root).await;
     gateway
         .wait_for_proxy_port(Duration::from_secs(10))
         .await
@@ -317,11 +297,11 @@ async fn unix_socket_backend_fails_closed_when_the_socket_is_absent() {
         502,
         "a missing unix socket is a pre-wire backend failure, not a TCP fallback"
     );
+    gateway.shutdown().await;
 }
 
-/// Reload/update/delete, not just first-start construction: the same running
-/// gateway must re-point a Unix backend at a different socket and then stop
-/// routing it entirely, both driven from the live data path.
+/// Reload/update/delete via trusted `update_config` (mesh projection boundary),
+/// not SIGHUP/file-loader — operator file reload must keep rejecting `mesh.*`.
 #[cfg(unix)]
 #[tokio::test]
 #[ignore]
@@ -335,34 +315,16 @@ async fn unix_socket_backend_survives_reload_update_and_delete() {
     let alpha_path = alpha.path.to_str().expect("utf-8 socket path").to_string();
     let beta_path = beta.path.to_str().expect("utf-8 socket path").to_string();
 
-    let gateway = TestGateway::builder()
-        .mode_file(build_config(
-            &[("unix-route", "/unix", &alpha_path)],
-            placeholder_port,
-        ))
-        .log_level("warn")
-        // Keep startup deterministic: the placeholder loopback port is bound but
-        // never served, so a warmup dial against it would only add noise.
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        // Containment is fail-closed with no configured roots, so the test's own
-        // socket directory has to be admitted explicitly.
-        .env(
-            "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS",
-            root.to_str().expect("utf-8 containment root"),
-        )
-        .spawn()
-        .await
-        .expect("start gateway");
+    let mut gateway = spawn_unix_gateway(
+        build_config(&[("unix-route", "/unix", &alpha_path)], placeholder_port, 0),
+        &root,
+    )
+    .await;
     gateway
         .wait_for_proxy_port(Duration::from_secs(10))
         .await
         .expect("proxy port ready");
 
-    let config_path = gateway
-        .config_path
-        .clone()
-        .expect("file mode writes a config path");
-    let pid = gateway.pid().expect("running gateway has a pid");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -376,13 +338,16 @@ async fn unix_socket_backend_survives_reload_update_and_delete() {
     )
     .await;
 
-    // UPDATE: re-point the same route at a different socket and SIGHUP.
-    std::fs::write(
-        &config_path,
-        build_config(&[("unix-route", "/unix", &beta_path)], placeholder_port),
-    )
-    .expect("rewrite config");
-    sighup(pid);
+    // UPDATE: re-point the same route at a different socket.
+    let outcome = gateway.apply_projected_yaml(&build_config(
+        &[("unix-route", "/unix", &beta_path)],
+        placeholder_port,
+        1,
+    ));
+    assert!(
+        matches!(outcome, ConfigApplyOutcome::Applied),
+        "unix backend retarget must apply via trusted projection, got {outcome:?}"
+    );
     wait_for_body(
         &client,
         &gateway.proxy_url("/unix"),
@@ -394,12 +359,15 @@ async fn unix_socket_backend_survives_reload_update_and_delete() {
 
     // DELETE: remove the route entirely; the path must stop resolving rather
     // than keep dialing a stale socket.
-    std::fs::write(
-        &config_path,
-        build_config(&[("other-route", "/other", &alpha_path)], placeholder_port),
-    )
-    .expect("rewrite config without the unix route");
-    sighup(pid);
+    let outcome = gateway.apply_projected_yaml(&build_config(
+        &[("other-route", "/other", &alpha_path)],
+        placeholder_port,
+        2,
+    ));
+    assert!(
+        matches!(outcome, ConfigApplyOutcome::Applied),
+        "unix backend route replacement must apply via trusted projection, got {outcome:?}"
+    );
     wait_for_body(
         &client,
         &gateway.proxy_url("/unix"),
@@ -416,17 +384,5 @@ async fn unix_socket_backend_survives_reload_update_and_delete() {
         |status, body| status == 200 && body.starts_with("alpha|"),
     )
     .await;
-}
-
-#[cfg(unix)]
-fn sighup(pid: u32) {
-    let output = std::process::Command::new("kill")
-        .args(["-HUP", &pid.to_string()])
-        .output()
-        .expect("send SIGHUP to gateway");
-    assert!(
-        output.status.success(),
-        "sending SIGHUP to gateway failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    gateway.shutdown().await;
 }

@@ -92,6 +92,10 @@
   "FERRUM_NODE_AGENT_BPF_FS_PATH"
   "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR"
   "FERRUM_MESH_CAPTURE_UDP_ENABLED"
+  "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE"
+  "FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION"
+  "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM"
+  "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO"
   "FERRUM_MESH_TOPOLOGY"
   "FERRUM_NODE_AGENT_ADMIN_ENABLED"
   "FERRUM_ADMIN_BIND_ADDRESS"
@@ -303,6 +307,12 @@ spec:
             {{- if $ambientUdpProducer }}
             - name: FERRUM_MESH_CAPTURE_UDP_ENABLED
               value: "true"
+            {{- end }}
+            {{- range $migrationName := list "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE" "FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION" "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM" "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO" }}
+            {{- if hasKey $ambientEnv $migrationName }}
+            - name: {{ $migrationName }}
+              value: {{ index $ambientEnv $migrationName | quote }}
+            {{- end }}
             {{- end }}
             {{- if .Values.nodeAgent.admin.enabled }}
             - name: FERRUM_NODE_AGENT_ADMIN_ENABLED

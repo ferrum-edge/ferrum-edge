@@ -465,6 +465,33 @@ The frontend/admin live-reload poller atomically swaps a validated `rustls::Serv
 
 For backend HTTP-family TLS, keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` to pick up in-place cert/key/CA/CRL source changes and to watch backend TLS sources added by later config reloads. Database TLS can opt in with `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` in database and CP modes. CP gRPC TLS swaps the server TLS slot for new handshakes when watched source bytes change; DP gRPC TLS reconnects the CP stream with fresh client-side TLS material.
 
+### Gateway API Multi-Certificate Serving (SNI)
+
+A data plane that receives its frontend TLS material from a Kubernetes Gateway (`spec.listeners[].tls.certificateRefs`) can serve **many** certificates at once. This covers two shapes that used to be refused:
+
+- one listener naming several `certificateRefs` (for example an RSA and an ECDSA leaf, or several hostnames);
+- several Gateways in the **same namespace**, each owning its own Secret.
+
+Every authorized certificate for the data plane's namespace is installed into one SNI-aware `rustls` certificate resolver:
+
+1. **Declared listener match.** Exact listener `hostname` claims win first, followed by declared one-label wildcards. A declared name is authoritative: certificate-derived aliases from other listeners are never added as alternative signing candidates for it.
+2. **Certificate SAN alias.** When no listener hostname claims the SNI, exact DNS SANs win over one-label wildcard SANs. `*.example.com` answers `a.example.com`, but not `a.b.example.com` and not bare `example.com` (RFC 6125).
+3. **Fallback listener.** A ClientHello with no SNI, or an SNI no certificate covers, is answered from the namespace's deterministic default — the first catch-all listener (one with no `hostname`) when there is one, otherwise the first admitted listener. Gateway owners precede ListenerSet extensions, then older resources and complete listener-key order decide ties. Selection never fails a handshake merely for lack of a name match; it uses the fallback exactly as a single-certificate listener would.
+
+Each exact, wildcard, or fallback listener retains all of its certificate candidates in declared order and chooses the first signing key compatible with the ClientHello's offered signature schemes. This makes an RSA/ECDSA `certificateRefs` pair effective instead of silently pinning the first algorithm. If a name is claimed but none of its candidates is cryptographically compatible, the handshake fails closed rather than falling through to an unrelated listener's certificate.
+
+ACME TLS-ALPN-01 validation still takes precedence over SNI selection, so `acme://` order validation is unaffected.
+
+**Ownership and tenancy.** A certificate is owned by its **Gateway's** namespace, never the Secret's — a `ReferenceGrant` may authorize a Secret from elsewhere. The control plane filters the certificate set to the subscribing namespace before it leaves the CP, and the data plane re-applies the same filter on receipt, so a data plane can never observe or serve another namespace's certificate.
+
+**Collision behavior.** Two listeners in one physical Gateway namespace that declare the **same** `hostname` with **different** certificates are a conflict. The winner is deterministic — Gateway owners precede ListenerSet extensions, then the older resource (by `creationTimestamp`), then complete listener-key order — and the loser fails closed: it serves no route traffic, so a hostname is never answered by an ambiguous certificate. Gateway losers keep their `Accepted`/`ResolvedRefs` status and report `Conflicted=True` with reason `HostnameConflict`; ListenerSet conflicts follow their attachment-status contract. Several `certificateRefs` on one listener are not a conflict, and two catch-all listeners are not either — they claim no name, so both stay served and selection falls back to each certificate's own SANs.
+
+**Fail-closed loading.** A listener whose `certificateRefs` contains any reference that is missing, malformed, not a `kubernetes.io/tls` Secret, or not authorized by a `ReferenceGrant` is left entirely unmaterialized — never partially. At the data plane, if any certificate in the delivered set fails to load, parse, pair, or is expired, or if an explicit listener hostname is malformed, the whole snapshot is rejected and the previous configuration keeps serving.
+
+**Rotation and deletion.** Each source carries a content digest (`k8s://<ns>/<secret>#tls.crt?sha256=…`), so a Secret update changes the snapshot and the control plane broadcasts it; the data plane rebuilds the resolver and swaps it atomically for new handshakes. In-flight sessions keep the configuration they negotiated. Deleting a Gateway or listener withdraws exactly its own certificates; when the last Gateway certificate for the namespace goes away, the data plane restores the operator's `FERRUM_FRONTEND_TLS_*` material if any was configured.
+
+**Bounds.** At most 256 Gateway certificates are admitted per configuration snapshot and at most 4096 SNI names are indexed. Certificate admission is listener-atomic: if every `certificateRef` on one listener cannot fit, none of that listener's certificates or routes are materialized. The runtime indexes every explicit listener hostname before adding certificate-derived SAN aliases, so SAN-heavy certificates cannot displace a later listener's declared SNI mapping; only surplus SAN aliases are omitted at the name bound. A stapled OCSP response (`FERRUM_FRONTEND_TLS_OCSP_RESPONSE_SOURCE`) is bound to one certificate, so it is stapled only when the data plane serves exactly one Gateway certificate; with several it is not stapled to any and a warning is logged.
+
 ### TLS Inventory Visibility and Metrics
 
 `GET /admin/tls/inventory` collects live: it loads every configured source on each request, including private keys (parse-checked and dropped immediately), so an operator request may reach the filesystem, the Kubernetes API, and secret managers.

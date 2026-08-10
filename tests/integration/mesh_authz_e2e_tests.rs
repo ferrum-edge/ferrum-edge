@@ -96,7 +96,7 @@ fn build_mesh_authz_for_workload(
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
         frontend_tls_source_namespace: None,
-        frontend_tls_namespace_sources: Vec::new(),
+        frontend_tls_certificate_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
         http_tls_listen_ports: Default::default(),
@@ -1532,7 +1532,7 @@ async fn trust_domain_alias_accepts_baggage_principal_from_aliased_domain() {
         frontend_tls_cert_path: None,
         frontend_tls_key_path: None,
         frontend_tls_source_namespace: None,
-        frontend_tls_namespace_sources: Vec::new(),
+        frontend_tls_certificate_sources: Vec::new(),
         trust_bundles: None,
         mesh: Some(Box::new(mesh)),
         http_tls_listen_ports: Default::default(),
@@ -1823,6 +1823,39 @@ async fn stream_port_scoped_deny_ignores_non_matching_port_and_admits_relay() {
         ),
         "a DENY scoped to an unrelated port must not block the captured raw-TCP \
          inbound relay on the app port"
+    );
+}
+
+#[tokio::test]
+async fn stream_ingress_listener_port_deny_rejects_on_declared_port_not_backend() {
+    // Issue #3260: Sidecar ingress stream listeners authorize on the DECLARED
+    // listener port (orig-dst), not the defaultEndpoint backend port — matching
+    // HTTP ingress authz. A DENY scoped to the listener port must fire; a DENY
+    // scoped only to the backend port must not.
+    let deny_listener = deny_any_source_on_port("deny-ingress-listener", 16379);
+    let plugin = build_mesh_authz_for_workload(&[], vec![deny_listener]);
+
+    let mut ctx = inbound_stream_ctx(16379, CLIENT_SPIFFE);
+    ctx.metadata = None;
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut ctx).await,
+            PluginResult::Reject { .. }
+        ),
+        "a DENY on the declared ingress listener port must reject the stream"
+    );
+
+    let deny_backend_only = deny_any_source_on_port("deny-backend-only", 6379);
+    let plugin_backend = build_mesh_authz_for_workload(&[], vec![deny_backend_only]);
+    let mut ctx_listener = inbound_stream_ctx(16379, CLIENT_SPIFFE);
+    ctx_listener.metadata = None;
+    assert!(
+        matches!(
+            plugin_backend.on_stream_connect(&mut ctx_listener).await,
+            PluginResult::Continue
+        ),
+        "a DENY scoped only to the defaultEndpoint backend port must not block \
+         an ingress stream authorized on the listener port"
     );
 }
 

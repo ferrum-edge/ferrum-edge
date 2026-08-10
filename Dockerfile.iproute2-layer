@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1
+# Adds the `ip` executable required by NodeWaypoint ingress policy routing to an
+# already-packaged Debian 13 distroless Ferrum image. Only the executable and
+# its loader-resolved shared-object closure cross into the final image; no shell,
+# package manager, or iptables fallback tools are shipped.
+ARG BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot
+ARG IPROUTE2_BASE=debian:13-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+ARG IPROUTE2_VERSION=6.15.0-1
+FROM ${BASE_IMAGE} AS runtime-base
+FROM ${IPROUTE2_BASE} AS iproute2-runtime
+ARG IPROUTE2_VERSION
+COPY .github/scripts/stage_iproute2_runtime.sh /usr/local/bin/stage-iproute2-runtime
+RUN --mount=from=runtime-base,source=/,target=/distroless-root,ro \
+    /bin/sh /usr/local/bin/stage-iproute2-runtime \
+        /iproute2-root /distroless-root "${IPROUTE2_VERSION}"
+
+FROM runtime-base
+COPY --from=iproute2-runtime /iproute2-root/usr/sbin/ip /usr/sbin/ip
+COPY --from=iproute2-runtime /iproute2-root/usr/lib/ /usr/lib/
+COPY --from=iproute2-runtime /iproute2-root/usr/lib64/ /usr/lib64/

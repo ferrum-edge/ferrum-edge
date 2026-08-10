@@ -30,9 +30,9 @@
 //!   number of JWT rules (permissive-by-default semantics).
 //! - `Sidecar` — status reports the egress scope and the modeled `ingress[]`
 //!   listener count. Only ingress entries Ferrum cannot model (an inadmissible
-//!   Unix-socket path, non-loopback `defaultEndpoint`, or non-HTTP-family
-//!   protocol) remain in `deferred_fields`; resolvable listeners are
-//!   materialized.
+//!   Unix-socket path, non-loopback `defaultEndpoint`, or unrecognized/UDP
+//!   protocol) remain in `deferred_fields`; resolvable HTTP- and stream-family
+//!   listeners are materialized.
 //! - `Telemetry` — status reports which sections (tracing / metrics /
 //!   accessLogging) are present.
 //! - `WorkloadEntry` — status reports the derived SPIFFE service account
@@ -1584,13 +1584,14 @@ fn sidecar_outbound_policy_label(classified: &SidecarOutboundPolicy) -> &'static
 /// materialized and which it left deferred. Mirrors
 /// `MeshSidecarIngress::resolve` and the slice resolver's fail-closed semantics
 /// on the raw spec so the translator predicate and the status writer stay in
-/// lock-step: an entry is modeled iff its protocol is HTTP-family, its
-/// `defaultEndpoint` is either a loopback / instance-IP `host:port` or a
-/// syntactically admissible `unix://` path, and its listener port has not
-/// already been claimed by an earlier modeled entry. Inadmissible Unix paths,
-/// non-loopback endpoints, non-HTTP-family protocols, unparseable shapes, and
-/// DUPLICATE listener ports are deferred (the translator still accepts the
-/// resource; only the unmodeled entries surface here).
+/// lock-step: an entry is modeled iff its protocol is HTTP- or stream-family,
+/// its `defaultEndpoint` is either a loopback / instance-IP `host:port` or (for
+/// HTTP-family only) a syntactically admissible `unix://` path, and its listener
+/// port has not already been claimed by an earlier modeled entry. Inadmissible
+/// Unix paths, Unix endpoints paired with stream protocols, non-loopback
+/// endpoints, unrecognized/UDP protocols, unparseable shapes, and DUPLICATE
+/// listener ports are deferred (the translator still accepts the resource;
+/// only the unmodeled entries surface here).
 ///
 /// The duplicate-port dedup mirrors `resolve_selected_sidecar_ingress` in
 /// `src/modes/mesh/slice.rs`, which reserves a listener port only for the FIRST
@@ -1619,24 +1620,25 @@ fn classify_sidecar_ingress_entries(spec: &Value) -> (usize, Vec<&'static str>) 
             .get("port")
             .and_then(|p| p.get("protocol"))
             .and_then(Value::as_str);
-        // Classify through the SAME shared predicate `MeshSidecarIngress::resolve`
-        // uses (raw string → `sidecar_ingress_app_protocol` →
-        // `is_http_family_app_protocol`), so resolution and this deferred-field
-        // report never disagree. `https` is recognized HTTP-family and IS
-        // materialized — counted as modeled below — while a MISSING or
-        // UNRECOGNIZED protocol (e.g. a `HTPS` typo) maps to a non-HTTP
-        // `AppProtocol` and is reported as a deferred non-HTTP listener (it is
-        // NOT routed onto the HTTP request path), matching resolution.
-        let http_family =
+        // Classify through the SAME shared predicates `MeshSidecarIngress::resolve`
+        // uses (raw string → `sidecar_ingress_app_protocol` → HTTP/stream/modeled),
+        // so resolution and this deferred-field report never disagree. `https` is
+        // recognized HTTP-family; recognized stream protocols (`tcp`/`tls`/db) and
+        // a MISSING protocol (Istio → TCP) are stream-modeled (#3260); an
+        // UNRECOGNIZED protocol (e.g. a `HTPS` typo) maps to `Unknown` and is
+        // deferred — never guessed onto either lane.
+        let modeled_protocol =
+            crate::config_sources::k8s::sidecar_ingress_protocol_is_modeled(protocol);
+        let http_protocol =
             crate::config_sources::k8s::sidecar_ingress_protocol_is_http_family(protocol);
         let endpoint = entry
             .get("defaultEndpoint")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if !http_family {
+        if !modeled_protocol {
             push_unique(
                 &mut deferred,
-                "non-HTTP-family listener (raw-TCP inbound not modeled)",
+                "unrecognized or unsupported ingress protocol (not HTTP/stream-modeled)",
             );
             continue;
         }
@@ -1653,6 +1655,13 @@ fn classify_sidecar_ingress_entries(spec: &Value) -> (usize, Vec<&'static str>) 
         // ownership / mode checks at the dial). Applying a CP-local allowlist
         // would report a decision the data plane does not make.
         if let Some(socket_path) = endpoint.strip_prefix("unix://") {
+            if !http_protocol {
+                push_unique(
+                    &mut deferred,
+                    "unix defaultEndpoint requires an HTTP-family ingress protocol",
+                );
+                continue;
+            }
             if let Err(rejection) = crate::util::unix_socket::validate_unix_socket_path(socket_path)
             {
                 push_unique(&mut deferred, rejection.reason());
@@ -3824,10 +3833,9 @@ mod tests {
 
     #[test]
     fn sidecar_unsupported_ingress_surfaces_deferred_field() {
-        // An ADMISSIBLE unix:// listener is modeled alongside the loopback one;
-        // an INADMISSIBLE socket path and a non-HTTP-family listener stay
-        // deferred with field-specific reasons even though the resource is
-        // accepted.
+        // Admissible Unix, loopback HTTP, and loopback TCP listeners are
+        // modeled together. Inadmissible socket paths and unrecognized
+        // protocols remain deferred with field-specific reasons.
         let obj = object(
             "networking.istio.io/v1",
             "Sidecar",
@@ -3838,7 +3846,9 @@ mod tests {
                     { "port": { "number": 7000, "protocol": "GRPC" }, "defaultEndpoint": "unix:///var/run/grpc.sock" },
                     { "port": { "number": 7100, "protocol": "GRPC" }, "defaultEndpoint": "unix://../etc/passwd" },
                     { "port": { "number": 7200, "protocol": "GRPC" }, "defaultEndpoint": "unix:///var/run/padded.sock " },
-                    { "port": { "number": 6000, "protocol": "TCP" }, "defaultEndpoint": "127.0.0.1:6000" }
+                    { "port": { "number": 6000, "protocol": "TCP" }, "defaultEndpoint": "127.0.0.1:6000" },
+                    { "port": { "number": 6100, "protocol": "TCP" }, "defaultEndpoint": "unix:///var/run/tcp.sock" },
+                    { "port": { "number": 5000, "protocol": "HTPS" }, "defaultEndpoint": "127.0.0.1:5000" }
                 ]
             }),
         );
@@ -3846,8 +3856,8 @@ mod tests {
         let detail = updates[0].ferrum_detail.as_ref().unwrap();
         assert_eq!(
             detail["translation"]["ingress_modeled"].as_u64(),
-            Some(2),
-            "the loopback HTTP listener and the admissible unix:// listener are modeled"
+            Some(3),
+            "loopback HTTP, loopback TCP, and admissible unix listeners are modeled"
         );
         let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
             .as_array()
@@ -3864,8 +3874,16 @@ mod tests {
             "a padded unix-socket path must not be silently rewritten, got {deferred:?}"
         );
         assert!(
-            deferred.iter().any(|f| f.contains("non-HTTP-family")),
-            "TCP listener must be deferred, got {deferred:?}"
+            deferred
+                .iter()
+                .any(|f| f.contains("requires an HTTP-family")),
+            "a stream protocol must not be reported as modeled over unix, got {deferred:?}"
+        );
+        assert!(
+            deferred
+                .iter()
+                .any(|f| f.contains("unrecognized") || f.contains("unsupported")),
+            "mistyped protocol must be deferred, got {deferred:?}"
         );
     }
 
@@ -3932,8 +3950,41 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("non-HTTP-family")),
-            "a mistyped protocol must be reported as a deferred non-HTTP listener, got {deferred:?}"
+            deferred
+                .iter()
+                .any(|f| f.contains("unrecognized") || f.contains("unsupported")),
+            "a mistyped protocol must be reported as deferred, got {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn sidecar_tcp_ingress_is_modeled_not_deferred() {
+        // Issue #3260: a recognized TCP Sidecar ingress listener with a
+        // loopback defaultEndpoint is modeled (raw-TCP inbound relay).
+        let obj = object(
+            "networking.istio.io/v1",
+            "Sidecar",
+            "tcp-ingress-sidecar",
+            json!({
+                "ingress": [ { "port": { "number": 6379, "protocol": "TCP", "name": "redis" }, "defaultEndpoint": "127.0.0.1:6379" } ]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options_ingress_enforced());
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["ingress_modeled"].as_u64(),
+            Some(1),
+            "a TCP listener with a loopback defaultEndpoint is modeled"
+        );
+        let deferred: Vec<&str> = detail["translation"]["deferred_fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            deferred.is_empty(),
+            "a fully supported TCP ingress listener is not deferred, got {deferred:?}"
         );
     }
 
@@ -3979,16 +4030,17 @@ mod tests {
 
     #[test]
     fn sidecar_deferred_entry_does_not_reserve_port_for_later_valid_entry() {
-        // A DEFERRED entry (non-HTTP) on a port must NOT reserve that port: a
-        // later VALID entry on the same port number is still modeled — mirroring
-        // the slice resolver, which reserves a port only on a SUCCESSFUL resolve.
+        // A DEFERRED entry (unrecognized protocol) on a port must NOT reserve
+        // that port: a later VALID entry on the same port number is still
+        // modeled — mirroring the slice resolver, which reserves a port only on
+        // a SUCCESSFUL resolve.
         let obj = object(
             "networking.istio.io/v1",
             "Sidecar",
             "deferred-then-valid-sidecar",
             json!({
                 "ingress": [
-                    { "port": { "number": 8443, "protocol": "TCP" }, "defaultEndpoint": "127.0.0.1:8080" },
+                    { "port": { "number": 8443, "protocol": "HTPS" }, "defaultEndpoint": "127.0.0.1:8080" },
                     { "port": { "number": 8443, "protocol": "HTTP" }, "defaultEndpoint": "127.0.0.1:9090" }
                 ]
             }),
@@ -4007,8 +4059,10 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(
-            deferred.iter().any(|f| f.contains("non-HTTP-family")),
-            "the TCP entry is deferred as non-HTTP, got {deferred:?}"
+            deferred
+                .iter()
+                .any(|f| f.contains("unrecognized") || f.contains("unsupported")),
+            "the mistyped entry is deferred, got {deferred:?}"
         );
         assert!(
             !deferred

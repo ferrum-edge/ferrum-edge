@@ -2171,6 +2171,8 @@ async fn handle_admin_request_inner(
                 "egress_scope": egress_health,
                 "node_waypoint_observability":
                     crate::modes::mesh::node_waypoint_observability::snapshot(),
+                "udp_placement_migration":
+                    crate::proxy::udp_placement_migration::snapshot(),
             });
         }
 
