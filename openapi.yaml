@@ -193,7 +193,7 @@ paths:
         `cached_config` proxy/consumer counts,
         `database_polling` degradation, `config_rejected`, mesh state,
         `logging`, `kafka_logging`, and `ai_transcript_audit` admitted capture
-        ceilings — are
+        ceilings, and fixed-cardinality `jwks_trust` aggregates — are
         returned only when the caller presents a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originates from
         `FERRUM_METRICS_ALLOWED_CIDRS`.
@@ -203,7 +203,8 @@ paths:
         complete it returns `200 OK` with `status` set to `"ok"` or
         `"degraded"` (DB disconnected / admin writes blocked / database
         incremental polling repeatedly rejecting the same delta while serving
-        last known-good config; or, in database, control-plane, or file mode, a
+        last known-good config; an active remote JWKS store in grace; or, in
+        database, control-plane, or file mode, a
         full config load/reload rejected while the previous generation keeps
         serving — `config_rejected: true`. In database/CP, rejection is by the
         runtime-config validation contract or by typed SQL row decoding while the
@@ -218,7 +219,9 @@ paths:
         outage. In CP/DP/mesh modes, if a supervised serving
         listener later exits with an error, `/health` returns `503` with
         `status: "unavailable"`, `ready: false` durably (sticky across a later
-        readiness restore). Mesh traffic and admin listener failures use the
+        readiness restore). The same unavailable/not-ready outcome applies when
+        an active remote JWKS store's maximum-stale deadline expires. Mesh
+        traffic and admin listener failures use the
         same sticky state; authenticated responses include a sanitized
         `listener_failures` snapshot.
       tags: [Health]
@@ -11609,9 +11612,9 @@ components:
         remaining detailed fields (`timestamp`, `mode`, `database`,
         `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
         `config_rejected`, `mesh`, `listener_failures`, `logging`,
-        `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`) are
-        present only when the caller is authenticated (admin JWT, metrics bearer
-        token, or allowlisted CIDR).
+        `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`)
+        are present only when the caller is authenticated (admin JWT, metrics
+        bearer token, or allowlisted CIDR).
       required: [status, ready]
       properties:
         status:
@@ -11622,32 +11625,40 @@ components:
             `ok` — fully ready and healthy (200). Also returned for
             intentionally read-only deployments (admin API in read-only mode
             with a healthy DB) — `admin_writes_enabled` is the right signal
-            for that, not `status`.
+            for that, not `status`. With no active remote JWKS the coarse
+            status stays `ok` when otherwise healthy.
             `degraded` — ready but the configured database is currently
             unavailable (still 200; the gateway continues to serve from
-            cached config), or the admin audit pipeline cannot durably record
-            committed mutations (see `audit_pipeline`). Intentional read-only
-            mode does NOT set `degraded`.
+            cached config), the admin audit pipeline cannot durably record
+            committed mutations (see `audit_pipeline`), or an active remote
+            JWKS store is in grace after its refresh interval. Intentional
+            read-only mode does NOT set `degraded`.
             `starting` — startup not yet complete (returned with 503 and
             `ready: false`).
             `unavailable` — the gateway became ready but a supervised serving
             listener task later exited with an error (CP gRPC or admin HTTP/HTTPS
             server, a DP proxy/admin listener, or a mesh traffic/admin
             listener), or — in control-plane mode — the database config poll
-            task exited unexpectedly. This is a sticky, monotonic
-            degradation: it stays set across a later readiness restore
-            (returned with 503 and `ready: false`). CP, DP, and mesh modes
-            report it.
+            task exited unexpectedly, or an active remote JWKS store's
+            maximum-stale deadline expired. Listener/poll failures are sticky
+            and monotonic across a later readiness restore (returned with 503
+            and `ready: false`). Expired JWKS trust clears after a later
+            validated non-empty refresh. CP, DP, and mesh modes report the
+            sticky listener/poll form.
         ready:
           type: boolean
           description: |
             `true` once the gateway has finished startup AND no supervised
             serving listener (or, in control-plane mode, the database config
-            poll task) has failed unexpectedly since. While `false`, the endpoint
-            returns `503 Service Unavailable`. In CP/DP/mesh modes a post-startup
-            serving-listener failure sets `ready: false` durably (sticky) even
-            though internal startup completed. In CP mode an unexpected database
-            poll-task exit uses the same sticky not-ready path.
+            poll task) has failed unexpectedly since AND no active remote JWKS
+            store is past its maximum-stale deadline. While `false`, the
+            endpoint returns `503 Service Unavailable`. In CP/DP/mesh modes a
+            post-startup serving-listener failure sets `ready: false` durably
+            (sticky) even though internal startup completed. In CP mode an
+            unexpected database poll-task exit uses the same sticky not-ready
+            path. Active remote JWKS expiry is evaluated from a precomputed
+            O(1) aggregate with monotonic deadlines — inactive/retired entries
+            and inline JWKS never participate.
         admin_writes_enabled:
           type: boolean
           description: |
@@ -11888,6 +11899,53 @@ components:
               ack_max_bytes: 65536
               ack_timeout_ms: 1000
               sink_healthy: true
+        jwks_trust:
+          $ref: "#/components/schemas/JwksTrustHealthSnapshot"
+
+    JwksTrustHealthSnapshot:
+      type: object
+      description: |
+        Authenticated `/health`/`/status` aggregate of **active remote** JWKS
+        trust stores (issue #3739). Counts and ages are fixed-cardinality only —
+        never JWKS/discovery URLs, `kid` values, tokens, claims, credentials,
+        or key material. Inactive/retired cache entries and inline JWKS are
+        excluded. Unauthenticated probes never receive this object; they see
+        only the coarse `status`/`ready` effects (grace → degraded+ready;
+        expired → unavailable+not-ready; none → neutral).
+      required: [fresh, grace, expired, max_age_seconds]
+      properties:
+        fresh:
+          type: integer
+          format: uint64
+          description: Active remote stores still within their refresh interval.
+        grace:
+          type: integer
+          format: uint64
+          description: >
+            Active remote stores past refresh but inside `jwks_max_stale_seconds`.
+            Coarse health remains ready with `status: degraded`.
+        expired:
+          type: integer
+          format: uint64
+          description: >
+            Active remote stores past maximum-stale. Coarse health is not-ready
+            with `status: unavailable`.
+        max_age_seconds:
+          type: object
+          required: [fresh, grace, expired]
+          description: >
+            Maximum age in seconds of the last validated non-empty JWKS among
+            active remotes currently in each trust state.
+          properties:
+            fresh:
+              type: integer
+              format: uint64
+            grace:
+              type: integer
+              format: uint64
+            expired:
+              type: integer
+              format: uint64
 
     AiTranscriptAuditStatusSnapshot:
       type: object

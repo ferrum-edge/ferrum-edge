@@ -151,7 +151,7 @@ fn create_rs256_token_no_kid(claims: &Value, private_key_pem: &[u8]) -> String {
 }
 
 /// Build a JWKS JSON response from an RSA public key PEM.
-fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
+pub(super) fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
     build_rsa_jwks_from_pem_with_kid(public_key_pem, "test-key-1")
 }
 

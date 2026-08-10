@@ -11,9 +11,10 @@ use jsonwebtoken::{Algorithm, DecodingKey};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 use url::Url;
@@ -115,6 +116,22 @@ static REFRESH_FAILURE_COUNTS: [AtomicU64; 6] = [
     AtomicU64::new(0),
 ];
 
+/// Process-wide hook so the shared cache can republish the O(1) trust-health
+/// aggregate whenever a store's snapshot or policy changes.
+static TRUST_CHANGE_HOOK: OnceLock<fn()> = OnceLock::new();
+
+/// Register the shared-cache republish callback. Idempotent: the first
+/// registration wins for the process lifetime.
+pub fn register_trust_change_hook(hook: fn()) {
+    let _ = TRUST_CHANGE_HOOK.set(hook);
+}
+
+fn note_trust_change() {
+    if let Some(hook) = TRUST_CHANGE_HOOK.get() {
+        hook();
+    }
+}
+
 pub fn redacted_jwks_uri(raw: &str) -> String {
     let Ok(mut url) = Url::parse(raw) else {
         return "redacted-jwks-url".to_string();
@@ -171,6 +188,11 @@ pub struct JwksKeyStore {
     http_client: PluginHttpClient,
     fetch_lock: Arc<Mutex<()>>,
     refreshable: bool,
+    /// Completed remote refresh attempts (success or failure). Used by tests
+    /// and operators to observe forced reconfiguration refreshes without
+    /// scraping endpoint URLs.
+    refresh_completions: Arc<AtomicU64>,
+    refresh_notify: Arc<Notify>,
 }
 
 /// Raw JWKS response from the endpoint.
@@ -292,6 +314,8 @@ impl JwksKeyStore {
             http_client,
             fetch_lock: Arc::new(Mutex::new(())),
             refreshable: true,
+            refresh_completions: Arc::new(AtomicU64::new(0)),
+            refresh_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -317,6 +341,8 @@ impl JwksKeyStore {
             http_client: PluginHttpClient::default(),
             fetch_lock: Arc::new(Mutex::new(())),
             refreshable: false,
+            refresh_completions: Arc::new(AtomicU64::new(0)),
+            refresh_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -336,6 +362,68 @@ impl JwksKeyStore {
             refresh_interval,
             max_stale,
         }));
+        note_trust_change();
+    }
+
+    /// Monotonic deadline when this remote store's retained keys become
+    /// untrusted. `None` for inline stores or stores that have never succeeded.
+    pub fn expiry_deadline(&self) -> Option<Instant> {
+        if !self.refreshable {
+            return None;
+        }
+        let snapshot = self.snapshot.load();
+        let last_success = snapshot.last_success?;
+        let max_stale = self.trust_policy.load().max_stale;
+        Some(last_success + max_stale)
+    }
+
+    /// Monotonic deadline when a still-fresh remote store enters grace because
+    /// its refresh interval elapsed. Stores already in grace/expired return
+    /// `None`.
+    pub fn grace_deadline(&self) -> Option<Instant> {
+        if !self.refreshable {
+            return None;
+        }
+        let snapshot = self.snapshot.load();
+        if snapshot.last_failure.is_some() {
+            return None;
+        }
+        let last_success = snapshot.last_success?;
+        let policy = self.trust_policy.load();
+        let grace_at = last_success + policy.refresh_interval;
+        let expires_at = last_success + policy.max_stale;
+        if grace_at >= expires_at {
+            None
+        } else {
+            Some(grace_at)
+        }
+    }
+
+    /// Number of completed remote refresh attempts (success or failure).
+    pub fn refresh_completions(&self) -> u64 {
+        self.refresh_completions.load(Ordering::Acquire)
+    }
+
+    /// Wait until a remote refresh attempt completes after `before`.
+    ///
+    /// Uses the store's completion notify so callers under a paused Tokio clock
+    /// do not need to sleep through virtual time to observe a forced refresh.
+    /// Subscribe before reading the counter so a completion that races the
+    /// check cannot be lost between the load and `notified().await`.
+    pub async fn wait_for_refresh_completion_after(&self, before: u64) {
+        loop {
+            let notified = self.refresh_notify.notified();
+            if self.refresh_completions() > before {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn note_refresh_completion(&self) {
+        self.refresh_completions.fetch_add(1, Ordering::AcqRel);
+        self.refresh_notify.notify_waiters();
+        note_trust_change();
     }
 
     fn trust_state_for_snapshot(&self, snapshot: &JwksSnapshot, now: Instant) -> JwksTrustState {
@@ -480,6 +568,7 @@ impl JwksKeyStore {
             last_failure: None,
             consecutive_failures: 0,
         }));
+        self.note_refresh_completion();
         debug!("JWKS key store updated: {} keys cached", count);
         Ok(count)
     }
@@ -495,6 +584,7 @@ impl JwksKeyStore {
             last_failure: Some(class),
             consecutive_failures: current.consecutive_failures.saturating_add(1),
         }));
+        self.note_refresh_completion();
         Err(format!("JWKS refresh failed: {}", class.as_str()))
     }
 
@@ -572,7 +662,7 @@ impl JwksKeyStore {
         } else {
             interval
         };
-        tokio::spawn(async move {
+        tokio::spawn(tokio::task::unconstrained(async move {
             let mut empty_store_retry_attempt = 0;
             let mut next_refresh_at = Instant::now();
             let mut first_refresh = true;
@@ -582,6 +672,8 @@ impl JwksKeyStore {
                 // under a frozen/paused clock the timer may never become ready
                 // until time is advanced, which would miss the stricter
                 // max-stale window the reconfiguration exists to honor.
+                // `unconstrained` keeps that first fetch from being fairness-
+                // delayed behind unrelated tasks under the full/coverage matrix.
                 if !(first_refresh && force_first_refresh) {
                     tokio::time::sleep_until(next_refresh_at).await;
                 }
@@ -614,7 +706,7 @@ impl JwksKeyStore {
                     empty_store_retry_attempt = empty_store_retry_attempt.saturating_add(1);
                 }
             }
-        })
+        }))
     }
 
     /// Parse a single JWK into a cached key.

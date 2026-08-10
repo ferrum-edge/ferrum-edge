@@ -199,6 +199,18 @@ async fn policy_reconfiguration_forces_refresh_without_resetting_retained_key_ag
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(899).saturating_sub(initial_age)).await;
 
+    let before_refresh = store.health_snapshot();
+    assert_eq!(
+        before_refresh.trust_state,
+        JwksTrustState::Fresh,
+        "the retained snapshot is still nominally fresh under the original policy"
+    );
+    assert!(
+        before_refresh.last_success_age >= Some(Duration::from_secs(899)),
+        "the stricter deadline is only one second away"
+    );
+    let completions_before = store.refresh_completions();
+
     retain_active_requirements(&HashMap::from([(
         uri.clone(),
         JwksRefreshRequirement::new(Duration::from_secs(900), Duration::from_secs(900)),
@@ -211,38 +223,27 @@ async fn policy_reconfiguration_forces_refresh_without_resetting_retained_key_ag
         generation_before_policy_change + 1,
         "a changed effective policy must replace the shared refresh worker"
     );
-    let before_refresh = store.health_snapshot();
-    assert_eq!(
-        before_refresh.trust_state,
-        JwksTrustState::Fresh,
-        "the retained snapshot is still nominally fresh under the stricter policy"
-    );
-    assert!(
-        before_refresh.last_success_age >= Some(Duration::from_secs(899)),
-        "the stricter deadline is only one second away"
-    );
 
     // The replacement worker must contact the endpoint without advancing the
-    // paused clock. Wall time is only a safety bound for full-suite scheduling;
-    // progress itself must not depend on sleeping through virtual time.
-    let request_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        let request_count = server
-            .received_requests()
-            .await
-            .map(|requests| requests.len())
-            .unwrap_or(0);
-        if request_count >= 1
-            && store.health_snapshot().last_failure == Some(JwksFailureClass::Empty)
-        {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < request_deadline,
-            "policy reconfiguration did not force an immediate JWKS request"
-        );
-        tokio::task::yield_now().await;
-    }
+    // paused clock. Wait on the store's completion notify rather than a
+    // wall-clock scheduling bound so the full/coverage matrix cannot flake.
+    store
+        .wait_for_refresh_completion_after(completions_before)
+        .await;
+    assert_eq!(
+        store.health_snapshot().last_failure,
+        Some(JwksFailureClass::Empty),
+        "policy reconfiguration must force an immediate JWKS request"
+    );
+    let request_count = server
+        .received_requests()
+        .await
+        .map(|requests| requests.len())
+        .unwrap_or(0);
+    assert!(
+        request_count >= 1,
+        "policy reconfiguration must force an immediate JWKS request"
+    );
 
     let after_failed_refresh = store.health_snapshot();
     assert_eq!(
@@ -449,5 +450,99 @@ async fn discarded_candidate_does_not_reap_or_poll_active_shared_store() {
     let still_active = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
     assert!(Arc::ptr_eq(&active_store, &still_active));
 
+    clear_jwks_cache();
+}
+
+#[tokio::test]
+async fn active_remote_trust_health_transitions_and_excludes_inactive() {
+    use ferrum_edge::plugins::utils::jwks_cache::{republish_trust_health, trust_health_snapshot};
+
+    let (server, uri) = super::jwks_auth_tests::start_jwks_server(RSA_PUBLIC_PEM).await;
+    let _guard = cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let store = get_or_create_jwks_store_with_policy(
+        &uri,
+        &client(),
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+    );
+    super::jwks_auth_tests::wait_for_received_request_count(&server, 1).await;
+    let populated = std::time::Instant::now() + Duration::from_secs(2);
+    while !store.has_keys() {
+        assert!(std::time::Instant::now() < populated, "initial JWKS populate");
+        tokio::task::yield_now().await;
+    }
+
+    // Inactive cache entries must not affect readiness.
+    republish_trust_health();
+    let inactive = trust_health_snapshot();
+    assert!(inactive.ready(tokio::time::Instant::now()));
+    assert!(!inactive.degraded(tokio::time::Instant::now()));
+    assert_eq!((inactive.fresh, inactive.grace, inactive.expired), (0, 0, 0));
+
+    retain_active_requirements(&HashMap::from([(
+        uri.clone(),
+        JwksRefreshRequirement::new(Duration::from_secs(10), Duration::from_secs(30)),
+    )]));
+    let fresh = trust_health_snapshot();
+    assert_eq!((fresh.fresh, fresh.grace, fresh.expired), (1, 0, 0));
+    assert!(fresh.ready(tokio::time::Instant::now()));
+    assert!(!fresh.degraded(tokio::time::Instant::now()));
+
+    // Prevent background refresh from resetting key age while we advance through
+    // grace and expiry. Recovery re-mounts a valid document below.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [] })))
+        .mount(&server)
+        .await;
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    // Deadline comparison flips degraded without a client verification attempt.
+    let after_grace_deadline = trust_health_snapshot();
+    assert!(after_grace_deadline.ready(tokio::time::Instant::now()));
+    assert!(after_grace_deadline.degraded(tokio::time::Instant::now()));
+    republish_trust_health();
+    let grace = trust_health_snapshot();
+    assert_eq!((grace.fresh, grace.grace, grace.expired), (0, 1, 0));
+    assert!(grace.ready(tokio::time::Instant::now()));
+    assert!(grace.degraded(tokio::time::Instant::now()));
+
+    tokio::time::advance(Duration::from_secs(20)).await;
+    let after_expiry_deadline = trust_health_snapshot();
+    assert!(!after_expiry_deadline.ready(tokio::time::Instant::now()));
+    assert!(after_expiry_deadline.degraded(tokio::time::Instant::now()));
+    republish_trust_health();
+    let expired = trust_health_snapshot();
+    assert_eq!((expired.fresh, expired.grace, expired.expired), (0, 0, 1));
+    assert!(!expired.ready(tokio::time::Instant::now()));
+
+    // Recovery after a later validated non-empty refresh.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            super::jwks_auth_tests::build_rsa_jwks_from_pem(RSA_PUBLIC_PEM),
+        ))
+        .mount(&server)
+        .await;
+    let before = store.refresh_completions();
+    let fetched = store.fetch_keys().await;
+    assert!(fetched.is_ok(), "recovery refresh should succeed: {fetched:?}");
+    store.wait_for_refresh_completion_after(before).await;
+    republish_trust_health();
+    let recovered = trust_health_snapshot();
+    assert_eq!((recovered.fresh, recovered.grace, recovered.expired), (1, 0, 0));
+    assert!(recovered.ready(tokio::time::Instant::now()));
+    assert!(!recovered.degraded(tokio::time::Instant::now()));
+
+    // Removing the active registration clears remote readiness pressure.
+    retain_active_requirements(&HashMap::new());
+    let removed = trust_health_snapshot();
+    assert_eq!((removed.fresh, removed.grace, removed.expired), (0, 0, 0));
+    assert!(removed.ready(tokio::time::Instant::now()));
+
+    tokio::time::resume();
     clear_jwks_cache();
 }

@@ -6578,6 +6578,37 @@ fn health_failover_topology_and_admin_writes_openapi_parity() {
     });
     assert_component_validity(&spec, "HealthResponse", &health, true);
 
+    let jwks_trust = json!({
+        "fresh": 1,
+        "grace": 0,
+        "expired": 0,
+        "max_age_seconds": {
+            "fresh": 12,
+            "grace": 0,
+            "expired": 0
+        }
+    });
+    assert_component_validity(&spec, "JwksTrustHealthSnapshot", &jwks_trust, true);
+    assert_component_validity(
+        &spec,
+        "HealthResponse",
+        &json!({
+            "status": "ok",
+            "ready": true,
+            "jwks_trust": jwks_trust
+        }),
+        true,
+    );
+    let jwks_trust_desc = spec["components"]["schemas"]["JwksTrustHealthSnapshot"]["description"]
+        .as_str()
+        .expect("JwksTrustHealthSnapshot description");
+    assert!(
+        jwks_trust_desc.contains("active remote")
+            && jwks_trust_desc.contains("never")
+            && (jwks_trust_desc.contains("kid") || jwks_trust_desc.contains("`kid`")),
+        "jwks_trust schema must document active-remote fixed-cardinality redaction"
+    );
+
     let admin_writes = spec["components"]["schemas"]["HealthResponse"]["properties"]
         ["admin_writes_enabled"]["description"]
         .as_str()
