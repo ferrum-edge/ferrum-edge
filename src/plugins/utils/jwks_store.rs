@@ -547,10 +547,13 @@ impl JwksKeyStore {
 
     /// Replace a background task after publishing a changed refresh policy.
     ///
-    /// Unlike ordinary startup, the first iteration always contacts the
-    /// endpoint. A retained snapshot may be fresh under the new policy but
-    /// close enough to its stricter deadline that waiting a full interval
-    /// would leave it expired before the next recovery attempt.
+    /// Unlike ordinary startup, the first iteration contacts the endpoint
+    /// before waiting on the timer wheel. A retained snapshot may be fresh
+    /// under the new policy but close enough to its stricter deadline that
+    /// waiting a full interval would leave it expired before the next
+    /// recovery attempt. Skipping the initial `sleep_until` is also required
+    /// for correctness under a paused Tokio clock: `sleep_until(now)` is not
+    /// guaranteed to fire until time advances past the deadline.
     pub(crate) fn start_background_refresh_after_policy_change(
         &self,
         interval: Duration,
@@ -574,7 +577,14 @@ impl JwksKeyStore {
             let mut next_refresh_at = Instant::now();
             let mut first_refresh = true;
             loop {
-                tokio::time::sleep_until(next_refresh_at).await;
+                // Policy reconfiguration must hit the endpoint immediately.
+                // Do not register a zero-delay timer for that first pass —
+                // under a frozen/paused clock the timer may never become ready
+                // until time is advanced, which would miss the stricter
+                // max-stale window the reconfiguration exists to honor.
+                if !(first_refresh && force_first_refresh) {
+                    tokio::time::sleep_until(next_refresh_at).await;
+                }
                 let fetch_started_at = Instant::now();
 
                 let fetch_result = if first_refresh && !force_first_refresh {

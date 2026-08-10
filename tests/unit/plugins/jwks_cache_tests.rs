@@ -194,6 +194,8 @@ async fn policy_reconfiguration_forces_refresh_without_resetting_retained_key_ag
         .health_snapshot()
         .last_success_age
         .expect("the initial fetch records key age");
+    let (_, generation_before_policy_change) =
+        cached_refresh_state(&uri).expect("shared store remains cached");
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(899).saturating_sub(initial_age)).await;
 
@@ -201,6 +203,14 @@ async fn policy_reconfiguration_forces_refresh_without_resetting_retained_key_ag
         uri.clone(),
         JwksRefreshRequirement::new(Duration::from_secs(900), Duration::from_secs(900)),
     )]));
+    let (interval_after_change, generation_after_policy_change) =
+        cached_refresh_state(&uri).expect("shared store remains cached");
+    assert_eq!(interval_after_change, Duration::from_secs(900));
+    assert_eq!(
+        generation_after_policy_change,
+        generation_before_policy_change + 1,
+        "a changed effective policy must replace the shared refresh worker"
+    );
     let before_refresh = store.health_snapshot();
     assert_eq!(
         before_refresh.trust_state,
@@ -212,6 +222,9 @@ async fn policy_reconfiguration_forces_refresh_without_resetting_retained_key_ag
         "the stricter deadline is only one second away"
     );
 
+    // The replacement worker must contact the endpoint without advancing the
+    // paused clock. Wall time is only a safety bound for full-suite scheduling;
+    // progress itself must not depend on sleeping through virtual time.
     let request_deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         let request_count = server
