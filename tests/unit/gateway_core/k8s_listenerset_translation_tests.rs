@@ -799,6 +799,83 @@ fn gateway_https_catch_all_and_hostname_siblings_stay_materializable() {
 }
 
 #[test]
+fn duplicate_gateway_listener_section_fails_closed() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([
+        {
+            "name": "a-primary",
+            "port": 80,
+            "protocol": "HTTP",
+            "hostname": "shared.example.com",
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        },
+        {
+            "name": "b-duplicate",
+            "port": 80,
+            "protocol": "HTTP",
+            "hostname": "shared.example.com",
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        }
+    ]);
+    let objects = vec![
+        gateway_class(),
+        gateway,
+        service("backend"),
+        http_route(
+            "duplicate-section-route",
+            json!([{
+                "name": "edge",
+                "sectionName": "b-duplicate"
+            }]),
+            "shared.example.com",
+            "/must-not-materialize",
+        ),
+    ];
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert!(translation.warnings.iter().any(|warning| {
+        warning.contains("Gateway default/edge listener b-duplicate rejected: HostnameConflict")
+    }));
+    assert!(
+        !translation.config.proxies.iter().any(|proxy| proxy
+            .listen_path
+            .as_deref()
+            .is_some_and(|path| path.contains("must-not-materialize"))),
+        "a route attached to a duplicate Gateway section must not materialize"
+    );
+}
+
+#[test]
+fn incompatible_gateway_listener_protocol_fails_closed() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([
+        {
+            "name": "a-http",
+            "port": 80,
+            "protocol": "HTTP",
+            "allowedRoutes": { "namespaces": { "from": "Same" } }
+        },
+        {
+            "name": "b-tcp",
+            "port": 80,
+            "protocol": "TCP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "TCPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        }
+    ]);
+    let objects = vec![gateway_class(), gateway];
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert!(translation.warnings.iter().any(|warning| {
+        warning.contains("Gateway default/edge listener b-tcp rejected: ProtocolConflict")
+    }));
+}
+
+#[test]
 fn listenerset_section_name_and_allowed_routes_gates() {
     let objects = vec![
         gateway_class(),
