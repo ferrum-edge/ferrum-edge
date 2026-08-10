@@ -361,65 +361,96 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
                     right.key.listener.as_str(),
                 ))
         });
-        let mut accepted: Vec<&ConflictCandidate> = Vec::new();
+
+        // ProtocolConflict is physical and order-independent: for each
+        // parent-Gateway + numeric-port domain, if any eligible HTTP-family
+        // claim coexists with any eligible raw TCP/TLS-stream claim, every
+        // eligible claim in those two TCP families is refused. UDP is a
+        // separate transport and is never withdrawn by this rule. A sequential
+        // accept/remove walk is wrong for 3+ claims (HTTP, TCP, HTTP): removing
+        // the first pair from `accepted` would let a later same-family sibling
+        // survive depending on listener/name order.
+        let mut tcp_family_by_port: BTreeMap<u64, Vec<&ConflictCandidate>> = BTreeMap::new();
         for candidate in candidates.iter() {
             if !candidate.eligible {
                 continue;
             }
-            // HostnameConflict keeps precedence (only the later claim loses).
-            // ProtocolConflict is physical across incompatible TCP datapath
-            // families (HTTP-family vs raw stream): every involved claim is
-            // refused — never an ordering-dependent winner. Distinct Gateway
-            // hostnames (including catch-all plus named siblings) do not
-            // conflict because `hostnames_conflict` only matches equal values.
-            // Plaintext-vs-TLS HTTP-family refusal stays in
-            // `refuse_incompatible_same_port_listeners` so messages stay one
-            // decision per physical shape.
+            match listener_port_family(candidate.protocol.as_str()) {
+                Some(ListenerPortFamily::Http | ListenerPortFamily::TcpStream) => {
+                    tcp_family_by_port
+                        .entry(candidate.port)
+                        .or_default()
+                        .push(candidate);
+                }
+                Some(ListenerPortFamily::Udp) | None => {}
+            }
+        }
+        for port_candidates in tcp_family_by_port.values() {
+            let has_http = port_candidates.iter().any(|candidate| {
+                listener_port_family(candidate.protocol.as_str()) == Some(ListenerPortFamily::Http)
+            });
+            let has_tcp_stream = port_candidates.iter().any(|candidate| {
+                listener_port_family(candidate.protocol.as_str())
+                    == Some(ListenerPortFamily::TcpStream)
+            });
+            if has_http && has_tcp_stream {
+                for candidate in port_candidates {
+                    conflicted.insert(candidate.key.clone(), "ProtocolConflict");
+                }
+            }
+        }
+
+        // HostnameConflict keeps Gateway→ListenerSet precedence (only the later
+        // claim loses) among otherwise compatible same-protocol claims that
+        // survived family arbitration. Distinct Gateway hostnames (including
+        // catch-all plus named siblings) do not conflict because
+        // `hostnames_conflict` only matches equal values. Plaintext-vs-TLS
+        // HTTP-family refusal stays in `refuse_incompatible_same_port_listeners`
+        // so messages stay one decision per physical shape.
+        let mut accepted: Vec<&ConflictCandidate> = Vec::new();
+        for candidate in candidates.iter() {
+            if !candidate.eligible || conflicted.contains_key(&candidate.key) {
+                continue;
+            }
             if let Some(reason) = conflict_against_accepted(candidate, &accepted) {
                 conflicted.insert(candidate.key.clone(), reason);
-                if reason == "ProtocolConflict" {
-                    let prior_keys: Vec<GatewayApiListenerKey> = accepted
-                        .iter()
-                        .filter(|prior| {
-                            prior.port == candidate.port
-                                && protocols_physically_conflict(
-                                    prior.protocol.as_str(),
-                                    candidate.protocol.as_str(),
-                                )
-                        })
-                        .map(|prior| prior.key.clone())
-                        .collect();
-                    for prior_key in &prior_keys {
-                        conflicted.insert(prior_key.clone(), reason);
-                    }
-                    accepted.retain(|prior| !prior_keys.iter().any(|key| key == &prior.key));
-                }
                 continue;
             }
             accepted.push(candidate);
         }
     }
 
-    // One deterministic ProtocolConflict message per port so Gateway status
-    // and translator warnings agree regardless of admission order.
-    let mut protocol_conflict_ports: BTreeMap<u64, Vec<GatewayApiListenerKey>> = BTreeMap::new();
+    // One deterministic ProtocolConflict message per parent Gateway + port so
+    // independent Gateways/namespaces that share a numeric port never combine
+    // object keys into one status string (false evidence / name disclosure).
+    // ListenerSet claims use the managed parent Gateway from policy.
+    let mut protocol_conflict_domains: BTreeMap<(String, String, u64), Vec<GatewayApiListenerKey>> =
+        BTreeMap::new();
     for (key, reason) in &conflicted {
         if *reason != "ProtocolConflict" {
             continue;
         }
-        let Some(port) = acc
-            .gateway_api_listener_policies
-            .get(key)
-            .and_then(|policy| policy.port)
-        else {
+        let Some(policy) = acc.gateway_api_listener_policies.get(key) else {
             continue;
         };
-        protocol_conflict_ports
-            .entry(port)
+        let Some(port) = policy.port else {
+            continue;
+        };
+        let parent = match key.parent_kind {
+            GatewayApiListenerParentKind::Gateway => {
+                (key.namespace.clone(), key.gateway.clone())
+            }
+            GatewayApiListenerParentKind::ListenerSet => match &policy.parent_gateway {
+                Some(parent) => parent.clone(),
+                None => continue,
+            },
+        };
+        protocol_conflict_domains
+            .entry((parent.0, parent.1, port))
             .or_default()
             .push(key.clone());
     }
-    for keys in protocol_conflict_ports.values_mut() {
+    for keys in protocol_conflict_domains.values_mut() {
         keys.sort();
     }
 
@@ -444,20 +475,18 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
         // while no traffic materializes.
         let message = match *reason {
             "ProtocolConflict" => {
-                let port = protocol_conflict_ports
-                    .iter()
-                    .find(|(_, keys)| keys.iter().any(|conflicted_key| conflicted_key == key))
-                    .map(|(port, _)| *port);
-                let listeners = port
-                    .and_then(|port| protocol_conflict_ports.get(&port))
-                    .map(|keys| {
+                let domain = protocol_conflict_domains.iter().find(|(_, keys)| {
+                    keys.iter().any(|conflicted_key| conflicted_key == key)
+                });
+                let listeners = domain
+                    .map(|(_, keys)| {
                         keys.iter()
                             .map(ToString::to_string)
                             .collect::<Vec<_>>()
                             .join(", ")
                     })
                     .unwrap_or_else(|| key.to_string());
-                let port = port.unwrap_or(0);
+                let port = domain.map(|((_, _, port), _)| *port).unwrap_or(0);
                 format!(
                     "Gateway API listeners [{listeners}] claim port {port} with incompatible \
                      protocol families on the same TCP transport (HTTP-family vs raw stream), \
@@ -684,9 +713,8 @@ fn conflict_against_accepted(
         if prior.port != candidate.port {
             continue;
         }
-        if protocols_physically_conflict(prior.protocol.as_str(), candidate.protocol.as_str()) {
-            return Some("ProtocolConflict");
-        }
+        // ProtocolConflict (HTTP-family vs raw TCP/TLS stream) is decided
+        // order-independently per parent-Gateway + port before this walk.
         // Same protocol family: hostname distinctness only. HTTP vs HTTPS on
         // one port is plaintext-vs-TLS physical refusal owned by
         // `refuse_incompatible_same_port_listeners`, not a family conflict.
@@ -720,19 +748,6 @@ fn listener_port_family(protocol: &str) -> Option<ListenerPortFamily> {
         "UDP" => Some(ListenerPortFamily::Udp),
         _ => None,
     }
-}
-
-fn protocols_physically_conflict(left: &str, right: &str) -> bool {
-    matches!(
-        (listener_port_family(left), listener_port_family(right)),
-        (
-            Some(ListenerPortFamily::Http),
-            Some(ListenerPortFamily::TcpStream)
-        ) | (
-            Some(ListenerPortFamily::TcpStream),
-            Some(ListenerPortFamily::Http)
-        )
-    )
 }
 
 fn hostnames_conflict(left: Option<&str>, right: Option<&str>) -> bool {
