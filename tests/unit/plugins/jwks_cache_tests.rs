@@ -6,11 +6,18 @@ use ferrum_edge::plugins::utils::jwks_cache::{
     render_prometheus, retain_active_requirements, retain_active_uris,
     retire_jwks_store_if_unreferenced,
 };
-use ferrum_edge::plugins::utils::jwks_store::{DEFAULT_JWKS_MAX_STALE_SECONDS, JwksKeyStore};
+use ferrum_edge::plugins::utils::jwks_store::{
+    DEFAULT_JWKS_MAX_STALE_SECONDS, JwksFailureClass, JwksKeyStore, JwksTrustState,
+};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
+use wiremock::matchers::method;
+use wiremock::{Mock, ResponseTemplate};
+
+const RSA_PUBLIC_PEM: &[u8] = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
 
 fn client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -152,6 +159,95 @@ async fn shared_store_uses_strictest_max_stale_and_relaxes_only_on_reconcile() {
     assert!(!metrics.contains(&uri));
     assert!(!metrics.contains("token=secret"));
 
+    clear_jwks_cache();
+}
+
+#[tokio::test]
+async fn policy_reconfiguration_forces_refresh_without_resetting_retained_key_age() {
+    let (server, uri) = super::jwks_auth_tests::start_jwks_server(RSA_PUBLIC_PEM).await;
+    let _guard = cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let store = get_or_create_jwks_store_with_policy(
+        &uri,
+        &client(),
+        Duration::from_secs(3_600),
+        Duration::from_secs(3_600),
+    );
+    super::jwks_auth_tests::wait_for_received_request_count(&server, 1).await;
+    let initial_fetch_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !store.has_keys() {
+        assert!(
+            std::time::Instant::now() < initial_fetch_deadline,
+            "initial JWKS response did not populate the shared store"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [] })))
+        .mount(&server)
+        .await;
+
+    let initial_age = store
+        .health_snapshot()
+        .last_success_age
+        .expect("the initial fetch records key age");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(899).saturating_sub(initial_age)).await;
+
+    retain_active_requirements(&HashMap::from([(
+        uri.clone(),
+        JwksRefreshRequirement::new(Duration::from_secs(900), Duration::from_secs(900)),
+    )]));
+    let before_refresh = store.health_snapshot();
+    assert_eq!(
+        before_refresh.trust_state,
+        JwksTrustState::Fresh,
+        "the retained snapshot is still nominally fresh under the stricter policy"
+    );
+    assert!(
+        before_refresh.last_success_age >= Some(Duration::from_secs(899)),
+        "the stricter deadline is only one second away"
+    );
+
+    let request_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let request_count = server
+            .received_requests()
+            .await
+            .map(|requests| requests.len())
+            .unwrap_or(0);
+        if request_count >= 1
+            && store.health_snapshot().last_failure == Some(JwksFailureClass::Empty)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < request_deadline,
+            "policy reconfiguration did not force an immediate JWKS request"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let after_failed_refresh = store.health_snapshot();
+    assert_eq!(
+        after_failed_refresh.last_failure,
+        Some(JwksFailureClass::Empty)
+    );
+    assert!(
+        after_failed_refresh.last_success_age >= before_refresh.last_success_age,
+        "restarting the worker must not reset the retained snapshot's key age"
+    );
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        store.health_snapshot().trust_state,
+        JwksTrustState::Expired
+    );
+
+    tokio::time::resume();
     clear_jwks_cache();
 }
 

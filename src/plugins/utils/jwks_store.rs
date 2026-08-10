@@ -542,6 +542,27 @@ impl JwksKeyStore {
     /// based on fetch start time; every failed refresh (including an empty 200)
     /// retries on a short capped backoff without advancing key trust.
     pub fn start_background_refresh(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
+        self.start_background_refresh_task(interval, false)
+    }
+
+    /// Replace a background task after publishing a changed refresh policy.
+    ///
+    /// Unlike ordinary startup, the first iteration always contacts the
+    /// endpoint. A retained snapshot may be fresh under the new policy but
+    /// close enough to its stricter deadline that waiting a full interval
+    /// would leave it expired before the next recovery attempt.
+    pub(crate) fn start_background_refresh_after_policy_change(
+        &self,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        self.start_background_refresh_task(interval, true)
+    }
+
+    fn start_background_refresh_task(
+        &self,
+        interval: Duration,
+        force_first_refresh: bool,
+    ) -> tokio::task::JoinHandle<()> {
         let store = self.clone();
         let interval = if interval.is_zero() {
             Duration::from_secs(1)
@@ -556,7 +577,7 @@ impl JwksKeyStore {
                 tokio::time::sleep_until(next_refresh_at).await;
                 let fetch_started_at = Instant::now();
 
-                let fetch_result = if first_refresh {
+                let fetch_result = if first_refresh && !force_first_refresh {
                     store.fetch_keys_if_empty().await
                 } else {
                     store.fetch_keys().await

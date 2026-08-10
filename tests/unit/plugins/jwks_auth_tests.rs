@@ -236,7 +236,7 @@ fn parse_asn1_length(data: &[u8]) -> (usize, usize) {
 }
 
 /// Helper: start a wiremock server serving a JWKS endpoint and return (server, jwks_uri).
-async fn start_jwks_server(public_key_pem: &[u8]) -> (wiremock::MockServer, String) {
+pub(super) async fn start_jwks_server(public_key_pem: &[u8]) -> (wiremock::MockServer, String) {
     let mock_server = wiremock::MockServer::start().await;
     let jwks_json = build_rsa_jwks_from_pem(public_key_pem);
     let jwks_path = unique_jwks_path("jwks");
@@ -249,7 +249,10 @@ async fn start_jwks_server(public_key_pem: &[u8]) -> (wiremock::MockServer, Stri
     (mock_server, jwks_uri)
 }
 
-async fn wait_for_received_request_count(server: &wiremock::MockServer, at_least: usize) -> usize {
+pub(super) async fn wait_for_received_request_count(
+    server: &wiremock::MockServer,
+    at_least: usize,
+) -> usize {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
     loop {
         let count = server

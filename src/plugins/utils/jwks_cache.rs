@@ -149,7 +149,7 @@ fn reconfigure_refresh_policy(
     entry.refresh_handle.abort();
     entry.refresh_handle = entry
         .store
-        .start_background_refresh(requirement.refresh_interval);
+        .start_background_refresh_after_policy_change(requirement.refresh_interval);
     entry.requirement = requirement;
     entry.refresh_generation = entry.refresh_generation.wrapping_add(1);
     info!(
