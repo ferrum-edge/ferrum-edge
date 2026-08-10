@@ -6090,14 +6090,20 @@ impl PluginCache {
         config: &GatewayConfig,
     ) -> Result<Arc<PluginCacheInner>, String> {
         let current = self.inner.load();
-        Self::build_inner_with_prior_states(
+        let jwks_rollback = StagedJwksPolicyRollback::for_published(&current);
+        let inner = Self::build_inner_with_prior_states(
             config,
             &self.http_client,
             &current.adaptive_concurrency_instances,
             &current.tcp_connection_throttle_instances,
             &current.proxy_lifecycle_generations,
             current.proxy_lifecycle_generation_high_water,
-        )
+        )?;
+        // A successful candidate remains protected by its publication site's
+        // outer rollback guard. This inner guard exists for build failures that
+        // occur before those sites receive a candidate to publish.
+        jwks_rollback.disarm();
+        Ok(inner)
     }
 
     pub(crate) fn store_inner(&self, inner: Arc<PluginCacheInner>) {
@@ -6549,6 +6555,11 @@ impl PluginCache {
         restrict_country_mmdb_refresh_to_rebuild_scope: bool,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
+        // All candidate plugin maps are declared after this guard, so an error
+        // drops their shared-store references before restoring the exact live
+        // requirements. Outer publication guards remain responsible for an
+        // otherwise valid candidate that is abandoned after this returns.
+        let jwks_rollback = StagedJwksPolicyRollback::for_published(current);
         let mut plugin_errors: Vec<String> = Vec::new();
         let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
@@ -7290,7 +7301,7 @@ impl PluginCache {
         let node_waypoint_destination_authz_ready =
             compute_node_waypoint_destination_authz_ready(config, &new_global_proto);
 
-        Ok(Arc::new(PluginCacheInner::new(
+        let inner = Arc::new(PluginCacheInner::new(
             new_map,
             new_globals,
             new_buffering,
@@ -7314,7 +7325,9 @@ impl PluginCache {
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
             mesh_bpf_metrics_exporter,
-        )))
+        ));
+        jwks_rollback.disarm();
+        Ok(inner)
     }
 
     pub fn apply_delta(
