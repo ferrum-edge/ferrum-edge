@@ -240,8 +240,14 @@ async fn empty_fetch_expires_bounded_trust_and_valid_recovery_restores_it() {
     assert_eq!(expired.trust_state, JwksTrustState::Expired);
     assert_eq!(expired.last_failure, Some(JwksFailureClass::Empty));
     assert_eq!(expired.consecutive_failures, 2);
-    assert!(store.has_keys(), "expiry must preserve retained recovery state");
-    assert!(store.get_key("k1").is_none(), "expired keys must not verify");
+    assert!(
+        store.has_keys(),
+        "expiry must preserve retained recovery state"
+    );
+    assert!(
+        store.get_key("k1").is_none(),
+        "expired keys must not verify"
+    );
 
     server.reset().await;
     let recovered = json!({

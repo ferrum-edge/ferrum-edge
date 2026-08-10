@@ -31,9 +31,7 @@ use super::utils::jwks_cache::{
     DiscoveryStoreCandidate, JwksRefreshRequirement, get_or_create_jwks_store,
     last_discovered_jwks_uri, remember_discovered_jwks_uri, retire_jwks_store_if_unreferenced,
 };
-pub use super::utils::jwks_store::{
-    DEFAULT_JWKS_MAX_STALE_SECONDS, MAX_JWKS_MAX_STALE_SECONDS,
-};
+pub use super::utils::jwks_store::{DEFAULT_JWKS_MAX_STALE_SECONDS, MAX_JWKS_MAX_STALE_SECONDS};
 use super::utils::jwks_store::{JwksKeyStore, redacted_jwks_uri};
 use super::utils::jwt_verifier::{JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks};
 use super::utils::response_body::read_response_body_bounded;
@@ -1193,10 +1191,7 @@ impl super::Plugin for JwksAuth {
                     .map(|store| {
                         (
                             store.jwks_uri().to_string(),
-                            JwksRefreshRequirement::new(
-                                self.refresh_interval,
-                                provider.max_stale,
-                            ),
+                            JwksRefreshRequirement::new(self.refresh_interval, provider.max_stale),
                         )
                     })
             })

@@ -338,11 +338,7 @@ impl JwksKeyStore {
         }));
     }
 
-    fn trust_state_for_snapshot(
-        &self,
-        snapshot: &JwksSnapshot,
-        now: Instant,
-    ) -> JwksTrustState {
+    fn trust_state_for_snapshot(&self, snapshot: &JwksSnapshot, now: Instant) -> JwksTrustState {
         if !self.refreshable {
             return if snapshot.keys.is_empty() {
                 JwksTrustState::Expired
@@ -692,10 +688,7 @@ fn refresh_delay_after_attempt(
     if refresh_succeeded {
         interval
     } else {
-        std::cmp::min(
-            interval,
-            empty_store_retry_interval(failed_refresh_attempt),
-        )
+        std::cmp::min(interval, empty_store_retry_interval(failed_refresh_attempt))
     }
 }
 

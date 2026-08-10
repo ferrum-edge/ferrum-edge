@@ -2999,8 +2999,7 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
         json!(ferrum_edge::plugins::jwks_auth::MAX_JWKS_MAX_STALE_SECONDS)
     );
     assert_eq!(
-        schema["properties"]["providers"]["items"]["properties"]
-            ["jwks_max_stale_seconds"]["maximum"],
+        schema["properties"]["providers"]["items"]["properties"]["jwks_max_stale_seconds"]["maximum"],
         json!(ferrum_edge::plugins::jwks_auth::MAX_JWKS_MAX_STALE_SECONDS)
     );
     assert_eq!(

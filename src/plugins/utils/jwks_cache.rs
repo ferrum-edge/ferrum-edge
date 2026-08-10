@@ -21,9 +21,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use super::PluginHttpClient;
-use super::jwks_store::{
-    JwksFailureClass, JwksKeyStore, JwksTrustState, redacted_jwks_uri,
-};
+use super::jwks_store::{JwksFailureClass, JwksKeyStore, JwksTrustState, redacted_jwks_uri};
 
 /// Effective requirements contributed by one active shared-store consumer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,10 +143,9 @@ fn reconfigure_refresh_policy(
         return;
     }
     let previous = entry.requirement;
-    entry.store.configure_trust_policy(
-        requirement.refresh_interval,
-        requirement.max_stale,
-    );
+    entry
+        .store
+        .configure_trust_policy(requirement.refresh_interval, requirement.max_stale);
     entry.refresh_handle.abort();
     entry.refresh_handle = entry
         .store
@@ -167,9 +164,7 @@ fn reconfigure_refresh_policy(
 
 /// Reconcile the shared cache against the exact strictest requirement of the
 /// newly committed plugin generation, then retire unreferenced stores.
-pub fn retain_active_requirements(
-    active_requirements: &HashMap<String, JwksRefreshRequirement>,
-) {
+pub fn retain_active_requirements(active_requirements: &HashMap<String, JwksRefreshRequirement>) {
     let cache = global_cache();
     cache.retain(|uri, entry| {
         if let Some(requirement) = active_requirements.get(uri) {
@@ -403,8 +398,8 @@ pub fn render_prometheus() -> String {
         }
         if let Some(class) = health.last_failure {
             let class_index = class.index();
-            max_consecutive_failures[class_index] = max_consecutive_failures[class_index]
-                .max(u64::from(health.consecutive_failures));
+            max_consecutive_failures[class_index] =
+                max_consecutive_failures[class_index].max(u64::from(health.consecutive_failures));
         }
     }
 
