@@ -18,7 +18,6 @@
 use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::config::db_backend::{
     NamespacedResourceId, namespaced_runtime_key, write_namespaced_runtime_key,

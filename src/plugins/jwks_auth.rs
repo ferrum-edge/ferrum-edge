@@ -1207,6 +1207,7 @@ impl super::Plugin for JwksAuth {
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_discovery_task(
     runtime: &tokio::runtime::Handle,
     slot: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
