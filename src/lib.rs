@@ -1281,6 +1281,9 @@ pub mod _test_support {
                 jwks_uri,
                 &http_client,
                 refresh_interval,
+                Duration::from_secs(
+                    crate::plugins::utils::jwks_store::DEFAULT_JWKS_MAX_STALE_SECONDS,
+                ),
             ),
         )
     }

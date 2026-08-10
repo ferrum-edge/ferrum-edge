@@ -28,8 +28,11 @@ use super::utils::claim_resolver::{
 };
 use super::utils::dpop::{self, DpopJtiCache, DpopVerifyInput};
 use super::utils::jwks_cache::{
-    DiscoveryStoreCandidate, get_or_create_jwks_store, last_discovered_jwks_uri,
-    remember_discovered_jwks_uri, retire_jwks_store_if_unreferenced,
+    DiscoveryStoreCandidate, JwksRefreshRequirement, get_or_create_jwks_store,
+    last_discovered_jwks_uri, remember_discovered_jwks_uri, retire_jwks_store_if_unreferenced,
+};
+pub use super::utils::jwks_store::{
+    DEFAULT_JWKS_MAX_STALE_SECONDS, MAX_JWKS_MAX_STALE_SECONDS,
 };
 use super::utils::jwks_store::{JwksKeyStore, redacted_jwks_uri};
 use super::utils::jwt_verifier::{JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks};
@@ -44,6 +47,7 @@ use super::{JwtAuthAttributeValue, PluginResult, RequestContext};
 
 /// Default JWKS refresh interval: 15 minutes.
 pub const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
+pub const MAX_JWKS_REFRESH_INTERVAL_SECS: u64 = MAX_JWKS_MAX_STALE_SECONDS;
 pub const DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES: usize = 10_000;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_DISCOVERED_JWKS_URI_BYTES: usize = 8 * 1024;
@@ -163,6 +167,8 @@ struct JwksProvider {
     dpop_jti_cache: Option<Arc<DpopJtiCache>>,
     /// The JWKS key store (shared via global cache).
     jwks_store: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
+    /// Maximum monotonic age of the last validated non-empty remote JWKS.
+    max_stale: Duration,
     jwks_source: JwksSource,
     /// Outbound hosts used by direct JWKS or discovery URLs.
     warmup_hostnames: Vec<String>,
@@ -185,6 +191,7 @@ const CONFIG_FIELDS: &[&str] = &[
     "emit_mesh_request_principal_metadata",
     "require_exp",
     "jwks_refresh_interval_secs",
+    "jwks_max_stale_seconds",
 ];
 
 const PROVIDER_FIELDS: &[&str] = &[
@@ -211,6 +218,7 @@ const PROVIDER_FIELDS: &[&str] = &[
     "dpop_clock_skew_secs",
     "dpop_jti_cache_max_entries",
     "dpop_jti_ttl_secs",
+    "jwks_max_stale_seconds",
 ];
 
 impl Drop for JwksAuth {
@@ -271,7 +279,18 @@ impl JwksAuth {
                 "jwks_auth: 'jwks_refresh_interval_secs' must be greater than 0".to_string(),
             );
         }
+        if refresh_interval_secs > MAX_JWKS_REFRESH_INTERVAL_SECS {
+            return Err(format!(
+                "jwks_auth: 'jwks_refresh_interval_secs' must be <= {MAX_JWKS_REFRESH_INTERVAL_SECS}"
+            ));
+        }
         let refresh_interval = Duration::from_secs(refresh_interval_secs);
+        let default_max_stale_seconds = optional_u64(
+            config_obj,
+            "jwks_max_stale_seconds",
+            DEFAULT_JWKS_MAX_STALE_SECONDS,
+        )?;
+        validate_max_stale_seconds("jwks_max_stale_seconds", default_max_stale_seconds)?;
 
         let global_scope_claim = optional_claim_path(config_obj, "scope_claim", "scope")?;
         let global_role_claim = optional_claim_path(config_obj, "role_claim", "roles")?;
@@ -313,6 +332,13 @@ impl JwksAuth {
             let jwks_endpoint = parse_url_field(prov_obj, "jwks_uri", idx)?;
             let discovery_endpoint = parse_url_field(prov_obj, "discovery_url", idx)?;
             let inline_jwks = parse_inline_jwks(prov_obj, idx)?;
+            let provider_max_stale_seconds =
+                optional_provider_u64(prov_obj, "jwks_max_stale_seconds", idx)?
+                    .unwrap_or(default_max_stale_seconds);
+            validate_max_stale_seconds(
+                &format!("provider[{idx}].jwks_max_stale_seconds"),
+                provider_max_stale_seconds,
+            )?;
             let jwks_uri = jwks_endpoint.as_ref().map(|endpoint| endpoint.url.clone());
             let discovery_url = discovery_endpoint
                 .as_ref()
@@ -333,6 +359,17 @@ impl JwksAuth {
                     idx
                 ));
             }
+            if inline_jwks.is_some() && prov_obj.contains_key("jwks_max_stale_seconds") {
+                return Err(format!(
+                    "jwks_auth: 'provider[{idx}].jwks_max_stale_seconds' applies only to remote JWKS sources"
+                ));
+            }
+            if inline_jwks.is_none() && refresh_interval_secs > provider_max_stale_seconds {
+                return Err(format!(
+                    "jwks_auth: 'jwks_refresh_interval_secs' must be <= the effective provider[{idx}] jwks_max_stale_seconds"
+                ));
+            }
+            let provider_max_stale = Duration::from_secs(provider_max_stale_seconds);
 
             let issuer = optional_non_empty_string(prov_obj, "issuer", idx)?;
             let audiences = parse_audiences(prov_obj, idx)?;
@@ -417,6 +454,7 @@ impl JwksAuth {
                 // offline validation needs no Tokio runtime. Runtime startup
                 // replaces it with the process-wide shared store.
                 let store = JwksKeyStore::new(uri.clone(), http_client.clone());
+                store.configure_trust_policy(refresh_interval, provider_max_stale);
                 jwks_store_slot.store(Arc::new(Some(Arc::new(store))));
                 JwksSource::Direct(uri.clone())
             } else if let Some(ref disc_url) = discovery_url {
@@ -446,6 +484,7 @@ impl JwksAuth {
                 dpop_clock_skew: Duration::from_secs(dpop_clock_skew_secs),
                 dpop_jti_cache,
                 jwks_store: jwks_store_slot,
+                max_stale: provider_max_stale,
                 jwks_source,
                 warmup_hostnames,
             });
@@ -1014,8 +1053,12 @@ impl super::Plugin for JwksAuth {
             match &provider.jwks_source {
                 JwksSource::Inline => {}
                 JwksSource::Direct(uri) => {
-                    let store =
-                        get_or_create_jwks_store(uri, &self.http_client, self.refresh_interval);
+                    let store = get_or_create_jwks_store(
+                        uri,
+                        &self.http_client,
+                        self.refresh_interval,
+                        provider.max_stale,
+                    );
                     provider.jwks_store.store(Arc::new(Some(store)));
                 }
                 JwksSource::Discovery(discovery_url) => {
@@ -1027,6 +1070,7 @@ impl super::Plugin for JwksAuth {
                             &uri,
                             &self.http_client,
                             self.refresh_interval,
+                            provider.max_stale,
                         );
                         provider.jwks_store.store(Arc::new(Some(store)));
                     }
@@ -1036,6 +1080,7 @@ impl super::Plugin for JwksAuth {
                         self.http_client.clone(),
                         discovery_url.clone(),
                         self.refresh_interval,
+                        provider.max_stale,
                         Arc::clone(&self.discovery_owner_live),
                         Arc::clone(&self.discovery_publication_gate),
                     ));
@@ -1136,10 +1181,25 @@ impl super::Plugin for JwksAuth {
         uris
     }
 
-    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
-        self.active_jwks_uris()
-            .into_iter()
-            .map(|uri| (uri, self.refresh_interval))
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, JwksRefreshRequirement)> {
+        self.providers
+            .iter()
+            .filter_map(|provider| {
+                let store = provider.jwks_store.load();
+                store
+                    .as_ref()
+                    .as_ref()
+                    .filter(|store| store.is_refreshable())
+                    .map(|store| {
+                        (
+                            store.jwks_uri().to_string(),
+                            JwksRefreshRequirement::new(
+                                self.refresh_interval,
+                                provider.max_stale,
+                            ),
+                        )
+                    })
+            })
             .collect()
     }
 
@@ -1158,6 +1218,7 @@ fn spawn_discovery_task(
     client: PluginHttpClient,
     discovery_url: String,
     refresh_interval: Duration,
+    max_stale: Duration,
     owner_live: Arc<AtomicBool>,
     publication_gate: Arc<Mutex<()>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -1189,6 +1250,7 @@ fn spawn_discovery_task(
                         &uri,
                         &client,
                         refresh_interval,
+                        max_stale,
                     );
                     let Some(store) = candidate.store().cloned() else {
                         warn!(
@@ -1338,6 +1400,20 @@ fn optional_u64(
     value
         .as_u64()
         .ok_or_else(|| format!("jwks_auth: '{field}' must be an unsigned integer, got: {value}"))
+}
+
+fn validate_max_stale_seconds(field: &str, value: u64) -> Result<(), String> {
+    if value == 0 {
+        return Err(format!(
+            "jwks_auth: '{field}' must be greater than 0; unlimited stale trust cannot be enabled"
+        ));
+    }
+    if value > MAX_JWKS_MAX_STALE_SECONDS {
+        return Err(format!(
+            "jwks_auth: '{field}' must be <= {MAX_JWKS_MAX_STALE_SECONDS}"
+        ));
+    }
+    Ok(())
 }
 
 fn optional_bool(config: &Map<String, Value>, field: &str) -> Result<Option<bool>, String> {

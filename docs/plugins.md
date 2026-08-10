@@ -2148,6 +2148,7 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `providers[].dpop_clock_skew_secs` | u64 (optional) | DPoP `iat`/`exp` clock skew in seconds (default: `30`, max: `300`) |
 | `providers[].dpop_jti_cache_max_entries` | usize (optional) | Per-provider DPoP replay cache capacity (default: `10000`) |
 | `providers[].dpop_jti_ttl_secs` | u64 (optional) | DPoP `jti` replay cache TTL (default: `300`, must be at least twice clock skew) |
+| `providers[].jwks_max_stale_seconds` | u64 (optional) | Per-provider maximum age of the last validated non-empty remote JWKS; overrides the plugin default (min `1`, max `86400`; remote sources only) |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
 | `consumer_identity_claim` | String | Global JWT claim for consumer lookup (default: `"sub"`) |
@@ -2156,13 +2157,16 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `claim_headers_separator` | String | Global separator for array claim header values (default: `","`) |
 | `emit_mesh_request_principal_metadata` | Boolean | Emit `mesh.request_principal` plus mesh JWT claim/audience metadata for direct `mesh_authz` request-principal and `when` condition evaluation (default: `false`) |
 | `require_exp` | Boolean | Global default for requiring an `exp` claim (default: `true`) |
-| `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`) |
+| `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`, min: `1`, max: `86400`); must not exceed each remote provider's effective maximum-stale value |
+| `jwks_max_stale_seconds` | u64 | Maximum age of the last validated non-empty remote JWKS (default: `3600`, max: `86400`). `0` is invalid and cannot disable fail-closed expiry |
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
 Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
-Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. Shared stores use the minimum refresh interval requested by active consumers, and full or incremental reloads reschedule the single refresh worker without dropping cached keys. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement.
+Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. For each remote provider, `jwks_refresh_interval_secs` must not exceed its effective `jwks_max_stale_seconds`. Shared stores use both the minimum refresh interval and the minimum maximum-stale value requested by active consumers. A newly added stricter consumer takes effect immediately; full or incremental publication deterministically reconciles the exact minima, so removing the strict consumer may relax policy without replacing the store or resetting key age. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement, but discovery success alone never refreshes key trust.
 
-Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A rejected refresh retains the last-known-good keys. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
+Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
+
+Authenticated `/metrics` exposes only fixed-cardinality aggregate JWKS state: `fresh`, `grace`, or `expired`, maximum trust age per state, and closed refresh-failure classes. It never labels a series with a JWKS/discovery URL, `kid`, token, claim, or key material. Choose the maximum-stale window as an explicit availability-versus-revocation trade-off; production deployments should keep it short enough for emergency key removal to take effect within their incident-response objective.
 
 ### `oauth2_introspection`
 
@@ -2280,6 +2284,12 @@ config:
   behavior:
     post_login_default_path: "/"
 ```
+
+OIDC relying-party JWKS uses the same shared bounded-trust store as
+`jwks_auth`, with the secure one-hour maximum-stale default. Discovery success
+does not refresh key trust; only a validated non-empty JWKS does. When the same
+URI is also referenced by `jwks_auth`, the strictest active maximum-stale and
+refresh requirements govern the shared store.
 
 ### `jwt_auth`
 

@@ -220,9 +220,9 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Default limit:** No hard entry cap -- bounded by the number of configured JWKS provider URLs (typically 1-3 per plugin instance).
 
-**Config field:** N/A (entry count equals configured provider count).
+**Config fields:** Entry count equals configured provider count. Trust retention is controlled by `jwks_max_stale_seconds` (default `3600` seconds / 1 hour, maximum `86400` seconds / 24 hours); `0` is invalid and cannot disable expiry. A remote provider override may set a stricter value.
 
-**Cleanup mechanism:** Periodic background refresh (`jwks_refresh_interval_secs`, default `900` seconds). The global JWKS store is keyed by provider URL, so duplicate URLs across plugin instances share a single cache entry and use the minimum interval requested by active consumers. See the [`jwks_auth` plugin reference](plugins.md#jwks_auth).
+**Cleanup mechanism:** Periodic background refresh (`jwks_refresh_interval_secs`, default `900` seconds). The global JWKS store is keyed by provider URL, so duplicate URLs across plugin instances share a single cache entry and deterministically use the minimum refresh interval and minimum maximum-stale requirement of active consumers. The store records monotonic last-success and last-attempt times plus a bounded failure class/count. Failed, empty, malformed, oversized, or non-2xx refreshes preserve the key map for diagnostics and a finite grace interval without advancing trust; verification fails closed after the deadline. Empty and failed refreshes use a 5s/15s/30s capped retry sequence (or the shorter configured refresh interval). A later valid non-empty response atomically replaces keys and restores trust. Discovery success alone does not refresh key age. Authenticated metrics aggregate stores only by `fresh`/`grace`/`expired` and fixed failure class, never by URL or key/token data. See the [`jwks_auth` plugin reference](plugins.md#jwks_auth).
 
 ### TCP Connection Throttle
 
@@ -288,7 +288,8 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 | `soap_ws_security` | `nonce.max_total_cache_bytes` | `67108864` | Maximum retained nonce-key UTF-8 payload bytes (one count per shared key allocation) |
 | `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results |
 | `ldap_auth` | `cache_ttl_seconds` | `0` | LDAP cache entry TTL (`0` = disabled; maximum `86400`) |
-| `jwks_auth` | `jwks_refresh_interval_secs` | `900` | JWKS key set refresh interval |
+| `jwks_auth` | `jwks_refresh_interval_secs` | `900` | JWKS key set refresh interval (`1`–`86400`; no greater than effective maximum stale) |
+| `jwks_auth` | `jwks_max_stale_seconds` | `3600` | Maximum trust age for the last validated non-empty remote JWKS (`0` invalid; maximum `86400`) |
 | `api_chargeback` | `max_entries` | `100000` | Hard ceiling on retained billing rows (complete registry entry keys) |
 | `api_chargeback` | `max_retained_bytes` | `67108864` | Hard ceiling on retained billing-row bytes |
 | `api_chargeback` | `render_cache_ttl_seconds` | `5` | Rendered output cache TTL |

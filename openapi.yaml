@@ -16100,6 +16100,16 @@ components:
                 format: uint64
                 default: 300
                 description: DPoP jti replay cache TTL in seconds
+              jwks_max_stale_seconds:
+                type: integer
+                format: uint64
+                minimum: 1
+                maximum: 86400
+                description: >-
+                  Per-provider maximum monotonic age of the last validated
+                  non-empty remote JWKS. Overrides the plugin default. Zero is
+                  invalid and cannot disable bounded stale-key expiry. Applies
+                  only to jwks_uri and discovery_url sources.
           description: Array of identity provider configurations
         scope_claim:
           type: string
@@ -16142,8 +16152,22 @@ components:
         jwks_refresh_interval_secs:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 86400
           default: 900
-          description: JWKS key refresh interval in seconds
+          description: >-
+            JWKS key refresh interval in seconds. Must not exceed the effective
+            jwks_max_stale_seconds for any remote provider.
+        jwks_max_stale_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 86400
+          default: 3600
+          description: >-
+            Maximum monotonic age of the last validated non-empty remote JWKS.
+            Cached keys fail closed at this deadline even if refreshes keep
+            failing or return empty. Zero is invalid and cannot disable expiry.
 
     Oauth2IntrospectionConfig:
       type: object

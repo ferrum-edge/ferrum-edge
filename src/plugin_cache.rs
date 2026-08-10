@@ -35,7 +35,7 @@ use crate::adaptive_concurrency::{
 };
 use crate::config::types::PluginConfig;
 use crate::plugins::tcp_connection_throttle::{TcpConnectionThrottle, TcpConnectionThrottleState};
-use crate::plugins::utils::jwks_cache::retain_active_requirements;
+use crate::plugins::utils::jwks_cache::{JwksRefreshRequirement, retain_active_requirements};
 use crate::plugins::utils::policy_digest::presentation_policy_digest;
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, ResponsePresentationPolicy,
@@ -2030,7 +2030,7 @@ impl Plugin for PluginInstanceWrapper {
     fn active_jwks_uris(&self) -> Vec<String> {
         self.inner.active_jwks_uris()
     }
-    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, JwksRefreshRequirement)> {
         self.inner.active_jwks_refresh_requirements()
     }
 }
@@ -4778,17 +4778,19 @@ fn build_protocol_snapshot(
 fn collect_active_jwks_requirements(
     proxy_map: &ProxyPluginMap,
     globals: &[Arc<dyn Plugin>],
-) -> HashMap<String, Duration> {
+) -> HashMap<String, JwksRefreshRequirement> {
     let mut requirements = HashMap::new();
     for plugin in globals
         .iter()
         .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
     {
-        for (uri, interval) in plugin.active_jwks_refresh_requirements() {
+        for (uri, requirement) in plugin.active_jwks_refresh_requirements() {
             requirements
                 .entry(uri)
-                .and_modify(|current: &mut Duration| *current = (*current).min(interval))
-                .or_insert(interval);
+                .and_modify(|current: &mut JwksRefreshRequirement| {
+                    *current = current.strictest(requirement)
+                })
+                .or_insert(requirement);
         }
     }
     requirements

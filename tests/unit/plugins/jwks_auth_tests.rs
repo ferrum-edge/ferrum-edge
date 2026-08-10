@@ -4,8 +4,9 @@ use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::AuthMode;
 use ferrum_edge::plugins::{
     HTTP_FAMILY_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginHttpClient, RequestContext,
-    jwks_auth::JwksAuth, key_auth::KeyAuth, priority, validate_plugin_config,
-    validate_plugin_config_with_policy,
+    jwks_auth::{JwksAuth, MAX_JWKS_MAX_STALE_SECONDS},
+    key_auth::KeyAuth,
+    priority, validate_plugin_config, validate_plugin_config_with_policy,
 };
 use ferrum_edge::proxy::run_authentication_phase;
 use serde_json::{Value, json};
@@ -372,6 +373,57 @@ async fn test_jwks_auth_rejects_zero_refresh_interval() {
             .unwrap()
             .contains("jwks_refresh_interval_secs")
     );
+}
+
+#[test]
+fn jwks_max_stale_is_finite_bounded_and_cannot_be_disabled() {
+    let base = |value| {
+        json!({
+            "providers": [{"jwks_uri": "https://keys.example.com/jwks"}],
+            "jwks_refresh_interval_secs": 30,
+            "jwks_max_stale_seconds": value
+        })
+    };
+    for invalid in [0, MAX_JWKS_MAX_STALE_SECONDS + 1] {
+        let error = JwksAuth::new(&base(invalid), default_client())
+            .err()
+            .expect("out-of-range max stale must fail");
+        assert!(error.contains("jwks_max_stale_seconds"));
+    }
+
+    let shorter_than_refresh = json!({
+        "providers": [{"jwks_uri": "https://keys.example.com/jwks"}],
+        "jwks_refresh_interval_secs": 60,
+        "jwks_max_stale_seconds": 30
+    });
+    assert!(
+        JwksAuth::new(&shorter_than_refresh, default_client())
+            .err()
+            .expect("refresh beyond trust deadline must fail")
+            .contains("must be <=")
+    );
+}
+
+#[test]
+fn provider_max_stale_override_is_reported_for_shared_store_arbitration() {
+    let uri = "https://keys.example.com/jwks";
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [
+                {"jwks_uri": uri, "jwks_max_stale_seconds": 1_800},
+                {"jwks_uri": uri, "jwks_max_stale_seconds": 600}
+            ],
+            "jwks_refresh_interval_secs": 300,
+            "jwks_max_stale_seconds": 3_600
+        }),
+        default_client(),
+    )
+    .expect("provider overrides are valid");
+
+    let requirements = plugin.active_jwks_refresh_requirements();
+    assert_eq!(requirements.len(), 2);
+    assert_eq!(requirements[0].1.max_stale.as_secs(), 1_800);
+    assert_eq!(requirements[1].1.max_stale.as_secs(), 600);
 }
 
 #[tokio::test]

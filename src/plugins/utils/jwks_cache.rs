@@ -13,6 +13,7 @@
 
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -20,13 +21,38 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use super::PluginHttpClient;
-use super::jwks_store::{JwksKeyStore, redacted_jwks_uri};
+use super::jwks_store::{
+    JwksFailureClass, JwksKeyStore, JwksTrustState, redacted_jwks_uri,
+};
+
+/// Effective requirements contributed by one active shared-store consumer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JwksRefreshRequirement {
+    pub refresh_interval: Duration,
+    pub max_stale: Duration,
+}
+
+impl JwksRefreshRequirement {
+    pub const fn new(refresh_interval: Duration, max_stale: Duration) -> Self {
+        Self {
+            refresh_interval,
+            max_stale,
+        }
+    }
+
+    pub fn strictest(self, other: Self) -> Self {
+        Self {
+            refresh_interval: self.refresh_interval.min(other.refresh_interval),
+            max_stale: self.max_stale.min(other.max_stale),
+        }
+    }
+}
 
 /// A cached JWKS entry: the key store plus its background refresh task handle.
 struct JwksCacheEntry {
     store: Arc<JwksKeyStore>,
     refresh_handle: JoinHandle<()>,
-    refresh_interval: Duration,
+    requirement: JwksRefreshRequirement,
     refresh_generation: u64,
     retirement_epoch: Arc<AtomicU64>,
     active: AtomicBool,
@@ -62,20 +88,23 @@ pub fn get_or_create_jwks_store(
     jwks_uri: &str,
     http_client: &PluginHttpClient,
     refresh_interval: Duration,
+    max_stale: Duration,
 ) -> Arc<JwksKeyStore> {
     let cache = global_cache();
+    let requested = JwksRefreshRequirement::new(refresh_interval, max_stale);
 
-    // Fast path: store already exists. A newly observed shorter interval must
-    // take effect immediately; longer intervals are applied only when the
-    // committed plugin generation is reconciled, because another active
-    // consumer may still require the shorter cadence.
+    // Fast path: store already exists. A newly observed stricter interval or
+    // maximum-stale requirement takes effect immediately; relaxation is
+    // applied only when the committed generation is reconciled, because
+    // another active consumer may still require the stricter policy.
     if let Some(mut entry) = cache.get_mut(jwks_uri) {
         // A new consumer revives an entry that may have been marked retired by
         // a concurrent plugin-cache publication. Bumping the epoch invalidates
         // any pending last-owner reaper before cloning the store.
         entry.retirement_epoch.fetch_add(1, Ordering::AcqRel);
-        if refresh_interval < entry.refresh_interval {
-            reconfigure_refresh_task(jwks_uri, entry.value_mut(), refresh_interval);
+        let strictest = entry.requirement.strictest(requested);
+        if strictest != entry.requirement {
+            reconfigure_refresh_policy(jwks_uri, entry.value_mut(), strictest);
         }
         return Arc::clone(&entry.value().store);
     }
@@ -87,11 +116,12 @@ pub fn get_or_create_jwks_store(
             redacted_jwks_uri(jwks_uri)
         );
         let store = JwksKeyStore::new(jwks_uri.to_string(), http_client.clone());
+        store.configure_trust_policy(refresh_interval, max_stale);
         let refresh_handle = store.start_background_refresh(refresh_interval);
         JwksCacheEntry {
             store: Arc::new(store),
             refresh_handle,
-            refresh_interval,
+            requirement: requested,
             refresh_generation: 1,
             retirement_epoch: Arc::new(AtomicU64::new(0)),
             active: AtomicBool::new(false),
@@ -99,42 +129,53 @@ pub fn get_or_create_jwks_store(
         }
     });
     entry.retirement_epoch.fetch_add(1, Ordering::AcqRel);
-    if refresh_interval < entry.refresh_interval {
-        reconfigure_refresh_task(jwks_uri, entry.value_mut(), refresh_interval);
+    let strictest = entry.requirement.strictest(requested);
+    if strictest != entry.requirement {
+        reconfigure_refresh_policy(jwks_uri, entry.value_mut(), strictest);
     }
     entry.value().store.clone()
 }
 
-fn reconfigure_refresh_task(
+fn reconfigure_refresh_policy(
     jwks_uri: &str,
     entry: &mut JwksCacheEntry,
-    refresh_interval: Duration,
+    requirement: JwksRefreshRequirement,
 ) {
-    if entry.refresh_interval == refresh_interval {
+    if entry.requirement == requirement {
         return;
     }
-    let previous = entry.refresh_interval;
+    let previous = entry.requirement;
+    entry.store.configure_trust_policy(
+        requirement.refresh_interval,
+        requirement.max_stale,
+    );
     entry.refresh_handle.abort();
-    entry.refresh_handle = entry.store.start_background_refresh(refresh_interval);
-    entry.refresh_interval = refresh_interval;
+    entry.refresh_handle = entry
+        .store
+        .start_background_refresh(requirement.refresh_interval);
+    entry.requirement = requirement;
     entry.refresh_generation = entry.refresh_generation.wrapping_add(1);
     info!(
-        "JWKS cache: refresh interval for {} changed from {:?} to {:?}",
+        "JWKS cache: policy for {} changed from refresh={:?}/max-stale={:?} to refresh={:?}/max-stale={:?}",
         redacted_jwks_uri(jwks_uri),
-        previous,
-        refresh_interval
+        previous.refresh_interval,
+        previous.max_stale,
+        requirement.refresh_interval,
+        requirement.max_stale
     );
 }
 
-/// Reconcile the shared cache against the exact minimum interval required by
-/// the newly committed plugin generation, then retire unreferenced stores.
-pub fn retain_active_requirements(active_requirements: &HashMap<String, Duration>) {
+/// Reconcile the shared cache against the exact strictest requirement of the
+/// newly committed plugin generation, then retire unreferenced stores.
+pub fn retain_active_requirements(
+    active_requirements: &HashMap<String, JwksRefreshRequirement>,
+) {
     let cache = global_cache();
     cache.retain(|uri, entry| {
-        if let Some(refresh_interval) = active_requirements.get(uri) {
+        if let Some(requirement) = active_requirements.get(uri) {
             entry.active.store(true, Ordering::Release);
             entry.retirement_epoch.fetch_add(1, Ordering::AcqRel);
-            reconfigure_refresh_task(uri, entry, *refresh_interval);
+            reconfigure_refresh_policy(uri, entry, *requirement);
             true
         } else {
             entry.active.store(false, Ordering::Release);
@@ -238,6 +279,7 @@ impl DiscoveryStoreCandidate {
         jwks_uri: &str,
         http_client: &PluginHttpClient,
         refresh_interval: Duration,
+        max_stale: Duration,
     ) -> Self {
         Self {
             jwks_uri: jwks_uri.to_string(),
@@ -245,6 +287,7 @@ impl DiscoveryStoreCandidate {
                 jwks_uri,
                 http_client,
                 refresh_interval,
+                max_stale,
             )),
         }
     }
@@ -326,10 +369,94 @@ pub fn retire_jwks_store_if_unreferenced(jwks_uri: &str) {
 pub fn cached_refresh_state(jwks_uri: &str) -> Option<(Duration, u64)> {
     global_cache().get(jwks_uri).map(|entry| {
         (
-            entry.value().refresh_interval,
+            entry.value().requirement.refresh_interval,
             entry.value().refresh_generation,
         )
     })
+}
+
+/// Return the current strict shared-store policy for diagnostics and tests.
+#[doc(hidden)]
+#[allow(dead_code)] // exercised by external unit tests
+pub fn cached_requirement(jwks_uri: &str) -> Option<JwksRefreshRequirement> {
+    global_cache()
+        .get(jwks_uri)
+        .map(|entry| entry.value().requirement)
+}
+
+/// Render fixed-cardinality JWKS trust and refresh observability.
+///
+/// Stores are aggregated by closed state/failure enums; endpoint URLs, key
+/// identifiers, tokens, claims, and key material never enter this surface.
+pub fn render_prometheus() -> String {
+    let mut store_counts = [0u64; 3];
+    let mut max_trust_age_seconds = [0u64; 3];
+    let mut max_consecutive_failures = [0u64; 6];
+
+    for entry in global_cache().iter() {
+        let health = entry.value().store.health_snapshot();
+        let state_index = health.trust_state.index();
+        store_counts[state_index] = store_counts[state_index].saturating_add(1);
+        if let Some(age) = health.last_success_age {
+            max_trust_age_seconds[state_index] =
+                max_trust_age_seconds[state_index].max(age.as_secs());
+        }
+        if let Some(class) = health.last_failure {
+            let class_index = class.index();
+            max_consecutive_failures[class_index] = max_consecutive_failures[class_index]
+                .max(u64::from(health.consecutive_failures));
+        }
+    }
+
+    let mut output = String::new();
+    output.push_str(
+        "# HELP ferrum_jwks_trust_stores Shared remote JWKS stores by bounded trust state.\n",
+    );
+    output.push_str("# TYPE ferrum_jwks_trust_stores gauge\n");
+    output.push_str(
+        "# HELP ferrum_jwks_trust_age_seconds Maximum age of the last validated non-empty JWKS among stores in each trust state.\n",
+    );
+    output.push_str("# TYPE ferrum_jwks_trust_age_seconds gauge\n");
+    for state in JwksTrustState::ALL {
+        let index = state.index();
+        let _ = writeln!(
+            output,
+            "ferrum_jwks_trust_stores{{state=\"{}\"}} {}",
+            state.as_str(),
+            store_counts[index]
+        );
+        let _ = writeln!(
+            output,
+            "ferrum_jwks_trust_age_seconds{{state=\"{}\"}} {}",
+            state.as_str(),
+            max_trust_age_seconds[index]
+        );
+    }
+
+    output.push_str(
+        "# HELP ferrum_jwks_refresh_failures_total Remote JWKS refresh failures by fixed failure class.\n",
+    );
+    output.push_str("# TYPE ferrum_jwks_refresh_failures_total counter\n");
+    output.push_str(
+        "# HELP ferrum_jwks_consecutive_failures Maximum current consecutive failures among shared stores by fixed failure class.\n",
+    );
+    output.push_str("# TYPE ferrum_jwks_consecutive_failures gauge\n");
+    let failure_counts = JwksKeyStore::refresh_failure_counts();
+    for (index, class) in JwksFailureClass::ALL.iter().enumerate() {
+        let _ = writeln!(
+            output,
+            "ferrum_jwks_refresh_failures_total{{class=\"{}\"}} {}",
+            class.as_str(),
+            failure_counts[index]
+        );
+        let _ = writeln!(
+            output,
+            "ferrum_jwks_consecutive_failures{{class=\"{}\"}} {}",
+            class.as_str(),
+            max_consecutive_failures[index]
+        );
+    }
+    output
 }
 
 /// Return reaper-scheduling state for lifecycle tests.

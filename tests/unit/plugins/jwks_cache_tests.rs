@@ -1,9 +1,12 @@
 use ferrum_edge::_test_support::jwks_discovery_candidate_for_test;
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::utils::jwks_cache::{
-    cached_reaper_generation, cached_refresh_state, clear_jwks_cache, get_or_create_jwks_store,
-    retain_active_requirements, retain_active_uris, retire_jwks_store_if_unreferenced,
+    JwksRefreshRequirement, cached_reaper_generation, cached_refresh_state, cached_requirement,
+    clear_jwks_cache, get_or_create_jwks_store as get_or_create_jwks_store_with_policy,
+    render_prometheus, retain_active_requirements, retain_active_uris,
+    retire_jwks_store_if_unreferenced,
 };
+use ferrum_edge::plugins::utils::jwks_store::{DEFAULT_JWKS_MAX_STALE_SECONDS, JwksKeyStore};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -11,6 +14,19 @@ use std::time::Duration;
 
 fn client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+fn get_or_create_jwks_store(
+    uri: &str,
+    http_client: &PluginHttpClient,
+    refresh_interval: Duration,
+) -> Arc<JwksKeyStore> {
+    get_or_create_jwks_store_with_policy(
+        uri,
+        http_client,
+        refresh_interval,
+        Duration::from_secs(DEFAULT_JWKS_MAX_STALE_SECONDS),
+    )
 }
 
 pub(super) fn cache_test_lock() -> &'static tokio::sync::Mutex<()> {
@@ -63,12 +79,78 @@ async fn shared_store_uses_minimum_interval_and_reconciles_removals() {
     // Simulate removal of the 30-second consumer from the committed plugin
     // generation. The surviving 300-second requirement takes effect without
     // replacing the key store or dropping its last-good keys.
-    retain_active_requirements(&HashMap::from([(uri.clone(), Duration::from_secs(300))]));
+    retain_active_requirements(&HashMap::from([(
+        uri.clone(),
+        JwksRefreshRequirement::new(Duration::from_secs(300), Duration::from_secs(3_600)),
+    )]));
     let (interval, generation_after_removal) = cached_refresh_state(&uri).expect("cache entry");
     assert_eq!(interval, Duration::from_secs(300));
     assert_eq!(generation_after_removal, generation_after_fast_consumer + 1);
     let still_shared = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
     assert!(Arc::ptr_eq(&slow, &still_shared));
+
+    clear_jwks_cache();
+}
+
+#[tokio::test]
+async fn shared_store_uses_strictest_max_stale_and_relaxes_only_on_reconcile() {
+    let server = wiremock::MockServer::start().await;
+    let uri = format!("{}/max-stale/jwks.json?token=secret", server.uri());
+    let _guard = cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let loose = get_or_create_jwks_store_with_policy(
+        &uri,
+        &client(),
+        Duration::from_secs(300),
+        Duration::from_secs(7_200),
+    );
+    let strict = get_or_create_jwks_store_with_policy(
+        &uri,
+        &client(),
+        Duration::from_secs(600),
+        Duration::from_secs(1_800),
+    );
+    assert!(Arc::ptr_eq(&loose, &strict));
+    assert_eq!(
+        cached_requirement(&uri),
+        Some(JwksRefreshRequirement::new(
+            Duration::from_secs(300),
+            Duration::from_secs(1_800),
+        ))
+    );
+
+    // A longer request cannot relax a live strict consumer. Only exact
+    // committed-generation reconciliation may remove the strict requirement.
+    let repeated_loose = get_or_create_jwks_store_with_policy(
+        &uri,
+        &client(),
+        Duration::from_secs(300),
+        Duration::from_secs(7_200),
+    );
+    assert!(Arc::ptr_eq(&strict, &repeated_loose));
+    assert_eq!(
+        cached_requirement(&uri).map(|requirement| requirement.max_stale),
+        Some(Duration::from_secs(1_800))
+    );
+
+    retain_active_requirements(&HashMap::from([(
+        uri.clone(),
+        JwksRefreshRequirement::new(Duration::from_secs(300), Duration::from_secs(7_200)),
+    )]));
+    assert_eq!(
+        cached_requirement(&uri).map(|requirement| requirement.max_stale),
+        Some(Duration::from_secs(7_200))
+    );
+
+    let metrics = render_prometheus();
+    assert!(metrics.contains("state=\"fresh\""));
+    assert!(metrics.contains("state=\"grace\""));
+    assert!(metrics.contains("state=\"expired\""));
+    assert!(metrics.contains("class=\"empty\""));
+    assert!(metrics.contains("class=\"transport\""));
+    assert!(!metrics.contains(&uri));
+    assert!(!metrics.contains("token=secret"));
 
     clear_jwks_cache();
 }
@@ -244,7 +326,10 @@ async fn discarded_candidate_does_not_reap_or_poll_active_shared_store() {
     clear_jwks_cache();
 
     let active_store = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
-    retain_active_requirements(&HashMap::from([(uri.clone(), Duration::from_secs(300))]));
+    retain_active_requirements(&HashMap::from([(
+        uri.clone(),
+        JwksRefreshRequirement::new(Duration::from_secs(300), Duration::from_secs(3_600)),
+    )]));
     assert_eq!(cached_reaper_generation(&uri), Some(0));
 
     let discarded = jwks_discovery_candidate_for_test(&uri, client(), Duration::from_secs(300));

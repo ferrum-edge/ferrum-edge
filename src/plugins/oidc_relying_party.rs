@@ -30,8 +30,8 @@ use super::utils::claim_header_fanout::{
     emit_claim_headers_to_attempt, parse_claim_headers,
 };
 use super::utils::claim_resolver::{extract_claim_string, extract_claim_string_exact};
-use super::utils::jwks_cache::get_or_create_jwks_store;
-use super::utils::jwks_store::JwksKeyStore;
+use super::utils::jwks_cache::{JwksRefreshRequirement, get_or_create_jwks_store};
+use super::utils::jwks_store::{DEFAULT_JWKS_MAX_STALE_SECONDS, JwksKeyStore};
 use super::utils::jwt_verifier::{JwtVerifyParams, verify_jwt_with_jwks};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
@@ -766,7 +766,12 @@ impl OidcRelyingParty {
                 .transpose()?;
         let initial_jwks_store = if start_background_tasks {
             jwks_uri.as_ref().map(|uri| {
-                get_or_create_jwks_store(uri, &http_client, DEFAULT_JWKS_REFRESH_INTERVAL)
+                get_or_create_jwks_store(
+                    uri,
+                    &http_client,
+                    DEFAULT_JWKS_REFRESH_INTERVAL,
+                    Duration::from_secs(DEFAULT_JWKS_MAX_STALE_SECONDS),
+                )
             })
         } else {
             None
@@ -1979,10 +1984,18 @@ impl super::Plugin for OidcRelyingParty {
             .map(|store| vec![store.jwks_uri().to_string()])
             .unwrap_or_default()
     }
-    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, JwksRefreshRequirement)> {
         self.active_jwks_uris()
             .into_iter()
-            .map(|uri| (uri, DEFAULT_JWKS_REFRESH_INTERVAL))
+            .map(|uri| {
+                (
+                    uri,
+                    JwksRefreshRequirement::new(
+                        DEFAULT_JWKS_REFRESH_INTERVAL,
+                        Duration::from_secs(DEFAULT_JWKS_MAX_STALE_SECONDS),
+                    ),
+                )
+            })
             .collect()
     }
 }
@@ -3241,6 +3254,7 @@ fn spawn_oidc_discovery(
                         &doc.jwks_uri,
                         &http_client,
                         DEFAULT_JWKS_REFRESH_INTERVAL,
+                        Duration::from_secs(DEFAULT_JWKS_MAX_STALE_SECONDS),
                     );
                     jwks_slot.store(Arc::new(Some(store)));
                     discovery_slot.store(Arc::new(Some(doc)));

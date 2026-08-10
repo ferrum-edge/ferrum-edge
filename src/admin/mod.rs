@@ -2309,6 +2309,7 @@ async fn handle_admin_request_inner(
             }
         }
         let mut metrics_output = registry.render();
+        metrics_output.push_str(&crate::plugins::utils::jwks_cache::render_prometheus());
         metrics_output.push_str(&crate::logging::render_prometheus());
         metrics_output.push_str(&crate::observability_delivery::render_prometheus());
         metrics_output.push_str(&crate::notifications::render_delivery_prometheus());

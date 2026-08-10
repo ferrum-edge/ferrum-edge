@@ -2983,6 +2983,27 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
         json!(ferrum_edge::plugins::jwks_auth::DEFAULT_JWKS_REFRESH_INTERVAL_SECS)
     );
     assert_eq!(
+        schema["properties"]["jwks_refresh_interval_secs"]["maximum"],
+        json!(ferrum_edge::plugins::jwks_auth::MAX_JWKS_REFRESH_INTERVAL_SECS)
+    );
+    assert_eq!(
+        schema["properties"]["jwks_max_stale_seconds"]["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_JWKS_MAX_STALE_SECONDS)
+    );
+    assert_eq!(
+        schema["properties"]["jwks_max_stale_seconds"]["minimum"],
+        json!(1)
+    );
+    assert_eq!(
+        schema["properties"]["jwks_max_stale_seconds"]["maximum"],
+        json!(ferrum_edge::plugins::jwks_auth::MAX_JWKS_MAX_STALE_SECONDS)
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]
+            ["jwks_max_stale_seconds"]["maximum"],
+        json!(ferrum_edge::plugins::jwks_auth::MAX_JWKS_MAX_STALE_SECONDS)
+    );
+    assert_eq!(
         schema["properties"]["providers"]["items"]["properties"]["dpop_jti_cache_max_entries"]["default"],
         json!(ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES)
     );
@@ -2990,6 +3011,10 @@ fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
     let guide = include_str!("../../docs/cache_management.md");
     assert!(guide.contains("`jwks_refresh_interval_secs`, default `900` seconds"));
     assert!(guide.contains("| `jwks_auth` | `jwks_refresh_interval_secs` | `900` |"));
+    assert!(guide.contains("`jwks_max_stale_seconds` (default `3600`"));
+    assert!(guide.contains("maximum `86400`"));
+    assert!(guide.contains("`0` is invalid"));
+    assert!(guide.contains("| `jwks_auth` | `jwks_max_stale_seconds` | `3600` |"));
     assert!(!guide.contains("| `jwks_auth` | `cache_ttl_seconds`"));
 }
 

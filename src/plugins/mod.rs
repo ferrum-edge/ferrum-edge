@@ -10207,10 +10207,12 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
-    /// Returns the refresh interval required for each actively referenced
-    /// shared JWKS URI. The plugin cache reconciles duplicate consumers to the
-    /// minimum interval after every full or incremental publication.
-    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+    /// Returns refresh and bounded-staleness requirements for each actively
+    /// referenced shared JWKS URI. The plugin cache reconciles duplicate
+    /// consumers to the strictest pair of minima after every publication.
+    fn active_jwks_refresh_requirements(
+        &self,
+    ) -> Vec<(String, utils::jwks_cache::JwksRefreshRequirement)> {
         Vec::new()
     }
 }
