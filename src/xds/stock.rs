@@ -624,7 +624,13 @@ impl StockXdsAccumulator {
                             refusals.extend(accepted.refusals);
                             route_configs.insert(name, accepted.config);
                         }
-                        Err(refused) => refusals.push(refused),
+                        Err(refused) => {
+                            // Omitted RDS resources retain their last accepted state, but an
+                            // explicitly present refusal must fail closed rather than leave the
+                            // previously accepted configuration active.
+                            route_configs.remove(&name);
+                            refusals.push(refused);
+                        }
                     }
                 }
                 self.route_configs = route_configs;
