@@ -35,17 +35,6 @@ impl EndpointSliceEndpointEligibility {
     pub fn is_eligible(self) -> bool {
         matches!(self, Self::Eligible)
     }
-
-    /// Stable skip-reason label for structured logs / counters.
-    #[inline]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Eligible => "eligible",
-            Self::Terminating => "terminating",
-            Self::NotReady => "not_ready",
-            Self::NotServing => "non_serving",
-        }
-    }
 }
 
 /// Evaluate EndpointSlice endpoint lifecycle eligibility.

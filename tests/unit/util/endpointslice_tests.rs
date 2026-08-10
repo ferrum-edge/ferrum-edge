@@ -80,16 +80,6 @@ fn endpoint_slice_lifecycle_eligibility_table() {
             expected.is_eligible(),
             "{label}: is_ready parity"
         );
-        assert_eq!(
-            got.as_str(),
-            match expected {
-                EndpointSliceEndpointEligibility::Eligible => "eligible",
-                EndpointSliceEndpointEligibility::Terminating => "terminating",
-                EndpointSliceEndpointEligibility::NotReady => "not_ready",
-                EndpointSliceEndpointEligibility::NotServing => "non_serving",
-            },
-            "{label}: fixed-cardinality reason label"
-        );
     }
 }
 
