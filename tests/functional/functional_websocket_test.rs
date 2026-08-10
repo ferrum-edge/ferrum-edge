@@ -42,6 +42,7 @@ const WS_FRAME_LIMIT_UNDER_TEST: usize = 64;
 const WS_OVERSIZE_FRAME_BYTES: usize = WS_FRAME_LIMIT_UNDER_TEST * 2;
 const WS_H3_FRAME_LIMIT_UNDER_TEST: usize = 64;
 const WS_H3_OVERSIZE_FRAME_BYTES: usize = WS_H3_FRAME_LIMIT_UNDER_TEST * 2;
+const WS_JWT_SECRET: &str = "ws-jwt-functional-secret-32-bytes-minimum";
 
 /// Allocate a free port by binding to port 0 and returning the assigned port.
 async fn free_port() -> u16 {
@@ -864,6 +865,46 @@ plugin_configs:
     enabled: true
 "#,
         backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
+/// Write a WebSocket route protected by the consumer-specific HS256 JWT
+/// plugin. The signing secret stays fixture-local and is never included in
+/// assertions, diagnostics, or gateway log metadata.
+fn write_ws_jwt_auth_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-jwt-proxy"
+    listen_path: "/ws-jwt"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "plugin-jwt-auth-ws"
+
+consumers:
+  - id: "consumer-ws-jwt"
+    username: "ws-jwt-client"
+    credentials:
+      jwt:
+        - secret: "{WS_JWT_SECRET}"
+
+plugin_configs:
+  - id: "plugin-jwt-auth-ws"
+    plugin_name: "jwt_auth"
+    config: {{}}
+    scope: proxy
+    proxy_id: "ws-jwt-proxy"
+    enabled: true
+"#
     );
 
     let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
@@ -3700,6 +3741,117 @@ async fn test_websocket_max_lifetime_active_traffic_h1_h2_h3_parity() {
     assert!(
         h3_closed,
         "active H3 traffic must not extend the maximum lifetime"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// A live H1 WebSocket authenticated by a short-lived consumer JWT must stop
+/// at the validated credential deadline even while application traffic keeps
+/// flowing and the configured maximum lifetime is materially later.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_active_jwt_session_closes_at_credential_expiry() {
+    const CREDENTIAL_TTL_SECONDS: i64 = 4;
+    const CREDENTIAL_CLOSE_GRACE_SECONDS: u64 = 4;
+    const CLOSE_BOUND_SECONDS: u64 =
+        CREDENTIAL_TTL_SECONDS as u64 + CREDENTIAL_CLOSE_GRACE_SECONDS;
+
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_jwt_auth_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) = start_gateway_plain_with_retry_extra_env(
+        config_path.to_str().unwrap(),
+        &[
+            ("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS", "0"),
+            ("FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS", "30"),
+        ],
+    )
+    .await;
+
+    // Mint only after the readiness barrier has proven ownership of the
+    // gateway listener, so the short-lived credential is valid at upgrade.
+    let token_minted_at = tokio::time::Instant::now();
+    let expires_at = chrono::Utc::now()
+        .timestamp()
+        .saturating_add(CREDENTIAL_TTL_SECONDS);
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &serde_json::json!({
+            "sub": "ws-jwt-client",
+            "exp": expires_at,
+            "nbf": 0,
+        }),
+        &jsonwebtoken::EncodingKey::from_secret(WS_JWT_SECRET.as_bytes()),
+    )
+    .unwrap_or_else(|_| panic!("failed to sign short-lived functional-test JWT"));
+
+    let url = format!("ws://127.0.0.1:{gateway_port}/ws-jwt");
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .expect("valid JWT WebSocket request");
+    request.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {token}")
+            .parse()
+            .unwrap_or_else(|_| panic!("signed JWT was not a valid authorization header")),
+    );
+    let (mut ws, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .unwrap_or_else(|_| panic!("JWT-authenticated WebSocket upgrade must succeed"));
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let mut sequence = 0u64;
+    let mut successful_round_trips = 0u64;
+    let closed_at_credential_deadline = loop {
+        if token_minted_at.elapsed() >= Duration::from_secs(CLOSE_BOUND_SECONDS) {
+            break false;
+        }
+        let payload = format!("jwt-active-{sequence}");
+        if ws
+            .send(Message::Text(payload.clone().into()))
+            .await
+            .is_err()
+        {
+            break true;
+        }
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(Message::Text(reply)))) => {
+                assert_eq!(reply, format!("Echo: {payload}"));
+                successful_round_trips = successful_round_trips.saturating_add(1);
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => break true,
+            Ok(Some(Ok(_))) | Err(_) => {}
+        }
+        sequence = sequence.saturating_add(1);
+        sleep(Duration::from_millis(100)).await;
+    };
+    let closed_after = token_minted_at.elapsed();
+
+    assert!(
+        successful_round_trips >= 2,
+        "JWT-authenticated WebSocket must remain active before credential expiry"
+    );
+    assert!(
+        closed_at_credential_deadline,
+        "active JWT-authenticated WebSocket must close in the credential-expiry window"
+    );
+    assert!(
+        closed_after >= Duration::from_secs(2),
+        "accepted JWT session must not close immediately after upgrade"
+    );
+    assert!(
+        closed_after < Duration::from_secs(CLOSE_BOUND_SECONDS),
+        "credential expiry must close the active session well before the 30-second maximum"
     );
 
     let _ = gateway.kill();

@@ -1,6 +1,12 @@
+use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
-use ferrum_edge::_test_support::{websocket_deadline_plan, websocket_stop_reason_for_test};
+use ferrum_edge::_test_support::{
+    websocket_deadline_plan, websocket_stop_reason_for_test,
+    websocket_stop_reason_with_overload_for_test,
+};
+use ferrum_edge::overload::OverloadState;
 
 #[test]
 fn credential_deadline_wins_when_earlier_than_maximum_lifetime() {
@@ -63,4 +69,30 @@ async fn listener_shutdown_wins_before_a_later_session_deadline() {
 async fn overload_drain_wins_before_a_later_session_deadline() {
     let reason = websocket_stop_reason_for_test(Duration::from_secs(60), false, false, true).await;
     assert_eq!(reason, "drain");
+}
+
+#[tokio::test(start_paused = true)]
+async fn begin_drain_wakes_all_registered_waiters_without_advancing_a_poll_timer() {
+    let overload = Arc::new(OverloadState::new());
+    let started_at = tokio::time::Instant::now();
+    let mut first_stop = Box::pin(websocket_stop_reason_with_overload_for_test(
+        Duration::from_secs(60),
+        Arc::clone(&overload),
+    ));
+    let mut second_stop = Box::pin(websocket_stop_reason_with_overload_for_test(
+        Duration::from_secs(60),
+        Arc::clone(&overload),
+    ));
+
+    assert!(matches!(futures_util::poll!(&mut first_stop), Poll::Pending));
+    assert!(matches!(futures_util::poll!(&mut second_stop), Poll::Pending));
+    ferrum_edge::overload::begin_drain(&overload);
+
+    assert_eq!(first_stop.await, "drain");
+    assert_eq!(second_stop.await, "drain");
+    assert_eq!(
+        tokio::time::Instant::now(),
+        started_at,
+        "drain wake must be event-driven rather than waiting for a timer tick"
+    );
 }

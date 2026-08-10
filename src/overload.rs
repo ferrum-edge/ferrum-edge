@@ -12,6 +12,7 @@ use crossbeam_utils::CachePadded;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 /// Number of monitor ticks between `fd_limit` refreshes.
@@ -96,9 +97,10 @@ pub enum OverloadLevel {
 /// churn, an unpadded layout puts the read-mostly action flags on the same
 /// cache line as the `fetch_add`/`fetch_sub` counters, causing the line to
 /// ping-pong between cores and turning every accept into a coherence stall.
-/// Snapshot fields (`fd_current`, `conn_current`, etc.), `draining`, and
-/// `port_exhaustion_events` are NOT padded — they are written ≤ once/sec or
-/// only on rare events, so contention does not justify the memory cost.
+/// Snapshot fields (`fd_current`, `conn_current`, etc.), `draining`, the
+/// one-shot `drain_started` notifier, and `port_exhaustion_events` are NOT
+/// padded — they are written ≤ once/sec or only on rare events, so contention
+/// does not justify the memory cost.
 /// `CachePadded<T>` derefs to `T`, so all existing
 /// `.load()` / `.fetch_add()` call sites compile unchanged.
 pub struct OverloadState {
@@ -115,6 +117,10 @@ pub struct OverloadState {
     // ── Graceful shutdown drain ────────────────────────────────────────
     /// Set to true when SIGTERM/SIGINT is received to begin the drain phase.
     pub draining: AtomicBool,
+    /// Cold one-shot broadcast for work that must stop as soon as drain starts.
+    /// The atomic remains the authoritative state and fast path; cancellation
+    /// supplies race-free event delivery to waiters already parked on drain.
+    drain_started: CancellationToken,
     /// In-flight connection counter. Incremented on accept, decremented on drop
     /// via [`ConnectionGuard`].
     pub active_connections: CachePadded<AtomicU64>,
@@ -180,6 +186,7 @@ impl OverloadState {
             reject_new_connections: CachePadded::new(AtomicBool::new(false)),
             reject_new_requests: CachePadded::new(AtomicBool::new(false)),
             draining: AtomicBool::new(false),
+            drain_started: CancellationToken::new(),
             active_connections: CachePadded::new(AtomicU64::new(0)),
             active_requests: CachePadded::new(AtomicU64::new(0)),
             drain_complete: tokio::sync::Notify::new(),
@@ -244,6 +251,16 @@ impl OverloadState {
         // so the comparison is exact — no precision bias.
         let hash = counter.wrapping_mul(0x9E3779B97F4A7C15) >> 54;
         (hash as u32) < prob
+    }
+
+    /// Wait until graceful drain begins.
+    ///
+    /// [`CancellationToken`] retains cancellation state, so a concurrent
+    /// [`begin_drain`] cannot be lost between an atomic check and waiter
+    /// registration, and a waiter registered after cancellation is ready
+    /// immediately.
+    pub(crate) async fn wait_for_drain_start(&self) {
+        self.drain_started.cancelled().await;
     }
 
     /// Record an ephemeral port exhaustion event (EADDRNOTAVAIL).
@@ -1050,6 +1067,7 @@ pub fn start_monitor(
 pub fn begin_drain(state: &Arc<OverloadState>) {
     state.draining.store(true, Ordering::Release);
     state.reject_new_requests.store(true, Ordering::Release);
+    state.drain_started.cancel();
 }
 
 /// Serving-mode shutdown entry point: [`begin_drain`] plus cancellation of any

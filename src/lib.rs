@@ -6467,6 +6467,29 @@ pub mod _test_support {
             .as_str()
     }
 
+    /// Await the WebSocket stop arbiter against caller-owned overload state so
+    /// external tests can start the waiter before invoking `begin_drain`.
+    pub async fn websocket_stop_reason_with_overload_for_test(
+        deadline_after: std::time::Duration,
+        overload: std::sync::Arc<crate::overload::OverloadState>,
+    ) -> &'static str {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let deadline = crate::proxy::WsSessionDeadline {
+            at: tokio::time::Instant::now()
+                .checked_add(deadline_after)
+                .unwrap_or_else(tokio::time::Instant::now),
+            reason: crate::proxy::WsTerminationReason::MaxLifetime,
+        };
+        let reason = crate::proxy::wait_for_websocket_session_stop(
+            deadline,
+            Some(shutdown_rx),
+            overload.as_ref(),
+        )
+        .await;
+        drop(shutdown_tx);
+        reason.as_str()
+    }
+
     pub fn request_credential_deadline_remaining(
         ctx: &crate::plugins::RequestContext,
     ) -> Option<std::time::Duration> {

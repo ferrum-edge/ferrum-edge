@@ -14479,27 +14479,19 @@ pub(crate) async fn wait_for_websocket_session_stop(
     {
         return WsTerminationReason::Drain;
     }
-    let mut drain_poll = tokio::time::interval(Duration::from_millis(50));
-    drain_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(deadline.at) => return deadline.reason,
-            changed = async {
-                match shutdown.as_mut() {
-                    Some(receiver) => receiver.changed().await.ok(),
-                    None => std::future::pending().await,
-                }
-            } => {
-                let _ = changed;
-                return WsTerminationReason::Drain;
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline.at) => deadline.reason,
+        changed = async {
+            match shutdown.as_mut() {
+                Some(receiver) => receiver.changed().await.ok(),
+                None => std::future::pending().await,
             }
-            _ = drain_poll.tick() => {
-                if overload.draining.load(Ordering::Acquire) {
-                    return WsTerminationReason::Drain;
-                }
-            }
+        } => {
+            let _ = changed;
+            WsTerminationReason::Drain
         }
+        _ = overload.wait_for_drain_start() => WsTerminationReason::Drain,
     }
 }
 
