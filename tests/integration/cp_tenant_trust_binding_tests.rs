@@ -26,11 +26,15 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 
 use ferrum_edge::config::types::GatewayConfig;
-use ferrum_edge::grpc::auth::{MESH_LOCAL_SUBSCRIBE_AUDIENCE, remote_discovery_audience};
+use ferrum_edge::grpc::auth::{
+    AuthorizedResponseStream, MESH_LOCAL_SUBSCRIBE_AUDIENCE, StreamAuthSurface,
+    remote_discovery_audience,
+};
 use ferrum_edge::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry};
 use ferrum_edge::grpc::cp_trust::{
     CpDpTrustBundle, CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo, PeerNamespaceScope,
@@ -206,6 +210,10 @@ fn multi_tenant_scope() -> CpScope {
     )
 }
 
+fn fixed_verifier_store(verifier: Arc<CpDpVerifier>) -> Arc<CpDpVerifierStore> {
+    Arc::new(CpDpVerifierStore::from_arc(verifier))
+}
+
 // ── Server harnesses ─────────────────────────────────────────────────────
 
 async fn start_configsync(
@@ -216,7 +224,7 @@ async fn start_configsync(
         .channel_capacity(64)
         .registry(Arc::new(DpNodeRegistry::new()))
         .expected_issuer(TEST_ISSUER.to_string())
-        .verifier(verifier)
+        .verifier_store(fixed_verifier_store(verifier))
         .scope(multi_tenant_scope())
         .real_ip_header(None)
         .build();
@@ -238,7 +246,7 @@ async fn start_mesh(verifier: Arc<CpDpVerifier>) -> (SocketAddr, tokio::task::Jo
         .channel_capacity(64)
         .registry(Arc::new(MeshNodeRegistry::new()))
         .expected_issuer(TEST_ISSUER.to_string())
-        .verifier(verifier)
+        .verifier_store(fixed_verifier_store(verifier))
         .scope(multi_tenant_scope())
         .build();
     let (listener, addr) = bind_loopback().await;
@@ -267,7 +275,7 @@ async fn start_xds(verifier: Arc<CpDpVerifier>) -> (SocketAddr, tokio::task::Joi
         TENANT_A.to_string(),
         32,
     )
-    .with_verifier(verifier)
+    .with_verifier_store(fixed_verifier_store(verifier))
     .with_scope(multi_tenant_scope());
     let (listener, addr) = bind_loopback().await;
     let handle = tokio::spawn(async move {
@@ -672,7 +680,189 @@ async fn verifier_rotation_revokes_only_streams_bound_to_removed_credentials() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn xds_revocation_preempts_already_buffered_sotw_and_delta_responses() {
+async fn revocation_preempts_buffered_delivery_on_every_configuration_surface() {
+    for surface in [
+        StreamAuthSurface::ConfigSync,
+        StreamAuthSurface::MeshSubscribeLocal,
+        StreamAuthSurface::MeshSubscribeRemote,
+        StreamAuthSurface::XdsSotw,
+        StreamAuthSurface::XdsDelta,
+    ] {
+        let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+        let snapshot = verifier.load();
+        let token = mint(
+            TENANT_A_SECRET,
+            Some(TENANT_A),
+            "buffered-delivery-node",
+            Some(json!(TENANT_A)),
+            None,
+        );
+        let request = authorize(tonic::Request::new(()), &token);
+        let identity = snapshot
+            .verify_and_bind_grpc_identity(
+                request.metadata(),
+                TEST_ISSUER,
+                None,
+                verifier.as_ref(),
+            )
+            .expect("test identity must bind to the active generation");
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Ok::<_, tonic::Status>(()))
+            .await
+            .expect("buffered response must enqueue");
+        let mut stream = AuthorizedResponseStream::new(
+            ReceiverStream::new(rx),
+            &identity,
+            verifier.clone(),
+            Duration::from_secs(300),
+            surface,
+        );
+
+        verifier.replace(tenant_b_only_verifier());
+        let status = stream
+            .next()
+            .await
+            .expect("authorization closure must emit one terminal item")
+            .expect_err("authorization closure must preempt buffered configuration output");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            status.message(),
+            "Stream verification credential is no longer trusted"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_reload_cannot_mask_the_next_revocation_on_an_idle_stream() {
+    let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+    let snapshot = verifier.load();
+    let token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "idle-reload-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let request = authorize(tonic::Request::new(()), &token);
+    let identity = snapshot
+        .verify_and_bind_grpc_identity(
+            request.metadata(),
+            TEST_ISSUER,
+            None,
+            verifier.as_ref(),
+        )
+        .expect("test identity must bind to the active generation");
+    let (_tx, rx) = mpsc::channel::<Result<(), tonic::Status>>(1);
+    let mut stream = AuthorizedResponseStream::new(
+        ReceiverStream::new(rx),
+        &identity,
+        verifier.clone(),
+        Duration::from_secs(300),
+        StreamAuthSurface::ConfigSync,
+    );
+    let waiter = tokio::spawn(async move { stream.next().await });
+    tokio::task::yield_now().await;
+
+    // This replacement retains tenant A's exact credential generation. The
+    // authorization watch must re-arm after observing it so the following
+    // removal still wakes an otherwise idle response stream.
+    verifier.replace(two_tenant_verifier());
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    verifier.replace(tenant_b_only_verifier());
+
+    let status = waiter
+        .await
+        .expect("idle response waiter must not panic")
+        .expect("revocation must emit one terminal item")
+        .expect_err("revocation must terminate the idle stream");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test(start_paused = true)]
+async fn deadlines_preempt_buffered_configuration_output() {
+    let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+    let snapshot = verifier.load();
+    let token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "server-deadline-buffered-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let request = authorize(tonic::Request::new(()), &token);
+    let identity = snapshot
+        .verify_and_bind_grpc_identity(
+            request.metadata(),
+            TEST_ISSUER,
+            None,
+            verifier.as_ref(),
+        )
+        .expect("test identity must bind to the active generation");
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Ok::<_, tonic::Status>(()))
+        .await
+        .expect("buffered response must enqueue");
+    let mut stream = AuthorizedResponseStream::new(
+        ReceiverStream::new(rx),
+        &identity,
+        verifier,
+        Duration::ZERO,
+        StreamAuthSurface::ConfigSync,
+    );
+    let status = stream
+        .next()
+        .await
+        .expect("server deadline must emit one terminal item")
+        .expect_err("server deadline must preempt buffered configuration output");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    assert_eq!(
+        status.message(),
+        "Authenticated stream reached server maximum lifetime"
+    );
+
+    let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+    let snapshot = verifier.load();
+    let token = mint_with_exp(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "token-deadline-buffered-node",
+        Some(json!(TENANT_A)),
+        None,
+        Utc::now().timestamp() - 59,
+    );
+    let request = authorize(tonic::Request::new(()), &token);
+    let identity = snapshot
+        .verify_and_bind_grpc_identity(
+            request.metadata(),
+            TEST_ISSUER,
+            None,
+            verifier.as_ref(),
+        )
+        .expect("token inside verification leeway must bind");
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Ok::<_, tonic::Status>(()))
+        .await
+        .expect("buffered response must enqueue");
+    let mut stream = AuthorizedResponseStream::new(
+        ReceiverStream::new(rx),
+        &identity,
+        verifier,
+        Duration::from_secs(300),
+        StreamAuthSurface::ConfigSync,
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let status = stream
+        .next()
+        .await
+        .expect("token deadline must emit one terminal item")
+        .expect_err("token deadline must preempt buffered configuration output");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    assert_eq!(status.message(), "Stream authorization expired");
+}
+
+#[tokio::test(start_paused = true)]
+async fn xds_revocation_terminates_sotw_and_delta_with_buffered_transport_data() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
     let (addr, handle) = start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
 
@@ -736,20 +926,19 @@ async fn xds_revocation_preempts_already_buffered_sotw_and_delta_responses() {
         .expect("delta ADS admission")
         .into_inner();
 
-    // Let both producer tasks enqueue their initial response without allowing
-    // either client to consume it. Revocation must win over the buffered item.
+    // Let both producer tasks enqueue their initial response. Tonic may already
+    // have placed that authorized-at-delivery response on the wire; regardless
+    // of client-side buffering, revocation must be the terminal stream status.
     settle().await;
     verifier.replace(tenant_b_only_verifier());
-    let sotw_status = sotw_stream
-        .message()
-        .await
-        .expect_err("revocation must preempt the buffered SotW response");
-    assert_eq!(sotw_status.code(), tonic::Code::PermissionDenied);
-    let delta_status = delta_stream
-        .message()
-        .await
-        .expect_err("revocation must preempt the buffered delta response");
-    assert_eq!(delta_status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        wait_for_terminal_status(&mut sotw_stream).await,
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        wait_for_terminal_status(&mut delta_stream).await,
+        tonic::Code::PermissionDenied
+    );
 
     drop(sotw_tx);
     drop(delta_tx);
@@ -1473,8 +1662,8 @@ fn verifier_debug_never_renders_material() {
 /// a trust-bundle control plane threads
 /// `cp_dp_grpc_jwt_secret.unwrap_or_default()` — an empty string — into those
 /// builders so cross-cluster remote discovery can still mint. A call site that
-/// forgot `.verifier(..)` would then verify against the empty HS256 key, which
-/// every caller can reproduce. The verifier itself refuses instead.
+/// forgot `.verifier_store(..)` would then verify against the empty HS256 key,
+/// which every caller can reproduce. The verifier itself refuses instead.
 #[test]
 fn empty_shared_secret_never_verifies() {
     let empty = CpDpVerifier::SharedSecret(String::new());
@@ -1573,7 +1762,7 @@ async fn xds_all_scope_rejects_bound_credential_without_ns_claim() {
         TENANT_A.to_string(),
         32,
     )
-    .with_verifier(two_tenant_bundle())
+    .with_verifier_store(fixed_verifier_store(two_tenant_bundle()))
     .with_scope(CpScope::All);
     let (listener, addr) = bind_loopback().await;
     let handle = tokio::spawn(async move {
@@ -1632,7 +1821,7 @@ async fn single_scope_require_ns_claim_rejects_token_without_ns() {
         .channel_capacity(64)
         .registry(Arc::new(DpNodeRegistry::new()))
         .expected_issuer(TEST_ISSUER.to_string())
-        .verifier(verifier)
+        .verifier_store(fixed_verifier_store(verifier))
         .scope(CpScope::Single(TENANT_A.to_string()))
         .require_ns_claim(true)
         .real_ip_header(None)
@@ -1674,7 +1863,7 @@ async fn single_scope_without_require_accepts_no_ns_but_applies_bound() {
         .channel_capacity(64)
         .registry(Arc::new(DpNodeRegistry::new()))
         .expected_issuer(TEST_ISSUER.to_string())
-        .verifier(verifier)
+        .verifier_store(fixed_verifier_store(verifier))
         .scope(CpScope::Single(TENANT_A.to_string()))
         .require_ns_claim(false)
         .real_ip_header(None)

@@ -587,7 +587,7 @@ impl CpDpVerifier {
                 // with `SharedSecret(jwt_secret)`, and a trust-bundle CP
                 // threads `cp_dp_grpc_jwt_secret.unwrap_or_default()` (i.e.
                 // `""`) into those builders for token *minting*. A future
-                // call site that forgot `.verifier(..)` would otherwise
+                // call site that forgot `.verifier_store(..)` would otherwise
                 // verify against the empty HS256 key and accept anything.
                 if secret.is_empty() {
                     return Err(TenantAuthRejectReason::TokenValidation);
@@ -605,18 +605,6 @@ impl CpDpVerifier {
                     &key.identity,
                 ))
             }
-        }
-    }
-
-    /// Whether this verifier snapshot still accepts the exact credential and
-    /// namespace policy that admitted a stream.
-    pub fn contains_credential(&self, identity: &VerificationCredentialIdentity) -> bool {
-        match self {
-            Self::SharedSecret(secret) => {
-                !secret.is_empty()
-                    && credential_identity(None, Algorithm::HS256, secret.as_bytes()) == *identity
-            }
-            Self::TrustBundle(bundle) => bundle.keys.values().any(|key| key.identity == *identity),
         }
     }
 

@@ -551,10 +551,10 @@ impl CpGrpcServer {
     /// Fluent builder seeded with the legacy fleet-wide shared secret.
     ///
     /// Production CP startup replaces the seeded verifier via
-    /// [`CpGrpcServerBuilder::verifier`] whenever a namespace-bound trust
-    /// bundle is configured; the shared-secret seed survives only for
-    /// single-namespace control planes and tests, where it is
-    /// security-equivalent.
+    /// [`CpGrpcServerBuilder::verifier_store`] so ConfigSync, MeshSubscribe,
+    /// and ADS share one reloadable authorization source. The shared-secret
+    /// seed survives only for single-namespace control planes and tests, where
+    /// it is security-equivalent.
     pub fn builder(config: Arc<ArcSwap<GatewayConfig>>, jwt_secret: String) -> CpGrpcServerBuilder {
         CpGrpcServerBuilder {
             config,
@@ -1697,13 +1697,6 @@ impl CpGrpcServerBuilder {
 
     pub fn expected_issuer(mut self, issuer: String) -> Self {
         self.expected_issuer = issuer;
-        self
-    }
-
-    /// Replace the seeded shared-secret verifier with the CP's configured
-    /// namespace-bound trust bundle.
-    pub fn verifier(mut self, verifier: Arc<CpDpVerifier>) -> Self {
-        self.verifier = Arc::new(CpDpVerifierStore::from_arc(verifier));
         self
     }
 

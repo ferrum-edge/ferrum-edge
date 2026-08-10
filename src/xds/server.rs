@@ -315,13 +315,6 @@ impl XdsAdsServer {
         self
     }
 
-    /// Replace the seeded shared-secret verifier with the CP's configured
-    /// namespace-bound trust bundle.
-    pub fn with_verifier(mut self, verifier: Arc<CpDpVerifier>) -> Self {
-        self.verifier = Arc::new(CpDpVerifierStore::from_arc(verifier));
-        self
-    }
-
     pub fn with_verifier_store(mut self, verifier: Arc<CpDpVerifierStore>) -> Self {
         self.verifier = verifier;
         self

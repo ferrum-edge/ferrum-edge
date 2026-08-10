@@ -2037,11 +2037,11 @@ pub async fn run(
             // The legacy secret stays optional here: with a trust bundle
             // configured it is no longer an authorization input, and CP mode
             // mints nothing with it. Every server builder below is seeded with
-            // it purely so the pre-`.verifier(..)` shape stays uniform; the
-            // seeded `SharedSecret` arm is replaced before any request is
-            // served. An absent secret therefore leaves that seed empty, which
-            // `CpDpVerifier::with_decoding_key` refuses outright rather than
-            // verifying against an empty HS256 key.
+            // it purely so the builders' seeded shape stays uniform; the
+            // shared reloadable verifier store replaces that seed before any
+            // request is served. An absent secret therefore leaves the seed
+            // empty, which `CpDpVerifier::with_decoding_key` refuses outright
+            // rather than verifying against an empty HS256 key.
             //
             // In particular this is NOT the cross-cluster remote-discovery
             // minting key. That minting happens on a mesh-mode node

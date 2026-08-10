@@ -658,21 +658,19 @@ impl StreamAuthorizationLease {
     /// Wait without polling. Used by the task-owned bidirectional ADS loops.
     pub async fn wait_for_end(&self) -> StreamAuthEndReason {
         let mut revisions = self.verifier.subscribe();
-        if !self
-            .verifier
-            .credential_is_active(&self.credential, self.credential_generation)
-        {
-            return StreamAuthEndReason::VerificationKeyRemoved;
-        }
         loop {
+            // Credential removal is an authorization decision, so it wins
+            // over a coincident expiry/server deadline. Checking the live
+            // generation directly also closes the remove-then-readd gap even
+            // when the watch receiver coalesces both revisions.
+            if !self
+                .verifier
+                .credential_is_active(&self.credential, self.credential_generation)
+            {
+                return StreamAuthEndReason::VerificationKeyRemoved;
+            }
             tokio::select! {
                 biased;
-                _ = tokio::time::sleep_until(self.authorization_deadline) => {
-                    return StreamAuthEndReason::Expired;
-                }
-                _ = tokio::time::sleep_until(self.server_deadline) => {
-                    return StreamAuthEndReason::ServerMaxLifetime;
-                }
                 changed = revisions.changed() => {
                     if changed.is_err()
                         || !self.verifier.credential_is_active(
@@ -682,6 +680,12 @@ impl StreamAuthorizationLease {
                     {
                         return StreamAuthEndReason::VerificationKeyRemoved;
                     }
+                }
+                _ = tokio::time::sleep_until(self.authorization_deadline) => {
+                    return StreamAuthEndReason::Expired;
+                }
+                _ = tokio::time::sleep_until(self.server_deadline) => {
+                    return StreamAuthEndReason::ServerMaxLifetime;
                 }
             }
         }
@@ -720,7 +724,7 @@ impl<S> AuthorizedResponseStream<S> {
                 identity.authorization_deadline,
             )),
             server_sleep: Box::pin(tokio::time::sleep_until(server_deadline)),
-            verifier_revisions: WatchStream::new(verifier.subscribe()),
+            verifier_revisions: WatchStream::from_changes(verifier.subscribe()),
             credential: identity.credential.clone(),
             credential_generation: identity.credential_generation,
             verifier,
@@ -734,6 +738,47 @@ impl<S> AuthorizedResponseStream<S> {
         self.guard.set_reason(reason);
         Poll::Ready(Some(Err(reason.status())))
     }
+
+    fn credential_is_active(&self) -> bool {
+        self.verifier
+            .credential_is_active(&self.credential, self.credential_generation)
+    }
+
+    /// Resolve a closed authorization boundary in deterministic priority
+    /// order. The direct generation read is load-bearing: the watch stream is
+    /// a wake-up mechanism, not the source of truth, and may coalesce a rapid
+    /// remove/re-add into one notification.
+    fn authorization_end(&mut self, cx: &mut Context<'_>) -> Option<StreamAuthEndReason> {
+        if !self.credential_is_active() {
+            return Some(StreamAuthEndReason::VerificationKeyRemoved);
+        }
+        if self.authorization_sleep.as_mut().poll(cx).is_ready() {
+            return Some(StreamAuthEndReason::Expired);
+        }
+        if self.server_sleep.as_mut().poll(cx).is_ready() {
+            return Some(StreamAuthEndReason::ServerMaxLifetime);
+        }
+        let verifier_changed = match tokio_stream::Stream::poll_next(
+            Pin::new(&mut self.verifier_revisions),
+            cx,
+        ) {
+            Poll::Ready(Some(_)) => {
+                // `WatchStream` installs its next `changed()` future only when
+                // it is polled again. Schedule that bounded follow-up poll so
+                // a retained-key reload cannot leave an idle response stream
+                // unwakeable for the next removal.
+                cx.waker().wake_by_ref();
+                true
+            }
+            Poll::Ready(None) => return Some(StreamAuthEndReason::VerificationKeyRemoved),
+            Poll::Pending => false,
+        };
+        if verifier_changed && !self.credential_is_active() {
+            Some(StreamAuthEndReason::VerificationKeyRemoved)
+        } else {
+            None
+        }
+    }
 }
 
 impl<S, T> tokio_stream::Stream for AuthorizedResponseStream<S>
@@ -746,25 +791,23 @@ where
         if self.terminal_sent {
             return Poll::Ready(None);
         }
-        if self.authorization_sleep.as_mut().poll(cx).is_ready() {
-            return self.terminate(StreamAuthEndReason::Expired);
+        if let Some(reason) = self.authorization_end(cx) {
+            return self.terminate(reason);
         }
-        if self.server_sleep.as_mut().poll(cx).is_ready() {
-            return self.terminate(StreamAuthEndReason::ServerMaxLifetime);
+
+        let next = self.inner.as_mut().poll_next(cx);
+
+        // An inner stream can make a buffered response ready in the same poll
+        // that a verifier reload or deadline closes authorization. Re-check at
+        // the delivery boundary so that item is discarded in favor of the one
+        // terminal status. This also covers an inner terminal item/closure and
+        // preserves the authorization status taxonomy.
+        if next.is_ready()
+            && let Some(reason) = self.authorization_end(cx)
+        {
+            return self.terminate(reason);
         }
-        let verifier_revision =
-            tokio_stream::Stream::poll_next(Pin::new(&mut self.verifier_revisions), cx);
-        let revoked = match verifier_revision {
-            Poll::Ready(Some(_)) => !self
-                .verifier
-                .credential_is_active(&self.credential, self.credential_generation),
-            Poll::Ready(None) => true,
-            Poll::Pending => false,
-        };
-        if revoked {
-            return self.terminate(StreamAuthEndReason::VerificationKeyRemoved);
-        }
-        self.inner.as_mut().poll_next(cx)
+        next
     }
 }
 

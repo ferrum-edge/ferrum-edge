@@ -121,7 +121,11 @@ at `exp` plus the verifier's 60-second leeway, or at the independent
 60..=86400), whichever comes first. Heartbeats and configuration traffic do not
 renew either deadline. Expiry and maximum-lifetime closure use
 `UNAUTHENTICATED`; removal of the exact accepted verification credential uses
-`PERMISSION_DENIED`.
+`PERMISSION_DENIED`. This is deliberately distinct from initial admission:
+missing, malformed, expired, unknown-key, wrong-signature, and wrong-algorithm
+credentials all remain the same non-disclosing `UNAUTHENTICATED` class. If key
+removal coincides with a deadline, removal takes precedence for an already
+admitted stream.
 
 `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` is watched at
 `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`. A valid replacement is installed
