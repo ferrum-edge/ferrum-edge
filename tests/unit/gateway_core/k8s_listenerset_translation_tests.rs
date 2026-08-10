@@ -7,8 +7,8 @@
 
 use base64::Engine as _;
 use ferrum_edge::config_sources::k8s::{
-    K8sMetadata, K8sObject, K8sTranslationOptions, translate_k8s_objects,
-    translate_k8s_objects_collecting_skips,
+    GatewayApiListenerKey, GatewayApiListenerParentKind, K8sMetadata, K8sObject,
+    K8sTranslationOptions, translate_k8s_objects, translate_k8s_objects_collecting_skips,
 };
 use ferrum_edge::identity::spiffe::TrustDomain;
 use ferrum_edge::k8s_controller::reconciler::merge_k8s_translation;
@@ -676,6 +676,21 @@ fn listenerset_protocol_conflict_with_gateway_listener() {
     );
     assert!(!status.accepted);
     assert_eq!(status.accepted_reason, "ListenersNotValid");
+    let gateway_http = GatewayApiListenerKey {
+        namespace: "default".to_string(),
+        parent_kind: GatewayApiListenerParentKind::Gateway,
+        gateway: "edge".to_string(),
+        listener: "http".to_string(),
+    };
+    assert_eq!(
+        translation
+            .listener_conflicts
+            .get(&gateway_http)
+            .map(|conflict| conflict.reason),
+        Some("ProtocolConflict"),
+        "Gateway HTTP claim must appear in translation.listener_conflicts for status parity: {:?}",
+        translation.listener_conflicts
+    );
 }
 
 /// Regression for upstream `HTTPRouteHTTPSListener`: a Gateway may declare an
@@ -887,6 +902,110 @@ fn incompatible_gateway_listener_protocol_fails_closed() {
             .all(|service| service.name != "edge-a-http" && service.name != "edge-b-tcp"),
         "neither protocol-conflicted claim may become a MeshService: {:?}",
         translation.config.mesh
+    );
+
+    for listener in ["a-http", "b-tcp"] {
+        let key = GatewayApiListenerKey {
+            namespace: "default".to_string(),
+            parent_kind: GatewayApiListenerParentKind::Gateway,
+            gateway: "edge".to_string(),
+            listener: listener.to_string(),
+        };
+        let conflict = translation
+            .listener_conflicts
+            .get(&key)
+            .unwrap_or_else(|| panic!("translation must record ProtocolConflict for {listener}"));
+        assert_eq!(conflict.reason, "ProtocolConflict");
+        assert!(
+            conflict.message.contains("incompatible protocol families"),
+            "conflict message must describe the family refusal without echoing user input: {}",
+            conflict.message
+        );
+        assert!(
+            !conflict.message.contains("example.com"),
+            "conflict message must not echo hostnames"
+        );
+    }
+}
+
+#[test]
+fn tcp_and_udp_gateway_listeners_may_share_a_numeric_port() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([
+        {
+            "name": "tcp",
+            "port": 9000,
+            "protocol": "TCP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "TCPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        },
+        {
+            "name": "udp",
+            "port": 9000,
+            "protocol": "UDP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "UDPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        }
+    ]);
+    let objects = vec![gateway_class(), gateway];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert!(
+        translation.listener_conflicts.is_empty(),
+        "TCP and UDP are different transports and must not ProtocolConflict on one number: {:?}",
+        translation.listener_conflicts
+    );
+    assert!(
+        !translation.warnings.iter().any(|warning| warning.contains("ProtocolConflict")),
+        "TCP+UDP must not emit ProtocolConflict warnings: {:?}",
+        translation.warnings
+    );
+}
+
+#[test]
+fn tcp_and_tls_passthrough_listeners_may_share_a_numeric_port() {
+    let mut gateway = http_gateway("edge", Some("Same"));
+    gateway.spec["listeners"] = json!([
+        {
+            "name": "tcp",
+            "port": 8443,
+            "protocol": "TCP",
+            "allowedRoutes": {
+                "kinds": [{ "kind": "TCPRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        },
+        {
+            "name": "tls",
+            "port": 8443,
+            "protocol": "TLS",
+            "hostname": "sni.example.com",
+            "tls": { "mode": "Passthrough" },
+            "allowedRoutes": {
+                "kinds": [{ "kind": "TLSRoute" }],
+                "namespaces": { "from": "Same" }
+            }
+        }
+    ]);
+    let objects = vec![gateway_class(), gateway];
+    let translation = translate_k8s_objects(&objects, options()).expect("translate");
+
+    assert!(
+        translation.listener_conflicts.is_empty(),
+        "raw TCP and TLS-passthrough share the opaque stream plane and must not ProtocolConflict: {:?}",
+        translation.listener_conflicts
+    );
+    assert!(
+        !translation
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ProtocolConflict")),
+        "TCP+TLS-passthrough must not emit ProtocolConflict warnings: {:?}",
+        translation.warnings
     );
 }
 

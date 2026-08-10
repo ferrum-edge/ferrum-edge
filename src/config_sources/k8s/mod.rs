@@ -421,10 +421,12 @@ pub struct K8sTranslation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayApiListenerConflict {
     /// Gateway API `ListenerConditionReason` for `Conflicted=True` —
-    /// `ProtocolConflict` when the port is claimed both plaintext and an
-    /// effective TLS-serving namespace slot, `HostnameConflict` when effective
-    /// per-namespace TLS serving slots on one socket resolve to different
-    /// credentials.
+    /// `ProtocolConflict` when the port is claimed by incompatible physical
+    /// shapes (HTTP-family vs raw TCP/TLS stream on one TCP transport, or
+    /// plaintext vs an effective TLS-serving HTTP-family slot),
+    /// `HostnameConflict` when effective per-namespace TLS serving slots on
+    /// one socket resolve to different credentials or a same-protocol
+    /// hostname loses ListenerSet/Gateway precedence.
     pub reason: &'static str,
     pub message: String,
 }

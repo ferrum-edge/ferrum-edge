@@ -23,9 +23,10 @@ use super::gateway_api::{
     namespace_selector_matches, normalize_gateway_hostname, validate_listenerset_listener_entry,
 };
 use super::{
-    GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerParentKind,
-    GatewayApiListenerPolicy, GatewayApiListenerSetStatus, K8sAccumulator, K8sObject,
-    K8sResourceKey, K8sTranslateError, includes_object_namespace, string_field,
+    GatewayApiAllowedRoutesNamespaces, GatewayApiListenerConflict, GatewayApiListenerKey,
+    GatewayApiListenerParentKind, GatewayApiListenerPolicy, GatewayApiListenerSetStatus,
+    K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError, includes_object_namespace,
+    string_field,
 };
 use crate::modes::mesh::config::{MeshService, ServicePort};
 
@@ -366,11 +367,14 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
                 continue;
             }
             // HostnameConflict keeps precedence (only the later claim loses).
-            // ProtocolConflict is physical: one socket cannot speak two
-            // protocols, so every involved claim is refused — never an
-            // ordering-dependent winner. Distinct Gateway hostnames
-            // (including catch-all plus named siblings) do not conflict
-            // because `hostnames_conflict` only matches equal values.
+            // ProtocolConflict is physical across incompatible TCP datapath
+            // families (HTTP-family vs raw stream): every involved claim is
+            // refused — never an ordering-dependent winner. Distinct Gateway
+            // hostnames (including catch-all plus named siblings) do not
+            // conflict because `hostnames_conflict` only matches equal values.
+            // Plaintext-vs-TLS HTTP-family refusal stays in
+            // `refuse_incompatible_same_port_listeners` so messages stay one
+            // decision per physical shape.
             if let Some(reason) = conflict_against_accepted(candidate, &accepted) {
                 conflicted.insert(candidate.key.clone(), reason);
                 if reason == "ProtocolConflict" {
@@ -378,7 +382,10 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
                         .iter()
                         .filter(|prior| {
                             prior.port == candidate.port
-                                && !prior.protocol.eq_ignore_ascii_case(&candidate.protocol)
+                                && protocols_physically_conflict(
+                                    prior.protocol.as_str(),
+                                    candidate.protocol.as_str(),
+                                )
                         })
                         .map(|prior| prior.key.clone())
                         .collect();
@@ -393,19 +400,83 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
         }
     }
 
+    // One deterministic ProtocolConflict message per port so Gateway status
+    // and translator warnings agree regardless of admission order.
+    let mut protocol_conflict_ports: BTreeMap<u64, Vec<GatewayApiListenerKey>> = BTreeMap::new();
     for (key, reason) in &conflicted {
-        if let Some(policy) = acc.gateway_api_listener_policies.get_mut(key) {
+        if *reason != "ProtocolConflict" {
+            continue;
+        }
+        let Some(port) = acc
+            .gateway_api_listener_policies
+            .get(key)
+            .and_then(|policy| policy.port)
+        else {
+            continue;
+        };
+        protocol_conflict_ports
+            .entry(port)
+            .or_default()
+            .push(key.clone());
+    }
+    for keys in protocol_conflict_ports.values_mut() {
+        keys.sort();
+    }
+
+    for (key, reason) in &conflicted {
+        {
+            let Some(policy) = acc.gateway_api_listener_policies.get_mut(key) else {
+                continue;
+            };
             policy.conflict_reason = Some(*reason);
             policy.materializable = false;
             policy.routes_materializable = false;
-            acc.warnings.push(format!(
-                "Gateway API {} {}/{} listener {} rejected: {reason}",
-                key.parent_kind.as_str(),
-                key.namespace,
-                key.gateway,
-                key.listener
-            ));
         }
+        acc.warnings.push(format!(
+            "Gateway API {} {}/{} listener {} rejected: {reason}",
+            key.parent_kind.as_str(),
+            key.namespace,
+            key.gateway,
+            key.listener
+        ));
+        // Gateway.status.listeners[] reads only `gateway_api_listener_conflicts`.
+        // Withdrawal without an entry leaves Conflicted=False / Accepted=True
+        // while no traffic materializes.
+        let message = match *reason {
+            "ProtocolConflict" => {
+                let port = protocol_conflict_ports
+                    .iter()
+                    .find(|(_, keys)| keys.iter().any(|conflicted_key| conflicted_key == key))
+                    .map(|(port, _)| *port);
+                let listeners = port
+                    .and_then(|port| protocol_conflict_ports.get(&port))
+                    .map(|keys| {
+                        keys.iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_else(|| key.to_string());
+                let port = port.unwrap_or(0);
+                format!(
+                    "Gateway API listeners [{listeners}] claim port {port} with incompatible \
+                     protocol families on the same TCP transport (HTTP-family vs raw stream), \
+                     so every conflicting claim on this port is refused (Conflicted)."
+                )
+            }
+            "HostnameConflict" => {
+                "Listener hostname conflicts with a higher-precedence listener on the same port."
+                    .to_string()
+            }
+            other => format!("Gateway API listener rejected: {other}"),
+        };
+        acc.gateway_api_listener_conflicts.insert(
+            key.clone(),
+            GatewayApiListenerConflict {
+                reason,
+                message,
+            },
+        );
     }
 
     refresh_listenerset_status_after_conflicts(acc);
@@ -613,14 +684,55 @@ fn conflict_against_accepted(
         if prior.port != candidate.port {
             continue;
         }
-        if !prior.protocol.eq_ignore_ascii_case(&candidate.protocol) {
+        if protocols_physically_conflict(prior.protocol.as_str(), candidate.protocol.as_str()) {
             return Some("ProtocolConflict");
         }
-        if hostnames_conflict(prior.hostname.as_deref(), candidate.hostname.as_deref()) {
+        // Same protocol family: hostname distinctness only. HTTP vs HTTPS on
+        // one port is plaintext-vs-TLS physical refusal owned by
+        // `refuse_incompatible_same_port_listeners`, not a family conflict.
+        if prior.protocol.eq_ignore_ascii_case(&candidate.protocol)
+            && hostnames_conflict(prior.hostname.as_deref(), candidate.hostname.as_deref())
+        {
             return Some("HostnameConflict");
         }
     }
     None
+}
+
+/// OS/datapath family for Gateway API listener protocol conflict arbitration.
+///
+/// TCP and UDP may share a numeric port (different transports). Within TCP,
+/// HTTP-family accept loops cannot share a socket with raw TCP / TLS-passthrough
+/// stream listeners. Compatible HTTP-family siblings and opaque TCP/TLS stream
+/// siblings are not ProtocolConflict here — plaintext-vs-TLS HTTP shapes are
+/// refused by [`super::gateway_api::refuse_incompatible_same_port_listeners`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenerPortFamily {
+    Http,
+    TcpStream,
+    Udp,
+}
+
+fn listener_port_family(protocol: &str) -> Option<ListenerPortFamily> {
+    match protocol.to_ascii_uppercase().as_str() {
+        "HTTP" | "HTTPS" | "GRPC" | "GRPCS" => Some(ListenerPortFamily::Http),
+        "TCP" | "TLS" => Some(ListenerPortFamily::TcpStream),
+        "UDP" => Some(ListenerPortFamily::Udp),
+        _ => None,
+    }
+}
+
+fn protocols_physically_conflict(left: &str, right: &str) -> bool {
+    matches!(
+        (listener_port_family(left), listener_port_family(right)),
+        (
+            Some(ListenerPortFamily::Http),
+            Some(ListenerPortFamily::TcpStream)
+        ) | (
+            Some(ListenerPortFamily::TcpStream),
+            Some(ListenerPortFamily::Http)
+        )
+    )
 }
 
 fn hostnames_conflict(left: Option<&str>, right: Option<&str>) -> bool {

@@ -1037,6 +1037,107 @@ fn a_plaintext_and_tls_listener_sharing_a_port_both_report_conflicted() {
     }
 }
 
+/// HTTP-family vs raw TCP on one TCP port is a physical family conflict.
+/// Both Gateway listeners must report Conflicted / PortUnavailable and the
+/// translation conflict map must agree — not merely withdraw config.
+#[test]
+fn http_and_raw_tcp_listeners_sharing_a_port_both_report_conflicted() {
+    let gateway = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [
+                {
+                    "name": "http",
+                    "port": 8080,
+                    "protocol": "HTTP",
+                    "allowedRoutes": {"namespaces": {"from": "All"}}
+                },
+                {
+                    "name": "tcp",
+                    "port": 8080,
+                    "protocol": "TCP",
+                    "allowedRoutes": {
+                        "kinds": [{"kind": "TCPRoute"}],
+                        "namespaces": {"from": "All"}
+                    }
+                }
+            ]
+        }),
+    );
+    let class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "default",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let objects = vec![class, gateway];
+
+    let update = gateway_update(&objects, "edge");
+    assert_listener_refused(&update, "http", "ProtocolConflict");
+    assert_listener_refused(&update, "tcp", "ProtocolConflict");
+
+    // Reversed listener order must not change status.
+    let mut reversed = objects.clone();
+    if let Some(listeners) = reversed[1].spec.get_mut("listeners").and_then(Value::as_array_mut)
+    {
+        listeners.reverse();
+    }
+    let reversed_update = gateway_update(&reversed, "edge");
+    assert_listener_refused(&reversed_update, "http", "ProtocolConflict");
+    assert_listener_refused(&reversed_update, "tcp", "ProtocolConflict");
+
+    let translation = translate_k8s_objects(&objects, options()).expect("translation");
+    assert_eq!(
+        translation.listener_conflicts.len(),
+        2,
+        "translation must refuse both HTTP and TCP claims: {:?}",
+        translation.listener_conflicts
+    );
+    for listener in ["http", "tcp"] {
+        let key = GatewayApiListenerKey {
+            namespace: "default".to_string(),
+            parent_kind: GatewayApiListenerParentKind::Gateway,
+            gateway: "edge".to_string(),
+            listener: listener.to_string(),
+        };
+        let conflict = translation
+            .listener_conflicts
+            .get(&key)
+            .unwrap_or_else(|| panic!("missing conflict for {listener}"));
+        assert_eq!(conflict.reason, "ProtocolConflict");
+        assert!(
+            conflict.message.contains("incompatible protocol families"),
+            "status/translation message must describe the family refusal: {}",
+            conflict.message
+        );
+    }
+    assert!(
+        translation.warnings.iter().any(|warning| {
+            warning.contains("Gateway default/edge listener http rejected: ProtocolConflict")
+        }) && translation.warnings.iter().any(|warning| {
+            warning.contains("Gateway default/edge listener tcp rejected: ProtocolConflict")
+        }),
+        "warnings must agree with status withdrawal: {:?}",
+        translation.warnings
+    );
+    // One family-arbitration decision — not a second plaintext-vs-TLS refuse message.
+    assert_eq!(
+        translation
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("incompatible frontend shapes"))
+            .count(),
+        0,
+        "HTTP+TCP must not also emit plaintext-vs-TLS refuse warnings: {:?}",
+        translation.warnings
+    );
+}
+
 /// Physically refused same-port listeners must not be advertised as
 /// MeshServices. A healthy sibling on a different port must still be exposed.
 #[test]

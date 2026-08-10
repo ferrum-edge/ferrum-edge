@@ -1703,14 +1703,11 @@ fn listener_is_effective_tls_serving_claim(
 /// one decision.
 ///
 /// Unresolved / unsupported listeners contribute no claim, so a broken sibling
-/// cannot take down a healthy listener. Listeners already marked
-/// `ProtocolConflict` by ListenerSet/Gateway precedence admission are the
-/// exception: they were shape-complete competitors withdrawn only because a
-/// sibling claimed the same port with another protocol. Excluding them would
-/// let the remaining claim silently win the socket and program traffic — the
-/// exact one-sided failure this helper exists to prevent. They still count so
-/// every involved claim is recorded in `gateway_api_listener_conflicts` for
-/// Gateway status parity.
+/// cannot take down a healthy listener. Listeners already recorded in
+/// `gateway_api_listener_conflicts` by ListenerSet/Gateway family arbitration
+/// (HTTP-family vs raw TCP/TLS stream on one TCP port) are skipped here so
+/// status and warnings stay one decision per physical shape — never a second
+/// plaintext-vs-TLS message for claims already withdrawn as family conflicts.
 pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) {
     let plan = plan_gateway_frontend_tls_namespace_slots(acc);
     apply_gateway_frontend_tls_namespace_slot_route_limits(acc, &plan);
@@ -1728,13 +1725,19 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
     }
 
     let mut claims_by_port: BTreeMap<u16, PortClaims> = BTreeMap::new();
+    let already_conflicted: BTreeSet<GatewayApiListenerKey> =
+        acc.gateway_api_listener_conflicts.keys().cloned().collect();
     for (key, policy) in &acc.gateway_api_listener_policies {
+        // Family arbitration already withdrew these and recorded Gateway status
+        // conflicts; do not re-claim them into plaintext-vs-TLS arbitration.
+        if already_conflicted.contains(key) {
+            continue;
+        }
         // Only the HTTP family shares the HTTP-route socket set — the same
         // protocols `listener_route_kinds_for_protocol` admits HTTPRoute /
         // GRPCRoute on. A TLS-passthrough or L4 listener on the same number is
         // a different datapath entirely and must not be dragged in here.
-        let protocol_conflicted = policy.conflict_reason == Some("ProtocolConflict");
-        if (!policy.materializable && !protocol_conflicted)
+        if !policy.materializable
             || !matches!(
                 policy.protocol.as_str(),
                 "HTTP" | "HTTPS" | "GRPC" | "GRPCS"
@@ -1747,16 +1750,7 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
         };
         let claims = claims_by_port.entry(port).or_default();
         if policy.requires_frontend_tls {
-            // Precedence admission may have already cleared `materializable`
-            // for a ProtocolConflicted TLS claim, which also drops it from the
-            // namespace serving-slot plan. Count a resolved frontend credential
-            // as a competing TLS shape so plaintext+TLS still fails closed.
-            let effective = if listener_is_effective_tls_serving_claim(key, policy, &plan) {
-                true
-            } else {
-                protocol_conflicted && policy.frontend_tls_source.is_some()
-            };
-            if effective {
+            if listener_is_effective_tls_serving_claim(key, policy, &plan) {
                 claims.effective_tls.push(key.clone());
                 claims
                     .effective_tls_namespaces
