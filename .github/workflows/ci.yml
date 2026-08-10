@@ -856,6 +856,7 @@ jobs:
               integration::grpc_proxy_tests
               integration::policy_path_canonicalization_tests
               integration::scripted_backend_smoke_tests
+              integration::service_discovery_endpointslice_lifecycle_tests
               integration::dtls_integration_tests
               integration::dtls_accept_isolation_tests
               integration::backend_mtls_tests

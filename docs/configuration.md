@@ -1198,6 +1198,7 @@ upstreams:
         poll_interval_seconds: 15
 ```
 
+The Kubernetes provider lists `EndpointSlice` objects for the configured service and publishes only lifecycle-eligible endpoints. Semantics match the controller path: `terminating=true` is never routable (even when `ready=true`), explicit `serving=false` is skipped, and omitted `ready`/`serving` follow Kubernetes tri-state defaults. Each poll rebuilds the upstream's load-balancer targets from the latest snapshot, so a draining endpoint is removed from the live set while healthy peers remain.
 **Consul**:
 ```yaml
 upstreams:

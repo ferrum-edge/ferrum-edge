@@ -1,7 +1,10 @@
 //! Kubernetes service discovery via EndpointSlice API.
 //!
 //! Polls the Kubernetes API server for EndpointSlice resources matching a
-//! service name and converts ready endpoints into upstream targets.
+//! service name and converts lifecycle-eligible endpoints into upstream
+//! targets. Eligibility matches the Kubernetes controller path: terminating
+//! and explicitly non-serving endpoints are rejected, and omitted
+//! `ready`/`serving` conditions follow Kubernetes tri-state defaults.
 //!
 //! Uses the gateway's shared `PluginHttpClient` (via its underlying
 //! `reqwest::Client`) so that Kubernetes API calls inherit the gateway's
@@ -9,6 +12,9 @@
 //! `FERRUM_TLS_NO_VERIFY` setting.
 
 use crate::config::types::UpstreamTarget;
+use crate::util::endpointslice::{
+    EndpointSliceEndpointEligibility, endpoint_slice_endpoint_eligibility,
+};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::collections::HashMap;
 use tracing::{debug, warn};
@@ -52,7 +58,7 @@ const QUERY_VALUE_ENCODE: &AsciiSet = &CONTROLS
 /// Kubernetes service discoverer.
 ///
 /// Polls EndpointSlice resources for the configured service and converts
-/// ready endpoints into `UpstreamTarget` entries. Uses a shared
+/// lifecycle-eligible endpoints into `UpstreamTarget` entries. Uses a shared
 /// `reqwest::Client` from the gateway's `PluginHttpClient` for connection
 /// reuse and consistent TLS configuration.
 pub struct KubernetesDiscoverer {
@@ -203,6 +209,8 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
         let mut missing_port = 0usize;
         let mut missing_endpoints = 0usize;
         let mut not_ready = 0usize;
+        let mut terminating = 0usize;
+        let mut non_serving = 0usize;
         let mut missing_addresses = 0usize;
         let mut non_string_addresses = 0usize;
 
@@ -218,16 +226,23 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
                 // Extract endpoints
                 if let Some(endpoints) = item.get("endpoints").and_then(|v| v.as_array()) {
                     for endpoint in endpoints {
-                        // Check if endpoint is ready
-                        let ready = endpoint
-                            .get("conditions")
-                            .and_then(|c| c.get("ready"))
-                            .and_then(|r| r.as_bool())
-                            .unwrap_or(true); // default to ready if conditions not set
-
-                        if !ready {
-                            not_ready += 1;
-                            continue;
+                        // Eligibility is decided once per snapshot ingest so the
+                        // published LB target set never consults conditions on
+                        // the request path.
+                        match endpoint_slice_endpoint_eligibility(endpoint) {
+                            EndpointSliceEndpointEligibility::Eligible => {}
+                            EndpointSliceEndpointEligibility::Terminating => {
+                                terminating += 1;
+                                continue;
+                            }
+                            EndpointSliceEndpointEligibility::NotReady => {
+                                not_ready += 1;
+                                continue;
+                            }
+                            EndpointSliceEndpointEligibility::NotServing => {
+                                non_serving += 1;
+                                continue;
+                            }
                         }
 
                         if let Some(addresses) =
@@ -277,6 +292,8 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
                 missing_port,
                 missing_endpoints,
                 not_ready,
+                terminating,
+                non_serving,
                 missing_addresses,
                 non_string_addresses,
                 "Kubernetes discovery produced zero valid targets from EndpointSlice payload"

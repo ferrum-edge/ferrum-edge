@@ -3501,26 +3501,7 @@ fn endpoint_slice_has_ready_endpoint(object: &K8sObject) -> bool {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .any(endpoint_ready)
-}
-
-fn endpoint_ready(endpoint: &Value) -> bool {
-    let Some(conditions) = endpoint.get("conditions") else {
-        return true;
-    };
-    if conditions
-        .get("terminating")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    let ready = conditions.get("ready").and_then(Value::as_bool);
-    let serving = conditions
-        .get("serving")
-        .and_then(Value::as_bool)
-        .unwrap_or_else(|| ready.unwrap_or(true));
-    ready.unwrap_or(true) && serving
+        .any(crate::util::endpointslice::endpoint_slice_endpoint_is_ready)
 }
 
 fn route_parent_ref_key(route: &K8sObject, parent_ref: &Value) -> String {

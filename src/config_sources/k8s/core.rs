@@ -454,7 +454,7 @@ fn collect_endpoint_slice(acc: &mut K8sAccumulator, object: &K8sObject) {
             CoreEndpoint {
                 pod_key,
                 addresses: string_array_from_value(endpoint, "addresses"),
-                ready: endpoint_is_ready(endpoint),
+                ready: crate::util::endpointslice::endpoint_slice_endpoint_is_ready(endpoint),
                 node_name: string_field(endpoint, "nodeName").map(ToOwned::to_owned),
             }
         })
@@ -1356,27 +1356,6 @@ fn condition_is_true(conditions: &[Value], condition_type: &str) -> bool {
         string_field(condition, "type") == Some(condition_type)
             && string_field(condition, "status") == Some("True")
     })
-}
-
-fn endpoint_is_ready(endpoint: &Value) -> bool {
-    let Some(conditions) = endpoint.get("conditions") else {
-        return true;
-    };
-    if conditions
-        .get("terminating")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    // EndpointSlice readiness fields are tri-state; Kubernetes treats omitted
-    // `ready`/`serving` as true for endpoints that are not terminating.
-    let ready = conditions.get("ready").and_then(Value::as_bool);
-    let serving = conditions
-        .get("serving")
-        .and_then(Value::as_bool)
-        .unwrap_or_else(|| ready.unwrap_or(true));
-    ready.unwrap_or(true) && serving
 }
 
 fn string_array_from_value(value: &Value, field: &str) -> Vec<String> {

@@ -1450,6 +1450,72 @@ async fn test_kubernetes_discover_missing_conditions_defaults_ready() {
 }
 
 #[tokio::test]
+async fn test_kubernetes_discover_rejects_terminating_and_non_serving_endpoints() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let response = serde_json::json!({
+        "items": [{
+            "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}],
+            "endpoints": [
+                {
+                    "addresses": ["10.244.0.1"],
+                    "conditions": {"ready": true, "serving": true, "terminating": false}
+                },
+                {
+                    "addresses": ["10.244.0.2"],
+                    "conditions": {"ready": true, "serving": false}
+                },
+                {
+                    "addresses": ["10.244.0.3"],
+                    "conditions": {"ready": true, "terminating": true}
+                },
+                {
+                    "addresses": ["10.244.0.4"],
+                    "conditions": {"serving": false}
+                },
+                {
+                    "addresses": ["10.244.0.5"],
+                    "conditions": {"terminating": false}
+                },
+                {
+                    "addresses": ["10.244.0.6"],
+                    "conditions": {"ready": true, "serving": true, "terminating": true}
+                },
+                {
+                    "addresses": ["10.244.0.7"]
+                }
+            ]
+        }]
+    });
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
+        "default".to_string(),
+        "my-service".to_string(),
+        None,
+        None,
+        1,
+    )
+    .with_api_url(mock_server.uri());
+
+    let targets = discoverer.discover().await.unwrap();
+    let hosts: Vec<&str> = targets.iter().map(|t| t.host.as_str()).collect();
+    assert_eq!(
+        hosts,
+        vec!["10.244.0.1", "10.244.0.5", "10.244.0.7"],
+        "only lifecycle-eligible EndpointSlice endpoints must be published"
+    );
+}
+
+#[tokio::test]
 async fn test_kubernetes_discover_multiple_endpointslice_items() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};

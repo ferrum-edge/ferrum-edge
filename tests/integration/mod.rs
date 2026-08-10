@@ -114,6 +114,7 @@ mod mesh_topology_hbone_tests;
 mod policy_path_canonicalization_tests;
 mod port_aware_route_traffic_tests;
 mod scripted_backend_smoke_tests;
+mod service_discovery_endpointslice_lifecycle_tests;
 mod spec_expose_integration_tests;
 mod tcp_fast_path_l4_plugins_tests;
 mod tcp_frontend_tls_order_tests;
