@@ -52,9 +52,7 @@ impl EndpointSliceEndpointEligibility {
 ///
 /// Semantics match the historical Kubernetes controller admission helper so
 /// both ingestion paths agree on which endpoints are routable.
-pub fn endpoint_slice_endpoint_eligibility(
-    endpoint: &Value,
-) -> EndpointSliceEndpointEligibility {
+pub fn endpoint_slice_endpoint_eligibility(endpoint: &Value) -> EndpointSliceEndpointEligibility {
     let Some(conditions) = endpoint.get("conditions") else {
         return EndpointSliceEndpointEligibility::Eligible;
     };

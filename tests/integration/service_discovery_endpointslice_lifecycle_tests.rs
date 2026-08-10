@@ -124,7 +124,9 @@ async fn kubernetes_endpointslice_active_to_terminating_removes_endpoint_from_lb
 
     let first = publish_discovered(&cache, &discoverer, "users").await;
     assert_eq!(first.len(), 2);
-    let live = cache.get_upstream("ferrum", "users").expect("upstream live");
+    let live = cache
+        .get_upstream("ferrum", "users")
+        .expect("upstream live");
     let mut hosts: Vec<&str> = live.targets.iter().map(|t| t.host.as_str()).collect();
     hosts.sort_unstable();
     assert_eq!(hosts, vec!["10.244.0.10", "10.244.0.11"]);
