@@ -65,7 +65,7 @@
 //!
 //! - an HTTP listener on the global HTTPS port (or the reverse),
 //! - admin HTTP/HTTPS ports and the CP gRPC port,
-//! - any port claimed by a TCP/UDP stream proxy in the same config, and
+//! - any port claimed by a TCP/TLS stream proxy in the same config, and
 //! - any port two HTTP-family proxies claim with different TLS classes.
 //!
 //! A refusal — and any bind failure, such as `:80` without
@@ -84,7 +84,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot, watch};
 use tracing::{error, info, warn};
 
-use crate::config::types::GatewayConfig;
+use crate::config::types::{DispatchKind, GatewayConfig};
 use crate::proxy::ProxyState;
 
 /// Whether a Gateway listener port terminates TLS on the frontend.
@@ -126,12 +126,17 @@ impl GatewayListenerPlan {
         reserved: &std::collections::HashSet<u16>,
         existing_frontends: &BTreeMap<u16, GatewayListenerClass>,
     ) -> Self {
-        let mut stream_ports: BTreeSet<u16> = BTreeSet::new();
+        // Only TCP/TLS raw-stream claims collide with an HTTP-family TCP
+        // listener on the same numeric port. UDP/DTLS use a different transport
+        // and may coexist (translation admits the same shape).
+        let mut tcp_stream_ports: BTreeSet<u16> = BTreeSet::new();
         for proxy in &config.proxies {
-            if proxy.dispatch_kind.is_stream()
-                && let Some(port) = proxy.listen_port
+            if matches!(
+                proxy.dispatch_kind,
+                DispatchKind::TcpRaw | DispatchKind::TcpTls
+            ) && let Some(port) = proxy.listen_port
             {
-                stream_ports.insert(port);
+                tcp_stream_ports.insert(port);
             }
         }
 
@@ -186,10 +191,10 @@ impl GatewayListenerPlan {
                 });
                 continue;
             }
-            if stream_ports.contains(&port) {
+            if tcp_stream_ports.contains(&port) {
                 refused.entry(port).or_insert_with(|| {
                     format!(
-                        "port {port} is claimed by a TCP/UDP stream proxy in the same config; \
+                        "port {port} is claimed by a TCP/TLS stream proxy in the same config; \
                          the HTTP-family Gateway listener is not bound"
                     )
                 });

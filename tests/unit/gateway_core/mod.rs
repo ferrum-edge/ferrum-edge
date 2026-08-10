@@ -27,6 +27,7 @@ mod early_upload_deadline_tests;
 mod error_classifier_tests;
 mod forwarded_ownership_parity_tests;
 mod gateway_backend_lb_policy_tests;
+mod gateway_listener_plan_tests;
 mod gateway_backend_ref_kinds_tests;
 mod grpc_proxy_tests;
 mod gso_batch_buf_tests;
