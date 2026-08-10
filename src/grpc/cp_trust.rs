@@ -400,11 +400,8 @@ impl CpDpTrustBundle {
     /// operator configured one. It is used only to *refuse* a bound credential
     /// backed by that value; it is never rendered.
     pub fn load_from_path(path: &str, fleet_secret: Option<&str>) -> Result<Self, String> {
-        let raw = read_regular_utf8_file_bounded(
-            path,
-            "CP/DP trust bundle",
-            TRUST_BUNDLE_MAX_BYTES,
-        )?;
+        let raw =
+            read_regular_utf8_file_bounded(path, "CP/DP trust bundle", TRUST_BUNDLE_MAX_BYTES)?;
         Self::from_document_str(&raw, path, fleet_secret)
     }
 
@@ -1142,8 +1139,8 @@ impl TrustBundleKeyDocument {
                     &format!("CP/DP trust bundle '{origin}' key '{kid}' secret file"),
                     TRUST_MATERIAL_MAX_BYTES,
                 )?
-                    .trim()
-                    .to_string()
+                .trim()
+                .to_string()
             } else {
                 // Unreachable: the source-count check above admits exactly one.
                 return Err(format!(
