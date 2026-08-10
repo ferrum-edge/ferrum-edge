@@ -2251,6 +2251,10 @@ impl<'a> HboneDialPlan<'a> {
     /// a plaintext or non-HBONE fallback.
     pub fn resolve(target: &'a UpstreamTarget) -> Result<Self, HbonePoolError> {
         let dial_host = target_hbone_dial_host(target)?;
+        if target_hbone_cross_cluster(target) && !target.tags.contains_key(HBONE_AUTHORITY_HOST_TAG)
+        {
+            return Err(HbonePoolError::MissingCrossClusterAuthorityHost);
+        }
         let app_host = target_hbone_authority_host(target)?;
         let hbone_port = target_hbone_port(target);
         if target_hbone_cross_cluster(target) {
