@@ -7,6 +7,12 @@ use ferrum_edge::plugins::utils::jwks_store::{
 use serde_json::json;
 use std::time::Duration;
 
+fn has_trusted_key(store: &JwksKeyStore, kid: &str) -> bool {
+    store
+        .trusted_keys()
+        .is_some_and(|keys| keys.contains_key(kid))
+}
+
 #[test]
 fn test_empty_store_has_no_keys() {
     let store = JwksKeyStore::new(
@@ -14,7 +20,7 @@ fn test_empty_store_has_no_keys() {
         PluginHttpClient::default(),
     );
     assert!(!store.has_keys());
-    assert!(store.get_key("nonexistent").is_none());
+    assert!(!has_trusted_key(&store, "nonexistent"));
 }
 
 #[test]
@@ -25,27 +31,27 @@ fn test_jwks_uri_accessor() {
 }
 
 #[test]
-fn test_all_keys_returns_empty_map_initially() {
+fn test_trusted_keys_returns_none_initially() {
     let store = JwksKeyStore::new(
         "https://example.com/.well-known/jwks.json".to_string(),
         PluginHttpClient::default(),
     );
-    let all = store.all_keys();
+    let all = store.trusted_keys();
     assert!(all.is_none());
 }
 
 #[test]
-fn test_get_key_with_various_kid_values() {
+fn test_trusted_keys_rejects_various_kid_values_in_empty_store() {
     let store = JwksKeyStore::new(
         "https://example.com/.well-known/jwks.json".to_string(),
         PluginHttpClient::default(),
     );
 
     // Various kid patterns should all return None on empty store
-    assert!(store.get_key("").is_none());
-    assert!(store.get_key("kid-123").is_none());
-    assert!(store.get_key("abc-def-ghi").is_none());
-    assert!(store.get_key("a".repeat(256).as_str()).is_none());
+    assert!(!has_trusted_key(&store, ""));
+    assert!(!has_trusted_key(&store, "kid-123"));
+    assert!(!has_trusted_key(&store, "abc-def-ghi"));
+    assert!(!has_trusted_key(&store, "a".repeat(256).as_str()));
 }
 
 #[test]
@@ -122,7 +128,7 @@ fn jwk_key_ops_must_authorize_signature_verification() {
     ] {
         let store = JwksKeyStore::from_inline_jwks(&accepted)
             .expect("verification-capable key should be accepted");
-        assert!(store.get_key("k1").is_some());
+        assert!(has_trusted_key(&store, "k1"));
     }
 
     for rejected in [
@@ -212,7 +218,7 @@ async fn empty_fetch_expires_bounded_trust_and_valid_recovery_restores_it() {
         .expect("first fetch should succeed");
     assert_eq!(count, 1);
     assert!(store.has_keys());
-    assert!(store.get_key("k1").is_some());
+    assert!(has_trusted_key(&store, "k1"));
 
     // Second fetch returns zero keys. It is a failed refresh and cannot move
     // the trust deadline, while the retained key remains usable during grace.
@@ -227,7 +233,7 @@ async fn empty_fetch_expires_bounded_trust_and_valid_recovery_restores_it() {
         "an empty 200 must not delete diagnostic/recovery state"
     );
     assert!(
-        store.get_key("k1").is_some(),
+        has_trusted_key(&store, "k1"),
         "the previously cached key remains trusted only during grace"
     );
     assert!(
@@ -245,7 +251,7 @@ async fn empty_fetch_expires_bounded_trust_and_valid_recovery_restores_it() {
         "expiry must preserve retained recovery state"
     );
     assert!(
-        store.get_key("k1").is_none(),
+        !has_trusted_key(&store, "k1"),
         "expired keys must not verify"
     );
 
@@ -267,8 +273,8 @@ async fn empty_fetch_expires_bounded_trust_and_valid_recovery_restores_it() {
         .await;
     assert_eq!(store.fetch_keys().await.expect("valid recovery fetch"), 1);
     assert_eq!(store.health_snapshot().trust_state, JwksTrustState::Fresh);
-    assert!(store.get_key("k1").is_none());
-    assert!(store.get_key("k2").is_some());
+    assert!(!has_trusted_key(&store, "k1"));
+    assert!(has_trusted_key(&store, "k2"));
 }
 
 /// An initially-empty store treats an empty 200 as a failed refresh so the
@@ -379,5 +385,5 @@ async fn test_oversized_refresh_retains_last_known_good_keys() {
 
     assert_eq!(store.fetch_keys().await.expect("initial fetch"), 1);
     assert!(store.fetch_keys().await.is_err());
-    assert!(store.get_key("k1").is_some());
+    assert!(has_trusted_key(&store, "k1"));
 }

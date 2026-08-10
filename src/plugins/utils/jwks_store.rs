@@ -390,24 +390,9 @@ impl JwksKeyStore {
             .then(|| Arc::clone(&snapshot.keys))
     }
 
-    /// Look up a cached key by its key ID (`kid`).
-    pub fn get_key(&self, kid: &str) -> Option<CachedJwk> {
-        self.trusted_keys()?.get(kid).cloned()
-    }
-
-    /// Get all trusted cached keys (for tokens without a `kid` header).
-    pub fn all_keys(&self) -> Option<Arc<HashMap<String, CachedJwk>>> {
-        self.trusted_keys()
-    }
-
     /// Returns true if diagnostic/recovery state retains any cached keys.
     pub fn has_keys(&self) -> bool {
         !self.snapshot.load().keys.is_empty()
-    }
-
-    /// Returns true if cached keys remain inside their monotonic trust deadline.
-    pub fn has_trusted_keys(&self) -> bool {
-        self.trusted_keys().is_some_and(|keys| !keys.is_empty())
     }
 
     /// Fetch keys from the JWKS endpoint and update the cache.
