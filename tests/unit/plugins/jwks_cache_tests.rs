@@ -242,10 +242,7 @@ async fn policy_reconfiguration_forces_refresh_without_resetting_retained_key_ag
     );
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    assert_eq!(
-        store.health_snapshot().trust_state,
-        JwksTrustState::Expired
-    );
+    assert_eq!(store.health_snapshot().trust_state, JwksTrustState::Expired);
 
     tokio::time::resume();
     clear_jwks_cache();
