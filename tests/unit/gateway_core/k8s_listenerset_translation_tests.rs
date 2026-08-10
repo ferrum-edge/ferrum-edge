@@ -1031,7 +1031,7 @@ fn cross_gateway_http_and_tcp_on_same_port_protocol_conflict() {
     for gateway_order in orders {
         let mut objects = vec![gateway_class()];
         for name in gateway_order {
-            let (namespace, listeners) = match *name {
+            let (namespace, listeners) = match name {
                 "alpha" => (
                     "team-a",
                     json!([{
