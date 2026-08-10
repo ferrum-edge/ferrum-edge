@@ -775,9 +775,7 @@ impl Oauth2Introspection {
             claims: Arc::new(claims),
             expires_at_unix,
         });
-        provider
-            .cache
-            .insert_active(token, credential.clone(), now);
+        provider.cache.insert_active(token, credential.clone(), now);
         Ok(credential)
     }
 
@@ -1087,9 +1085,7 @@ fn credential_expired(expires_at_unix: Option<i64>) -> bool {
 /// Resolve an introspection credential's authoritative validity once, at the
 /// provider-response boundary. Relative `expires_in` is converted immediately
 /// so cache hits and single-flight followers cannot slide the deadline.
-fn validated_introspection_expiry(
-    claims: &Value,
-) -> Result<Option<i64>, IntrospectionDecision> {
+fn validated_introspection_expiry(claims: &Value) -> Result<Option<i64>, IntrospectionDecision> {
     validated_introspection_expiry_at(claims, chrono::Utc::now().timestamp())
 }
 

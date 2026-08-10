@@ -97,10 +97,7 @@ impl Plugin for CapturingDisconnectPlugin {
             direction: ctx.direction,
             io_side: ctx.io_side,
             error_class: ctx.error_class,
-            termination_reason: ctx
-                .metadata
-                .get("websocket.termination_reason")
-                .cloned(),
+            termination_reason: ctx.metadata.get("websocket.termination_reason").cloned(),
         });
     }
 }
@@ -203,10 +200,12 @@ async fn test_tunnel_disconnect_overwrites_untrusted_termination_metadata() {
         captured[0].termination_reason.as_deref(),
         Some("normal_peer_close")
     );
-    assert!(!captured[0]
-        .termination_reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("secret")));
+    assert!(
+        !captured[0]
+            .termination_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("secret"))
+    );
 }
 
 #[tokio::test]

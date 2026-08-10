@@ -11645,10 +11645,8 @@ async fn handle_websocket_request_authenticated(
     // how the caller classified or constructed the request context.
     ctx.set_websocket_response_boundary(true);
     let mut current_cb_target_key = cb_target_key;
-    let ws_session_deadline = effective_websocket_session_deadline(
-        &ctx,
-        state.env_config.websocket_max_lifetime_seconds,
-    );
+    let ws_session_deadline =
+        effective_websocket_session_deadline(&ctx, state.env_config.websocket_max_lifetime_seconds);
     if ws_session_deadline.at <= tokio::time::Instant::now() {
         let (status, body, phase) = match ws_session_deadline.reason {
             WsTerminationReason::CredentialExpired => (
@@ -15675,9 +15673,7 @@ where
                 && copy_result
                     .first_failure
                     .as_ref()
-                    .is_some_and(|(_, class, _, _)| {
-                        *class == retry::ErrorClass::ReadWriteTimeout
-                    })
+                    .is_some_and(|(_, class, _, _)| *class == retry::ErrorClass::ReadWriteTimeout)
             {
                 WsTerminationReason::IdleTimeout
             } else {

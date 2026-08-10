@@ -97,12 +97,7 @@ impl IntrospectionCache {
         CacheLookup::Miss
     }
 
-    pub fn insert_active(
-        &self,
-        token: &str,
-        credential: Arc<CachedIntrospection>,
-        now: Instant,
-    ) {
+    pub fn insert_active(&self, token: &str, credential: Arc<CachedIntrospection>, now: Instant) {
         if self.positive_ttl.is_zero() {
             return;
         }

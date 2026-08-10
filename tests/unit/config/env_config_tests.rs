@@ -2997,7 +2997,9 @@ fn test_env_config_websocket_max_lifetime_is_finite_and_configurable() {
         || {
             remove_var("FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS");
             assert_eq!(
-                EnvConfig::from_env().unwrap().websocket_max_lifetime_seconds,
+                EnvConfig::from_env()
+                    .unwrap()
+                    .websocket_max_lifetime_seconds,
                 3_600
             );
         },
@@ -3010,7 +3012,9 @@ fn test_env_config_websocket_max_lifetime_is_finite_and_configurable() {
         ],
         || {
             assert_eq!(
-                EnvConfig::from_env().unwrap().websocket_max_lifetime_seconds,
+                EnvConfig::from_env()
+                    .unwrap()
+                    .websocket_max_lifetime_seconds,
                 900
             );
         },

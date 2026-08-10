@@ -253,8 +253,7 @@ impl AuthMechanism for JwtAuth {
                         &token_data.claims,
                         self.validation.leeway,
                     );
-                    return VerifyOutcome::consumer(consumer)
-                        .with_credential_deadline(deadline);
+                    return VerifyOutcome::consumer(consumer).with_credential_deadline(deadline);
                 }
             }
         }

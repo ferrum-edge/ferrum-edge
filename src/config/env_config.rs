@@ -5266,8 +5266,7 @@ impl EnvConfig {
     fn validate(&mut self) -> Result<(), String> {
         if !(1..=86_400).contains(&self.websocket_max_lifetime_seconds) {
             return Err(
-                "FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS must be between 1 and 86400 seconds"
-                    .into(),
+                "FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS must be between 1 and 86400 seconds".into(),
             );
         }
         if let Some(gateway_ref) = self.stream_gateway_ref.as_deref() {

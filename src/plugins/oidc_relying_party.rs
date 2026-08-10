@@ -1248,7 +1248,11 @@ impl OidcRelyingParty {
         }
         let credential_valid_until = claims_expires_at
             .saturating_add(leeway)
-            .min(payload.issued_at_unix.saturating_add(self.session.ttl.as_secs() as i64))
+            .min(
+                payload
+                    .issued_at_unix
+                    .saturating_add(self.session.ttl.as_secs() as i64),
+            )
             .min(
                 payload
                     .last_touch_unix

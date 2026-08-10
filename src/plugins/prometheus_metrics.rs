@@ -3977,12 +3977,7 @@ fn render_ws_histogram(
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
     let labels = format!(
         "proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\"",
-        proxy_id,
-        key.result,
-        key.direction,
-        key.io_side,
-        key.error_class,
-        key.termination_reason
+        proxy_id, key.result, key.direction, key.io_side, key.error_class, key.termination_reason
     );
     output.push_str(&format!(
         "ferrum_websocket_session_duration_ms_bucket{{{},le=\"+Inf\"{}}} {}\n",

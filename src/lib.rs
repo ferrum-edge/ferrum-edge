@@ -6434,10 +6434,7 @@ pub mod _test_support {
         );
         ctx.grpc_deadline_received_at = now;
         ctx.credential_deadline_at = credential_lifetime.and_then(|ttl| now.checked_add(ttl));
-        let plan = crate::proxy::effective_websocket_session_deadline(
-            &ctx,
-            max_lifetime.as_secs(),
-        );
+        let plan = crate::proxy::effective_websocket_session_deadline(&ctx, max_lifetime.as_secs());
         (plan.at.saturating_duration_since(now), plan.reason.as_str())
     }
 
@@ -6465,13 +6462,9 @@ pub mod _test_support {
                 .unwrap_or_else(tokio::time::Instant::now),
             reason,
         };
-        crate::proxy::wait_for_websocket_session_stop(
-            deadline,
-            Some(shutdown_rx),
-            &overload,
-        )
-        .await
-        .as_str()
+        crate::proxy::wait_for_websocket_session_stop(deadline, Some(shutdown_rx), &overload)
+            .await
+            .as_str()
     }
 
     pub fn request_credential_deadline_remaining(

@@ -167,12 +167,7 @@ pub fn credential_deadline_from_unix_seconds(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(u64::MAX);
-    credential_deadline_from_unix_seconds_at(
-        expires_at_unix,
-        leeway_seconds,
-        now_unix,
-        now_mono,
-    )
+    credential_deadline_from_unix_seconds_at(expires_at_unix, leeway_seconds, now_unix, now_mono)
 }
 
 fn credential_deadline_from_unix_seconds_at(
@@ -513,8 +508,8 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 mod tests {
     use super::{
         AuthMechanism, AuthenticationAttempt, ExtractedCredential, VerifyOutcome,
-        commit_authentication_attempt, constant_time_eq,
-        credential_deadline_from_unix_seconds_at, run_auth, run_auth_external_identity,
+        commit_authentication_attempt, constant_time_eq, credential_deadline_from_unix_seconds_at,
+        run_auth, run_auth_external_identity,
     };
     use crate::config::types::{Consumer, default_namespace};
     use crate::consumer_index::ConsumerIndex;

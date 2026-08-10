@@ -47,29 +47,20 @@ async fn active_scheduler_progress_does_not_extend_absolute_credential_deadline(
         tokio::time::advance(Duration::from_millis(500)).await;
     }
 
-    assert_eq!(stop.await.expect("deadline waiter panicked"), "credential_expired");
+    assert_eq!(
+        stop.await.expect("deadline waiter panicked"),
+        "credential_expired"
+    );
 }
 
 #[tokio::test]
 async fn listener_shutdown_wins_before_a_later_session_deadline() {
-    let reason = websocket_stop_reason_for_test(
-        Duration::from_secs(60),
-        false,
-        true,
-        false,
-    )
-    .await;
+    let reason = websocket_stop_reason_for_test(Duration::from_secs(60), false, true, false).await;
     assert_eq!(reason, "drain");
 }
 
 #[tokio::test]
 async fn overload_drain_wins_before_a_later_session_deadline() {
-    let reason = websocket_stop_reason_for_test(
-        Duration::from_secs(60),
-        false,
-        false,
-        true,
-    )
-    .await;
+    let reason = websocket_stop_reason_for_test(Duration::from_secs(60), false, false, true).await;
     assert_eq!(reason, "drain");
 }
