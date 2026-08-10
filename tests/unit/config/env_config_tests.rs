@@ -1208,9 +1208,8 @@ fn test_env_config_mesh_production_allows_verified_tls_with_custom_ca() {
         unsafe {
             std::env::remove_var("FERRUM_TLS_CA_BUNDLE_PATH");
         }
-        let config = result.expect(
-            "production mesh with verified TLS and a custom CA must validate",
-        );
+        let config =
+            result.expect("production mesh with verified TLS and a custom CA must validate");
         assert!(!config.tls_no_verify);
         assert!(!config.admin_tls_no_verify);
         assert_eq!(config.tls_ca_bundle_path.as_deref(), Some(ca_path.as_str()));
