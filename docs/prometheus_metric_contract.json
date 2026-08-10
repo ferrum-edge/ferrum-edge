@@ -1337,6 +1337,54 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_jwks_consecutive_failures",
+    "type": "gauge",
+    "help": "Maximum current consecutive failures among shared stores by fixed failure class.",
+    "labels": [
+      "class"
+    ],
+    "subsystem": "jwks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_jwks_refresh_failures_total",
+    "type": "counter",
+    "help": "Remote JWKS refresh failures by fixed failure class.",
+    "labels": [
+      "class"
+    ],
+    "subsystem": "jwks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_jwks_trust_age_seconds",
+    "type": "gauge",
+    "help": "Maximum age of the last validated non-empty JWKS among stores in each trust state.",
+    "labels": [
+      "state"
+    ],
+    "subsystem": "jwks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_jwks_trust_stores",
+    "type": "gauge",
+    "help": "Shared remote JWKS stores by bounded trust state.",
+    "labels": [
+      "state"
+    ],
+    "subsystem": "jwks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_kafka_logging_accepting",
     "type": "gauge",
     "help": "Whether the Kafka logging generation still admits new records.",

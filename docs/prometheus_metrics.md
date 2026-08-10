@@ -215,6 +215,10 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_database_delta_rejections_total` | counter | `resource_category`, `namespace` | `database_polling` | `documented_only` | `conditional` | Database incremental deltas rejected by validation, bucketed by bounded resource category. |
 | `ferrum_database_poll_last_completed_timestamp_seconds` | gauge | `namespace` | `database_polling` | `documented_only` | `conditional` | Unix timestamp of the most recently completed database/CP config poll attempt (including empty success). |
 | `ferrum_edge_overhead_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Gateway overhead (excluding backend and plugins) in milliseconds. |
+| `ferrum_jwks_consecutive_failures` | gauge | `class` | `jwks` | `documented_only` | `always` | Maximum current consecutive failures among shared stores by fixed failure class. |
+| `ferrum_jwks_refresh_failures_total` | counter | `class` | `jwks` | `documented_only` | `always` | Remote JWKS refresh failures by fixed failure class. |
+| `ferrum_jwks_trust_age_seconds` | gauge | `state` | `jwks` | `documented_only` | `always` | Maximum age of the last validated non-empty JWKS among stores in each trust state. |
+| `ferrum_jwks_trust_stores` | gauge | `state` | `jwks` | `documented_only` | `always` | Shared remote JWKS stores by bounded trust state. |
 | `ferrum_kafka_logging_accepting` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation still admits new records. |
 | `ferrum_kafka_logging_healthy` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation recovered from its latest failure. |
 | `ferrum_kafka_logging_in_flight` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Records waiting in librdkafka for terminal delivery. |
