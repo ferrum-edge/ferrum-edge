@@ -688,10 +688,7 @@ impl CpDpVerifierStore {
     }
 
     pub fn replace(&self, verifier: CpDpVerifier) {
-        let _replace_guard = self
-            .replace_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _replace_guard = self.replace_lock.lock().unwrap_or_else(|e| e.into_inner());
         let current = self.active.load();
         let revision = current.revision.saturating_add(1);
         let credential_generations = verifier
