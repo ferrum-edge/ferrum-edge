@@ -1845,7 +1845,7 @@ impl ConfigSync for CpGrpcServer {
         // check. The returned sender is the per-namespace broadcast channel
         // — DPs in different namespaces are guaranteed to receive only their
         // own slice.
-        let namespace_tx = match self.authorise_namespace(&allowed, &dp_namespace) {
+        let namespace_tx = match self.authorise_namespace(allowed, &dp_namespace) {
             Ok(tx) => tx,
             Err(status) => {
                 Self::audit_tenant_subscription(
