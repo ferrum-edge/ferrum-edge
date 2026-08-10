@@ -745,6 +745,7 @@ fn representative_exposition() -> String {
     );
 
     let mut output = registry.render_uncached();
+    output.push_str(&ferrum_edge::plugins::utils::jwks_cache::render_prometheus());
     output.push_str(&ferrum_edge::observability_delivery::render_prometheus());
     output.push_str(&ferrum_edge::notifications::render_delivery_prometheus());
 
