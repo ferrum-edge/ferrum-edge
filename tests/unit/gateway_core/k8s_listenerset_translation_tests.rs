@@ -1006,7 +1006,9 @@ fn three_claim_http_tcp_http_protocol_conflict_is_order_independent() {
             .unwrap_or(&[]);
         for name in names {
             assert!(
-                services.iter().all(|service| service.name != format!("edge-{name}")),
+                services
+                    .iter()
+                    .all(|service| service.name != format!("edge-{name}")),
                 "order {:?} must not materialize conflicted MeshService edge-{name}: {:?}",
                 names,
                 services
