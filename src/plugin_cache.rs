@@ -4806,6 +4806,7 @@ thread_local! {
 /// Arm a single post-JWKS-startup rejection for the next staged PluginCache
 /// build. Consumed once by [`reject_after_jwks_startup_if_requested_for_test`].
 #[doc(hidden)]
+#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call through its wrapper.
 pub fn request_reject_after_jwks_startup_for_test() {
     REJECT_AFTER_JWKS_STARTUP_FOR_TEST.with(|requested| requested.set(true));
 }
