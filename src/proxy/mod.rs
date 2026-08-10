@@ -14597,49 +14597,8 @@ async fn fire_ws_tunnel_disconnect_hooks_with_reason(
     }
 }
 
-/// Fire `on_ws_disconnect` for the framed (parsed) WebSocket path.
-///
-/// Unlike tunnel mode, framed mode reports real frame counters. Duration still
-/// comes from `session_start_mono` (`Instant`); wall `session_start` is only
-/// used for `timestamp_connected` rendering. Takes `session_meta` by value
-/// because the framed relay consumes it at teardown.
-#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub async fn fire_ws_framed_disconnect_hooks(
-    ws_disconnect_plugins: &[Arc<dyn Plugin>],
-    proxy_id: &str,
-    session_meta: WsSessionMeta,
-    frames_client_to_backend: u64,
-    frames_backend_to_client: u64,
-    bytes_client_to_backend: u64,
-    bytes_backend_to_client: u64,
-    failure: Option<(
-        crate::plugins::Direction,
-        retry::ErrorClass,
-        Option<tcp_proxy::StreamIoSide>,
-    )>,
-) {
-    let termination_reason = if failure.is_some() {
-        WsTerminationReason::RelayError
-    } else {
-        WsTerminationReason::NormalPeerClose
-    };
-    fire_ws_framed_disconnect_hooks_with_reason(
-        ws_disconnect_plugins,
-        proxy_id,
-        session_meta,
-        frames_client_to_backend,
-        frames_backend_to_client,
-        bytes_client_to_backend,
-        bytes_backend_to_client,
-        failure,
-        termination_reason,
-    )
-    .await;
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn fire_ws_framed_disconnect_hooks_with_reason(
+pub(crate) async fn fire_ws_framed_disconnect_hooks_with_reason(
     ws_disconnect_plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
     session_meta: WsSessionMeta,

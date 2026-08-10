@@ -6406,7 +6406,12 @@ pub mod _test_support {
             Option<StreamIoSide>,
         )>,
     ) {
-        crate::proxy::fire_ws_framed_disconnect_hooks(
+        let termination_reason = if failure.is_some() {
+            crate::proxy::WsTerminationReason::RelayError
+        } else {
+            crate::proxy::WsTerminationReason::NormalPeerClose
+        };
+        crate::proxy::fire_ws_framed_disconnect_hooks_with_reason(
             ws_disconnect_plugins,
             proxy_id,
             session_meta,
@@ -6415,6 +6420,7 @@ pub mod _test_support {
             bytes_client_to_backend,
             bytes_backend_to_client,
             failure,
+            termination_reason,
         )
         .await
     }
