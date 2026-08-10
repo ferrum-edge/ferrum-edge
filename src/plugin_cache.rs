@@ -16,9 +16,9 @@
 //! lists (including their stateful instances) and only rebuild affected proxies.
 
 use arc_swap::ArcSwap;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::db_backend::{
     NamespacedResourceId, namespaced_runtime_key, write_namespaced_runtime_key,
@@ -4796,20 +4796,24 @@ fn collect_active_jwks_requirements(
     requirements
 }
 
-/// One-shot seam: reject a staged PluginCache after JWKS background startup so
-/// external tests can prove unpublished policy is rolled back. Production
-/// callers never arm this.
-static REJECT_AFTER_JWKS_STARTUP_FOR_TEST: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// One-shot seam: reject a staged PluginCache after JWKS background startup
+    /// on the requesting test thread. Thread-local state prevents an unrelated
+    /// parallel PluginCache test from consuming the injected rejection.
+    static REJECT_AFTER_JWKS_STARTUP_FOR_TEST: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Arm a single post-JWKS-startup rejection for the next staged PluginCache
 /// build. Consumed once by [`reject_after_jwks_startup_if_requested_for_test`].
 #[doc(hidden)]
 pub fn request_reject_after_jwks_startup_for_test() {
-    REJECT_AFTER_JWKS_STARTUP_FOR_TEST.store(true, Ordering::SeqCst);
+    REJECT_AFTER_JWKS_STARTUP_FOR_TEST.with(|requested| requested.set(true));
 }
 
 fn reject_after_jwks_startup_if_requested_for_test() -> Result<(), String> {
-    if REJECT_AFTER_JWKS_STARTUP_FOR_TEST.swap(false, Ordering::SeqCst) {
+    let requested =
+        REJECT_AFTER_JWKS_STARTUP_FOR_TEST.with(|requested| requested.replace(false));
+    if requested {
         Err(
             "test-injected rejection after JWKS background startup (unpublished policy must not stick)"
                 .to_string(),

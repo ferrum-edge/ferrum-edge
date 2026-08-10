@@ -1620,7 +1620,9 @@ impl RequestEpochStore {
         let jwks_rollback =
             crate::plugin_cache::StagedJwksPolicyRollback::for_published(&current.plugin_cache);
         let Some(staged) = build(&current)? else {
-            jwks_rollback.disarm();
+            // No generation was published. Keep the rollback armed in case the
+            // builder acquired or tightened a shared store before deciding
+            // there was no epoch to install.
             return Ok(None);
         };
 
