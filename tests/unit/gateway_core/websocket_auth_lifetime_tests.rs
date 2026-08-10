@@ -84,8 +84,14 @@ async fn begin_drain_wakes_all_registered_waiters_without_advancing_a_poll_timer
         Arc::clone(&overload),
     ));
 
-    assert!(matches!(futures_util::poll!(&mut first_stop), Poll::Pending));
-    assert!(matches!(futures_util::poll!(&mut second_stop), Poll::Pending));
+    assert!(matches!(
+        futures_util::poll!(&mut first_stop),
+        Poll::Pending
+    ));
+    assert!(matches!(
+        futures_util::poll!(&mut second_stop),
+        Poll::Pending
+    ));
     ferrum_edge::overload::begin_drain(&overload);
 
     assert_eq!(first_stop.await, "drain");

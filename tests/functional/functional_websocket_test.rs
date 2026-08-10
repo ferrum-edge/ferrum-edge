@@ -3756,8 +3756,7 @@ async fn test_websocket_max_lifetime_active_traffic_h1_h2_h3_parity() {
 async fn test_websocket_active_jwt_session_closes_at_credential_expiry() {
     const CREDENTIAL_TTL_SECONDS: i64 = 4;
     const CREDENTIAL_CLOSE_GRACE_SECONDS: u64 = 4;
-    const CLOSE_BOUND_SECONDS: u64 =
-        CREDENTIAL_TTL_SECONDS as u64 + CREDENTIAL_CLOSE_GRACE_SECONDS;
+    const CLOSE_BOUND_SECONDS: u64 = CREDENTIAL_TTL_SECONDS as u64 + CREDENTIAL_CLOSE_GRACE_SECONDS;
 
     let backend_port = free_port().await;
     let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
