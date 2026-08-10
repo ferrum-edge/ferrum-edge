@@ -8,9 +8,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use chrono::Utc;
-use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy,
-};
+use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
 use ferrum_edge::proxy::gateway_listener::{GatewayListenerClass, GatewayListenerPlan};
 
 const PORT: u16 = 9000;
@@ -112,7 +110,10 @@ fn http_and_udp_stream_may_share_numeric_port() {
         stream_proxy("udp-stream", BackendScheme::Udp, PORT),
     ]);
 
-    assert_eq!(plan.ports.get(&PORT), Some(&GatewayListenerClass::Plaintext));
+    assert_eq!(
+        plan.ports.get(&PORT),
+        Some(&GatewayListenerClass::Plaintext)
+    );
     assert!(
         !plan.refused.contains_key(&PORT),
         "UDP must not withdraw the HTTP-family listener: {:?}",
@@ -127,7 +128,10 @@ fn http_and_dtls_stream_may_share_numeric_port() {
         stream_proxy("dtls-stream", BackendScheme::Dtls, PORT),
     ]);
 
-    assert_eq!(plan.ports.get(&PORT), Some(&GatewayListenerClass::Plaintext));
+    assert_eq!(
+        plan.ports.get(&PORT),
+        Some(&GatewayListenerClass::Plaintext)
+    );
     assert!(
         !plan.refused.contains_key(&PORT),
         "DTLS must not withdraw the HTTP-family listener: {:?}",
