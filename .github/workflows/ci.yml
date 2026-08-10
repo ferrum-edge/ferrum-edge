@@ -4009,7 +4009,7 @@ jobs:
         with:
           toolchain: nightly-2025-07-01
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz -> target
           shared-key: fuzz-smoke
@@ -4059,7 +4059,7 @@ jobs:
 
       - name: Cache eBPF Rust dependencies and compiler outputs
         if: steps.changes.outputs.ebpf_changed == 'true'
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: "ci-ebpf-programs"
           workspaces: |
@@ -4812,7 +4812,7 @@ jobs:
       - uses: ./.github/actions/setup-fast-linker
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         # Cache restore/save is a build-time optimization, not a correctness
         # input. The Windows runner occasionally fails the post-step cache
         # upload to GitHub's cache service with no log output (observed on PR
