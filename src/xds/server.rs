@@ -26,8 +26,8 @@ use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
 use crate::grpc::auth::{
-    AllowedNamespaces, DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS, StreamAuthSurface,
-    StreamAuthTerminationGuard, StreamAuthorizationLease, VerifiedGrpcIdentity,
+    AllowedNamespaces, AuthorizedResponseStream, DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS,
+    StreamAuthSurface, StreamAuthorizationLease, VerifiedGrpcIdentity,
 };
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, NamespaceBroadcasts};
 use crate::grpc::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
@@ -1693,8 +1693,6 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         tokio::spawn(async move {
             let authorization_end = authorization.wait_for_end();
             tokio::pin!(authorization_end);
-            let mut authorization_guard =
-                StreamAuthTerminationGuard::new(StreamAuthSurface::XdsSotw);
             let mut stream_guard = server.stream_guard();
             let mut node_id: Option<String> = None;
             let mut node_state_key: Option<String> = None;
@@ -1708,11 +1706,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
             loop {
                 tokio::select! {
-                    reason = &mut authorization_end => {
-                        authorization_guard.set_reason(reason);
-                        let _ = tx.send(Err(reason.status())).await;
-                        return;
-                    }
+                    _reason = &mut authorization_end => return,
                     maybe_request = requests.next() => {
                         let Some(request) = maybe_request else {
                             return;
@@ -1926,7 +1920,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             }
         });
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        let authorized = AuthorizedResponseStream::new(
+            ReceiverStream::new(rx),
+            &identity,
+            self.verifier.clone(),
+            self.max_stream_lifetime,
+            StreamAuthSurface::XdsSotw,
+        );
+        Ok(Response::new(Box::pin(authorized)))
     }
 
     async fn delta_aggregated_resources(
@@ -1994,8 +1995,6 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         tokio::spawn(async move {
             let authorization_end = authorization.wait_for_end();
             tokio::pin!(authorization_end);
-            let mut authorization_guard =
-                StreamAuthTerminationGuard::new(StreamAuthSurface::XdsDelta);
             let mut stream_guard = server.stream_guard();
             let mut node_id: Option<String> = None;
             let mut node_state_key: Option<String> = None;
@@ -2011,11 +2010,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 HashMap::new();
             loop {
                 tokio::select! {
-                    reason = &mut authorization_end => {
-                        authorization_guard.set_reason(reason);
-                        let _ = tx.send(Err(reason.status())).await;
-                        return;
-                    }
+                    _reason = &mut authorization_end => return,
                     maybe_request = requests.next() => {
                         let Some(request) = maybe_request else {
                             return;
@@ -2241,7 +2236,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             }
         });
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        let authorized = AuthorizedResponseStream::new(
+            ReceiverStream::new(rx),
+            &identity,
+            self.verifier.clone(),
+            self.max_stream_lifetime,
+            StreamAuthSurface::XdsDelta,
+        );
+        Ok(Response::new(Box::pin(authorized)))
     }
 }
 

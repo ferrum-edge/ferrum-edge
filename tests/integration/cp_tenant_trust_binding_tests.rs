@@ -93,6 +93,23 @@ fn tenant_b_only_verifier() -> CpDpVerifier {
     )
 }
 
+fn tenant_a_broad_verifier() -> CpDpVerifier {
+    let document = json!({
+        "version": 1,
+        "keys": [
+            { "kid": TENANT_A, "algorithm": "HS256", "secret": TENANT_A_SECRET,
+              "namespaces": [TENANT_A, TENANT_B] },
+            { "kid": TENANT_B, "algorithm": "HS256", "secret": TENANT_B_SECRET,
+              "namespaces": [TENANT_B] },
+        ]
+    })
+    .to_string();
+    CpDpVerifier::TrustBundle(
+        CpDpTrustBundle::from_document_str(&document, "tenant-a-broad", None)
+            .expect("broad tenant A verifier must load"),
+    )
+}
+
 /// Mint a token exactly as a compromised node would: arbitrary claims, signed
 /// with whatever key that node actually holds, and stamped with whatever `kid`
 /// the attacker chooses.
@@ -455,7 +472,7 @@ fn captured_old_verifier_snapshot_cannot_bind_after_remove_then_readd() {
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn finite_server_lease_closes_every_bearer_configuration_stream() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
     let (addr, handle) = start_all_stream_surfaces(verifier, Duration::from_millis(150)).await;
@@ -587,7 +604,7 @@ async fn finite_server_lease_closes_every_bearer_configuration_stream() {
     handle.abort();
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn verifier_rotation_revokes_only_streams_bound_to_removed_credentials() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
     let (addr, handle) = start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
@@ -654,31 +671,259 @@ async fn verifier_rotation_revokes_only_streams_bound_to_removed_credentials() {
     handle.abort();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn accepted_token_expiry_closes_stream_without_heartbeat_extension() {
+#[tokio::test(start_paused = true)]
+async fn xds_revocation_preempts_already_buffered_sotw_and_delta_responses() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
-    let (addr, handle) = start_all_stream_surfaces(verifier, Duration::from_secs(5)).await;
-    let token = mint_with_exp(
+    let (addr, handle) =
+        start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
+
+    let sotw_token = mint(
         TENANT_A_SECRET,
         Some(TENANT_A),
-        "expiring-node",
+        "buffered-xds-sotw-node",
         Some(json!(TENANT_A)),
         None,
-        Utc::now().timestamp() - 58,
+    );
+    let mut sotw_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
+    let (sotw_tx, sotw_rx) = mpsc::channel(2);
+    sotw_tx
+        .send(DiscoveryRequest {
+            node: Some(Node {
+                id: "buffered-xds-sotw-node".to_string(),
+                ..Node::default()
+            }),
+            resource_names: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            ..DiscoveryRequest::default()
+        })
+        .await
+        .unwrap();
+    let mut sotw_stream = sotw_client
+        .stream_aggregated_resources(authorize(
+            tonic::Request::new(ReceiverStream::new(sotw_rx)),
+            &sotw_token,
+        ))
+        .await
+        .expect("SotW ADS admission")
+        .into_inner();
+
+    let delta_token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "buffered-xds-delta-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let mut delta_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
+    let (delta_tx, delta_rx) = mpsc::channel(2);
+    delta_tx
+        .send(DeltaDiscoveryRequest {
+            node: Some(Node {
+                id: "buffered-xds-delta-node".to_string(),
+                ..Node::default()
+            }),
+            resource_names_subscribe: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            ..DeltaDiscoveryRequest::default()
+        })
+        .await
+        .unwrap();
+    let mut delta_stream = delta_client
+        .delta_aggregated_resources(authorize(
+            tonic::Request::new(ReceiverStream::new(delta_rx)),
+            &delta_token,
+        ))
+        .await
+        .expect("delta ADS admission")
+        .into_inner();
+
+    // Let both producer tasks enqueue their initial response without allowing
+    // either client to consume it. Revocation must win over the buffered item.
+    settle().await;
+    verifier.replace(tenant_b_only_verifier());
+    let sotw_status = sotw_stream
+        .message()
+        .await
+        .expect_err("revocation must preempt the buffered SotW response");
+    assert_eq!(sotw_status.code(), tonic::Code::PermissionDenied);
+    let delta_status = delta_stream
+        .message()
+        .await
+        .expect_err("revocation must preempt the buffered delta response");
+    assert_eq!(delta_status.code(), tonic::Code::PermissionDenied);
+
+    drop(sotw_tx);
+    drop(delta_tx);
+    handle.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn namespace_binding_narrowing_revokes_stream_using_the_old_ceiling() {
+    let verifier = Arc::new(CpDpVerifierStore::new(tenant_a_broad_verifier()));
+    let (addr, handle) =
+        start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
+    let token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "dp-a-old-ceiling",
+        Some(json!(TENANT_B)),
+        None,
     );
     let mut client = configsync_client!(addr, token);
     let mut stream = client
         .subscribe(tonic::Request::new(subscribe_request(
-            "expiring-node",
+            "dp-a-old-ceiling",
+            TENANT_B,
+        )))
+        .await
+        .expect("the original broad namespace policy must admit the stream")
+        .into_inner();
+    stream
+        .message()
+        .await
+        .expect("initial response must be readable")
+        .expect("initial snapshot must be present");
+
+    verifier.replace(two_tenant_verifier());
+    assert_eq!(
+        wait_for_terminal_status(&mut stream).await,
+        tonic::Code::PermissionDenied
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn accepted_token_expiry_closes_stream_without_heartbeat_extension() {
+    let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+    let (addr, handle) = start_all_stream_surfaces(verifier, Duration::from_secs(5)).await;
+    let config_token = mint_with_exp(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "expiring-config-node",
+        Some(json!(TENANT_A)),
+        None,
+        Utc::now().timestamp() - 58,
+    );
+    let mut config_client = configsync_client!(addr, config_token);
+    let mut config_stream = config_client
+        .subscribe(tonic::Request::new(subscribe_request(
+            "expiring-config-node",
             TENANT_A,
         )))
         .await
         .expect("token inside verifier leeway must be admitted")
         .into_inner();
     assert_eq!(
-        wait_for_terminal_status(&mut stream).await,
+        wait_for_terminal_status(&mut config_stream).await,
         tonic::Code::Unauthenticated
     );
+
+    for (node_id, remote, audience) in [
+        (
+            "expiring-mesh-local-node",
+            false,
+            MESH_LOCAL_SUBSCRIBE_AUDIENCE.to_string(),
+        ),
+        (
+            "expiring-mesh-remote-node",
+            true,
+            remote_discovery_audience("test-cluster"),
+        ),
+    ] {
+        let mesh_token = mint_with_exp(
+            TENANT_A_SECRET,
+            Some(TENANT_A),
+            node_id,
+            Some(json!(TENANT_A)),
+            Some(&audience),
+            Utc::now().timestamp() - 58,
+        );
+        let mut mesh_client = mesh_client!(addr, mesh_token);
+        let mut mesh_stream = mesh_client
+            .mesh_subscribe(tonic::Request::new(mesh_subscribe_request(
+                node_id, TENANT_A, remote,
+            )))
+            .await
+            .expect("mesh token inside verifier leeway must be admitted")
+            .into_inner();
+        assert_eq!(
+            wait_for_terminal_status(&mut mesh_stream).await,
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    let sotw_token = mint_with_exp(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "expiring-xds-sotw-node",
+        Some(json!(TENANT_A)),
+        None,
+        Utc::now().timestamp() - 58,
+    );
+    let mut sotw_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
+    let (sotw_tx, sotw_rx) = mpsc::channel(2);
+    sotw_tx
+        .send(DiscoveryRequest {
+            node: Some(Node {
+                id: "expiring-xds-sotw-node".to_string(),
+                ..Node::default()
+            }),
+            resource_names: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            ..DiscoveryRequest::default()
+        })
+        .await
+        .unwrap();
+    let mut sotw_stream = sotw_client
+        .stream_aggregated_resources(authorize(
+            tonic::Request::new(ReceiverStream::new(sotw_rx)),
+            &sotw_token,
+        ))
+        .await
+        .expect("SotW token inside verifier leeway must be admitted")
+        .into_inner();
+    assert_eq!(
+        wait_for_terminal_status(&mut sotw_stream).await,
+        tonic::Code::Unauthenticated
+    );
+    drop(sotw_tx);
+
+    let delta_token = mint_with_exp(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "expiring-xds-delta-node",
+        Some(json!(TENANT_A)),
+        None,
+        Utc::now().timestamp() - 58,
+    );
+    let mut delta_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
+    let (delta_tx, delta_rx) = mpsc::channel(2);
+    delta_tx
+        .send(DeltaDiscoveryRequest {
+            node: Some(Node {
+                id: "expiring-xds-delta-node".to_string(),
+                ..Node::default()
+            }),
+            resource_names_subscribe: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            ..DeltaDiscoveryRequest::default()
+        })
+        .await
+        .unwrap();
+    let mut delta_stream = delta_client
+        .delta_aggregated_resources(authorize(
+            tonic::Request::new(ReceiverStream::new(delta_rx)),
+            &delta_token,
+        ))
+        .await
+        .expect("delta token inside verifier leeway must be admitted")
+        .into_inner();
+    assert_eq!(
+        wait_for_terminal_status(&mut delta_stream).await,
+        tonic::Code::Unauthenticated
+    );
+    drop(delta_tx);
 
     handle.abort();
 }

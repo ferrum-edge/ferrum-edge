@@ -126,9 +126,10 @@ renew either deadline. Expiry and maximum-lifetime closure use
 `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` is watched at
 `FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`. A valid replacement is installed
 atomically. Adding an overlapping credential does not disrupt streams admitted
-by a retained credential; removing that credential closes only its streams.
-Invalid reloads retain the last accepted verifier. DPs and mesh/xDS clients use
-their existing bounded reconnect backoff and reread
+by a retained credential with the same namespace policy. Removing that
+credential, or changing its trusted namespace ceiling, closes its existing
+streams. Invalid reloads retain the last accepted verifier. DPs and mesh/xDS
+clients use their existing bounded reconnect backoff and reread
 `FERRUM_DP_CP_GRPC_TOKEN_FILE` (or mint a new short-lived token) on each attempt.
 The fixed-cardinality
 `ferrum_grpc_config_stream_terminations_total{surface,reason}` metric and

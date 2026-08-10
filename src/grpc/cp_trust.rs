@@ -235,10 +235,10 @@ pub struct TrustedKey {
     algorithm: Algorithm,
     decoding_key: DecodingKey,
     /// Stable, process-internal identity of the accepted verification
-    /// credential. This is derived from the configured key material but is
-    /// never logged or exported. It lets an admitted stream survive an
-    /// overlapping bundle rotation while closing if its exact credential is
-    /// removed.
+    /// credential and namespace policy. This is derived from the configured
+    /// key material and namespace ceiling but is never logged or exported. It
+    /// lets an admitted stream survive an overlapping bundle rotation while
+    /// closing if its exact credential or authorization policy is removed.
     identity: VerificationCredentialIdentity,
     /// Immutable namespace ceiling for every token this key verifies. Sourced
     /// exclusively from trusted CP configuration; a bearer can never change it.
@@ -274,6 +274,26 @@ fn credential_identity(
     }
     hasher.update(b"\0");
     hasher.update(material);
+    VerificationCredentialIdentity(hasher.finalize())
+}
+
+/// Bind a verification credential to the trusted namespace policy that was
+/// in force when it admitted a stream. Reloading the same key with an expanded
+/// or reduced namespace ceiling must not leave an established stream using the
+/// old authorization policy until its maximum lifetime happens to elapse.
+fn namespace_bound_credential_identity(
+    credential: VerificationCredentialIdentity,
+    namespaces: &HashSet<String>,
+) -> VerificationCredentialIdentity {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ferrum-cp-dp-authorization-credential-v1\0");
+    hasher.update(credential.0);
+    let mut namespaces: Vec<&str> = namespaces.iter().map(String::as_str).collect();
+    namespaces.sort_unstable();
+    for namespace in namespaces {
+        hasher.update(namespace.as_bytes());
+        hasher.update(b"\0");
+    }
     VerificationCredentialIdentity(hasher.finalize())
 }
 
@@ -588,10 +608,8 @@ impl CpDpVerifier {
         }
     }
 
-    /// Whether this verifier snapshot still accepts the exact credential that
-    /// admitted a stream. Namespace changes on a retained credential are not a
-    /// credential removal: the stream remains bound to the already verified
-    /// identity and its original namespace ceiling until its finite lease ends.
+    /// Whether this verifier snapshot still accepts the exact credential and
+    /// namespace policy that admitted a stream.
     pub fn contains_credential(&self, identity: &VerificationCredentialIdentity) -> bool {
         match self {
             Self::SharedSecret(secret) => {
@@ -761,7 +779,8 @@ impl CpDpVerifierStore {
             return None;
         }
         let generation = snapshot.credential_generation(identity)?;
-        self.credential_is_active(identity, generation).then_some(generation)
+        self.credential_is_active(identity, generation)
+            .then_some(generation)
     }
 }
 
@@ -1190,6 +1209,8 @@ impl TrustBundleKeyDocument {
             let identity = credential_identity(Some(&kid), algorithm, &identity_material);
             (decoding_key, identity)
         };
+
+        let identity = namespace_bound_credential_identity(identity, &namespaces);
 
         Ok(TrustedKey {
             kid,

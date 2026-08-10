@@ -35,7 +35,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::{Instant, Interval, Sleep};
+use tokio::time::{Instant, Sleep};
+use tokio_stream::wrappers::WatchStream;
 use tonic::Status;
 use tracing::{info, warn};
 
@@ -56,8 +57,6 @@ pub const GRPC_JWT_LEEWAY_SECONDS: u64 = 60;
 pub const DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS: u64 = 3_600;
 pub const MIN_GRPC_MAX_STREAM_LIFETIME_SECONDS: u64 = 60;
 pub const MAX_GRPC_MAX_STREAM_LIFETIME_SECONDS: u64 = 86_400;
-
-const CREDENTIAL_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 fn bounded_server_lifetime(lifetime: Duration) -> Duration {
     lifetime.min(Duration::from_secs(MAX_GRPC_MAX_STREAM_LIFETIME_SECONDS))
@@ -689,14 +688,15 @@ impl StreamAuthorizationLease {
     }
 }
 
-/// Deadline/revocation wrapper for server-streaming ConfigSync and
-/// MeshSubscribe responses. Timers are fixed at admission; polling inner
-/// traffic and heartbeat activity cannot modify them.
+/// Deadline/revocation wrapper for authenticated server responses. Timers are
+/// fixed at admission; inner traffic and heartbeat activity cannot modify
+/// them. Verifier reloads are observed through the store's watch channel, so
+/// idle streams do not need periodic revocation polling.
 pub struct AuthorizedResponseStream<S> {
     inner: Pin<Box<S>>,
     authorization_sleep: Pin<Box<Sleep>>,
     server_sleep: Pin<Box<Sleep>>,
-    revocation_checks: Interval,
+    verifier_revisions: WatchStream<u64>,
     credential: VerificationCredentialIdentity,
     credential_generation: u64,
     verifier: Arc<CpDpVerifierStore>,
@@ -720,10 +720,7 @@ impl<S> AuthorizedResponseStream<S> {
                 identity.authorization_deadline,
             )),
             server_sleep: Box::pin(tokio::time::sleep_until(server_deadline)),
-            revocation_checks: tokio::time::interval_at(
-                Instant::now() + CREDENTIAL_RECHECK_INTERVAL,
-                CREDENTIAL_RECHECK_INTERVAL,
-            ),
+            verifier_revisions: WatchStream::new(verifier.subscribe()),
             credential: identity.credential.clone(),
             credential_generation: identity.credential_generation,
             verifier,
@@ -755,11 +752,18 @@ where
         if self.server_sleep.as_mut().poll(cx).is_ready() {
             return self.terminate(StreamAuthEndReason::ServerMaxLifetime);
         }
-        if self.revocation_checks.poll_tick(cx).is_ready()
-            && !self
+        let verifier_revision = tokio_stream::Stream::poll_next(
+            Pin::new(&mut self.verifier_revisions),
+            cx,
+        );
+        let revoked = match verifier_revision {
+            Poll::Ready(Some(_)) => !self
                 .verifier
-                .credential_is_active(&self.credential, self.credential_generation)
-        {
+                .credential_is_active(&self.credential, self.credential_generation),
+            Poll::Ready(None) => true,
+            Poll::Pending => false,
+        };
+        if revoked {
             return self.terminate(StreamAuthEndReason::VerificationKeyRemoved);
         }
         self.inner.as_mut().poll_next(cx)
