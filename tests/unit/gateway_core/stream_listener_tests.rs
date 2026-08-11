@@ -11,9 +11,9 @@ use ferrum_edge::config::types::{
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::load_balancer::LoadBalancerCache;
+use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::proxy::client_ip::TrustedProxies;
-use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::proxy::stream_listener::{StreamListenerDegradation, StreamListenerManager};
 use ferrum_edge::proxy::stream_match::{StreamMatchArm, StreamMatchCriteria};
 use ferrum_edge::request_epoch::RequestEpochStore;
@@ -2089,7 +2089,10 @@ async fn test_reconcile_restarts_on_dedicated_bind_address_change() {
     assert_eq!(
         manager.active_binds().await,
         vec![(
-            format!("{}|tcp-bind-rebind", ferrum_edge::config::types::default_namespace()),
+            format!(
+                "{}|tcp-bind-rebind",
+                ferrum_edge::config::types::default_namespace()
+            ),
             first
         )]
     );
@@ -2112,7 +2115,10 @@ async fn test_reconcile_restarts_on_dedicated_bind_address_change() {
     assert_eq!(
         manager.active_binds().await,
         vec![(
-            format!("{}|tcp-bind-rebind", ferrum_edge::config::types::default_namespace()),
+            format!(
+                "{}|tcp-bind-rebind",
+                ferrum_edge::config::types::default_namespace()
+            ),
             second
         )],
         "bind-address drift must rebind the live stream listener"

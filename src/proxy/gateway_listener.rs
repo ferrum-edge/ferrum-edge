@@ -276,10 +276,8 @@ impl GatewayListenerPlan {
                 });
                 continue;
             }
-            if let Some(existing) = ports.insert(
-                port,
-                DesiredGatewayListener { class, bind_addr },
-            ) && existing.class != class
+            if let Some(existing) = ports.insert(port, DesiredGatewayListener { class, bind_addr })
+                && existing.class != class
             {
                 // One socket cannot be both plaintext and TLS. The Gateway API
                 // translator refuses this at admission, so reaching it means a
@@ -637,9 +635,7 @@ impl GatewayListenerManager {
             };
             let replacing = plan.ports.contains_key(&port);
             let retire_reason = match plan.ports.get(&port) {
-                Some(desired) if desired.class != listener.class => {
-                    "its frontend class changed"
-                }
+                Some(desired) if desired.class != listener.class => "its frontend class changed",
                 Some(_) => "its bind address changed",
                 None => "no longer declared by config",
             };
