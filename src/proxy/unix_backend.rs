@@ -126,13 +126,19 @@ pub enum UnixBackendError {
     /// ended it on the very poll that validated that preface. Either way no
     /// request could be issued on it and none was.
     H2ConnectionClosed,
-    /// The destination is already at its DestinationRule
-    /// `connectionPool.tcp.maxConnections` ceiling and this request would have
-    /// required a NEW physical connection (issue #3764).
+    /// This ingress target already holds its configured maximum of
+    /// concurrently open PHYSICAL connections
+    /// (`FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS`) and this request would have
+    /// required a new one (issue #3731).
+    ///
+    /// An INBOUND transport ceiling toward the co-located application, not an
+    /// Istio `DestinationRule` — that is outbound client-side policy and does
+    /// not govern this direction. The payload type is shared with the outbound
+    /// limiter purely because "current versus cap" is the same shape.
     ///
     /// Decided BEFORE `connect(2)`, so no socket is opened and no application
     /// byte is written. Reuse of an already-admitted pooled carrier never
-    /// reaches this refusal, so a saturated destination still serves every
+    /// reaches this refusal, so a target at its bound still serves every
     /// request that can ride an existing connection.
     BackendConnectionLimit(crate::backend_conn_limit::BackendConnectionLimitExceeded),
     /// The socket accepted the connection but the h2c connection did not become
@@ -192,7 +198,7 @@ impl std::fmt::Display for UnixBackendError {
                 "unix backend h2c handshake timed out after {timeout_ms}ms"
             ),
             Self::BackendConnectionLimit(limit) => {
-                write!(f, "unix backend connection limit reached: {limit}")
+                write!(f, "unix ingress connection bound reached: {limit}")
             }
             Self::PlatformUnsupported => {
                 write!(f, "unix backends are not supported on this platform")
@@ -236,12 +242,13 @@ impl UnixBackendError {
     ///   hung up, or never became usable inside the budget — IS evidence the
     ///   local app is down, wedged, or not speaking its declared protocol, so
     ///   those keep the ordinary connect-phase classes;
-    /// * an over-cap refusal is the operator's own gateway-side ceiling, decided
-    ///   before `connect(2)`. It gets the shared typed
-    ///   [`crate::retry::ErrorClass::BackendConnectionLimit`] class every other
-    ///   transport uses: pre-wire, health-neutral (no breaker, passive-health,
-    ///   or LB penalty for a healthy destination that is merely saturated), and
-    ///   retryable onto another load-balanced target with its own lane.
+    /// * an over-bound refusal is the operator's own gateway-side ceiling on
+    ///   this ingress target, decided before `connect(2)`. It gets the shared
+    ///   typed [`crate::retry::ErrorClass::BackendConnectionLimit`] class every
+    ///   other transport uses: pre-wire, health-neutral (no breaker,
+    ///   passive-health, or LB penalty for a healthy application that is merely
+    ///   at its configured transport capacity), and retryable onto another
+    ///   load-balanced target with its own lane.
     pub fn error_class(&self) -> crate::retry::ErrorClass {
         match self {
             Self::BackendConnectionLimit(_) => crate::retry::ErrorClass::BackendConnectionLimit,

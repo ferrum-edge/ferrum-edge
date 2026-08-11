@@ -196,8 +196,11 @@ mod unix_bench {
         let dial_peer = BenchPeer::bind(&dial_socket, 16);
         let pooled_peer = BenchPeer::bind(&pooled_socket, 4);
 
-        let dial_pool = Arc::new(UnixBackendConnectionPool::new(PoolConfig::default(), 8));
-        let pooled_pool = Arc::new(UnixBackendConnectionPool::new(PoolConfig::default(), 8));
+        // Per-target physical-connection bound disabled (`0`): this harness
+        // measures dial-versus-reuse cost, and the dial arm deliberately opens
+        // a fresh connection per iteration.
+        let dial_pool = Arc::new(UnixBackendConnectionPool::new(PoolConfig::default(), 8, 0));
+        let pooled_pool = Arc::new(UnixBackendConnectionPool::new(PoolConfig::default(), 8, 0));
         let proxy = bench_proxy("unix-ingress-bench");
         let dial_path = dial_socket.to_str().expect("utf-8").to_string();
         let pooled_path = pooled_socket.to_str().expect("utf-8").to_string();

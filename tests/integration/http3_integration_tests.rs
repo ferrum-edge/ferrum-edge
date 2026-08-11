@@ -386,6 +386,7 @@ async fn test_http3_proxy_state_creation() {
             ferrum_edge::proxy::unix_backend_pool::UnixBackendConnectionPool::new(
                 ferrum_edge::config::PoolConfig::default(),
                 64,
+                ferrum_edge::proxy::unix_backend_pool::DEFAULT_UNIX_INGRESS_MAX_CONNECTIONS,
             ),
         ),
         h3_pool: Arc::new(ferrum_edge::http3::client::Http3ConnectionPool::new(
@@ -696,6 +697,7 @@ async fn test_http3_full_integration() {
             ferrum_edge::proxy::unix_backend_pool::UnixBackendConnectionPool::new(
                 ferrum_edge::config::PoolConfig::default(),
                 64,
+                ferrum_edge::proxy::unix_backend_pool::DEFAULT_UNIX_INGRESS_MAX_CONNECTIONS,
             ),
         ),
         h3_pool: Arc::new(ferrum_edge::http3::client::Http3ConnectionPool::new(

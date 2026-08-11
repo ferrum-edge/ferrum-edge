@@ -7459,9 +7459,15 @@ impl ProxyState {
                 backend_svid_generation.clone(),
             ),
         );
+        // Sidecar-ingress Unix carriers are INBOUND transport toward the
+        // co-located application, so they are bounded by the operator's own
+        // per-target ceiling rather than by an outbound DestinationRule
+        // (issue #3731). See `unix_backend_pool`'s module docs for why the two
+        // are not interchangeable.
         let unix_backend_pool = Arc::new(unix_backend_pool::UnixBackendConnectionPool::new(
             global_pool_config.clone(),
             pool_shard_amount,
+            env_config.mesh_unix_ingress_max_connections,
         ));
         let h3_pool = Arc::new(Http3ConnectionPool::new_with_svid_generation(
             env_config_arc.clone(),
@@ -7476,10 +7482,6 @@ impl ProxyState {
         hbone_pool.attach_backend_conn_limit(backend_conn_limit.clone());
         mesh_mtls_pool.attach_backend_conn_limit(backend_conn_limit.clone());
         h3_pool.attach_backend_conn_limit(backend_conn_limit.clone());
-        // Sidecar-ingress Unix carriers are physical backend connections Ferrum
-        // owns, so they are admitted against the SAME per-destination
-        // DestinationRule ceiling as every other transport (issue #3764).
-        unix_backend_pool.attach_backend_conn_limit(backend_conn_limit.clone());
         let backend_capabilities = Arc::new(BackendCapabilityRegistry::with_shard_amount(
             pool_shard_amount,
         ));
