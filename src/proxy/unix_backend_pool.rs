@@ -874,6 +874,7 @@ mod imp {
         }
 
         /// Slots currently held for one target. Diagnostics and tests only.
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         fn current(&self, key: &UnixPoolKey) -> u64 {
             self.counters
                 .get(key)
@@ -884,6 +885,7 @@ mod imp {
         /// Targets with a resident lane. Tests/diagnostics: proves the map
         /// drains rather than retaining a zero-count lane per socket ever
         /// dialed.
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         fn resident_lanes(&self) -> usize {
             self.counters.len()
         }
@@ -998,6 +1000,7 @@ mod imp {
 
         /// Drivers currently tracked. Diagnostics/tests only; never on the
         /// request path.
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         fn entries(&self) -> usize {
             self.lock().len()
         }
@@ -1378,6 +1381,7 @@ mod imp {
 
         /// Physical connections currently held for one target identity.
         /// Diagnostics and external tests only; never on the request path.
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn open_connections_for_target(
             &self,
             proxy: &Proxy,
@@ -1392,6 +1396,7 @@ mod imp {
         /// Targets with a resident connection lane. Diagnostics and external
         /// tests: proves the bound's map drains instead of retaining a
         /// zero-count lane per socket the gateway has ever dialed.
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn resident_connection_lanes(&self) -> usize {
             self.conn_bound.resident_lanes()
         }
@@ -1399,6 +1404,7 @@ mod imp {
         /// Entries currently held by the driver tracker. Diagnostics and
         /// external tests: proves a drain leaves no registration sentinel and
         /// no orphaned handle behind.
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub fn tracked_drivers(&self) -> usize {
             self.drivers.entries()
         }
@@ -1604,6 +1610,7 @@ mod imp {
         /// shutdown-path tests use this to exercise the forced-cancellation
         /// branch deterministically instead of waiting out the production
         /// budget; production goes through [`Self::shutdown_drain`].
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
         pub async fn shutdown_drain_with_budgets(
             &self,
             driver_budget: std::time::Duration,

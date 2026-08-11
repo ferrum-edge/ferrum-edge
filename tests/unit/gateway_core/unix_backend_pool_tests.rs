@@ -1853,15 +1853,15 @@ async fn a_new_physical_connection_is_refused_at_the_target_bound() {
             &[],
         )
         .await;
-    match refused {
-        Err(UnixBackendError::BackendConnectionLimit(limit)) => {
-            assert_eq!(limit.cap, 1);
-            assert_eq!(limit.current, 1);
-        }
-        other => {
-            panic!("an over-bound dial must be refused with the typed limit error, got {other:?}")
-        }
-    }
+    let err = expect_refusal(
+        refused,
+        "an over-bound dial must be refused with the typed limit error",
+    );
+    let UnixBackendError::BackendConnectionLimit(limit) = err else {
+        panic!("an over-bound dial must be refused with the typed limit error, got {err:?}");
+    };
+    assert_eq!(limit.cap, 1);
+    assert_eq!(limit.current, 1);
     let typed = UnixBackendError::BackendConnectionLimit(BackendConnectionLimitExceeded {
         current: 1,
         cap: 1,
@@ -3033,7 +3033,7 @@ async fn the_establishment_budget_opens_before_the_idle_sweep() {
         .await;
     assert!(
         matches!(refused, Err(UnixBackendError::ConnectTimeout { .. })),
-        "an unrepresentable establishment budget must fail closed, got {refused:?}"
+        "an unrepresentable establishment budget must fail closed"
     );
     assert_eq!(
         pool.stats().idle_h1_connections,
