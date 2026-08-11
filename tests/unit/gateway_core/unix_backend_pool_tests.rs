@@ -3037,8 +3037,11 @@ async fn the_establishment_budget_opens_before_the_idle_sweep() {
     assert_eq!(pool.stats().idle_h1_connections, 1);
 
     // Wait past the sweep interval so the NEXT checkout would sweep, and long
-    // enough that the pooled entry is idle-expired and would be evicted.
-    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    // enough that the pooled entry is idle-expired and would be evicted. Idle
+    // age is stored in whole Unix seconds and expires only when age is strictly
+    // greater than the configured timeout, so anything below two full seconds
+    // is boundary-dependent for a one-second timeout.
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
 
     let refused = pool
         .checkout_h1(
