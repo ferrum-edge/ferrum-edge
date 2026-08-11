@@ -1162,12 +1162,18 @@ fn service_discovery_cursor_and_rejection_counters_are_label_safe_and_rendered()
     registry.record_service_discovery_cursor_advance();
     registry.record_service_discovery_cursor_advance();
     registry.record_service_discovery_cursor_rollback();
+    registry.record_service_discovery_response_oversized();
+    registry.record_service_discovery_body_budget_rejected();
+    registry.record_service_discovery_malformed_envelope();
 
     let output = registry.render_uncached();
     assert!(output.contains("ferrum_service_discovery_provider_normalization_rejected_total 2"));
     assert!(output.contains("ferrum_service_discovery_shared_admission_rejected_total 1"));
     assert!(output.contains("ferrum_service_discovery_cursor_advance_total 3"));
     assert!(output.contains("ferrum_service_discovery_cursor_rollback_total 1"));
+    assert!(output.contains("ferrum_service_discovery_response_oversized_total 1"));
+    assert!(output.contains("ferrum_service_discovery_body_budget_rejected_total 1"));
+    assert!(output.contains("ferrum_service_discovery_malformed_envelope_total 1"));
     // No unbounded dimensions: scope the check to these families because unrelated
     // registry metrics legitimately carry labels with the same names.
     for line in output

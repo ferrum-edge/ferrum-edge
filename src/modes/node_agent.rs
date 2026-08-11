@@ -1176,7 +1176,51 @@ async fn start_node_agent_admin_listeners(
     if !env_config.node_agent_admin_enabled {
         return Ok(handles);
     }
-    if env_config.admin_http_port == 0 {
+    // Fail closed on HTTPS-only incomplete intent before treating the admin
+    // surface as inactive (issue #3704). When plaintext HTTP is also active the
+    // shared planner below owns the same TLS/CRL/admin-TLS loads — skip the
+    // duplicate I/O here. Inherited default 9443 without TLS stays HTTP-only
+    // compatible.
+    if env_config.admin_http_port == 0
+        && env_config.admin_https_port != 0
+        && crate::modes::startup_security::node_agent_admin_https_security_applicable(env_config)
+        && !env_config.admin_https_listener_enabled()
+    {
+        let tls_policy = crate::modes::startup_security::load_tls_policy(env_config)?;
+        let crls = crate::modes::startup_security::load_crls_from_env(env_config)?;
+        let _ = crate::modes::startup_security::load_admin_https_tls_fail_closed(
+            env_config,
+            &tls_policy,
+            &crls,
+            "Invalid node_agent admin TLS configuration",
+        )?;
+    }
+    // HTTP and HTTPS are planned independently. Port 0 disables only that
+    // transport; a nonzero HTTPS port with cert/key still starts HTTPS when
+    // HTTP is disabled (issue #3704).
+    if !crate::modes::startup_security::node_agent_admin_surface_active(env_config) {
+        if env_config.admin_https_port == 0 {
+            info!(
+                "{} — node_agent admin HTTPS listener disabled",
+                crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
+            );
+        } else if !env_config.admin_https_explicitly_requested() {
+            info!("Node agent admin TLS not configured - HTTPS listener disabled");
+        }
+        if env_config.admin_http_port == 0 {
+            info!(
+                "{} — plaintext node_agent admin HTTP listener disabled",
+                crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0")
+            );
+            warn!(
+                "No node_agent admin API listeners are active — {} and admin HTTPS not configured or {}. The admin API is unreachable.",
+                crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0"),
+                crate::secrets::report_env_assignment(
+                    "FERRUM_ADMIN_HTTPS_PORT",
+                    &env_config.admin_https_port.to_string()
+                )
+            );
+        }
         return Ok(handles);
     }
 
@@ -1247,6 +1291,7 @@ async fn start_node_agent_admin_listeners(
             },
         ),
     };
+    let admin_state_for_https = admin_state.clone();
 
     // Safe-by-default bind: when the operator opts into the node-agent admin
     // listener but configures neither an explicit bind nor an allowlist, fall
@@ -1254,48 +1299,188 @@ async fn start_node_agent_admin_listeners(
     // default. Endpoint authentication and observability-detail tiers still
     // apply. See `decide_admin_bind_address`.
     let signals = AdminBindSignals::from_env();
-    let admin_http_addr = decide_admin_bind_address(
-        &env_config.admin_bind_address,
-        env_config.admin_http_port,
-        &signals,
-    )?;
     let admin_conn_limiter = Arc::new(admin::AdminConnLimiter::new(
         env_config.admin_max_connections,
         env_config.admin_max_connections_per_ip,
     ));
-    let shutdown = shutdown_tx.subscribe();
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let handle = tokio::spawn(async move {
-        info!(
-            "Starting node_agent admin HTTP listener on {}",
-            crate::secrets::report_listener_addr(
-                "FERRUM_ADMIN_BIND_ADDRESS",
-                "FERRUM_ADMIN_HTTP_PORT",
-                &admin_http_addr.to_string()
-            )
-        );
-        if let Err(err) = admin::start_admin_listener_with_tls_and_signal(
-            admin_http_addr,
-            admin_state,
-            shutdown,
-            None,
-            Some(started_tx),
-            admin_conn_limiter,
-        )
-        .await
-        {
-            error!("Node agent admin HTTP listener error: {}", err);
-        }
-    });
-    handles.push(handle);
 
-    crate::startup::wait_for_start_signals(
-        vec![("Node agent admin HTTP listener".to_string(), started_rx)],
-        Duration::from_secs(10),
-    )
-    .await?;
+    // Validate admin HTTPS TLS material BEFORE spawning any admin listener so a
+    // bad cert/key cannot orphan an already-running plaintext admin task
+    // (issue #2372 / #3704). Reuse the shared reloadable frontend/admin TLS
+    // planner rather than a node-agent-only TLS stack. Skip TLS policy/CRL loads
+    // for the inherited default HTTPS port when HTTPS was never requested.
+    let admin_https_plan = if env_config.admin_https_port == 0 {
+        info!(
+            "{} — node_agent admin HTTPS listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTPS_PORT", "0")
+        );
+        None
+    } else if env_config.admin_https_listener_enabled()
+        || env_config.admin_https_explicitly_requested()
+    {
+        let tls_policy = crate::modes::startup_security::load_tls_policy(env_config)?;
+        let crls = crate::modes::startup_security::load_crls_from_env(env_config)?;
+        let admin_https_addr = decide_admin_bind_address(
+            &env_config.admin_bind_address,
+            env_config.admin_https_port,
+            &signals,
+        )?;
+        match crate::modes::startup_security::plan_admin_https_listener(
+            env_config,
+            &tls_policy,
+            &crls,
+            "Invalid node_agent admin TLS configuration",
+            admin_https_addr,
+            Some(shutdown_tx.subscribe()),
+        )? {
+            crate::modes::startup_security::AdminHttpsListenerPlan::Enabled(planned) => {
+                if env_config.admin_tls_client_ca_bundle_path.is_some() {
+                    info!(
+                        "Node agent admin TLS configuration loaded with client certificate verification (HTTPS with mTLS available)"
+                    );
+                } else if env_config.admin_tls_no_verify {
+                    warn!(
+                        "Node agent admin TLS configuration loaded with certificate verification DISABLED (testing mode)"
+                    );
+                } else {
+                    info!(
+                        "Node agent admin TLS configuration loaded without client certificate verification (HTTPS available)"
+                    );
+                }
+                if planned.reload.watcher_handle.is_some() {
+                    info!("Frontend TLS live reload enabled for node_agent admin HTTPS");
+                }
+                Some(planned)
+            }
+            crate::modes::startup_security::AdminHttpsListenerPlan::DisabledByPort => None,
+            crate::modes::startup_security::AdminHttpsListenerPlan::DisabledByMissingTls => {
+                info!("Node agent admin TLS not configured - HTTPS listener disabled");
+                None
+            }
+        }
+    } else {
+        info!("Node agent admin TLS not configured - HTTPS listener disabled");
+        None
+    };
+
+    let mut startup_signals = Vec::new();
+
+    if env_config.admin_http_port != 0 {
+        let admin_http_addr = decide_admin_bind_address(
+            &env_config.admin_bind_address,
+            env_config.admin_http_port,
+            &signals,
+        )?;
+        let shutdown = shutdown_tx.subscribe();
+        let admin_http_limiter = admin_conn_limiter.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        handles.push(tokio::spawn(async move {
+            info!(
+                "Starting node_agent admin HTTP listener on {}",
+                crate::secrets::report_listener_addr(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
+                    "FERRUM_ADMIN_HTTP_PORT",
+                    &admin_http_addr.to_string()
+                )
+            );
+            if let Err(err) = admin::start_admin_listener_with_tls_and_signal(
+                admin_http_addr,
+                admin_state,
+                shutdown,
+                None,
+                Some(started_tx),
+                admin_http_limiter,
+            )
+            .await
+            {
+                error!("Node agent admin HTTP listener error: {}", err);
+            }
+        }));
+        startup_signals.push(("Node agent admin HTTP listener".to_string(), started_rx));
+    } else {
+        info!(
+            "{} — plaintext node_agent admin HTTP listener disabled",
+            crate::secrets::report_env_assignment("FERRUM_ADMIN_HTTP_PORT", "0")
+        );
+    }
+
+    if let Some(mut planned) = admin_https_plan {
+        if let Some(handle) = planned.reload.watcher_handle.take() {
+            handles.push(handle);
+        }
+        let admin_https_addr = planned.addr;
+        let admin_tls_config = planned.tls_config;
+        let admin_tls_slot = planned.reload.slot.take();
+        let shutdown = shutdown_tx.subscribe();
+        let admin_https_limiter = admin_conn_limiter.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        handles.push(tokio::spawn(async move {
+            info!(
+                "Starting node_agent admin HTTPS listener on {}",
+                crate::secrets::report_listener_addr(
+                    "FERRUM_ADMIN_BIND_ADDRESS",
+                    "FERRUM_ADMIN_HTTPS_PORT",
+                    &admin_https_addr.to_string()
+                )
+            );
+            let result = if let Some(slot) = admin_tls_slot {
+                admin::start_admin_listener_with_dynamic_tls_and_signal(
+                    admin_https_addr,
+                    admin_state_for_https,
+                    shutdown,
+                    slot,
+                    Some(started_tx),
+                    admin_https_limiter,
+                )
+                .await
+            } else {
+                admin::start_admin_listener_with_tls_and_signal(
+                    admin_https_addr,
+                    admin_state_for_https,
+                    shutdown,
+                    Some(admin_tls_config),
+                    Some(started_tx),
+                    admin_https_limiter,
+                )
+                .await
+            };
+            if let Err(err) = result {
+                error!("Node agent admin HTTPS listener error: {}", err);
+            }
+        }));
+        startup_signals.push(("Node agent admin HTTPS listener".to_string(), started_rx));
+    }
+
+    if let Err(err) =
+        crate::startup::wait_for_start_signals(startup_signals, Duration::from_secs(10)).await
+    {
+        // Partial bind must not leave a half-started admin surface: shut down
+        // and join every listener/watcher already spawned.
+        let _ = shutdown_tx.send(true);
+        for handle in handles {
+            if let Err(join_err) = handle.await {
+                warn!(
+                    error = %join_err,
+                    "Node agent admin listener task failed during startup rollback"
+                );
+            }
+        }
+        return Err(err);
+    }
 
     Ok(handles)
+}
+
+/// Test-only seam for issue #3704 external coverage of the production
+/// node-agent admin HTTP/HTTPS planner and startup path.
+#[allow(dead_code)]
+#[doc(hidden)]
+pub async fn start_node_agent_admin_listeners_for_test(
+    env_config: &EnvConfig,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    startup_ready: Arc<AtomicBool>,
+) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
+    start_node_agent_admin_listeners(env_config, shutdown_tx, startup_ready).await
 }
 
 /// Operator signals that confirm the node-agent admin listener is intentionally
@@ -18415,6 +18600,9 @@ mod tests {
         let env_config = EnvConfig {
             node_agent_admin_enabled: true,
             admin_http_port: 0,
+            // Explicitly disable HTTPS so the default 9443 port cannot look like
+            // a half-configured HTTPS listener under the shared planner.
+            admin_https_port: 0,
             ..EnvConfig::default()
         };
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);

@@ -7495,10 +7495,19 @@ impl ProxyState {
             plugin_cache: plugin_cache.load_inner(),
             consumer_index: consumer_index.load_inner(),
             load_balancer: load_balancer_cache.load_inner(),
+            gateway_listener_admission: crate::router_cache::GatewayListenerAdmission::pending(),
             config_generation: 1,
             route_generation: 1,
             lb_generation: 1,
         }));
+        {
+            let initial_epoch = request_epoch.load();
+            router_cache.store_route_epoch_snapshot(
+                Arc::clone(&initial_epoch.route_table),
+                initial_epoch.route_generation,
+                Arc::clone(&initial_epoch.gateway_listener_admission),
+            );
+        }
         // Initialize health checker with the gateway's pool settings so active
         // probes share connection tuning (keep-alive, idle timeout, HTTP/2) with
         // regular proxy traffic.
@@ -7908,6 +7917,42 @@ impl ProxyState {
     /// withdrawal without polling.
     pub fn subscribe_config_revision(&self) -> watch::Receiver<u64> {
         self.config_revision.subscribe()
+    }
+
+    /// Publish the listener admission decision produced from `expected` only
+    /// while that exact config generation remains current. Returns `false` for
+    /// a stale reconcile so the manager can immediately process the newer one.
+    pub(crate) fn publish_gateway_listener_admission(
+        &self,
+        expected: &RequestEpoch,
+        refused_ports: std::collections::BTreeSet<u16>,
+    ) -> bool {
+        let admission = crate::router_cache::GatewayListenerAdmission::decided(refused_ports);
+        self.request_epoch
+            .publish_gateway_listener_admission(expected, admission, |published| {
+                self.router_cache.store_route_epoch_snapshot(
+                    Arc::clone(&published.route_table),
+                    published.route_generation,
+                    Arc::clone(&published.gateway_listener_admission),
+                );
+            })
+            .is_some()
+    }
+
+    /// Production route lookup exposed narrowly for external generation-race
+    /// regression tests. Both HTTP and HTTP/3 use the same epoch-bound helper.
+    #[doc(hidden)]
+    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
+    pub fn find_proxy_on_frontend_for_test(
+        &self,
+        host: Option<&str>,
+        path: &str,
+        frontend_port: Option<u16>,
+        frontend_is_tls: bool,
+    ) -> Option<crate::router_cache::RouteMatch> {
+        let epoch = self.request_epoch.load();
+        self.router_cache
+            .find_proxy_in_epoch(&epoch, host, path, frontend_port, frontend_is_tls)
     }
 
     /// The Alt-Svc value to advertise for the frontend port a request arrived
@@ -10109,14 +10154,17 @@ impl ProxyState {
         route_changed: bool,
         clear_route_caches: bool,
     ) {
-        if route_changed {
-            self.router_cache.store_route_table_snapshot(
-                Arc::clone(&published.route_table),
-                published.route_generation,
-            );
-            if clear_route_caches {
-                self.router_cache.clear_lookup_caches();
-            }
+        // Mirror route table and listener admission as one compatibility
+        // snapshot even when route content did not change. Production request
+        // paths read both directly from RequestEpoch; standalone/library
+        // lookups must not observe a partial generation either.
+        self.router_cache.store_route_epoch_snapshot(
+            Arc::clone(&published.route_table),
+            published.route_generation,
+            Arc::clone(&published.gateway_listener_admission),
+        );
+        if route_changed && clear_route_caches {
+            self.router_cache.clear_lookup_caches();
         }
         // No withdrawal pass is needed for the reqwest `maxConnections` admission
         // lanes: a lane exists only while some capped dispatch holds a lease
@@ -25389,9 +25437,8 @@ async fn handle_proxy_request_inner(
             record_status(&state, response.status().as_u16());
             return Ok(response);
         }
-        None => state.router_cache.find_proxy_in_snapshot(
-            &epoch.route_table,
-            epoch.route_generation,
+        None => state.router_cache.find_proxy_in_epoch(
+            &epoch,
             request_host.as_deref(),
             &path,
             ctx.frontend_listen_port,
@@ -25412,14 +25459,16 @@ async fn handle_proxy_request_inner(
             if crate::modes::mesh::mesh_route_direction(&rm.proxy.id)
                 .is_some_and(|route_dir| Some(route_dir) != ctx.mesh_direction) =>
         {
-            state.router_cache.resolve_route_excluding_wrong_direction(
-                &epoch.route_table,
-                request_host.as_deref(),
-                &path,
-                ctx.mesh_direction,
-                ctx.frontend_listen_port,
-                is_tls,
-            )
+            state
+                .router_cache
+                .resolve_route_excluding_wrong_direction_in_epoch(
+                    &epoch,
+                    request_host.as_deref(),
+                    &path,
+                    ctx.mesh_direction,
+                    ctx.frontend_listen_port,
+                    is_tls,
+                )
         }
         other => other,
     };

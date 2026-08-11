@@ -3101,6 +3101,18 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_service_discovery_body_budget_rejected_total",
+    "type": "counter",
+    "help": "Service-discovery HTTP responses rejected because the concurrent body budget was exhausted.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_service_discovery_cursor_advance_total",
     "type": "counter",
     "help": "Service-discovery blocking-query cursor advances after an admitted higher-index snapshot.",
@@ -3125,9 +3137,33 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_service_discovery_malformed_envelope_total",
+    "type": "counter",
+    "help": "Service-discovery Kubernetes EndpointSliceList envelopes rejected as malformed.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_service_discovery_provider_normalization_rejected_total",
     "type": "counter",
     "help": "Service-discovery snapshots rejected because every provider catalog entry failed provider normalization.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_response_oversized_total",
+    "type": "counter",
+    "help": "Service-discovery HTTP responses rejected for oversized or ambiguous body bounds.",
     "labels": [
       "namespace"
     ],
@@ -3306,6 +3342,72 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "conditional"
+  },
+  {
+    "name": "ferrum_tls_store_admission_rejected_total",
+    "type": "counter",
+    "help": "Logical persistent TLS store admission refusals by store and reason.",
+    "labels": [
+      "store",
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_tls_store_document_bytes",
+    "type": "gauge",
+    "help": "Current serialized byte length of a persistent TLS store document.",
+    "labels": [
+      "store",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_tls_store_oversized_total",
+    "type": "counter",
+    "help": "Oversized persistent TLS store document refusals by store and direction.",
+    "labels": [
+      "store",
+      "direction",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_tls_store_pruned_total",
+    "type": "counter",
+    "help": "Terminal ACME order history entries pruned under the exclusive mutation lock.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_tls_store_record_count",
+    "type": "gauge",
+    "help": "Current logical record count in a persistent TLS store.",
+    "labels": [
+      "store",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
   },
   {
     "name": "ferrum_websocket_bytes_total",

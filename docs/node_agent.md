@@ -11,7 +11,7 @@ For the security posture of this mode (required Linux capabilities, mounts, secc
 | Surface | Name / default | Purpose |
 |---|---|---|
 | Proxy mode | `FERRUM_NODE_AGENT_PROXY_MODE=local_pod` | Selects the capture topology. `local_pod` redirects to the co-located pod proxy. `node_waypoint` drives the sidecarless node-waypoint datapath: per-pod dual-family in-netns capture listeners, the GAP-2M socket-cookie bridge, the pod registry, and the direct-inbound pod-veth guard (see below). The remote `node-waypoint-ebpf-live` workflow gates IPv4 and IPv6 capture, secured node-to-node transport, SPIRE-backed identity, direct Pod-IP bypass checks, source workload IPv4 reuse, HBONE negative authentication probes, and SPIRE/NodeWaypoint restart recovery. |
-| Admin listener | `FERRUM_NODE_AGENT_ADMIN_ENABLED=false` | Opts in to the read-only admin listener for node-agent metrics/health. When enabled, `FERRUM_ADMIN_HTTP_PORT` controls the port and the listener defaults to loopback unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set. |
+| Admin listener | `FERRUM_NODE_AGENT_ADMIN_ENABLED=false` | Opts in to the read-only admin listeners for node-agent metrics/health. When enabled, `FERRUM_ADMIN_HTTP_PORT` and `FERRUM_ADMIN_HTTPS_PORT` control plaintext and TLS listeners independently (port `0` disables that transport only). HTTPS uses the shared `FERRUM_ADMIN_TLS_*` contract and fails closed on explicit TLS intent without server cert/key. The listener defaults to loopback unless `FERRUM_ADMIN_BIND_ADDRESS` or `FERRUM_ADMIN_ALLOWED_CIDRS` is set. `/live` is always unauthenticated/minimal; unauthenticated `/health` returns only `status`/`ready`; `/metrics` requires admin JWT, metrics bearer token, or metrics CIDR. |
 | Outbound capture port | `15001` | The port written into the BPF capture config map and used by cgroup connect hooks when rewriting outbound sockets. |
 | HBONE redirect port | `FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT=15008` | The HBONE listener/redirect port carried in the same BPF config map for sidecarless topologies. Must match the mesh proxy HBONE listener (`15008` today). Node-agent startup automatically adds this port to outbound capture exclusions. |
 | Unix socket | `/run/ferrum/node-agent.sock` | Reserved IPC path for future node-agent/proxy coordination. Phase 1 treats this as inert contract metadata; no socket is created yet. |
@@ -932,27 +932,63 @@ In a cluster with heterogeneous kernels, the recommended pattern is:
 
 The mesh control plane is not changed by node-level degradation: slice apply, `mesh_authz`, `mesh_workload_metrics`, and HBONE all continue to function as ambient. Only the per-pod capture mechanism on the affected node changes.
 
-The node agent starts the read-only admin HTTP listener on `FERRUM_ADMIN_HTTP_PORT` unless that port is set to `0`. Node-agent mode does not start an HTTPS admin listener yet, even when `FERRUM_ADMIN_HTTPS_PORT` is set.
+The node agent starts the read-only admin listeners independently for HTTP and HTTPS, matching the other serving modes:
 
-The Helm chart sets `nodeAgent.admin.port` to `19090` by default. The binary default remains `9000`, but the chart uses a different host-network port so an ambient NodeWaypoint proxy and node-agent can run on the same node without an admin listener collision.
+- `FERRUM_ADMIN_HTTP_PORT` controls plaintext. Set to `0` to disable only HTTP.
+- `FERRUM_ADMIN_HTTPS_PORT` controls HTTPS. Set to `0` to disable only HTTPS. An explicitly configured nonzero port requires a complete `FERRUM_ADMIN_TLS_CERT_PATH` / `FERRUM_ADMIN_TLS_KEY_PATH` pair and starts the shared reloadable admin TLS listener (optional client CA / CRL / live reload via the existing frontend/admin TLS contract). Invalid, missing, partial, unreadable, mismatched, or malformed TLS material fails startup before plaintext can bind; HTTPS is never silently skipped in favor of plaintext. Explicit TLS intent also includes `FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH`, `FERRUM_ADMIN_TLS_OCSP_RESPONSE_SOURCE`, or `FERRUM_ADMIN_TLS_NO_VERIFY=true` (only `true` is intent): with the inherited default port `9443`, those signals fail closed when server cert/key are absent rather than being silently ignored. The inherited global default `9443` without an explicit port or any of those TLS intent signals remains the raw binary HTTP-only compatibility posture. Port `0` remains the unconditional HTTPS disable sentinel even when TLS intent fields are present.
+- Dual nonzero ports supervise both listeners under one connection-limit / JWT / CIDR / metrics-auth / request-limit policy. SIGINT/SIGTERM and capture-loop shutdown join both handles.
+
+The Helm chart sets `nodeAgent.admin.port` to `19090` and `nodeAgent.admin.httpsPort` to `0` by default (HTTP-only, preserving existing installs). Set `nodeAgent.admin.tls.enabled=true` with `secretName` (and a nonzero `httpsPort`) for HTTPS-only (`port=0`) or dual listeners. The chart mounts Secret keys for cert/key and optional client CA / CRL; it does not store PEM in values.
+
+The binary default HTTP port remains `9000`, but the chart uses a different host-network port so an ambient NodeWaypoint proxy and node-agent can run on the same node without an admin listener collision.
 
 `nodeAgent.probes` configures independently toggleable startup/liveness/readiness
 checks. Defaults exec `ferrum-edge health --live` for startup/liveness and
 `ferrum-edge health` for readiness against the chart-managed admin listener.
-When admin is disabled or `nodeAgent.admin.port=0`, computed probes are omitted
-unless a per-probe `override` handler is supplied — the same historical
-no-readiness behavior used before startup/liveness were added.
+HTTPS-only (`port=0` with TLS) appends `--tls --tls-no-verify` and dials
+`httpsPort`. When admin is disabled or both ports are unavailable, computed
+probes are omitted unless a per-probe `override` handler is supplied — the same
+historical no-readiness behavior used before startup/liveness were added.
+HTTPS-only mTLS (`tls.clientCaKey` with `port=0`) requires every enabled probe
+to be disabled or given an explicit override; startup, liveness, and readiness
+are classified independently (overriding only liveness does not cover startup).
+Optional `nodeAgent.admin.metricsScrape.enabled` stamps Prometheus scrape
+annotations: HTTPS without client auth prefers the HTTPS port/scheme; dual
+HTTP + mTLS HTTPS advertises the plaintext HTTP listener because simple
+`prometheus.io/*` annotations cannot present a client certificate; HTTPS-only
+mTLS with scrape enabled fails at render and directs operators to an external
+scrape config/sidecar.
 
-`/metrics` is unauthenticated, matching the rest of Ferrum's Prometheus surface. To prevent an opt-in to `FERRUM_NODE_AGENT_ADMIN_ENABLED=true` from accidentally exposing unauthenticated `/metrics` and `/health` to the network, the node-agent admin listener defaults to loopback (`127.0.0.1`) when **none** of the following operator signals are configured:
+Observability auth on the node-agent admin surface matches the shared admin
+contract: `/live` is always unauthenticated and minimal; unauthenticated
+`/health` returns only `status` and `ready`, while full diagnostics require
+authorization; `/metrics` returns `401` unless authorized by a valid admin JWT,
+a matching `FERRUM_METRICS_BEARER_TOKEN`, or a source IP in
+`FERRUM_METRICS_ALLOWED_CIDRS`. To prevent an opt-in to
+`FERRUM_NODE_AGENT_ADMIN_ENABLED=true` from accidentally exposing those
+surfaces beyond the host, the node-agent admin listener defaults to loopback
+(`127.0.0.1`) when **none** of the following operator signals are configured:
 
 - `FERRUM_ADMIN_BIND_ADDRESS` is set explicitly (any value, including `0.0.0.0` if intentional), or
 - `FERRUM_ADMIN_ALLOWED_CIDRS` is set to a non-empty allowlist.
 
-`FERRUM_ADMIN_JWT_SECRET` does not affect the bind address because `/metrics` and `/health` remain unauthenticated. The two signals resolve as follows: an explicit `FERRUM_ADMIN_BIND_ADDRESS` is honored verbatim; an `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist with no explicit bind binds the listener to `0.0.0.0` (restricted by that allowlist) so cluster scraping can reach `/metrics` — because the bind now defaults to loopback, the allowlist alone would otherwise leave the listener unreachable. When neither signal is set, the listener stays on `127.0.0.1` and the gateway emits a `warn!` at startup pointing at the two opt-ins. For node-agent deployments scraped over the cluster network, prefer the `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist (which must include the scrape source ranges) or front the listener with a local sidecar scraper bound to loopback.
+`FERRUM_ADMIN_JWT_SECRET` alone does not change the bind address; it authenticates
+management routes but does not make `/metrics` or detailed `/health` public.
+The two bind signals resolve as follows: an explicit `FERRUM_ADMIN_BIND_ADDRESS`
+is honored verbatim; an `FERRUM_ADMIN_ALLOWED_CIDRS` allowlist with no explicit
+bind binds the listener to `0.0.0.0` (restricted by that allowlist) so an
+authorized scrape source can reach `/metrics` — because the bind now defaults
+to loopback, the allowlist alone would otherwise leave the listener unreachable.
+When neither signal is set, the listener stays on `127.0.0.1` and the gateway
+emits a `warn!` at startup pointing at the two opt-ins. For node-agent
+deployments scraped over the cluster network, prefer
+`FERRUM_ADMIN_ALLOWED_CIDRS` (including the scrape source ranges) together with
+metrics auth (JWT, metrics bearer token, or metrics CIDR), or front a local
+sidecar scraper bound to loopback.
 
-> **Helm chart users:** the allowlist-only `0.0.0.0` behavior above applies to the **raw env** contract. The `charts/ferrum-mesh` node-agent DaemonSet always renders `FERRUM_ADMIN_BIND_ADDRESS` from `nodeAgent.admin.bindAddress` (default `127.0.0.1`) whenever node-agent admin is enabled, so the bind is always an explicit signal and the allowlist-only branch never engages through the chart. To expose `/metrics` for cluster scraping via Helm, set **`nodeAgent.admin.bindAddress=0.0.0.0`** (and `nodeAgent.admin.allowedCidrs` to the scrape source ranges); setting only the allowlist leaves a loopback listener and scraping fails.
+> **Helm chart users:** the allowlist-only `0.0.0.0` behavior above applies to the **raw env** contract. The `charts/ferrum-mesh` node-agent DaemonSet always renders `FERRUM_ADMIN_BIND_ADDRESS` from `nodeAgent.admin.bindAddress` (default `127.0.0.1`) whenever node-agent admin is enabled, so the bind is always an explicit signal and the allowlist-only branch never engages through the chart. To expose `/metrics` for cluster scraping via Helm, set **`nodeAgent.admin.bindAddress=0.0.0.0`** together with supported env allowlists such as `nodeAgent.env.FERRUM_ADMIN_ALLOWED_CIDRS`, `nodeAgent.env.FERRUM_METRICS_ALLOWED_CIDRS`, and/or `nodeAgent.env.FERRUM_METRICS_BEARER_TOKEN` for the scrape sources; setting only the allowlist leaves a loopback listener and scraping fails.
 
-When ambient NodeWaypoint and the node agent run on the same host-network nodes, their admin listeners must use distinct `FERRUM_ADMIN_HTTP_PORT` values or one listener must be disabled with port `0`. The Helm chart rejects equal host-network admin ports, and the binary also treats an enabled admin-listener bind failure as fatal startup rather than continuing to report ready.
+When ambient NodeWaypoint and the node agent run on the same host-network nodes, their admin listeners must use distinct `FERRUM_ADMIN_HTTP_PORT` / `FERRUM_ADMIN_HTTPS_PORT` values or one listener must be disabled with port `0`. The Helm chart rejects equal host-network admin HTTP ports, equal HTTPS ports only when both sides would actually bind HTTPS (complete admin TLS), node-agent HTTP and HTTPS on the same port when both would bind, and cross-protocol collisions (ambient HTTP vs node-agent HTTPS, ambient HTTPS vs node-agent HTTP) when those respective surfaces are active. Inherited inactive HTTPS defaults without TLS material do not create false conflicts. The binary also treats an enabled admin-listener bind failure as fatal startup rather than continuing to report ready.
 
 ## CNI plugin install (optional)
 

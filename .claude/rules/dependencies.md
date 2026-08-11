@@ -59,7 +59,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   (`RELEASE_IMAGE_FAMILY_GENERATIONS`): the current two image families, or those
   plus the complete frozen `-ebpf-tools` contract (`docker-ebpf-tools-manifest`
   job, tools build/export/upload steps in `docker-ebpf`, sole ownership of the
-  `docker-ebpf-tools-digest-` wildcard, extended `create-release` `needs`/notes,
+  `docker-ebpf-tools-digest-` wildcard, extended `create-release`
+  `needs`/rationale-comment/notes,
   and three-family resolve/compare/SBOM/provenance/sign/verify coverage in
   `attest-release-images`). The credentialed eBPF producer and tools manifest
   have closed job-field sets and complete `steps:` contracts, so extra execution

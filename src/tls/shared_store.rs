@@ -68,6 +68,84 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// Fixed diagnostic for a poisoned in-process guard. Never includes contents.
 const POISONED_GUARD: &str = "in-process store guard is poisoned";
 
+/// Fixed diagnostic when a candidate document exceeds the byte ceiling.
+const OVERSIZED_DOCUMENT: &str = "shared TLS store document exceeds the configured byte ceiling";
+
+/// Fixed set of persistent TLS documents that share the byte-bounded I/O path.
+///
+/// Labels are operator-facing metric dimensions only — never record IDs, domains,
+/// paths, or account identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum TlsPersistentStoreKind {
+    Managed = 0,
+    AcmeCertificates = 1,
+    AcmeOrders = 2,
+    AcmeAccounts = 3,
+    Leases = 4,
+    Events = 5,
+}
+
+impl TlsPersistentStoreKind {
+    pub const ALL: [Self; 6] = [
+        Self::Managed,
+        Self::AcmeCertificates,
+        Self::AcmeOrders,
+        Self::AcmeAccounts,
+        Self::Leases,
+        Self::Events,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::AcmeCertificates => "acme_certificates",
+            Self::AcmeOrders => "acme_orders",
+            Self::AcmeAccounts => "acme_accounts",
+            Self::Leases => "leases",
+            Self::Events => "events",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Direction of an oversized-document observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum TlsStoreIoDirection {
+    Read = 0,
+    Write = 1,
+}
+
+impl TlsStoreIoDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+/// Logical admission refusal reason (fixed cardinality).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum TlsStoreAdmissionReason {
+    RecordLimit = 0,
+    DocumentBytes = 1,
+}
+
+impl TlsStoreAdmissionReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RecordLimit => "record_limit",
+            Self::DocumentBytes => "document_bytes",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SharedStoreError {
     #[error("failed to read shared TLS store '{path}': {details}")]
@@ -84,6 +162,16 @@ pub enum SharedStoreError {
     /// the rule that was broken, never the configured value.
     #[error("invalid shared TLS store configuration: {details}")]
     InvalidConfig { details: String },
+    /// On-disk or candidate document exceeds `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
+    ///
+    /// Deliberately content-free apart from the operator-configured path and the
+    /// numeric ceiling: never echoes document bytes or parsed fields.
+    #[error("{OVERSIZED_DOCUMENT} ('{path}', max {max_bytes} bytes)")]
+    Oversized {
+        path: String,
+        max_bytes: usize,
+        direction: TlsStoreIoDirection,
+    },
 }
 
 impl SharedStoreError {
@@ -107,6 +195,14 @@ impl SharedStoreError {
             details: details.to_string(),
         }
     }
+
+    fn oversized(path: &Path, max_bytes: usize, direction: TlsStoreIoDirection) -> Self {
+        Self::Oversized {
+            path: path.display().to_string(),
+            max_bytes,
+            direction,
+        }
+    }
 }
 
 /// A JSON document that carries a monotonic store version.
@@ -120,6 +216,10 @@ pub trait VersionedStoreFile:
 {
     fn store_version(&self) -> u64;
     fn set_store_version(&mut self, version: u64);
+    /// Logical record cardinality published on successful authoritative reads
+    /// and successful durable publishes. Must not advance on a rejected
+    /// candidate.
+    fn logical_record_count(&self) -> u64;
 }
 
 /// Whether the filesystem exposes an exact *replacement identity* for the store
@@ -242,6 +342,8 @@ pub struct SharedStoreFile<T: VersionedStoreFile> {
     lock_path: PathBuf,
     lock_timeout: Duration,
     identity_mode: StoreIdentityMode,
+    store_kind: TlsPersistentStoreKind,
+    max_document_bytes: usize,
     cached: RwLock<Cached<T>>,
     /// Serializes writers inside this process before they contend for the
     /// cross-process advisory lock.
@@ -253,6 +355,8 @@ impl<T: VersionedStoreFile> fmt::Debug for SharedStoreFile<T> {
         formatter
             .debug_struct("SharedStoreFile")
             .field("path", &self.path)
+            .field("store_kind", &self.store_kind.as_str())
+            .field("max_document_bytes", &self.max_document_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -260,11 +364,14 @@ impl<T: VersionedStoreFile> fmt::Debug for SharedStoreFile<T> {
 impl<T: VersionedStoreFile> SharedStoreFile<T> {
     /// Open (or adopt) the shared document at `path`.
     ///
-    /// A missing document is an empty store; an unreadable or unparseable one
-    /// is an error, so a corrupt shared volume is never silently replaced by an
-    /// empty local map.
-    pub fn open(path: PathBuf) -> Result<Self, SharedStoreError> {
-        Self::open_with_identity_mode(path, StoreIdentityMode::platform_default())
+    /// A missing document is an empty store; an unreadable, unparseable, or
+    /// oversized one is an error, so a corrupt shared volume is never silently
+    /// replaced by an empty local map.
+    pub fn open(
+        path: PathBuf,
+        store_kind: TlsPersistentStoreKind,
+    ) -> Result<Self, SharedStoreError> {
+        Self::open_with_identity_mode(path, StoreIdentityMode::platform_default(), store_kind)
     }
 
     /// [`Self::open`] with an explicit replacement-identity mode.
@@ -275,7 +382,25 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
     pub fn open_with_identity_mode(
         path: PathBuf,
         identity_mode: StoreIdentityMode,
+        store_kind: TlsPersistentStoreKind,
     ) -> Result<Self, SharedStoreError> {
+        let max_document_bytes = crate::config::env_config::tls_store_max_document_bytes_from_env()
+            .map_err(|details| SharedStoreError::InvalidConfig { details })?;
+        Self::open_with_limits(path, identity_mode, store_kind, max_document_bytes)
+    }
+
+    /// Open with an explicit document byte ceiling (tests and injectors).
+    ///
+    /// Rejects `0` and caps values above the hard maximum before any store I/O
+    /// so a hostile ceiling cannot make the bounded reader practically
+    /// unbounded.
+    pub fn open_with_limits(
+        path: PathBuf,
+        identity_mode: StoreIdentityMode,
+        store_kind: TlsPersistentStoreKind,
+        max_document_bytes: usize,
+    ) -> Result<Self, SharedStoreError> {
+        let max_document_bytes = validate_explicit_store_max_document_bytes(max_document_bytes)?;
         let lock_path = lock_path_for(&path)?;
         // Fail closed on a malformed bound rather than opening the store on a
         // default the operator never asked for: this setting is the only thing
@@ -288,6 +413,8 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
             lock_path,
             lock_timeout,
             identity_mode,
+            store_kind,
+            max_document_bytes,
             cached: RwLock::new(Cached {
                 value: Arc::new(T::default()),
                 stamp: None,
@@ -297,6 +424,18 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
         };
         store.read_authoritative()?;
         Ok(store)
+    }
+
+    /// Configured whole-document byte ceiling for this store handle.
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn max_document_bytes(&self) -> usize {
+        self.max_document_bytes
+    }
+
+    /// Fixed store kind used for observability.
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn store_kind(&self) -> TlsPersistentStoreKind {
+        self.store_kind
     }
 
     /// Committed version of the current authoritative document.
@@ -377,7 +516,19 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
     fn cached_if_fresh(&self) -> Result<Option<Arc<T>>, SharedStoreError> {
         let cached = self.cached.read().map_err(|_| self.poisoned())?;
         let current = match std::fs::metadata(&self.path) {
-            Ok(metadata) => Some(FileStamp::from_metadata(&metadata, self.identity_mode)),
+            Ok(metadata) => {
+                // Metadata is a fast reject only. Growth/TOCTOU still terminate
+                // through the bounded reader on the authoritative path.
+                if metadata.len() > self.max_document_bytes as u64 {
+                    record_store_oversized(self.store_kind, TlsStoreIoDirection::Read);
+                    return Err(SharedStoreError::oversized(
+                        &self.path,
+                        self.max_document_bytes,
+                        TlsStoreIoDirection::Read,
+                    ));
+                }
+                Some(FileStamp::from_metadata(&metadata, self.identity_mode))
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(SharedStoreError::read(&self.path, error)),
         };
@@ -400,30 +551,49 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
     /// destination path only ever names a complete, atomically renamed
     /// document.
     fn read_authoritative(&self) -> Result<Arc<T>, SharedStoreError> {
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        let mut file = match open_authoritative_document_file(&self.path)? {
+            Some(file) => file,
+            None => {
                 let value = Arc::new(T::default());
                 self.publish_cached(value.clone(), None, None)?;
+                record_store_document_bytes(self.store_kind, 0);
+                record_store_record_count(self.store_kind, value.logical_record_count());
                 return Ok(value);
             }
-            Err(error) => return Err(SharedStoreError::read(&self.path, error)),
         };
         // Stamp from the open handle so it describes exactly the bytes read,
         // not whatever the path may point at by the time the read finishes.
         let stamp = file.metadata().ok();
+        if let Some(metadata) = stamp.as_ref()
+            && metadata.len() > self.max_document_bytes as u64
+        {
+            record_store_oversized(self.store_kind, TlsStoreIoDirection::Read);
+            return Err(SharedStoreError::oversized(
+                &self.path,
+                self.max_document_bytes,
+                TlsStoreIoDirection::Read,
+            ));
+        }
         let stamp = stamp
             .as_ref()
             .map(|metadata| FileStamp::from_metadata(metadata, self.identity_mode));
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|error| SharedStoreError::read(&self.path, error))?;
+        let bytes =
+            match read_bounded_document_bytes(&mut file, &self.path, self.max_document_bytes) {
+                Ok(bytes) => bytes,
+                Err(error @ SharedStoreError::Oversized { .. }) => {
+                    record_store_oversized(self.store_kind, TlsStoreIoDirection::Read);
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
         // A document that does not parse is an error. A partially written one
         // cannot be observed (rename is atomic), so this is real corruption and
         // must never degrade to an empty local map.
         let parsed = serde_json::from_slice::<T>(&bytes)
             .map_err(|error| SharedStoreError::parse(&self.path, error))?;
         let value = Arc::new(parsed);
+        record_store_document_bytes(self.store_kind, bytes.len() as u64);
+        record_store_record_count(self.store_kind, value.logical_record_count());
         self.publish_cached(value.clone(), stamp, Some(file))?;
         Ok(value)
     }
@@ -431,16 +601,35 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
     fn persist_locked(&self, value: &T) -> Result<(), SharedStoreError> {
         let payload = serde_json::to_vec_pretty(value)
             .map_err(|error| SharedStoreError::write(&self.path, error))?;
+        if payload.len() > self.max_document_bytes {
+            record_store_oversized(self.store_kind, TlsStoreIoDirection::Write);
+            record_store_admission_rejected(
+                self.store_kind,
+                TlsStoreAdmissionReason::DocumentBytes,
+            );
+            // Fail before rename so the previous authoritative document and the
+            // in-process cache remain intact. Rejected candidates must not move
+            // the record-count gauge ahead of durable state.
+            return Err(SharedStoreError::oversized(
+                &self.path,
+                self.max_document_bytes,
+                TlsStoreIoDirection::Write,
+            ));
+        }
         crate::tls::private_file::replace_private_file(&self.path, &payload)
             .map_err(|error| SharedStoreError::write(&self.path, error))?;
         // Pin the freshly published inode the same way a read does. If it
         // cannot be reopened the cache simply records no stamp, which makes
         // every later read re-read — degraded, never stale.
-        let pinned = File::open(&self.path).ok();
+        let pinned = open_authoritative_document_file(&self.path)
+            .ok()
+            .and_then(|opened| opened);
         let stamp = pinned
             .as_ref()
             .and_then(|file| file.metadata().ok())
             .map(|metadata| FileStamp::from_metadata(&metadata, self.identity_mode));
+        record_store_document_bytes(self.store_kind, payload.len() as u64);
+        record_store_record_count(self.store_kind, value.logical_record_count());
         self.publish_cached(Arc::new(value.clone()), stamp, pinned)
     }
 
@@ -515,6 +704,117 @@ impl<T: VersionedStoreFile> SharedStoreFile<T> {
             .open(&self.lock_path)
             .map_err(|error| SharedStoreError::write(&self.lock_path, error))
     }
+}
+
+/// Validate an explicit document ceiling before any store I/O.
+pub fn validate_explicit_store_max_document_bytes(
+    max_bytes: usize,
+) -> Result<usize, SharedStoreError> {
+    if max_bytes < crate::config::env_config::MIN_TLS_STORE_MAX_DOCUMENT_BYTES {
+        return Err(SharedStoreError::InvalidConfig {
+            details: format!(
+                "{} must be at least {} bytes; 0 is not unlimited",
+                crate::config::env_config::TLS_STORE_MAX_DOCUMENT_BYTES_KEY,
+                crate::config::env_config::MIN_TLS_STORE_MAX_DOCUMENT_BYTES
+            ),
+        });
+    }
+    Ok(max_bytes.min(crate::config::env_config::HARD_MAX_TLS_STORE_MAX_DOCUMENT_BYTES))
+}
+
+/// Open a durable TLS document for an authoritative bounded read.
+///
+/// Returns `Ok(None)` when the path is absent. On Unix the open uses
+/// `O_NONBLOCK` so a FIFO/special path cannot hang before the post-open
+/// regular-file check and bounded `limit+1` reader run. The regular-file
+/// verdict comes from the opened descriptor's own metadata (not a racy path
+/// precheck). Errors are content-free aside from the operator-configured path.
+pub fn open_authoritative_document_file(path: &Path) -> Result<Option<File>, SharedStoreError> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SharedStoreError::read(path, error)),
+        }
+    };
+    #[cfg(not(unix))]
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SharedStoreError::read(path, error)),
+    };
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| SharedStoreError::read(path, error))?;
+    if !metadata.is_file() {
+        // Stable, content-free refusal: never echo whatever a special file
+        // might produce if a blocking open had succeeded.
+        return Err(SharedStoreError::read(path, "path is not a regular file"));
+    }
+    Ok(Some(file))
+}
+
+/// Read at most `max_bytes + 1` from `reader`, rejecting without retaining an
+/// unbounded buffer. Used after any metadata precheck so growth/TOCTOU and
+/// non-regular files still terminate.
+pub fn read_bounded_document_bytes<R: Read>(
+    reader: &mut R,
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>, SharedStoreError> {
+    let max_bytes = validate_explicit_store_max_document_bytes(max_bytes)?;
+    let limit_plus_one = (max_bytes as u64).saturating_add(1);
+    let mut bytes = Vec::new();
+    reader
+        .take(limit_plus_one)
+        .read_to_end(&mut bytes)
+        .map_err(|error| SharedStoreError::read(path, error))?;
+    if bytes.len() > max_bytes {
+        return Err(SharedStoreError::oversized(
+            path,
+            max_bytes,
+            TlsStoreIoDirection::Read,
+        ));
+    }
+    Ok(bytes)
+}
+
+fn record_store_document_bytes(kind: TlsPersistentStoreKind, bytes: u64) {
+    crate::plugins::prometheus_metrics::global_registry().set_tls_store_document_bytes(kind, bytes);
+}
+
+fn record_store_oversized(kind: TlsPersistentStoreKind, direction: TlsStoreIoDirection) {
+    crate::plugins::prometheus_metrics::global_registry()
+        .record_tls_store_oversized(kind, direction);
+}
+
+/// Record a fixed-cardinality logical admission rejection.
+pub fn record_store_admission_rejected(
+    kind: TlsPersistentStoreKind,
+    reason: TlsStoreAdmissionReason,
+) {
+    crate::plugins::prometheus_metrics::global_registry()
+        .record_tls_store_admission_rejected(kind, reason);
+}
+
+/// Publish the current logical record count for a store.
+pub fn record_store_record_count(kind: TlsPersistentStoreKind, count: u64) {
+    crate::plugins::prometheus_metrics::global_registry().set_tls_store_record_count(kind, count);
+}
+
+/// Count terminal ACME order history pruned under the exclusive mutation lock.
+pub fn record_store_pruned(count: u64) {
+    if count == 0 {
+        return;
+    }
+    crate::plugins::prometheus_metrics::global_registry().record_tls_store_pruned(count);
 }
 
 /// Sidecar advisory-lock path for a store document.

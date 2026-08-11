@@ -86,7 +86,7 @@ WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
         "build-arm64-cross",
-        "80992a65fb662f8e97cdea91b5302485744e4ae5558d1750e5cd260120b89a20",
+        "905e23deac2aa3021e3472c13745e146cf5f49c05d97861962ac2d2c612dce6f",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,
@@ -96,7 +96,7 @@ WORKFLOW_CONTRACTS = (
     (
         "release workflow",
         "build-release-arm64-cross",
-        "a7843ce946dae8ca0b7be5ed905b233fd89ad1bfed9814a180e90b0cb85c78bf",
+        "e2792eb548322f3ef062b93ad971b5a13e9d21c74d9b00f5f3bdf8e0119c9712",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
         "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
@@ -558,6 +558,33 @@ CI_DOCKER_MANIFEST_STEPS = r"""    steps:
             -t ghcr.io/${{ github.repository }}:main-${{ github.sha }} \
             $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
 """
+
+# `create-release` states its gating rationale as a comment between `name:` and
+# `needs:`. A comment line is not a mapping key, so `extract_job_field_block`
+# reads it as the tail of the `name:` field block rather than as part of `needs:`.
+# The whole block is therefore frozen as one control field: the published
+# rationale names exactly the manifests the `needs` graph waits for, and the two
+# must move together or not at all. It is also what makes the job's control
+# surface completely substitutable, so the one admitted image-family adoption —
+# which rewrites the rationale and the `needs` graph in the same edit — can be
+# projected back to the text it came from instead of leaving a stale comment
+# behind for the Cross-surface comparison to reject.
+RELEASE_CREATE_RELEASE_NAME_COMMENT = (
+    "    # Wait for BOTH manifests: the release notes advertise the `:<tag>` "
+    "default\n"
+    "    # image AND the `:<tag>-ebpf` variant, so the GitHub Release must not "
+    "publish\n"
+    "    # until the eBPF manifest exists — otherwise the notes link `-ebpf` "
+    "tags that\n"
+    "    # were never pushed. Both `docker-manifest` and `docker-ebpf-manifest` "
+    "run\n"
+    "    # unconditionally on every `v*` tag (no `if:`/path filters), so this "
+    "keeps the\n"
+    "    # default release path intact.\n"
+)
+RELEASE_CREATE_RELEASE_NAME = (
+    "    name: Create GitHub Release\n" + RELEASE_CREATE_RELEASE_NAME_COMMENT
+)
 
 RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -1455,6 +1482,35 @@ RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS = (
     "docker-ebpf-tools-manifest]\n"
 )
 
+# The rationale comment above that `needs` graph is part of the same frozen
+# control field, so the adoption moves it in the same step. Restating which
+# manifests the release page waits for is not cosmetic: the comment is the
+# reviewed justification for the gate, and a version of it that still says "BOTH
+# manifests" after a third family is published would describe a gate the workflow
+# no longer has.
+RELEASE_THREE_FAMILY_CREATE_RELEASE_NAME = adopted_release_contract(
+    RELEASE_CREATE_RELEASE_NAME,
+    (
+        (
+            RELEASE_CREATE_RELEASE_NAME_COMMENT,
+            "    # Wait for ALL THREE manifests: the release notes advertise "
+            "the `:<tag>`\n"
+            "    # default image, the `:<tag>-ebpf` variant, AND the "
+            "`:<tag>-ebpf-tools`\n"
+            "    # Ambient UDP lifecycle variant, so the GitHub Release must not "
+            "publish until\n"
+            "    # every advertised manifest exists — otherwise the notes link "
+            "tags that were\n"
+            "    # never pushed. All three manifest jobs run unconditionally on "
+            "every `v*` tag\n"
+            "    # (no `if:`/path filters), so this keeps the default release "
+            "path intact.\n",
+            1,
+        ),
+    ),
+    "create-release name",
+)
+
 # The `-ebpf-tools` tag family assembles from its own digest name space in its
 # own job. It publishes by wildcard exactly like the other manifest jobs, so its
 # whole step list is frozen: the download pattern, the working directory the
@@ -1880,6 +1936,7 @@ PUBLISH_CONTROL_CONTRACTS = {
     },
     "release workflow": {
         "create-release": {
+            "name": RELEASE_CREATE_RELEASE_NAME,
             "needs": (
                 "    needs: [build-release-binaries, build-release-arm64-cross, "
                 "docker-manifest, docker-ebpf-manifest]\n"
@@ -1964,6 +2021,7 @@ RELEASE_IMAGE_FAMILY_GENERATIONS = {
         "control": {
             **PUBLISH_CONTROL_CONTRACTS["release workflow"],
             "create-release": {
+                "name": RELEASE_THREE_FAMILY_CREATE_RELEASE_NAME,
                 "needs": RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS,
                 "steps": RELEASE_THREE_FAMILY_CREATE_RELEASE_STEPS,
             },
@@ -2010,6 +2068,155 @@ RELEASE_IMAGE_FAMILY_GENERATIONS = {
         },
     },
 }
+
+
+# The publication contract above admits the `-ebpf-tools` adoption. The generic
+# Cross-surface comparison in `compare_pr_workflow_job` did not, and it does not
+# read contracts: it hashes every job it reads as Cross-sensitive and requires
+# the two revisions to agree. The adoption moves frozen text inside such jobs by
+# design — the extended `create-release` `needs` names `build-release-arm64-cross`
+# — so the digest surface moved, the comparison rejected it, and the admitted
+# transition was unreachable no matter how completely the proposal satisfied the
+# contract it was written for.
+#
+# The repair is a projection, not an exemption. Once BOTH revisions have
+# classified and the proposal has validated against the COMPLETE three-family
+# contract, the proposal is re-rendered in the two-family text it came from:
+# every frozen fragment the adoption is allowed to change is substituted back to
+# its two-family original, and the wholly new manifest job is removed. Only text
+# already proven byte-equal to a frozen contract is touched, so nothing else in
+# the file is withheld and the surface comparison still reads every other byte on
+# both sides. The projection is only ever applied to the proposal; the trusted
+# base is the baseline and is never rewritten.
+#
+# The substitution table is derived from the two contract tables themselves
+# rather than transcribed, so it cannot drift from the shapes it maps between,
+# and any contract change it cannot express (a job the adoption drops, a field it
+# invents on a pre-existing job) is a hard derivation error that disables the
+# projection entirely rather than silently narrowing it.
+def derive_release_family_transition(
+    two: dict[str, dict] | None = None,
+    three: dict[str, dict] | None = None,
+) -> tuple[tuple[tuple[str, str, str], ...], tuple[str, ...], list[str]]:
+    """Derive the exact frozen text the admitted family adoption moves.
+
+    The two generation tables are parameters so the self-test can hold the
+    derivation itself to its contract by feeding it deliberately broken tables.
+    In production both default to the module-level generations.
+    """
+
+    if two is None:
+        two = RELEASE_IMAGE_FAMILY_GENERATIONS[RELEASE_TWO_FAMILY_GENERATION]
+    if three is None:
+        three = RELEASE_IMAGE_FAMILY_GENERATIONS[RELEASE_THREE_FAMILY_GENERATION]
+    replacements: list[tuple[str, str, str]] = []
+    added_jobs: list[str] = []
+    errors: list[str] = []
+    # Jobs whose whole frozen text the projection substitutes, so a frozen step
+    # inside them is restored with it.
+    substituted: set[str] = set()
+
+    for job_name in two["exact_jobs"]:
+        if job_name not in three["exact_jobs"]:
+            errors.append(
+                f"the three-family release contract drops exact job {job_name!r}; "
+                "the admitted adoption may only extend the publication contract"
+            )
+    for job_name, adopted in three["exact_jobs"].items():
+        prior = two["exact_jobs"].get(job_name)
+        if prior is None:
+            errors.append(
+                f"the three-family release contract adds exact job {job_name!r}, "
+                "which the transition projection cannot map back to a "
+                "two-family text"
+            )
+            continue
+        if prior != adopted:
+            replacements.append((f"exact job {job_name!r}", adopted, prior))
+            substituted.add(job_name)
+
+    for job_name in two["control"]:
+        if job_name not in three["control"]:
+            errors.append(
+                f"the three-family release contract drops job {job_name!r}; "
+                "the admitted adoption may only extend the publication contract"
+            )
+    for job_name, fields in three["control"].items():
+        prior_fields = two["control"].get(job_name)
+        if prior_fields is None:
+            added_jobs.append(job_name)
+            continue
+        for field_name, adopted in fields.items():
+            prior = prior_fields.get(field_name)
+            if prior is None:
+                errors.append(
+                    f"the three-family release contract adds field "
+                    f"{field_name!r} to pre-existing job {job_name!r}, which "
+                    "the transition projection cannot map back to a two-family "
+                    "text"
+                )
+                continue
+            if prior != adopted:
+                replacements.append(
+                    (f"job {job_name!r} field {field_name!r}", adopted, prior)
+                )
+                if field_name == "steps":
+                    substituted.add(job_name)
+
+    # The same "may only extend" rule applies to the three tables that are keyed
+    # by job or by digest name space but are not themselves substituted text. A
+    # dropped entry there is not a projection failure, it is a silently narrowed
+    # contract: an artifact-selection step, a digest owner, or a closed job-field
+    # set that the two-family shape enforces and the three-family shape would
+    # stop enforcing. Checking them here fails the whole projection closed rather
+    # than admitting an adoption that relaxes the publication contract.
+    for table_name, entry_noun in (
+        ("steps", "artifact-selection steps for job"),
+        ("digest_owners", "digest name-space ownership of"),
+        ("closed_job_fields", "the closed direct-field set of job"),
+    ):
+        for entry_key in two[table_name]:
+            if entry_key not in three[table_name]:
+                errors.append(
+                    f"the three-family release contract drops {entry_noun} "
+                    f"{entry_key!r}; the admitted adoption may only extend the "
+                    "publication contract"
+                )
+
+    # A frozen artifact-selection step only moves inside a job whose whole
+    # `steps` block is already being substituted, or inside a job the adoption
+    # adds outright. Anything else would be frozen text the projection cannot
+    # restore, and the surface comparison would reject the adoption again.
+    for job_name, steps in three["steps"].items():
+        if job_name in added_jobs or job_name in substituted:
+            continue
+        if steps != two["steps"].get(job_name):
+            errors.append(
+                f"the three-family release contract changes artifact-selection "
+                f"steps in job {job_name!r} without substituting that job's "
+                "whole frozen text"
+            )
+
+    if not replacements or not added_jobs:
+        errors.append(
+            "the release image-family transition projection derived no "
+            "substitutions or no added job, so it no longer describes the "
+            "admitted adoption"
+        )
+    for _, adopted, prior in replacements:
+        if not adopted or not prior:
+            errors.append(
+                "the release image-family transition projection derived an "
+                "empty frozen text"
+            )
+    return tuple(replacements), tuple(added_jobs), errors
+
+
+(
+    RELEASE_FAMILY_TRANSITION_REPLACEMENTS,
+    RELEASE_FAMILY_TRANSITION_ADDED_JOBS,
+    RELEASE_FAMILY_TRANSITION_DERIVATION_ERRORS,
+) = derive_release_family_transition()
 
 # ---------------------------------------------------------------------------
 # Trusted-base relevance contract for the required live-datapath gates
@@ -2312,7 +2519,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
         with:
           toolchain: nightly-2025-07-01
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz -> target
           shared-key: fuzz-smoke
@@ -2459,7 +2666,7 @@ jobs:
         with:
           toolchain: nightly-2025-07-01
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz -> target
           shared-key: fuzz-sanitized
@@ -4493,6 +4700,10 @@ def build_release_family_fixture(generation: str) -> str:
         + tables["exact_jobs"]["attest-release-images"]
         + "\n"
         + "  create-release:\n"
+        # Comment-bearing on purpose: the real `create-release` carries its
+        # gating rationale between `name:` and `needs:`, so a fixture without it
+        # would not exercise the field block the adoption actually rewrites.
+        + control["create-release"]["name"]
         + control["create-release"]["needs"]
         + "    runs-on: ubuntu-latest\n"
         + control["create-release"]["steps"]
@@ -4600,6 +4811,227 @@ def release_image_family_transition_errors(
             f"({base_generation} to {proposed_generation})"
         )
     return errors
+
+
+def release_two_family_anchor_errors(contents: str, source: str) -> list[str]:
+    """Require a revision to carry every two-family frozen text exactly once.
+
+    The projection substitutes the adopted text back to these originals, so a
+    baseline that does not carry them verbatim is not the shape the projection
+    maps onto and the withholding must not happen. Requiring exactly one
+    occurrence also makes the substitution unambiguous.
+    """
+
+    errors: list[str] = []
+    for label, _, prior in RELEASE_FAMILY_TRANSITION_REPLACEMENTS:
+        occurrences = contents.count(prior)
+        if occurrences != 1:
+            errors.append(
+                f"{source} must carry the two-family {label} text exactly once "
+                f"for the admitted `-ebpf-tools` adoption to be comparable "
+                f"(found {occurrences})"
+            )
+    for job_name in RELEASE_FAMILY_TRANSITION_ADDED_JOBS:
+        block, failures = extract_job_block(
+            contents,
+            source,
+            job_name,
+            required=False,
+        )
+        errors.extend(failures)
+        if not failures and block is not None:
+            errors.append(
+                f"{source} already carries job {job_name!r}, so it is not the "
+                "two-family baseline the admitted adoption starts from"
+            )
+    return errors
+
+
+def release_two_family_projection(
+    contents: str,
+    source: str,
+) -> tuple[str | None, list[str]]:
+    """Re-render a validated three-family release workflow in two-family text.
+
+    Every substitution is a frozen contract the caller has already proven this
+    revision carries byte for byte, and each must occur exactly once so the
+    rewrite is unambiguous. The added manifest job is removed whole: its direct
+    field set is closed and every one of its fields is frozen, so nothing but
+    comments and blank lines can live inside it.
+
+    That is the exact boundary of what this projection withholds from the
+    Cross-surface comparison, and it is worth stating in full: every byte it
+    removes or rewrites is either text already proven byte-equal to a frozen
+    contract, or a comment or blank line inside the removed job. Those inert
+    lines are the ONLY text withheld that is not itself frozen contract text.
+    They can carry no executable step, no `uses:`, no `env:`, and no other
+    configuration surface, because a line that did would be a direct field the
+    closed field set rejects or a step the frozen `steps` block rejects — so
+    withholding them removes nothing the comparison would have anything to say
+    about. Every other byte of the proposal, in every other job and outside the
+    frozen fragments of the transitioned jobs, survives into the projection and
+    is still compared.
+
+    Anything the projection cannot perform exactly returns `None` with a
+    diagnostic, and the caller then compares the unmodified revisions — the
+    fail-closed direction.
+    """
+
+    projected = contents
+    errors: list[str] = []
+    for label, adopted, prior in RELEASE_FAMILY_TRANSITION_REPLACEMENTS:
+        occurrences = projected.count(adopted)
+        if occurrences != 1:
+            errors.append(
+                f"{source} must carry the admitted three-family {label} text "
+                f"exactly once (found {occurrences})"
+            )
+            continue
+        projected = projected.replace(adopted, prior, 1)
+    for job_name in RELEASE_FAMILY_TRANSITION_ADDED_JOBS:
+        block, failures = extract_job_block(
+            projected,
+            source,
+            job_name,
+            required=True,
+        )
+        errors.extend(failures)
+        if failures or block is None:
+            continue
+        start = projected.find(block)
+        if start < 0:
+            errors.append(f"{source} job {job_name!r} cannot be isolated")
+            continue
+        projected = projected[:start] + projected[start + len(block) :]
+        # `extract_job_block` trims trailing blank lines, so removing a job that
+        # a blank line separated from its neighbour would leave that separator
+        # behind. Dropping exactly one keeps the projection byte-identical to
+        # the workflow the adoption started from.
+        if projected.endswith("\n\n", 0, start):
+            projected = projected[: start - 1] + projected[start:]
+    if errors:
+        return None, errors
+    return projected, []
+
+
+def release_family_transition_surface_contents(
+    merge_base_contents: str,
+    proposed_contents: str,
+    source: str,
+) -> tuple[str, str, list[str]]:
+    """Withhold ONLY the frozen text of a fully validated family adoption.
+
+    Returns the two revisions the Cross-surface comparison should read. Outside
+    an exact, completely validated two-family to three-family adoption both are
+    the unmodified inputs, so every other release-workflow change — and every
+    other workflow — reaches that comparison exactly as before.
+
+    The gate is deliberately narrow and is evaluated in this order:
+
+    * the trusted base must classify as exactly two-family, and the proposal as
+      exactly three-family, with no classification error on either side;
+    * the derived substitution table must itself be sound. This is checked only
+      once the pair is already the exact transition candidate, because outside
+      one the projection is never consulted and strict comparison of the
+      unmodified revisions is the safe fallback: reporting a table defect on
+      every unrelated pull request would fail them all closed for a contract
+      they do not touch. The table is still validated unconditionally by
+      `self_test`, so a defective table cannot reach a merge unnoticed;
+    * `release_image_family_transition_errors` must be empty, which is what
+      proves the proposal satisfies the COMPLETE three-family contract — the
+      frozen publisher, the closed job-field sets, the digest name-space
+      ownership, and the attestation coverage — and that the transition is the
+      admitted one;
+    * the baseline must carry every two-family frozen text verbatim and must not
+      already carry the added job.
+
+    Only then is the proposal re-rendered, and only in the frozen fragments the
+    adoption is defined to move. A Cross surface anywhere else in the file is
+    still present in the projection and still compared.
+    """
+
+    if source != "release workflow":
+        return merge_base_contents, proposed_contents, []
+    base_generation, base_errors = release_image_family_generation(
+        merge_base_contents,
+        f"merge-base {source}",
+    )
+    proposed_generation, proposed_errors = release_image_family_generation(
+        proposed_contents,
+        f"proposed {source}",
+    )
+    if base_errors or proposed_errors:
+        return merge_base_contents, proposed_contents, []
+    if (
+        base_generation != RELEASE_TWO_FAMILY_GENERATION
+        or proposed_generation != RELEASE_THREE_FAMILY_GENERATION
+    ):
+        return merge_base_contents, proposed_contents, []
+    # From here the pair IS the exact transition candidate, so a defect in the
+    # derived substitution table is this pull request's problem and fails it
+    # closed. Before here it is not, and reporting it would have failed every
+    # unrelated pull request that merely touches the release workflow.
+    if RELEASE_FAMILY_TRANSITION_DERIVATION_ERRORS:
+        return (
+            merge_base_contents,
+            proposed_contents,
+            list(RELEASE_FAMILY_TRANSITION_DERIVATION_ERRORS),
+        )
+    if release_image_family_transition_errors(
+        merge_base_contents,
+        proposed_contents,
+        source,
+    ):
+        # The contract rejected this adoption; its own errors are reported by
+        # `compare_pr_publish_control_contract`. Comparing the unmodified
+        # revisions keeps the surface rejection alongside them.
+        return merge_base_contents, proposed_contents, []
+    anchor_errors = release_two_family_anchor_errors(
+        merge_base_contents,
+        f"merge-base {source}",
+    )
+    if anchor_errors:
+        return merge_base_contents, proposed_contents, anchor_errors
+    projected, projection_errors = release_two_family_projection(
+        proposed_contents,
+        f"proposed {source}",
+    )
+    if projected is None:
+        return merge_base_contents, proposed_contents, projection_errors
+    return merge_base_contents, projected, []
+
+
+# Marker carried by every diagnostic raised while reading a projected rendering
+# rather than a revision as it was written.
+PROJECTED_RENDERING_LABEL = (
+    "family-transition projected rendering; line numbers are of this rendering, "
+    "not of the file under review"
+)
+
+
+def projected_surface_label(
+    side: str,
+    source: str,
+    original: str,
+    rendered: str,
+) -> str:
+    """Name the revision a surface diagnostic was actually computed from.
+
+    A projected revision is not the file the author wrote: substituted frozen
+    fragments differ in length from the ones they replace and a whole job has
+    been removed, so a `source:line` diagnostic raised while reading it points
+    at a line of the projection, not at that line of the proposed file. Saying
+    so in the source label is cheaper than letting a reviewer chase a line
+    number that does not mean what it appears to mean.
+
+    The label is unchanged whenever the rendering is the revision itself, which
+    is every revision except the proposal of the one admitted release
+    image-family adoption.
+    """
+
+    if rendered == original:
+        return f"{side} {source}"
+    return f"{side} {source} ({PROJECTED_RENDERING_LABEL})"
 
 
 def digest_artifact_ownership_errors(
@@ -14710,6 +15142,13 @@ def compare_pr_workflow_job(
     introduces it, neither of which a pull request can be held responsible for.
     Equality with the trusted base already prevents a pull request from moving
     any of the three.
+
+    Two admissions are withheld from the surface comparison, both symmetrically
+    and both tied to a contract that has already validated exactly: the anchored
+    `fuzz-smoke` wiring in `ci.yml`, and the one admitted release image-family
+    adoption, whose frozen text is projected back to the shape it came from by
+    `release_family_transition_surface_contents`. Neither withholds a whole job's
+    comparison, and neither is reachable without the complete frozen contract.
     """
 
     baseline, failures = extract_job_block(
@@ -14791,14 +15230,50 @@ def compare_pr_workflow_job(
             )
         )
 
-    baseline_surfaces, baseline_surface_failures = pr_workflow_job_surfaces(
+    # The one admitted release image-family adoption moves frozen text inside
+    # Cross-sensitive publication jobs by design. When — and only when — both
+    # revisions classify and the proposal validates against the complete
+    # three-family contract, the proposal is re-rendered in the two-family text
+    # it came from so this comparison reads the same bytes on both sides. Every
+    # other byte of the file, and every other workflow, is untouched.
+    (
+        baseline_surface_source,
+        proposed_surface_source,
+        family_transition_errors,
+    ) = release_family_transition_surface_contents(
         baseline_wiring.contents,
-        f"merge-base {source}",
+        proposed_wiring.contents,
+        source,
+    )
+    errors.extend(family_transition_errors)
+
+    # A projected revision is not the file the author wrote: the substituted
+    # frozen fragments differ in length from the ones they replace and a whole
+    # job has been removed, so any `source:line` diagnostic raised while reading
+    # it points at a line of the projection, not at that line of the proposed
+    # file. Label the rendering explicitly rather than let a reviewer chase a
+    # line number that does not mean what it appears to mean. Surfaces
+    # themselves carry no line numbers, so the comparison below is unaffected.
+    # The label never varies for an unprojected revision, which is every
+    # revision except the one admitted image-family adoption.
+    baseline_surfaces, baseline_surface_failures = pr_workflow_job_surfaces(
+        baseline_surface_source,
+        projected_surface_label(
+            "merge-base",
+            source,
+            baseline_wiring.contents,
+            baseline_surface_source,
+        ),
         job_name,
     )
     proposed_surfaces, proposed_surface_failures = pr_workflow_job_surfaces(
-        proposed_wiring.contents,
-        f"proposed {source}",
+        proposed_surface_source,
+        projected_surface_label(
+            "proposed",
+            source,
+            proposed_wiring.contents,
+            proposed_surface_source,
+        ),
         job_name,
     )
     errors.extend(baseline_surface_failures)
@@ -23515,6 +23990,16 @@ pre_build = []
                 1,
             )
         ),
+        # The rationale comment shares the `name:` field block with nothing else,
+        # so leaving it at "BOTH manifests" while publishing three families is a
+        # partial adoption of a frozen control field like any other.
+        "create-release rationale still describes the two-family gate": (
+            three_family_release.replace(
+                RELEASE_THREE_FAMILY_CREATE_RELEASE_NAME,
+                two_family["control"]["create-release"]["name"],
+                1,
+            )
+        ),
     }
     for label, tampered in partial_adoptions.items():
         if tampered == three_family_release:
@@ -23539,6 +24024,343 @@ pre_build = []
             failures.append(
                 f"a post-adoption mutation ({label}) was allowed by the "
                 "merge-base comparison"
+            )
+
+    # ----------------------------------------------------------------------
+    # The same adoption, seen by the generic Cross-surface comparison.
+    # ----------------------------------------------------------------------
+    # The publication contract admitting the transition is not enough on its
+    # own: `compare_pr_workflow_job` hashes every job it reads as
+    # Cross-sensitive, the adoption moves frozen text inside such jobs (the
+    # extended `create-release` `needs` names `build-release-arm64-cross`), and
+    # that comparison rejected the complete admitted shape. These cases hold the
+    # projection that repairs it to the same boundary the contract has.
+    failures.extend(RELEASE_FAMILY_TRANSITION_DERIVATION_ERRORS)
+
+    # A comment is not a mapping key, so the rationale between `create-release`'s
+    # `name:` and `needs:` is read as the tail of the `name:` field block. If
+    # that block were not a frozen, substituted control field, the adoption's
+    # rewritten rationale would survive the projection and the Cross-surface
+    # comparison would reject the exact adoption this policy admits. The
+    # assembled fixtures carry the block, so the byte-exact projection equality
+    # below is the end-to-end proof; these are the guards that keep the block
+    # comment-bearing and substituted in the first place.
+    two_family_create_release_name = two_family["control"].get(
+        "create-release",
+        {},
+    ).get("name")
+    three_family_create_release_name = three_family["control"].get(
+        "create-release",
+        {},
+    ).get("name")
+    for generation, name_block in (
+        (RELEASE_TWO_FAMILY_GENERATION, two_family_create_release_name),
+        (RELEASE_THREE_FAMILY_GENERATION, three_family_create_release_name),
+    ):
+        if name_block is None:
+            failures.append(
+                f"the {generation} release contract does not freeze the "
+                "`create-release` `name:` field block, so its gating rationale "
+                "is neither frozen nor substitutable"
+            )
+            continue
+        if not name_block.startswith("    name: "):
+            failures.append(
+                f"the {generation} `create-release` name contract is not a whole "
+                "extracted field block"
+            )
+        if "\n    # " not in name_block:
+            failures.append(
+                f"the {generation} `create-release` name contract no longer "
+                "carries the gating rationale the field block includes"
+            )
+    if two_family_create_release_name == three_family_create_release_name:
+        failures.append(
+            "the `-ebpf-tools` adoption leaves the `create-release` gating "
+            "rationale unchanged, so it would still describe a two-manifest gate"
+        )
+    if not any(
+        label == "job 'create-release' field 'name'"
+        for label, _, _ in RELEASE_FAMILY_TRANSITION_REPLACEMENTS
+    ):
+        failures.append(
+            "the family-transition projection does not substitute the "
+            "`create-release` name/comment block, so the adoption's rewritten "
+            "rationale would survive into the surface comparison"
+        )
+
+    # Dropping an entry from any table the projection reads narrows the
+    # publication contract rather than extending it, and must be a hard
+    # derivation error in every one of them — not only in the two that were
+    # originally checked.
+    for table_name in (
+        "exact_jobs",
+        "control",
+        "steps",
+        "digest_owners",
+        "closed_job_fields",
+    ):
+        two_table = two_family[table_name]
+        if not two_table:
+            failures.append(
+                f"the two-family release {table_name!r} table is empty, so its "
+                "dropped-entry derivation guard proves nothing"
+            )
+            continue
+        dropped_key = next(iter(two_table))
+        narrowed_three = dict(three_family)
+        narrowed_three[table_name] = {
+            key: value
+            for key, value in three_family[table_name].items()
+            if key != dropped_key
+        }
+        _, _, narrowed_errors = derive_release_family_transition(
+            two_family,
+            narrowed_three,
+        )
+        if not any(
+            "drops" in error and repr(dropped_key) in error
+            for error in narrowed_errors
+        ):
+            failures.append(
+                f"the family-transition derivation accepted a {table_name!r} "
+                f"entry ({dropped_key!r}) dropped by the adoption"
+            )
+
+    # A diagnostic computed from a projected rendering must say so, because its
+    # line numbers are the projection's rather than the reviewed file's.
+    unprojected_label = projected_surface_label(
+        "proposed",
+        "release workflow",
+        three_family_release,
+        three_family_release,
+    )
+    if unprojected_label != "proposed release workflow":
+        failures.append("an unprojected revision was labelled as a projection")
+    projected_label = projected_surface_label(
+        "proposed",
+        "release workflow",
+        three_family_release,
+        two_family_release,
+    )
+    if not projected_label.startswith("proposed release workflow"):
+        failures.append("a projected-rendering label lost its revision identity")
+    if PROJECTED_RENDERING_LABEL not in projected_label:
+        failures.append(
+            "a diagnostic read from a projected rendering does not say its line "
+            "numbers are the projection's"
+        )
+
+    # The projection is exact: an adopted workflow re-renders to precisely the
+    # workflow the adoption started from, byte for byte. That equality is what
+    # makes the withholding safe to describe as "the frozen transition text and
+    # nothing else".
+    projected_release, projection_failures = release_two_family_projection(
+        three_family_release,
+        "self-test release workflow",
+    )
+    if projection_failures:
+        failures.append(
+            "the adopted release fixture could not be projected back to its "
+            f"two-family text: {projection_failures}"
+        )
+    elif projected_release != two_family_release:
+        failures.append(
+            "projecting the adopted release fixture did not reproduce the "
+            "two-family workflow exactly"
+        )
+    # It is a projection of an adoption, not a general rewriter: a workflow that
+    # never adopted carries none of the adopted text and fails closed.
+    unadopted_projection, unadopted_failures = release_two_family_projection(
+        two_family_release,
+        "self-test release workflow",
+    )
+    if unadopted_projection is not None or not unadopted_failures:
+        failures.append(
+            "the family-transition projection accepted a workflow that never "
+            "adopted the `-ebpf-tools` family"
+        )
+    # A baseline that already carries the added job is not the shape the
+    # projection maps onto.
+    if not release_two_family_anchor_errors(
+        three_family_release,
+        "self-test release workflow",
+    ):
+        failures.append(
+            "an already-adopted baseline was accepted as the two-family "
+            "starting point of the admitted adoption"
+        )
+    if release_two_family_anchor_errors(
+        two_family_release,
+        "self-test release workflow",
+    ):
+        failures.append("the two-family release fixture was not read as the baseline")
+    # Withholding is scoped to the release workflow and to the adoption itself:
+    # any other source, and any pair that is not an admitted transition, reaches
+    # the surface comparison as the unmodified revisions.
+    for scope_label, scope_source, scope_base, scope_proposed in (
+        ("another workflow", "CI workflow", two_family_release, three_family_release),
+        (
+            "an unchanged release workflow",
+            "release workflow",
+            two_family_release,
+            two_family_release,
+        ),
+        (
+            "a rollback",
+            "release workflow",
+            three_family_release,
+            two_family_release,
+        ),
+    ):
+        scope_baseline, scope_rendered, scope_errors = (
+            release_family_transition_surface_contents(
+                scope_base,
+                scope_proposed,
+                scope_source,
+            )
+        )
+        if (
+            scope_errors
+            or scope_baseline != scope_base
+            or scope_rendered != scope_proposed
+        ):
+            failures.append(
+                f"the family-transition projection was applied to {scope_label}"
+            )
+
+    # The admitted adoption now passes the surface comparison, in this direction
+    # only, and taking the third family back out is still refused.
+    if compare_pr_workflow_job(
+        two_family_release,
+        three_family_release,
+        "release workflow",
+        "build-release-arm64-cross",
+    ):
+        failures.append(
+            "the exact `-ebpf-tools` adoption was rejected by the Cross surface "
+            "comparison"
+        )
+    if not compare_pr_workflow_job(
+        three_family_release,
+        two_family_release,
+        "release workflow",
+        "build-release-arm64-cross",
+    ):
+        failures.append(
+            "removing the adopted `-ebpf-tools` family was not rejected by the "
+            "pull-request workflow comparison"
+        )
+
+    # Tampering with any transitioned publication control keeps the withholding
+    # switched off entirely: the projection is gated on the complete contract,
+    # so every entry of the full tamper table above is compared as the
+    # unmodified revisions and stays rejected. This is asserted directly rather
+    # than through a full comparison per entry, which would rescan two complete
+    # workflows thirty times over for a property the gate decides on its own.
+    for label, tampered in partial_adoptions.items():
+        for tamper_base_label, tamper_base in (
+            ("before adoption", two_family_release),
+            ("after adoption", three_family_release),
+        ):
+            _, tamper_rendered, _ = release_family_transition_surface_contents(
+                tamper_base,
+                tampered,
+                "release workflow",
+            )
+            if tamper_rendered != tampered:
+                failures.append(
+                    f"a tampered `-ebpf-tools` adoption ({label}, "
+                    f"{tamper_base_label}) was granted the transition "
+                    "withholding"
+                )
+    # Two representatives — one that breaks the added job's own contract, one
+    # that breaks a transitioned pre-existing job — are carried all the way
+    # through the pull-request comparison the withholding lives in.
+    for label in (
+        "tools manifest moved to an attacker-controlled runner",
+        "extra producer step rewrites the Docker context",
+    ):
+        tampered = partial_adoptions.get(label)
+        if tampered is None:
+            failures.append(
+                f"the {label!r} tamper case is no longer in the adoption table"
+            )
+            continue
+        if not compare_pr_workflow_job(
+            two_family_release,
+            tampered,
+            "release workflow",
+            "build-release-arm64-cross",
+        ):
+            failures.append(
+                f"a partial `-ebpf-tools` adoption ({label}) was allowed by the "
+                "pull-request workflow comparison"
+            )
+
+    # An otherwise perfect adoption may not smuggle a Cross surface with it.
+    # Every case below satisfies the complete three-family publication contract,
+    # so the projection runs; the surface it adds survives the projection and is
+    # rejected exactly as it would be without an adoption in flight.
+    def adopted_fixture_with_job(job_block: str, label: str) -> str:
+        spliced = three_family_release.replace(
+            RELEASE_FIXTURE_JOB_ANCHOR,
+            "\n" + job_block + RELEASE_FIXTURE_JOB_ANCHOR,
+            1,
+        )
+        if spliced == three_family_release:
+            failures.append(
+                f"the adopted release fixture job anchor did not match for {label}"
+            )
+        return spliced
+
+    smuggled_adoptions = {
+        "added Cross build job": adopted_fixture_with_job(
+            "  smuggled-cross:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            f"      - run: cross build --target {TARGET}\n",
+            "the smuggled Cross build",
+        ),
+        "added flow-spelled Cross build job": adopted_fixture_with_job(
+            "  smuggled-flow-cross:\n"
+            "    runs-on: ubuntu-latest\n"
+            f"    steps: [{{run: cross build --target {TARGET}}}]\n",
+            "the smuggled flow-spelled Cross build",
+        ),
+        "added Cross configuration job": adopted_fixture_with_job(
+            "  smuggled-cross-config:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    env:\n"
+            "      CROSS_CONFIG: attacker.toml\n"
+            "    steps:\n"
+            "      - run: echo staged\n",
+            "the smuggled Cross configuration",
+        ),
+        # Inside a transitioned job, outside its frozen text: `create-release`
+        # has no closed field set, so this is the case the projection must not
+        # launder along with the frozen fragments it restores.
+        "Cross configuration added to a transitioned job": (
+            three_family_release.replace(
+                RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS,
+                RELEASE_THREE_FAMILY_CREATE_RELEASE_NEEDS
+                + "    env:\n      CROSS_CONFIG: attacker.toml\n",
+                1,
+            )
+        ),
+    }
+    for label, smuggled in smuggled_adoptions.items():
+        if smuggled == three_family_release:
+            failures.append(f"the {label} adoption fixture did not change anything")
+            continue
+        if not compare_pr_workflow_job(
+            two_family_release,
+            smuggled,
+            "release workflow",
+            "build-release-arm64-cross",
+        ):
+            failures.append(
+                f"an `-ebpf-tools` adoption carrying a {label} was accepted"
             )
 
     # Injecting the third digest name space into a workflow that has not adopted
@@ -24024,7 +24846,7 @@ pre_build = []
             "actions/checkout@v6",
         ),
         "local action substitution": (
-            "uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2",
+            "uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2",
             "uses: ./.github/actions/fuzz-cache",
         ),
         "widened permissions": (

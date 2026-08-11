@@ -512,23 +512,26 @@ fn test_resolve_all_env_secrets_reports_first_unsupported_suffix_deterministical
     );
 }
 
-/// Shared FIFO + watchdog harness for `_FILE` timeout/teardown coverage.
+/// Shared FIFO + watchdog harness for `_FILE` non-regular rejection and teardown.
 ///
-/// A `_FILE` source can point at a FIFO with no writer, where the read blocks
-/// uninterruptibly. `tokio::time::timeout` around a `spawn_blocking` handle
-/// returns on schedule but does not stop the blocking task, and **dropping the
-/// runtime then waits for the blocking pool** — so the timeout was honored and
-/// the process hung anyway at runtime teardown.
+/// A `_FILE` source pointing at a FIFO/socket/device must be rejected before any
+/// blocking open/read. The whole resolve — runtime build, `block_on`, *and the
+/// runtime drop* — happens on a worker thread that the test body joins with a
+/// bounded `recv_timeout`. A regression fails the test loudly instead of parking
+/// the suite.
 ///
-/// These tests must not be able to hang CI themselves, so the whole resolve —
-/// runtime build, `block_on`, *and the runtime drop* — happens on a worker
-/// thread that the test body joins with a bounded `recv_timeout`. A regression
-/// fails the test loudly instead of parking the suite.
+/// This harness no longer exercises `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS`: a
+/// FIFO cannot reach the read at all now, so there is no portable way to stall a
+/// *regular*-file read here. The residual — a stalled mount on a regular file —
+/// is bounded by the detached-thread contract, covered at the reader seam by
+/// `secrets::credential_file_tests::detached_bounded_reader_timeout_does_not_pin_runtime_teardown`
+/// and pinned structurally by
+/// `secrets::file_tests::file_secret_reads_use_detached_os_thread_not_spawn_blocking`.
 ///
 /// The env vars are set and left in place for the worker (which only reads
 /// them) and are cleared after the bounded wait; `ENV_LOCK` is held throughout.
 #[cfg(unix)]
-fn assert_blocked_file_source_times_out_and_tears_down<F>(
+fn assert_non_regular_file_source_fails_immediately_and_tears_down<F>(
     file_env_key: &str,
     expected_base_key: &str,
     resolve: F,
@@ -538,13 +541,8 @@ fn assert_blocked_file_source_times_out_and_tears_down<F>(
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    const FETCH_TIMEOUT_SECS: u64 = 2;
-    // Generous multiple of the fetch timeout: enough that a slow runner cannot
-    // flake, far below anything that looks like a hang.
     const WATCHDOG: Duration = Duration::from_secs(30);
-    // Soft upper bound: timeout plus generous scheduling slack. Still proves
-    // we are nowhere near a blocking-pool hang.
-    const EXPECTED_CEILING: Duration = Duration::from_secs(15);
+    const EXPECTED_CEILING: Duration = Duration::from_secs(2);
 
     let dir = tempfile::tempdir().unwrap();
     let fifo = dir.path().join("blocked-secret");
@@ -564,12 +562,6 @@ fn assert_blocked_file_source_times_out_and_tears_down<F>(
     // SAFETY: ENV_LOCK is held for the whole test, including the worker thread.
     unsafe {
         std::env::set_var(file_env_key, &fifo);
-        // Startup resolution reads this from the environment only; single-key
-        // resolution also honors the env override through the conf-aware helper.
-        std::env::set_var(
-            "FERRUM_SECRET_FETCH_TIMEOUT_SECONDS",
-            FETCH_TIMEOUT_SECS.to_string(),
-        );
     }
 
     let (sender, receiver) = mpsc::channel();
@@ -584,20 +576,23 @@ fn assert_blocked_file_source_times_out_and_tears_down<F>(
     // SAFETY: ENV_LOCK is still held.
     unsafe {
         std::env::remove_var(file_env_key);
-        std::env::remove_var("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS");
     }
 
     let (result, elapsed) = received.expect(
-        "resolution and runtime teardown must complete; a blocked _FILE read \
+        "resolution and runtime teardown must complete; a non-regular _FILE source \
          must not be waited on",
     );
     let err = match result {
-        Ok(()) => panic!("a FIFO with no writer must not resolve"),
+        Ok(()) => panic!("a FIFO must not resolve"),
         Err(err) => err,
     };
     assert!(
-        err.contains(&format!("Timeout resolving {expected_base_key}")),
-        "expected a fetch timeout naming the base key, got: {err}"
+        err.contains(expected_base_key),
+        "expected an error naming the base key, got: {err}"
+    );
+    assert!(
+        err.contains("not a regular file"),
+        "expected immediate non-regular-file rejection, got: {err}"
     );
     assert!(
         !err.contains(fifo.to_str().unwrap()),
@@ -605,14 +600,14 @@ fn assert_blocked_file_source_times_out_and_tears_down<F>(
     );
     assert!(
         elapsed < EXPECTED_CEILING,
-        "resolution must be bounded by the fetch timeout, took {elapsed:?}"
+        "non-regular rejection must be immediate, took {elapsed:?}"
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
-    assert_blocked_file_source_times_out_and_tears_down(
+fn test_resolve_all_env_secrets_refuses_non_regular_file_source() {
+    assert_non_regular_file_source_fails_immediately_and_tears_down(
         "FERRUM_TEST_SECRET_BLOCKED_FILE",
         "FERRUM_TEST_SECRET_BLOCKED",
         || {
@@ -632,8 +627,8 @@ fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
 /// cannot hide behind the startup-batch test.
 #[cfg(unix)]
 #[test]
-fn test_resolve_secret_times_out_on_blocked_file_source() {
-    assert_blocked_file_source_times_out_and_tears_down(
+fn test_resolve_secret_refuses_non_regular_file_source() {
+    assert_non_regular_file_source_fails_immediately_and_tears_down(
         "FERRUM_TEST_SECRET_BLOCKED_ONE_FILE",
         "FERRUM_TEST_SECRET_BLOCKED_ONE",
         || {

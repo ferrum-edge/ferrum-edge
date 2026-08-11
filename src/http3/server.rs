@@ -1824,9 +1824,8 @@ async fn handle_h3_request(
     ctx.config_generation = epoch.config_generation;
 
     // Route: host + longest prefix match via router cache
-    let route_match = state.router_cache.find_proxy_in_snapshot(
-        &epoch.route_table,
-        epoch.route_generation,
+    let route_match = state.router_cache.find_proxy_in_epoch(
+        &epoch,
         request_host.as_deref(),
         &path,
         ctx.frontend_listen_port,
@@ -1843,14 +1842,16 @@ async fn handle_h3_request(
             if crate::modes::mesh::mesh_route_direction(&rm.proxy.id)
                 .is_some_and(|route_dir| Some(route_dir) != ctx.mesh_direction) =>
         {
-            state.router_cache.resolve_route_excluding_wrong_direction(
-                &epoch.route_table,
-                request_host.as_deref(),
-                &path,
-                ctx.mesh_direction,
-                ctx.frontend_listen_port,
-                true,
-            )
+            state
+                .router_cache
+                .resolve_route_excluding_wrong_direction_in_epoch(
+                    &epoch,
+                    request_host.as_deref(),
+                    &path,
+                    ctx.mesh_direction,
+                    ctx.frontend_listen_port,
+                    true,
+                )
         }
         other => other,
     };

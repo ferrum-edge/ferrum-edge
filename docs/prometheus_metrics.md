@@ -346,9 +346,12 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_request_mirror_request_failures_total` | counter | `namespace` | `request_mirror` | `documented_only` | `always` | request_mirror pre-response transport failures (DNS, refused, reset, TLS, …). |
 | `ferrum_request_mirror_request_timeouts_total` | counter | `namespace` | `request_mirror` | `documented_only` | `always` | request_mirror request-phase deadline expiries (connect/headers/body). |
 | `ferrum_requests_total` | counter | `proxy_id`, `method`, `status_code`, `grpc_status`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Total number of requests processed. |
+| `ferrum_service_discovery_body_budget_rejected_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery HTTP responses rejected because the concurrent body budget was exhausted. |
 | `ferrum_service_discovery_cursor_advance_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery blocking-query cursor advances after an admitted higher-index snapshot. |
 | `ferrum_service_discovery_cursor_rollback_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery blocking-query cursor rollbacks after an admitted lower-index snapshot. |
+| `ferrum_service_discovery_malformed_envelope_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery Kubernetes EndpointSliceList envelopes rejected as malformed. |
 | `ferrum_service_discovery_provider_normalization_rejected_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery snapshots rejected because every provider catalog entry failed provider normalization. |
+| `ferrum_service_discovery_response_oversized_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery HTTP responses rejected for oversized or ambiguous body bounds. |
 | `ferrum_service_discovery_shared_admission_rejected_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery snapshots rejected by shared host/egress target admission. |
 | `ferrum_stream_connections_total` | counter | `proxy_id`, `protocol`, `namespace` | `stream` | `dashboard` | `conditional` | Total stream connections (TCP/UDP). |
 | `ferrum_stream_disconnects_total` | counter | `proxy_id`, `protocol`, `cause`, `direction`, `namespace` | `stream` | `dashboard` | `conditional` | Stream disconnects (TCP/UDP) by cause and direction. |
@@ -361,6 +364,11 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_tls_source_fetch_duration_seconds` | histogram | `scheme`, `kind`, `le`, `namespace` | `tls` | `documented_only` | `conditional` | TLS material source fetch duration in seconds. |
 | `ferrum_tls_source_fetch_failures_total` | counter | `scheme`, `kind`, `reason`, `namespace` | `tls` | `documented_only` | `conditional` | TLS material source fetch failures by scheme, kind, and bounded reason. |
 | `ferrum_tls_source_refresh_total` | counter | `scheme`, `kind`, `surface`, `outcome`, `namespace` | `tls` | `documented_only` | `conditional` | TLS material source refresh attempts by scheme, kind, surface, and outcome. |
+| `ferrum_tls_store_admission_rejected_total` | counter | `store`, `reason`, `namespace` | `tls` | `documented_only` | `always` | Logical persistent TLS store admission refusals by store and reason. |
+| `ferrum_tls_store_document_bytes` | gauge | `store`, `namespace` | `tls` | `documented_only` | `always` | Current serialized byte length of a persistent TLS store document. |
+| `ferrum_tls_store_oversized_total` | counter | `store`, `direction`, `namespace` | `tls` | `documented_only` | `always` | Oversized persistent TLS store document refusals by store and direction. |
+| `ferrum_tls_store_pruned_total` | counter | `namespace` | `tls` | `documented_only` | `always` | Terminal ACME order history entries pruned under the exclusive mutation lock. |
+| `ferrum_tls_store_record_count` | gauge | `store`, `namespace` | `tls` | `documented_only` | `always` | Current logical record count in a persistent TLS store. |
 | `ferrum_websocket_bytes_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket payload bytes relayed by direction. |
 | `ferrum_websocket_frames_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket frames relayed by direction. |
 | `ferrum_websocket_session_duration_ms` | histogram | `proxy_id`, `result`, `direction`, `io_side`, `error_class`, `termination_reason`, `le`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket session duration in milliseconds. |

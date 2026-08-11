@@ -33,6 +33,10 @@ impl VersionedStoreFile for ProbeDocument {
     fn set_store_version(&mut self, version: u64) {
         self.version = version;
     }
+
+    fn logical_record_count(&self) -> u64 {
+        u64::from(!self.value.is_empty())
+    }
 }
 
 fn document_bytes(value: &str) -> Vec<u8> {
@@ -48,7 +52,12 @@ fn lock_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
 }
 
 fn open(dir: &tempfile::TempDir, mode: StoreIdentityMode) -> SharedStoreFile<ProbeDocument> {
-    SharedStoreFile::open_with_identity_mode(store_path(dir), mode).expect("open shared store")
+    SharedStoreFile::open_with_identity_mode(
+        store_path(dir),
+        mode,
+        crate::tls::shared_store::TlsPersistentStoreKind::Managed,
+    )
+    .expect("open shared store")
 }
 
 /// An ACME HTTP-01 / TLS-ALPN-01 challenge lookup is request-adjacent and admin

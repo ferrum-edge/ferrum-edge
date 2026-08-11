@@ -206,6 +206,11 @@ Build the process-only (/live) and dependency-aware (/health) exec handlers for
 workloads that expose the admin listener. Liveness/startup MUST use --live so an
 alive-but-degraded process is not restart-looped.
 
+Dict keys:
+  port      - listen port
+  probeHost - dial host for in-pod exec
+  tls       - optional; when truthy, append --tls --tls-no-verify (HTTPS-only)
+
 Command argv is kept as a Helm list here; `ferrum-mesh.renderProbeHandler` emits
 each item with `| quote` so hosts like `::1` / `127.0.0.1` and ports stay
 double-quoted in the rendered manifest (go-yaml's plain `toYaml` leaves those
@@ -214,9 +219,25 @@ bare, which breaks frozen NodeWaypoint chart assertions).
 {{- define "ferrum-mesh.adminHealthHandlers" -}}
 {{- $port := toString .port -}}
 {{- $host := toString .probeHost -}}
+{{- $tls := .tls | default false -}}
 {{- $liveCmd := list "/app/ferrum-edge" "health" "--live" "-p" $port "--host" $host -}}
 {{- $readyCmd := list "/app/ferrum-edge" "health" "-p" $port "--host" $host -}}
+{{- if $tls -}}
+{{- $liveCmd = list "/app/ferrum-edge" "health" "--live" "--tls" "--tls-no-verify" "-p" $port "--host" $host -}}
+{{- $readyCmd = list "/app/ferrum-edge" "health" "--tls" "--tls-no-verify" "-p" $port "--host" $host -}}
+{{- end -}}
 {{- dict "live" (dict "exec" (dict "command" $liveCmd)) "ready" (dict "exec" (dict "command" $readyCmd)) | toYaml -}}
+{{- end -}}
+
+{{/*
+Resolve whether node-agent admin TLS Secret mounts are fully configured.
+Returns the string "true" or empty.
+*/}}
+{{- define "ferrum-mesh.nodeAgentAdminTlsConfigured" -}}
+{{- $tls := . | default dict -}}
+{{- if and $tls.enabled $tls.secretName $tls.certKey $tls.keyKey -}}
+true
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -240,9 +261,14 @@ exec:
 {{/*
 Render independently configurable startup/liveness/readiness probes.
 Required dict keys:
-  probes       - values.<workload>.probes
-  liveHandler  - non-empty handler used by startup + liveness (empty → skip)
-  readyHandler - non-empty handler used by readiness (empty → skip)
+  probes         - values.<workload>.probes
+  liveHandler    - non-empty handler used by liveness (empty → skip)
+  readyHandler   - non-empty handler used by readiness (empty → skip)
+Optional:
+  startupHandler - non-empty handler used by startup. When omitted/empty,
+                   startup falls back to liveHandler (backward-compatible:
+                   a liveness.override still reaches startup unless an
+                   explicit startup.override is supplied).
 */}}
 {{- define "ferrum-mesh.renderProbes" -}}
 {{- $probes := .probes | default dict -}}
@@ -251,12 +277,14 @@ Required dict keys:
 {{- $readiness := $probes.readiness | default dict -}}
 {{- $liveHandler := .liveHandler | default dict -}}
 {{- $readyHandler := .readyHandler | default dict -}}
-{{- if and ($startup.enabled | default false) $liveHandler }}
+{{- $startupHandler := .startupHandler | default dict -}}
+{{- if not $startupHandler -}}{{- $startupHandler = $liveHandler -}}{{- end -}}
+{{- if and ($startup.enabled | default false) $startupHandler }}
           startupProbe:
-            {{- /* Startup shares the process-only liveness handler. Pointing it
-                   at dependency-aware readiness would kill a pod that boots but
-                   stays legitimately unready (cert/config/CP wait). */}}
-            {{- include "ferrum-mesh.renderProbeHandler" $liveHandler | nindent 12 }}
+            {{- /* Prefer a process-only handler (--live / TCP accept). Pointing
+                   startup at dependency-aware readiness would kill a pod that
+                   boots but stays legitimately unready (cert/config/CP wait). */}}
+            {{- include "ferrum-mesh.renderProbeHandler" $startupHandler | nindent 12 }}
             failureThreshold: {{ $startup.failureThreshold }}
             periodSeconds: {{ $startup.periodSeconds }}
 {{- end }}

@@ -107,11 +107,15 @@ controlPlane:
       enabled: true
       failureThreshold: 36
       periodSeconds: 5
+      # Replaces the computed startup handler. When empty, startup falls back
+      # to the liveness handler (including any liveness.override).
+      override: {}
     liveness:
       enabled: true
       initialDelaySeconds: 10
       periodSeconds: 15
-      # Replaces the computed liveness handler (also used by startup).
+      # Replaces the computed liveness handler. Also used by startup when
+      # startup.override is unset.
       override: {}
     readiness:
       enabled: true
@@ -180,6 +184,7 @@ injector:
       enabled: true
       failureThreshold: 36
       periodSeconds: 5
+      override: {}
     liveness:
       enabled: true
       initialDelaySeconds: 10
@@ -224,6 +229,7 @@ ambient:
       enabled: true
       failureThreshold: 36
       periodSeconds: 5
+      override: {}
     liveness:
       enabled: true
       initialDelaySeconds: 10
@@ -250,6 +256,7 @@ eastWest:
       enabled: true
       failureThreshold: 36
       periodSeconds: 5
+      override: {}
     liveness:
       enabled: true
       initialDelaySeconds: 10
@@ -273,6 +280,7 @@ ca:
       enabled: true
       failureThreshold: 36
       periodSeconds: 5
+      override: {}
     liveness:
       enabled: true
       initialDelaySeconds: 10
@@ -417,15 +425,53 @@ nodeAgent:
     # Non-conflicting with the ambient mesh admin listener's binary default
     # (9000) when both DaemonSets run on the host network.
     port: 19090
-  # Admin-backed probes. When admin is disabled or port=0, computed probes are
-  # omitted (preserve the historical no-readiness behavior) unless an override
+    # Admin HTTPS port. Default 0 keeps existing HTTP-only installs unchanged
+    # (the binary default is 9443, so the chart must pin 0 until TLS is opted
+    # in). Set a nonzero port together with admin.tls below for HTTPS-only
+    # (port=0) or dual-listener operation.
+    httpsPort: 0
+    # Optional admin TLS Secret mount. Uses the shared FERRUM_ADMIN_TLS_*
+    # contract — no node-agent-only TLS variables. When enabled with a
+    # secretName, the chart mounts cert/key (and optional client CA / CRL)
+    # read-only and sets the matching PATH env vars. Incomplete or invalid
+    # combinations fail at helm render; do not store PEM material in values.
+    tls:
+      enabled: false
+      secretName: ""
+      mountPath: /etc/ferrum/tls/admin
+      certKey: tls.crt
+      keyKey: tls.key
+      # Optional mTLS client CA key within the same Secret. When set with
+      # port=0 (HTTPS-only), computed exec probes cannot present a client
+      # cert — override or disable every enabled probe independently, or keep
+      # a plaintext loopback port. Simple Prometheus annotations also cannot
+      # present a client cert (see metricsScrape).
+      clientCaKey: ""
+      # Optional PEM CRL key within the same Secret (FERRUM_TLS_CRL_FILE_PATH).
+      crlKey: ""
+    # Optional Prometheus scrape annotations. Simple prometheus.io annotations
+    # cannot present a client certificate: when TLS requires mTLS
+    # (tls.clientCaKey) and a plaintext admin.port is still enabled, annotations
+    # advertise that HTTP listener. HTTPS-only + mTLS rejects metricsScrape
+    # (use an external scrape config/sidecar). HTTPS without client auth still
+    # prefers the HTTPS port/scheme.
+    metricsScrape:
+      enabled: false
+      path: /metrics
+  # Admin-backed probes. When admin is disabled or both HTTP and HTTPS ports
+  # are 0 (or HTTPS is selected without TLS), computed probes are omitted
+  # (preserve the historical no-readiness behavior) unless an override
   # handler is supplied. Liveness uses --live so capture degradation does not
-  # restart-loop the agent.
+  # restart-loop the agent. HTTPS-only probes dial with --tls --tls-no-verify.
+  # HTTPS-only mTLS requires every enabled probe to be disabled or given an
+  # explicit per-probe override (startup/liveness/readiness are classified
+  # independently — overriding only liveness does not cover startup).
   probes:
     startup:
       enabled: true
       failureThreshold: 36
       periodSeconds: 5
+      override: {}
     liveness:
       enabled: true
       initialDelaySeconds: 10

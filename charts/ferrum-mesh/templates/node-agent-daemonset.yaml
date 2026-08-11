@@ -57,6 +57,94 @@
 {{- $nodeAgentImage := printf "%s:%s" $nodeAgentImageRepository $nodeAgentImageTag -}}
 {{- $nodeAgentAdminBindAddress := toString .Values.nodeAgent.admin.bindAddress -}}
 {{- $nodeAgentAdminProbeHost := include "ferrum-mesh.adminProbeHost" $nodeAgentAdminBindAddress -}}
+{{- /* Do not pipe ports through Sprig `default`: integer 0 is empty there and
+       would silently re-enable plaintext admin.port=19090 (or httpsPort defaults).
+       values.yaml already supplies the chart defaults. */ -}}
+{{- $nodeAgentAdminHttpPort := toString .Values.nodeAgent.admin.port -}}
+{{- $nodeAgentAdminHttpsPort := toString .Values.nodeAgent.admin.httpsPort -}}
+{{- $nodeAgentAdminTls := .Values.nodeAgent.admin.tls | default dict -}}
+{{- $nodeAgentAdminTlsConfigured := include "ferrum-mesh.nodeAgentAdminTlsConfigured" $nodeAgentAdminTls -}}
+{{- $nodeAgentAdminMountPath := trimSuffix "/" ($nodeAgentAdminTls.mountPath | default "/etc/ferrum/tls/admin") -}}
+{{- $nodeAgentAdminCertKey := $nodeAgentAdminTls.certKey | default "tls.crt" -}}
+{{- $nodeAgentAdminKeyKey := $nodeAgentAdminTls.keyKey | default "tls.key" -}}
+{{- $nodeAgentAdminClientCaKey := $nodeAgentAdminTls.clientCaKey | default "" -}}
+{{- $nodeAgentAdminCrlKey := $nodeAgentAdminTls.crlKey | default "" -}}
+{{- if and $nodeAgentAdminTls.enabled (not $nodeAgentAdminTls.secretName) -}}
+{{- fail "nodeAgent.admin.tls.enabled=true requires nodeAgent.admin.tls.secretName" -}}
+{{- end -}}
+{{- if and $nodeAgentAdminTls.secretName (not $nodeAgentAdminTls.enabled) -}}
+{{- fail "nodeAgent.admin.tls.secretName is set but nodeAgent.admin.tls.enabled is false; enable TLS or clear secretName" -}}
+{{- end -}}
+{{- if and $nodeAgentAdminTlsConfigured (eq $nodeAgentAdminHttpsPort "0") -}}
+{{- fail "nodeAgent.admin.tls is configured but nodeAgent.admin.httpsPort=0; set a nonzero httpsPort or disable admin.tls" -}}
+{{- end -}}
+{{- if and (ne $nodeAgentAdminHttpsPort "0") (not $nodeAgentAdminTlsConfigured) -}}
+{{- fail "nodeAgent.admin.httpsPort is nonzero but admin TLS is incomplete; set nodeAgent.admin.tls.enabled=true with secretName (and certKey/keyKey) or set httpsPort=0" -}}
+{{- end -}}
+{{- if and $nodeAgentAdminClientCaKey (not $nodeAgentAdminTlsConfigured) -}}
+{{- fail "nodeAgent.admin.tls.clientCaKey requires a complete admin TLS Secret mount (enabled + secretName + certKey + keyKey)" -}}
+{{- end -}}
+{{- if and $nodeAgentAdminCrlKey (not $nodeAgentAdminTlsConfigured) -}}
+{{- fail "nodeAgent.admin.tls.crlKey requires a complete admin TLS Secret mount (enabled + secretName + certKey + keyKey)" -}}
+{{- end -}}
+{{- /* Same-process HTTP/HTTPS collision when both listeners would bind. */ -}}
+{{- if and (ne $nodeAgentAdminHttpPort "0") (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured (eq $nodeAgentAdminHttpPort $nodeAgentAdminHttpsPort) -}}
+{{- fail (printf "nodeAgent.admin.port and nodeAgent.admin.httpsPort both use %s; set distinct ports or disable one listener (port/httpsPort=0)" $nodeAgentAdminHttpPort) -}}
+{{- end -}}
+{{- /* Prefer plaintext probes when HTTP is enabled so kubelet does not need
+       --tls; HTTPS-only (HTTP port 0) dials the HTTPS port with --tls. */ -}}
+{{- $nodeAgentProbeUsesTls := and (eq $nodeAgentAdminHttpPort "0") (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured -}}
+{{- $nodeAgentProbePort := $nodeAgentAdminHttpPort -}}
+{{- if $nodeAgentProbeUsesTls -}}
+{{- $nodeAgentProbePort = $nodeAgentAdminHttpsPort -}}
+{{- end -}}
+{{- /* HTTPS-only mTLS: computed exec probes cannot present a client cert.
+       Classify startup/liveness/readiness independently — a liveness override
+       does not cover an enabled startup probe that still uses the built-in
+       HTTPS handler. Permit the combo only when every enabled probe is
+       disabled or has an explicit override; fail otherwise. */ -}}
+{{- $nodeAgentProbes := .Values.nodeAgent.probes | default dict -}}
+{{- $nodeAgentStartupProbe := $nodeAgentProbes.startup | default dict -}}
+{{- $nodeAgentLivenessProbe := $nodeAgentProbes.liveness | default dict -}}
+{{- $nodeAgentReadinessProbe := $nodeAgentProbes.readiness | default dict -}}
+{{- $nodeAgentStartupEnabled := true -}}
+{{- if hasKey $nodeAgentStartupProbe "enabled" -}}
+{{- $nodeAgentStartupEnabled = $nodeAgentStartupProbe.enabled -}}
+{{- end -}}
+{{- $nodeAgentLivenessEnabled := true -}}
+{{- if hasKey $nodeAgentLivenessProbe "enabled" -}}
+{{- $nodeAgentLivenessEnabled = $nodeAgentLivenessProbe.enabled -}}
+{{- end -}}
+{{- $nodeAgentReadinessEnabled := true -}}
+{{- if hasKey $nodeAgentReadinessProbe "enabled" -}}
+{{- $nodeAgentReadinessEnabled = $nodeAgentReadinessProbe.enabled -}}
+{{- end -}}
+{{- $nodeAgentDefaultStartupProbe := and $nodeAgentStartupEnabled (not ($nodeAgentStartupProbe.override | default dict)) -}}
+{{- $nodeAgentDefaultLivenessProbe := and $nodeAgentLivenessEnabled (not ($nodeAgentLivenessProbe.override | default dict)) -}}
+{{- $nodeAgentDefaultReadyProbe := and $nodeAgentReadinessEnabled (not ($nodeAgentReadinessProbe.override | default dict)) -}}
+{{- if and $nodeAgentProbeUsesTls $nodeAgentAdminClientCaKey (or $nodeAgentDefaultStartupProbe $nodeAgentDefaultLivenessProbe $nodeAgentDefaultReadyProbe) -}}
+{{- fail "nodeAgent.admin.port=0 with admin mTLS (tls.clientCaKey) makes HTTPS require a client certificate, but computed exec probes cannot present one; override/disable every enabled probe (startup/liveness/readiness independently) or keep a plaintext loopback admin.port" -}}
+{{- end -}}
+{{- $nodeAgentScrape := .Values.nodeAgent.admin.metricsScrape | default dict -}}
+{{- $nodeAgentScrapeEnabled := $nodeAgentScrape.enabled | default false -}}
+{{- $nodeAgentScrapePath := $nodeAgentScrape.path | default "/metrics" -}}
+{{- /* Simple prometheus.io annotations cannot present a client certificate.
+       Dual HTTP + mTLS HTTPS: advertise the plaintext HTTP port/scheme.
+       HTTPS without client auth: prefer HTTPS.
+       HTTPS-only + mTLS with metricsScrape.enabled: fail closed. */ -}}
+{{- if and $nodeAgentScrapeEnabled (eq $nodeAgentAdminHttpPort "0") (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured $nodeAgentAdminClientCaKey -}}
+{{- fail "nodeAgent.admin.metricsScrape.enabled=true with HTTPS-only mTLS (tls.clientCaKey) cannot be scraped via simple Prometheus pod annotations (no client certificate); use an external scrape config/sidecar that presents a client certificate, or keep a plaintext loopback admin.port" -}}
+{{- end -}}
+{{- $nodeAgentScrapeUsesHttps := and (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured (not $nodeAgentAdminClientCaKey) -}}
+{{- $nodeAgentScrapePort := $nodeAgentAdminHttpPort -}}
+{{- $nodeAgentScrapeScheme := "http" -}}
+{{- if $nodeAgentScrapeUsesHttps -}}
+{{- $nodeAgentScrapePort = $nodeAgentAdminHttpsPort -}}
+{{- $nodeAgentScrapeScheme = "https" -}}
+{{- end -}}
+{{- if and $nodeAgentScrapeEnabled (eq $nodeAgentScrapePort "0") -}}
+{{- fail "nodeAgent.admin.metricsScrape.enabled=true requires an active admin listener port (admin.port or admin.httpsPort with TLS)" -}}
+{{- end -}}
 {{- $nodeWaypointRegistryEnabled := eq $nodeAgentProxyMode "node_waypoint" -}}
 {{- $ambientEnv := default dict .Values.ambient.env -}}
 {{- $ambientTopology := replace "-" "_" (lower (trim (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY")))) -}}
@@ -100,6 +188,11 @@
   "FERRUM_NODE_AGENT_ADMIN_ENABLED"
   "FERRUM_ADMIN_BIND_ADDRESS"
   "FERRUM_ADMIN_HTTP_PORT"
+  "FERRUM_ADMIN_HTTPS_PORT"
+  "FERRUM_ADMIN_TLS_CERT_PATH"
+  "FERRUM_ADMIN_TLS_KEY_PATH"
+  "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH"
+  "FERRUM_TLS_CRL_FILE_PATH"
   "FERRUM_NODE_AGENT_NODE_NAME"
   "FERRUM_NODE_AGENT_NODE_IP"
   "FERRUM_NODE_AGENT_NODE_IPS"
@@ -142,6 +235,13 @@ spec:
       labels:
         app.kubernetes.io/name: ferrum-mesh-node-agent
         app.kubernetes.io/instance: {{ .Release.Name }}
+      {{- if and .Values.nodeAgent.admin.enabled $nodeAgentScrapeEnabled }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: {{ $nodeAgentScrapePath | quote }}
+        prometheus.io/port: {{ $nodeAgentScrapePort | quote }}
+        prometheus.io/scheme: {{ $nodeAgentScrapeScheme | quote }}
+      {{- end }}
     spec:
       serviceAccountName: ferrum-node-agent
       hostPID: true
@@ -320,7 +420,23 @@ spec:
             - name: FERRUM_ADMIN_BIND_ADDRESS
               value: {{ $nodeAgentAdminBindAddress | quote }}
             - name: FERRUM_ADMIN_HTTP_PORT
-              value: {{ .Values.nodeAgent.admin.port | quote }}
+              value: {{ $nodeAgentAdminHttpPort | quote }}
+            - name: FERRUM_ADMIN_HTTPS_PORT
+              value: {{ $nodeAgentAdminHttpsPort | quote }}
+            {{- if $nodeAgentAdminTlsConfigured }}
+            - name: FERRUM_ADMIN_TLS_CERT_PATH
+              value: {{ printf "%s/%s" $nodeAgentAdminMountPath $nodeAgentAdminCertKey | quote }}
+            - name: FERRUM_ADMIN_TLS_KEY_PATH
+              value: {{ printf "%s/%s" $nodeAgentAdminMountPath $nodeAgentAdminKeyKey | quote }}
+            {{- if $nodeAgentAdminClientCaKey }}
+            - name: FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH
+              value: {{ printf "%s/%s" $nodeAgentAdminMountPath $nodeAgentAdminClientCaKey | quote }}
+            {{- end }}
+            {{- if $nodeAgentAdminCrlKey }}
+            - name: FERRUM_TLS_CRL_FILE_PATH
+              value: {{ printf "%s/%s" $nodeAgentAdminMountPath $nodeAgentAdminCrlKey | quote }}
+            {{- end }}
+            {{- end }}
             {{- end }}
             - name: FERRUM_NODE_AGENT_NODE_NAME
               valueFrom:
@@ -394,22 +510,35 @@ spec:
             - name: node-waypoint-pod-registry
               mountPath: {{ .Values.nodeAgent.podRegistryDir }}
             {{- end }}
+            {{- if $nodeAgentAdminTlsConfigured }}
+            - name: node-agent-admin-tls
+              mountPath: {{ $nodeAgentAdminMountPath | quote }}
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.nodeAgent.resources | nindent 12 }}
           {{- /* Preserve special behavior: no computed probes when admin is
-                 disabled or port=0 (historical readiness omission). Overrides
-                 still render. Liveness uses --live so capture degradation does
-                 not restart-loop the agent. */ -}}
-          {{- $nodeAgentAdminAvailable := and .Values.nodeAgent.admin.enabled (ne (toString .Values.nodeAgent.admin.port) "0") -}}
+                 disabled or neither HTTP nor HTTPS is available. Overrides
+                 still render. HTTPS-only probes use --tls --tls-no-verify.
+                 Liveness uses --live so capture degradation does not
+                 restart-loop the agent. Startup/liveness/readiness overrides
+                 are classified independently for HTTPS-only mTLS. */ -}}
+          {{- $nodeAgentAdminAvailable := and .Values.nodeAgent.admin.enabled (or (ne $nodeAgentAdminHttpPort "0") $nodeAgentProbeUsesTls) -}}
           {{- $nodeAgentHandlers := dict "live" (dict) "ready" (dict) -}}
           {{- if $nodeAgentAdminAvailable -}}
-          {{- $nodeAgentHandlers = include "ferrum-mesh.adminHealthHandlers" (dict "port" .Values.nodeAgent.admin.port "probeHost" $nodeAgentAdminProbeHost) | fromYaml -}}
+          {{- $nodeAgentHandlers = include "ferrum-mesh.adminHealthHandlers" (dict "port" $nodeAgentProbePort "probeHost" $nodeAgentAdminProbeHost "tls" $nodeAgentProbeUsesTls) | fromYaml -}}
           {{- end -}}
-          {{- $nodeAgentLiveHandler := .Values.nodeAgent.probes.liveness.override | default dict -}}
+          {{- /* Pass startupHandler explicitly so a liveness.override cannot
+                 silently cover an enabled startup probe under HTTPS-only mTLS.
+                 Other workloads omit startupHandler and keep the liveHandler
+                 fallback in renderProbes. */ -}}
+          {{- $nodeAgentStartupHandler := $nodeAgentStartupProbe.override | default dict -}}
+          {{- if not $nodeAgentStartupHandler }}{{- $nodeAgentStartupHandler = $nodeAgentHandlers.live | default dict -}}{{- end -}}
+          {{- $nodeAgentLiveHandler := $nodeAgentLivenessProbe.override | default dict -}}
           {{- if not $nodeAgentLiveHandler }}{{- $nodeAgentLiveHandler = $nodeAgentHandlers.live | default dict -}}{{- end -}}
-          {{- $nodeAgentReadyHandler := .Values.nodeAgent.probes.readiness.override | default dict -}}
+          {{- $nodeAgentReadyHandler := $nodeAgentReadinessProbe.override | default dict -}}
           {{- if not $nodeAgentReadyHandler }}{{- $nodeAgentReadyHandler = $nodeAgentHandlers.ready | default dict -}}{{- end -}}
-          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.nodeAgent.probes "liveHandler" $nodeAgentLiveHandler "readyHandler" $nodeAgentReadyHandler) }}
+          {{- include "ferrum-mesh.renderProbes" (dict "probes" .Values.nodeAgent.probes "startupHandler" $nodeAgentStartupHandler "liveHandler" $nodeAgentLiveHandler "readyHandler" $nodeAgentReadyHandler) }}
       volumes:
         - name: bpf-fs
           hostPath:
@@ -442,5 +571,24 @@ spec:
           hostPath:
             path: {{ .Values.nodeAgent.podRegistryDir }}
             type: DirectoryOrCreate
+        {{- end }}
+        {{- if $nodeAgentAdminTlsConfigured }}
+        - name: node-agent-admin-tls
+          secret:
+            secretName: {{ $nodeAgentAdminTls.secretName | quote }}
+            defaultMode: 288
+            items:
+              - key: {{ $nodeAgentAdminCertKey | quote }}
+                path: {{ $nodeAgentAdminCertKey | quote }}
+              - key: {{ $nodeAgentAdminKeyKey | quote }}
+                path: {{ $nodeAgentAdminKeyKey | quote }}
+              {{- if $nodeAgentAdminClientCaKey }}
+              - key: {{ $nodeAgentAdminClientCaKey | quote }}
+                path: {{ $nodeAgentAdminClientCaKey | quote }}
+              {{- end }}
+              {{- if $nodeAgentAdminCrlKey }}
+              - key: {{ $nodeAgentAdminCrlKey | quote }}
+                path: {{ $nodeAgentAdminCrlKey | quote }}
+              {{- end }}
         {{- end }}
 {{- end }}

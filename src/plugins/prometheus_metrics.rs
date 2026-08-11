@@ -737,6 +737,14 @@ pub struct MetricsRegistry {
     service_discovery_cursor_rollback: AtomicU64,
     /// Blocking-query cursor advances after an admitted higher-index snapshot.
     service_discovery_cursor_advance: AtomicU64,
+    /// Discovery HTTP responses rejected for oversized / ambiguous body bounds.
+    service_discovery_response_oversized: AtomicU64,
+    /// Discovery HTTP responses rejected because the concurrent body budget
+    /// could not admit the next byte range.
+    service_discovery_body_budget_rejected: AtomicU64,
+    /// Kubernetes EndpointSliceList envelopes rejected as malformed (missing /
+    /// null / non-array `items`, invalid JSON, incompatible top-level shape).
+    service_discovery_malformed_envelope: AtomicU64,
     /// Current ai_federation circuits in an open/half-open recovery state.
     ai_federation_circuits_open: AtomicI64,
     /// ai_federation closed-to-open transitions.
@@ -819,6 +827,21 @@ pub struct MetricsRegistry {
     pub tls_source_fetch_failure_counter: DashMap<TlsSourceFetchFailureKey, TimestampedCounter>,
     /// TLS certificate rotation outcomes from source watchers.
     pub tls_cert_rotation_counter: DashMap<TlsCertRotationKey, TimestampedCounter>,
+    /// Current serialized byte length of each persistent TLS store document.
+    /// Fixed cardinality: one gauge per [`crate::tls::shared_store::TlsPersistentStoreKind`].
+    tls_store_document_bytes:
+        [AtomicU64; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
+    /// Current logical record count for each persistent TLS store.
+    tls_store_record_count:
+        [AtomicU64; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
+    /// Oversized read/write refusals by store kind and I/O direction.
+    tls_store_oversized_total:
+        [[AtomicU64; 2]; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
+    /// Logical admission refusals by store kind and fixed reason.
+    tls_store_admission_rejected_total:
+        [[AtomicU64; 2]; crate::tls::shared_store::TlsPersistentStoreKind::ALL.len()],
+    /// Terminal ACME order history entries pruned under the exclusive mutation lock.
+    tls_store_pruned_total: AtomicU64,
     /// Node-agent metrics registered by `FERRUM_MODE=node_agent`.
     node_agent_metrics: ArcSwap<Option<Arc<NodeAgentMetrics>>>,
     /// Admin/management-plane connection limiter, registered when an admin
@@ -911,6 +934,9 @@ impl MetricsRegistry {
             service_discovery_shared_admission_rejected: AtomicU64::new(0),
             service_discovery_cursor_rollback: AtomicU64::new(0),
             service_discovery_cursor_advance: AtomicU64::new(0),
+            service_discovery_response_oversized: AtomicU64::new(0),
+            service_discovery_body_budget_rejected: AtomicU64::new(0),
+            service_discovery_malformed_envelope: AtomicU64::new(0),
             ai_federation_circuits_open: AtomicI64::new(0),
             ai_federation_circuits_opened: AtomicU64::new(0),
             ai_federation_circuits_closed: AtomicU64::new(0),
@@ -935,6 +961,15 @@ impl MetricsRegistry {
             tls_source_fetch_duration_buckets: DashMap::new(),
             tls_source_fetch_failure_counter: DashMap::new(),
             tls_cert_rotation_counter: DashMap::new(),
+            tls_store_document_bytes: std::array::from_fn(|_| AtomicU64::new(0)),
+            tls_store_record_count: std::array::from_fn(|_| AtomicU64::new(0)),
+            tls_store_oversized_total: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            tls_store_admission_rejected_total: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            tls_store_pruned_total: AtomicU64::new(0),
             node_agent_metrics: ArcSwap::from_pointee(None),
             admin_conn_metrics: ArcSwap::from_pointee(None),
             cp_grpc_conn_metrics: ArcSwap::from_pointee(None),
@@ -1413,7 +1448,25 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
-    // Test-crate observation seams for issue #3719 counters.
+    pub fn record_service_discovery_response_oversized(&self) {
+        self.service_discovery_response_oversized
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_body_budget_rejected(&self) {
+        self.service_discovery_body_budget_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_malformed_envelope(&self) {
+        self.service_discovery_malformed_envelope
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    // Test-crate observation seams for issue #3719 / #3718 / #3720 counters.
     #[allow(dead_code)]
     pub fn service_discovery_provider_normalization_rejected_total(&self) -> u64 {
         self.service_discovery_provider_normalization_rejected
@@ -1435,6 +1488,24 @@ impl MetricsRegistry {
     #[allow(dead_code)]
     pub fn service_discovery_cursor_advance_total(&self) -> u64 {
         self.service_discovery_cursor_advance
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_response_oversized_total(&self) -> u64 {
+        self.service_discovery_response_oversized
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_body_budget_rejected_total(&self) -> u64 {
+        self.service_discovery_body_budget_rejected
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_malformed_envelope_total(&self) -> u64 {
+        self.service_discovery_malformed_envelope
             .load(Ordering::Relaxed)
     }
 
@@ -1700,6 +1771,60 @@ impl MetricsRegistry {
             .entry(key)
             .or_insert_with(|| TimestampedCounter::new(self.epoch))
             .increment(self.epoch);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn set_tls_store_document_bytes(
+        &self,
+        kind: crate::tls::shared_store::TlsPersistentStoreKind,
+        bytes: u64,
+    ) {
+        self.tls_store_document_bytes[kind.index()].store(bytes, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn set_tls_store_record_count(
+        &self,
+        kind: crate::tls::shared_store::TlsPersistentStoreKind,
+        count: u64,
+    ) {
+        self.tls_store_record_count[kind.index()].store(count, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Fixed-cardinality test/operator seam for the current logical record
+    /// count gauge of one persistent TLS store.
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn current_tls_store_record_count(
+        &self,
+        kind: crate::tls::shared_store::TlsPersistentStoreKind,
+    ) -> u64 {
+        self.tls_store_record_count[kind.index()].load(Ordering::Relaxed)
+    }
+
+    pub fn record_tls_store_oversized(
+        &self,
+        kind: crate::tls::shared_store::TlsPersistentStoreKind,
+        direction: crate::tls::shared_store::TlsStoreIoDirection,
+    ) {
+        self.tls_store_oversized_total[kind.index()][direction as usize]
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_tls_store_admission_rejected(
+        &self,
+        kind: crate::tls::shared_store::TlsPersistentStoreKind,
+        reason: crate::tls::shared_store::TlsStoreAdmissionReason,
+    ) {
+        self.tls_store_admission_rejected_total[kind.index()][reason as usize]
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_tls_store_pruned(&self, count: u64) {
+        self.tls_store_pruned_total
+            .fetch_add(count, Ordering::Relaxed);
         self.maybe_invalidate_cache();
     }
 
@@ -3010,8 +3135,14 @@ impl MetricsRegistry {
             render_process_counter(&mut output, name, value, &ns_label);
         }
 
-        // Service-discovery admission / cursor events (aggregate, label-safe).
+        // Service-discovery admission / cursor / body-bound events (aggregate, label-safe).
         for (name, help, value) in [
+            (
+                "ferrum_service_discovery_body_budget_rejected_total",
+                "Service-discovery HTTP responses rejected because the concurrent body budget was exhausted.",
+                self.service_discovery_body_budget_rejected
+                    .load(Ordering::Relaxed),
+            ),
             (
                 "ferrum_service_discovery_cursor_advance_total",
                 "Service-discovery blocking-query cursor advances after an admitted higher-index snapshot.",
@@ -3025,9 +3156,21 @@ impl MetricsRegistry {
                     .load(Ordering::Relaxed),
             ),
             (
+                "ferrum_service_discovery_malformed_envelope_total",
+                "Service-discovery Kubernetes EndpointSliceList envelopes rejected as malformed.",
+                self.service_discovery_malformed_envelope
+                    .load(Ordering::Relaxed),
+            ),
+            (
                 "ferrum_service_discovery_provider_normalization_rejected_total",
                 "Service-discovery snapshots rejected because every provider catalog entry failed provider normalization.",
                 self.service_discovery_provider_normalization_rejected
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_response_oversized_total",
+                "Service-discovery HTTP responses rejected for oversized or ambiguous body bounds.",
+                self.service_discovery_response_oversized
                     .load(Ordering::Relaxed),
             ),
             (
@@ -3678,6 +3821,83 @@ impl MetricsRegistry {
                 ));
             }
         }
+
+        output.push_str(
+            "# HELP ferrum_tls_store_document_bytes Current serialized byte length of a persistent TLS store document.\n",
+        );
+        output.push_str("# TYPE ferrum_tls_store_document_bytes gauge\n");
+        for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
+            let bytes = self.tls_store_document_bytes[kind.index()].load(Ordering::Relaxed);
+            output.push_str(&format!(
+                "ferrum_tls_store_document_bytes{{store=\"{}\"{}}} {}\n",
+                kind.as_str(),
+                ns_label,
+                bytes
+            ));
+        }
+        output.push_str(
+            "# HELP ferrum_tls_store_record_count Current logical record count in a persistent TLS store.\n",
+        );
+        output.push_str("# TYPE ferrum_tls_store_record_count gauge\n");
+        for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
+            let records = self.tls_store_record_count[kind.index()].load(Ordering::Relaxed);
+            output.push_str(&format!(
+                "ferrum_tls_store_record_count{{store=\"{}\"{}}} {}\n",
+                kind.as_str(),
+                ns_label,
+                records
+            ));
+        }
+        output.push_str(
+            "# HELP ferrum_tls_store_oversized_total Oversized persistent TLS store document refusals by store and direction.\n",
+        );
+        output.push_str("# TYPE ferrum_tls_store_oversized_total counter\n");
+        for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
+            for direction in [
+                crate::tls::shared_store::TlsStoreIoDirection::Read,
+                crate::tls::shared_store::TlsStoreIoDirection::Write,
+            ] {
+                let count = self.tls_store_oversized_total[kind.index()][direction as usize]
+                    .load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_tls_store_oversized_total{{store=\"{}\",direction=\"{}\"{}}} {}\n",
+                    kind.as_str(),
+                    direction.as_str(),
+                    ns_label,
+                    count
+                ));
+            }
+        }
+        output.push_str(
+            "# HELP ferrum_tls_store_admission_rejected_total Logical persistent TLS store admission refusals by store and reason.\n",
+        );
+        output.push_str("# TYPE ferrum_tls_store_admission_rejected_total counter\n");
+        for kind in crate::tls::shared_store::TlsPersistentStoreKind::ALL {
+            for reason in [
+                crate::tls::shared_store::TlsStoreAdmissionReason::RecordLimit,
+                crate::tls::shared_store::TlsStoreAdmissionReason::DocumentBytes,
+            ] {
+                let count = self.tls_store_admission_rejected_total[kind.index()][reason as usize]
+                    .load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_tls_store_admission_rejected_total{{store=\"{}\",reason=\"{}\"{}}} {}\n",
+                    kind.as_str(),
+                    reason.as_str(),
+                    ns_label,
+                    count
+                ));
+            }
+        }
+        output.push_str(
+            "# HELP ferrum_tls_store_pruned_total Terminal ACME order history entries pruned under the exclusive mutation lock.\n",
+        );
+        output.push_str("# TYPE ferrum_tls_store_pruned_total counter\n");
+        render_process_counter(
+            &mut output,
+            "ferrum_tls_store_pruned_total",
+            self.tls_store_pruned_total.load(Ordering::Relaxed),
+            &ns_label,
+        );
 
         // Mesh observability and NodeWaypoint ADR families are appended outside
         // this cached body — do not fold either of them back in here.

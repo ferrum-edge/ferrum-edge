@@ -13662,28 +13662,23 @@ fn start_mesh_admin_listeners(
         None
     } else if env_config.admin_https_listener_enabled() {
         let admin_https_addr = env_config.admin_socket_addr(env_config.admin_https_port);
-        let admin_tls_config = startup_security::load_admin_tls_material(
+        match startup_security::plan_admin_https_listener(
             env_config,
             tls_policy,
             crls,
             "Invalid mesh admin TLS configuration",
-        )?;
-        let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
-            admin_tls_config.clone(),
-            env_config,
-            tls_policy,
-            crls,
-            Some(shutdown_tx.subscribe()),
-        );
-        if admin_reload_handles.watcher_handle.is_some() {
-            info!("Frontend TLS live reload enabled for mesh admin HTTPS");
-        }
-        Some((
             admin_https_addr,
-            admin_tls_config,
-            admin_reload_handles.slot.clone(),
-            admin_reload_handles.watcher_handle,
-        ))
+            Some(shutdown_tx.subscribe()),
+        )? {
+            startup_security::AdminHttpsListenerPlan::Enabled(planned) => {
+                if planned.reload.watcher_handle.is_some() {
+                    info!("Frontend TLS live reload enabled for mesh admin HTTPS");
+                }
+                Some(planned)
+            }
+            startup_security::AdminHttpsListenerPlan::DisabledByPort
+            | startup_security::AdminHttpsListenerPlan::DisabledByMissingTls => None,
+        }
     } else {
         info!("Mesh admin TLS not configured - HTTPS listener disabled");
         None
@@ -13734,12 +13729,13 @@ fn start_mesh_admin_listeners(
         );
     }
 
-    if let Some((admin_https_addr, admin_tls_config, admin_tls_slot, watcher_handle)) =
-        admin_https_plan
-    {
-        if let Some(handle) = watcher_handle {
+    if let Some(mut planned) = admin_https_plan {
+        if let Some(handle) = planned.reload.watcher_handle.take() {
             handles.push(handle);
         }
+        let admin_https_addr = planned.addr;
+        let admin_tls_config = planned.tls_config;
+        let admin_tls_slot = planned.reload.slot.take();
         let shutdown = shutdown_tx.subscribe();
         let admin_https_limiter = admin_conn_limiter.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();

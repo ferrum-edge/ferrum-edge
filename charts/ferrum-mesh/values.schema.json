@@ -606,6 +606,59 @@
                   "pattern": "^[0-9]{1,5}$"
                 }
               ]
+            },
+            "httpsPort": {
+              "description": "Admin HTTPS listen port. Default 0 disables HTTPS until admin.tls is configured. Accepts integer or numeric string.",
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 65535
+                },
+                {
+                  "type": "string",
+                  "pattern": "^[0-9]{1,5}$"
+                }
+              ]
+            },
+            "tls": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "secretName": {
+                  "type": "string"
+                },
+                "mountPath": {
+                  "type": "string"
+                },
+                "certKey": {
+                  "type": "string"
+                },
+                "keyKey": {
+                  "type": "string"
+                },
+                "clientCaKey": {
+                  "type": "string"
+                },
+                "crlKey": {
+                  "type": "string"
+                }
+              }
+            },
+            "metricsScrape": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "path": {
+                  "type": "string"
+                }
+              }
             }
           }
         },
@@ -802,7 +855,7 @@
     },
     "workloadProbes": {
       "type": "object",
-      "description": "Per-workload health probes. Where an admin listener exists, liveness/startup use `ferrum-edge health --live` (GET /live) and readiness uses `ferrum-edge health` (GET /health). Injector/east-west defaults use a TCP probe on their listen port. Overrides are per-probe so liveness and readiness cannot be silently coupled.",
+      "description": "Per-workload health probes. Where an admin listener exists, liveness/startup use `ferrum-edge health --live` (GET /live) and readiness uses `ferrum-edge health` (GET /health). Injector/east-west defaults use a TCP probe on their listen port. Overrides are per-probe (startup/liveness/readiness) so handlers cannot be silently coupled; when startup.override is unset, templates may still fall back to the liveness handler for backward compatibility.",
       "additionalProperties": false,
       "properties": {
         "startup": {
@@ -819,6 +872,10 @@
             "periodSeconds": {
               "type": "integer",
               "minimum": 1
+            },
+            "override": {
+              "type": "object",
+              "description": "Custom startup handler (exec/httpGet/tcpSocket) replacing the computed default. When unset, the rendered startup probe falls back to the liveness handler (including any liveness.override) unless a workload template classifies startup independently."
             }
           }
         },
@@ -839,7 +896,7 @@
             },
             "override": {
               "type": "object",
-              "description": "Custom liveness handler (exec/httpGet/tcpSocket) replacing the computed default; also used by the startup probe."
+              "description": "Custom liveness handler (exec/httpGet/tcpSocket) replacing the computed default. Also used by startup when startup.override is unset (backward-compatible fallback)."
             }
           }
         },

@@ -149,6 +149,313 @@ pub fn parse_tls_max_material_size_bytes(raw: Option<&str>) -> Result<usize, Str
     Ok(value.min(HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES))
 }
 
+/// Settings key for the shared TLS state document byte ceiling.
+pub const TLS_STORE_MAX_DOCUMENT_BYTES_KEY: &str = "FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES";
+/// Default shared TLS state document byte ceiling (16 MiB).
+pub const DEFAULT_TLS_STORE_MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+/// Minimum accepted shared TLS state document byte ceiling.
+pub const MIN_TLS_STORE_MAX_DOCUMENT_BYTES: usize = 1024;
+/// Hard maximum shared TLS state document byte ceiling (64 MiB).
+pub const HARD_MAX_TLS_STORE_MAX_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Settings key for the managed-TLS logical record cap.
+pub const TLS_MANAGED_MAX_RECORDS_KEY: &str = "FERRUM_TLS_MANAGED_MAX_RECORDS";
+/// Default managed-TLS logical record cap.
+pub const DEFAULT_TLS_MANAGED_MAX_RECORDS: usize = 1024;
+/// Minimum managed-TLS logical record cap.
+pub const MIN_TLS_MANAGED_MAX_RECORDS: usize = 1;
+/// Hard maximum managed-TLS logical record cap.
+pub const HARD_MAX_TLS_MANAGED_MAX_RECORDS: usize = 100_000;
+
+/// Settings key for the ACME certificate logical record cap.
+pub const TLS_ACME_MAX_CERTIFICATES_KEY: &str = "FERRUM_TLS_ACME_MAX_CERTIFICATES";
+/// Default ACME certificate logical record cap.
+pub const DEFAULT_TLS_ACME_MAX_CERTIFICATES: usize = 1024;
+/// Minimum ACME certificate logical record cap.
+pub const MIN_TLS_ACME_MAX_CERTIFICATES: usize = 1;
+/// Hard maximum ACME certificate logical record cap.
+pub const HARD_MAX_TLS_ACME_MAX_CERTIFICATES: usize = 100_000;
+
+/// Settings key for the ACME account logical record cap.
+pub const TLS_ACME_MAX_ACCOUNTS_KEY: &str = "FERRUM_TLS_ACME_MAX_ACCOUNTS";
+/// Default ACME account logical record cap.
+pub const DEFAULT_TLS_ACME_MAX_ACCOUNTS: usize = 256;
+/// Minimum ACME account logical record cap.
+pub const MIN_TLS_ACME_MAX_ACCOUNTS: usize = 1;
+/// Hard maximum ACME account logical record cap.
+pub const HARD_MAX_TLS_ACME_MAX_ACCOUNTS: usize = 10_000;
+
+/// Settings key for retained terminal ACME order history per certificate.
+pub const TLS_ACME_TERMINAL_ORDER_HISTORY_KEY: &str = "FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY";
+/// Default retained terminal ACME order history per certificate.
+pub const DEFAULT_TLS_ACME_TERMINAL_ORDER_HISTORY: usize = 16;
+/// Minimum retained terminal ACME order history (`0` retains none).
+pub const MIN_TLS_ACME_TERMINAL_ORDER_HISTORY: usize = 0;
+/// Hard maximum retained terminal ACME order history per certificate.
+pub const HARD_MAX_TLS_ACME_TERMINAL_ORDER_HISTORY: usize = 1024;
+
+fn parse_bounded_usize_setting(
+    key: &str,
+    raw: Option<&str>,
+    default: usize,
+    min: usize,
+    hard_max: usize,
+    zero_means: Option<&'static str>,
+) -> Result<usize, String> {
+    let value = match raw {
+        None => return Ok(default),
+        Some(value) => value
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("{key} must be a whole number; the configured value is not"))?,
+    };
+    if value < min {
+        return Err(match zero_means {
+            Some(reason) if value == 0 => {
+                format!("{key} must be at least {min}; 0 is {reason}")
+            }
+            _ => format!("{key} must be at least {min}"),
+        });
+    }
+    Ok(value.min(hard_max))
+}
+
+/// Settings key for the per-response discovery success-body ceiling.
+pub const SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES";
+/// Settings key for the discovery error-body ceiling.
+pub const SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES";
+/// Settings key for the process-wide concurrent discovery-body budget.
+pub const SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_BODY_BUDGET_BYTES";
+
+/// Default per-response Kubernetes/Consul discovery success-body ceiling (4 MiB).
+pub const DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Hard maximum per-response discovery success-body ceiling (16 MiB).
+pub const HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Default discovery error-body ceiling (4 KiB).
+pub const DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
+/// Hard maximum discovery error-body ceiling (64 KiB).
+pub const HARD_MAX_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// Default concurrent discovery-body budget across pollers (32 MiB).
+pub const DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// Hard maximum concurrent discovery-body budget (256 MiB).
+pub const HARD_MAX_SERVICE_DISCOVERY_BODY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Validated discovery body ceilings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryBodyLimits {
+    pub max_response_bytes: usize,
+    pub max_error_bytes: usize,
+    pub body_budget_bytes: usize,
+}
+
+impl DiscoveryBodyLimits {
+    pub const fn defaults() -> Self {
+        Self {
+            max_response_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+            max_error_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+            body_budget_bytes: DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        }
+    }
+}
+
+/// Pure parse/validation for the three discovery body env keys.
+///
+/// `None` for a key selects that key's documented default. Values above the
+/// hard maximum clamp down. `0` and malformed values fail closed. The error
+/// ceiling must not exceed the success ceiling, and the shared budget must be
+/// at least the success ceiling.
+pub fn parse_discovery_body_limits(
+    max_response: Option<&str>,
+    max_error: Option<&str>,
+    body_budget: Option<&str>,
+) -> Result<DiscoveryBodyLimits, String> {
+    let max_response_bytes = parse_discovery_body_positive_clamped(
+        max_response,
+        SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+        HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+    )?;
+    let max_error_bytes = parse_discovery_body_positive_clamped(
+        max_error,
+        SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        HARD_MAX_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+    )?;
+    let body_budget_bytes = parse_discovery_body_positive_clamped(
+        body_budget,
+        SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY,
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        HARD_MAX_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+    )?;
+    let limits = DiscoveryBodyLimits {
+        max_response_bytes,
+        max_error_bytes,
+        body_budget_bytes,
+    };
+    validate_discovery_body_limits(limits)?;
+    Ok(limits)
+}
+
+fn parse_discovery_body_positive_clamped(
+    raw: Option<&str>,
+    key: &str,
+    default: usize,
+    hard_max: usize,
+) -> Result<usize, String> {
+    let value = match raw {
+        None => return Ok(default),
+        Some(value) => value.trim().parse::<usize>().map_err(|_| {
+            format!("{key} must be a whole number of bytes; the configured value is not")
+        })?,
+    };
+    if value == 0 {
+        return Err(format!("{key} must be at least 1 byte; 0 is not unlimited"));
+    }
+    Ok(value.min(hard_max))
+}
+
+/// Pure parse for `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
+pub fn parse_tls_store_max_document_bytes(raw: Option<&str>) -> Result<usize, String> {
+    parse_bounded_usize_setting(
+        TLS_STORE_MAX_DOCUMENT_BYTES_KEY,
+        raw,
+        DEFAULT_TLS_STORE_MAX_DOCUMENT_BYTES,
+        MIN_TLS_STORE_MAX_DOCUMENT_BYTES,
+        HARD_MAX_TLS_STORE_MAX_DOCUMENT_BYTES,
+        Some("not unlimited"),
+    )
+}
+
+/// Read `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES` with conf-file precedence.
+pub fn tls_store_max_document_bytes_from_env() -> Result<usize, String> {
+    parse_tls_store_max_document_bytes(
+        crate::config::conf_file::resolve_ferrum_var(TLS_STORE_MAX_DOCUMENT_BYTES_KEY).as_deref(),
+    )
+}
+
+/// Pure parse for `FERRUM_TLS_MANAGED_MAX_RECORDS`.
+pub fn parse_tls_managed_max_records(raw: Option<&str>) -> Result<usize, String> {
+    parse_bounded_usize_setting(
+        TLS_MANAGED_MAX_RECORDS_KEY,
+        raw,
+        DEFAULT_TLS_MANAGED_MAX_RECORDS,
+        MIN_TLS_MANAGED_MAX_RECORDS,
+        HARD_MAX_TLS_MANAGED_MAX_RECORDS,
+        Some("not unlimited"),
+    )
+}
+
+/// Read `FERRUM_TLS_MANAGED_MAX_RECORDS` with conf-file precedence.
+pub fn tls_managed_max_records_from_env() -> Result<usize, String> {
+    parse_tls_managed_max_records(
+        crate::config::conf_file::resolve_ferrum_var(TLS_MANAGED_MAX_RECORDS_KEY).as_deref(),
+    )
+}
+
+/// Pure parse for `FERRUM_TLS_ACME_MAX_CERTIFICATES`.
+pub fn parse_tls_acme_max_certificates(raw: Option<&str>) -> Result<usize, String> {
+    parse_bounded_usize_setting(
+        TLS_ACME_MAX_CERTIFICATES_KEY,
+        raw,
+        DEFAULT_TLS_ACME_MAX_CERTIFICATES,
+        MIN_TLS_ACME_MAX_CERTIFICATES,
+        HARD_MAX_TLS_ACME_MAX_CERTIFICATES,
+        Some("not unlimited"),
+    )
+}
+
+/// Read `FERRUM_TLS_ACME_MAX_CERTIFICATES` with conf-file precedence.
+pub fn tls_acme_max_certificates_from_env() -> Result<usize, String> {
+    parse_tls_acme_max_certificates(
+        crate::config::conf_file::resolve_ferrum_var(TLS_ACME_MAX_CERTIFICATES_KEY).as_deref(),
+    )
+}
+
+/// Pure parse for `FERRUM_TLS_ACME_MAX_ACCOUNTS`.
+pub fn parse_tls_acme_max_accounts(raw: Option<&str>) -> Result<usize, String> {
+    parse_bounded_usize_setting(
+        TLS_ACME_MAX_ACCOUNTS_KEY,
+        raw,
+        DEFAULT_TLS_ACME_MAX_ACCOUNTS,
+        MIN_TLS_ACME_MAX_ACCOUNTS,
+        HARD_MAX_TLS_ACME_MAX_ACCOUNTS,
+        Some("not unlimited"),
+    )
+}
+
+/// Read `FERRUM_TLS_ACME_MAX_ACCOUNTS` with conf-file precedence.
+pub fn tls_acme_max_accounts_from_env() -> Result<usize, String> {
+    parse_tls_acme_max_accounts(
+        crate::config::conf_file::resolve_ferrum_var(TLS_ACME_MAX_ACCOUNTS_KEY).as_deref(),
+    )
+}
+
+/// Pure parse for `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY`.
+///
+/// `0` is valid and means retain no terminal order history (active/recoverable
+/// orders are never pruned by this setting).
+pub fn parse_tls_acme_terminal_order_history(raw: Option<&str>) -> Result<usize, String> {
+    parse_bounded_usize_setting(
+        TLS_ACME_TERMINAL_ORDER_HISTORY_KEY,
+        raw,
+        DEFAULT_TLS_ACME_TERMINAL_ORDER_HISTORY,
+        MIN_TLS_ACME_TERMINAL_ORDER_HISTORY,
+        HARD_MAX_TLS_ACME_TERMINAL_ORDER_HISTORY,
+        None,
+    )
+}
+
+/// Read `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` with conf-file precedence.
+pub fn tls_acme_terminal_order_history_from_env() -> Result<usize, String> {
+    parse_tls_acme_terminal_order_history(
+        crate::config::conf_file::resolve_ferrum_var(TLS_ACME_TERMINAL_ORDER_HISTORY_KEY)
+            .as_deref(),
+    )
+}
+
+fn validate_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), String> {
+    if limits.max_response_bytes == 0
+        || limits.max_error_bytes == 0
+        || limits.body_budget_bytes == 0
+    {
+        return Err("service discovery body ceilings must be >= 1; 0 is not unlimited".to_string());
+    }
+    if limits.max_response_bytes > HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES {
+        return Err(format!(
+            "{SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY} must be <= \
+             {HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES}"
+        ));
+    }
+    if limits.max_error_bytes > HARD_MAX_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES {
+        return Err(format!(
+            "{SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY} must be <= \
+             {HARD_MAX_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES}"
+        ));
+    }
+    if limits.body_budget_bytes > HARD_MAX_SERVICE_DISCOVERY_BODY_BUDGET_BYTES {
+        return Err(format!(
+            "{SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY} must be <= \
+             {HARD_MAX_SERVICE_DISCOVERY_BODY_BUDGET_BYTES}"
+        ));
+    }
+    if limits.max_error_bytes > limits.max_response_bytes {
+        return Err(format!(
+            "{SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY} must be <= \
+             {SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY}"
+        ));
+    }
+    if limits.body_budget_bytes < limits.max_response_bytes {
+        return Err(format!(
+            "{SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY} must be >= \
+             {SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY}"
+        ));
+    }
+    Ok(())
+}
+
 /// SQL connection target for secondary consumers that must track the gateway
 /// configuration database (`FERRUM_DB_TYPE` + effective `FERRUM_DB_URL`).
 ///
@@ -1208,6 +1515,16 @@ pub struct EnvConfig {
     // Admin API
     pub admin_http_port: u16,
     pub admin_https_port: u16,
+    /// Whether `FERRUM_ADMIN_HTTPS_PORT` was present in the environment or
+    /// `ferrum.conf` (any value, including `0` or `9443`).
+    ///
+    /// The hardcoded/default value `9443` alone is **not** operator intent: raw
+    /// binary HTTP-only startups inherit that default without requesting HTTPS.
+    /// Node-agent / shared admin HTTPS planning uses
+    /// [`Self::admin_https_explicitly_requested`] so an inherited default stays
+    /// compatible while an explicitly configured nonzero HTTPS listener fails
+    /// closed on missing/partial TLS (issue #3704).
+    pub admin_https_port_configured: bool,
     pub admin_tls_cert_path: Option<String>,
     pub admin_tls_key_path: Option<String>,
     /// Bind address for Admin API listeners (HTTP, HTTPS).
@@ -2367,6 +2684,16 @@ pub struct EnvConfig {
     /// Kubernetes Secrets, managed store, and ACME store). Default and hard
     /// maximum are both 4 MiB; `0` is rejected (not unlimited). (default: 4194304)
     pub tls_max_material_size_bytes: usize,
+    /// Per-response Kubernetes/Consul discovery success-body ceiling in bytes.
+    /// Default 4 MiB, hard maximum 16 MiB; `0` is rejected (not unlimited).
+    pub service_discovery_max_response_body_bytes: usize,
+    /// Independent discovery error-body ceiling in bytes (tighter than success).
+    /// Default 4 KiB, hard maximum 64 KiB; `0` is rejected (not unlimited).
+    pub service_discovery_max_error_body_bytes: usize,
+    /// Process-wide concurrent discovery-body budget in bytes across all
+    /// Kubernetes/Consul pollers. Default 32 MiB, hard maximum 256 MiB; must be
+    /// at least the per-response success ceiling; `0` is rejected.
+    pub service_discovery_body_budget_bytes: usize,
     /// Number of days before certificate expiration to emit a warning log.
     /// Expired certificates are rejected at startup/config-load time.
     /// Set to 0 to disable near-expiry warnings. (default: 30)
@@ -2872,6 +3199,7 @@ impl Default for EnvConfig {
             proxy_bind_address: "0.0.0.0".into(),
             admin_http_port: 9000,
             admin_https_port: 9443,
+            admin_https_port_configured: false,
             admin_tls_cert_path: None,
             admin_tls_key_path: None,
             admin_bind_address: "127.0.0.1".into(),
@@ -3120,6 +3448,10 @@ impl Default for EnvConfig {
             tls_curves: None,
             tls_session_cache_size: 4096,
             tls_max_material_size_bytes: DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+            service_discovery_max_response_body_bytes:
+                DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+            service_discovery_max_error_body_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+            service_discovery_body_budget_bytes: DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
             tls_cert_expiry_warning_days: 30,
             tls_inventory_snapshot_ttl_seconds: DEFAULT_SNAPSHOT_TTL_SECONDS,
             tls_early_data_methods: HashSet::new(),
@@ -3309,6 +3641,11 @@ impl EnvConfig {
                 => crate::admin::audit::AUDIT_MAX_DELIVERY_ATTEMPTS_DEFAULT;
             admin_require_namespace_claim: bool = "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM" => false;
         }
+        // Durable HTTPS-intent signal: the inherited default `9443` alone is not
+        // an operator request. Capture whether the port key was actually present
+        // so node-agent / shared planners can fail closed on explicit incomplete
+        // TLS without breaking raw HTTP-only defaults (issue #3704).
+        let admin_https_port_configured = resolve_var(conf, "FERRUM_ADMIN_HTTPS_PORT").is_some();
         let audit_retention_policy = crate::admin::audit::AuditRetentionPolicy::from_parts(
             audit_retention_days,
             Some(audit_retention_max_rows),
@@ -3678,6 +4015,19 @@ impl EnvConfig {
                 crate::tls::source::MaterialError::InvalidSource { details, .. } => details,
                 other => other.to_string(),
             })?;
+
+        let discovery_body_limits = parse_discovery_body_limits(
+            resolve_var(conf, SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY).as_deref(),
+            resolve_var(conf, SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY).as_deref(),
+            resolve_var(conf, SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY).as_deref(),
+        )?;
+        // Parsing stays pure: do not publish the process OnceLock here.
+        // `main` installs the accepted EnvConfig snapshot once before any
+        // discovery poller can run (identical reinstall accepted; mismatch
+        // fails closed at that seam).
+        let service_discovery_max_response_body_bytes = discovery_body_limits.max_response_bytes;
+        let service_discovery_max_error_body_bytes = discovery_body_limits.max_error_bytes;
+        let service_discovery_body_budget_bytes = discovery_body_limits.body_budget_bytes;
 
         // This binding is trusted process configuration, never connection or
         // header data. An explicit empty value deliberately clears it. When it
@@ -4172,6 +4522,7 @@ impl EnvConfig {
             proxy_bind_address,
             admin_http_port,
             admin_https_port,
+            admin_https_port_configured,
             admin_tls_cert_path,
             admin_tls_key_path,
             admin_bind_address,
@@ -4408,6 +4759,9 @@ impl EnvConfig {
             tls_curves,
             tls_session_cache_size,
             tls_max_material_size_bytes,
+            service_discovery_max_response_body_bytes,
+            service_discovery_max_error_body_bytes,
+            service_discovery_body_budget_bytes,
             tls_cert_expiry_warning_days,
             tls_inventory_snapshot_ttl_seconds,
             tls_early_data_methods,
@@ -4568,6 +4922,24 @@ impl EnvConfig {
         self.admin_https_port != 0
             && self.admin_tls_cert_path.is_some()
             && self.admin_tls_key_path.is_some()
+    }
+
+    /// Whether the operator explicitly requested admin HTTPS configuration.
+    ///
+    /// True when `FERRUM_ADMIN_HTTPS_PORT` was present in env/`ferrum.conf`,
+    /// either admin TLS cert/key path is set, a client CA / OCSP source is set,
+    /// or `FERRUM_ADMIN_TLS_NO_VERIFY=true`. The inherited global default port
+    /// `9443` with none of those signals is **not** an explicit request — that
+    /// is the raw binary HTTP-only compatibility posture (issue #3704). Port
+    /// `0` remains the unconditional HTTPS disable sentinel even when TLS
+    /// intent fields are present.
+    pub fn admin_https_explicitly_requested(&self) -> bool {
+        self.admin_https_port_configured
+            || self.admin_tls_cert_path.is_some()
+            || self.admin_tls_key_path.is_some()
+            || self.admin_tls_client_ca_bundle_path.is_some()
+            || self.admin_tls_ocsp_response_source.is_some()
+            || self.admin_tls_no_verify
     }
 
     /// Classify the network exposure of the **plaintext** admin HTTP listener

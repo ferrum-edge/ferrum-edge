@@ -55,6 +55,8 @@ mod mesh_host_udp_capture_plan_tests;
 mod mesh_startup_rollback_tests;
 mod mesh_udp_capture_outcome_tests;
 mod metrics_tests;
+mod node_agent_admin_https_helm_tests;
+mod node_agent_admin_https_tests;
 mod node_agent_ingress_topology_tests;
 mod node_agent_startup_cleanup_tests;
 mod node_agent_watcher_exit_tests;

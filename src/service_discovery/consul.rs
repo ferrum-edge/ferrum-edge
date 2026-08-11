@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
+use super::http_body::{DiscoveryBodyRole, collect_discovery_response_body};
 use super::{DiscoveryCursorCommit, DiscoverySnapshot};
 
 /// Characters that must be percent-encoded in a URL path segment (RFC 3986 §3.3).
@@ -188,10 +189,11 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
         let candidate_index = parse_consul_index_header(response.headers());
 
         if !response.status().is_success() {
-            // Fail closed without reading or logging response bodies (may
-            // contain secrets). Fixed ACL remediation for 401/403 only.
+            // Fail closed without surfacing response bodies (may contain
+            // secrets). Drain under the tighter error-body ceiling, then emit
+            // fixed ACL remediation for 401/403 only.
             let status = response.status().as_u16();
-            drop(response);
+            let _ = collect_discovery_response_body(response, DiscoveryBodyRole::Error).await;
             if matches!(status, 401 | 403) {
                 anyhow::bail!(
                     "Consul API returned status {status}; check Consul ACL token policy (service:read on the discovered service)"
@@ -202,19 +204,20 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
 
         // Distinguish transport/read failures from malformed JSON without
         // logging body bytes, URLs, tokens, or unredacted error strings.
-        // Body byte caps for Consul / Kubernetes discovery are owned by
-        // issue #3720 — do not absorb that work here.
-        let body_bytes = response
-            .bytes()
+        let body_bytes = collect_discovery_response_body(response, DiscoveryBodyRole::Success)
             .await
-            .map_err(|_| anyhow::anyhow!("Consul API response body read failed"))?;
-        let body: Vec<serde_json::Value> = serde_json::from_slice(&body_bytes)
+            .map_err(|e| e.as_anyhow("Consul"))?;
+        let body: Vec<serde_json::Value> = serde_json::from_slice(body_bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("Consul API returned malformed JSON"))?;
+        // Release the shared body-budget permit before target construction.
+        drop(body_bytes);
         let provider_item_count = body.len();
         let mut targets = Vec::new();
         let mut missing_service = 0usize;
         let mut missing_address = 0usize;
         let mut missing_port = 0usize;
+        let mut invalid_port = 0usize;
+        let mut invalid_weight = 0usize;
 
         for entry in &body {
             let service = match entry.get("Service") {
@@ -246,20 +249,46 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
                 continue;
             }
 
-            let port = service.get("Port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
+            // Checked port admission: reject 0 / out-of-range without wrapping.
+            let port = match service.get("Port") {
+                None => {
+                    missing_port += 1;
+                    continue;
+                }
+                Some(value) => match value.as_u64() {
+                    None => {
+                        invalid_port += 1;
+                        continue;
+                    }
+                    Some(raw) => match super::admit_registry_port(raw) {
+                        Some(port) => port,
+                        None => {
+                            invalid_port += 1;
+                            continue;
+                        }
+                    },
+                },
+            };
 
-            if port == 0 {
-                missing_port += 1;
-                continue;
-            }
-
-            // Use Consul service weights if available
-            let weight = service
-                .get("Weights")
-                .and_then(|w| w.get("Passing"))
-                .and_then(|p| p.as_u64())
-                .map(|w| w as u32)
-                .unwrap_or(self.default_weight);
+            // Weight contract:
+            // - Missing `Weights` / `Passing` → configured `default_weight`
+            //   (already validated as 1..=MAX_TARGET_WEIGHT at config load).
+            // - Explicit `Passing` present → must admit as 1..=MAX_TARGET_WEIGHT;
+            //   zero, non-integer, and out-of-range values skip this entry only
+            //   (no wrap/coercion into a routable weight).
+            let weight = match service.get("Weights").and_then(|w| w.get("Passing")) {
+                None => self.default_weight,
+                Some(passing) => match passing
+                    .as_u64()
+                    .and_then(super::admit_registry_target_weight)
+                {
+                    Some(weight) => weight,
+                    None => {
+                        invalid_weight += 1;
+                        continue;
+                    }
+                },
+            };
 
             // Extract service tags as target tags
             let mut tags = HashMap::new();
@@ -296,6 +325,8 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
                 missing_service,
                 missing_address,
                 missing_port,
+                invalid_port,
+                invalid_weight,
                 "Consul discovery produced zero valid targets from provider payload"
             );
         }

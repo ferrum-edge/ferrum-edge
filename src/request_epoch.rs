@@ -1,8 +1,9 @@
 //! Atomic request-facing runtime snapshot.
 //!
-//! Request paths load one `RequestEpoch` and use its route table, plugin cache,
-//! consumer index, and load-balancer snapshot together. Writers build staged
-//! inners before publishing, then swap the whole epoch with one ArcSwap store.
+//! Request paths load one `RequestEpoch` and use its route table, Gateway
+//! listener admission, plugin cache, consumer index, and load-balancer snapshot
+//! together. Writers build staged inners before publishing, then swap the whole
+//! epoch with one ArcSwap store.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,7 @@ use crate::load_balancer::LoadBalancerCache;
 use crate::load_balancer::LoadBalancerCacheInner;
 use crate::plugin_cache::PluginCache;
 use crate::plugin_cache::PluginCacheInner;
+use crate::router_cache::GatewayListenerAdmission;
 use crate::router_cache::HostRouteTable;
 use crate::router_cache::RouterCache;
 
@@ -45,6 +47,10 @@ pub struct RequestEpoch {
     pub(crate) plugin_cache: Arc<PluginCacheInner>,
     pub(crate) consumer_index: Arc<ConsumerIndexInner>,
     pub(crate) load_balancer: Arc<LoadBalancerCacheInner>,
+    /// Listener routing admission for this exact config generation. Config
+    /// publication installs `pending`; only a reconcile derived from the same
+    /// config `Arc` may replace it with a decided refusal set.
+    pub(crate) gateway_listener_admission: Arc<GatewayListenerAdmission>,
     pub(crate) config_generation: u64,
     pub(crate) route_generation: u64,
     pub(crate) lb_generation: u64,
@@ -295,6 +301,7 @@ mod tests {
             plugin_cache: Arc::clone(&current.plugin_cache),
             consumer_index: Arc::clone(&current.consumer_index),
             load_balancer: Arc::clone(&current.load_balancer),
+            gateway_listener_admission: Arc::clone(&current.gateway_listener_admission),
             config_generation: current.config_generation,
             route_generation: current.route_generation,
             lb_generation,
@@ -339,6 +346,68 @@ mod tests {
         assert_eq!(after.route_generation, before.route_generation);
         assert_eq!(after.config.proxies.len(), 1);
         assert_eq!(after.config.proxies[0].id, "old");
+    }
+
+    #[test]
+    fn stale_listener_reconcile_cannot_acknowledge_a_newer_config_generation() {
+        let mut old_proxy = proxy("old", "/old", vec![]);
+        old_proxy.listen_port = Some(80);
+        let old_config = config(vec![old_proxy], vec![], vec![]);
+        let store = epoch_store(old_config);
+        let old_epoch = store.load();
+        let old_ack = store
+            .publish_gateway_listener_admission(
+                &old_epoch,
+                GatewayListenerAdmission::decided(std::collections::BTreeSet::new()),
+                |_| {},
+            )
+            .expect("initial generation admission");
+
+        let mut new_proxy = proxy("new", "/new", vec![]);
+        new_proxy.listen_port = Some(81);
+        let new_config = config(vec![new_proxy], vec![], vec![]);
+        store
+            .update_config(
+                |current| {
+                    Ok(Some(StagedRequestEpoch {
+                        config: Arc::new(new_config.clone()),
+                        route_table: RouterCache::build_route_table_snapshot(&new_config),
+                        plugin_cache: Arc::clone(&current.plugin_cache),
+                        consumer_index: Arc::clone(&current.consumer_index),
+                        load_balancer: Arc::clone(&current.load_balancer),
+                        route_changed: true,
+                        lb_changed: false,
+                    }))
+                },
+                |_| {},
+            )
+            .expect("new config publication")
+            .expect("new config epoch");
+
+        assert!(
+            store
+                .publish_gateway_listener_admission(
+                    &old_ack,
+                    GatewayListenerAdmission::decided(std::collections::BTreeSet::new()),
+                    |_| {},
+                )
+                .is_none(),
+            "generation N must not publish an admission decision for N+1"
+        );
+        let pending = store.load();
+        assert!(
+            !pending.gateway_listener_admission.allows(81),
+            "the newer route must remain fail-closed after a stale acknowledgement"
+        );
+
+        let admitted = store
+            .publish_gateway_listener_admission(
+                &pending,
+                GatewayListenerAdmission::decided(std::collections::BTreeSet::new()),
+                |_| {},
+            )
+            .expect("matching generation admission");
+        assert!(admitted.gateway_listener_admission.allows(81));
     }
 
     #[tokio::test]
@@ -1543,6 +1612,7 @@ impl RequestEpochStore {
             plugin_cache: plugin_cache.load_inner(),
             consumer_index: consumer_index.load_inner(),
             load_balancer: load_balancer_cache.load_inner(),
+            gateway_listener_admission: GatewayListenerAdmission::pending(),
             proxy_index_by_key: build_proxy_index_by_key(&config),
             config: Arc::new(config),
             config_generation: 1,
@@ -1639,6 +1709,10 @@ impl RequestEpochStore {
             plugin_cache: staged.plugin_cache,
             consumer_index: staged.consumer_index,
             load_balancer: staged.load_balancer,
+            // Every config generation is conservatively unavailable to
+            // listener-scoped routing until its exact reconcile acknowledges
+            // admission. This publication is atomic with the new route table.
+            gateway_listener_admission: GatewayListenerAdmission::pending(),
             config_generation: current.config_generation.saturating_add(1),
             route_generation: if staged.route_changed {
                 current.route_generation.saturating_add(1)
@@ -1675,6 +1749,48 @@ impl RequestEpochStore {
         Ok(Some(next))
     }
 
+    /// Publish a Gateway listener admission decision only if it was derived
+    /// from the config generation that is still current.
+    ///
+    /// Load-balancer-only epochs may replace the outer `RequestEpoch` while a
+    /// reconcile awaits socket work, so config identity (generation plus the
+    /// config `Arc`) is the fence rather than outer-epoch pointer identity.
+    pub(crate) fn publish_gateway_listener_admission(
+        &self,
+        expected: &RequestEpoch,
+        listener_admission: Arc<GatewayListenerAdmission>,
+        mirror: impl FnOnce(&RequestEpoch),
+    ) -> Option<Arc<RequestEpoch>> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let current = self.current.load_full();
+        if current.config_generation != expected.config_generation
+            || !Arc::ptr_eq(&current.config, &expected.config)
+        {
+            return None;
+        }
+        if current.gateway_listener_admission == listener_admission {
+            mirror(&current);
+            return Some(current);
+        }
+        let next = Arc::new(RequestEpoch {
+            config: Arc::clone(&current.config),
+            proxy_index_by_key: Arc::clone(&current.proxy_index_by_key),
+            route_table: Arc::clone(&current.route_table),
+            plugin_cache: Arc::clone(&current.plugin_cache),
+            consumer_index: Arc::clone(&current.consumer_index),
+            load_balancer: Arc::clone(&current.load_balancer),
+            gateway_listener_admission: listener_admission,
+            config_generation: current.config_generation,
+            // Admission transitions must invalidate both positive and negative
+            // route-cache entries without a hot-path cache clear.
+            route_generation: current.route_generation.saturating_add(1),
+            lb_generation: current.lb_generation,
+        });
+        self.current.store(Arc::clone(&next));
+        mirror(&next);
+        Some(next)
+    }
+
     pub(crate) fn update_load_balancer(
         &self,
         build: impl FnOnce(&RequestEpoch) -> Option<Arc<LoadBalancerCacheInner>>,
@@ -1695,6 +1811,7 @@ impl RequestEpochStore {
             plugin_cache: Arc::clone(&current.plugin_cache),
             consumer_index: Arc::clone(&current.consumer_index),
             load_balancer,
+            gateway_listener_admission: Arc::clone(&current.gateway_listener_admission),
             config_generation: current.config_generation,
             route_generation: current.route_generation,
             lb_generation,
