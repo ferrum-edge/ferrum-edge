@@ -2354,11 +2354,7 @@ async fn dedicated_websocket_holds_the_per_target_physical_connection_lane() {
     let root = root_dir(&temp);
     let socket = root.join("app.sock");
     let _peer = HoldingPeer::bind(&socket);
-    let pool = Arc::new(UnixBackendConnectionPool::new(
-        PoolConfig::default(),
-        8,
-        1,
-    ));
+    let pool = Arc::new(UnixBackendConnectionPool::new(PoolConfig::default(), 8, 1));
     let proxy = test_proxy("unix-websocket-bound");
 
     let first = pool
@@ -2393,10 +2389,7 @@ async fn dedicated_websocket_holds_the_per_target_physical_connection_lane() {
         )
         .await;
     assert!(
-        matches!(
-            second,
-            Err(UnixBackendError::BackendConnectionLimit(_))
-        ),
+        matches!(second, Err(UnixBackendError::BackendConnectionLimit(_))),
         "a second dedicated websocket must be refused before connect"
     );
 

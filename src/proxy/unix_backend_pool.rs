@@ -382,8 +382,8 @@ mod imp {
     use crate::proxy::hbone_pool::{entry_idle_expired, unix_secs};
     use crate::proxy::mesh_mtls_pool::MeshMtlsSender;
     use crate::proxy::unix_backend::{
-        UnixBackendError, UnixConnectionDriver, connect_admitted,
-        connect_deadline, handshake_unix_h2c_sender,
+        UnixBackendError, UnixConnectionDriver, connect_admitted, connect_deadline,
+        handshake_unix_h2c_sender,
     };
     use crate::runtime_metrics::PoolKind;
     use crate::util::unix_socket::AdmittedUnixSocket;
