@@ -1852,10 +1852,23 @@ fn managed_error_response(error: ManagedTlsError) -> Response<Full<Bytes>> {
         | ManagedTlsError::InvalidPath(_)
         | ManagedTlsError::MissingMaterial { .. }
         | ManagedTlsError::WrongKind { .. } => StatusCode::BAD_REQUEST,
-        ManagedTlsError::MaterialTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        // Bounded admitted material and an oversized candidate document are
+        // write-side admission decisions, so they stay caller-facing 413s. An
+        // authoritative document that is already oversized is unreachable
+        // shared state and maps to 500 below.
+        ManagedTlsError::MaterialTooLarge
+        | ManagedTlsError::DocumentTooLarge {
+            direction: crate::tls::shared_store::TlsStoreIoDirection::Write,
+        } => StatusCode::PAYLOAD_TOO_LARGE,
+        ManagedTlsError::RecordLimitReached => StatusCode::CONFLICT,
         ManagedTlsError::Read(_)
         | ManagedTlsError::Write(_)
         | ManagedTlsError::Parse(_)
+        // An oversized store document is unreachable shared state, reported the
+        // same way as an unreadable or unparseable one.
+        | ManagedTlsError::DocumentTooLarge {
+            direction: crate::tls::shared_store::TlsStoreIoDirection::Read,
+        }
         // A misconfigured store is a server-side operator failure; reporting it
         // as a 4xx would blame the caller for something no request can fix.
         | ManagedTlsError::InvalidConfiguration(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1875,7 +1888,14 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         | AcmeError::InvalidChallengeToken(_)
         | AcmeError::BlockedDirectoryUrl(_)
         | AcmeError::MissingMaterial { .. } => StatusCode::BAD_REQUEST,
-        AcmeError::MaterialTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        // Admitted material and an oversized candidate document are write-side
+        // admission decisions, so they stay caller-facing 413s. An
+        // authoritative document that is already oversized maps to 500 below.
+        AcmeError::MaterialTooLarge
+        | AcmeError::DocumentTooLarge {
+            direction: crate::tls::shared_store::TlsStoreIoDirection::Write,
+        } => StatusCode::PAYLOAD_TOO_LARGE,
+        AcmeError::RecordLimitReached => StatusCode::CONFLICT,
         // The stored order cannot be finalized; no retry of this request can
         // change that, so it is reported to the caller rather than as an outage.
         // The rendering names the order and nothing about the material itself.
@@ -1883,6 +1903,12 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
         AcmeError::Read(_)
         | AcmeError::Write(_)
         | AcmeError::Parse(_)
+        // An oversized store document is unreachable shared state, reported the
+        // same way as an unreadable or unparseable one. `GET /acme/accounts`
+        // documents exactly that contract.
+        | AcmeError::DocumentTooLarge {
+            direction: crate::tls::shared_store::TlsStoreIoDirection::Read,
+        }
         // A misconfigured store is a server-side operator failure; reporting it
         // as a 4xx would blame the caller for something no request can fix.
         | AcmeError::InvalidConfiguration(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -2493,6 +2519,65 @@ fn acme_certificate_usage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #3737: a read-side whole-document refusal is shared-state
+    /// unavailability and returns `500`; a candidate document rejected before
+    /// publication is write-side admission and returns `413`, like admitted
+    /// material. `GET /admin/tls/acme/accounts` documents the read contract.
+    #[test]
+    fn store_document_refusals_follow_io_direction_and_material_refusals_stay_413() {
+        assert_eq!(
+            managed_error_response(ManagedTlsError::DocumentTooLarge {
+                direction: crate::tls::shared_store::TlsStoreIoDirection::Read,
+            })
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            acme_error_response(AcmeError::DocumentTooLarge {
+                direction: crate::tls::shared_store::TlsStoreIoDirection::Read,
+            })
+            .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            managed_error_response(ManagedTlsError::DocumentTooLarge {
+                direction: crate::tls::shared_store::TlsStoreIoDirection::Write,
+            })
+            .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            acme_error_response(AcmeError::DocumentTooLarge {
+                direction: crate::tls::shared_store::TlsStoreIoDirection::Write,
+            })
+            .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            managed_error_response(ManagedTlsError::MaterialTooLarge).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            acme_error_response(AcmeError::MaterialTooLarge).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    /// A logical create ceiling *is* caller-facing: overwrite and delete remain
+    /// available, and every create/`PUT` route that can raise it already
+    /// declares `409` in `openapi.yaml`.
+    #[test]
+    fn logical_record_limit_refusals_are_conflicts() {
+        assert_eq!(
+            managed_error_response(ManagedTlsError::RecordLimitReached).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            acme_error_response(AcmeError::RecordLimitReached).status(),
+            StatusCode::CONFLICT
+        );
+    }
 
     fn generated_cert_and_key() -> (String, String) {
         let key_pair =

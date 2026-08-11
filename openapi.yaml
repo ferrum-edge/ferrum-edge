@@ -581,8 +581,10 @@ paths:
         are never returned.
 
         An empty list means the shared stores hold no accounts. A store that
-        cannot be opened, read, or parsed returns `500` instead: an unreachable
-        account store is never reported as "no persisted credentials".
+        cannot be opened, read, or parsed — including one that exceeds
+        `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES` — returns `500` instead: an
+        unreachable account store is never reported as "no persisted
+        credentials".
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/PaginationLimit"
@@ -6256,7 +6258,10 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     PayloadTooLarge:
-      description: Request body or admitted TLS material exceeds its configured byte limit
+      description: >
+        Request body, admitted TLS material, or a candidate managed/ACME store
+        document exceeds its configured byte limit; a rejected candidate store
+        write leaves the previous authoritative document intact
       content:
         application/json:
           schema:
@@ -6265,8 +6270,9 @@ components:
       description: >
         Resource already exists, conflicts with an existing resource, a managed TLS
         ID collides across material kinds, the mutation would invalidate an active
-        managed TLS reference on delete, or the mutation would make mTLS DNS
-        identities ambiguous
+        managed TLS reference on delete, the mutation would make mTLS DNS
+        identities ambiguous, or a managed/ACME create would exceed the configured
+        logical record limit (overwrite and delete remain available)
       content:
         application/json:
           schema:
@@ -6278,7 +6284,12 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     InternalServerError:
-      description: Internal server error
+      description: >
+        Internal server error. For managed TLS and ACME routes this also covers a
+        shared authoritative store document that cannot be opened, read, or
+        parsed, including one that already exceeds
+        `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`; no request can fix that read-side
+        state, so it is never reported as a 4xx
       content:
         application/json:
           schema:

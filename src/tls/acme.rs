@@ -44,7 +44,10 @@ use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
 
 use crate::config::types::validate_resource_id;
-use crate::tls::shared_store::{SharedStoreError, SharedStoreFile, VersionedStoreFile};
+use crate::tls::shared_store::{
+    SharedStoreError, SharedStoreFile, TlsPersistentStoreKind, TlsStoreAdmissionReason,
+    TlsStoreIoDirection, VersionedStoreFile, record_store_admission_rejected, record_store_pruned,
+};
 use crate::tls::source::MaterialKind;
 
 const STORE_FILE_NAME: &str = "acme-certificates.json";
@@ -549,6 +552,12 @@ pub enum AcmeError {
     /// Deliberately content-free: diagnostics must not echo PEM or key bytes.
     #[error("ACME certificate material exceeds the configured byte ceiling")]
     MaterialTooLarge,
+    /// Whole-document serialized size exceeded `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
+    #[error("ACME store document exceeds the configured byte ceiling")]
+    DocumentTooLarge { direction: TlsStoreIoDirection },
+    /// Creating a new certificate/account would exceed the configured logical limit.
+    #[error("ACME store has reached the configured record limit")]
+    RecordLimitReached,
     /// Deliberately content-free apart from the order id: this fires on
     /// private-key/CSR material, so it must not describe what it found.
     #[error("ACME order '{0}' finalization material is missing or unusable")]
@@ -582,6 +591,9 @@ impl From<SharedStoreError> for AcmeError {
             // configuration failure, not a missing record: fail closed with the
             // rule that was broken so the operator can see it.
             SharedStoreError::InvalidConfig { .. } => Self::InvalidConfiguration(error.to_string()),
+            SharedStoreError::Oversized { direction, .. } => Self::DocumentTooLarge {
+                direction: *direction,
+            },
         }
     }
 }
@@ -603,6 +615,10 @@ impl VersionedStoreFile for AcmeCertificateStoreFile {
     fn set_store_version(&mut self, version: u64) {
         self.store_version = version;
     }
+
+    fn logical_record_count(&self) -> u64 {
+        self.certificates.len() as u64
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -620,6 +636,10 @@ impl VersionedStoreFile for AcmeOrderStoreFile {
 
     fn set_store_version(&mut self, version: u64) {
         self.store_version = version;
+    }
+
+    fn logical_record_count(&self) -> u64 {
+        self.orders.len() as u64
     }
 }
 
@@ -639,28 +659,37 @@ impl VersionedStoreFile for AcmeAccountStoreFile {
     fn set_store_version(&mut self, version: u64) {
         self.store_version = version;
     }
+
+    fn logical_record_count(&self) -> u64 {
+        self.accounts.len() as u64
+    }
 }
 
 #[derive(Debug)]
 pub struct AcmeCertificateStore {
     file: SharedStoreFile<AcmeCertificateStoreFile>,
     max_material_bytes: usize,
+    max_certificates: usize,
 }
 
 #[derive(Debug)]
 pub struct AcmeOrderStore {
     file: SharedStoreFile<AcmeOrderStoreFile>,
+    terminal_history: usize,
 }
 
 #[derive(Debug)]
 pub struct AcmeAccountStore {
     file: SharedStoreFile<AcmeAccountStoreFile>,
+    max_accounts: usize,
 }
 
 impl AcmeCertificateStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, AcmeError> {
         let max_material_bytes = acme_material_max_bytes()?;
-        Self::open_with_material_limit(dir, max_material_bytes)
+        let max_certificates = crate::config::env_config::tls_acme_max_certificates_from_env()
+            .map_err(AcmeError::InvalidConfiguration)?;
+        Self::open_with_limits(dir, max_material_bytes, max_certificates, None)
     }
 
     /// Open an ACME certificate store with an explicit material byte ceiling.
@@ -670,11 +699,36 @@ impl AcmeCertificateStore {
         dir: impl Into<PathBuf>,
         max_material_bytes: usize,
     ) -> Result<Self, AcmeError> {
+        let max_certificates = crate::config::env_config::tls_acme_max_certificates_from_env()
+            .map_err(AcmeError::InvalidConfiguration)?;
+        Self::open_with_limits(dir, max_material_bytes, max_certificates, None)
+    }
+
+    /// Open with explicit material, certificate-count, and optional document ceilings.
+    pub fn open_with_limits(
+        dir: impl Into<PathBuf>,
+        max_material_bytes: usize,
+        max_certificates: usize,
+        max_document_bytes: Option<usize>,
+    ) -> Result<Self, AcmeError> {
         let max_material_bytes = validate_acme_material_limit(max_material_bytes)?;
+        let max_certificates = validate_acme_certificate_limit(max_certificates)?;
+        let path = acme_store_path(dir, STORE_FILE_NAME)?;
+        let file = open_shared_acme_store(
+            path,
+            TlsPersistentStoreKind::AcmeCertificates,
+            max_document_bytes,
+        )?;
         Ok(Self {
-            file: SharedStoreFile::open(acme_store_path(dir, STORE_FILE_NAME)?)?,
+            file,
             max_material_bytes,
+            max_certificates,
         })
+    }
+
+    /// Configured logical certificate admission ceiling.
+    pub fn max_certificates(&self) -> usize {
+        self.max_certificates
     }
 
     /// Version of the authoritative document behind the last read. Non-secret.
@@ -710,7 +764,8 @@ impl AcmeCertificateStore {
         validate_acme_id(&record.id)?;
         validate_acme_domains(&record.domains)?;
         validate_acme_certificate_material_size(&record, self.max_material_bytes)?;
-        self.file.mutate(move |document| {
+        let max_certificates = self.max_certificates;
+        let outcome = self.file.mutate(move |document| {
             let mut record = record;
             let now = Utc::now();
             if let Some(existing) = document.certificates.get(&record.id) {
@@ -720,6 +775,13 @@ impl AcmeCertificateStore {
                 record.created_at = existing.created_at;
                 record.updated_at = now;
             } else {
+                if document.certificates.len() >= max_certificates {
+                    record_store_admission_rejected(
+                        TlsPersistentStoreKind::AcmeCertificates,
+                        TlsStoreAdmissionReason::RecordLimit,
+                    );
+                    return Err(AcmeError::RecordLimitReached);
+                }
                 record.created_at = now;
                 record.updated_at = now;
             }
@@ -727,7 +789,8 @@ impl AcmeCertificateStore {
                 .certificates
                 .insert(record.id.clone(), record.clone());
             Ok(record)
-        })
+        })?;
+        Ok(outcome)
     }
 
     pub fn delete_certificate(&self, id: &str) -> Result<AcmeCertificateRecord, AcmeError> {
@@ -735,7 +798,10 @@ impl AcmeCertificateStore {
         let id = id.to_string();
         self.file.mutate(move |document| {
             let removed = document.certificates.remove(&id);
-            removed.ok_or(AcmeError::NotFound(id))
+            match removed {
+                Some(record) => Ok(record),
+                None => Err(AcmeError::NotFound(id)),
+            }
         })
     }
 
@@ -783,11 +849,49 @@ fn acme_store_path(dir: impl Into<PathBuf>, file_name: &str) -> Result<PathBuf, 
     Ok(dir.join(file_name))
 }
 
+fn open_shared_acme_store<T: VersionedStoreFile>(
+    path: PathBuf,
+    kind: TlsPersistentStoreKind,
+    max_document_bytes: Option<usize>,
+) -> Result<SharedStoreFile<T>, AcmeError> {
+    match max_document_bytes {
+        Some(max_document_bytes) => Ok(SharedStoreFile::open_with_limits(
+            path,
+            crate::tls::shared_store::StoreIdentityMode::platform_default(),
+            kind,
+            max_document_bytes,
+        )?),
+        None => Ok(SharedStoreFile::open(path, kind)?),
+    }
+}
+
 impl AcmeOrderStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, AcmeError> {
+        let terminal_history =
+            crate::config::env_config::tls_acme_terminal_order_history_from_env()
+                .map_err(AcmeError::InvalidConfiguration)?;
+        Self::open_with_limits(dir, terminal_history, None)
+    }
+
+    /// Open with an explicit terminal-history bound and optional document ceiling.
+    pub fn open_with_limits(
+        dir: impl Into<PathBuf>,
+        terminal_history: usize,
+        max_document_bytes: Option<usize>,
+    ) -> Result<Self, AcmeError> {
+        let terminal_history = validate_acme_terminal_history(terminal_history)?;
+        let path = acme_store_path(dir, ORDER_STORE_FILE_NAME)?;
+        let file =
+            open_shared_acme_store(path, TlsPersistentStoreKind::AcmeOrders, max_document_bytes)?;
         Ok(Self {
-            file: SharedStoreFile::open(acme_store_path(dir, ORDER_STORE_FILE_NAME)?)?,
+            file,
+            terminal_history,
         })
+    }
+
+    /// Configured retained terminal order history per certificate.
+    pub fn terminal_history(&self) -> usize {
+        self.terminal_history
     }
 
     /// Version of the authoritative document behind the last read. Non-secret.
@@ -844,7 +948,8 @@ impl AcmeOrderStore {
         if let Some(finalization) = record.finalization.as_ref() {
             finalization.validate(&record.domains)?;
         }
-        self.file.mutate(move |document| {
+        let terminal_history = self.terminal_history;
+        let outcome = self.file.mutate(move |document| {
             let mut record = record;
             let now = Utc::now();
             if let Some(existing) = document.orders.get(&record.id) {
@@ -858,8 +963,11 @@ impl AcmeOrderStore {
                 record.updated_at = now;
             }
             document.orders.insert(record.id.clone(), record.clone());
-            Ok(record)
-        })
+            let pruned = prune_terminal_order_history(document, terminal_history);
+            Ok((record, pruned))
+        })?;
+        record_store_pruned(outcome.1 as u64);
+        Ok(outcome.0)
     }
 
     pub fn delete_order(&self, id: &str) -> Result<AcmeOrderRecord, AcmeError> {
@@ -867,7 +975,10 @@ impl AcmeOrderStore {
         let id = id.to_string();
         self.file.mutate(move |document| {
             let removed = document.orders.remove(&id);
-            removed.ok_or(AcmeError::OrderNotFound(id))
+            match removed {
+                Some(record) => Ok(record),
+                None => Err(AcmeError::OrderNotFound(id)),
+            }
         })
     }
 
@@ -960,9 +1071,30 @@ impl AcmeOrderStore {
 
 impl AcmeAccountStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, AcmeError> {
-        Ok(Self {
-            file: SharedStoreFile::open(acme_store_path(dir, ACCOUNT_STORE_FILE_NAME)?)?,
-        })
+        let max_accounts = crate::config::env_config::tls_acme_max_accounts_from_env()
+            .map_err(AcmeError::InvalidConfiguration)?;
+        Self::open_with_limits(dir, max_accounts, None)
+    }
+
+    /// Open with an explicit account cap and optional document ceiling.
+    pub fn open_with_limits(
+        dir: impl Into<PathBuf>,
+        max_accounts: usize,
+        max_document_bytes: Option<usize>,
+    ) -> Result<Self, AcmeError> {
+        let max_accounts = validate_acme_account_limit(max_accounts)?;
+        let path = acme_store_path(dir, ACCOUNT_STORE_FILE_NAME)?;
+        let file = open_shared_acme_store(
+            path,
+            TlsPersistentStoreKind::AcmeAccounts,
+            max_document_bytes,
+        )?;
+        Ok(Self { file, max_accounts })
+    }
+
+    /// Configured logical account admission ceiling.
+    pub fn max_accounts(&self) -> usize {
+        self.max_accounts
     }
 
     /// Version of the authoritative document behind the last read. Non-secret.
@@ -999,13 +1131,22 @@ impl AcmeAccountStore {
         validate_acme_account_identifier(&account_id)?;
         validate_acme_account_credentials_json(&credentials_json)?;
         let key = acme_account_store_key(&directory_url, &account_id);
-        self.file.mutate(move |document| {
+        let max_accounts = self.max_accounts;
+        let outcome = self.file.mutate(move |document| {
             let now = Utc::now();
-            let created_at = document
-                .accounts
-                .get(&key)
-                .map(|existing| existing.created_at)
-                .unwrap_or(now);
+            let created_at = match document.accounts.get(&key) {
+                Some(existing) => existing.created_at,
+                None => {
+                    if document.accounts.len() >= max_accounts {
+                        record_store_admission_rejected(
+                            TlsPersistentStoreKind::AcmeAccounts,
+                            TlsStoreAdmissionReason::RecordLimit,
+                        );
+                        return Err(AcmeError::RecordLimitReached);
+                    }
+                    now
+                }
+            };
             let record = AcmeAccountRecord {
                 account_id,
                 directory_url,
@@ -1016,7 +1157,8 @@ impl AcmeAccountStore {
             };
             document.accounts.insert(key, record.clone());
             Ok(record)
-        })
+        })?;
+        Ok(outcome)
     }
 }
 
@@ -1425,6 +1567,86 @@ fn validate_acme_material_limit(max_bytes: usize) -> Result<usize, AcmeError> {
             other => AcmeError::InvalidConfiguration(other.to_string()),
         }
     })
+}
+
+fn validate_acme_certificate_limit(max_certificates: usize) -> Result<usize, AcmeError> {
+    if max_certificates < crate::config::env_config::MIN_TLS_ACME_MAX_CERTIFICATES {
+        return Err(AcmeError::InvalidConfiguration(format!(
+            "{} must be at least {}; 0 is not unlimited",
+            crate::config::env_config::TLS_ACME_MAX_CERTIFICATES_KEY,
+            crate::config::env_config::MIN_TLS_ACME_MAX_CERTIFICATES
+        )));
+    }
+    Ok(max_certificates.min(crate::config::env_config::HARD_MAX_TLS_ACME_MAX_CERTIFICATES))
+}
+
+fn validate_acme_account_limit(max_accounts: usize) -> Result<usize, AcmeError> {
+    if max_accounts < crate::config::env_config::MIN_TLS_ACME_MAX_ACCOUNTS {
+        return Err(AcmeError::InvalidConfiguration(format!(
+            "{} must be at least {}; 0 is not unlimited",
+            crate::config::env_config::TLS_ACME_MAX_ACCOUNTS_KEY,
+            crate::config::env_config::MIN_TLS_ACME_MAX_ACCOUNTS
+        )));
+    }
+    Ok(max_accounts.min(crate::config::env_config::HARD_MAX_TLS_ACME_MAX_ACCOUNTS))
+}
+
+fn validate_acme_terminal_history(terminal_history: usize) -> Result<usize, AcmeError> {
+    Ok(terminal_history.min(crate::config::env_config::HARD_MAX_TLS_ACME_TERMINAL_ORDER_HISTORY))
+}
+
+/// Whether an order is still active or recoverable and must not be pruned.
+///
+/// Pending/ready/processing orders are always retained, including their
+/// finalization packages. `Valid` orders that still carry finalization material
+/// are also retained (corrupt/partial states). Terminal history is
+/// `Failed`/`Cancelled`, plus `Valid` once finalization has been cleared.
+fn order_is_active_or_recoverable(order: &AcmeOrderRecord) -> bool {
+    match order.status {
+        AcmeOrderStatus::PendingChallenges
+        | AcmeOrderStatus::Ready
+        | AcmeOrderStatus::Processing => true,
+        AcmeOrderStatus::Valid => order.finalization.is_some(),
+        AcmeOrderStatus::Failed | AcmeOrderStatus::Cancelled => false,
+    }
+}
+
+/// Retain all active/recoverable orders plus at most `max_terminal` newest
+/// terminal orders per certificate (or orphan bucket). Returns how many were
+/// removed. Runs under the exclusive mutation lock of the order store.
+fn prune_terminal_order_history(document: &mut AcmeOrderStoreFile, max_terminal: usize) -> usize {
+    use std::collections::HashMap;
+
+    // Group by `Option<String>` so a corrupt/external `certificate_id` equal to
+    // any sentinel can never collide with the orphan (`None`) bucket.
+    let mut terminal_by_group: HashMap<Option<String>, Vec<(String, DateTime<Utc>)>> =
+        HashMap::new();
+    for (id, order) in &document.orders {
+        if order_is_active_or_recoverable(order) {
+            continue;
+        }
+        terminal_by_group
+            .entry(order.certificate_id.clone())
+            .or_default()
+            .push((id.clone(), order.updated_at));
+    }
+
+    let mut remove_ids = Vec::new();
+    for mut entries in terminal_by_group.into_values() {
+        if entries.len() <= max_terminal {
+            continue;
+        }
+        entries.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+        for (id, _) in entries.into_iter().skip(max_terminal) {
+            remove_ids.push(id);
+        }
+    }
+
+    let pruned = remove_ids.len();
+    for id in remove_ids {
+        document.orders.remove(&id);
+    }
+    pruned
 }
 
 fn ensure_acme_bytes_within_limit(len: usize, max_bytes: usize) -> Result<(), AcmeError> {

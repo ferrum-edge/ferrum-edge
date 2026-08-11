@@ -86,7 +86,7 @@ WORKFLOW_CONTRACTS = (
     (
         "CI workflow",
         "build-arm64-cross",
-        "80992a65fb662f8e97cdea91b5302485744e4ae5558d1750e5cd260120b89a20",
+        "905e23deac2aa3021e3472c13745e146cf5f49c05d97861962ac2d2c612dce6f",
         "143872ebf5dd925529b785273f180671bcc3bbd612d74ef0b88e1b8dce86c774",
         # Pins the top-level `on:` mapping that schedules CI, including
         # unconditional `merge_group: checks_requested` alongside push,
@@ -96,7 +96,7 @@ WORKFLOW_CONTRACTS = (
     (
         "release workflow",
         "build-release-arm64-cross",
-        "a7843ce946dae8ca0b7be5ed905b233fd89ad1bfed9814a180e90b0cb85c78bf",
+        "e2792eb548322f3ef062b93ad971b5a13e9d21c74d9b00f5f3bdf8e0119c9712",
         "1d5104bd955d0ef4c397cb7be08f37d2d829a822ff9efe43eb26bdac1133bc0a",
         "2a9e77c5946c27cbf1f055f20adf283e159ffd3735e2dcc90edded2c35563c3b",
     ),
@@ -2519,7 +2519,7 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
         with:
           toolchain: nightly-2025-07-01
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz -> target
           shared-key: fuzz-smoke
@@ -2666,7 +2666,7 @@ jobs:
         with:
           toolchain: nightly-2025-07-01
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz -> target
           shared-key: fuzz-sanitized
@@ -24846,7 +24846,7 @@ pre_build = []
             "actions/checkout@v6",
         ),
         "local action substitution": (
-            "uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2",
+            "uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2",
             "uses: ./.github/actions/fuzz-cache",
         ),
         "widened permissions": (

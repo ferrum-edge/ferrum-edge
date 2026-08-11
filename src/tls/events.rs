@@ -15,6 +15,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::tls::shared_store::{
+    TlsPersistentStoreKind, TlsStoreIoDirection, open_authoritative_document_file,
+    read_bounded_document_bytes, record_store_record_count,
+    validate_explicit_store_max_document_bytes,
+};
 use crate::tls::source::subscription::{MaterialFingerprintEntry, WatchedMaterialSource};
 use crate::tls::source::{CertSource, MaterialKind, SourceScheme};
 
@@ -118,6 +123,7 @@ pub struct TlsEventLog {
     next_id: AtomicU64,
     events: Mutex<VecDeque<TlsSourceEvent>>,
     path: Option<PathBuf>,
+    max_document_bytes: usize,
 }
 
 impl TlsEventLog {
@@ -127,6 +133,7 @@ impl TlsEventLog {
             next_id: AtomicU64::new(1),
             events: Mutex::new(VecDeque::new()),
             path: None,
+            max_document_bytes: crate::config::env_config::DEFAULT_TLS_STORE_MAX_DOCUMENT_BYTES,
         }
     }
 
@@ -138,15 +145,9 @@ impl TlsEventLog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        let mut events = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<TlsEventLogFile>(&bytes)
-                .map_err(|error| error.to_string())?
-                .events
-                .into_iter()
-                .collect::<VecDeque<_>>(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => VecDeque::new(),
-            Err(error) => return Err(error.to_string()),
-        };
+        let max_document_bytes =
+            crate::config::env_config::tls_store_max_document_bytes_from_env()?;
+        let mut events = load_event_log_events(&path, max_document_bytes)?;
         while events.len() > capacity {
             events.pop_front();
         }
@@ -162,26 +163,96 @@ impl TlsEventLog {
             next_id: AtomicU64::new(next_id),
             events: Mutex::new(events),
             path: Some(path),
+            max_document_bytes,
+        };
+        // Compact atomically to the configured capacity so a legacy oversized
+        // entry count (still within the byte ceiling) shrinks on disk.
+        log.persist_snapshot()?;
+        record_store_record_count(
+            TlsPersistentStoreKind::Events,
+            log.events
+                .lock()
+                .map(|events| events.len() as u64)
+                .unwrap_or(0),
+        );
+        Ok(log)
+    }
+
+    /// Open with an explicit document ceiling (tests).
+    #[allow(dead_code)] // External unit tests; production uses open.
+    pub fn open_with_document_limit(
+        capacity: usize,
+        path: Option<PathBuf>,
+        max_document_bytes: usize,
+    ) -> Result<Self, String> {
+        let capacity = capacity.max(1);
+        let max_document_bytes = validate_explicit_store_max_document_bytes(max_document_bytes)
+            .map_err(|error| error.to_string())?;
+        let Some(path) = path else {
+            return Ok(Self {
+                capacity,
+                next_id: AtomicU64::new(1),
+                events: Mutex::new(VecDeque::new()),
+                path: None,
+                max_document_bytes,
+            });
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let mut events = load_event_log_events(&path, max_document_bytes)?;
+        while events.len() > capacity {
+            events.pop_front();
+        }
+        let next_id = events
+            .iter()
+            .map(|event| event.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1);
+        let log = Self {
+            capacity,
+            next_id: AtomicU64::new(next_id),
+            events: Mutex::new(events),
+            path: Some(path),
+            max_document_bytes,
         };
         log.persist_snapshot()?;
+        record_store_record_count(
+            TlsPersistentStoreKind::Events,
+            log.events
+                .lock()
+                .map(|events| events.len() as u64)
+                .unwrap_or(0),
+        );
         Ok(log)
     }
 
     pub fn record(&self, mut event: TlsSourceEvent) {
+        // Allocate the id before building the candidate. Gaps after a refused
+        // persist are acceptable; the deque must stay untouched until durable
+        // publication succeeds.
         event.id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let Ok(mut events) = self.events.lock() else {
             return;
         };
-        events.push_back(event);
-        while events.len() > self.capacity {
-            events.pop_front();
+        let mut candidate = events.clone();
+        candidate.push_back(event);
+        while candidate.len() > self.capacity {
+            candidate.pop_front();
         }
-        if let Err(error) = self.persist_locked(&events) {
+        if let Err(error) = self.persist_locked(&candidate) {
             warn!(
                 error = %error,
                 "Failed to persist TLS source rotation event"
             );
+            // Leave the prior in-memory deque exactly unchanged so a refused
+            // oversized/I/O candidate cannot evict durable history from cache.
+            return;
         }
+        *events = candidate;
+        record_store_record_count(TlsPersistentStoreKind::Events, events.len() as u64);
     }
 
     pub fn list(&self, filter: &TlsEventFilter) -> Vec<TlsSourceEvent> {
@@ -223,8 +294,59 @@ impl TlsEventLog {
             events: events.iter().cloned().collect(),
         })
         .map_err(|error| error.to_string())?;
-        write_private_file_atomic(path, &payload)
+        if payload.len() > self.max_document_bytes {
+            crate::plugins::prometheus_metrics::global_registry().record_tls_store_oversized(
+                TlsPersistentStoreKind::Events,
+                TlsStoreIoDirection::Write,
+            );
+            return Err(format!(
+                "TLS event log document exceeds the configured byte ceiling (max {} bytes)",
+                self.max_document_bytes
+            ));
+        }
+        write_private_file_atomic(path, &payload)?;
+        crate::plugins::prometheus_metrics::global_registry()
+            .set_tls_store_document_bytes(TlsPersistentStoreKind::Events, payload.len() as u64);
+        Ok(())
     }
+}
+
+fn load_event_log_events(
+    path: &Path,
+    max_document_bytes: usize,
+) -> Result<VecDeque<TlsSourceEvent>, String> {
+    let mut file = match open_authoritative_document_file(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(VecDeque::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if let Ok(metadata) = file.metadata()
+        && metadata.len() > max_document_bytes as u64
+    {
+        crate::plugins::prometheus_metrics::global_registry()
+            .record_tls_store_oversized(TlsPersistentStoreKind::Events, TlsStoreIoDirection::Read);
+        return Err(format!(
+            "TLS event log document exceeds the configured byte ceiling (max {max_document_bytes} bytes)"
+        ));
+    }
+    let bytes = match read_bounded_document_bytes(&mut file, path, max_document_bytes) {
+        Ok(bytes) => bytes,
+        Err(crate::tls::shared_store::SharedStoreError::Oversized { .. }) => {
+            crate::plugins::prometheus_metrics::global_registry().record_tls_store_oversized(
+                TlsPersistentStoreKind::Events,
+                TlsStoreIoDirection::Read,
+            );
+            return Err(format!(
+                "TLS event log document exceeds the configured byte ceiling (max {max_document_bytes} bytes)"
+            ));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    crate::plugins::prometheus_metrics::global_registry()
+        .set_tls_store_document_bytes(TlsPersistentStoreKind::Events, bytes.len() as u64);
+    let parsed = serde_json::from_slice::<TlsEventLogFile>(&bytes)
+        .map_err(|_error| "TLS event log is malformed".to_string())?;
+    Ok(parsed.events.into_iter().collect())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
