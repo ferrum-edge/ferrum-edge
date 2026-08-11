@@ -26,6 +26,7 @@ pub mod consumer_index;
 pub mod custom_plugins;
 pub mod date_cache;
 pub mod dns;
+pub mod dp_config_freshness;
 pub mod dtls;
 pub mod ebpf;
 pub mod fips;

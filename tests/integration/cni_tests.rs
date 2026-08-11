@@ -125,6 +125,33 @@ fn run_ferrum_cni_status(stdin_config: serde_json::Value) -> std::process::Outpu
     child.wait_with_output().expect("wait ferrum-cni")
 }
 
+/// Drive the standalone binary for ADD with the kubelet-shaped env that
+/// supplies pod identity. Used to pin the fail-closed IPC posture.
+fn run_ferrum_cni_add(stdin_config: serde_json::Value) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ferrum-cni"))
+        .env("CNI_COMMAND", "ADD")
+        .env("CNI_CONTAINERID", "ctr-crash-loop")
+        .env("CNI_NETNS", "/var/run/netns/cni-crash-loop")
+        .env("CNI_IFNAME", "eth0")
+        .env("CNI_PATH", "/opt/cni/bin")
+        .env(
+            "CNI_ARGS",
+            "IgnoreUnknown=1;K8S_POD_NAMESPACE=demo;K8S_POD_NAME=crash-loop;K8S_POD_INFRA_CONTAINER_ID=ctr-crash-loop",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ferrum-cni");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin pipe")
+        .write_all(stdin_config.to_string().as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait ferrum-cni")
+}
+
 /// Drive one synthetic CNI ADD round-trip: client sends the framed
 /// request, listener task accepts the connection, work item arrives in
 /// the queue, a stub "main loop" replies `Ok`, response wire-encodes
@@ -969,6 +996,53 @@ async fn ferrum_cni_binary_status_unavailable_when_socket_missing() {
     );
 }
 
+/// Crash-loop / absent node-agent: ADD fails closed (CNI code 11) and never
+/// pass-through-unenrolls. Preserves the capture-race posture from issue #3609.
+#[tokio::test]
+async fn ferrum_cni_binary_add_fails_closed_when_socket_missing() {
+    let dir = tempdir().expect("tempdir");
+    let missing_socket = dir.path().join("missing-agent.sock");
+    let missing_socket_string = missing_socket.to_string_lossy().into_owned();
+    let requested_socket = missing_socket_string.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        run_ferrum_cni_add(serde_json::json!({
+            "cniVersion": "1.0.0",
+            "name": "ferrum-mesh-chain",
+            "type": "ferrum-cni",
+            "prevResult": {
+                "cniVersion": "1.0.0",
+                "interfaces": [{"name": "eth0"}],
+                "ips": [{"address": "10.244.0.10/24", "interface": 0}]
+            },
+            "ferrum": { "socketPath": requested_socket }
+        }))
+    })
+    .await
+    .expect("blocking task joined");
+
+    assert!(
+        !output.status.success(),
+        "ADD must fail closed when the node-agent socket is absent; stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("CNI error JSON should parse");
+    assert_eq!(
+        payload["code"], 11,
+        "IPC failure must surface as CNI code 11, not a success/prevResult pass-through: {payload}"
+    );
+    let message = payload["msg"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains(missing_socket_string.as_str()),
+        "ADD IPC error must not echo the socket path: {message}"
+    );
+    assert!(
+        payload.get("ips").is_none() && payload.get("interfaces").is_none(),
+        "fail-closed ADD must not emit a CNI result: {payload}"
+    );
+}
+
 /// Node-agent not-ready replies map to CNI STATUS code 50.
 #[tokio::test]
 async fn ferrum_cni_binary_status_not_ready_maps_to_code_50() {
@@ -1800,6 +1874,10 @@ mod install_lifecycle {
 
     #[test]
     fn rollback_watch_retains_artifacts_once_readiness_is_observed() {
+        // Post-readiness failure recovery boundary (issue #3609): the first
+        // successful STATUS permanently retains this generation's chain for
+        // the lifetime of the pod. A later crash-loop is NOT auto-rolled-back;
+        // operators recover via uninstall / "Recovering a node".
         let node = Node::new();
         node.install("ferrum/mesh", "gen-1");
         let mut probes = 0;

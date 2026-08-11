@@ -2565,7 +2565,29 @@ impl MetricsRegistry {
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
+        self.append_dp_config_freshness_prometheus(&mut output);
         output
+    }
+
+    /// Append the bounded DP configuration-freshness families from live state.
+    ///
+    /// Kept off the render cache (issue #3726): every one of these series comes
+    /// from process-static atomics and from the passage of time — snapshot age,
+    /// the stale/blocked bits, and counters that no registry producer can
+    /// invalidate the cache for. A memoized body would report an age and an
+    /// admission state that are wrong by however long the cache has been held,
+    /// which is exactly the window an operator is watching during an outage.
+    fn append_dp_config_freshness_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        render_dp_config_freshness_prometheus(
+            output,
+            &ns_label,
+            crate::dp_config_freshness::snapshot().as_ref(),
+        );
     }
 
     /// Append the process-static mesh observability families from live state.
@@ -2630,6 +2652,7 @@ impl MetricsRegistry {
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
         self.append_udp_placement_migration_prometheus(&mut output);
+        self.append_dp_config_freshness_prometheus(&mut output);
         output
     }
 
@@ -4481,6 +4504,125 @@ fn render_ai_counter_family(
             proxy_id, key.provider, ns_label, value
         ));
     }
+}
+
+/// Render the bounded DP last-known-good configuration families (issue #3726).
+///
+/// A free function taking the projection explicitly so the exact rendered text
+/// is testable without installing the process-global DP tracker, which would
+/// publish a process-wide admission flag inside a shared test binary.
+///
+/// Present only in DP mode (`freshness` is `None` everywhere else). Every
+/// series is fixed-cardinality: `namespace` is the only standard metric label.
+/// CP endpoint, credential, node id, and configuration content are not exposed
+/// as labels — the closed-set reason is exposed on authenticated `/health`
+/// instead.
+pub fn render_dp_config_freshness_prometheus(
+    output: &mut String,
+    ns_label: &str,
+    freshness: Option<&crate::dp_config_freshness::DpConfigFreshnessSnapshot>,
+) {
+    let Some(freshness) = freshness else {
+        return;
+    };
+    output.push_str(
+        "# HELP ferrum_dp_config_snapshot_age_seconds Age of the DP's last validated and successfully applied CP configuration snapshot, on a monotonic clock.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_snapshot_age_seconds gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_snapshot_age_seconds",
+        freshness.snapshot_age_seconds,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_max_stale_seconds Configured maximum applied-snapshot age before the DP degrades readiness (0 = bound disabled).\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_max_stale_seconds gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_max_stale_seconds",
+        freshness.max_stale_seconds,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_stale Whether the DP's applied configuration is past its bound with no authoritative CP (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_stale gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_stale",
+        u64::from(freshness.stale),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_new_traffic_blocked Whether the DP is refusing new HTTP/TCP/UDP-session/DTLS-session admissions because its configuration is stale (1) or not (0).\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_new_traffic_blocked gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_new_traffic_blocked",
+        u64::from(freshness.new_traffic_blocked),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_cp_connected Whether the DP currently has a ConfigSync stream to some control plane (1) or none (0).\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_cp_connected gauge\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_cp_connected",
+        u64::from(freshness.cp_connected),
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_stale_transitions_total Transitions into the stale state since process start.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_stale_transitions_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_stale_transitions_total",
+        freshness.stale_transitions_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_snapshots_applied_total CP snapshots/deltas validated and successfully applied since process start.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_snapshots_applied_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_snapshots_applied_total",
+        freshness.applied_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_snapshots_rejected_total CP payloads refused before apply since process start.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_snapshots_rejected_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_snapshots_rejected_total",
+        freshness.rejected_total,
+        ns_label,
+    );
+
+    output.push_str(
+        "# HELP ferrum_dp_config_snapshot_apply_failures_total CP snapshots that were admitted and then failed to apply since process start.\n",
+    );
+    output.push_str("# TYPE ferrum_dp_config_snapshot_apply_failures_total counter\n");
+    render_process_counter(
+        output,
+        "ferrum_dp_config_snapshot_apply_failures_total",
+        freshness.apply_failed_total,
+        ns_label,
+    );
 }
 
 fn render_process_counter(output: &mut String, metric_name: &str, value: u64, ns_label: &str) {

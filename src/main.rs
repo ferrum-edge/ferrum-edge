@@ -30,6 +30,11 @@ mod consumer_index;
 mod custom_plugins;
 mod date_cache;
 mod dns;
+// Test-facing constructors/accessors (deterministic-clock variants) are used by
+// the external unit suites and the library target; the binary only reaches the
+// runtime entry points, so the rest is dead code *here* only.
+#[allow(dead_code)]
+mod dp_config_freshness;
 mod dtls;
 mod ebpf;
 // Most of this module is consumed by the library target, `validate`, the admin

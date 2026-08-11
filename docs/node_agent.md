@@ -1279,7 +1279,7 @@ Delivered (issue #3609):
 - **Rollback.** `ferrum-cni rollback-watch` removes an install that never reached CNI readiness, scoped by ownership and generation, with the readiness budget gated on this generation's own publication.
 - **Install verification.** The rollback watcher's STATUS poll *is* the post-install probe: an install whose plugin never answers is undone rather than left in place. The ownership manifest additionally records the digest of the binary that was installed, so an out-of-band replacement is detectable (and blocks removal of that binary). Install also fail-closes under the lifecycle lock before overwriting an existing target conflist unless that file's Ferrum marker names this same owner.
 - **In-place upgrade.** See below.
-- **Hosted evidence.** External Rust integration coverage in `tests/integration/cni_tests.rs` (`install_lifecycle`) plus the existing CI Helm render/static contract assertions. There is no privileged live CNI lifecycle workflow.
+- **Hosted evidence.** External Rust integration coverage in `tests/integration/cni_tests.rs` (`install_lifecycle`, including crash-loop ADD fail-closed, ownership mismatch, repeated cleanup, and upgrade ordering) plus the existing CI Helm render/static contract assertions, plus the privileged live suite `tests/k8s/cni_lifecycle_live/run.sh` (workflow `.github/workflows/cni-lifecycle-live.yml`): live kind install → fail-closed pod creation → rollback recovery → idempotent uninstall → chart cleanup graph failure/retry → full-chart `helm install` / `helm uninstall` under the cluster's real primary CNI.
 
 **In-place upgrade.** A re-run of the installer is an upgrade, and the semantics are now explicit rather than incidental:
 
@@ -1290,10 +1290,9 @@ Delivered (issue #3609):
 
 What remains true, and is a property of POSIX rather than a gap Ferrum can close: a plugin process already `exec`'d from the previous inode runs the previous code until it exits. Because the RPC contract is forward-compatible within a release and the forward is a single sub-second call, that is a coordination *cost* rather than an upgrade barrier — and the skip-if-identical rule removes it from the common case. There is no cross-process handshake that would make an already-running plugin adopt new code, so none is claimed.
 
-**Hosted evidence (not a live cluster gate).** This change is gated by the Rust integration suite and the normal CI Helm rendering/static contract assertions. It does **not** claim a live kind / multi-node recovery job or a full-chart `helm install` / `helm uninstall` lifecycle gate.
+**Post-readiness failure recovery boundary (by design).** Automatic rollback is a *never-ready* path only. The moment CNI STATUS answers `Ok` for this generation, the watcher retains the chain for the lifetime of the pod and never silently unchains a later crash-loop. That is the capture-race posture: a node that was once enrolled stays dependent until an operator (or `helm uninstall`) removes the chain. Recovery after that boundary is the manual path in "Recovering a node" — delete the Ferrum-owned conflist (preferably via `ferrum-cni uninstall`), fix the node-agent, recreate the pod to reinstall. The Rust suite pins the retain-after-ready half (`rollback_watch_retains_artifacts_once_readiness_is_observed`); the live suite pins the never-ready and uninstall halves.
 
 Still deferred / unclaimed operational gaps:
 
 - **Admission-time validation of pod CNI metadata.**
-- **Rollback for a node-agent that fails after it was once ready.** By design (see above); recovery is the manual path in "Recovering a node".
-- **Live full-chart lifecycle.** A privileged live CNI lifecycle workflow is not present; full `helm install` / `helm uninstall` round-trip against a cluster with kernel prerequisites remains an operational gap. Chart hook policies and wiring are pinned statically by the `helm-chart` CI job instead.
+- **Automatic rollback for a node-agent that fails after it was once ready.** Deliberately not implemented (see the boundary above); recovery is the manual path in "Recovering a node".

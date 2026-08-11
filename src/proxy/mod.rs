@@ -24805,6 +24805,36 @@ async fn handle_proxy_request_on_frontend_port(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    // Stale-configuration admission fence (issue #3726). One relaxed atomic
+    // load on a process-global word that only a data plane whose applied CP
+    // snapshot aged past `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` — with no CP
+    // authoritative — ever sets; every other mode reads a constant `0`. New
+    // work fails closed because the gateway can no longer be told that a route,
+    // policy, or credential was revoked; already-accepted connections and
+    // in-flight requests are untouched and drain normally.
+    //
+    // This runs BEFORE the ACME HTTP-01 early return, unlike the overload
+    // carve-out below. Losing a domain validation to load shedding costs a
+    // certificate, which is why ACME outruns overload — but this fence is an
+    // authority-loss boundary, not a capacity one. The challenge token and the
+    // routes that serve it are themselves CP-controlled state the DP can no
+    // longer be told to withdraw, so a challenge must not be the one request
+    // shape that walks past a stale-config gate.
+    if crate::dp_config_freshness::new_traffic_blocked() {
+        let is_grpc = grpc_proxy::is_grpc_request(&req);
+        record_request(&state, 503);
+        if is_grpc {
+            return Ok(grpc_proxy::build_grpc_error_response(
+                grpc_proxy::grpc_status::UNAVAILABLE,
+                "Gateway configuration stale",
+            ));
+        }
+        return Ok(build_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"Gateway configuration stale"}"#,
+        ));
+    }
+
     // ACME HTTP-01 is answered ahead of overload admission on purpose: losing a
     // domain validation to load shedding costs a certificate. The lookup
     // resolves the *canonical* policy path (advisory GHSA-69xf-42xm-4w4f), so an

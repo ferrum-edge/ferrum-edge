@@ -31,6 +31,31 @@ pub async fn run(
 ) -> Result<(), anyhow::Error> {
     info!("DP mode: starting with empty config, waiting for CP");
 
+    // Bounded last-known-good configuration age (issue #3726). Installed before
+    // anything can accept a snapshot or report readiness, so the very first
+    // CP event is already accounted for. The action string was validated in
+    // `EnvConfig::validate()`; re-parsing here keeps the failure explicit
+    // instead of silently choosing a weaker mode.
+    let stale_action = env_config
+        .dp_config_stale_action_parsed()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let config_freshness =
+        crate::dp_config_freshness::install(env_config.dp_config_max_stale(), stale_action);
+    if config_freshness.enabled() {
+        info!(
+            max_stale_seconds = config_freshness.max_stale().as_secs(),
+            stale_action = stale_action.as_str(),
+            "DP last-known-good configuration age is bounded; readiness degrades and the \
+             configured stale action applies once the bound is exceeded with no CP connected"
+        );
+    } else {
+        warn!(
+            "FERRUM_DP_CONFIG_MAX_STALE_SECONDS=0 — the DP will serve its last applied \
+             configuration indefinitely during a total control-plane outage, with no \
+             readiness or admission bound. This is an explicit, unsafe opt-in."
+        );
+    }
+
     // Open the observability delivery lifecycle for this serving cycle before
     // any plugin activation registers a queue worker. Re-running this mode in
     // one process after a completed drain otherwise targets the closed
@@ -143,6 +168,14 @@ pub async fn run(
         env_config.runtime_metrics_window_5m_seconds,
         shutdown_tx.subscribe(),
     );
+
+    // Config-staleness evaluator (issue #3726). CP events (connect, disconnect,
+    // applied snapshot) evaluate inline and `/health` evaluates on demand; the
+    // monitor itself is event/deadline-driven and sleeps until the exact bound
+    // implied by the current applied snapshot (`next_stale_deadline_at`),
+    // re-arming whenever that state changes — no coarse tick.
+    let staleness_handle =
+        start_config_staleness_monitor(config_freshness.clone(), shutdown_tx.subscribe());
 
     // Spawn the DP gRPC client to connect to CP and receive config updates
     let cp_urls = env_config.resolved_dp_cp_grpc_urls();
@@ -912,6 +945,7 @@ pub async fn run(
         background_handles.push(h);
     }
     background_handles.push(overload_handle);
+    background_handles.push(staleness_handle);
     background_handles.push(metrics_handle);
     background_handles.push(runtime_system_handle);
     background_handles.push(runtime_window_handle);
@@ -959,6 +993,74 @@ pub(crate) async fn await_dp_listener_handles(
         let _ = shutdown_tx.send(true);
     };
     crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
+}
+
+/// Close the DP config-staleness boundary at its exact deadline (issue #3726).
+///
+/// Every state change the DP can observe (CP connect, an intentional or failed
+/// reconnect, an applied snapshot) evaluates inline, and `/health` evaluates on
+/// demand. What neither covers is the passage of time itself: a DP that has
+/// lost every control plane and is idle has no event at the moment its snapshot
+/// crosses the bound.
+///
+/// A coarse tick would supply that event only to within its period, which widens
+/// the operator's configured maximum by up to a full period — the bound is a
+/// safety boundary, so it may not be rounded up. Instead this task sleeps until
+/// the *exact* deadline the current applied snapshot implies
+/// (`next_stale_deadline_at`) and re-arms whenever the state that deadline is
+/// derived from changes. There is no polling: with no deadline pending (bound
+/// disabled, already stale, or a CP still authoritative) it waits only on the
+/// change notification, which carries a stored permit so a change that lands
+/// between two waits cannot be missed.
+///
+/// Evaluation itself is a handful of atomic operations with no allocation and no
+/// lock, so nothing here touches the proxy hot path.
+fn start_config_staleness_monitor(
+    freshness: Arc<crate::dp_config_freshness::DpConfigFreshness>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if !freshness.enabled() {
+            return;
+        }
+        let mut logged_transitions = 0u64;
+        loop {
+            let snapshot = freshness.evaluate();
+            if snapshot.stale && snapshot.stale_transitions_total > logged_transitions {
+                logged_transitions = snapshot.stale_transitions_total;
+                // Once per transition into stale, not once per wakeup. No CP
+                // URL, token, or config content — closed-set labels and
+                // counters only.
+                tracing::warn!(
+                    reason = snapshot.reason,
+                    stale_action = snapshot.stale_action,
+                    new_traffic_blocked = snapshot.new_traffic_blocked,
+                    snapshot_age_seconds = snapshot.snapshot_age_seconds,
+                    max_stale_seconds = snapshot.max_stale_seconds,
+                    "DP configuration is stale beyond the configured bound with no \
+                     authoritative control plane; readiness is degraded"
+                );
+            }
+
+            let deadline = freshness.next_stale_deadline_at(std::time::Instant::now());
+            let changed = freshness.wait_for_change();
+            match deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+                        _ = changed => {}
+                        _ = shutdown_rx.changed() => break,
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        _ = changed => {}
+                        _ = shutdown_rx.changed() => break,
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn proxy_frontend_tls_slot_from_operator(

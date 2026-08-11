@@ -8,10 +8,12 @@
 //!
 //! Failure model: any connection / IO / decode error surfaces as
 //! [`CniError::IpcFailed`] which the CNI binary reports back to kubelet
-//! as CNI error code 11. kubelet retries, and meanwhile the node-agent's
-//! kube-rs watcher fallback path keeps enrolling pods at the next
-//! reconcile, so a transient IPC outage degrades to "slower enrollment"
-//! rather than "broken pod networking".
+//! as CNI error code 11. That is the deliberate fail-closed ADD posture
+//! (issue #3609): while a chained conflist is installed, an unreachable
+//! node-agent leaves new pods in `ContainerCreating` rather than starting
+//! them outside the mesh. The kube-rs watcher still reconciles pods that
+//! already have a sandbox; it cannot create one. Do not turn IPC failure
+//! into an unauthenticated pass-through.
 
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -46,8 +48,12 @@ pub fn send_rpc(
     use std::os::unix::net::UnixStream;
 
     let frame = encode_frame(request).map_err(CniError::IpcFailed)?;
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| CniError::IpcFailed(format!("connect {socket_path}: {e}")))?;
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        // The configured socket can contain host filesystem details.  Keep
+        // the CNI stdout error actionable without echoing that path to the
+        // container runtime or its logs.
+        CniError::IpcFailed(format!("connect failed: {:?}", e.kind()))
+    })?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| CniError::IpcFailed(format!("set_read_timeout: {e}")))?;
@@ -168,10 +174,16 @@ mod tests {
         )
         .expect_err("connect should fail when socket is missing");
         match err {
-            CniError::IpcFailed(msg) => assert!(
-                msg.contains("connect"),
-                "expected connect error, got: {msg}"
-            ),
+            CniError::IpcFailed(msg) => {
+                assert!(
+                    msg.contains("connect"),
+                    "expected connect error, got: {msg}"
+                );
+                assert!(
+                    !msg.contains(socket_path.to_string_lossy().as_ref()),
+                    "connect error must not disclose the socket path: {msg}"
+                );
+            }
             other => panic!("expected IpcFailed, got {other:?}"),
         }
     }

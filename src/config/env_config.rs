@@ -1756,6 +1756,21 @@ pub struct EnvConfig {
     /// How often (in seconds) the DP retries the primary (first) CP URL while
     /// connected to a fallback CP. Default: 300 (5 minutes). 0 = disabled.
     pub dp_cp_failover_primary_retry_secs: u64,
+    /// Maximum age (seconds) of the DP's last **validated and successfully
+    /// applied** CP configuration snapshot, measured on a monotonic clock so a
+    /// wall-clock step cannot extend the window (issue #3726). Once the bound is
+    /// exceeded with no CP connected, readiness degrades and — under the default
+    /// `fail_closed` action — new traffic is refused while already-accepted work
+    /// drains. Heartbeats, reconnects, transport success, rejected snapshots,
+    /// and failed applies never reset the age. Default: 3600 (1 hour).
+    /// `0` = disabled (unbounded serving of last-known-good config).
+    pub dp_config_max_stale_seconds: u64,
+    /// What the DP does for NEW traffic once `dp_config_max_stale_seconds` is
+    /// exceeded: `fail_closed` (default — degrade readiness and refuse new
+    /// request/connection admissions) or `readiness_only` (explicitly named
+    /// compatibility mode that degrades readiness only). Parsed into
+    /// [`crate::dp_config_freshness::StaleAction`] by `validate()`.
+    pub dp_config_stale_action: String,
     /// Allow plaintext (non-TLS) CP/DP gRPC config sync on a non-loopback
     /// address. Off by default (secure-by-default): the CP gRPC listener refuses
     /// to bind a non-loopback address without TLS, and the DP rejects a
@@ -3251,6 +3266,8 @@ impl Default for EnvConfig {
             dp_cp_grpc_token_file: None,
             dp_cp_grpc_urls: Vec::new(),
             dp_cp_failover_primary_retry_secs: 300,
+            dp_config_max_stale_seconds: 3600,
+            dp_config_stale_action: "fail_closed".to_string(),
             cp_dp_grpc_allow_plaintext: false,
             cp_grpc_tls_cert_path: None,
             cp_grpc_tls_key_path: None,
@@ -3789,6 +3806,10 @@ impl EnvConfig {
             dp_cp_grpc_token_file: Option<String> = "FERRUM_DP_CP_GRPC_TOKEN_FILE";
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
             dp_cp_failover_primary_retry_secs: u64 = "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS" => 300u64;
+            // Bounded last-known-good config age (issue #3726). Nonzero by
+            // default: an unbounded window is opt-in, never the silent default.
+            dp_config_max_stale_seconds: u64 = "FERRUM_DP_CONFIG_MAX_STALE_SECONDS" => 3600u64;
+            dp_config_stale_action: String = "FERRUM_DP_CONFIG_STALE_ACTION" => "fail_closed".to_string();
             cp_dp_grpc_allow_plaintext: bool = "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT" => false;
             cp_grpc_tls_cert_path: Option<String> = "FERRUM_CP_GRPC_TLS_CERT_PATH";
             cp_grpc_tls_key_path: Option<String> = "FERRUM_CP_GRPC_TLS_KEY_PATH";
@@ -4574,6 +4595,8 @@ impl EnvConfig {
             dp_cp_grpc_token_file,
             dp_cp_grpc_urls,
             dp_cp_failover_primary_retry_secs,
+            dp_config_max_stale_seconds,
+            dp_config_stale_action,
             cp_dp_grpc_allow_plaintext,
             cp_grpc_tls_cert_path,
             cp_grpc_tls_key_path,
@@ -4878,6 +4901,20 @@ impl EnvConfig {
             loop_warn_us: self.overload_loop_warn_us,
             loop_critical_us: self.overload_loop_critical_us,
         }
+    }
+
+    /// Parsed `FERRUM_DP_CONFIG_STALE_ACTION` (issue #3726). An unrecognized
+    /// value is an error, never a silent downgrade to the weaker mode.
+    pub fn dp_config_stale_action_parsed(
+        &self,
+    ) -> Result<crate::dp_config_freshness::StaleAction, String> {
+        crate::dp_config_freshness::StaleAction::parse(&self.dp_config_stale_action)
+    }
+
+    /// Configured maximum age of the DP's applied config snapshot.
+    /// `Duration::ZERO` means the bound is disabled.
+    pub fn dp_config_max_stale(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.dp_config_max_stale_seconds)
     }
 
     pub fn proxy_socket_addr(&self, port: u16) -> std::net::SocketAddr {
@@ -5849,6 +5886,9 @@ impl EnvConfig {
                 if self.dp_cp_grpc_urls.is_empty() {
                     return Err("FERRUM_DP_CP_GRPC_URLS is required in dp mode".into());
                 }
+                // Fail closed on a typo'd stale action rather than silently
+                // falling back to the weaker readiness-only behavior (#3726).
+                self.dp_config_stale_action_parsed()?;
             }
             OperatingMode::Mesh => {
                 // Validate the protocol value before the per-protocol CP
