@@ -603,9 +603,10 @@ mod imp {
         /// insert. See the module-level "withdrawal fence" section.
         publication_generation: AtomicU64,
         /// Exact config-declared identities from the newest reconciled request
-        /// epoch. `None` exists only before the first publication, while the
-        /// serving state is still being constructed. Check-in reads this
-        /// lock-free and compares against the identity already owned by its key.
+        /// epoch. `None` exists only before the first post-construction
+        /// publication; the initial config has no stale predecessor to fence.
+        /// Check-in reads this lock-free and compares against the identity
+        /// already owned by its key.
         live_targets: ArcSwapOption<std::collections::HashSet<UnixTargetIdentity>>,
         /// Highest request-epoch config generation reconciled into this pool.
         ///
@@ -715,10 +716,11 @@ mod imp {
 
         /// Whether the newest published request epoch still declares `key`.
         ///
-        /// Before the first publication the pool is not reachable by serving
-        /// traffic, and focused pool tests intentionally exercise standalone
-        /// checkout/check-in, so an absent snapshot is treated as live. Every
-        /// production publication installs `Some`, including an empty set.
+        /// Before the first post-construction publication the initial config
+        /// has no stale predecessor to fence, and focused pool tests
+        /// intentionally exercise standalone checkout/check-in, so an absent
+        /// snapshot is treated as live. Every later production publication
+        /// installs `Some`, including an empty set.
         #[inline]
         fn target_is_live(&self, key: &UnixPoolKey) -> bool {
             let snapshot = self.live_targets.load();
