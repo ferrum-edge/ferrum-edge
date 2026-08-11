@@ -2015,28 +2015,67 @@ async fn swap_frontend_tls_config_replaces_slot_without_reconcile() {
     );
 }
 
-/// `swap_active_dtls_frontend_configs` is a no-op when there are no active
-/// UDP+DTLS listeners. This proves the swap path doesn't crash on an empty
-/// manager (the common case when a PeerAuth slice apply fires before any
-/// stream listener has bound).
+/// `swap_active_dtls_frontend_configs` validates the candidate once and
+/// publishes it as the accepted generation even when no DTLS listeners are
+/// active yet, so a later-started listener converges on the same material.
 #[tokio::test]
-async fn swap_active_dtls_frontend_configs_is_noop_with_no_listeners() {
+async fn swap_active_dtls_frontend_configs_publishes_generation_without_listeners() {
     let manager = create_manager(empty_config());
     let calls = std::sync::atomic::AtomicUsize::new(0);
     let swapped = manager
         .swap_active_dtls_frontend_configs(|| {
             calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Err(anyhow::anyhow!(
-                "build_config must not be called when no DTLS listeners exist"
-            ))
+            Ok(ephemeral_frontend_dtls_config())
         })
         .await;
-    assert_eq!(swapped, 0, "no listeners should mean no swaps");
+    assert_eq!(swapped, 0, "no listeners should mean no live swaps");
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::Relaxed),
-        0,
-        "build_config must not be invoked when there are no active DTLS listeners"
+        1,
+        "build_config must run exactly once so the accepted generation is published"
     );
+    let generation = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("generation published with zero listeners");
+    assert_eq!(generation.generation, 1);
+    let status = manager.frontend_dtls_reload_status();
+    assert_eq!(status.last_outcome, "accepted");
+    assert_eq!(status.generation, 1);
+}
+
+#[tokio::test]
+async fn rejected_dtls_candidate_retains_previous_generation() {
+    let manager = create_manager(empty_config());
+    let (_gen, swapped) = manager
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .await;
+    assert_eq!(swapped, 0);
+    let before = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("initial generation");
+
+    let swapped = manager
+        .swap_active_dtls_frontend_configs(|| Err(anyhow::anyhow!("simulated bad candidate")))
+        .await;
+    assert_eq!(swapped, 0);
+    let after = manager
+        .snapshot_frontend_dtls_generation()
+        .expect("previous generation retained");
+    assert_eq!(before.generation, after.generation);
+    let status = manager.frontend_dtls_reload_status();
+    assert_eq!(status.last_outcome, "rejected");
+    assert_eq!(status.generation, before.generation);
+    assert!(status.last_failure_unix.is_some());
+}
+
+fn ephemeral_frontend_dtls_config() -> ferrum_edge::dtls::FrontendDtlsConfig {
+    let certificate = ferrum_edge::dtls::generate_ephemeral_cert_public().expect("ephemeral cert");
+    let config = dimpl::Config::builder().build().expect("dtls config");
+    ferrum_edge::dtls::FrontendDtlsConfig {
+        dimpl_config: std::sync::Arc::new(config),
+        certificate,
+        client_cert_verifier: None,
+    }
 }
 
 /// Minimal cert resolver for the swap-pointer test. Never gets driven, so

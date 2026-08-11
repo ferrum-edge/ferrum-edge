@@ -111,10 +111,29 @@ async fn fail_pending_app_sends(driver_app_rx: &mut mpsc::Receiver<PendingAppSen
 // ============================================================================
 
 /// Frontend DTLS server configuration (client → gateway).
+///
+/// Cloneable so one validated generation can be published into the shared
+/// accept slot and live-swapped into every active [`DtlsServer`] without
+/// re-reading sources (which could race and mix generations).
+#[derive(Clone)]
 pub struct FrontendDtlsConfig {
     pub dimpl_config: Arc<Config>,
     pub certificate: DtlsCertificateChain,
     pub client_cert_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+}
+
+/// One immutable, accepted frontend DTLS material generation.
+///
+/// Live reload validates candidate cert/key/client-CA/CRL inputs into a single
+/// [`FrontendDtlsConfig`], then publishes that config under a monotonic
+/// generation id. Active DTLS servers and listeners spawned after the publish
+/// all observe the same generation; a rejected candidate never replaces it.
+#[derive(Clone)]
+pub struct FrontendDtlsGeneration {
+    /// Monotonic generation id assigned at publish time (starts at 1).
+    pub generation: u64,
+    /// Validated crypto material for new handshakes.
+    pub config: FrontendDtlsConfig,
 }
 
 /// Admission controls for the frontend DTLS demuxer.
@@ -1055,7 +1074,8 @@ impl DtlsServer {
 
     /// Atomically swap the DTLS crypto material used for **new** sessions.
     ///
-    /// Used by mesh PeerAuthentication live reload to rotate the inbound DTLS
+    /// Used by frontend DTLS live reload (`FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED`)
+    /// and mesh PeerAuthentication live reload to rotate the inbound DTLS
     /// `ServerConfig` equivalent (dimpl `Config` + certificate + optional
     /// `ClientCertVerifier`) without re-binding the socket or evicting any
     /// in-flight session. Active sessions keep the snapshot they handshake

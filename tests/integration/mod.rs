@@ -48,6 +48,7 @@ mod example_audit_plugin_opt_in_tests;
 mod example_plugin_contract_tests;
 mod file_mode_admin_jwt_tests;
 mod file_mode_reload_observability_tests;
+mod frontend_dtls_live_reload_tests;
 mod frontend_tls_live_reload_tests;
 mod gateway_allowed_routes_selector_tests;
 mod gateway_api_backend_ref_kinds_tests;
