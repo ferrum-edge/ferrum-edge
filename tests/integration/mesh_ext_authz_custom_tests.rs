@@ -1069,4 +1069,101 @@ mod live_datapath {
         .expect("generation builds");
         assert!(plugin.should_buffer_request_body(&ctx("/anything")));
     }
+
+    fn body_slice_with_ports(port: u16, ports: &[u16], not_ports: &[u16]) -> serde_json::Value {
+        json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "delegate-admin-port",
+                "namespace": "default",
+                "scope": { "kind": "mesh_wide" },
+                "rules": [{
+                    "to": [{
+                        "paths": ["/admin/*"],
+                        "ports": ports,
+                        "not_ports": not_ports,
+                    }],
+                    "action": { "custom": { "provider": "sample-ext-authz" } },
+                }],
+            }],
+            "ext_authz_providers": [{
+                "name": "sample-ext-authz",
+                "service": "127.0.0.1",
+                "port": port,
+                "timeout_ms": 500,
+                "fail_open": true,
+                "status_on_error": 403,
+                "include_request_body_in_check": { "max_request_bytes": 64 },
+            }],
+        })
+    }
+
+    /// Positive port scoping must NOT suppress pre-authorize buffering.
+    ///
+    /// Destination port is resolved later (orig-dst / matched proxy). A
+    /// prebuffer predicate that required `request.port` would return false
+    /// here, leave the body unbuffered, then match at authorize and — with
+    /// `failOpen` — admit on `BodyUnavailable`.
+    #[test]
+    fn a_body_inspecting_custom_rule_with_positive_port_scope_still_buffers() {
+        let plugin =
+            plugin(body_slice_with_ports(9000, &[8080], &[])).expect("generation builds");
+        assert!(
+            plugin.should_buffer_request_body(&ctx("/admin/reports")),
+            "positive ports are unavailable at the prebuffer point and must be treated as satisfiable"
+        );
+        assert!(
+            !plugin.should_buffer_request_body(&ctx("/public/upload")),
+            "method/path/host narrowing must still exclude unrelated requests"
+        );
+    }
+
+    #[test]
+    fn a_body_inspecting_custom_rule_with_negative_port_scope_still_buffers() {
+        let plugin =
+            plugin(body_slice_with_ports(9000, &[], &[9090])).expect("generation builds");
+        assert!(
+            plugin.should_buffer_request_body(&ctx("/admin/reports")),
+            "notPorts is also unavailable pre-authorize and must not false-negative buffering"
+        );
+    }
+
+    /// End-to-end through `authorize`: once the prebuffer gate says yes and
+    /// the body is present, a port-scoped body-inspecting CUSTOM rule with
+    /// `failOpen` contacts the provider instead of admitting on
+    /// `BodyUnavailable`.
+    #[tokio::test]
+    async fn a_port_scoped_body_inspecting_rule_cannot_fail_open_on_body_unavailable() {
+        let stub = start_status_stub(200).await;
+        let plugin =
+            plugin(body_slice_with_ports(stub.port, &[8080], &[])).expect("generation builds");
+        let mut ctx = ctx("/admin/reports");
+        // Authorize resolves destination port from the frontend listen port
+        // when mesh direction / orig-dst evidence is absent — the same
+        // evidence that is unavailable at the prebuffer point.
+        ctx.frontend_listen_port = Some(8080);
+        assert!(
+            plugin.should_buffer_request_body(&ctx),
+            "the proxy must buffer before authorize for this rule"
+        );
+        ctx.request_body_bytes = Some(b"payload".to_vec().into());
+
+        assert!(
+            matches!(plugin.authorize(&mut ctx).await, PluginResult::Continue),
+            "with the body buffered, failOpen must not be reached via BodyUnavailable"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("mesh_authz.ext_authz_outcome")
+                .map(String::as_str),
+            Some("allowed")
+        );
+        assert_eq!(
+            stub.calls.load(Ordering::SeqCst),
+            1,
+            "the provider must be contacted once the body is available"
+        );
+    }
 }

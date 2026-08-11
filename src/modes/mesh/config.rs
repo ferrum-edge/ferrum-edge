@@ -582,9 +582,11 @@ pub struct MeshExtAuthzHeader {
 pub struct MeshExtAuthzBodyCheck {
     /// Maximum number of request body bytes forwarded to the provider.
     pub max_request_bytes: usize,
-    /// When `true`, a body larger than `max_request_bytes` is truncated and
-    /// the check still runs. When `false` (Istio default) an oversize body
-    /// fails the check, which fails closed unless `failOpen` is set.
+    /// Istio's `allowPartialMessage`. Ferrum refuses `true` at every admission
+    /// boundary: an oversize body is an unconditional client-facing `413`
+    /// before the check runs and is never subject to `failOpen`. Kept on the
+    /// typed model so a hostile/`true` carrier is still deserialized and
+    /// rejected with a field-shaped diagnostic rather than silently dropped.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_partial_message: bool,
 }

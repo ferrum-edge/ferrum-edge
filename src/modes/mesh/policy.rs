@@ -319,31 +319,106 @@ where
 /// body-inspecting CUSTOM rule can reach a request — i.e. whether that
 /// provider's `maxRequestBytes` ceiling and the pre-`authorize` body buffer
 /// apply at all. It must have NO FALSE NEGATIVES for a rule that will later
-/// match, or a body-inspecting check would run without a body and fail closed.
+/// match, or a body-inspecting check would run without a body and — under
+/// `failOpen` — admit the request without an authorization decision.
 ///
-/// It is therefore evaluated over the `to:` block alone, against the three
-/// attributes the pre-authorize point can read. Every other predicate —
-/// `from:` source identity, `when:` conditions, and the port/header fields of
-/// the same `to:` block — is treated as satisfiable: the synthetic request
-/// leaves them absent, and CUSTOM (like DENY) treats an unobservable HTTP
-/// attribute as matched, so the answer can only ever be MORE permissive than
-/// the real evaluation. A request whose method, path, and host cannot satisfy
-/// any `to:` entry keeps its ordinary accepted body size.
+/// Method, path, and host are checked precisely against the `to:` block.
+/// Every other predicate — `from:` source identity, `when:` conditions, and
+/// the port/header fields of the same `to:` block — is treated as
+/// satisfiable: those dimensions are incomplete or unavailable at the
+/// prebuffer point (destination port is resolved later from orig-dst /
+/// matched-proxy evidence), so consulting them here would false-negative a
+/// rule that matches once authorize observes them. A request whose method,
+/// path, and host cannot satisfy any `to:` entry keeps its ordinary accepted
+/// body size. This path intentionally allocates nothing beyond an optional
+/// host normalization when a `to:` entry actually constrains hosts.
 pub fn mesh_rule_request_scope_may_apply(
     rule: &MeshRule,
     method: &str,
     path: &str,
     host: Option<&str>,
 ) -> bool {
-    let request = MeshAuthzRequest {
-        method: Some(method.to_string()),
-        path: Some(path.to_string()),
-        host: host.map(str::to_string),
-        protocol: MeshAuthzProtocol::Http,
-        ..MeshAuthzRequest::default()
+    if rule.to.is_empty() {
+        return true;
+    }
+    let needs_host = rule
+        .to
+        .iter()
+        .any(|match_| !match_.hosts.is_empty() || !match_.not_hosts.is_empty());
+    let normalized_host = if needs_host {
+        host.and_then(normalize_match_host)
+    } else {
+        None
     };
-    let normalized_host = request.host.as_deref().and_then(normalize_match_host);
-    matches_requests(&rule.to, &request, &rule.action, normalized_host.as_ref())
+    rule.to.iter().any(|match_| {
+        request_scope_method_path_host_may_apply(match_, method, path, normalized_host.as_ref())
+    })
+}
+
+/// Precise method/path/host narrowing for the pre-`authorize` body-buffer
+/// decision. Ports, headers, and every other `to:` dimension are deliberately
+/// ignored so an unavailable attribute cannot suppress buffering.
+fn request_scope_method_path_host_may_apply(
+    match_: &RequestMatch,
+    method: &str,
+    path: &str,
+    normalized_host: Option<&NormalizedHost>,
+) -> bool {
+    if !match_.methods.is_empty()
+        && !match_
+            .methods
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(method))
+    {
+        return false;
+    }
+    if !match_.not_methods.is_empty()
+        && match_
+            .not_methods
+            .iter()
+            .any(|denied| denied.eq_ignore_ascii_case(method))
+    {
+        return false;
+    }
+    if !match_.paths.is_empty()
+        && !match_
+            .paths
+            .iter()
+            .any(|pattern| wildcard_match(pattern, path))
+    {
+        return false;
+    }
+    if !match_.not_paths.is_empty()
+        && match_
+            .not_paths
+            .iter()
+            .any(|pattern| wildcard_match(pattern, path))
+    {
+        return false;
+    }
+    if !match_.hosts.is_empty() {
+        match normalized_host {
+            Some(host)
+                if match_
+                    .hosts
+                    .iter()
+                    .any(|pattern| normalized_host_matches(pattern, host)) => {}
+            // Missing/unparseable host is satisfiable: authorize may still
+            // observe one, and this predicate must not false-negative.
+            None => {}
+            Some(_) => return false,
+        }
+    }
+    if !match_.not_hosts.is_empty()
+        && let Some(host) = normalized_host
+        && match_
+            .not_hosts
+            .iter()
+            .any(|pattern| normalized_host_matches(pattern, host))
+    {
+        return false;
+    }
+    true
 }
 
 /// `policy_namespace` is the namespace of the owning [`MeshPolicy`] (the
