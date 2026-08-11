@@ -1699,7 +1699,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
             let mut last_snapshot: Option<Arc<XdsSnapshot>> = None;
             loop {
                 tokio::select! {
-                    _reason = &mut authorization_end => return,
+                    reason = &mut authorization_end => {
+                        // Deliver the authoritative status into the authorized
+                        // response wrapper. Dropping the producer alone can race
+                        // paused-time deadline auto-advance on the wrapper and
+                        // surface an unrelated Unauthenticated closure.
+                        let _ = tx.send(Err(reason.status())).await;
+                        return;
+                    }
                     maybe_request = requests.next() => {
                         let Some(request) = maybe_request else {
                             return;
@@ -2003,7 +2010,14 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                 HashMap::new();
             loop {
                 tokio::select! {
-                    _reason = &mut authorization_end => return,
+                    reason = &mut authorization_end => {
+                        // Deliver the authoritative status into the authorized
+                        // response wrapper. Dropping the producer alone can race
+                        // paused-time deadline auto-advance on the wrapper and
+                        // surface an unrelated Unauthenticated closure.
+                        let _ = tx.send(Err(reason.status())).await;
+                        return;
+                    }
                     maybe_request = requests.next() => {
                         let Some(request) = maybe_request else {
                             return;

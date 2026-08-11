@@ -35,8 +35,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 use tokio::time::{Instant, Sleep};
-use tokio_stream::wrappers::WatchStream;
 use tonic::Status;
 use tracing::{info, warn};
 
@@ -640,6 +640,11 @@ pub struct StreamAuthorizationLease {
 }
 
 impl StreamAuthorizationLease {
+    /// Matches ConfigSync's application heartbeat cadence so ADS producers and
+    /// ConfigSync response streams share the same paused-time auto-advance
+    /// ceiling while setup I/O is still in flight.
+    const KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
+
     pub fn new(
         identity: &VerifiedGrpcIdentity,
         verifier: Arc<CpDpVerifierStore>,
@@ -655,39 +660,98 @@ impl StreamAuthorizationLease {
         }
     }
 
+    fn credential_is_active(&self) -> bool {
+        self.verifier
+            .credential_is_active(&self.credential, self.credential_generation)
+    }
+
     /// Wait without polling. Used by the task-owned bidirectional ADS loops.
     pub async fn wait_for_end(&self) -> StreamAuthEndReason {
         let mut revisions = self.verifier.subscribe();
+        // ADS producers have no application heartbeat. A short keepalive timer
+        // keeps paused-time auto-advance from leaping straight to a multi-minute
+        // server/token deadline while real loopback setup I/O is still in flight;
+        // each tick only re-enters the credential check at the top of the loop.
+        let mut keepalive = tokio::time::interval_at(
+            Instant::now() + Self::KEEPALIVE_PERIOD,
+            Self::KEEPALIVE_PERIOD,
+        );
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             // Credential removal is an authorization decision, so it wins
             // over a coincident expiry/server deadline. Checking the live
             // generation directly also closes the remove-then-readd gap even
             // when the watch receiver coalesces both revisions.
-            if !self
-                .verifier
-                .credential_is_active(&self.credential, self.credential_generation)
-            {
+            if !self.credential_is_active() {
                 return StreamAuthEndReason::VerificationKeyRemoved;
             }
             tokio::select! {
                 biased;
                 changed = revisions.changed() => {
-                    if changed.is_err()
-                        || !self.verifier.credential_is_active(
-                            &self.credential,
-                            self.credential_generation,
-                        )
-                    {
+                    if changed.is_err() || !self.credential_is_active() {
                         return StreamAuthEndReason::VerificationKeyRemoved;
                     }
                 }
+                _ = keepalive.tick() => {}
                 _ = tokio::time::sleep_until(self.authorization_deadline) => {
+                    // A paused-time auto-advance can make this arm ready in the
+                    // same wakeup as a coalesced revocation. Re-check before
+                    // classifying the closure as expiry.
+                    if !self.credential_is_active() {
+                        return StreamAuthEndReason::VerificationKeyRemoved;
+                    }
                     return StreamAuthEndReason::Expired;
                 }
                 _ = tokio::time::sleep_until(self.server_deadline) => {
+                    if !self.credential_is_active() {
+                        return StreamAuthEndReason::VerificationKeyRemoved;
+                    }
                     return StreamAuthEndReason::ServerMaxLifetime;
                 }
             }
+        }
+    }
+}
+
+/// Pinned `watch::Receiver::changed()` future used by response streams. Kept
+/// as an explicit state machine so a retained-key reload re-arms without the
+/// `WatchStream` follow-up-poll hazard that can leave an idle tonic stream
+/// unwakeable for the next removal.
+struct VerifierWatch {
+    future: Pin<
+        Box<
+            dyn Future<Output = (Result<(), watch::error::RecvError>, watch::Receiver<u64>)> + Send,
+        >,
+    >,
+}
+
+impl VerifierWatch {
+    fn new(rx: watch::Receiver<u64>) -> Self {
+        Self {
+            future: Self::wait(rx),
+        }
+    }
+
+    fn wait(
+        mut rx: watch::Receiver<u64>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = (Result<(), watch::error::RecvError>, watch::Receiver<u64>)> + Send,
+        >,
+    > {
+        Box::pin(async move {
+            let result = rx.changed().await;
+            (result, rx)
+        })
+    }
+
+    fn poll_changed(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), watch::error::RecvError>> {
+        match self.future.as_mut().poll(cx) {
+            Poll::Ready((result, rx)) => {
+                self.future = Self::wait(rx);
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -700,7 +764,7 @@ pub struct AuthorizedResponseStream<S> {
     inner: Pin<Box<S>>,
     authorization_sleep: Pin<Box<Sleep>>,
     server_sleep: Pin<Box<Sleep>>,
-    verifier_revisions: WatchStream<u64>,
+    verifier_watch: VerifierWatch,
     credential: VerificationCredentialIdentity,
     credential_generation: u64,
     verifier: Arc<CpDpVerifierStore>,
@@ -724,7 +788,7 @@ impl<S> AuthorizedResponseStream<S> {
                 identity.authorization_deadline,
             )),
             server_sleep: Box::pin(tokio::time::sleep_until(server_deadline)),
-            verifier_revisions: WatchStream::from_changes(verifier.subscribe()),
+            verifier_watch: VerifierWatch::new(verifier.subscribe()),
             credential: identity.credential.clone(),
             credential_generation: identity.credential_generation,
             verifier,
@@ -745,7 +809,7 @@ impl<S> AuthorizedResponseStream<S> {
     }
 
     /// Resolve a closed authorization boundary in deterministic priority
-    /// order. The direct generation read is load-bearing: the watch stream is
+    /// order. The direct generation read is load-bearing: the watch channel is
     /// a wake-up mechanism, not the source of truth, and may coalesce a rapid
     /// remove/re-add into one notification.
     fn authorization_end(&mut self, cx: &mut Context<'_>) -> Option<StreamAuthEndReason> {
@@ -753,28 +817,33 @@ impl<S> AuthorizedResponseStream<S> {
             return Some(StreamAuthEndReason::VerificationKeyRemoved);
         }
         if self.authorization_sleep.as_mut().poll(cx).is_ready() {
-            return Some(StreamAuthEndReason::Expired);
+            return Some(if !self.credential_is_active() {
+                StreamAuthEndReason::VerificationKeyRemoved
+            } else {
+                StreamAuthEndReason::Expired
+            });
         }
         if self.server_sleep.as_mut().poll(cx).is_ready() {
-            return Some(StreamAuthEndReason::ServerMaxLifetime);
+            return Some(if !self.credential_is_active() {
+                StreamAuthEndReason::VerificationKeyRemoved
+            } else {
+                StreamAuthEndReason::ServerMaxLifetime
+            });
         }
-        let verifier_changed =
-            match tokio_stream::Stream::poll_next(Pin::new(&mut self.verifier_revisions), cx) {
-                Poll::Ready(Some(_)) => {
-                    // `WatchStream` installs its next `changed()` future only when
-                    // it is polled again. Schedule that bounded follow-up poll so
-                    // a retained-key reload cannot leave an idle response stream
-                    // unwakeable for the next removal.
-                    cx.waker().wake_by_ref();
-                    true
+        match self.verifier_watch.poll_changed(cx) {
+            Poll::Ready(Err(_)) => Some(StreamAuthEndReason::VerificationKeyRemoved),
+            Poll::Ready(Ok(())) => {
+                // Re-arm immediately so a retained-key reload cannot leave the
+                // next removal without a parked `changed()` waker. The
+                // generation read below is authoritative for this wakeup.
+                cx.waker().wake_by_ref();
+                if !self.credential_is_active() {
+                    Some(StreamAuthEndReason::VerificationKeyRemoved)
+                } else {
+                    None
                 }
-                Poll::Ready(None) => return Some(StreamAuthEndReason::VerificationKeyRemoved),
-                Poll::Pending => false,
-            };
-        if verifier_changed && !self.credential_is_active() {
-            Some(StreamAuthEndReason::VerificationKeyRemoved)
-        } else {
-            None
+            }
+            Poll::Pending => None,
         }
     }
 }
