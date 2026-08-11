@@ -71,29 +71,14 @@ use crate::modes::mesh::slice::{
 pub const CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL: Duration =
     Duration::from_secs(CONFIGSYNC_HEARTBEAT_INTERVAL_SECS);
 
+/// Project this subscriber's namespace view of Gateway frontend TLS.
+///
+/// The whole certificate set for the namespace is retained — a namespace may
+/// own many certificates (#3267 / #3268) — and every other namespace's entries
+/// are dropped before the snapshot leaves the CP. One shared implementation
+/// with the DP-side filter so the two cannot drift apart.
 fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespace: &str) {
-    if let Some(source) = config
-        .frontend_tls_namespace_sources
-        .iter()
-        .find(|source| source.namespace == namespace)
-        .cloned()
-    {
-        config.frontend_tls_cert_path = Some(source.cert_path);
-        config.frontend_tls_key_path = Some(source.key_path);
-        config.frontend_tls_source_namespace = Some(source.namespace);
-        config.frontend_tls_namespace_sources.clear();
-        return;
-    }
-    config.frontend_tls_namespace_sources.clear();
-    if config
-        .frontend_tls_source_namespace
-        .as_deref()
-        .is_some_and(|source_namespace| source_namespace != namespace)
-    {
-        config.frontend_tls_cert_path = None;
-        config.frontend_tls_key_path = None;
-        config.frontend_tls_source_namespace = None;
-    }
+    let _ = config.filter_frontend_tls_to_namespace(namespace);
 }
 
 /// What set of namespaces a CP instance is authorised to serve.
@@ -3682,16 +3667,18 @@ mod tests {
             frontend_tls_cert_path: Some("k8s://ns-a/gateway-cert#tls.crt".to_string()),
             frontend_tls_key_path: Some("k8s://ns-a/gateway-cert#tls.key".to_string()),
             frontend_tls_source_namespace: Some("ns-a".to_string()),
-            frontend_tls_namespace_sources: vec![
-                FrontendTlsNamespaceSource {
+            frontend_tls_certificate_sources: vec![
+                FrontendTlsCertificateSource {
                     namespace: "ns-a".to_string(),
                     cert_path: "k8s://ns-a/gateway-cert#tls.crt".to_string(),
                     key_path: "k8s://ns-a/gateway-cert#tls.key".to_string(),
+                    ..Default::default()
                 },
-                FrontendTlsNamespaceSource {
+                FrontendTlsCertificateSource {
                     namespace: "ns-b".to_string(),
                     cert_path: "k8s://ns-b/gateway-cert#tls.crt".to_string(),
                     key_path: "k8s://ns-b/gateway-cert#tls.key".to_string(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -3710,7 +3697,15 @@ mod tests {
             filtered.frontend_tls_source_namespace.as_deref(),
             Some("ns-b")
         );
-        assert!(filtered.frontend_tls_namespace_sources.is_empty());
+        // The whole set the subscribing namespace owns is retained — a
+        // namespace is not a one-certificate slot (#3268) — and every other
+        // namespace's entries are gone before the snapshot leaves the CP.
+        assert_eq!(filtered.frontend_tls_certificate_sources.len(), 1);
+        assert_eq!(
+            filtered.frontend_tls_certificate_sources[0].namespace,
+            "ns-b"
+        );
+        assert!(filtered.frontend_tls_certificate_sources[0].default_certificate);
     }
 
     #[test]

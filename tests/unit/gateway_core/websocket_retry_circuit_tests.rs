@@ -71,10 +71,12 @@ fn h3_websocket_retry_is_circuit_breaker_gated_before_dispatch() {
 }
 
 // The H3 WebSocket bridge has no mesh WS transport fork, so its connect loop
-// must screen the selected target with `direct_http_mesh_transport_refusal`
-// BEFORE the plain `connect_websocket_backend` dial. The screen sits at the
-// loop top so both the initial target and every retry-rotated target
-// re-entering the loop are covered (issue #2007).
+// must screen the selected target with `direct_network_http_transport_refusal`
+// BEFORE the plain `connect_websocket_backend` dial. That stronger helper
+// retains the secured-mesh screen and also rejects Unix targets whose host/port
+// is only a schema carrier. The screen sits at the loop top so both the initial
+// target and every retry-rotated target re-entering the loop are covered
+// (issues #2007 and #3261).
 #[test]
 fn h3_websocket_connect_loop_screens_mesh_transport_refusal_before_dial() {
     let src = include_str!("../../../src/http3/websocket.rs");
@@ -83,15 +85,15 @@ fn h3_websocket_connect_loop_screens_mesh_transport_refusal_before_dial() {
         .expect("h3_websocket: backend connect loop not found");
     let loop_tail = &src[loop_start..];
     let refusal = loop_tail
-        .find("direct_http_mesh_transport_refusal(")
-        .expect("h3_websocket: connect loop does not screen mesh transport refusal");
+        .find("direct_network_http_transport_refusal(")
+        .expect("h3_websocket: connect loop does not screen network-only transport refusal");
     let dial = loop_tail
         .find("connect_websocket_backend(")
         .expect("h3_websocket: backend dial not found");
     assert!(
         refusal < dial,
-        "h3_websocket: the mesh-transport refusal screen must run before the plain \
-         backend dial so a mesh-tagged target (initial or retry-rotated) is never \
+        "h3_websocket: the network-only transport refusal screen must run before the plain \
+         backend dial so a mesh- or Unix-tagged target (initial or retry-rotated) is never \
          dialed directly"
     );
 }

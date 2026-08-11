@@ -13,4 +13,5 @@ pub mod http_headers;
 pub mod json_dup_keys;
 pub mod media_type;
 pub mod sharding;
+pub mod unix_socket;
 pub mod unknown_keys;

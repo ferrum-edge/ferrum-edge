@@ -50,6 +50,7 @@ DISC_BA_PORT=15444
 NODE_A="" NODE_B="" TOXI_IP="" ADMIN_SECRET="" JWT_A="" JWT_B=""
 INITIAL_TRUST_AGE=0 INITIAL_ENDPOINT_AGE=0
 INITIAL_FEDERATION_SUCCESS_AT=0 INITIAL_DISCOVERY_SUCCESSES=0
+INITIAL_REVERSE_FEDERATION_SUCCESS_AT=0 INITIAL_REVERSE_DISCOVERY_SUCCESSES=0
 INITIAL_FEDERATION_FAILURES=0 INITIAL_DISCOVERY_FAILURES=0
 TRANSIENT_FEDERATION_FAILURE_DELTA=0 TRANSIENT_DISCOVERY_FAILURE_DELTA=0
 RECORDED=" "
@@ -737,8 +738,10 @@ scenario_initial() {
   wait_for_state "A initial polled trust and endpoints" 90 "$CONTEXT_A" "$JWT_A" cluster-b true polled true true
   wait_for_state "B initial polled trust and endpoints" 90 "$CONTEXT_B" "$JWT_B" cluster-a true polled true true
   wait_for_fresh_state "A initial cache freshness" 20 "$CONTEXT_A" "$JWT_A" cluster-b
-  INITIAL_FEDERATION_SUCCESS_AT="$( metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_federation_last_success_timestamp_seconds "trust_domain=\"$TD_B\"")"
-  INITIAL_DISCOVERY_SUCCESSES="$( metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_remote_discovery_poll_successes_total "cluster=\"cluster-b\"")"
+  INITIAL_FEDERATION_SUCCESS_AT="$( metric_uint_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_federation_last_success_timestamp_seconds "trust_domain=\"$TD_B\"")"
+  INITIAL_DISCOVERY_SUCCESSES="$( metric_uint_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_remote_discovery_poll_successes_total "cluster=\"cluster-b\"")"
+  INITIAL_REVERSE_FEDERATION_SUCCESS_AT="$( metric_uint_value "$CONTEXT_B" "$JWT_B" ferrum_mesh_federation_last_success_timestamp_seconds "trust_domain=\"$TD_A\"")"
+  INITIAL_REVERSE_DISCOVERY_SUCCESSES="$( metric_uint_value "$CONTEXT_B" "$JWT_B" ferrum_mesh_remote_discovery_poll_successes_total "cluster=\"cluster-a\"")"
   wait_for_traffic "A to B initial traffic" 60 "$CONTEXT_A" echo-b echo-b
   wait_for_traffic "B to A initial traffic" 60 "$CONTEXT_B" echo-a echo-a
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.initial.polled_trust_endpoints_installed
@@ -790,14 +793,25 @@ scenario_transient() {
   }
   record multicluster_poller.transient.last_good_retained pass "traffic-200-during-short-partition" "poller.transient.last_good_retained.{json,prom}"
   record multicluster_poller.transient.cache_age_increased pass "trust-and-endpoint-age-3-to-7-seconds" "poller.transient.last_good_retained.json"
+  # Cache age is deliberately still below the stale windows here. Merely
+  # observing an age below five seconds after re-enabling Toxiproxy can therefore
+  # accept the retained pre-partition value before either poller has recovered.
+  # Prove a real post-partition poll in both directions by waiting on each
+  # monotonic success signal before using freshness as the admin/status check.
+  wait_for_metric_increase "A federation poll recovery" 40 "$CONTEXT_A" "$JWT_A" \
+    ferrum_mesh_federation_last_success_timestamp_seconds "trust_domain=\"$TD_B\"" \
+    "$INITIAL_FEDERATION_SUCCESS_AT"
+  wait_for_metric_increase "A discovery poll recovery" 40 "$CONTEXT_A" "$JWT_A" \
+    ferrum_mesh_remote_discovery_poll_successes_total "cluster=\"cluster-b\"" \
+    "$INITIAL_DISCOVERY_SUCCESSES"
+  wait_for_metric_increase "B federation poll recovery" 40 "$CONTEXT_B" "$JWT_B" \
+    ferrum_mesh_federation_last_success_timestamp_seconds "trust_domain=\"$TD_A\"" \
+    "$INITIAL_REVERSE_FEDERATION_SUCCESS_AT"
+  wait_for_metric_increase "B discovery poll recovery" 40 "$CONTEXT_B" "$JWT_B" \
+    ferrum_mesh_remote_discovery_poll_successes_total "cluster=\"cluster-a\"" \
+    "$INITIAL_REVERSE_DISCOVERY_SUCCESSES"
   wait_for_fresh_state "same-generation transient recovery" 40 "$CONTEXT_A" "$JWT_A" cluster-b
   wait_for_fresh_state "same-generation reverse recovery" 40 "$CONTEXT_B" "$JWT_B" cluster-a
-  local recovered_federation_at recovered_discovery_successes
-  recovered_federation_at="$( metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_federation_last_success_timestamp_seconds "trust_domain=\"$TD_B\"")"
-  recovered_discovery_successes="$( metric_value "$CONTEXT_A" "$JWT_A" ferrum_mesh_remote_discovery_poll_successes_total "cluster=\"cluster-b\"")"
-  (( recovered_federation_at > INITIAL_FEDERATION_SUCCESS_AT && recovered_discovery_successes > INITIAL_DISCOVERY_SUCCESSES )) || {
-    echo "poll recovery metrics did not advance" >&2; return 1;
-  }
   assert_metric_admin_parity "$CONTEXT_A" "$JWT_A" cluster-b "$TD_B"
   capture_boundary "$CONTEXT_A" "$JWT_A" poller.metrics.failure_backoff_recovery_cache_age
   record multicluster_poller.metrics.failure_backoff_recovery_bounded pass \

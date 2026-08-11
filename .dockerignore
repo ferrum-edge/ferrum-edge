@@ -1,6 +1,11 @@
 .git
 .gitignore
 .github
+!.github/
+.github/*
+!.github/scripts/
+.github/scripts/*
+!.github/scripts/stage_iproute2_runtime.sh
 target
 *.md
 docs

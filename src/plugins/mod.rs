@@ -7978,6 +7978,34 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Cold-path: encoded per-family tag-override plans this instance stamps
+    /// into request/stream metadata.
+    ///
+    /// Plugin-cache admission composes surviving plans across effective
+    /// `workload_metrics` instances (later same-family plans replace; other
+    /// families survive) and rejects chains whose aggregate stamped bytes
+    /// exceed the publication budget. Ordinary plugins retain the empty
+    /// default. Must not run on the request hot path.
+    fn metric_tag_override_plans(
+        &self,
+    ) -> &[(
+        crate::plugins::mesh::prometheus_helpers::MeshMetricFamily,
+        String,
+    )] {
+        &[]
+    }
+
+    /// Cold-path: whether this instance may be skipped by an execution gate.
+    ///
+    /// A conditional later plan cannot unconditionally retire an earlier plan
+    /// from PluginCache's worst-case publication budget: when the gate skips,
+    /// the earlier same-family plan remains in request metadata. Ordinary and
+    /// unwrapped plugin instances always execute and retain the `false`
+    /// default. Must not run on the request hot path.
+    fn metric_tag_override_plans_are_conditional(&self) -> bool {
+        false
+    }
+
     /// Cold-path scrape exporter for `__mesh_bpf_metrics`.
     ///
     /// Plugin-cache generations extract this once from the constructed global

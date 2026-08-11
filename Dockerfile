@@ -1,23 +1,14 @@
+# syntax=docker/dockerfile:1
 # Multi-stage build for Ferrum Edge
 
-# Build features for the main binary. Default = `cloud-secrets` (the historical
-# image). Pass `--build-arg FEATURES=cloud-secrets,ebpf` to build the
-# node-agent / ambient-mesh capture image, which also COPYs the compiled
-# ferrum-ebpf ELF into the runtime image (see the ebpf-builder stage and the
-# FERRUM_NODE_AGENT_BPF_ELF_PATH default below).
-#
-# KNOWN COUPLING (follow-up): the runtime stage's `COPY --from=ebpf-builder`
-# is unconditional, so EVERY image build — including the default cloud-secrets
-# image, which does not use the ELF — depends on the `ebpf-builder` stage
-# (nightly + bpf-linker + `-Z build-std`). This adds build time and a new
-# failure mode (nightly/bpf-linker availability) to the default image that it
-# did not previously have. Decoupling the ELF copy (e.g. an ARG-selected
-# source stage, or a dedicated capture image/target) so the default image does
-# not require the eBPF toolchain — plus a CI job that actually builds the
-# ebpf-builder stage so it stays verified — is a recommended follow-up. It is
-# deliberately not done here because it changes the capture-image build
-# interface and must be validated against the release/CI image-build scripts.
+# Build features for the main binary. The final `runtime` target is the ordinary
+# gateway image and contains neither the eBPF ELF nor `ip`. Build the explicit
+# `runtime-ebpf` target with `FEATURES=cloud-secrets,ebpf` for node-agent /
+# ambient capture; hosted CI exercises both contracts.
 ARG FEATURES=cloud-secrets
+ARG RUNTIME_BASE=gcr.io/distroless/cc-debian13:nonroot
+ARG IPROUTE2_BASE=debian:13-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+ARG IPROUTE2_VERSION=6.15.0-1
 
 # --- eBPF build stage (nightly, Linux only) ---
 # Compiles the no_std `ferrum-ebpf` crate to a BPF ELF using nightly +
@@ -44,6 +35,16 @@ RUN cargo +nightly build \
         --target bpfel-unknown-none \
         -Z build-std=core \
     && test -f target/bpfel-unknown-none/release/ferrum-ebpf
+
+# Runtime tool closure for the distroless eBPF image. Inventory the actual base
+# filesystem and stage only loader-resolved libraries it does not already own.
+FROM ${RUNTIME_BASE} AS runtime-base
+FROM ${IPROUTE2_BASE} AS iproute2-runtime
+ARG IPROUTE2_VERSION
+COPY .github/scripts/stage_iproute2_runtime.sh /usr/local/bin/stage-iproute2-runtime
+RUN --mount=from=runtime-base,source=/,target=/distroless-root,ro \
+    /bin/sh /usr/local/bin/stage-iproute2-runtime \
+        /iproute2-root /distroless-root "${IPROUTE2_VERSION}"
 
 # Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
 FROM rust:latest AS builder
@@ -89,26 +90,15 @@ COPY src ./src
 # Touch main.rs so cargo knows it changed (not the dummy)
 RUN touch src/main.rs && cargo build --features "${FEATURES}" --release
 
-# Stage 2: Distroless runtime — no OS packages, no shell, no CVEs
-# Uses nonroot tag (UID 65532) for least-privilege execution.
-# OpenSSL is vendored (statically linked) so libssl is not needed.
-# ca-certificates are included in distroless/cc.
-FROM gcr.io/distroless/cc-debian13:nonroot
+# Stage 2: common distroless runtime. It intentionally has no shell, package
+# manager, eBPF ELF, or `ip` executable.
+FROM runtime-base AS runtime-common
 
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder --chown=nonroot:nonroot /build/target/release/ferrum-edge /app/ferrum-edge
-COPY --from=builder --chown=nonroot:nonroot /build/target/release/ferrum-cni /app/ferrum-cni
-
-# Copy the compiled eBPF ELF. The node_agent / node-waypoint mesh mode loads it
-# via aya only when the binary was built with `--features ebpf`; in the default
-# image the file is present but unused (the mock backend attaches nothing).
-# `FERRUM_NODE_AGENT_BPF_ELF_PATH` below points the aya loader at this path
-# (the CARGO_MANIFEST_DIR-relative default in src/ebpf/loader.rs does not exist
-# in the distroless runtime image).
-COPY --from=ebpf-builder --chown=nonroot:nonroot \
-    /build/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf /app/bpf/ferrum-ebpf
+COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-edge /app/ferrum-edge
+COPY --from=builder --chown=65532:65532 /build/target/release/ferrum-cni /app/ferrum-cni
 
 # Set environment variables
 ENV PATH="/app:${PATH}" \
@@ -117,13 +107,12 @@ ENV PATH="/app:${PATH}" \
     FERRUM_PROXY_HTTP_PORT=8000 \
     FERRUM_PROXY_HTTPS_PORT=8443 \
     FERRUM_ADMIN_HTTP_PORT=9000 \
-    FERRUM_ADMIN_HTTPS_PORT=9443 \
-    FERRUM_NODE_AGENT_BPF_ELF_PATH=/app/bpf/ferrum-ebpf
+    FERRUM_ADMIN_HTTPS_PORT=9443
 
 # Expose ports
 EXPOSE 8000 8443 9000 9443 50051
 
-# Health check using built-in CLI subcommand (no curl needed in distroless)
+# Health check using the built-in CLI subcommand (no curl needed)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD ["/app/ferrum-edge", "health"]
 
@@ -132,6 +121,21 @@ LABEL org.opencontainers.image.title="Ferrum Edge" \
       org.opencontainers.image.description="High-performance edge proxy built in Rust" \
       org.opencontainers.image.source="https://github.com/ferrum-edge/ferrum-edge"
 
-# Run the gateway (already running as nonroot via distroless tag)
+# Run the gateway (already running as nonroot via the distroless tag). The
+# mesh/node-agent charts explicitly select UID 0 for kernel capture operations.
 ENTRYPOINT ["/app/ferrum-edge"]
 CMD ["run"]
+
+# Privileged capture runtime. NodeWaypoint ingress redirect owns an exact policy
+# rule/route and therefore needs this staged `ip` closure at startup/teardown.
+# No shell or package manager crosses into the image.
+FROM runtime-common AS runtime-ebpf
+COPY --from=iproute2-runtime /iproute2-root/usr/sbin/ip /usr/sbin/ip
+COPY --from=iproute2-runtime /iproute2-root/usr/lib/ /usr/lib/
+COPY --from=iproute2-runtime /iproute2-root/usr/lib64/ /usr/lib64/
+COPY --from=ebpf-builder --chown=65532:65532 \
+    /build/ebpf/target/bpfel-unknown-none/release/ferrum-ebpf /app/bpf/ferrum-ebpf
+ENV FERRUM_NODE_AGENT_BPF_ELF_PATH=/app/bpf/ferrum-ebpf
+
+# Keep the ordinary runtime as the default final target.
+FROM runtime-common AS runtime

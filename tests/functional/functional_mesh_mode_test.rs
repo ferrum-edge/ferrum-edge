@@ -38,6 +38,7 @@ use tokio_stream::wrappers::{
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use ferrum_edge::config::EnvConfig;
 use ferrum_edge::config::types::GatewayConfig;
 use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
 use ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
@@ -61,9 +62,13 @@ use ferrum_edge::modes::mesh::config::{
     WorkloadRef, WorkloadSelector,
 };
 use ferrum_edge::modes::mesh::slice::MeshSlice;
+use ferrum_edge::proxy::ConfigApplyOutcome;
 use ferrum_edge::xds::XdsAdsServer;
 
-use crate::common::{TestGateway, ensure_gateway_built};
+use crate::common::{
+    TrustedProjectedGateway, TrustedProjectedGatewayOptions, ensure_gateway_built,
+    run_trusted_projected_gateway_test,
+};
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::{Http3Client, Http3GrpcStream};
 use crate::scaffolding::ports::reserve_port;
@@ -620,7 +625,32 @@ fn spawn_mesh_gateway_in_netns_as_uid(
         .args(["--clear-groups", "--"])
         .arg(binary_path());
     configure_mesh_gateway_command(&mut cmd, temp, options);
+    make_mesh_registry_owned_by_uid(temp, uid);
     cmd.spawn().expect("spawn mesh gateway inside pod netns")
+}
+
+#[cfg(target_os = "linux")]
+fn make_mesh_registry_owned_by_uid(temp: &TempDir, uid: u32) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let registry_dir = temp.path().join("node-waypoint-pods");
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o711))
+        .expect("make mesh fixture tempdir traversable");
+    let registry_path = CString::new(registry_dir.as_os_str().as_bytes())
+        .expect("mesh fixture registry path has no NUL");
+    // SAFETY: `registry_path` is a live NUL-terminated CString and both IDs
+    // are the numeric uid/gid passed to the immediately following `setpriv`.
+    let result = unsafe { libc::chown(registry_path.as_ptr(), uid, uid) };
+    assert_eq!(
+        result,
+        0,
+        "chown mesh fixture registry: {}",
+        std::io::Error::last_os_error()
+    );
+    std::fs::set_permissions(&registry_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restrict mesh fixture registry to gateway uid");
 }
 
 #[cfg(target_os = "linux")]
@@ -880,8 +910,8 @@ const MESH_MODE_TEST_SOURCE: &str = include_str!(concat!(
     "/tests/functional/functional_mesh_mode_test.rs"
 ));
 
-/// Multi-gateway mesh fixtures that spawn gateway subprocesses under a bounded
-/// retry loop. Every one of them must gate readiness on the SPAWNED CHILD.
+/// Mesh fixtures that spawn gateway subprocesses under a bounded retry loop.
+/// Every one of them must gate readiness on the SPAWNED CHILD.
 const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
     "drive_dr_live_visibility",
     "drive_egress_a_to_b",
@@ -891,6 +921,8 @@ const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
     "drive_ambient_cross_cluster_egress",
     "try_start_sidecar_cross_cluster_fixture",
     "try_start_ambient_cross_cluster_fixture",
+    "drive_sidecar_ingress_connect_relay",
+    "functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener",
     "drive_waypoint_target_refs",
 ];
 
@@ -906,6 +938,8 @@ const DEAD_GATEWAY_VOIDING_DRIVERS: &[&str] = &[
     "drive_cross_cluster_ws_egress",
     "drive_ambient_cross_cluster_ws_egress",
     "drive_ambient_cross_cluster_ws_path_egress",
+    "drive_sidecar_ingress_connect_relay",
+    "functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener",
     "drive_waypoint_target_refs",
 ];
 
@@ -992,6 +1026,7 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
         "start_grpc_trailers_echo_backend",
         "start_websocket_echo_backend",
         "start_websocket_path_echo_backend",
+        "start_tagged_tcp_backend",
         "start_loopback_tcp_echo",
     ] {
         let body = mesh_test_fn_body(name);
@@ -4489,13 +4524,13 @@ fn mesh_retry_mtls_fixture_phase_arms_before_application_request() {
     );
 
     let live = mesh_test_fn_body(
-        "functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers",
+        "functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers_inner",
     );
     let arm = live
         .find("arm_application_phase")
         .expect("live fixture must arm application phase before the request");
     let request = live
-        .find("grpc_mesh_retry_request(gateway.proxy_port, &payload, None)")
+        .find("grpc_mesh_retry_request(gateway.proxy_http_port, &payload, None)")
         .expect("live fixture application request not found");
     assert!(
         arm < request,
@@ -4852,8 +4887,15 @@ async fn grpc_mesh_retry_request(
 /// another backend stream is admitted because this generic intake cannot prove
 /// them safe to replay.
 #[ignore]
-#[tokio::test]
-async fn functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers() {
+#[test]
+fn functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers() {
+    run_trusted_projected_gateway_test(
+        functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers_inner,
+    );
+}
+
+async fn functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers_inner()
+ {
     let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/retry-client";
     let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/retry-backend";
     let identities = TempDir::new().expect("mesh retry identity tempdir");
@@ -4874,6 +4916,9 @@ async fn functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_
         )
         .await;
 
+    // Trusted projection: mesh.* transport tags are stamped the way slice
+    // materialization does, then fed to in-process `file::serve`. Operator
+    // file-mode YAML must continue rejecting these tags.
     let config = format!(
         r#"version: "1"
 proxies:
@@ -4904,20 +4949,23 @@ consumers: []
 plugin_configs: []
 "#
     );
-    let mut gateway = TestGateway::builder()
-        .mode_file(config)
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        .env("FERRUM_GATEWAY_SVID_CERT_PATH", &svids.a.cert_path)
-        .env("FERRUM_GATEWAY_SVID_KEY_PATH", &svids.a.key_path)
-        .env(
-            "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
-            &svids.a.trust_bundle_path,
-        )
-        .capture_output()
-        .reserve_listener_port(backend_port)
-        .spawn()
-        .await
-        .expect("spawn retry-enabled mesh gateway");
+    let env = EnvConfig {
+        pool_warmup_enabled: false,
+        gateway_svid_cert_path: Some(svids.a.cert_path.clone()),
+        gateway_svid_key_path: Some(svids.a.key_path.clone()),
+        gateway_svid_trust_bundle_path: Some(svids.a.trust_bundle_path.clone()),
+        ..Default::default()
+    };
+    let mut gateway = TrustedProjectedGateway::spawn_from_yaml(
+        &config,
+        TrustedProjectedGatewayOptions {
+            env,
+            excluded_ports: vec![backend_port],
+            ..TrustedProjectedGatewayOptions::default()
+        },
+    )
+    .await
+    .expect("spawn retry-enabled mesh gateway via trusted projection");
     gateway
         .wait_for_proxy_port(Duration::from_secs(10))
         .await
@@ -4931,7 +4979,7 @@ plugin_configs: []
         .expect("mesh retry backend application phase receiver dropped");
 
     let payload = grpc_framed_payload(b"mesh-replay-body");
-    let response = grpc_mesh_retry_request(gateway.proxy_port, &payload, None)
+    let response = grpc_mesh_retry_request(gateway.proxy_http_port, &payload, None)
         .await
         .expect("secured mesh retry request");
     assert_eq!(
@@ -5012,9 +5060,10 @@ plugin_configs: []
         "x-native-request-trailer",
         hyper::header::HeaderValue::from_static("must-not-disappear"),
     );
-    let rejected = grpc_mesh_retry_request(gateway.proxy_port, &payload, Some(native_trailers))
-        .await
-        .expect("native trailer refusal response");
+    let rejected =
+        grpc_mesh_retry_request(gateway.proxy_http_port, &payload, Some(native_trailers))
+            .await
+            .expect("native trailer refusal response");
     assert_eq!(
         rejected.status, 200,
         "gRPC refusal uses Trailers-Only HTTP 200"
@@ -5030,7 +5079,11 @@ plugin_configs: []
         "native trailer refusal must not create another application stream"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
+    // In-process `TrustedProjectedGateway` keeps `ProxyState` (and its pooled
+    // backend h2 client) alive until dropped; release it before joining the
+    // fixture so the secured connection closes and the backend task can exit.
+    drop(gateway);
     tokio::time::timeout(Duration::from_secs(5), backend_task)
         .await
         .expect("mesh retry backend teardown timed out")
@@ -9628,6 +9681,919 @@ async fn functional_mesh_udp_dest_untrusted_peer_fails_closed() {
 }
 
 // ===================================================================
+// Sidecar `ingress[]` STREAM listeners over the authenticated
+// mesh-mTLS CONNECT lane (issue #3260)
+// ===================================================================
+
+/// Reply tag of the loopback backend a declared `ingress[]` listener's
+/// `defaultEndpoint` points at — the ONLY backend a remapped CONNECT may reach.
+const INGRESS_ENDPOINT_TAG: &str = "ingress-default-endpoint";
+
+/// Reply tag of a decoy bound on the DECLARED LISTENER port itself. That port
+/// is also a declared workload port, so the ordinary inbound open-relay guard
+/// WOULD admit a CONNECT to it — seeing this tag therefore means the dial was
+/// relayed to the port the peer named instead of the `defaultEndpoint` the
+/// operator mapped it onto.
+const INGRESS_DECOY_TAG: &str = "listener-port-decoy";
+
+/// Same decoy role for the SECOND listener port the reload phase declares.
+const INGRESS_DECOY_B_TAG: &str = "listener-b-port-decoy";
+
+/// Reply tag of a live loopback backend on a declared WORKLOAD port that the
+/// `ingress[]` block does NOT declare. Seeing it means a declared ingress block
+/// failed OPEN to the ordinary inbound relay surface it is supposed to replace.
+const INGRESS_UNLISTED_TAG: &str = "unlisted-port-backend";
+
+/// A raw-TCP loopback backend that TAGS every reply with `label`, so a relayed
+/// byte stream proves WHICH loopback endpoint actually served it.
+///
+/// Holds its listener for the task's lifetime (never drop+rebind) and binds
+/// through [`bind_fixture_listener`] so it can never take a port already handed
+/// to a mesh gateway subprocess (issue #2132).
+async fn start_tagged_tcp_backend(label: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = bind_fixture_listener(loopback_ephemeral())
+        .await
+        .expect("bind tagged tcp backend");
+    let port = listener.local_addr().expect("echo backend addr").port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let Ok(read) = sock.read(&mut buf).await else {
+                    return;
+                };
+                let payload = String::from_utf8_lossy(&buf[..read]).trim().to_string();
+                let reply = format!("{label}:{payload}\n");
+                let _ = sock.write_all(reply.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
+        }
+    });
+    (port, handle)
+}
+
+fn abort_backends(handles: &[tokio::task::JoinHandle<()>]) {
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+/// Outcome of ONE authenticated mesh-mTLS CONNECT into a Sidecar inbound
+/// listener.
+#[derive(Debug)]
+struct IngressConnectOutcome {
+    /// Status the destination sidecar returned for the CONNECT itself.
+    status: u16,
+    /// The tagged line the relayed loopback backend wrote back, when the tunnel
+    /// opened. `None` for every refused CONNECT.
+    relayed: Option<String>,
+}
+
+/// mTLS client config presenting the peer SVID and verifying the sidecar's
+/// server SVID against the shared mesh CA. ALPN `h2` — the mesh-mTLS transport.
+fn sidecar_ingress_client_config(
+    peers: &MeshPeerSvids,
+) -> Result<Arc<rustls::ClientConfig>, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut peers.ca_pem.as_bytes()).filter_map(|c| c.ok()) {
+        roots
+            .add(cert)
+            .map_err(|e| format!("add mesh CA root: {e}"))?;
+    }
+    let provider = rustls::crypto::ring::default_provider();
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("client protocol versions: {e}"))?
+        .with_root_certificates(roots);
+    let chain: Vec<_> = rustls_pemfile::certs(&mut peers.client_cert_pem.as_bytes())
+        .filter_map(|c| c.ok())
+        .collect();
+    let key = rustls_pemfile::private_key(&mut peers.client_key_pem.as_bytes())
+        .map_err(|e| format!("parse client SVID key: {e}"))?
+        .ok_or_else(|| "no client SVID private key in PEM".to_string())?;
+    let mut config = builder
+        .with_client_auth_cert(chain, key)
+        .map_err(|e| format!("client auth cert: {e}"))?;
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(Arc::new(config))
+}
+
+/// Read one newline-terminated tagged line out of a relayed CONNECT tunnel.
+///
+/// The tunnel stays OPEN after the backend replies, so this stops at the first
+/// `\n` rather than draining to EOF. A stream that ends with bytes buffered
+/// still returns them, so a truncated reply is reported rather than silently
+/// timing out.
+async fn read_tagged_relay_reply(
+    body: &mut h2::RecvStream,
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(end) = buf.iter().position(|byte| *byte == b'\n') {
+                return Ok(String::from_utf8_lossy(&buf[..end]).into_owned());
+            }
+            match body.data().await {
+                Some(Ok(chunk)) => {
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    buf.extend_from_slice(&chunk);
+                }
+                Some(Err(e)) => return Err(format!("relay body error: {e}")),
+                None if buf.is_empty() => {
+                    return Err("relay closed before any backend bytes".to_string());
+                }
+                None => return Ok(String::from_utf8_lossy(&buf).into_owned()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "timed out reading the relayed reply".to_string())?
+}
+
+/// Open a real mesh-mTLS HTTP/2 tunnel to a Sidecar's inbound listener and
+/// drive ONE bare CONNECT at `authority`.
+///
+/// This is exactly the wire shape a peer Sidecar's raw-TCP egress opens: a
+/// markerless HTTP/2 CONNECT over SVID-mTLS whose `:authority` is
+/// `pod-ip:<declared listener port>`. It never touches the REDIRECT-captured
+/// plaintext inbound table, so it is the identity-protected lane issue #3260
+/// adds the `ingress[]` remap to.
+async fn sidecar_ingress_connect(
+    inbound_port: u16,
+    authority: &str,
+    peers: &MeshPeerSvids,
+    payload: &str,
+) -> Result<IngressConnectOutcome, String> {
+    let config = sidecar_ingress_client_config(peers)?;
+    let tcp = TcpStream::connect(("127.0.0.1", inbound_port))
+        .await
+        .map_err(|e| format!("connect sidecar inbound: {e}"))?;
+    let _ = tcp.set_nodelay(true);
+    let connector = tokio_rustls::TlsConnector::from(config);
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string())
+        .map_err(|e| format!("server name: {e}"))?;
+    // Bound the handshakes: a bound-but-wedged listener would otherwise hang
+    // this ignored test forever, before any of the later deadlines apply.
+    let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(name, tcp))
+        .await
+        .map_err(|_| "client TLS handshake timed out".to_string())?
+        .map_err(|e| format!("client TLS handshake: {e}"))?;
+    {
+        // Pin the sidecar's SPIFFE identity from the presented leaf — a
+        // same-CA loopback certificate is not proof we reached the workload.
+        let (_io, conn) = tls.get_ref();
+        let leaf = conn
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .ok_or_else(|| "sidecar presented no certificate".to_string())?;
+        let presented = ferrum_edge::identity::spiffe::extract_spiffe_id_from_cert(leaf.as_ref())
+            .map_err(|e| format!("sidecar leaf lacks a valid SPIFFE URI SAN: {e}"))?;
+        let expected = SpiffeId::new(&peers.server_spiffe)
+            .map_err(|e| format!("invalid expected sidecar SPIFFE ID: {e}"))?;
+        if presented != expected {
+            return Err(format!(
+                "sidecar SPIFFE ID '{presented}' does not match expected '{expected}'"
+            ));
+        }
+    }
+
+    let (mut sender, conn) =
+        tokio::time::timeout(Duration::from_secs(10), h2::client::handshake(tls))
+            .await
+            .map_err(|_| "h2 handshake timed out".to_string())?
+            .map_err(|e| format!("h2 handshake: {e}"))?;
+    let conn_task = tokio::spawn(conn);
+
+    // No `x-ferrum-mesh-protocol` marker: the markerless default IS byte-stream
+    // HBONE/mesh-mTLS CONNECT, which is what Sidecar raw-TCP egress sends.
+    let request = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .uri(authority)
+        .body(())
+        .map_err(|e| format!("build CONNECT: {e}"))?;
+    let (response, mut send_body) = sender
+        .send_request(request, false)
+        .map_err(|e| format!("send CONNECT: {e}"))?;
+    let response = tokio::time::timeout(Duration::from_secs(10), response)
+        .await
+        .map_err(|_| "CONNECT response timed out".to_string())?
+        .map_err(|e| format!("CONNECT response: {e}"))?;
+    let status = response.status().as_u16();
+
+    // Only an accepted CONNECT has a tunnel to write into; a refusal must never
+    // be probed for relayed bytes (that would mask a fail-open regression).
+    let relayed = if status == 200 {
+        send_body
+            .send_data(Bytes::from(payload.to_string()), false)
+            .map_err(|e| format!("write relay payload: {e}"))?;
+        let mut body = response.into_body();
+        Some(read_tagged_relay_reply(&mut body, Duration::from_secs(10)).await?)
+    } else {
+        None
+    };
+
+    conn_task.abort();
+    Ok(IngressConnectOutcome { status, relayed })
+}
+
+/// The local `echo` workload plus its Service.
+///
+/// Every port in `workload_ports` is declared as a WORKLOAD port, so the
+/// ordinary inbound open-relay guard (`inbound_hbone_relay_destination_allowed`)
+/// would admit an authenticated CONNECT to any of them. That is what makes the
+/// ingress assertions non-vacuous: refusals below come from the DECLARED
+/// `ingress[]` surface replacing the ordinary one, not from a port the slice
+/// never knew about.
+fn sidecar_ingress_local_workload(
+    server_spiffe: &str,
+    workload_ports: &[u16],
+) -> (Workload, MeshService) {
+    let server_id = SpiffeId::new(server_spiffe).expect("server SPIFFE id");
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    let workload = Workload {
+        spiffe_id: server_id.clone(),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "echo".to_string())]),
+            namespace: Some("ferrum".to_string()),
+        },
+        service_name: "echo".to_string(),
+        service_namespace: None,
+        addresses: vec!["127.0.0.1".to_string()],
+        ports: workload_ports
+            .iter()
+            .map(|port| WorkloadPort {
+                port: *port,
+                protocol: AppProtocol::Tcp,
+                name: None,
+            })
+            .collect(),
+        trust_domain,
+        namespace: "ferrum".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("echo".to_string()),
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "echo".to_string(),
+        namespace: "ferrum".to_string(),
+        ports: workload_ports
+            .iter()
+            .map(|port| ServicePort {
+                port: *port,
+                protocol: AppProtocol::Tcp,
+                name: None,
+                target_port: None,
+            })
+            .collect(),
+        workloads: vec![WorkloadRef {
+            spiffe_id: server_id,
+        }],
+        protocol_overrides: HashMap::new(),
+    };
+    (workload, service)
+}
+
+/// Mesh slice whose applicable `Sidecar.ingress[]` was already RESOLVED control
+/// plane side — the carrier lane a real CP/xDS deployment delivers. One STREAM
+/// listener on `listener_port` forwards to `127.0.0.1:endpoint_port`, and the
+/// fail-closed `sidecar_ingress_declared` marker replaces the ordinary inbound
+/// surface for every other port. STRICT PeerAuthentication, so the sidecar
+/// requires and verifies the peer SVID.
+fn sidecar_ingress_stream_slice(
+    node_id: &str,
+    server_spiffe: &str,
+    workload_ports: &[u16],
+    listener_port: u16,
+    endpoint_port: u16,
+) -> MeshSlice {
+    use ferrum_edge::modes::mesh::config::ResolvedIngressListener;
+
+    let (workload, service) = sidecar_ingress_local_workload(server_spiffe, workload_ports);
+    MeshSlice {
+        node_id: node_id.to_string(),
+        namespace: "ferrum".to_string(),
+        version: Utc::now().to_rfc3339(),
+        workloads: vec![workload.clone()],
+        services: vec![service.clone()],
+        local_inbound_workloads: Some(vec![workload]),
+        local_inbound_services: vec![service],
+        local_ingress_listeners: vec![ResolvedIngressListener {
+            port: listener_port,
+            endpoint_host: "127.0.0.1".to_string(),
+            endpoint_port,
+            protocol: AppProtocol::Tcp,
+            endpoint_unix_path: None,
+            endpoint_unix_h2c: false,
+            owner_namespace: "ferrum".to_string(),
+            owner_service: "echo".to_string(),
+        }],
+        sidecar_ingress_declared: true,
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        ..MeshSlice::default()
+    }
+}
+
+/// File-source `{ "mesh": ... }` document for the same workload, expressed as a
+/// RAW ingress-only `Sidecar` so the DATA PLANE runs the real
+/// `Sidecar.ingress[]` resolution itself (`FERRUM_MESH_SIDECAR_ENFORCED=true`)
+/// instead of consuming a control-plane-resolved listener set.
+///
+/// `ingress` is `(listener_port, endpoint_port)` pairs. `deny_listener_port`
+/// adds a MeshWide `AuthorizationPolicy` DENY scoped to that DESTINATION port.
+fn sidecar_ingress_mesh_document(
+    server_spiffe: &str,
+    workload_ports: &[u16],
+    ingress: &[(u16, u16)],
+    deny_listener_port: Option<u16>,
+) -> String {
+    use ferrum_edge::modes::mesh::config::{MeshSidecar, MeshSidecarIngress, RequestMatch};
+
+    let (workload, service) = sidecar_ingress_local_workload(server_spiffe, workload_ports);
+    let sidecar = MeshSidecar {
+        name: "echo-ingress".to_string(),
+        namespace: "ferrum".to_string(),
+        workload_selector: None,
+        // An ingress-only Sidecar omits `spec.egress`, so no egress scope
+        // resolves and the listeners must anchor on the local service through
+        // the decoupled path (F6 §6.2), not through egress narrowing.
+        egress_inherits_defaults: true,
+        egress: Vec::new(),
+        // No explicit `spec.outboundTrafficPolicy`, so this Sidecar inherits the
+        // mesh-wide policy (issue #3262).
+        outbound_traffic_policy: None,
+        ingress_declared: true,
+        ingress: ingress
+            .iter()
+            .map(|(listener_port, endpoint_port)| MeshSidecarIngress {
+                port: *listener_port,
+                protocol: AppProtocol::Tcp,
+                name: None,
+                bind: None,
+                default_endpoint: format!("127.0.0.1:{endpoint_port}"),
+            })
+            .collect(),
+    };
+    // Istio scopes `AuthorizationPolicy` `to.ports` to the DECLARED listener
+    // port for a Sidecar ingress listener, never to its `defaultEndpoint`.
+    let mesh_policies: Vec<MeshPolicy> = deny_listener_port
+        .into_iter()
+        .map(|port| MeshPolicy {
+            name: "deny-ingress-listener-port".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: PolicyScope::MeshWide,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: vec![RequestMatch {
+                    ports: vec![port],
+                    ..RequestMatch::default()
+                }],
+                when: Vec::new(),
+                request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
+                never_matches: false,
+                action: PolicyAction::Deny,
+            }],
+        })
+        .collect();
+    let mesh = MeshConfig {
+        workloads: vec![workload],
+        services: vec![service],
+        sidecars: vec![sidecar],
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-strict".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Strict,
+            port_overrides: HashMap::new(),
+        }],
+        mesh_policies,
+        ..MeshConfig::default()
+    };
+    serde_json::to_string(&serde_json::json!({ "mesh": mesh })).expect("mesh document serializes")
+}
+
+/// The two authoritative CONNECT observations one healthy sidecar fixture makes.
+struct SidecarIngressProbes {
+    /// CONNECT naming the DECLARED `ingress[]` listener port.
+    declared: IngressConnectOutcome,
+    /// CONNECT naming a declared workload port the `ingress[]` block omits.
+    unlisted: IngressConnectOutcome,
+}
+
+/// Spawn a production Sidecar over a slice carrying one RESOLVED stream
+/// `ingress[]` listener, then drive both authoritative CONNECTs against it.
+///
+/// Spawn/bind flakes are retried with fresh ports, temp dirs, control planes and
+/// backends; the CONNECT observations themselves are made exactly once against a
+/// healthy fixture. The outer `Err` is a SETUP failure — never a fail-closed
+/// pass.
+async fn drive_sidecar_ingress_connect_relay() -> Result<SidecarIngressProbes, String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
+    let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_id = format!("functional-mesh-ingress-connect-{attempt}");
+        let temp = TempDir::new().map_err(|e| format!("temp dir: {e}"))?;
+        let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
+        let (endpoint_port, endpoint) = start_tagged_tcp_backend(INGRESS_ENDPOINT_TAG).await;
+        let (listener_port, decoy) = start_tagged_tcp_backend(INGRESS_DECOY_TAG).await;
+        let (unlisted_port, unlisted) = start_tagged_tcp_backend(INGRESS_UNLISTED_TAG).await;
+        let backends = [endpoint, decoy, unlisted];
+
+        let cp = start_static_mesh_cp(sidecar_ingress_stream_slice(
+            &node_id,
+            server_spiffe,
+            &[listener_port, unlisted_port],
+            listener_port,
+            endpoint_port,
+        ))
+        .await;
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp.addr,
+                ports,
+                node_id: &node_id,
+                config_protocol: "native",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        let readiness = wait_for_gateway_listener(&mut child, inbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = format!(
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("sidecar", inbound_port),
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            cp.shutdown().await;
+            abort_backends(&backends);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let declared = sidecar_ingress_connect(
+            inbound_port,
+            &format!("127.0.0.1:{listener_port}"),
+            &peers,
+            "ping",
+        )
+        .await;
+        let unlisted = sidecar_ingress_connect(
+            inbound_port,
+            &format!("127.0.0.1:{unlisted_port}"),
+            &peers,
+            "ping",
+        )
+        .await;
+
+        let exited = exited_gateway_diagnostic(&mut [("sidecar", &mut child)]);
+        let logs = captured_output(&temp);
+        kill_child(&mut child);
+        cp.shutdown().await;
+        abort_backends(&backends);
+
+        // An attempt whose gateway died mid-run is VOID: the listener port was
+        // never owned by the process these probes believed they reached.
+        if let Some(diagnostic) = exited {
+            last_failure = format!("attempt {attempt}: {diagnostic}\n{logs}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        return Ok(SidecarIngressProbes {
+            declared: declared.map_err(|e| format!("declared-port CONNECT: {e}\n{logs}"))?,
+            unlisted: unlisted.map_err(|e| format!("unlisted-port CONNECT: {e}\n{logs}"))?,
+        });
+    }
+
+    Err(format!(
+        "sidecar ingress gateway never came up after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// Issue #3260 keystone: the identity-protected Sidecar-to-Sidecar lane.
+///
+/// A real `ferrum-edge` Sidecar consumes a slice declaring one STREAM
+/// `ingress[]` listener, and a genuine SVID-mTLS HTTP/2 CONNECT naming
+/// `pod-ip:<declared listener port>` is relayed to that listener's loopback
+/// `defaultEndpoint` — a DIFFERENT port, proven by the endpoint backend's tag
+/// rather than the decoy bound on the declared port itself. The declared port
+/// is the routing signal; the endpoint port is only where it lands.
+///
+/// The same run asserts the fail-closed half: a CONNECT naming a declared
+/// WORKLOAD port the `ingress[]` block does NOT declare is refused, even though
+/// a live backend is listening there and the ordinary open-relay guard would
+/// have admitted it. Declaring `ingress[]` REPLACES the ordinary inbound
+/// surface; falling through to it would be a fail-open regression.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_ingress_stream_connect_relays_declared_listener_port() {
+    // `.expect` on the outer Result: a setup failure is a test failure, never a
+    // silent fail-closed pass.
+    let probes = drive_sidecar_ingress_connect_relay()
+        .await
+        .expect("sidecar ingress fixture");
+    let expected = format!("{INGRESS_ENDPOINT_TAG}:ping");
+
+    assert_eq!(
+        probes.declared.status, 200,
+        "a CONNECT naming the declared ingress listener port must be accepted; relayed {:?}",
+        probes.declared.relayed
+    );
+    assert_eq!(
+        probes.declared.relayed.as_deref(),
+        Some(expected.as_str()),
+        "the declared listener must relay to its defaultEndpoint backend, not to the \
+         listener port the peer named (decoy tag '{INGRESS_DECOY_TAG}')"
+    );
+
+    assert_ne!(
+        probes.unlisted.status, 200,
+        "a declared ingress[] block replaces the ordinary inbound surface: a CONNECT to an \
+         UNLISTED workload port must be refused, not relayed"
+    );
+    assert!(
+        probes.unlisted.relayed.is_none(),
+        "a refused CONNECT must not carry relayed backend bytes: {:?}",
+        probes.unlisted.relayed
+    );
+}
+
+/// Issue #3260 live policy + reload: the DECLARED listener port is the security
+/// signal, and a config refresh withdraws a listener on the live datapath.
+///
+/// Driven from the FILE source so the data plane resolves the raw
+/// `Sidecar.ingress[]` itself (`FERRUM_MESH_SIDECAR_ENFORCED=true`) and SIGHUP
+/// is a deterministic in-test config refresh — the only refresh this harness can
+/// perform without standing up a second control plane (the `MeshSubscribe` stub
+/// serves one slice then heartbeats).
+///
+/// * Phase 1 — the declared stream listener relays to its `defaultEndpoint`, and
+///   an unlisted workload port is refused.
+/// * Phase 2 — a MeshWide `AuthorizationPolicy` DENY scoped to the DECLARED
+///   LISTENER port rejects the CONNECT (403). Authorizing on the
+///   `defaultEndpoint` backend port instead would let that DENY fail OPEN.
+/// * Phase 3 — a reload that declares a DIFFERENT listener withdraws the first:
+///   the old port fails closed (neither relayed nor still 403 from phase 2) and
+///   the new one relays to the same endpoint.
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener() {
+    ensure_gateway_built().expect("gateway build");
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
+    let client_spiffe = "spiffe://cluster.local/ns/default/sa/client";
+
+    let mut last_failure = String::new();
+    'attempts: for attempt in 1..=RETRY_ATTEMPTS {
+        let temp = TempDir::new().expect("temp dir");
+        let peers = generate_mesh_peer_svids(temp.path(), server_spiffe, client_spiffe);
+        let (endpoint_port, endpoint) = start_tagged_tcp_backend(INGRESS_ENDPOINT_TAG).await;
+        let (first_port, first_decoy) = start_tagged_tcp_backend(INGRESS_DECOY_TAG).await;
+        let (second_port, second_decoy) = start_tagged_tcp_backend(INGRESS_DECOY_B_TAG).await;
+        let (unlisted_port, unlisted) = start_tagged_tcp_backend(INGRESS_UNLISTED_TAG).await;
+        let backends = [endpoint, first_decoy, second_decoy, unlisted];
+        let reload_ports = SidecarIngressReloadPorts {
+            endpoint: endpoint_port,
+            first: first_port,
+            second: second_port,
+            unlisted: unlisted_port,
+        };
+        let workload_ports = reload_ports.workload_ports();
+
+        let mesh_doc_path = temp.path().join("mesh.json");
+        std::fs::write(
+            &mesh_doc_path,
+            sidecar_ingress_mesh_document(
+                server_spiffe,
+                &workload_ports,
+                &[(first_port, endpoint_port)],
+                None,
+            ),
+        )
+        .expect("write mesh document");
+        let mesh_doc_env = mesh_doc_path
+            .to_str()
+            .expect("mesh document path is UTF-8")
+            .to_string();
+
+        let ports = reserve_mesh_ports().await;
+        let inbound_port = ports.inbound;
+        let mut child = spawn_mesh_gateway(
+            &temp,
+            MeshGatewaySpawnOptions {
+                // The file protocol consumes no CP; the harness's default
+                // FERRUM_DP_CP_GRPC_URLS points at a dead port and is ignored.
+                cp_addr: "127.0.0.1:1".parse().expect("dummy addr"),
+                ports,
+                node_id: &format!("functional-mesh-ingress-reload-{attempt}"),
+                config_protocol: "file",
+                topology: "sidecar",
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_FILE_CONFIG_PATH", mesh_doc_env),
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_MESH_SIDECAR_ENFORCED", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                    (
+                        "FERRUM_GATEWAY_SVID_CERT_PATH",
+                        peers.server_cert_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_KEY_PATH",
+                        peers.server_key_path.clone(),
+                    ),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        peers.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+
+        let readiness = wait_for_gateway_listener(&mut child, inbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
+            last_failure = format!(
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("sidecar", inbound_port),
+                captured_output(&temp)
+            );
+            kill_child(&mut child);
+            abort_backends(&backends);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue 'attempts;
+        }
+
+        let outcome = run_sidecar_ingress_reload_phases(
+            inbound_port,
+            &peers,
+            &reload_ports,
+            &mesh_doc_path,
+            &mut child,
+        )
+        .await;
+
+        // One cleanup path for every phase outcome, so a failed phase can never
+        // leave the gateway subprocess or a fixture backend running.
+        let exited = exited_gateway_diagnostic(&mut [("sidecar", &mut child)]);
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        abort_backends(&backends);
+
+        // An attempt whose gateway died mid-run is VOID: its inbound port was
+        // never owned by the process these phases believed they were driving,
+        // so retry with fresh ports, temp dirs and backends instead of
+        // reporting the resulting transport error as a datapath result.
+        if let Some(diagnostic) = exited {
+            last_failure = format!("attempt {attempt}: {diagnostic}\n{output}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue 'attempts;
+        }
+        if let Err(e) = outcome {
+            panic!("{e}\n{output}");
+        }
+        return;
+    }
+
+    panic!(
+        "mesh file-source sidecar never came up after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    );
+}
+
+/// The four loopback ports the reload fixture juggles.
+struct SidecarIngressReloadPorts {
+    /// The shared `defaultEndpoint` backend both declared listeners map onto.
+    endpoint: u16,
+    /// The listener the first document declares, then withdraws.
+    first: u16,
+    /// The listener the reloaded document declares instead.
+    second: u16,
+    /// A declared workload port the `ingress[]` block never declares.
+    unlisted: u16,
+}
+
+impl SidecarIngressReloadPorts {
+    /// Every listener port stays a declared WORKLOAD port for the whole run, so
+    /// a withdrawn listener remains a port the ordinary inbound open-relay guard
+    /// WOULD have admitted. The withdrawal assertion then measures the ingress
+    /// surface, not a shrinking workload port set.
+    fn workload_ports(&self) -> [u16; 3] {
+        [self.first, self.second, self.unlisted]
+    }
+}
+
+/// The three live phases of the file-source reload fixture, run against one
+/// healthy sidecar subprocess. Returns `Err` with a self-describing message so
+/// the caller owns the single cleanup path.
+async fn run_sidecar_ingress_reload_phases(
+    inbound_port: u16,
+    peers: &MeshPeerSvids,
+    ports: &SidecarIngressReloadPorts,
+    mesh_doc_path: &std::path::Path,
+    child: &mut Child,
+) -> Result<(), String> {
+    let server_spiffe = peers.server_spiffe.as_str();
+    let workload_ports = ports.workload_ports();
+    let first_authority = format!("127.0.0.1:{}", ports.first);
+    let second_authority = format!("127.0.0.1:{}", ports.second);
+    let unlisted_authority = format!("127.0.0.1:{}", ports.unlisted);
+    let expected = format!("{INGRESS_ENDPOINT_TAG}:ping");
+    let reload_deadline = Duration::from_secs(20);
+
+    // ── Phase 1: the resolved stream listener relays to its endpoint ──────
+    let served = sidecar_ingress_connect(inbound_port, &first_authority, peers, "ping").await?;
+    if served.status != 200 {
+        return Err(format!(
+            "a data-plane-resolved ingress[] stream listener must accept the CONNECT, got \
+             status {} relayed {:?}",
+            served.status, served.relayed
+        ));
+    }
+    if served.relayed.as_deref() != Some(expected.as_str()) {
+        return Err(format!(
+            "the CONNECT must be relayed to the defaultEndpoint backend, not the declared \
+             listener port's decoy; relayed {:?}",
+            served.relayed
+        ));
+    }
+
+    let unlisted_probe =
+        sidecar_ingress_connect(inbound_port, &unlisted_authority, peers, "ping").await?;
+    if unlisted_probe.status == 200 {
+        return Err(format!(
+            "a declared ingress[] block must refuse an unlisted workload port, not relay it; \
+             relayed {:?}",
+            unlisted_probe.relayed
+        ));
+    }
+
+    // ── Phase 2: a DENY scoped to the DECLARED listener port ──────────────
+    std::fs::write(
+        mesh_doc_path,
+        sidecar_ingress_mesh_document(
+            server_spiffe,
+            &workload_ports,
+            &[(ports.first, ports.endpoint)],
+            Some(ports.first),
+        ),
+    )
+    .map_err(|e| format!("rewrite mesh document with a listener-port DENY: {e}"))?;
+    sighup_mesh_gateway(child)?;
+    // Authorizing on the `defaultEndpoint` backend port instead of the DECLARED
+    // listener port would let this DENY fail OPEN — the CONNECT would keep
+    // returning 200 and this wait would time out.
+    let denied = wait_for_ingress_connect(
+        inbound_port,
+        &first_authority,
+        peers,
+        reload_deadline,
+        |outcome| outcome.status == 403,
+    )
+    .await
+    .map_err(|e| format!("listener-port DENY never fired after reload: {e}"))?;
+    if denied.relayed.is_some() {
+        return Err(format!(
+            "a denied CONNECT must not reach the loopback endpoint: {:?}",
+            denied.relayed
+        ));
+    }
+
+    // ── Phase 3: withdraw that listener, declare a different one ──────────
+    std::fs::write(
+        mesh_doc_path,
+        sidecar_ingress_mesh_document(
+            server_spiffe,
+            &workload_ports,
+            &[(ports.second, ports.endpoint)],
+            None,
+        ),
+    )
+    .map_err(|e| format!("rewrite mesh document withdrawing the first listener: {e}"))?;
+    sighup_mesh_gateway(child)?;
+    // Neither 200 (relayed) nor 403 (phase 2's now-withdrawn DENY): under the
+    // NEW document the withdrawn listener port must fail closed.
+    let withdrawn = wait_for_ingress_connect(
+        inbound_port,
+        &first_authority,
+        peers,
+        reload_deadline,
+        |outcome| outcome.status != 200 && outcome.status != 403,
+    )
+    .await
+    .map_err(|e| format!("the withdrawn ingress listener never failed closed: {e}"))?;
+    if withdrawn.relayed.is_some() {
+        return Err(format!(
+            "a withdrawn listener must not relay: {:?}",
+            withdrawn.relayed
+        ));
+    }
+
+    let updated = sidecar_ingress_connect(inbound_port, &second_authority, peers, "ping").await?;
+    if updated.status != 200 {
+        return Err(format!(
+            "the reloaded document's NEW listener port must serve, got status {} relayed {:?}",
+            updated.status, updated.relayed
+        ));
+    }
+    if updated.relayed.as_deref() != Some(expected.as_str()) {
+        return Err(format!(
+            "the updated listener must relay to the same defaultEndpoint backend, not its own \
+             decoy; relayed {:?}",
+            updated.relayed
+        ));
+    }
+    Ok(())
+}
+
+/// Deliver SIGHUP to a spawned mesh gateway so the file source reloads.
+fn sighup_mesh_gateway(child: &mut Child) -> Result<(), String> {
+    let pid = child.id().to_string();
+    let status = Command::new("kill")
+        .args(["-HUP", &pid])
+        .status()
+        .map_err(|e| format!("send SIGHUP to pid {pid}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("SIGHUP delivery failed for pid {pid}: {status}"))
+    }
+}
+
+/// Poll an authenticated CONNECT until `accept` is satisfied or the deadline
+/// passes.
+///
+/// Used ONLY to wait for a config refresh to land — never to retry a
+/// steady-state observation from a healthy fixture.
+async fn wait_for_ingress_connect(
+    inbound_port: u16,
+    authority: &str,
+    peers: &MeshPeerSvids,
+    timeout: Duration,
+    accept: impl Fn(&IngressConnectOutcome) -> bool,
+) -> Result<IngressConnectOutcome, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last = match sidecar_ingress_connect(inbound_port, authority, peers, "ping").await {
+            Ok(outcome) if accept(&outcome) => return Ok(outcome),
+            Ok(outcome) => format!(
+                "last CONNECT to {authority}: status {} relayed {:?}",
+                outcome.status, outcome.relayed
+            ),
+            Err(e) => format!("last CONNECT to {authority} failed: {e}"),
+        };
+        if Instant::now() >= deadline {
+            return Err(last);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+// ===================================================================
 // Issue #3226 — AuthorizationPolicy targetRefs live datapath
 // ===================================================================
 //
@@ -10737,6 +11703,10 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
             return;
         }
     };
+    let disabled_registry = TempDir::new().expect("disabled UDP pod registry tempdir");
+    let _disabled_registry_entry = pod
+        .publish(disabled_registry.path(), POD_UID)
+        .expect("publish disabled UDP pod registry entry");
     let registry = TempDir::new().expect("UDP pod registry tempdir");
     let registry_entry = pod
         .publish(registry.path(), POD_UID)
@@ -10802,8 +11772,10 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
     );
 
     // Disabled-mode negative: the same enrolled pod produces no rules and no
-    // capture socket. The cleanup manager is allowed to run, but it must never
-    // install state while the feature flag is off.
+    // capture socket. This is an independent fixture ownership generation;
+    // reusing its durable state for the enabled producer below would model an
+    // unsafe disabled -> pod-netns rollout, which correctly requires an
+    // explicit cleanup/finalize generation.
     let ports_disabled = reserve_mesh_ports().await;
     let disabled_outbound = ports_disabled.outbound;
     let mut disabled_a = LiveGatewayChild::new(spawn_mesh_gateway(
@@ -10827,7 +11799,7 @@ async fn functional_mesh_live_source_capture_udp_manager_hbone_round_trip() {
                 ),
                 (
                     "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR",
-                    registry.path().display().to_string(),
+                    disabled_registry.path().display().to_string(),
                 ),
                 ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "false".to_string()),
                 ("FERRUM_MESH_IP6TABLES_ENABLED", "false".to_string()),
@@ -11224,6 +12196,12 @@ fn tcp_round_trip_from_netns(
 /// capture a client in a fresh pod netns, `SO_ORIGINAL_DST` selects the strict
 /// VIP:port route, and a real Sidecar source opens the mesh-mTLS CONNECT tunnel
 /// to gateway B's destination relay and TCP echo.
+///
+/// This proves the shared REDIRECT-captured `mesh_tcp_inbound` relay datapath
+/// only. The issue #3260 Sidecar `ingress[]` STREAM lane has its OWN live
+/// coverage, which does not need root/netns:
+/// `functional_mesh_sidecar_ingress_stream_connect_relays_declared_listener_port`
+/// and `functional_mesh_sidecar_ingress_stream_reload_withdraws_declared_listener`.
 #[cfg(target_os = "linux")]
 #[ignore = "requires root + netns/veth + iptables REDIRECT"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -13511,6 +14489,797 @@ async fn functional_mesh_live_two_cluster_cross_cluster_protocol_matrix() {
     eprintln!("LIVE_XC_STAGE shutdown:ok");
 }
 
+// ── Sidecar ingress Unix-socket backends (issue #3261) ───────────────────────
+//
+// These tests drive the REAL translation boundary: a `Sidecar` with
+// `ingress[].defaultEndpoint: unix://…` rides the localized mesh file source,
+// the data plane builds the slice itself (`MeshSlice::from_gateway_config` — the
+// same materialization every CP path uses), materializes the tagged upstream,
+// and then serves LIVE traffic over the socket. Nothing here hand-authors the
+// reserved `mesh.unix_socket` tag, so a regression anywhere between the Sidecar
+// spec and the dial fails the test.
+//
+// The inbound listener is plaintext (no SVID material, dev posture, an explicit
+// PeerAuthentication DISABLE), so the client side is a plain TCP/HTTP client and
+// the assertions stay about the Unix backend rather than about mTLS.
+
+/// A minimal HTTP/1.1 server on a Unix-domain stream socket. Answers every
+/// request with `name` plus the request line and forwarded Host, so a test can
+/// prove WHICH socket served it and that header regeneration survived the
+/// transport swap.
+#[cfg(unix)]
+struct UnixHttp1Backend {
+    path: PathBuf,
+    hits: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl UnixHttp1Backend {
+    fn start(path: PathBuf, name: &'static str) -> Self {
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind unix http1 backend");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_task = Arc::clone(&hits);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let hits = Arc::clone(&hits_task);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n =
+                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(n)) if n > 0 => n,
+                            _ => return,
+                        };
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let request_line = request.lines().next().unwrap_or("").to_string();
+                    let host = request
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("host:"))
+                        .map(|line| line["host:".len()..].trim().to_string())
+                        .unwrap_or_default();
+                    let body = format!("{name}|{request_line}|{host}");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        Self { path, hits, task }
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+
+    /// Simulate the app going away without rewriting config: stop serving and
+    /// unlink the socket, so the next dial gets `ENOENT`.
+    fn make_stale(&self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixHttp1Backend {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A minimal **h2c prior-knowledge HTTP/2** gRPC-shaped server on a
+/// Unix-domain stream socket.
+///
+/// `/ferrum.Test/Echo` answers immediately with a DATA frame plus a terminal
+/// `grpc-status: 0` TRAILER and echoes the received `grpc-timeout` back in a
+/// header, so a test can prove trailers AND deadline propagation survived the
+/// socket hop. `/ferrum.Test/Slow` sleeps well past any short deadline so the
+/// gateway's deadline enforcement (and the resulting upstream cancellation) is
+/// observable.
+#[cfg(unix)]
+struct UnixH2cBackend {
+    path: PathBuf,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl UnixH2cBackend {
+    fn start(path: PathBuf) -> Self {
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind unix h2c backend");
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let service =
+                        service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+                            let received_timeout = req
+                                .headers()
+                                .get("grpc-timeout")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let te_trailers = req
+                                .headers()
+                                .get("te")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let slow = req.uri().path().ends_with("/Slow");
+                            // Drain the request body so bidirectional streaming
+                            // is genuinely exercised rather than short-circuited.
+                            let _ = req.into_body().collect().await;
+                            if slow {
+                                tokio::time::sleep(Duration::from_millis(2_000)).await;
+                            }
+                            let mut trailers = hyper::HeaderMap::new();
+                            trailers.insert(
+                                "grpc-status",
+                                hyper::header::HeaderValue::from_static("0"),
+                            );
+                            trailers.insert(
+                                "grpc-message",
+                                hyper::header::HeaderValue::from_static("ok"),
+                            );
+                            let frames: Vec<Result<Frame<Bytes>, std::io::Error>> = vec![
+                                Ok(Frame::data(Bytes::from_static(b"\x00\x00\x00\x00\x04unix"))),
+                                Ok(Frame::trailers(trailers)),
+                            ];
+                            let body = StreamBody::new(stream::iter(frames));
+                            let response = hyper::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .header("x-received-grpc-timeout", received_timeout)
+                                .header("x-received-te", te_trailers)
+                                .body(body)
+                                .expect("h2c grpc response builds");
+                            Ok::<_, std::io::Error>(response)
+                        });
+                    let _ = Http2ServerBuilder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        Self { path, task }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixH2cBackend {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// One `Sidecar` `ingress[]` entry for the mesh document below.
+#[cfg(unix)]
+struct UnixIngressEntry {
+    listener_port: u16,
+    protocol: AppProtocol,
+    default_endpoint: String,
+}
+
+/// `{ "mesh": … }` file-source document: an `echo` workload/service in `ferrum`
+/// plus a namespace-default `Sidecar` whose `ingress[]` is `entries`.
+///
+/// PeerAuthentication DISABLE keeps the inbound listener plaintext so the test
+/// client needs no SVID; the Unix backend behavior under test is independent of
+/// the inbound transport.
+#[cfg(unix)]
+fn unix_ingress_mesh_document(server_spiffe: &str, entries: &[UnixIngressEntry]) -> String {
+    use ferrum_edge::modes::mesh::config::{MeshSidecar, MeshSidecarIngress};
+
+    let server_id = SpiffeId::new(server_spiffe).expect("server SPIFFE id");
+    let trust_domain = TrustDomain::new("cluster.local").expect("trust domain");
+    let workload = Workload {
+        spiffe_id: server_id.clone(),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), "echo".to_string())]),
+            namespace: Some("ferrum".to_string()),
+        },
+        service_name: "echo".to_string(),
+        service_namespace: None,
+        addresses: vec!["127.0.0.1".to_string()],
+        ports: vec![WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        }],
+        trust_domain,
+        namespace: "ferrum".to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some("echo".to_string()),
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    };
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "echo".to_string(),
+        namespace: "ferrum".to_string(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        }],
+        workloads: vec![WorkloadRef {
+            spiffe_id: server_id,
+        }],
+        protocol_overrides: HashMap::new(),
+    };
+    let sidecar = MeshSidecar {
+        name: "echo-ingress".to_string(),
+        namespace: "ferrum".to_string(),
+        workload_selector: None,
+        egress_inherits_defaults: true,
+        egress: Vec::new(),
+        // Declared even when the list is empty: that is how the withdrawal
+        // phase proves the routes are gone rather than silently replaced by the
+        // service-port defaults.
+        ingress_declared: true,
+        ingress: entries
+            .iter()
+            .map(|entry| MeshSidecarIngress {
+                port: entry.listener_port,
+                protocol: entry.protocol,
+                name: None,
+                bind: None,
+                default_endpoint: entry.default_endpoint.clone(),
+            })
+            .collect(),
+        outbound_traffic_policy: None,
+    };
+    // `local_inbound_services` is deliberately NOT set here: it is a
+    // `serde(skip)` runtime back-projection the data plane resolves for itself
+    // from the un-narrowed local view, so a document that tried to supply it
+    // would be silently dropped rather than honored.
+    let mesh = MeshConfig {
+        workloads: vec![workload],
+        services: vec![service],
+        peer_authentications: vec![PeerAuthentication {
+            name: "mesh-disable".to_string(),
+            namespace: "ferrum".to_string(),
+            scope: None,
+            selector: None,
+            mtls_mode: MtlsMode::Disable,
+            port_overrides: HashMap::new(),
+        }],
+        sidecars: vec![sidecar],
+        ..MeshConfig::default()
+    };
+    serde_json::to_string(&serde_json::json!({ "mesh": mesh })).expect("mesh document serializes")
+}
+
+/// Plain HTTP/1.1 request against the plaintext sidecar inbound listener.
+/// Returns `(status, raw response)`.
+#[cfg(unix)]
+async fn plaintext_inbound_http1(
+    port: u16,
+    authority: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<(u16, String), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\n");
+    // Only default to `Connection: close` when the caller did not set its own —
+    // the WebSocket case needs `Connection: Upgrade` for the flavor detector to
+    // classify the request as an upgrade at all.
+    if !extra_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+    {
+        request.push_str("Connection: close\r\n");
+    }
+    for (name, value) in extra_headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+    // A refusal on an upgrade request may leave the connection open, so read
+    // until EOF OR a short quiet period and use whatever arrived. A response
+    // that never arrives at all still fails, because the status parse below has
+    // nothing to read.
+    let mut raw = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut chunk = [0u8; 4096];
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => raw.extend_from_slice(&chunk[..n]),
+            Ok(Err(e)) => return Err(Box::new(e)),
+            // Quiet socket: if headers already arrived we are done, otherwise
+            // keep waiting until the outer deadline.
+            Err(_) if raw.windows(4).any(|w| w == b"\r\n\r\n") => break,
+            Err(_) => continue,
+        }
+    }
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("no status line in response: {text:?}"))?;
+    Ok((status, text))
+}
+
+/// A gRPC-shaped h2c prior-knowledge request against the plaintext sidecar
+/// inbound listener. Returns `(status, response headers, trailers)`.
+#[cfg(unix)]
+async fn plaintext_inbound_grpc(
+    port: u16,
+    authority: &str,
+    path: &str,
+    grpc_timeout: Option<&str>,
+) -> Result<(u16, hyper::HeaderMap, hyper::HeaderMap), Box<dyn std::error::Error + Send + Sync>> {
+    let stream = TcpStream::connect(("127.0.0.1", port)).await?;
+    let (mut sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(stream))
+        .await?;
+    let driver = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut builder = hyper::Request::builder()
+        .method("POST")
+        .uri(format!("http://{authority}{path}"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers");
+    if let Some(timeout) = grpc_timeout {
+        builder = builder.header("grpc-timeout", timeout);
+    }
+    let request = builder.body(Full::new(Bytes::from_static(b"\x00\x00\x00\x00\x00")))?;
+    let response =
+        tokio::time::timeout(Duration::from_secs(15), sender.send_request(request)).await??;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let collected =
+        tokio::time::timeout(Duration::from_secs(15), response.into_body().collect()).await??;
+    let trailers = collected.trailers().cloned().unwrap_or_default();
+    driver.abort();
+    Ok((status, headers, trailers))
+}
+
+/// Read a gRPC status code from either the response headers (Trailers-Only) or
+/// the terminal trailers.
+#[cfg(unix)]
+fn grpc_status_code(headers: &hyper::HeaderMap, trailers: &hyper::HeaderMap) -> Option<i32> {
+    trailers
+        .get("grpc-status")
+        .or_else(|| headers.get("grpc-status"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i32>().ok())
+}
+
+/// Keystone for issue #3261: a `Sidecar` ingress `defaultEndpoint: unix://…`
+/// translated through the supported source path serves LIVE traffic over the
+/// socket on HTTP/1.1 and on h2c (including native gRPC trailers and deadline
+/// enforcement), refuses the cases Ferrum does not support, and stays
+/// fail-closed for a socket outside the configured containment roots.
+///
+/// Also covers the lifecycle the acceptance criteria call out: update (re-point
+/// to a different allowed socket on SIGHUP), withdrawal (the entry disappears),
+/// and a stale socket (the app went away without a config change).
+#[cfg(unix)]
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
+    ensure_gateway_built().expect("gateway build");
+    let server_spiffe = "spiffe://cluster.local/ns/ferrum/sa/echo";
+
+    let temp = TempDir::new().expect("temp dir");
+    // The CONTAINMENT root. Only sockets strictly below it are admissible.
+    let socket_root = temp.path().join("sockets");
+    std::fs::create_dir_all(&socket_root).expect("create socket root");
+    // Deliberately OUTSIDE the root, standing in for `/var/run/docker.sock`.
+    let outside_root = temp.path().join("privileged");
+    std::fs::create_dir_all(&outside_root).expect("create outside root");
+
+    let http1_socket = socket_root.join("http1.sock");
+    let h2c_socket = socket_root.join("h2c.sock");
+    let outside_socket = outside_root.join("privileged.sock");
+
+    let http1_backend = UnixHttp1Backend::start(http1_socket.clone(), "unix-http1-a");
+    let _h2c_backend = UnixH2cBackend::start(h2c_socket.clone());
+    // A REAL, reachable socket that config points at but containment forbids:
+    // the refusal must be the allowlist, not an absent socket.
+    let outside_backend = UnixHttp1Backend::start(outside_socket.clone(), "must-never-be-reached");
+
+    let unix_url = |path: &std::path::Path| format!("unix://{}", path.display());
+    let phase_a = vec![
+        UnixIngressEntry {
+            listener_port: 8443,
+            protocol: AppProtocol::Http,
+            default_endpoint: unix_url(&http1_socket),
+        },
+        UnixIngressEntry {
+            listener_port: 9443,
+            protocol: AppProtocol::Grpc,
+            default_endpoint: unix_url(&h2c_socket),
+        },
+        UnixIngressEntry {
+            listener_port: 7443,
+            protocol: AppProtocol::Http,
+            default_endpoint: unix_url(&outside_socket),
+        },
+    ];
+
+    let mesh_doc_path = temp.path().join("mesh.json");
+    std::fs::write(
+        &mesh_doc_path,
+        unix_ingress_mesh_document(server_spiffe, &phase_a),
+    )
+    .expect("write mesh document");
+
+    let ports = reserve_mesh_ports().await;
+    let inbound_port = ports.inbound;
+    let mut child = spawn_mesh_gateway(
+        &temp,
+        MeshGatewaySpawnOptions {
+            cp_addr: "127.0.0.1:1".parse().expect("dummy addr"),
+            ports,
+            node_id: "functional-mesh-unix-ingress",
+            config_protocol: "file",
+            topology: "sidecar",
+            waypoint_name: None,
+            env_overrides: vec![
+                (
+                    "FERRUM_MESH_FILE_CONFIG_PATH",
+                    mesh_doc_path
+                        .to_str()
+                        .expect("mesh document path is UTF-8")
+                        .to_string(),
+                ),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", server_spiffe.to_string()),
+                // `ingress[]` materialization is gated on enforcement, NOT dry-run.
+                ("FERRUM_MESH_SIDECAR_ENFORCED", "true".to_string()),
+                // THE containment allowlist. Without it every unix listener is
+                // refused, which is asserted separately by the unit tests.
+                (
+                    "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS",
+                    socket_root
+                        .to_str()
+                        .expect("socket root is UTF-8")
+                        .to_string(),
+                ),
+                // A Unix target's synthetic loopback `host:port` is never a
+                // network dial target. Public-only IP egress must therefore
+                // leave this socket path to its own containment, inode, and
+                // peer-credential admission gates instead of rejecting the
+                // carrier address before Unix dispatch.
+                ("FERRUM_BACKEND_ALLOW_IPS", "public".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+            ],
+        },
+    );
+
+    if !wait_for_tcp_port(inbound_port, STARTUP_TIMEOUT).await {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!("mesh inbound listener never bound\n{output}");
+    }
+
+    // ── (a) HTTP/1.1 over the socket, through real Sidecar translation ──
+    let authority_8443 = "echo.ferrum.svc.cluster.local:8443";
+    let (status, body) = match plaintext_inbound_http1(inbound_port, authority_8443, "/", &[]).await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!("HTTP/1.1 request to the unix ingress listener failed: {e}\n{output}");
+        }
+    };
+    if status != 200 || !body.contains("unix-http1-a") {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "a translated unix:// ingress listener must serve live HTTP/1.1 traffic from its \
+             socket; status {status} body {body:?}\n{output}"
+        );
+    }
+    assert!(
+        http1_backend.hits() >= 1,
+        "the HTTP/1.1 unix socket must have served the request"
+    );
+
+    // ── (b) native gRPC over h2c: trailers and `te: trailers` survive ──
+    let authority_9443 = "echo.ferrum.svc.cluster.local:9443";
+    let (grpc_status, grpc_headers, grpc_trailers) = match plaintext_inbound_grpc(
+        inbound_port,
+        authority_9443,
+        "/ferrum.Test/Echo",
+        Some("30S"),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!("gRPC request to the h2c unix ingress listener failed: {e}\n{output}");
+        }
+    };
+    if grpc_status != 200 || grpc_status_code(&grpc_headers, &grpc_trailers) != Some(0) {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "gRPC over an h2c unix ingress listener must return OK with terminal trailers; \
+             status {grpc_status} headers {grpc_headers:?} trailers {grpc_trailers:?}\n{output}"
+        );
+    }
+    assert!(
+        grpc_trailers.contains_key("grpc-status"),
+        "the terminal grpc-status must arrive as a TRAILER, not a header: {grpc_trailers:?}"
+    );
+    assert_eq!(
+        grpc_headers
+            .get("x-received-te")
+            .and_then(|v| v.to_str().ok()),
+        Some("trailers"),
+        "the gateway must regenerate `te: trailers` on the h2c socket hop"
+    );
+    let forwarded_deadline = grpc_headers
+        .get("x-received-grpc-timeout")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !forwarded_deadline.is_empty(),
+        "the client's gRPC deadline must be propagated onto the socket hop"
+    );
+
+    // ── (c) deadline enforcement / upstream cancellation ──
+    // 5 MILLISECONDS against a backend that sleeps 2s: the gateway must cancel
+    // and answer DEADLINE_EXCEEDED rather than hang for the backend.
+    let (slow_status, slow_headers, slow_trailers) = match plaintext_inbound_grpc(
+        inbound_port,
+        authority_9443,
+        "/ferrum.Test/Slow",
+        Some("5m"),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!("deadline-bounded gRPC request failed to complete: {e}\n{output}");
+        }
+    };
+    let slow_code = grpc_status_code(&slow_headers, &slow_trailers);
+    if slow_code != Some(4) {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "an exceeded gRPC deadline on the h2c unix hop must be DEADLINE_EXCEEDED (4); got \
+             status {slow_status} code {slow_code:?} headers {slow_headers:?} trailers \
+             {slow_trailers:?}\n{output}"
+        );
+    }
+
+    // ── (d) gRPC against an `http`-declared (HTTP/1.1) socket is REFUSED ──
+    // HTTP/1.1 cannot carry gRPC trailers, so this must be a clean gRPC
+    // UNAVAILABLE, never a downgraded dial.
+    let (h1_grpc_status, h1_grpc_headers, h1_grpc_trailers) =
+        match plaintext_inbound_grpc(inbound_port, authority_8443, "/ferrum.Test/Echo", None).await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!("gRPC request to the http-declared unix listener failed: {e}\n{output}");
+            }
+        };
+    let h1_grpc_code = grpc_status_code(&h1_grpc_headers, &h1_grpc_trailers);
+    if h1_grpc_status != 200 || h1_grpc_code != Some(14) {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "gRPC to an http-declared unix ingress listener must be refused UNAVAILABLE (14); \
+             got status {h1_grpc_status} code {h1_grpc_code:?}\n{output}"
+        );
+    }
+
+    // ── (e) WebSocket upgrade over a unix backend is explicitly refused ──
+    let (ws_status, ws_body) = match plaintext_inbound_http1(
+        inbound_port,
+        authority_8443,
+        "/ws",
+        &[
+            ("Connection", "Upgrade"),
+            ("Upgrade", "websocket"),
+            ("Sec-WebSocket-Version", "13"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ],
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!("WebSocket upgrade attempt failed to complete: {e}\n{output}");
+        }
+    };
+    if ws_status != 502 || !ws_body.contains("does not support WebSocket") {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "a WebSocket upgrade to a unix-socket backend must be refused 502 with the documented \
+             message; got status {ws_status} body {ws_body:?}\n{output}"
+        );
+    }
+
+    // ── (f) containment: a real socket OUTSIDE the allowed roots never dials ──
+    let (denied_status, denied_body) =
+        match plaintext_inbound_http1(inbound_port, "echo.ferrum.svc.cluster.local:7443", "/", &[])
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!("request to the out-of-root unix listener failed: {e}\n{output}");
+            }
+        };
+    if denied_status == 200 || denied_body.contains("must-never-be-reached") {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "a unix socket outside FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS must never be dialed; \
+             got status {denied_status} body {denied_body:?}\n{output}"
+        );
+    }
+    assert_eq!(
+        outside_backend.hits(),
+        0,
+        "the out-of-root socket must have received NO connection at all"
+    );
+
+    // ── (g) stale socket: the app vanished without a config change ──
+    http1_backend.make_stale();
+    let (stale_status, stale_body) =
+        match plaintext_inbound_http1(inbound_port, authority_8443, "/", &[]).await {
+            Ok(result) => result,
+            Err(e) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!("request to the stale unix socket failed: {e}\n{output}");
+            }
+        };
+    if stale_status == 200 {
+        let output = captured_output(&temp);
+        kill_child(&mut child);
+        panic!(
+            "a removed unix socket must fail the request, not serve it; body \
+             {stale_body:?}\n{output}"
+        );
+    }
+
+    // ── (h) UPDATE: re-point the listener at a DIFFERENT allowed socket ──
+    let updated_socket = socket_root.join("http1-b.sock");
+    let updated_backend = UnixHttp1Backend::start(updated_socket.clone(), "unix-http1-b");
+    std::fs::write(
+        &mesh_doc_path,
+        unix_ingress_mesh_document(
+            server_spiffe,
+            &[UnixIngressEntry {
+                listener_port: 8443,
+                protocol: AppProtocol::Http,
+                default_endpoint: unix_url(&updated_socket),
+            }],
+        ),
+    )
+    .expect("rewrite mesh document for the update phase");
+    let pid = child.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .expect("send SIGHUP")
+            .success(),
+        "SIGHUP delivery failed for pid {pid}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match plaintext_inbound_http1(inbound_port, authority_8443, "/", &[]).await {
+            Ok((200, body)) if body.contains("unix-http1-b") => break,
+            _ if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            other => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!(
+                    "the reloaded listener never dialed the new socket; last result \
+                     {other:?}\n{output}"
+                );
+            }
+        }
+    }
+    assert!(
+        updated_backend.hits() >= 1,
+        "the re-pointed socket must have served the request after reload"
+    );
+
+    // ── (i) WITHDRAWAL: the ingress entry disappears entirely ──
+    // `ingress_declared` stays true with an EMPTY list, so Istio semantics say
+    // the service-port defaults must NOT come back either.
+    std::fs::write(
+        &mesh_doc_path,
+        unix_ingress_mesh_document(server_spiffe, &[]),
+    )
+    .expect("rewrite mesh document for the withdrawal phase");
+    assert!(
+        Command::new("kill")
+            .args(["-HUP", &pid])
+            .status()
+            .expect("send SIGHUP")
+            .success(),
+        "SIGHUP delivery failed for pid {pid}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match plaintext_inbound_http1(inbound_port, authority_8443, "/", &[]).await {
+            Ok((status, body)) if status != 200 && !body.contains("unix-http1-b") => break,
+            _ if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            other => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!(
+                    "a withdrawn unix ingress listener must stop routing; last result \
+                     {other:?}\n{output}"
+                );
+            }
+        }
+    }
+
+    // The polling request that observes the reload may be preceded by requests
+    // served from the old atomic snapshot. Measure only after withdrawal is
+    // visible, then prove a fresh request cannot reach the removed backend.
+    let hits_after_withdrawal = updated_backend.hits();
+    let (withdrawn_status, withdrawn_body) =
+        plaintext_inbound_http1(inbound_port, authority_8443, "/", &[])
+            .await
+            .expect("post-withdrawal request must complete");
+    assert!(
+        withdrawn_status != 200 && !withdrawn_body.contains("unix-http1-b"),
+        "a fresh request after withdrawal must remain unroutable; status {withdrawn_status} body \
+         {withdrawn_body:?}"
+    );
+    assert_eq!(
+        updated_backend.hits(),
+        hits_after_withdrawal,
+        "no request may reach the socket after its listener was withdrawn"
+    );
+
+    kill_child(&mut child);
+}
+
 // ── Live H3 → authenticated mesh-transport gRPC datapath (issue #3284) ───────
 //
 // The LIVE keystone for H3-to-gRPC mesh dispatch. Every test below drives a real
@@ -14256,8 +16025,10 @@ fn h3_mesh_frontend_certs() -> H3MeshFrontendCerts {
 }
 
 /// One upstream-target YAML block (indented for `upstreams[].targets`) carrying
-/// `tags` verbatim, so a test declares the exact mesh metadata the runtime
-/// transport materialization has to consume — no in-process target construction.
+/// `tags` verbatim. The block is deserialized into a trusted projected
+/// [`GatewayConfig`] and fed to in-process serve / `update_config` — the same
+/// runtime boundary production mesh materialization uses — rather than being
+/// written through the operator file-loader (which must keep rejecting `mesh.*`).
 fn h3_mesh_target_yaml(host: &str, port: u16, tags: &[(&str, String)]) -> String {
     let mut block = String::new();
     block.push_str(&format!("      - host: \"{host}\"\n"));
@@ -14272,20 +16043,20 @@ fn h3_mesh_target_yaml(host: &str, port: u16, tags: &[(&str, String)]) -> String
 }
 
 /// The upstream id every H3 mesh gRPC config declares. Shared with
-/// `h3_mesh_reload`, which polls the admin projection of THIS upstream to prove a
-/// SIGHUP reload has been applied.
+/// `h3_mesh_reload`, which waits until the applied projection exposes these
+/// upstream tags after a trusted `update_config`.
 const H3_MESH_UPSTREAM_ID: &str = "h3-mesh-grpc-upstream";
 
-/// File-mode YAML for ONE gRPC-serving proxy whose upstream carries the supplied
-/// target blocks. `dead_backend_port` is the proxy's own (unlistened) backend, so
-/// only a mesh dispatch can reach anything at all.
+/// Trusted-projected fixture YAML for ONE gRPC-serving proxy whose upstream
+/// carries the supplied target blocks. `dead_backend_port` is the proxy's own
+/// (unlistened) backend, so only a mesh dispatch can reach anything at all.
 fn h3_mesh_grpc_config(dead_backend_port: u16, targets: &str, retry: bool) -> String {
     h3_mesh_grpc_config_with_generation(dead_backend_port, targets, retry, 0)
 }
 
 /// Like [`h3_mesh_grpc_config`], but stamps an advancing `updated_at` on the
-/// proxy and upstream so file-mode `ConfigDelta` sees a real modification even
-/// when only mesh target tags change (host/port stay fixed across reloads).
+/// proxy and upstream so `ConfigDelta` sees a real modification even when only
+/// mesh target tags change (host/port stay fixed across projected reloads).
 fn h3_mesh_grpc_config_with_generation(
     dead_backend_port: u16,
     targets: &str,
@@ -14327,44 +16098,50 @@ plugin_configs: []
     )
 }
 
-/// Spawn a file-mode gateway with a QUIC/HTTP-3 frontend and a real SPIFFE SVID
-/// loaded from files. Returns the gateway plus the HTTPS/QUIC port to drive.
+/// Spawn an in-process gateway with a QUIC/HTTP-3 frontend and a real SPIFFE
+/// SVID, feeding a **trusted projected** config (may carry reserved `mesh.*`
+/// tags) through `file::serve` — the same boundary mesh materialization uses.
+/// Returns the gateway plus the HTTPS/QUIC port to drive.
 ///
-/// `reserved_ports` are ports this test's fixtures already own, so the harness's
-/// own admin/proxy allocation cannot land on one of them.
+/// `reserved_ports` are ports this test's fixtures already own; the HTTPS port
+/// is allocated from the mesh-port set so it cannot collide with them.
 async fn spawn_h3_mesh_gateway(
     config_yaml: String,
     svid: &GeneratedGatewaySvid,
     frontend: &H3MeshFrontendCerts,
     reserved_ports: &[u16],
-) -> (TestGateway, u16) {
-    let https_port = reserve_unique_mesh_port().await;
-    let mut builder = TestGateway::builder()
-        .mode_file(config_yaml)
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", frontend.cert_path.clone())
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", frontend.key_path.clone())
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        // gRPC always rides the cross-protocol bridge, never the native-H3
-        // backend pool, so the capability warmup probe has nothing to prove and
-        // would only add an unrelated dial to the fixtures.
-        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
-        .env("FERRUM_GATEWAY_SVID_CERT_PATH", svid.cert_path.clone())
-        .env("FERRUM_GATEWAY_SVID_KEY_PATH", svid.key_path.clone())
-        .env(
-            "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
-            svid.trust_bundle_path.clone(),
-        );
-    for port in reserved_ports {
-        builder = builder.reserve_listener_port(*port);
-    }
-    let gateway = builder.spawn().await.expect("spawn H3 mesh gRPC gateway");
+) -> (TrustedProjectedGateway, u16) {
+    let env = EnvConfig {
+        enable_http3: true,
+        pool_warmup_enabled: false,
+        tls_no_verify: true,
+        frontend_tls_cert_path: Some(frontend.cert_path.clone()),
+        frontend_tls_key_path: Some(frontend.key_path.clone()),
+        gateway_svid_cert_path: Some(svid.cert_path.clone()),
+        gateway_svid_key_path: Some(svid.key_path.clone()),
+        gateway_svid_trust_bundle_path: Some(svid.trust_bundle_path.clone()),
+        log_level: "warn".into(),
+        ..Default::default()
+    };
+
+    let gateway = TrustedProjectedGateway::spawn_from_yaml(
+        &config_yaml,
+        TrustedProjectedGatewayOptions {
+            env,
+            enable_https: true,
+            excluded_ports: reserved_ports.to_vec(),
+            ..TrustedProjectedGatewayOptions::default()
+        },
+    )
+    .await
+    .expect("spawn H3 mesh gRPC gateway via trusted projection");
     gateway
         .wait_for_proxy_port(Duration::from_secs(15))
         .await
         .expect("H3 mesh gRPC gateway proxy port");
+    let https_port = gateway
+        .proxy_https_port
+        .expect("H3 mesh gateway must expose an HTTPS/QUIC port");
     (gateway, https_port)
 }
 
@@ -14566,7 +16343,7 @@ async fn functional_h3_grpc_dispatches_over_same_cluster_sidecar_mesh_mtls() {
         "the H3 request DATA must reach the peer byte-for-byte"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 2. Cross-cluster Sidecar mesh mTLS (east-west) ───────────────────────────
@@ -14645,7 +16422,7 @@ async fn functional_h3_grpc_dispatches_over_cross_cluster_sidecar_mesh_mtls() {
          not the gateway address dialed; observed {snis:?}"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 3. Same-cluster Ambient HBONE (nested HTTP/2 in the CONNECT tunnel) ──────
@@ -14727,7 +16504,7 @@ async fn functional_h3_grpc_dispatches_over_same_cluster_ambient_hbone() {
         "the inner request authority must be the destination's own app address"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 4. Cross-cluster Ambient HBONE (east-west gateway) ──────────────────────
@@ -14815,7 +16592,7 @@ async fn functional_h3_grpc_dispatches_over_cross_cluster_ambient_hbone() {
     );
     assert_eq!(observed.body, payload);
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 5. Streaming + cancellation over a mesh transport ───────────────────────
@@ -14891,7 +16668,7 @@ async fn functional_h3_grpc_streams_and_cancels_over_ambient_hbone() {
     stream.cancel_request_upload();
     app.wait_for_request_reset(Duration::from_secs(15)).await;
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 6. Deadline propagation over a mesh transport ───────────────────────────
@@ -14946,7 +16723,7 @@ async fn functional_h3_grpc_propagates_the_deadline_over_sidecar_mesh_mtls() {
         "the peer must have received a grpc-timeout on the mesh hop: {observed:?}"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 7. Fail-closed refusal for unmaterializable mesh metadata ───────────────
@@ -15067,7 +16844,7 @@ async fn functional_h3_grpc_mesh_transport_refuses_unmaterializable_metadata() {
             );
         }
 
-        gateway.shutdown();
+        gateway.shutdown().await;
     }
 }
 
@@ -15164,14 +16941,14 @@ async fn functional_h3_grpc_retry_rotation_re_resolves_the_mesh_transport() {
     );
     assert_eq!(observed.body, payload);
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
 // ── 9. Configuration update / reload / withdrawal ──────────────────────────
 
 /// The live transport follows configuration TRANSITIONS, not just first-start
-/// construction. One gateway process is driven through three SIGHUP file-mode
-/// reloads:
+/// construction. One trusted-projected gateway is driven through three
+/// in-process `update_config` applications (the mesh materialization boundary):
 ///
 /// 1. the mesh target is RE-POINTED at a second peer with a different pinned
 ///    workload identity — the RPC must move to that peer over its own dial plan;
@@ -15227,7 +17004,7 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
 
     // 1. UPDATE: re-point the mesh target at peer B (different pinned identity).
     let peer_b_tags = h3_mesh_mtls_tags(peer_b.port, H3_MESH_PEER_B_SPIFFE);
-    h3_mesh_reload(&mut gateway, config_for(&peer_b_tags, 1), &peer_b_tags).await;
+    h3_mesh_reload(&gateway, config_for(&peer_b_tags, 1), &peer_b_tags).await;
     let retargeted = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
     assert_eq!(
         retargeted.grpc_status().as_deref(),
@@ -15245,7 +17022,7 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
     // 2. WITHDRAWAL: drop the mesh transport tags entirely. The target becomes an
     //    ordinary direct-dial one, so the mesh listener must stop being reached.
     let peer_b_accepts = peer_b.accept_count();
-    h3_mesh_reload(&mut gateway, config_for(&[], 2), &[]).await;
+    h3_mesh_reload(&gateway, config_for(&[], 2), &[]).await;
     let withdrawn = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
     assert_ne!(
         withdrawn.grpc_status().as_deref(),
@@ -15270,12 +17047,7 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
         ("mesh.mtls_port", peer_a.port.to_string()),
         ("mesh.spiffe_id", "not-a-spiffe-id".to_string()),
     ];
-    h3_mesh_reload(
-        &mut gateway,
-        config_for(&corrupted_tags, 3),
-        &corrupted_tags,
-    )
-    .await;
+    h3_mesh_reload(&gateway, config_for(&corrupted_tags, 3), &corrupted_tags).await;
     let corrupted = h3_mesh_unary_rpc(https_port, b"h3-reload", &[]).await;
     assert_eq!(
         corrupted.grpc_status().as_deref(),
@@ -15291,105 +17063,44 @@ async fn functional_h3_grpc_mesh_transport_follows_reload_and_withdrawal() {
         "the fail-closed reload must not dial the peer"
     );
 
-    gateway.shutdown();
+    gateway.shutdown().await;
 }
 
-/// Rewrite the running file-mode gateway's config, SIGHUP it, and WAIT until the
-/// gateway's OWN read-only admin projection proves the new upstream targets are
-/// the live ones.
+/// Apply a new trusted projected config via `ProxyState::update_config` and wait
+/// until the live projection exposes the expected upstream target tags.
 ///
-/// A fixed sleep is not proof: on a loaded hosted runner the reload can land
-/// after it, and the very next RPC then exercises the PREVIOUS target — which
-/// reads as "the re-pointed peer was never dialed" instead of "the reload had
-/// not landed yet". Polling the applied config observes convergence directly and
-/// spends no datapath RPC, so each step's authoritative protocol / fail-closed
-/// observation is still made exactly once, against a known-converged gateway.
-/// The child is polled between probes so a gateway that died on the reload fails
-/// as itself rather than being waited out for the whole window.
-///
-/// Publish via write-temp → rename (the file loader's stability contract) and
-/// assert `kill -HUP` succeeded — discarding the signal status previously hid
-/// delivery failures behind a 20s admin-poll timeout.
+/// This is the mesh materialization reload boundary — not SIGHUP / file-loader
+/// reload, which must keep rejecting operator-authored `mesh.*` tags. Polling
+/// the applied projection observes convergence directly without spending a
+/// datapath RPC, so each step's authoritative protocol / fail-closed observation
+/// is still made exactly once against a known-converged gateway.
 async fn h3_mesh_reload(
-    gateway: &mut TestGateway,
+    gateway: &TrustedProjectedGateway,
     config_yaml: String,
     expected_tags: &[(&'static str, String)],
 ) {
-    let config_path = gateway
-        .config_path
-        .as_ref()
-        .expect("file-mode harness must populate config_path")
-        .clone();
-    let tmp_path = config_path.with_extension("yaml.tmp");
-    std::fs::write(&tmp_path, &config_yaml).expect("stage H3 mesh config rewrite");
-    std::fs::rename(&tmp_path, &config_path).expect("atomically publish H3 mesh config rewrite");
-    #[cfg(unix)]
-    {
-        let pid = gateway.pid().expect("gateway still running");
-        let signal = std::process::Command::new("kill")
-            .args(["-HUP", &pid.to_string()])
-            .output()
-            .expect("invoke kill -HUP for H3 mesh reload");
-        assert!(
-            signal.status.success(),
-            "kill -HUP {pid} failed with status {}; stderr={}",
-            signal.status,
-            String::from_utf8_lossy(&signal.stderr)
-        );
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = config_yaml;
-        panic!("H3 mesh file-mode SIGHUP reload requires Unix");
-    }
+    let outcome = gateway.apply_projected_yaml(&config_yaml);
+    assert!(
+        matches!(outcome, ConfigApplyOutcome::Applied),
+        "trusted projected H3 mesh reload must apply, got {outcome:?}"
+    );
 
-    let expected: serde_json::Map<String, serde_json::Value> = expected_tags
+    let expected: HashMap<String, String> = expected_tags
         .iter()
-        .map(|(key, value)| ((*key).to_string(), serde_json::Value::String(value.clone())))
+        .map(|(key, value)| ((*key).to_string(), value.clone()))
         .collect();
-    let url = gateway.admin_url(&format!("/upstreams/{H3_MESH_UPSTREAM_ID}"));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("admin client");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let last = match client
-            .get(&url)
-            .header("Authorization", gateway.auth_header())
-            .send()
-            .await
-        {
-            Ok(response) => match response.json::<serde_json::Value>().await {
-                Ok(upstream) => {
-                    let tags = upstream
-                        .get("targets")
-                        .and_then(|targets| targets.as_array())
-                        .and_then(|targets| targets.first())
-                        .and_then(|target| target.get("tags"))
-                        .and_then(|tags| tags.as_object())
-                        .cloned()
-                        .unwrap_or_default();
-                    if tags == expected {
-                        return;
-                    }
-                    format!("live target tags {tags:?}")
-                }
-                Err(error) => format!("unreadable admin response: {error}"),
-            },
-            Err(error) => format!("admin request failed: {error}"),
-        };
-        let logs = gateway.diagnostic_captured_output();
-        assert!(
-            gateway.is_running(),
-            "the gateway died while reloading the H3 mesh config ({last})\n\
-             --- captured gateway output ---\n{logs}"
-        );
-        assert!(
-            Instant::now() < deadline,
-            "the SIGHUP reload never applied the expected mesh target tags \
-             {expected:?} ({last})\n--- captured gateway output ---\n{logs}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        match gateway.live_upstream_tags(H3_MESH_UPSTREAM_ID) {
+            Some(live) if live == expected => return,
+            live => {
+                assert!(
+                    Instant::now() < deadline,
+                    "trusted projected reload never exposed expected mesh target tags \
+                     {expected:?}; live={live:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
     }
 }

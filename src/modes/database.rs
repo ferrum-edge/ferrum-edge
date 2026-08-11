@@ -3836,7 +3836,7 @@ mod tests {
     #[test]
     fn prometheus_registry_renders_database_delta_poll_metrics() {
         let registry = crate::plugins::prometheus_metrics::MetricsRegistry::new();
-        registry.configure(5, 3600, 0, "ops");
+        registry.configure(5, 3600, 0, 10_000, "ops");
         assert!(registry.database_delta_poll_metrics_snapshot().is_none());
 
         let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
@@ -3915,7 +3915,7 @@ mod tests {
     #[test]
     fn prometheus_registry_invalidates_cached_database_delta_poll_metrics() {
         let registry = crate::plugins::prometheus_metrics::global_registry();
-        registry.configure(3600, 3600, 0, "ops-cache");
+        registry.configure(3600, 3600, 0, 10_000, "ops-cache");
 
         let metrics = Arc::new(DatabaseDeltaPollMetrics::default());
         let mut tracker = RejectedDeltaTracker::new(

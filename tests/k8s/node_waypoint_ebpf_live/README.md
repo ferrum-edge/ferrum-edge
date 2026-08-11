@@ -21,8 +21,13 @@ fail-closed SPIRE Agent identity proof
 with positive expiry, `ferrum_mesh_ca_health{ca_type="spire_agent"} 1`, and
 `ferrum_mesh_trust_bundle_version{trust_domain=<domain>,source="spire_agent"}`
 >= 1), checks
-`/metrics` for `ferrum_node_agent_capture_state{state="ready"} 1`, collects BPF
-program/link/map evidence with `bpftool`, creates same-node and cross-node
+`/metrics` for `ferrum_node_agent_capture_state{state="ready"} 1`, proves the
+explicit ingress redirect interface set for IPv4 and IPv6, then injects an
+existing but wrong route device both across a replacement startup and as
+post-start route drift. In both cases the node-agent must withdraw readiness
+with bounded topology metrics and recover only after the original routes are
+restored. The harness then collects BPF program/link/map evidence with
+`bpftool`, creates same-node and cross-node
 source/destination pods, verifies `src-a` Service ClusterIP traffic is admitted,
 verifies `src-b` Service ClusterIP and direct Pod-IP attempts are rejected by the
 live `AuthorizationPolicy`, and forces the `src-a` workload to be recreated with
@@ -101,4 +106,7 @@ domain across SPIRE registration, Ferrum Kubernetes identity derivation, and
 the workload `AuthorizationPolicy` principals.
 Set `FERRUM_LIVE_DOCKER_NODE_EVIDENCE=true` when running against kind from the
 Docker host; the harness will collect BPF evidence through the kind node
-containers instead of pulling a separate `kubectl debug` image.
+containers instead of pulling a separate `kubectl debug` image. The ingress
+topology wrong-interface and drift cases require this access. With
+`FERRUM_LIVE_TESTS_REQUIRED=1`, missing Docker/node route prerequisites fail the
+run rather than skipping those cases.

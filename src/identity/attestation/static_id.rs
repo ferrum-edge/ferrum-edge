@@ -11,7 +11,6 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::env;
 
 use super::{AttestError, Attestor, PeerInfo, WorkloadIdentity};
 use crate::identity::spiffe::SpiffeId;
@@ -35,10 +34,7 @@ impl StaticAttestor {
                     .to_string(),
             ));
         }
-        let opt_in = env::var("FERRUM_MESH_ALLOW_STATIC_ID")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if !opt_in {
+        if !crate::identity::allow_static_id() {
             return Err(AttestError::Config(
                 "FERRUM_MESH_ALLOW_STATIC_ID is not 'true' — StaticAttestor is dev-only \
                  and refuses to construct without explicit opt-in"

@@ -6,8 +6,8 @@ fn h3_native_mesh_refusal_screens_plain_and_grpc_before_dispatch() {
         .expect("native H3 direct-dispatch gate must remain explicit");
     let after_gate = &src[native_gate..];
     let refusal = after_gate
-        .find("direct_http_mesh_transport_refusal(")
-        .expect("native H3 dispatch must screen mesh transport refusal");
+        .find("direct_network_http_transport_refusal(")
+        .expect("native H3 dispatch must screen network-only transport refusal");
     let native_grpc = after_gate
         .find("if use_native_h3_grpc")
         .expect("native H3 gRPC dispatch branch must remain present");
@@ -17,11 +17,24 @@ fn h3_native_mesh_refusal_screens_plain_and_grpc_before_dispatch() {
 
     assert!(
         refusal < native_grpc,
-        "mesh-transport-tagged gRPC targets must fail closed before native H3 gRPC dispatch can dial the QUIC pool"
+        "mesh- or Unix-transport-tagged gRPC targets must fail closed before native H3 gRPC dispatch can dial the QUIC pool"
     );
     assert!(
         refusal < native_plain_bridge_bypass,
-        "mesh-transport-tagged plain targets must fail closed before native H3 plain dispatch can bypass the bridge"
+        "mesh- or Unix-transport-tagged plain targets must fail closed before native H3 plain dispatch can bypass the bridge"
+    );
+
+    let dispatch_src = include_str!("../../../src/proxy/backend_dispatch.rs");
+    let helper = dispatch_src
+        .split("pub(crate) fn direct_network_http_transport_refusal(")
+        .nth(1)
+        .expect("network-only transport refusal helper must remain present")
+        .split("/// Select an upstream target")
+        .next()
+        .expect("network-only transport refusal helper boundary must remain present");
+    assert!(
+        helper.contains("direct_http_mesh_transport_refusal(target)"),
+        "the stronger network-only refusal must retain the secured mesh-transport screen"
     );
 }
 

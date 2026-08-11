@@ -382,14 +382,17 @@ pub struct MeshSlice {
     /// Istio `Sidecar.ingress[]`. Computed at slice build (the applicable
     /// Sidecar is resolved CP-side; raw `MeshSidecar` records do not ride the
     /// slice, only this resolved view — mirroring `local_inbound_services`).
-    /// Per Istio semantics, when this is non-empty it **replaces** the default
-    /// per-service-port inbound materialization for the workload: the inbound
-    /// materializer emits one loopback route per entry (listener port → the
-    /// entry's `defaultEndpoint`) instead of the service-port defaults. Only
-    /// resolvable entries land here; unsupported shapes (Unix-socket /
-    /// non-loopback `defaultEndpoint`, non-HTTP-family protocol) are dropped at
-    /// resolution and reported as deferred. Empty when no Sidecar applies, the
-    /// Sidecar declares no ingress, or no entry resolved.
+    /// Per Istio semantics, when `sidecar_ingress_declared` is true the entries
+    /// here **replace** the default per-service-port inbound materialization for
+    /// the workload: the inbound materializer emits an HTTP route or raw-TCP
+    /// relay per resolved entry instead of the service-port defaults. Only
+    /// resolvable entries land here; unsupported shapes (non-loopback
+    /// `defaultEndpoint`, an inadmissible Unix-socket path, or an unmodeled
+    /// `Unknown`/`Udp` protocol) are dropped at resolution and reported as
+    /// deferred. Recognized stream protocols materialize raw-TCP relays;
+    /// admissible Unix-socket listeners remain HTTP-only and subject to the data
+    /// plane's containment allowlist at materialization and dial time. Empty when
+    /// no Sidecar applies, the Sidecar declares no ingress, or no entry resolved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_ingress_listeners: Vec<ResolvedIngressListener>,
     /// Fail-closed marker: the local workload's applicable `Sidecar` declared a
@@ -407,8 +410,9 @@ pub struct MeshSlice {
     /// Count of DISTINCT HTTP-family `ingress[]` listener ports the local
     /// workload's applicable Sidecar DECLARED (F6 §6.2), independent of how many
     /// resolved into `local_ingress_listeners`. It can EXCEED the resolved count
-    /// when an HTTP-family entry's `defaultEndpoint` is omitted / `unix://` /
-    /// off-box (the entry still declared a distinct listener port). The router
+    /// when an HTTP-family entry's `defaultEndpoint` is omitted / an
+    /// inadmissible `unix://` path / off-box (the entry still declared a
+    /// distinct listener port). The router
     /// uses it as the ingress group's `declared_http_ports` so a partially
     /// materialized group stays AMBIGUOUS to an orig-dst-less request — without
     /// it, two declared listeners with one resolved collapse to the single-listener
@@ -1256,11 +1260,14 @@ impl MeshSlice {
         };
 
         // Resolve the local workload's custom inbound listeners from the selected
-        // Sidecar's `ingress[]`, keeping only the routable entries (loopback
-        // host:port HTTP listeners); unsupported shapes are dropped here and
-        // reported as deferred by the K8s status writer. Carried on the slice so
-        // the DP materializer never re-resolves raw `MeshSidecar` records (they
-        // do not ride the slice), mirroring the `local_inbound_services` pattern.
+        // Sidecar's `ingress[]`, keeping only the syntactically routable entries
+        // (loopback host:port or admissible Unix-socket HTTP listeners).
+        // Unsupported shapes are dropped here and reported as deferred by the
+        // K8s status writer. Unix containment is intentionally deferred to the
+        // data-plane materializer because a control plane does not share the
+        // workload filesystem. Carried on the slice so the DP materializer never
+        // re-resolves raw `MeshSidecar` records (they do not ride the slice),
+        // mirroring the `local_inbound_services` pattern.
         let (
             mut local_ingress_listeners,
             sidecar_ingress_declared,
@@ -3515,9 +3522,10 @@ fn resolve_applicable_sidecar_outbound_policy(
 /// tier precedence under the identical enforcement gate. `None` (no applicable
 /// Sidecar, or the gate is off) resolves to "no custom listeners declared".
 ///
-/// Unsupported entries (Unix-socket / non-loopback `defaultEndpoint`,
-/// non-HTTP-family protocol, zero port) are dropped fail-closed and warned; only
-/// the entries that resolve to a loopback host:port HTTP route are returned.
+/// Unsupported entries (an inadmissible Unix-socket path, non-loopback
+/// `defaultEndpoint`, non-HTTP-family protocol, or zero port) are dropped
+/// fail-closed and warned; entries that resolve to either a loopback host:port
+/// HTTP route or an admissible Unix-stream backend are returned.
 ///
 /// `ingress_declared` is `true` when the applicable Sidecar DECLARED an
 /// `ingress` block — a non-empty `ingress[]` OR an explicit empty `ingress: []`
@@ -3534,8 +3542,8 @@ fn resolve_applicable_sidecar_outbound_policy(
 /// `declared_http_ports` is the count of DISTINCT HTTP-family listener ports the
 /// Sidecar declared (`MeshSidecarIngress::is_declared_http_family_listener`),
 /// whether or not each one's `defaultEndpoint` resolved — so it can EXCEED
-/// `resolved_listeners.len()` when an HTTP-family entry has an omitted / `unix://`
-/// / off-box endpoint. The router uses it as the ingress group's
+/// `resolved_listeners.len()` when an HTTP-family entry has an omitted / an
+/// inadmissible `unix://` / an off-box endpoint. The router uses it as the ingress group's
 /// `declared_http_ports` so a partially materialized group stays ambiguous to an
 /// orig-dst-less request (F6 §6.2): without it, two declared listeners with one
 /// resolved would collapse to a single-listener no-signal pass-through and route
@@ -3559,7 +3567,7 @@ fn resolve_selected_sidecar_ingress(
     let ingress_declared = sidecar.ingress_declared || !sidecar.ingress.is_empty();
     // Distinct HTTP-family listener ports the operator declared, counted BEFORE
     // endpoint resolution so an HTTP-family entry whose `defaultEndpoint` is
-    // omitted / `unix://` / off-box still contributes its port. Deduped by port,
+    // omitted / inadmissible `unix://` / off-box still contributes its port. Deduped by port,
     // mirroring `seen_ports` for the resolved set, so the count is over distinct
     // ports (two entries on the same port count once, like the resolver keeps the
     // first). Drives the router's fail-closed ingress port ambiguity (F6 §6.2).
@@ -3594,7 +3602,6 @@ fn resolve_selected_sidecar_ingress(
                     sidecar = %sidecar.name,
                     namespace = %sidecar.namespace,
                     port = entry.port,
-                    default_endpoint = %entry.default_endpoint,
                     reason = ?reason,
                     "Skipping unsupported Sidecar ingress[] listener (kept in deferred_fields)"
                 );
@@ -7842,7 +7849,10 @@ mod tests {
                 protocol: AppProtocol::Grpc,
                 name: None,
                 bind: None,
-                default_endpoint: "unix:///var/run/grpc.sock".to_string(),
+                // An INADMISSIBLE unix path (relative), so it still fails
+                // closed. An absolute one would resolve into a Unix-stream
+                // backend (issue #3261).
+                default_endpoint: "unix://relative/grpc.sock".to_string(),
             },
         ];
         let mesh = MeshConfig {
@@ -7864,7 +7874,8 @@ mod tests {
         assert_eq!(
             slice.local_ingress_listeners.len(),
             1,
-            "only the supported loopback HTTP listener resolves; the unix-socket entry is dropped"
+            "only the supported loopback HTTP listener resolves; the inadmissible unix-socket \
+             entry is dropped"
         );
         let listener = &slice.local_ingress_listeners[0];
         assert_eq!(listener.port, 8443);
@@ -7880,15 +7891,15 @@ mod tests {
             "the applicable Sidecar declared a non-empty ingress[]"
         );
         // Codex round-4 P2: BOTH entries are HTTP-family on distinct ports (8443
-        // http + 9000 grpc), so the DECLARED count is 2 even though the unix://
-        // gRPC entry did not resolve. This is what keeps the router's ingress
+        // http + 9000 grpc), so the DECLARED count is 2 even though the
+        // inadmissible unix:// gRPC entry did not resolve. That keeps the router's ingress
         // group ambiguous (it exceeds the 1 resolved listener), so an
         // orig-dst-less request fails closed instead of routing the skipped
         // listener's traffic to the survivor.
         assert_eq!(
             slice.declared_ingress_http_ports, 2,
-            "both HTTP-family ingress ports are DECLARED even though the unix:// gRPC entry \
-             produced no resolved listener"
+            "both HTTP-family ingress ports are DECLARED even though the inadmissible unix:// \
+             gRPC entry produced no resolved listener"
         );
     }
 
@@ -8012,11 +8023,11 @@ mod tests {
         );
     }
 
-    /// Codex round-4 P2: the DECLARED HTTP-family port count counts DISTINCT
-    /// HTTP-family listener ports (resolvable or not) and EXCLUDES non-HTTP-family
-    /// entries (deferred raw-TCP, never an HTTP route) and duplicate ports. This
-    /// pins the exact boundary so the router's fail-closed ambiguity is neither
-    /// over- nor under-counted.
+    /// Declared HTTP-family port count counts DISTINCT HTTP-family listener
+    /// ports (resolvable or not) and EXCLUDES stream-family entries (they use
+    /// the raw-TCP inbound table, not HTTP sibling ambiguity) and duplicate
+    /// ports. Pins the exact boundary so the router's fail-closed ambiguity is
+    /// neither over- nor under-counted.
     #[test]
     fn sidecar_ingress_declared_count_excludes_non_http_and_dedups_ports() {
         let spiffe = "spiffe://cluster.local/ns/alpha/sa/reviews";
@@ -8044,13 +8055,14 @@ mod tests {
                 bind: None,
                 default_endpoint: "127.0.0.1:5000".to_string(),
             },
-            // HTTP-family (gRPC) but unroutable endpoint → declared, NOT resolved.
+            // HTTP-family (gRPC) but unroutable endpoint (a traversal-like
+            // unix path fails admission) → declared, NOT resolved.
             MeshSidecarIngress {
                 port: 8443,
                 protocol: AppProtocol::Grpc,
                 name: None,
                 bind: None,
-                default_endpoint: "unix:///var/run/grpc.sock".to_string(),
+                default_endpoint: "unix:///var/../escape.sock".to_string(),
             },
             // Duplicate of the first listener port → does NOT add a distinct port.
             MeshSidecarIngress {
@@ -8060,8 +8072,8 @@ mod tests {
                 bind: None,
                 default_endpoint: "127.0.0.1:5001".to_string(),
             },
-            // Non-HTTP-family (raw TCP) → deferred, NOT counted as a declared
-            // HTTP-family port.
+            // Stream-family (raw TCP) → resolves into local_ingress_listeners but
+            // is NOT counted as a declared HTTP-family port (#3260).
             MeshSidecarIngress {
                 port: 9000,
                 protocol: AppProtocol::Tcp,
@@ -8094,11 +8106,23 @@ mod tests {
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
 
-        // Resolved: only the routable HTTP listener on 8080.
+        // Resolved: routable HTTP on 8080 + routable TCP on 9000.
         assert_eq!(
             slice.local_ingress_listeners.len(),
-            1,
-            "only the routable HTTP listener resolves"
+            2,
+            "routable HTTP and TCP listeners resolve"
+        );
+        assert!(
+            slice
+                .local_ingress_listeners
+                .iter()
+                .any(|l| l.port == 8080 && l.is_http_family())
+        );
+        assert!(
+            slice
+                .local_ingress_listeners
+                .iter()
+                .any(|l| l.port == 9000 && l.is_stream_family())
         );
         // Declared HTTP-family ports: {8080, 8443} = 2. The duplicate 8080, the
         // raw-TCP 9000, and the zero-port entry are excluded.

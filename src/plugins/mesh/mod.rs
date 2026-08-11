@@ -89,6 +89,10 @@ mod tests {
                 "mesh.metrics.disabled".to_string(),
                 "request_count".to_string(),
             ),
+            (
+                "mesh.metrics.cel.request_host".to_string(),
+                "attacker-controlled.example".to_string(),
+            ),
             ("tenant".to_string(), "acme".to_string()),
             (
                 super::CUSTOM_TRACE_ATTRIBUTES_METADATA.to_string(),

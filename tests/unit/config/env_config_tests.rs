@@ -851,6 +851,119 @@ fn test_env_config_mesh_mode_gateway_svid_takes_precedence_over_ca_backend() {
 }
 
 #[test]
+fn test_env_config_mesh_workload_api_rejects_file_svid_override() {
+    // Mesh startup deliberately suppresses automatic CA-backed issuance when
+    // any explicit file SVID path is present. Validation must reject that
+    // combination before accepting a Workload API surface with no issuer.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "internal"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/ferrum",
+            ),
+            ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
+            ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
+            ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", "/tmp/ferrum-svid.crt"),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", "/tmp/ferrum-svid.key"),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                "/tmp/ferrum-svid-bundle.pem",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            let error = EnvConfig::from_env().expect_err(
+                "file SVID override must not leave an enabled Workload API without an issuer",
+            );
+            assert!(error.contains("FERRUM_MESH_WORKLOAD_API_ENABLED"));
+            assert!(error.contains("FERRUM_GATEWAY_SVID"));
+            assert!(error.contains("overrides automatic CA-backed issuance"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_workload_api_rejects_malformed_unix_identity_rule() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "internal"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/ferrum",
+            ),
+            ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
+            ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
+            ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
+            (
+                "FERRUM_MESH_WORKLOAD_API_SOCKET_PATH",
+                "/tmp/ferrum-env-config-attestor-validation.sock",
+            ),
+            (
+                "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES",
+                "uid:not-a-number=spiffe://cluster.local/ns/default/sa/app",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_ALLOW_STATIC_ID");
+            let error = EnvConfig::from_env()
+                .expect_err("validate must reject an attestor rule startup cannot parse");
+            assert!(error.contains("FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES"));
+            assert!(error.contains("not a numeric uid"));
+        },
+    );
+}
+
+#[test]
+fn test_env_config_mesh_workload_api_requires_available_attestor() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "mesh"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_MESH_CA_BACKEND", "internal"),
+            (
+                "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
+                "spiffe://cluster.local/ns/default/sa/ferrum",
+            ),
+            ("FERRUM_MESH_CA_BOOTSTRAP_DEV", "true"),
+            ("FERRUM_MESH_WORKLOAD_API_ENABLED", "true"),
+            ("FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY", "true"),
+            (
+                "FERRUM_MESH_WORKLOAD_API_SOCKET_PATH",
+                "/tmp/ferrum-env-config-attestor-validation.sock",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_MESH_ALLOW_STATIC_ID");
+            remove_var("FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES");
+            let error = EnvConfig::from_env()
+                .expect_err("validate must reject a Workload API with no usable attestor");
+            assert!(error.contains("FERRUM_MESH_WORKLOAD_API_ENABLED=true"));
+            assert!(error.contains("requires at least one attestor"));
+        },
+    );
+}
+
+#[test]
 fn test_env_config_mesh_mode_production_mode_accepts_numeric_one() {
     // FERRUM_MESH_PRODUCTION_MODE=1 must be honored (same truthy spelling as
     // EnvConfig bools), so the opt-out cannot re-open the no-identity posture.

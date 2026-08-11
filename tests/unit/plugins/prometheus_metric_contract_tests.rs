@@ -627,7 +627,7 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
 /// inventory + chart validators rather than this scrape fixture.
 fn representative_exposition() -> String {
     let registry = MetricsRegistry::new();
-    registry.configure(60, 3600, 0, "contract-ns");
+    registry.configure(60, 3600, 0, 10_000, "contract-ns");
     registry.record(&make_summary("contract-proxy"));
     let mut grpc_summary = make_summary("contract-grpc-proxy");
     grpc_summary

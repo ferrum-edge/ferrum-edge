@@ -13,10 +13,17 @@
 //!   trust a SAN claim coming from a CSR.
 //! - Publish the trust bundle (the root cert) for verifiers.
 //!
+//! - Own a [`LocalJwtAuthority`] so the Workload API can mint and validate
+//!   JWT-SVIDs for this trust domain, and publish that authority's public
+//!   half as the trust domain's JWT bundle (issue #3617). The JWT signing key
+//!   is **separately configured** material, never derived from the X.509 root:
+//!   rotating one does not disturb the other, the root private key is never
+//!   exposed to the JWT path, and a JWT verifier is never handed a key that
+//!   also anchors certificate trust. See [`InternalCaConfig::jwt_signing_key_pem`].
+//!
 //! ## Out of scope (deferred to later phases)
 //!
-//! - Intermediate CAs, key escrow, JWT-SVID minting (we expose the JWKS
-//!   plumbing as an empty list for Phase A; later phases plug it in).
+//! - Intermediate CAs and key escrow.
 //! - CRL / OCSP publication.
 //! - Cross-trust-domain federation (the upstream wrappers handle that).
 
@@ -34,7 +41,12 @@ use super::{
     CaError, CertificateAuthority, IssuanceRequest, PublishedJwtAuthority, PublishedTrustBundle,
     SignedSvid,
 };
+use crate::identity::jwt_svid::{
+    DEFAULT_JWT_KEY_LIFETIME_SECS, JwtSvidSigner, LocalJwtAuthority, LocalJwtAuthorityConfig,
+    SharedJwtSvidSigner,
+};
 use crate::identity::spiffe::{SpiffeId, TrustDomain, spiffe_id_to_san};
+use zeroize::Zeroizing;
 
 /// Default SVID lifetime when the issuance request does not specify one.
 pub const DEFAULT_SVID_TTL_SECS: u64 = 3600; // 1h
@@ -58,6 +70,31 @@ pub struct InternalCaConfig {
     pub default_svid_ttl_secs: u64,
     /// Hard cap on per-SVID TTL — requests above are clamped.
     pub max_svid_ttl_secs: u64,
+    /// Operator-configured ES256 (P-256) JWT signing key PEM for this trust
+    /// domain.
+    ///
+    /// Deliberately **not** the X.509 root: a JWT bundle is published to every
+    /// workload, so reusing the certificate root across protocols would put the
+    /// CA's own key identity into a second, differently-scoped trust surface.
+    /// Supplying the same value on every replica (and across restarts) is what
+    /// keeps the trust domain's JWT authority continuous.
+    pub jwt_signing_key_pem: Option<Zeroizing<String>>,
+    /// JWT signing keys retained for **verification only**, newest first —
+    /// normally the previous primary during a rotation.
+    pub jwt_retired_key_pems: Vec<Zeroizing<String>>,
+    /// How long an **ephemeral** JWT signing key stays active before the
+    /// background rotation task replaces it. `0` disables time-based JWT key
+    /// rotation, and is the default.
+    ///
+    /// Ignored (normalized to `0`) when [`Self::jwt_signing_key_pem`] is set:
+    /// configured material is rotated externally, by rolling a new primary with
+    /// the outgoing key in [`Self::jwt_retired_key_pems`]. See
+    /// [`LocalJwtAuthority`].
+    pub jwt_key_lifetime_secs: u64,
+    /// Permit an ephemeral, process-local JWT signing key when none is
+    /// configured. Dev/test only — it breaks restart and multi-replica
+    /// continuity, so it is never a default.
+    pub allow_ephemeral_jwt_key: bool,
 }
 
 impl InternalCaConfig {
@@ -88,6 +125,10 @@ impl InternalCaConfig {
             bundle_refresh_hint_secs: None,
             default_svid_ttl_secs: DEFAULT_SVID_TTL_SECS,
             max_svid_ttl_secs: MAX_SVID_TTL_SECS,
+            jwt_signing_key_pem: None,
+            jwt_retired_key_pems: Vec::new(),
+            jwt_key_lifetime_secs: DEFAULT_JWT_KEY_LIFETIME_SECS,
+            allow_ephemeral_jwt_key: false,
         })
     }
 }
@@ -105,6 +146,15 @@ pub struct InternalCa {
     bundle_refresh_hint_secs: Option<u64>,
     default_svid_ttl_secs: u64,
     max_svid_ttl_secs: u64,
+    /// JWT signing authority for this trust domain, when one is configured.
+    ///
+    /// `None` when no JWT signing material is configured and the ephemeral dev
+    /// opt-in is off: the JWT-SVID surface is then genuinely unavailable, so
+    /// `jwt_signer()` returns `None` and `jwt_authorities()` is empty, and the
+    /// Workload API answers the JWT RPCs `UNIMPLEMENTED` — fail-closed, rather
+    /// than minting tokens signed by a key that vanishes on restart. Built at
+    /// construction so no request path ever loads or generates a key.
+    jwt_authority: Option<Arc<LocalJwtAuthority>>,
 }
 
 impl InternalCa {
@@ -135,6 +185,37 @@ impl InternalCa {
             Issuer::from_ca_cert_pem(&config.root_cert_pem, key_pair)
                 .map_err(|e| CaError::Config(format!("invalid root cert PEM: {e}")))?;
 
+        // JWT signing authority for this trust domain, built eagerly so key
+        // loading happens once at startup rather than on a mint RPC, and so
+        // unusable material or an unprovable rotation cadence fails startup
+        // closed instead of at first use. `JwtSvidError`'s message is a fixed
+        // string that names no key material and no source.
+        //
+        // With NOTHING configured the authority is simply absent: this CA then
+        // publishes no JWT trust and cannot mint JWT-SVIDs, which the Workload
+        // API reports as `UNIMPLEMENTED`. That is the honest answer — silently
+        // generating a process-local key would mint tokens that no restart and no
+        // sibling replica can verify. The dev opt-in
+        // (`allow_ephemeral_jwt_key`) is the only way to get one.
+        let jwt_authority =
+            if config.jwt_signing_key_pem.is_some() || config.allow_ephemeral_jwt_key {
+                let mut jwt_config = LocalJwtAuthorityConfig::new(config.trust_domain.clone());
+                jwt_config.signing_key_pem = config.jwt_signing_key_pem.clone();
+                jwt_config.retired_key_pems = config.jwt_retired_key_pems.clone();
+                jwt_config.key_lifetime_secs = config.jwt_key_lifetime_secs;
+                jwt_config.allow_ephemeral_key = config.allow_ephemeral_jwt_key;
+                Some(Arc::new(LocalJwtAuthority::new(jwt_config).map_err(
+                    |e| CaError::Config(format!("JWT-SVID authority setup failed: {e}")),
+                )?))
+            } else {
+                debug!(
+                    trust_domain = %config.trust_domain,
+                    "internal CA has no JWT signing material configured; JWT-SVID mint / bundles / \
+                     validate stay UNIMPLEMENTED on this backend"
+                );
+                None
+            };
+
         info!(
             trust_domain = %config.trust_domain,
             "internal CA initialised"
@@ -143,6 +224,7 @@ impl InternalCa {
 
         Ok(Self {
             trust_domain: config.trust_domain,
+            jwt_authority,
             root_cert_der,
             issuer,
             bundle_refresh_hint_secs: config.bundle_refresh_hint_secs,
@@ -162,6 +244,15 @@ impl InternalCa {
     /// The trust domain this CA serves.
     pub fn trust_domain(&self) -> &TrustDomain {
         &self.trust_domain
+    }
+
+    /// The JWT signing authority backing this CA's JWT-SVID surface, when one is
+    /// configured.
+    ///
+    /// Exposed so the background rotation task can drive
+    /// [`LocalJwtAuthority::rotate_if_due`]; nothing on a request path needs it.
+    pub fn jwt_authority(&self) -> Option<&Arc<LocalJwtAuthority>> {
+        self.jwt_authority.as_ref()
     }
 
     fn enforce_trust_domain(&self, id: &SpiffeId) -> Result<(), CaError> {
@@ -371,9 +462,22 @@ impl CertificateAuthority for InternalCa {
         if td != &self.trust_domain {
             return Err(CaError::UnknownTrustDomain(td.to_string()));
         }
-        // Phase A: JWT-SVID minting is wired in but no signing keys are
-        // published. Future phases plug a JwtAuthority registry here.
-        Ok(Vec::new())
+        // The active signing key plus every retired key still inside its
+        // rotation overlap, so a token minted just before a rotation stays
+        // verifiable for its whole bounded lifetime. Empty when no JWT signing
+        // material is configured — the Workload API turns that into
+        // `UNIMPLEMENTED`, never into an empty (misleading) bundle map.
+        Ok(self
+            .jwt_authority
+            .as_ref()
+            .map(|authority| authority.authorities())
+            .unwrap_or_default())
+    }
+
+    fn jwt_signer(&self) -> Option<SharedJwtSvidSigner> {
+        self.jwt_authority
+            .as_ref()
+            .map(|authority| Arc::clone(authority) as SharedJwtSvidSigner)
     }
 }
 

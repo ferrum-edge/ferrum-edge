@@ -1438,8 +1438,10 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         node_waypoint_capture_peer_authentications: _,
         local_inbound_services: _,
         local_ingress_listeners: _,
+        sidecar_ingress_declared: _,
         declared_ingress_http_ports: _,
         local_inbound_tcp_routes: _,
+        local_workload_addresses: _,
         // EgressGateway external-UDP relay admissions and the source-side
         // captured-UDP routes that originate them (issue #3263): both are
         // rebuilt from the slice on every mesh apply, never Kubernetes-owned.

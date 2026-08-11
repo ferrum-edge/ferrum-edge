@@ -452,15 +452,46 @@ registration entry you need to add for Ferrum, and `default_jwt_svid_ttl` on
 the Server is irrelevant for Ferrum's identity consumption today.
 
 When Ferrum itself exposes the in-process SPIFFE Workload API server
-(`src/identity/workload_api/server.rs`), JWT-SVID RPCs are **not** available
-yet ([#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617)):
-`FetchJWTSVID`, `ValidateJWTSVID`, and `FetchJWTBundles` all return gRPC
-`UNIMPLEMENTED`. Do not deploy workloads that depend on JWT-SVID mint,
-validate, or JWT trust-bundle streaming against Ferrum's Workload API.
-`FetchJWTBundles` deliberately does **not** stream an empty `bundles` map —
-SPIFFE Workload API §6.2.2 requires at least the local trust-domain JWT
-bundle, and an empty map would be misread as "zero trusted JWT authorities"
-rather than "unsupported".
+(`src/identity/workload_api/server.rs`), that surface can be served only on
+`FERRUM_MESH_CA_BACKEND=internal`, where all three JWT RPCs (`FetchJWTSVID`,
+`FetchJWTBundles`, `ValidateJWTSVID`) are implemented — see
+[docs/mesh.md](mesh.md#workload-api-jwt-svid) for the exact contract.
+
+**With `FERRUM_MESH_CA_BACKEND=spire`, serving a Workload API is refused
+outright** ([#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617)).
+`FERRUM_MESH_WORKLOAD_API_ENABLED=true` together with that backend **fails
+startup**, with a diagnostic naming both settings.
+
+This is a terminal capability boundary, not a deferral, and it covers the whole
+surface rather than the JWT RPCs alone. A SPIRE agent issues only the **calling
+process's own** attested identity, so Ferrum's `SpireAgentCa` fetches Ferrum's
+agent SVID and refuses every other subject — while a Workload API server exists
+precisely to issue for a *different*, locally attested downstream workload.
+`FetchX509SVID` would ask that CA for an identity it cannot produce, and
+`FetchJWTSVID` is authorized by SPIRE against the calling process too, so
+proxying the agent's own mint RPC would return a token whose `sub` is Ferrum's
+SPIFFE ID rather than the workload's. A silent identity substitution is strictly
+worse for a relying party than a refusal, so Ferrum does not do it and must not
+be changed to. Minting for a delegated subject requires SPIRE's delegated
+identity / admin API: an explicitly authorized integration outside the Workload
+API surface Ferrum consumes.
+
+**X.509 consumption is a different capability, and it still works.** Under
+`spire` the active mesh runtime consumes the agent's X.509 SVID and trust
+bundles through its dedicated fetch loop, retains the last good identity across
+reconnects, and publishes rotations to the live TLS slots. The reusable
+`SpireAgentCa` / `WorkloadApiClient` adapter can decode a bounded
+`FetchJWTBundles` stream when explicitly constructed, but mesh startup does not
+construct that adapter or start its JWT stream today. This change therefore
+makes no production claim that SPIRE JWT authorities back Ferrum validation.
+The active X.509 consumption does **not** amount to issuance, and none of it
+makes a Workload API servable here.
+
+Workloads that need SVID **mint** under a SPIRE deployment should call their
+local SPIRE agent's Workload API directly (that is the socket SPIRE authorizes
+them on), or use `FERRUM_MESH_CA_BACKEND=internal` with configured JWT signing
+material — see [docs/mesh.md](mesh.md#jwt-signing-material-restart-and-ha) for
+the signing-key, restart, and HA contract.
 
 If you also issue JWT-SVIDs to non-Ferrum workloads in the same SPIRE
 deployment, that is unaffected.

@@ -66,6 +66,7 @@ mod mcp_aggregate_sse_tests;
 mod mcp_gateway_tests;
 mod mesh_plugins_tests;
 mod mesh_telemetry_metric_families_tests;
+mod mesh_telemetry_tag_cel_tests;
 mod metadata_redaction_contract_tests;
 mod mtls_auth_tests;
 mod oauth2_introspection_tests;

@@ -34,10 +34,12 @@ use tracing::debug;
 use tracing::info;
 
 use super::latest_wins;
-use super::proto::X509svidRequest;
 use super::proto::spiffe_workload_api_client::SpiffeWorkloadApiClient;
+use super::proto::{JwtBundlesRequest, X509svidRequest};
+use crate::identity::ca::PublishedJwtAuthority;
 use crate::identity::spiffe::{SpiffeId, TrustDomain};
 use crate::identity::{SvidBundle, TrustBundle, TrustBundleSet};
+use std::collections::BTreeMap;
 
 /// Default Unix-socket path used when `FERRUM_MESH_WORKLOAD_API_SOCKET` is unset.
 pub const DEFAULT_WORKLOAD_API_SOCKET: &str = "/run/spire/agent/agent.sock";
@@ -237,6 +239,140 @@ impl WorkloadApiClient {
             .await
             .ok_or_else(|| WorkloadApiClientError::Rpc("stream closed before first SVID".into()))?
     }
+
+    /// Open the streaming `FetchJWTBundles` RPC and decode each response into
+    /// per-trust-domain JWT authorities.
+    ///
+    /// This helper lets an explicitly wired SPIRE client obtain JWT trust
+    /// material: the agent publishes a JWKS document per trust domain, and
+    /// Ferrum converts it back into the SPKI-PEM form the rest of the identity
+    /// subsystem speaks (issue #3617). It carries no private key and mints
+    /// nothing. The active mesh SPIRE identity path currently starts only the
+    /// X.509 fetch loop; it does not call this helper.
+    pub async fn fetch_jwt_bundles_stream(
+        &mut self,
+    ) -> Result<
+        impl Stream<Item = Result<JwtBundleSet, WorkloadApiClientError>> + Send + 'static,
+        WorkloadApiClientError,
+    > {
+        let response = self
+            .inner
+            .fetch_jwt_bundles(workload_request(JwtBundlesRequest {}))
+            .await
+            .map_err(|e| WorkloadApiClientError::Rpc(e.to_string()))?;
+        Ok(Self::relay_jwt_bundles_stream(response.into_inner()))
+    }
+
+    /// Decode an inbound `FetchJWTBundles` response stream into coalesced
+    /// [`JwtBundleSet`] updates.
+    ///
+    /// Shared by the live gRPC client and unit tests that drive synthetic
+    /// inbound frames without a Unix-socket transport. Errors are terminal for
+    /// the same reason they are on the X.509 stream: every consumer treats an
+    /// `Err` as "drop and reconnect", so a later good frame must not be able to
+    /// overwrite one in the capacity-one slot before it is observed.
+    pub fn relay_jwt_bundles_stream<S>(
+        inbound: S,
+    ) -> impl Stream<Item = Result<JwtBundleSet, WorkloadApiClientError>> + Send + 'static
+    where
+        S: Stream<Item = Result<super::proto::JwtBundlesResponse, tonic::Status>> + Send + 'static,
+    {
+        let mut inbound = Box::pin(inbound);
+        let (out_tx, out_rx) = latest_wins::channel();
+
+        tokio::spawn(async move {
+            loop {
+                let msg_result = tokio::select! {
+                    _ = out_tx.closed() => return,
+                    next = inbound.next() => {
+                        let Some(next) = next else {
+                            return;
+                        };
+                        next
+                    }
+                };
+                let msg = match msg_result {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = out_tx.publish(Err(WorkloadApiClientError::Rpc(format!(
+                            "Workload API JWT bundle stream error: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                let decoded = jwt_bundles_response_to_set(msg);
+                let was_ok = decoded.is_ok();
+                if !out_tx.publish(decoded) {
+                    return;
+                }
+                if !was_ok {
+                    return;
+                }
+            }
+        });
+
+        out_rx.into_stream()
+    }
+}
+
+/// JWT authorities decoded from one `FetchJWTBundles` response, keyed by trust
+/// domain.
+pub type JwtBundleSet = BTreeMap<TrustDomain, Vec<PublishedJwtAuthority>>;
+
+/// Convert one `JWTBundlesResponse` into per-trust-domain authorities.
+///
+/// Fail-closed and bounded at every step, because this is externally supplied
+/// material:
+///
+/// - the trust-domain count is capped before any JWKS is parsed;
+/// - each key is a trust-domain name (plain or `spiffe://` form) that must
+///   parse;
+/// - each value goes through
+///   [`authorities_from_jwks`](crate::identity::jwt_svid::authorities_from_jwks),
+///   which bounds the document, bounds the key list, refuses non-signing and
+///   unsupported keys, and re-checks the recovered set against exactly the
+///   bounds a locally published bundle is held to;
+/// - a malformed entry fails the whole response rather than being dropped: a
+///   partially decoded trust map would silently narrow what Ferrum accepts, and
+///   an operator cannot see that happen.
+///
+/// An entirely empty `bundles` map is *not* an error here — a SPIRE agent that
+/// has no JWT authorities to publish legitimately says so, and Ferrum's own
+/// `FetchJWTBundles` translates the resulting empty set into `UNIMPLEMENTED`
+/// rather than streaming an empty map onward.
+fn jwt_bundles_response_to_set(
+    msg: super::proto::JwtBundlesResponse,
+) -> Result<JwtBundleSet, WorkloadApiClientError> {
+    if msg.bundles.len() > crate::identity::jwt_svid::MAX_JWT_BUNDLE_TRUST_DOMAINS {
+        return Err(WorkloadApiClientError::Rpc(
+            "JWTBundlesResponse carries more trust domains than one response may hold".into(),
+        ));
+    }
+    let mut set: JwtBundleSet = BTreeMap::new();
+    for (key, jwks) in &msg.bundles {
+        let trust_domain = parse_trust_domain_key(key).map_err(|e| {
+            WorkloadApiClientError::Rpc(format!(
+                "JWTBundlesResponse has a malformed trust-domain key: {e}"
+            ))
+        })?;
+        // The reason is a fixed string from `identity::jwt_svid`; it names no
+        // key material.
+        let authorities = crate::identity::jwt_svid::authorities_from_jwks(&trust_domain, jwks)
+            .map_err(|e| {
+                WorkloadApiClientError::Rpc(format!(
+                    "JWTBundlesResponse JWT bundle for trust domain '{trust_domain}' rejected: {e}"
+                ))
+            })?;
+        if set.insert(trust_domain.clone(), authorities).is_some() {
+            // Two keys normalized to the same trust domain (e.g. `example.org`
+            // and `spiffe://example.org`). Which one wins would be arbitrary, so
+            // refuse instead of picking.
+            return Err(WorkloadApiClientError::Rpc(format!(
+                "JWTBundlesResponse carries two bundles for trust domain '{trust_domain}'"
+            )));
+        }
+    }
+    Ok(set)
 }
 
 /// Parse a federated bundle map key into a [`TrustDomain`].

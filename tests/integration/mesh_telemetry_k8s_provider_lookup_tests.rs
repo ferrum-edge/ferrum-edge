@@ -981,35 +981,46 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
 }
 
 #[test]
-fn k8s_telemetry_metric_upsert_rejects_missing_empty_and_cel_values() {
+fn k8s_telemetry_metric_upsert_rejects_missing_empty_and_unsupported_cel() {
+    let oversized = format!("request.{}", "x".repeat(600));
     let cases = [
         (
             "missing value",
             json!({"operation": "UPSERT"}),
             "UPSERT value is required",
+            "REQUEST_COUNT",
         ),
         (
             "empty value",
             json!({"operation": "UPSERT", "value": ""}),
             "UPSERT value is required",
+            "REQUEST_COUNT",
         ),
         (
-            "attribute expression",
+            "unsupported attribute",
+            json!({"operation": "UPSERT", "value": "request.headers[\"authorization\"]"}),
+            "unsupported attribute",
+            "REQUEST_COUNT",
+        ),
+        (
+            "http-only attribute on tcp family",
             json!({"operation": "UPSERT", "value": "request.host"}),
-            "CEL expressions are unsupported",
+            "HTTP-only attributes that are unrepresentable for TCP metric families",
+            "TCP_SENT_BYTES",
         ),
         (
-            "function expression",
-            json!({"operation": "UPSERT", "value": "string(destination.port)"}),
-            "CEL expressions are unsupported",
+            "oversized expression",
+            json!({"operation": "UPSERT", "value": oversized}),
+            "exceeds maximum length",
+            "REQUEST_COUNT",
         ),
     ];
 
-    for (name, tag_override, expected) in cases {
+    for (name, tag_override, expected, metric) in cases {
         let error = telemetry_translation_error(json!({
             "metrics": [{
                 "overrides": [{
-                    "match": {"metric": "REQUEST_COUNT"},
+                    "match": {"metric": metric},
                     "tagOverrides": {"source_workload": tag_override}
                 }]
             }]
@@ -1017,6 +1028,10 @@ fn k8s_telemetry_metric_upsert_rejects_missing_empty_and_cel_values() {
         assert!(
             error.contains(expected),
             "{name} should fail visibly with '{expected}', got: {error}"
+        );
+        assert!(
+            !error.contains("authorization"),
+            "{name} must not echo attacker-controlled expression text: {error}"
         );
     }
 }
@@ -1059,4 +1074,97 @@ fn k8s_telemetry_metric_upsert_accepts_double_quoted_string_literal() {
         &metrics.tag_overrides[0].operation,
         TagOverrideOperation::Set { value } if value == "edge"
     ));
+}
+
+#[test]
+fn k8s_telemetry_metric_upsert_accepts_bounded_cel_expressions() {
+    use ferrum_edge::modes::mesh::metric_tag_cel::{MetricTagCelAttr, MetricTagCelExpr};
+
+    let translation = translate_k8s_objects(
+        &[telemetry(json!({
+            "metrics": [{
+                "overrides": [{
+                    "match": {"metric": "REQUEST_COUNT"},
+                    "tagOverrides": {
+                        "source_workload": {
+                            "operation": "UPSERT",
+                            "value": "request.host"
+                        },
+                        "destination_service": {
+                            "operation": "UPSERT",
+                            "value": "string(destination.port)"
+                        },
+                        "response_flags": {
+                            "operation": "UPSERT",
+                            "value": "has(request.host) ? request.host : \"unknown\""
+                        }
+                    }
+                }]
+            }]
+        }))],
+        options(),
+    )
+    .expect("bounded CEL expressions translate");
+    let metrics = translation
+        .config
+        .mesh
+        .expect("mesh config")
+        .telemetry_resources[0]
+        .config
+        .metrics
+        .clone()
+        .expect("metrics config");
+
+    assert_eq!(metrics.tag_overrides.len(), 3);
+    assert!(metrics.tag_overrides.iter().any(|ovr| {
+        matches!(
+            &ovr.operation,
+            TagOverrideOperation::SetExpr {
+                expression: MetricTagCelExpr::Attribute {
+                    name: MetricTagCelAttr::RequestHost
+                }
+            } if ovr.name == "source_workload"
+        )
+    }));
+    assert!(metrics.tag_overrides.iter().any(|ovr| {
+        matches!(
+            &ovr.operation,
+            TagOverrideOperation::SetExpr {
+                expression: MetricTagCelExpr::StringOfInt {
+                    attribute: MetricTagCelAttr::DestinationPort
+                }
+            } if ovr.name == "destination_service"
+        )
+    }));
+    assert!(metrics.tag_overrides.iter().any(|ovr| {
+        matches!(
+            &ovr.operation,
+            TagOverrideOperation::SetExpr {
+                expression: MetricTagCelExpr::HasThenElse { .. }
+            } if ovr.name == "response_flags"
+        )
+    }));
+}
+
+#[test]
+fn k8s_telemetry_metric_upsert_counts_surrounding_whitespace_in_cel_limit() {
+    use ferrum_edge::modes::mesh::metric_tag_cel::MAX_METRIC_TAG_CEL_EXPR_LEN;
+
+    let padded = format!("{}request.host", " ".repeat(MAX_METRIC_TAG_CEL_EXPR_LEN));
+    let error = telemetry_translation_error(json!({
+        "metrics": [{
+            "overrides": [{
+                "match": {"metric": "REQUEST_COUNT"},
+                "tagOverrides": {
+                    "source_workload": {
+                        "operation": "UPSERT",
+                        "value": padded
+                    }
+                }
+            }]
+        }]
+    }));
+
+    assert!(error.contains("exceeds maximum length"), "{error}");
+    assert!(!error.contains("request.host"));
 }

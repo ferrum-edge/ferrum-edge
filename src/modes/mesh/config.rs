@@ -1704,8 +1704,17 @@ pub struct MetricTagOverride {
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum TagOverrideOperation {
     Remove,
-    Rename { new_name: String },
-    Set { value: String },
+    Rename {
+        new_name: String,
+    },
+    /// Static UPSERT value (decoded Telemetry string literal or direct plugin config).
+    Set {
+        value: String,
+    },
+    /// Compiled Telemetry UPSERT CEL expression evaluated at metric emission.
+    SetExpr {
+        expression: super::metric_tag_cel::MetricTagCelExpr,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2173,9 +2182,9 @@ impl TrustBundleSet {
 // ── Sidecar (Istio egress scoping) ───────────────────────────────────────
 
 /// Istio `Sidecar` resource. Narrows which services / service-entries /
-/// destination-rules a workload may reach via egress. Mirror of Istio's
-/// `networking.istio.io/v1.Sidecar` for `egress` scoping; ingress listener
-/// configuration is intentionally not modeled.
+/// destination-rules a workload may reach via egress and can replace its
+/// default inbound surface with declared `ingress[]` HTTP or stream listeners.
+/// Mirror of the modeled `networking.istio.io/v1.Sidecar` fields.
 ///
 /// Resolution order at slice build time (most specific wins):
 /// 1. Workload-scoped (non-empty `workload_selector` whose labels match)
@@ -2265,20 +2274,23 @@ pub struct MeshSidecarIngress {
     /// this port (captured original destination, or a peer's request
     /// authority) is forwarded to `default_endpoint`.
     pub port: u16,
-    /// Application-layer protocol of the listener. Only recognized HTTP-family
-    /// listeners (`http`/`http2`/`grpc`/`https`) materialize an HTTP route;
-    /// stream (`tcp`/`tls`/db) listeners — and a MISSING or UNRECOGNIZED protocol
-    /// — are not modeled here (raw-TCP inbound has no Host/route and is captured
-    /// separately) and are reported as deferred.
+    /// Application-layer protocol of the listener.
+    ///
+    /// Recognized HTTP-family listeners (`http`/`http2`/`grpc`/`https`)
+    /// materialize an HTTP inbound route. Recognized stream-family listeners
+    /// (`tcp`/`tls`/database protocols) materialize a raw-TCP inbound relay
+    /// keyed by the declared listener port (issue #3260). `Udp` and
+    /// `Unknown` (native omitted / K8s unrecognized typo) stay deferred —
+    /// never guessed onto either lane.
     ///
     /// Fail-closed across sources: on the K8s path the translator's
-    /// `sidecar_ingress_app_protocol` maps a missing/typo'd protocol to a non-HTTP
-    /// `AppProtocol` (never `Unknown`). On the native/file/xDS path this field
+    /// `sidecar_ingress_app_protocol` maps recognized HTTP and stream tokens
+    /// explicitly, defaults a MISSING protocol to `Tcp` (Istio's unset-port
+    /// default), and maps an UNRECOGNIZED string to `Unknown` so typos cannot
+    /// become live TCP listeners. On the native/file/xDS path this field
     /// deserializes directly, so an OMITTED `protocol` falls back to
-    /// `AppProtocol::default()` (`Unknown`) and an explicit `"unknown"` parses to
-    /// `Unknown`; `resolve()` REJECTS `Unknown` (via `is_http_family_app_protocol`)
-    /// so a listener whose protocol the source omitted or garbled defers rather
-    /// than being guessed onto the HTTP request path — matching the K8s behavior.
+    /// `AppProtocol::default()` (`Unknown`) and defers at `resolve()` rather
+    /// than being guessed onto the HTTP request path.
     #[serde(default)]
     pub protocol: AppProtocol,
     /// Istio `port.name` — informational; preserved for observability.
@@ -2289,15 +2301,25 @@ pub struct MeshSidecarIngress {
     /// `bind` does not create a separate OS listener; it is preserved for
     /// observability and surfaced as a documented limitation when non-default.
     /// Unix sockets are not valid here (Istio rejects them too).
+    ///
+    /// **Scope boundary (issue #3266):** arbitrary Sidecar ingress `bind`
+    /// socket materialization is intentionally out of scope for stream-ingress
+    /// modeling (#3260). Supported non-HTTP ingress still requires the shared
+    /// capture-listener contract (orig-dst / authority selects the declared
+    /// listener port). Do not treat a non-default `bind` as opening a dedicated
+    /// socket here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind: Option<String>,
     /// Istio `defaultEndpoint` — where inbound traffic is forwarded. Supported
-    /// forms (per Istio): `127.0.0.1:PORT`, `[::1]:PORT` (loopback), and
+    /// forms (per Istio): `127.0.0.1:PORT`, `[::1]:PORT` (loopback),
     /// `0.0.0.0:PORT` / `[::]:PORT` (the instance IP, modeled as loopback in
-    /// Ferrum's co-located-app deployment). `unix:///path` Unix-domain-socket
-    /// endpoints are **not** representable by Ferrum's host:port backend model
-    /// and fail closed (the entry is skipped at materialization and kept in the
-    /// `deferred_fields` report) rather than being mis-modeled.
+    /// Ferrum's co-located-app deployment), and `unix:///absolute/path.sock`
+    /// (a co-located Unix-domain stream socket, dialed by the Unix backend
+    /// dispatch path). A `unix://` path that fails the admission rules in
+    /// [`crate::util::unix_socket::validate_unix_socket_path`] — relative,
+    /// traversal-like, over-long, control characters — fails closed (the entry
+    /// is skipped at materialization and kept in the `deferred_fields` report)
+    /// rather than being dialed.
     ///
     /// **Optional** in Istio (an entry may omit it — Istio then defers the
     /// listener). The native/file/xDS mesh model must mirror that: an omitted
@@ -2317,20 +2339,74 @@ pub struct MeshSidecarIngress {
 /// the slice — only the resolved local-inbound views do, mirroring
 /// `local_inbound_services`).
 ///
-/// Forward-derived (the listener port + the parsed `defaultEndpoint`), never
-/// reconstructed by parsing materialized proxy ids. Unsupported shapes
-/// (Unix-socket / non-loop, non-instance-IP `defaultEndpoint`; non-HTTP-family
-/// protocol) are dropped before this is built and reported as deferred.
+/// Forward-derived (the listener port + the parsed `defaultEndpoint` +
+/// protocol), never reconstructed by parsing materialized proxy ids.
+/// Unsupported shapes (non-loopback, non-instance-IP `defaultEndpoint`; an
+/// inadmissible `unix://` path; `Unknown`/`Udp` protocol) are dropped before
+/// this is built and reported as deferred. HTTP-family entries materialize
+/// inbound HTTP routes (including supported Unix backends); stream-family
+/// entries materialize raw-TCP inbound relays (issue #3260).
+///
+/// The backend is one of TWO shapes and never both (see
+/// [`ResolvedIngressListener::backend`]):
+///   * **loopback TCP** — `endpoint_host` + `endpoint_port` set,
+///     `endpoint_unix_path` absent;
+///   * **Unix stream** — `endpoint_unix_path` set, `endpoint_host` empty and
+///     `endpoint_port` zero.
+///
+/// The mutual exclusion is enforced by [`Self::endpoint_is_valid`] rather than
+/// by the type, because this struct is decoded straight from untrusted carrier
+/// JSON: a hostile carrier that set BOTH could otherwise smuggle a TCP fallback
+/// alongside a socket path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedIngressListener {
     /// The declared listener port (the dialed/authority port used for
     /// per-port disambiguation on the shared inbound listener).
     pub port: u16,
     /// Backend host the route forwards to — always loopback (`127.0.0.1` or
-    /// `::1`) in Ferrum's co-located-app sidecar model.
+    /// `::1`) in Ferrum's co-located-app sidecar model. EMPTY for a Unix-stream
+    /// backend (see `endpoint_unix_path`).
     pub endpoint_host: String,
-    /// Backend port parsed from `defaultEndpoint`.
+    /// Backend port parsed from `defaultEndpoint`. ZERO for a Unix-stream
+    /// backend (see `endpoint_unix_path`).
     pub endpoint_port: u16,
+    /// Application protocol that resolved.
+    ///
+    /// **No compatibility default.** The ECDS / native carrier is an untrusted
+    /// decode boundary, so an OMITTED `protocol` deserializes to
+    /// `AppProtocol::default()` (`Unknown`) — NOT to a live HTTP listener.
+    /// `Unknown` fails [`Self::endpoint_is_valid`], so the back-projection
+    /// chokepoint and the materializer both drop the entry before it can
+    /// become a route or a relay. Same treatment as an explicitly hostile
+    /// `Udp`/`unknown` protocol on the wire: a carrier that cannot say what a
+    /// listener speaks never gets one.
+    #[serde(default)]
+    pub protocol: AppProtocol,
+    /// Absolute filesystem path of the co-located Unix-domain STREAM socket
+    /// this listener forwards to, parsed from a `unix:///path` `defaultEndpoint`
+    /// and admitted by [`crate::util::unix_socket::validate_unix_socket_path`].
+    ///
+    /// Mutually exclusive with `endpoint_host`/`endpoint_port` (see the struct
+    /// docs). `skip_serializing_if` keeps the wire shape byte-identical for the
+    /// far more common loopback-TCP listener, so an older peer that never sees
+    /// the field is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_unix_path: Option<String>,
+    /// Whether the Unix-stream backend speaks **h2c prior-knowledge** HTTP/2
+    /// rather than HTTP/1.1, derived from the declared `port.protocol`:
+    /// `http` → HTTP/1.1 (`false`); `http2`, `https` (which the Istio
+    /// translator maps to `Http2`), and `grpc` → h2c (`true`).
+    ///
+    /// This is the ONLY thing that decides which client handshake the dispatch
+    /// path performs on the socket, so it must never be guessed: an unmapped
+    /// protocol is refused at [`MeshSidecarIngress::resolve`] before a listener
+    /// exists. Meaningless — and never set — for a loopback-TCP listener, whose
+    /// protocol negotiation is the ordinary backend-capability machinery.
+    ///
+    /// `skip_serializing_if` keeps the wire shape byte-identical for the far
+    /// more common HTTP/1.1 listener.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub endpoint_unix_h2c: bool,
     /// Namespace of the local service whose host identity anchors the listener
     /// route. Carried so the materializer and the router/validator derive the
     /// SAME materialized proxy id forward (`mesh_ingress_proxy_id`) without
@@ -2343,33 +2419,143 @@ pub struct ResolvedIngressListener {
     pub owner_service: String,
 }
 
+/// The typed, routable backend one [`ResolvedIngressListener`] forwards to.
+///
+/// Constructed only by [`MeshSidecarIngress::resolve`] and
+/// [`ResolvedIngressListener::backend`]. The former applies the shape and
+/// syntax rules available to a control plane; the latter additionally applies
+/// the data plane's configured containment roots. Callers at a materialization
+/// or dial boundary must use `backend(allowed_roots)`, not treat a carried enum
+/// or listener as evidence of local containment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeshIngressBackend {
+    /// A co-located loopback TCP backend (`127.0.0.1`/`::1` + nonzero port).
+    Loopback { host: String, port: u16 },
+    /// A co-located Unix-domain STREAM socket at a syntactically admitted
+    /// absolute path. Values returned by `backend(allowed_roots)` are also
+    /// contained by the supplied data-plane roots; CP-side `resolve()` cannot
+    /// make that filesystem-local decision. `h2c` selects the client handshake:
+    /// prior-knowledge HTTP/2 when true, HTTP/1.1 when false.
+    Unix { path: String, h2c: bool },
+}
+
 impl ResolvedIngressListener {
     /// Re-validate a CARRIED resolved listener's backend endpoint against the
-    /// same loopback / instance-IP allowlist + nonzero-port invariants that
-    /// [`MeshSidecarIngress::resolve`] applies at resolution.
+    /// same allowlists [`MeshSidecarIngress::resolve`] applies at resolution.
     ///
     /// A `ResolvedIngressListener` can arrive already resolved over the xDS /
     /// native slice carrier (`LocalIngressListeners`), where the
-    /// `endpoint_host`/`endpoint_port` are decoded straight from untrusted wire
-    /// JSON. A malformed or hostile carrier could therefore point a listener at
-    /// an off-box host or a `:0` backend that the raw `Sidecar` path would have
-    /// deferred fail-closed. The inbound materializer re-checks this before
-    /// dialing so the carrier path enforces the SAME invariant as resolution
-    /// (loopback host — `127.0.0.1`/`::1`, the only forms `resolve()` ever emits
-    /// after collapsing the instance-IP wildcards — and a nonzero listener +
-    /// backend port).
+    /// `endpoint_host`/`endpoint_port`/`protocol`/`endpoint_unix_path` are decoded straight
+    /// from untrusted wire JSON. A malformed or hostile carrier could therefore
+    /// point a listener at an off-box host, a `:0` backend, or a traversal-like
+    /// socket path that the raw `Sidecar` path would have deferred fail-closed.
+    /// The inbound materializer re-checks this before dialing so the carrier
+    /// path enforces the SAME invariants as resolution:
+    ///   * nonzero LISTENER port on both shapes;
+    ///   * loopback host (`127.0.0.1`/`::1`, the only forms `resolve()` ever
+    ///     emits after collapsing the instance-IP wildcards) + nonzero backend
+    ///     port for the TCP shape;
+    ///   * an admitted, CONTAINED absolute socket path AND a vacant
+    ///     `endpoint_host` / `endpoint_port` for the Unix shape, so a
+    ///     both-shapes carrier cannot smuggle a TCP fallback past the Unix
+    ///     dispatch gate.
+    ///
+    /// `allowed_roots` is the data plane's configured Unix-socket containment
+    /// allowlist (`FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS`). It is a DATA-PLANE
+    /// policy — a control plane does not share the workload's filesystem — so
+    /// containment is enforced here, at materialization, and again at dial,
+    /// rather than at CP-side `resolve()`. An EMPTY allowlist refuses every
+    /// Unix listener; loopback-TCP listeners are unaffected by it.
     ///
     /// `pub` (like `MeshSidecarIngress::resolve`) so it is testable from the
     /// external mesh-validation test crate; it is a pure, side-effect-free
     /// validator over already-public fields.
-    pub fn endpoint_is_valid(&self) -> bool {
-        if self.port == 0 || self.endpoint_port == 0 {
-            return false;
+    pub fn endpoint_is_valid(&self, allowed_roots: &[String]) -> bool {
+        self.backend(allowed_roots).is_some()
+    }
+
+    /// The listener's backend SHAPE check, WITHOUT Unix-socket containment.
+    ///
+    /// Used only by the PeerAuthentication port-domain helpers, which care
+    /// solely about the backend app PORT (a Unix listener has none and is
+    /// filtered out by their own `endpoint_port != 0` rule). Never use it to
+    /// decide whether a listener may be materialized or dialed — that is
+    /// [`Self::endpoint_is_valid`]'s job, and only it applies containment.
+    pub fn endpoint_shape_is_valid(&self) -> bool {
+        self.backend_shape().is_some()
+    }
+
+    /// The typed backend this listener dials, or `None` when the carried fields
+    /// fail the fail-closed admission rules described on
+    /// [`Self::endpoint_is_valid`] — INCLUDING containment inside
+    /// `allowed_roots` for the Unix shape.
+    pub fn backend(&self, allowed_roots: &[String]) -> Option<MeshIngressBackend> {
+        let backend = self.backend_shape()?;
+        if let MeshIngressBackend::Unix { path, .. } = &backend {
+            crate::util::unix_socket::admit_configured_path(path, allowed_roots).ok()?;
+        }
+        Some(backend)
+    }
+
+    /// Shape-only backend resolution: mutual exclusion, nonzero ports, loopback
+    /// host, and the SYNTACTIC socket-path rules. Deliberately does NOT apply
+    /// containment, so every containment decision has exactly one home
+    /// ([`Self::backend`]).
+    fn backend_shape(&self) -> Option<MeshIngressBackend> {
+        if self.port == 0 || !is_modeled_ingress_app_protocol(self.protocol) {
+            return None;
+        }
+        if let Some(path) = self.endpoint_unix_path.as_deref() {
+            if !self.endpoint_host.is_empty() || self.endpoint_port != 0 {
+                return None;
+            }
+            crate::util::unix_socket::validate_unix_socket_path(path).ok()?;
+            let h2c = unix_backend_wire_protocol(self.protocol)?;
+            if h2c != self.endpoint_unix_h2c {
+                return None;
+            }
+            return Some(MeshIngressBackend::Unix {
+                path: path.to_string(),
+                h2c,
+            });
+        }
+        // A loopback-TCP listener must not carry the Unix-only protocol marker:
+        // a carrier that sets it is internally inconsistent, and admitting it
+        // would let a future reader treat a TCP listener as an h2c socket one.
+        if self.endpoint_unix_h2c {
+            return None;
+        }
+        if self.endpoint_port == 0 {
+            return None;
         }
         match self.endpoint_host.parse::<std::net::IpAddr>() {
-            Ok(ip) => ip.is_loopback(),
-            Err(_) => false,
+            Ok(ip) if ip.is_loopback() => Some(MeshIngressBackend::Loopback {
+                host: self.endpoint_host.clone(),
+                port: self.endpoint_port,
+            }),
+            _ => None,
         }
+    }
+
+    /// Whether this resolved listener materializes on the HTTP inbound route
+    /// lane (vs. the raw-TCP inbound relay lane).
+    pub fn is_http_family(&self) -> bool {
+        is_http_family_app_protocol(self.protocol)
+    }
+
+    /// Whether this resolved listener materializes as a raw-TCP inbound relay
+    /// keyed by the declared listener port (issue #3260).
+    pub fn is_stream_family(&self) -> bool {
+        is_stream_family_app_protocol(self.protocol)
+    }
+
+    /// The admitted, CONTAINED Unix-socket path this listener dials, or `None`
+    /// when it is a loopback-TCP listener (or fails admission).
+    pub fn unix_socket_path(&self, allowed_roots: &[String]) -> Option<&str> {
+        if !self.endpoint_is_valid(allowed_roots) {
+            return None;
+        }
+        self.endpoint_unix_path.as_deref()
     }
 }
 
@@ -2378,36 +2564,92 @@ impl ResolvedIngressListener {
 /// the Sidecar `deferred_fields` report rather than silently dropping it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngressListenerUnsupported {
-    /// `defaultEndpoint` is a `unix://` socket — not representable by the
-    /// host:port backend model.
-    UnixSocketEndpoint,
+    /// `defaultEndpoint` named a `unix://` socket whose PATH failed admission
+    /// (relative, traversal-like, over-long, control characters, …). The
+    /// wrapped rejection keeps the diagnostic field-specific instead of
+    /// collapsing every bad socket path into one opaque reason.
+    ///
+    /// A well-formed `unix://` path is NOT reported here — it resolves into a
+    /// routable Unix-stream backend.
+    InvalidUnixSocketPath(crate::util::unix_socket::UnixSocketPathRejection),
     /// `defaultEndpoint` did not parse as a supported `host:port` (missing
     /// port, malformed, or an arbitrary non-loopback / non-instance IP).
     UnparseableEndpoint,
     /// `port` or the parsed endpoint port was `0`.
     ZeroPort,
-    /// The listener protocol is stream-family (raw TCP / TLS / DB) — inbound
-    /// raw-TCP has no Host/route and is not modeled here.
+    /// The listener protocol is not a modeled HTTP-family or stream-family
+    /// token (`Unknown` typo / native omitted, or `Udp`). Historical name
+    /// retained for status/test stability; stream protocols are modeled.
     NonHttpProtocol,
+    /// The listener protocol is HTTP-family but Ferrum cannot speak it over a
+    /// Unix stream, so a `unix://` `defaultEndpoint` for it is refused with a
+    /// field-specific reason rather than materialized into a listener that
+    /// would refuse every request at runtime (issue #3261).
+    UnixProtocolUnsupported,
+}
+
+/// Which HTTP wire protocol Ferrum speaks to a Unix-stream backend for a given
+/// declared listener protocol, or `None` when that protocol has no Unix-stream
+/// dispatch at all.
+///
+/// `Some(false)` = HTTP/1.1, `Some(true)` = h2c prior-knowledge HTTP/2 (which
+/// is what carries gRPC's request/response streaming, deadlines, cancellation,
+/// and trailers). The `Http2` arm also covers Istio's `https`, which the K8s
+/// ingress translator maps to `Http2`: a `defaultEndpoint` is a plaintext hop
+/// to a co-located app, so TLS is not re-originated onto the socket.
+///
+/// Kept as an explicit total match over the HTTP-family set — adding an
+/// `AppProtocol` variant must be a deliberate decision here, not a silent
+/// inherit of HTTP/1.1.
+pub(crate) fn unix_backend_wire_protocol(protocol: AppProtocol) -> Option<bool> {
+    match protocol {
+        AppProtocol::Http => Some(false),
+        AppProtocol::Http2 | AppProtocol::Grpc => Some(true),
+        _ => None,
+    }
 }
 
 impl MeshSidecarIngress {
     /// Resolve this ingress entry into a routable [`ResolvedIngressListener`],
     /// or the reason it cannot be modeled. Fail-closed: anything that does not
-    /// map cleanly onto a loopback host:port HTTP route is rejected, never
-    /// guessed.
+    /// map cleanly onto a loopback host:port HTTP route or a syntactically
+    /// admitted Unix-stream HTTP socket, or a loopback raw-TCP relay is
+    /// rejected, never guessed. Unix containment is deliberately enforced
+    /// later by the data plane.
     pub fn resolve(&self) -> Result<ResolvedIngressListener, IngressListenerUnsupported> {
-        if !is_http_family_app_protocol(self.protocol) {
+        if !is_modeled_ingress_app_protocol(self.protocol) {
             return Err(IngressListenerUnsupported::NonHttpProtocol);
         }
         if self.port == 0 {
             return Err(IngressListenerUnsupported::ZeroPort);
         }
-        let (host, port) = parse_ingress_default_endpoint(&self.default_endpoint)?;
+        let (endpoint_host, endpoint_port, endpoint_unix_path, endpoint_unix_h2c) =
+            match parse_ingress_default_endpoint(&self.default_endpoint)? {
+                MeshIngressBackend::Loopback { host, port } => (host, port, None, false),
+                // The host:port pair is left VACANT for a Unix backend so the
+                // carrier re-validation (`endpoint_is_valid`) can reject a
+                // both-shapes carrier outright.
+                MeshIngressBackend::Unix { path, .. } => {
+                    // The wire protocol spoken on the socket is decided HERE,
+                    // from the declared `port.protocol`, and never guessed at
+                    // dispatch. `unix_backend_wire_protocol` returns `None` for
+                    // any HTTP-family protocol Ferrum cannot actually speak over
+                    // a Unix stream, which fails the entry closed with a
+                    // field-specific reason instead of materializing a listener
+                    // that would refuse every request at runtime.
+                    let Some(h2c) = unix_backend_wire_protocol(self.protocol) else {
+                        return Err(IngressListenerUnsupported::UnixProtocolUnsupported);
+                    };
+                    (String::new(), 0, Some(path), h2c)
+                }
+            };
         Ok(ResolvedIngressListener {
             port: self.port,
-            endpoint_host: host,
-            endpoint_port: port,
+            endpoint_host,
+            endpoint_port,
+            protocol: self.protocol,
+            endpoint_unix_path,
+            endpoint_unix_h2c,
             // Stamped by the slice builder once the local service is known.
             owner_namespace: String::new(),
             owner_service: String::new(),
@@ -2420,14 +2662,15 @@ impl MeshSidecarIngress {
     /// were its `defaultEndpoint` routable. This is the port-ambiguity predicate
     /// (a superset of [`resolve`](Self::resolve) success): it deliberately
     /// returns `true` for an HTTP-family entry whose endpoint is omitted /
-    /// `unix://` / off-box (a `resolve()` failure), because such an entry STILL
+    /// an inadmissible `unix://` / off-box (a `resolve()` failure), because such an entry STILL
     /// declared a distinct inbound listener port — so a partially materialized
     /// group must stay ambiguous to an orig-dst-less request rather than letting
     /// a surviving sibling absorb the skipped port's traffic (F6 §6.2). It
-    /// excludes only listeners that are not HTTP-family at all (deferred raw-TCP,
-    /// never an HTTP route) and zero-port entries (no port to disambiguate on).
-    /// The slice resolver dedups by port, so the DECLARED COUNT is over distinct
-    /// HTTP-family ports, mirroring the resolved-set dedup.
+    /// excludes stream-family listeners (they use the raw-TCP inbound table,
+    /// not HTTP sibling disambiguation), unrecognized/`Udp` protocols, and
+    /// zero-port entries. The slice resolver dedups by port, so the DECLARED
+    /// COUNT is over distinct HTTP-family ports, mirroring the resolved-set
+    /// dedup.
     pub(crate) fn is_declared_http_family_listener(&self) -> bool {
         self.port != 0 && is_http_family_app_protocol(self.protocol)
     }
@@ -2435,46 +2678,79 @@ impl MeshSidecarIngress {
 
 /// HTTP-family classification for Sidecar `ingress[]` listeners, shared by
 /// ingress-listener resolution ([`MeshSidecarIngress::resolve`]) and the K8s
-/// status writer's deferred-field report (via
-/// [`sidecar_ingress_protocol_is_http_family`](crate::config_sources::k8s::sidecar_ingress_protocol_is_http_family)),
+/// status writer's shared modeled-listener predicate,
 /// kept here so the config model can resolve ingress entries without importing
 /// the mode module and so the two callers can never disagree on whether a
-/// listener is modeled.
+/// listener is modeled as HTTP.
 ///
 /// **Fail-closed on `Unknown`** (unlike the service-port default path's separate
 /// `is_http_family_mesh_protocol`, which keeps the `unknown → HTTP` convention).
 /// On the K8s path the raw `port.protocol` string is pre-classified by
-/// `sidecar_ingress_app_protocol`, which maps `https` → `Http2` (routed) and a
-/// missing/mistyped protocol → `Tcp` (deferred) and NEVER yields `Unknown`. But
-/// the native/file/xDS source stores `MeshSidecarIngress.protocol` directly via
+/// `sidecar_ingress_app_protocol`, which maps `https` → `Http2` (routed),
+/// recognized stream tokens to their `AppProtocol`, a missing protocol → `Tcp`
+/// (stream-modeled), and an unrecognized typo → `Unknown` (deferred). The
+/// native/file/xDS source stores `MeshSidecarIngress.protocol` directly via
 /// serde, where an OMITTED `protocol` falls back to `AppProtocol::default()`
 /// (`Unknown`) and an explicit `"unknown"` deserializes to `Unknown`. Treating
 /// `Unknown` as HTTP-family there would materialize a custom inbound listener
 /// the K8s translator (and the documented fail-closed rule) would have deferred.
-/// Excluding `Unknown` here defers it on every source — matching the K8s path's
-/// missing/garbled-protocol behavior — without affecting the status-writer
-/// lock-step (that caller only ever passes the routable values
-/// `sidecar_ingress_app_protocol` emits, never `Unknown`).
-pub(crate) fn is_http_family_app_protocol(protocol: AppProtocol) -> bool {
+pub fn is_http_family_app_protocol(protocol: AppProtocol) -> bool {
     matches!(
         protocol,
         AppProtocol::Http | AppProtocol::Http2 | AppProtocol::Grpc
     )
 }
 
-/// Parse an Istio `defaultEndpoint` into a `(loopback_host, port)` pair.
+/// Stream-family classification for Sidecar `ingress[]` listeners (issue #3260):
+/// raw TCP, opaque TLS, and the database protocols Ferrum already relays on the
+/// service-port default inbound path. Shared by resolution and the K8s status
+/// writer so a modeled stream listener is never falsely reported as deferred.
+///
+/// Excludes `Unknown` (typo / native omitted) and `Udp` (not REDIRECT-captured
+/// TCP). Partitions with [`is_http_family_app_protocol`].
+pub fn is_stream_family_app_protocol(protocol: AppProtocol) -> bool {
+    matches!(
+        protocol,
+        AppProtocol::Tcp
+            | AppProtocol::Tls
+            | AppProtocol::Mongo
+            | AppProtocol::Redis
+            | AppProtocol::Mysql
+            | AppProtocol::Postgres
+    )
+}
+
+/// Whether a Sidecar `ingress[]` protocol is modeled on either inbound lane.
+pub fn is_modeled_ingress_app_protocol(protocol: AppProtocol) -> bool {
+    is_http_family_app_protocol(protocol) || is_stream_family_app_protocol(protocol)
+}
+
+/// Parse an Istio `defaultEndpoint` into the typed backend it names.
 ///
 /// Supported (per Istio's "Arbitrary IPs are not supported" rule): loopback
-/// (`127.0.0.1` / `::1`) and the instance-IP wildcards (`0.0.0.0` / `::`),
-/// which in Ferrum's co-located-app sidecar model both resolve to loopback (the
-/// app shares the pod network namespace). Unix sockets and arbitrary IPs are
-/// rejected fail-closed.
+/// (`127.0.0.1` / `::1`), the instance-IP wildcards (`0.0.0.0` / `::`) — which
+/// in Ferrum's co-located-app sidecar model both resolve to loopback (the app
+/// shares the pod network namespace) — and `unix:///absolute/path.sock`, whose
+/// path must pass [`crate::util::unix_socket::validate_unix_socket_path`].
+/// Arbitrary IPs and inadmissible socket paths are rejected fail-closed with a
+/// field-specific reason.
 fn parse_ingress_default_endpoint(
     endpoint: &str,
-) -> Result<(String, u16), IngressListenerUnsupported> {
-    let endpoint = endpoint.trim();
-    if endpoint.starts_with("unix://") {
-        return Err(IngressListenerUnsupported::UnixSocketEndpoint);
+) -> Result<MeshIngressBackend, IngressListenerUnsupported> {
+    if let Some(path) = endpoint.strip_prefix("unix://") {
+        // Istio writes `unix://` + an ABSOLUTE path, so the canonical form is
+        // the triple-slash `unix:///var/run/app.sock`. The leading `/` is part
+        // of the path, and a value that lost it (`unix://var/run/app.sock`)
+        // fails admission as `NotAbsolute` rather than being repaired.
+        return match crate::util::unix_socket::validate_unix_socket_path(path) {
+            Ok(()) => Ok(MeshIngressBackend::Unix {
+                path: path.to_string(),
+                // The wire protocol is not a property of the ENDPOINT string;
+                // `resolve` fills it in from the declared `port.protocol`.
+                h2c: false,
+            }),
+            Err(rejection) => Err(IngressListenerUnsupported::InvalidUnixSocketPath(rejection)),
+        };
     }
     // `host:port` where host is an IP literal (IPv4 dotted, or bracketed IPv6).
     let socket: std::net::SocketAddr = endpoint
@@ -2494,7 +2770,10 @@ fn parse_ingress_default_endpoint(
         // can't honor them; fail closed rather than dial an off-box address.
         return Err(IngressListenerUnsupported::UnparseableEndpoint);
     };
-    Ok((host.to_string(), socket.port()))
+    Ok(MeshIngressBackend::Loopback {
+        host: host.to_string(),
+        port: socket.port(),
+    })
 }
 
 /// A single egress listener entry under a [`MeshSidecar`]. Carries the
@@ -3380,6 +3659,23 @@ pub struct MeshConfig {
     /// operator-settable, never serialized.
     #[serde(skip)]
     pub local_ingress_listeners: Vec<ResolvedIngressListener>,
+    /// Runtime-only back-projection of `MeshSlice.sidecar_ingress_declared`.
+    /// This is deliberately separate from `local_ingress_listeners`: an
+    /// explicit empty block, an all-unsupported block, or a carrier whose
+    /// entries all fail re-validation still replaces the ordinary Sidecar
+    /// inbound surface. The authenticated CONNECT boundary reads this marker
+    /// so those cases deny rather than falling through to the transparent
+    /// relay and dialing a port the operator removed. `serde(skip)`: never
+    /// operator-settable, never serialized.
+    ///
+    /// Back-projected under `MeshTopology::Sidecar` ONLY, matching the inbound
+    /// materializer this marker gates. `FERRUM_MESH_SIDECAR_ENFORCED` is
+    /// topology-independent, so an Ambient/Waypoint proxy can be handed a slice
+    /// whose applicable Sidecar declares `ingress[]` — and those topologies
+    /// materialize no inbound routes at all, so honoring the marker there would
+    /// deny every transparent-relay CONNECT instead of replacing a surface.
+    #[serde(skip)]
+    pub sidecar_ingress_declared: bool,
     /// Runtime-only back-projection of `MeshSlice.declared_ingress_http_ports`
     /// (F6 §6.2), set by mesh preparation. The count of DISTINCT HTTP-family
     /// `ingress[]` listener ports the workload DECLARED — which can EXCEED
@@ -3398,6 +3694,21 @@ pub struct MeshConfig {
     /// operator-settable, never serialized.
     #[serde(skip)]
     pub local_inbound_tcp_routes: Vec<MeshInboundTcpRoute>,
+    /// Runtime-only back-projection of the unambiguously resolved local
+    /// service workload set's addresses, taken
+    /// from `MeshSlice.local_inbound_workloads` (the un-narrowed local-inbound
+    /// view) and canonicalized for comparison (IPv4-mapped IPv6 folded).
+    ///
+    /// Deliberately NOT `workloads`: that is the subscription-NAMESPACE view
+    /// and contains unrelated pods. This set can include sibling replicas of
+    /// the one resolved service, so the authenticated CONNECT boundary also
+    /// requires the authority host to equal the accepted socket's actual local
+    /// IP. Together those checks prove the peer reached the pod it named before
+    /// the dial may be remapped onto a local `ingress[]` `defaultEndpoint`
+    /// (issue #3260). Empty ⇒ no local identity resolved, and the remap is
+    /// refused. `serde(skip)`: never operator-settable, never serialized.
+    #[serde(skip)]
+    pub local_workload_addresses: Vec<std::net::IpAddr>,
     /// Runtime-only allowlist of external UDP destinations this **EgressGateway**
     /// may relay datagram-over-mesh traffic to (issue #3263). Materialized by
     /// `materialize_egress_gateway_proxies` from `MESH_EXTERNAL` `ServiceEntry`
@@ -3446,6 +3757,166 @@ pub struct MeshConfig {
     /// captured datapath trusts.
     #[serde(skip)]
     pub external_udp_egress_routes: Vec<MeshExternalUdpEgressRoute>,
+}
+
+/// Canonical comparison form for a mesh host: IP literals fold IPv4-mapped
+/// IPv6 to their IPv4 form, everything else is ASCII-lowercased. Used for
+/// validated loopback endpoint comparisons.
+pub fn canonical_mesh_host(host: &str) -> String {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_canonical().to_string(),
+        Err(_) => host.to_ascii_lowercase(),
+    }
+}
+
+/// Outcome of resolving an authenticated inbound CONNECT `:authority` against
+/// this workload's declared Sidecar `ingress[]` listeners (issue #3260).
+///
+/// The identity-protected Sidecar inbound path is a fresh mesh-mTLS HTTP/2
+/// CONNECT to `:15006`, NOT a REDIRECT-captured plaintext stream, so it never
+/// reaches `local_inbound_tcp_routes`. Without this resolution an authenticated
+/// CONNECT for a declared ingress listener (`pod-ip:16379`) would be relayed
+/// straight back to `pod-ip:16379` — the declared listener port — instead of the
+/// `defaultEndpoint` the operator pointed it at (`127.0.0.1:6379`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidecarIngressConnectRelay {
+    /// This workload has no declared Sidecar ingress block. The ordinary
+    /// transparent-relay open-relay guard decides this CONNECT unchanged; this
+    /// resolution must never widen ordinary HBONE/Ambient relay destinations.
+    NotDeclared,
+    /// A Sidecar ingress block is declared, but the authority does not resolve
+    /// to exactly one valid, owner-stamped, stream-family loopback mapping for
+    /// this accepted local address. Fail closed: the caller must refuse the
+    /// CONNECT rather than fall back to dialing the authority, including for a
+    /// port absent from an explicit-empty/all-invalid replacement surface.
+    Deny,
+    /// Relay to the listener's validated loopback `defaultEndpoint`, while
+    /// AuthorizationPolicy evaluation stays keyed to `listener_port`.
+    Relay {
+        /// The DECLARED listener port the peer addressed. Authorization
+        /// (`mesh_authz` `destination.port`) is evaluated on this, never on
+        /// `endpoint_port` — a listener-scoped DENY must still fire.
+        listener_port: u16,
+        /// Validated loopback backend host.
+        endpoint_host: String,
+        /// Validated `defaultEndpoint` backend port.
+        endpoint_port: u16,
+    },
+}
+
+impl MeshConfig {
+    /// Whether `host` belongs to the unambiguously resolved local service's
+    /// workload set (see [`Self::local_workload_addresses`]). This membership
+    /// check is not pod-unique; callers that need the exact replica must also
+    /// compare the accepted socket's local IP. Empty inventory ⇒ `false`.
+    pub fn host_is_local_service_workload_address(&self, host: &str) -> bool {
+        if self.local_workload_addresses.is_empty() || host.is_empty() {
+            return false;
+        }
+        host.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| self.local_workload_addresses.contains(&ip.to_canonical()))
+    }
+
+    /// Resolve an authenticated inbound CONNECT `host:port` against this
+    /// workload's declared Sidecar `ingress[]` stream listeners (issue #3260).
+    ///
+    /// `host` must already be unbracketed (the CONNECT boundary normalizes an
+    /// `[::1]`-style authority before calling). Fail-closed rules, in order:
+    ///
+    /// 1. No Sidecar `ingress` block declared ⇒
+    ///    [`SidecarIngressConnectRelay::NotDeclared`] (ordinary relay guard
+    ///    decides; behavior unchanged). Once an ingress block is declared,
+    ///    any port without one valid modeled listener is denied: explicit
+    ///    empty/all-invalid declarations replace the ordinary inbound surface.
+    /// 2. MORE than one declared listener on `port` ⇒ `Deny`. A hostile or
+    ///    duplicated carrier must not pick a mapping by iteration order.
+    /// 3. `host` is not in the resolved local-service workload set, does not
+    ///    equal the accepted connection's actual local IP, or the local IP is
+    ///    unavailable ⇒ `Deny`. Sharing a port number with a local listener
+    ///    is not permission to remap a sibling replica's (or a bare loopback)
+    ///    destination onto our application.
+    /// 4. Malformed endpoint / unmodeled protocol / zero port, or a missing
+    ///    owner stamp ⇒ `Deny` (same pair of guards the back-projection
+    ///    chokepoint and the materializer apply).
+    /// 5. Not stream-family ⇒ `Deny`. An HTTP-family listener is served by its
+    ///    materialized `__mesh-ingress-*` HTTP route; a bare byte-stream CONNECT
+    ///    naming it is outside the declared contract and is refused rather than
+    ///    relayed to the listener port the operator replaced.
+    pub fn resolve_sidecar_ingress_connect_relay(
+        &self,
+        host: &str,
+        port: u16,
+        accepted_local_ip: Option<std::net::IpAddr>,
+    ) -> SidecarIngressConnectRelay {
+        if !self.sidecar_ingress_declared {
+            return SidecarIngressConnectRelay::NotDeclared;
+        }
+        if port == 0 {
+            return SidecarIngressConnectRelay::Deny;
+        }
+        let mut rest = self.local_ingress_listeners.iter();
+        let Some(listener) = rest.find(|entry| entry.port == port) else {
+            return SidecarIngressConnectRelay::Deny;
+        };
+        if rest.any(|entry| entry.port == port) {
+            return SidecarIngressConnectRelay::Deny;
+        }
+        let Ok(authority_ip) = host.parse::<std::net::IpAddr>() else {
+            return SidecarIngressConnectRelay::Deny;
+        };
+        let authority_ip = authority_ip.to_canonical();
+        if accepted_local_ip.map(|ip| ip.to_canonical()) != Some(authority_ip)
+            || !self.local_workload_addresses.contains(&authority_ip)
+        {
+            return SidecarIngressConnectRelay::Deny;
+        }
+        if !listener.endpoint_shape_is_valid()
+            || listener.owner_namespace.is_empty()
+            || listener.owner_service.is_empty()
+            || !listener.is_stream_family()
+        {
+            return SidecarIngressConnectRelay::Deny;
+        }
+        SidecarIngressConnectRelay::Relay {
+            listener_port: listener.port,
+            endpoint_host: listener.endpoint_host.clone(),
+            endpoint_port: listener.endpoint_port,
+        }
+    }
+
+    /// Whether `host:port` is EXACTLY the loopback `defaultEndpoint` that
+    /// `listener_port` resolves to right now — the post-plugin re-check for a
+    /// Sidecar ingress CONNECT relay.
+    ///
+    /// The synthesized relay proxy passes through the ordinary `before_proxy`
+    /// chain, so a `mesh_route_dispatch` route override (or an upstream
+    /// selection) can replace the destination between synthesis and dial. Only
+    /// the one mapping this listener declares survives; anything else — a
+    /// different backend, a widened port, a withdrawn listener — fails closed
+    /// before the dial.
+    pub fn sidecar_ingress_connect_relay_endpoint_matches(
+        &self,
+        listener_port: u16,
+        host: &str,
+        port: u16,
+    ) -> bool {
+        if !self.sidecar_ingress_declared {
+            return false;
+        }
+        let mut rest = self.local_ingress_listeners.iter();
+        let Some(listener) = rest.find(|entry| entry.port == listener_port) else {
+            return false;
+        };
+        if rest.any(|entry| entry.port == listener_port) {
+            return false;
+        }
+        listener.endpoint_shape_is_valid()
+            && listener.is_stream_family()
+            && !listener.owner_namespace.is_empty()
+            && !listener.owner_service.is_empty()
+            && listener.endpoint_port == port
+            && canonical_mesh_host(&listener.endpoint_host) == canonical_mesh_host(host)
+    }
 }
 
 /// One admitted external UDP egress destination materialized from a
@@ -3569,8 +4040,10 @@ impl Default for MeshConfig {
             node_waypoint_capture_peer_authentications: Vec::new(),
             local_inbound_services: None,
             local_ingress_listeners: Vec::new(),
+            sidecar_ingress_declared: false,
             declared_ingress_http_ports: 0,
             local_inbound_tcp_routes: Vec::new(),
+            local_workload_addresses: Vec::new(),
             egress_udp_destinations: Vec::new(),
             external_udp_egress_routes: Vec::new(),
         }
@@ -3621,11 +4094,17 @@ pub struct MeshWaypointBinding {
 }
 
 /// Runtime-only local Sidecar raw-TCP inbound route, prepared from the same
-/// local workload/service view as HTTP-family inbound materialization.
+/// local workload/service view as HTTP-family inbound materialization — and,
+/// when Sidecar `ingress[]` declares stream-family listeners (issue #3260),
+/// from those resolved listeners as well.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshInboundTcpRoute {
-    /// Captured original-destination port that selects this route. For
-    /// REDIRECT-captured inbound traffic this is the local app/container port.
+    /// Captured original-destination port that selects this route.
+    ///
+    /// For service-port default inbound this is the local app/container port.
+    /// For Sidecar `ingress[]` stream listeners it is the **declared listener
+    /// port** (the dialed port recovered from orig-dst), while
+    /// [`Self::backend_addr`] may target a different `defaultEndpoint` port.
     pub match_port: u16,
     /// Loopback target for the co-located application.
     pub backend_addr: std::net::SocketAddr,
@@ -4902,10 +5381,10 @@ fn validate_mesh_config_internal(
         }
         // Ingress listeners: the listener port is a mandatory structural field.
         // The `defaultEndpoint` routability decision — empty, Unix sockets,
-        // non-HTTP-family protocols, arbitrary IPs — is NOT a validation error
+        // unrecognized/`Udp` protocols, arbitrary IPs — is NOT a validation error
         // (Istio allows omitting `defaultEndpoint`): those entries are accepted,
         // reported as deferred by the status writer, and skipped fail-closed at
-        // materialization.
+        // materialization. Recognized HTTP and stream protocols are modeled.
         for (i, ingress) in sidecar.ingress.iter().enumerate() {
             validate_non_zero_port(
                 format!("MeshSidecar '{}'.ingress[{}].port", sidecar.name, i),

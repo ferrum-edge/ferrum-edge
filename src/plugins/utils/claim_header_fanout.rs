@@ -124,6 +124,25 @@ pub fn emit_claim_headers_to_attempt(
     }
 }
 
+/// Resolve configured mappings once for a cacheable normalized authorization
+/// result. The returned index refers to the immutable provider mapping table,
+/// so cache entries retain only provider-controlled header values rather than
+/// duplicating configuration-owned metadata keys and destination names.
+pub fn normalized_claim_header_values(
+    claims: &Value,
+    mappings: &[ClaimHeaderMapping],
+    separator: &str,
+) -> Vec<(usize, String)> {
+    mappings
+        .iter()
+        .enumerate()
+        .filter_map(|(mapping_index, mapping)| {
+            claim_value_for_header(claims, &mapping.claim_path, separator)
+                .map(|value| (mapping_index, value))
+        })
+        .collect()
+}
+
 /// Install verified claim values into the backend request headers.
 ///
 /// `claim_headers` destinations are gateway-owned and always sanitized: every

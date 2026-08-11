@@ -341,7 +341,8 @@ async fn workload_api_streams_federated_x509_bundles() {
     let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
     let attestor: Arc<dyn Attestor> = Arc::new(StubAttestor { id });
     let svc = WorkloadApiService::new(vec![attestor], ca, trust_domain.clone(), 600)
-        .with_federated_trust_domains(vec![partner_domain.clone()]);
+        .with_federated_trust_domains(vec![partner_domain.clone()])
+        .expect("one federated trust domain is within the configured cap");
 
     let svid_resp = svc
         .fetch_x509svid(workload_request(X509svidRequest {}))
@@ -957,8 +958,17 @@ async fn fetch_x509svid_rejects_missing_workload_metadata_before_attestation() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
+/// A CA backend with no JWT authority at all (the `StubCa` here, and in
+/// production `FERRUM_MESH_CA_BACKEND=spire`, whose agent streams carry only
+/// X.509 authorities) must fail closed with `UNIMPLEMENTED` on every JWT RPC.
+///
+/// `FetchJWTBundles` in particular must not return `Ok(stream)`: SPIFFE
+/// Workload API §6.2.2 requires at least the local trust-domain JWT bundle, so
+/// an empty `bundles` map reads as "zero trusted JWT authorities" rather than
+/// "unsupported". Backends that *do* own a JWT authority are covered in
+/// `jwt_svid_tests.rs`.
 #[tokio::test]
-async fn jwt_svid_rpcs_return_unimplemented_fail_closed() {
+async fn jwt_svid_rpcs_return_unimplemented_when_backend_has_no_jwt_authority() {
     use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
     use ferrum_edge::identity::workload_api::proto::{
         JwtBundlesRequest, JwtsvidRequest, ValidateJwtsvidRequest,
@@ -982,13 +992,13 @@ async fn jwt_svid_rpcs_return_unimplemented_fail_closed() {
         }))
         .await
     {
-        Ok(_) => panic!("FetchJWTSVID must not succeed while deferred"),
+        Ok(_) => panic!("FetchJWTSVID must not mint without a JWT signing authority"),
         Err(err) => err,
     };
     assert_eq!(mint_err.code(), Code::Unimplemented);
     assert!(
-        mint_err.message().contains("JWT-SVID issuance"),
-        "mint error should name issuance deferral (got: {})",
+        mint_err.message().contains("cannot mint JWT-SVIDs"),
+        "mint error should name the missing signing authority (got: {})",
         mint_err.message()
     );
 
@@ -1003,8 +1013,8 @@ async fn jwt_svid_rpcs_return_unimplemented_fail_closed() {
     };
     assert_eq!(bundles_err.code(), Code::Unimplemented);
     assert!(
-        bundles_err.message().contains("JWT-SVID bundle"),
-        "bundles error should name bundle-stream deferral (got: {})",
+        bundles_err.message().contains("no JWT authority"),
+        "bundles error should name the missing authority (got: {})",
         bundles_err.message()
     );
 
@@ -1015,13 +1025,13 @@ async fn jwt_svid_rpcs_return_unimplemented_fail_closed() {
         }))
         .await
     {
-        Ok(_) => panic!("ValidateJWTSVID must not succeed while deferred"),
+        Ok(_) => panic!("ValidateJWTSVID must not succeed without a JWT authority"),
         Err(err) => err,
     };
     assert_eq!(validate_err.code(), Code::Unimplemented);
     assert!(
-        validate_err.message().contains("JWT-SVID validation"),
-        "validate error should name validation deferral (got: {})",
+        validate_err.message().contains("no JWT authority"),
+        "validate error should name the missing authority (got: {})",
         validate_err.message()
     );
 }
@@ -1660,4 +1670,692 @@ async fn workload_api_sources_avoid_unbounded_rotation_queues() {
         !client.contains("unbounded_channel"),
         "client must not reintroduce unbounded relay queues"
     );
+}
+
+// ── Workload API socket boundary (issue #3617) ───────────────────────────
+//
+// The socket is a credential-adjacent surface: whoever can replace it can
+// impersonate the endpoint workloads dial for their identity. Two layers are
+// covered here — the pure directory-trust predicate (exhaustively, including
+// ownership shapes a non-root test process cannot create on disk) and the
+// filesystem walk over every component of a real path.
+
+#[cfg(unix)]
+mod socket_boundary {
+    use ferrum_edge::identity::workload_api::{
+        DirectoryTrustVerdict, WorkloadApiSocketConfig, classify_directory_component,
+    };
+    use std::path::{Path, PathBuf};
+
+    const EUID: u32 = 1000;
+    const OTHER_UID: u32 = 4242;
+    const ROOT: u32 = 0;
+
+    #[test]
+    fn the_directory_trust_predicate_refuses_every_untrusted_shape() {
+        use DirectoryTrustVerdict::*;
+
+        // (label, is_symlink, is_dir, uid, mode, expected)
+        let cases: &[(&str, bool, bool, u32, u32, DirectoryTrustVerdict)] = &[
+            ("own dir 0755", false, true, EUID, 0o755, Trusted),
+            ("own dir 0700", false, true, EUID, 0o700, Trusted),
+            ("root dir 0755", false, true, ROOT, 0o755, Trusted),
+            // Sticky rescues shared-writable: a non-owner can create entries but
+            // cannot unlink or rename ours (`/tmp`, `/run` semantics).
+            ("root sticky 1777", false, true, ROOT, 0o1777, Trusted),
+            ("own sticky 1775", false, true, EUID, 0o1775, Trusted),
+            // A symlink is refused, never followed — the LINK's owner, not the
+            // directory's, decides where the socket lands.
+            ("symlink", true, true, EUID, 0o755, Symlink),
+            ("symlink owned by root", true, true, ROOT, 0o755, Symlink),
+            ("regular file", false, false, EUID, 0o644, NotADirectory),
+            // A directory's OWNER may modify its entries whatever the mode says,
+            // so ownership is checked independently of permissions. This is the
+            // directory-owner exception the sticky bit does not constrain.
+            (
+                "other-owned 0755",
+                false,
+                true,
+                OTHER_UID,
+                0o755,
+                UntrustedOwner,
+            ),
+            (
+                "other-owned 0700",
+                false,
+                true,
+                OTHER_UID,
+                0o700,
+                UntrustedOwner,
+            ),
+            (
+                "other-owned sticky",
+                false,
+                true,
+                OTHER_UID,
+                0o1777,
+                UntrustedOwner,
+            ),
+            // Group-writable is an untrusted actor exactly as world-writable is.
+            (
+                "group-writable 0775",
+                false,
+                true,
+                EUID,
+                0o775,
+                UntrustedlyWritable,
+            ),
+            (
+                "group-writable 0770",
+                false,
+                true,
+                ROOT,
+                0o770,
+                UntrustedlyWritable,
+            ),
+            (
+                "world-writable 0777",
+                false,
+                true,
+                ROOT,
+                0o777,
+                UntrustedlyWritable,
+            ),
+            (
+                "world-writable 0707",
+                false,
+                true,
+                EUID,
+                0o707,
+                UntrustedlyWritable,
+            ),
+        ];
+
+        for (label, is_symlink, is_dir, uid, mode, expected) in cases {
+            assert_eq!(
+                classify_directory_component(*is_symlink, *is_dir, *uid, *mode, EUID),
+                *expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn ownership_is_checked_before_permissions_so_a_private_hostile_dir_is_refused() {
+        // A 0700 directory owned by another user is the case a mode-only check
+        // waves through: nothing is writable by "us", yet its owner can replace
+        // any entry at will.
+        assert_eq!(
+            classify_directory_component(false, true, OTHER_UID, 0o700, EUID),
+            DirectoryTrustVerdict::UntrustedOwner
+        );
+    }
+
+    /// A private per-test directory whose ancestors are all trusted, so a test
+    /// can introduce exactly one untrusted component.
+    ///
+    /// Shared with the publication tests below, which need the same "a real path
+    /// Ferrum would accept" starting point.
+    pub(crate) struct Sandbox {
+        pub(crate) root: PathBuf,
+    }
+
+    impl Sandbox {
+        pub(crate) fn new(label: &str) -> Option<Self> {
+            // Canonicalized: on macOS `std::env::temp_dir()` sits under `/var`,
+            // which is itself a symlink — the very thing the walk refuses. The
+            // canonical form is what an operator would configure.
+            let base = std::fs::canonicalize(std::env::temp_dir()).ok()?;
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            let root = base.join(format!("fe-wl-sb-{label}-{}", unique % 1_000_000_000));
+            std::fs::create_dir_all(&root).ok()?;
+            let sandbox = Self { root };
+            // If the ambient temp path is itself untrusted (an unusual CI image),
+            // every case below would pass for the wrong reason. Skip instead.
+            sandbox
+                .socket_in(&sandbox.root)
+                .validate()
+                .ok()
+                .map(|()| sandbox)
+        }
+
+        fn socket_in(&self, parent: &Path) -> WorkloadApiSocketConfig {
+            WorkloadApiSocketConfig::from_parts(parent.join("api.sock"), "0660")
+                .expect("mode parses")
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .expect("test can chmod a directory it owns");
+    }
+
+    #[test]
+    fn a_group_writable_parent_directory_is_refused() {
+        let Some(sandbox) = Sandbox::new("grp") else {
+            return;
+        };
+        let parent = sandbox.root.join("parent");
+        std::fs::create_dir(&parent).expect("create parent");
+        set_mode(&parent, 0o775);
+
+        let error = sandbox
+            .socket_in(&parent)
+            .validate()
+            .expect_err("a group-writable parent must be refused");
+        assert!(
+            error.to_string().contains("group- or world-writable"),
+            "unexpected reason: {error}"
+        );
+
+        // ...and the sticky bit makes the same mode acceptable, because a
+        // non-owner can then no longer unlink our socket.
+        set_mode(&parent, 0o1775);
+        sandbox
+            .socket_in(&parent)
+            .validate()
+            .expect("sticky group-writable is the /tmp posture and is accepted");
+    }
+
+    #[test]
+    fn a_group_writable_ancestor_is_refused_even_with_a_pristine_parent() {
+        // The finding this closes: checking only the immediate parent proves
+        // nothing, because whoever controls an ancestor can rename the whole
+        // subtree aside and substitute their own.
+        let Some(sandbox) = Sandbox::new("anc") else {
+            return;
+        };
+        let ancestor = sandbox.root.join("ancestor");
+        let parent = ancestor.join("parent");
+        std::fs::create_dir_all(&parent).expect("create ancestor/parent");
+        set_mode(&parent, 0o700);
+        set_mode(&ancestor, 0o777);
+
+        let error = sandbox
+            .socket_in(&parent)
+            .validate()
+            .expect_err("a world-writable ancestor must be refused");
+        assert!(
+            error.to_string().contains(&ancestor.display().to_string()),
+            "the diagnostic must name the offending ancestor, not the parent: {error}"
+        );
+
+        set_mode(&ancestor, 0o755);
+        sandbox
+            .socket_in(&parent)
+            .validate()
+            .expect("a trusted ancestor chain is accepted");
+    }
+
+    #[test]
+    fn a_symlinked_ancestor_is_refused_rather_than_followed() {
+        let Some(sandbox) = Sandbox::new("sym") else {
+            return;
+        };
+        let real = sandbox.root.join("real");
+        std::fs::create_dir(&real).expect("create real dir");
+        let link = sandbox.root.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("test can create a symlink");
+
+        // The symlink as the socket's own parent...
+        let error = sandbox
+            .socket_in(&link)
+            .validate()
+            .expect_err("a symlinked parent must be refused");
+        assert!(error.to_string().contains("symlink"), "reason: {error}");
+
+        // ...and as an ANCESTOR of it. Following either would mean the path the
+        // operator reviewed and the path Ferrum binds are different objects.
+        let under_real = real.join("nested");
+        std::fs::create_dir(&under_real).expect("create nested dir");
+        let error = sandbox
+            .socket_in(&link.join("nested"))
+            .validate()
+            .expect_err("a symlinked ancestor must be refused");
+        assert!(error.to_string().contains("symlink"), "reason: {error}");
+
+        // The same directory reached through its real path is fine, which is
+        // what makes the refusal about the link rather than the target.
+        sandbox
+            .socket_in(&under_real)
+            .validate()
+            .expect("the real path to the same directory is accepted");
+    }
+
+    #[test]
+    fn a_non_directory_component_is_refused() {
+        let Some(sandbox) = Sandbox::new("file") else {
+            return;
+        };
+        let file = sandbox.root.join("not-a-dir");
+        std::fs::write(&file, b"operator data").expect("write file");
+        let error = sandbox
+            .socket_in(&file)
+            .validate()
+            .expect_err("a regular file cannot be the socket's parent");
+        assert!(
+            error.to_string().contains("is not a directory"),
+            "reason: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("the file survives"),
+            b"operator data",
+            "validation must never mutate the artifact it refuses"
+        );
+    }
+}
+
+// ── Socket mode, lexical path, liveness, and cleanup identity ─────────────
+//
+// The pure halves of the socket contract, exercised over shapes a test process
+// cannot always force onto a real filesystem.
+
+#[cfg(unix)]
+mod socket_policy {
+    use ferrum_edge::identity::workload_api::{
+        MAX_STAGING_SUFFIX_BYTES, SocketLiveness, WorkloadApiSocketConfig, classify_connect_result,
+        matches_bound_socket_identity,
+    };
+    use std::io;
+
+    const EUID: u32 = 1000;
+    const OTHER_UID: u32 = 4242;
+
+    #[test]
+    fn a_mode_that_permits_no_connection_is_refused_at_parse() {
+        // `connect(2)` on a Unix socket requires WRITE permission on the socket
+        // file. A mode with neither an owner nor a group write bit therefore
+        // binds happily and then rejects every workload with EACCES, which
+        // contradicts the startup contract: a successful start must mean
+        // workloads can actually connect.
+        for mode in ["0000", "0400", "0440", "0444", "0500", "0550", "0555"] {
+            let error = WorkloadApiSocketConfig::from_parts("/run/ferrum/api.sock", mode)
+                .expect_err("a mode with no owner/group write bit must be refused");
+            assert!(
+                error.to_string().contains("write"),
+                "mode {mode} should be refused for lacking a write bit, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn world_writable_modes_stay_refused() {
+        for mode in ["0666", "0662", "0602", "0002", "0777"] {
+            let error = WorkloadApiSocketConfig::from_parts("/run/ferrum/api.sock", mode)
+                .expect_err("a world-writable mode must be refused");
+            assert!(
+                error.to_string().contains("world-writable"),
+                "mode {mode} should be refused as world-writable, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn modes_that_grant_owner_or_group_write_are_accepted() {
+        // Owner-write alone, group-write alone, and the default all satisfy the
+        // "a workload can reach it" rule; the group case is the documented
+        // production shape.
+        for mode in ["0600", "0660", "0060", "0760", "0700"] {
+            let config = WorkloadApiSocketConfig::from_parts("/run/ferrum/api.sock", mode)
+                .unwrap_or_else(|error| panic!("mode {mode} should parse, got: {error}"));
+            assert_ne!(
+                config.socket_mode & 0o220,
+                0,
+                "mode {mode} must retain a write bit"
+            );
+        }
+    }
+
+    #[test]
+    fn an_embedded_dot_segment_is_refused_rather_than_normalized_away() {
+        // `Path::components()` drops an embedded `.` on Unix, so a lexical
+        // rejection written over it would have accepted this path while the
+        // documentation promised otherwise. The check reads raw segments.
+        for path in [
+            "/run/ferrum/./api.sock",
+            "/run/./ferrum/api.sock",
+            "/run/ferrum/../ferrum/api.sock",
+            "/run/ferrum/..",
+            "/./api.sock",
+        ] {
+            let error = WorkloadApiSocketConfig::from_parts(path, "0660")
+                .expect("mode parses")
+                .validate()
+                .expect_err("a '.' or '..' segment must be refused");
+            assert!(
+                error.to_string().contains("'.' or '..'"),
+                "path {path} should be refused for its dot segment, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parent_with_no_room_for_the_staging_directory_is_refused() {
+        // The socket is bound inside a private staging directory beneath the
+        // parent and only then published from there, so it is the STAGING path
+        // that has to fit `sockaddr_un.sun_path`. A parent that leaves no
+        // headroom is a configuration error, not a bare EINVAL from `bind`.
+        let parent = format!("/{}", "d".repeat(90));
+        let error = WorkloadApiSocketConfig::from_parts(format!("{parent}/s"), "0660")
+            .expect("mode parses")
+            .validate()
+            .expect_err("an over-long parent must be refused");
+        let text = error.to_string();
+        assert!(
+            text.contains("staging") || text.contains("Unix-socket limit"),
+            "unexpected reason: {error}"
+        );
+
+        // The default deployment path is comfortably inside the budget, so the
+        // reserved headroom costs a real operator nothing.
+        let default_parent = "/run/ferrum/workload-api";
+        assert!(
+            default_parent.len() + MAX_STAGING_SUFFIX_BYTES <= 100,
+            "the documented default parent must still fit with staging headroom"
+        );
+        WorkloadApiSocketConfig::from_parts(format!("{default_parent}/socket"), "0660")
+            .expect("the default path and mode parse");
+    }
+
+    #[test]
+    fn only_a_definitive_not_listening_result_admits_an_unlink() {
+        // A successful connection means a LIVE endpoint: refusing to unlink it
+        // is what stops a second same-uid process taking over the path
+        // workloads dial for their identity. Everything the kernel could not
+        // answer definitively is undetermined, and undetermined fails closed.
+        assert_eq!(classify_connect_result(&Ok(())), SocketLiveness::Live);
+        assert_eq!(
+            classify_connect_result(&Err(io::Error::from(io::ErrorKind::ConnectionRefused))),
+            SocketLiveness::NotListening
+        );
+        assert_eq!(
+            classify_connect_result(&Err(io::Error::from(io::ErrorKind::NotFound))),
+            SocketLiveness::NotListening
+        );
+        for ambiguous in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::Other,
+        ] {
+            assert_eq!(
+                classify_connect_result(&Err(io::Error::from(ambiguous))),
+                SocketLiveness::Undetermined,
+                "{ambiguous:?} must not be read as 'nobody is listening'"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_identity_is_type_and_owner_as_well_as_device_and_inode() {
+        let bound = (7u64, 42u64);
+
+        assert!(
+            matches_bound_socket_identity(true, EUID, bound, EUID, bound),
+            "our own socket at the recorded inode is the thing we may unlink"
+        );
+        // Inode reuse: the number is recycled and a REGULAR FILE lands on it.
+        // A device+inode-only predicate would have deleted somebody's data.
+        assert!(
+            !matches_bound_socket_identity(false, EUID, bound, EUID, bound),
+            "a non-socket on the recycled inode must not satisfy the identity"
+        );
+        // Type replacement by another user, same inode.
+        assert!(
+            !matches_bound_socket_identity(true, OTHER_UID, bound, EUID, bound),
+            "another user's socket must not satisfy the identity"
+        );
+        // A different inode is a different object even when it is our socket.
+        assert!(
+            !matches_bound_socket_identity(true, EUID, (7, 43), EUID, bound),
+            "a successor socket at the same path must be left alone"
+        );
+        assert!(
+            !matches_bound_socket_identity(true, EUID, (8, 42), EUID, bound),
+            "the device is part of the identity too"
+        );
+    }
+
+    #[test]
+    fn the_liveness_probe_carries_a_bound_and_a_timeout_is_not_an_answer() {
+        use ferrum_edge::identity::workload_api::listener::SOCKET_LIVENESS_PROBE_TIMEOUT;
+
+        // A local Unix connect either completes or fails at once; the deadline
+        // exists for the peer that does neither — one that is listening but has
+        // stopped draining its accept queue. Without a bound, that peer holds
+        // startup open indefinitely, which is neither of the two refusals the
+        // contract documents.
+        assert!(
+            SOCKET_LIVENESS_PROBE_TIMEOUT > std::time::Duration::ZERO
+                && SOCKET_LIVENESS_PROBE_TIMEOUT <= std::time::Duration::from_secs(10),
+            "the probe must be bounded, and briefly: a slow local connect is already evidence"
+        );
+        // Expiry is folded back through the ordinary classification rather than
+        // short-circuiting it, so it lands on the same fail-closed verdict as
+        // every other answer the kernel did not give.
+        assert_eq!(
+            classify_connect_result(&Err(io::Error::from(io::ErrorKind::TimedOut))),
+            SocketLiveness::Undetermined
+        );
+    }
+}
+
+// ── Publication and the liveness probe against real sockets ───────────────
+//
+// The two startup steps that decide whether Ferrum may own the path workloads
+// dial for their identity. Both are exercised on a real filesystem here: the
+// pure predicates above say what the policy is, these say what the code does
+// with it.
+
+#[cfg(unix)]
+mod socket_publication {
+    use super::socket_boundary::Sandbox;
+    use ferrum_edge::identity::workload_api::listener::{
+        SocketLiveness, bind_and_publish_socket, probe_socket_liveness,
+    };
+    use std::os::unix::fs::MetadataExt;
+
+    fn entries(directory: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .expect("the parent directory is readable")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn publication_never_replaces_an_artifact_that_is_already_at_the_destination() {
+        // The race the publication step exists to lose safely. The liveness
+        // probe runs before the socket is even bound, so a peer can bind the
+        // path in between; `rename(2)` would have silently unlinked that live
+        // listener and taken over the endpoint workloads dial for their
+        // identity. The destination is created up front here, which is the same
+        // state that window produces and needs no timing to reach.
+        let Some(sandbox) = Sandbox::new("pub") else {
+            return;
+        };
+        let path = sandbox.root.join("api.sock");
+        let competitor = std::os::unix::net::UnixListener::bind(&path)
+            .expect("a competing process can bind the path first");
+        let before = std::fs::symlink_metadata(&path).expect("the competitor's socket exists");
+
+        let error = bind_and_publish_socket(&path, 0o660)
+            .expect_err("publication must refuse a destination that is already occupied");
+        assert!(
+            error.to_string().contains("another process"),
+            "unexpected refusal reason: {error}"
+        );
+
+        let after = std::fs::symlink_metadata(&path).expect("the competitor's socket survives");
+        assert_eq!(
+            (before.dev(), before.ino()),
+            (after.dev(), after.ino()),
+            "a refused publication must never replace the artifact it lost to"
+        );
+        std::os::unix::net::UnixStream::connect(&path)
+            .expect("the competing listener is still serving on its own socket");
+        assert_eq!(
+            entries(&sandbox.root),
+            vec!["api.sock".to_string()],
+            "a refused publication must leave nothing of ours behind, staging included"
+        );
+
+        drop(competitor);
+    }
+
+    #[tokio::test]
+    async fn a_published_socket_is_the_staged_inode_and_reachable_through_its_new_name() {
+        // The other half: refusing to clobber must not have cost publication its
+        // meaning. The listener is bound in staging and never rebound, so this
+        // pins that the published NAME reaches that same listener — a Unix
+        // socket is resolved to its inode, which is what makes linking a valid
+        // publication rather than a copy.
+        let Some(sandbox) = Sandbox::new("ok") else {
+            return;
+        };
+        let path = sandbox.root.join("api.sock");
+        let (listener, identity) =
+            bind_and_publish_socket(&path, 0o660).expect("an empty destination is published");
+
+        let metadata = std::fs::symlink_metadata(&path).expect("the published socket exists");
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            identity,
+            "the published name is the inode that was bound and permissioned in staging"
+        );
+        assert_eq!(
+            metadata.mode() & 0o777,
+            0o660,
+            "the configured mode survives"
+        );
+        assert_eq!(
+            metadata.nlink(),
+            1,
+            "only the published name survives; the staging alias is unlinked"
+        );
+        assert_eq!(
+            entries(&sandbox.root),
+            vec!["api.sock".to_string()],
+            "publication leaves no staging directory behind"
+        );
+
+        let client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("the published name reaches the listener bound in staging");
+        listener
+            .accept()
+            .await
+            .expect("the listener accepts a connection made through the published name");
+        drop(client);
+        drop(listener);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn the_probe_reads_live_leftover_and_missing_sockets_correctly() {
+        let Some(sandbox) = Sandbox::new("probe") else {
+            return;
+        };
+
+        let path = sandbox.root.join("live.sock");
+        let live = tokio::net::UnixListener::bind(&path).expect("bind a live listener");
+        assert_eq!(
+            probe_socket_liveness(&path).await,
+            SocketLiveness::Live,
+            "a listener that is serving must be seen as live and never unlinked"
+        );
+
+        // Closing the listener leaves the name on disk with nothing bound to it:
+        // exactly what a crashed predecessor leaves behind, and the only shape
+        // that admits an unlink.
+        drop(live);
+        assert!(path.exists(), "the leftover socket file remains on disk");
+        assert_eq!(
+            probe_socket_liveness(&path).await,
+            SocketLiveness::NotListening
+        );
+
+        assert_eq!(
+            probe_socket_liveness(&sandbox.root.join("missing.sock")).await,
+            SocketLiveness::NotListening
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_socket_we_cannot_reach_is_undetermined_rather_than_stale() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // "Ambiguous fails closed", against a real socket rather than a
+        // synthesized error kind. A live listener whose file denies us write
+        // permission answers `connect(2)` with `EACCES`, and that is not
+        // evidence that nobody is there — reading it as stale would unlink a
+        // serving endpoint. Root bypasses the permission check, so there is
+        // nothing to observe as that user.
+        //
+        // SAFETY: `geteuid` is a pure read of this process's credentials.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let Some(sandbox) = Sandbox::new("eacces") else {
+            return;
+        };
+        let path = sandbox.root.join("closed.sock");
+        let live = tokio::net::UnixListener::bind(&path).expect("bind a live listener");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("test can chmod a socket it owns");
+
+        assert_eq!(
+            probe_socket_liveness(&path).await,
+            SocketLiveness::Undetermined,
+            "an unreachable socket is an answer we did not get, not an absent listener"
+        );
+
+        drop(live);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_listener_publishes_and_probes_without_the_primitives_that_caused_this() {
+        // Two structural regressions this module cannot observe behaviourally,
+        // both of which reintroduce a silent failure rather than a visible one:
+        // an overwrite-capable `rename` as the publication step, and a blocking
+        // `connect(2)` issued from the async startup path.
+        let listener = include_str!("../../../src/identity/workload_api/listener.rs");
+        assert!(
+            !listener.contains("fs::rename"),
+            "publication must not go back to an overwrite-capable rename"
+        );
+        assert!(
+            listener.contains("fs::hard_link"),
+            "publication must use a primitive that fails when the destination exists"
+        );
+        assert!(
+            !listener.contains("std::os::unix::net::UnixStream::connect"),
+            "the liveness probe must not block the startup runtime on a peer that never answers"
+        );
+        assert!(
+            listener.contains("tokio::net::UnixStream::connect")
+                && listener.contains("tokio::time::timeout("),
+            "the liveness probe must stay asynchronous and bounded"
+        );
+    }
 }

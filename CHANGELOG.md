@@ -24,16 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by port number, so it retains healthy sibling claims and sibling listeners
   sharing a port cannot suppress or TLS-taint one another. A numeric port
   claimed by physically incompatible listener shapes — plaintext vs an
-  effective TLS-serving namespace slot, or effective TLS serving slots from
-  more than one Gateway namespace that resolve to different credentials — is
+  effective TLS-serving claim, or complete TLS certificate sets from more than
+  one Gateway namespace that disagree on the physical socket — is
   refused at admission on every conflicting side,
   reported on the Gateway's `status.listeners[]` as `Conflicted=True` /
   `Accepted=False` (`PortUnavailable`) / `Programmed=False`. Differing raw
   `certificateRefs` alone are not a conflict: Gateway API v1.5.1 excludes the
   `tls` field from listener distinctness, so same-port HTTPS siblings with
-  disjoint hostnames stay Accepted and Ferrum's shared one-serving-slot-per-
-  namespace plan keeps the non-winning listener's routes unmaterialized without
-  manufacturing a cross-namespace conflict. Same-kind route merging keys on the
+  disjoint hostnames stay Accepted and each retains its listener-owned SNI
+  certificate set. Same-kind route merging keys on the
   exact admitting listener, so two Gateways sharing a port never have their
   dispatch rules combined, and a host+path claimed by two different listeners on
   one port is refused on both sides — in Route status as well as in the data

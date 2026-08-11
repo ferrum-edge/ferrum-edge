@@ -434,6 +434,75 @@ pub fn any_supported_signing_key(
     rustls::crypto::aws_lc_rs::sign::any_supported_type(der)
 }
 
+/// Outcome of [`ec_point_on_named_curve`].
+///
+/// Three states rather than a `bool`, because "the check could not run" must
+/// never collapse into "the point is fine": the caller is admitting trust
+/// material, so an unavailable check is a failure, not an acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EcPointCheck {
+    /// The selected backend accepted the point as a valid, non-identity point
+    /// on the named curve.
+    OnCurve,
+    /// The selected backend refused the point.
+    Invalid,
+    /// The check itself could not be performed (ephemeral key generation
+    /// failed). Treat as a failure.
+    Unavailable,
+}
+
+/// Prove an uncompressed SEC1 point is a valid, non-identity point on
+/// `algorithm`'s named curve, using the **selected backend's own** peer-public-key
+/// validation.
+///
+/// Implemented as a bounded ephemeral ECDH agreement whose shared secret is
+/// discarded: both backends validate the peer public key (SEC1 §3.2.2) as part
+/// of accepting it, and neither exposes that validation on its own. Routing it
+/// here rather than reimplementing curve arithmetic is the point — a second,
+/// unrouted elliptic implementation on a trust-admission path is exactly what
+/// this module exists to prevent.
+///
+/// The two backends' `agree_ephemeral` signatures diverge (`ring` 0.17 takes the
+/// peer key by reference with an infallible KDF; `aws-lc-rs` takes it by value
+/// with an explicit error value and a fallible KDF), so the divergence is
+/// absorbed **at the seam**, as every other provider difference in this module
+/// is, rather than being cfg-split at the call site.
+#[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
+pub fn ec_point_on_named_curve(
+    algorithm: &'static backend::agreement::Algorithm,
+    point: &[u8],
+) -> EcPointCheck {
+    let rng = backend::rand::SystemRandom::new();
+    let Ok(private) = backend::agreement::EphemeralPrivateKey::generate(algorithm, &rng) else {
+        return EcPointCheck::Unavailable;
+    };
+    let peer = backend::agreement::UnparsedPublicKey::new(algorithm, point);
+    match backend::agreement::agree_ephemeral(private, &peer, |_shared_secret| ()) {
+        Ok(()) => EcPointCheck::OnCurve,
+        Err(_) => EcPointCheck::Invalid,
+    }
+}
+
+/// Prove an uncompressed SEC1 point lies on `algorithm`'s named curve. See the
+/// `crypto-ring` arm for the rationale; on a FIPS build the validation is
+/// performed by the selected AWS-LC FIPS module.
+#[cfg(feature = "fips")]
+pub fn ec_point_on_named_curve(
+    algorithm: &'static backend::agreement::Algorithm,
+    point: &[u8],
+) -> EcPointCheck {
+    let rng = backend::rand::SystemRandom::new();
+    let Ok(private) = backend::agreement::EphemeralPrivateKey::generate(algorithm, &rng) else {
+        return EcPointCheck::Unavailable;
+    };
+    let peer = backend::agreement::UnparsedPublicKey::new(algorithm, point);
+    match backend::agreement::agree_ephemeral(private, peer, (), |_shared_secret| Ok::<(), ()>(()))
+    {
+        Ok(()) => EcPointCheck::OnCurve,
+        Err(()) => EcPointCheck::Invalid,
+    }
+}
+
 /// TLS 1.2 session-ticket encrypter/decrypter from the selected provider.
 #[cfg(all(feature = "crypto-ring", not(feature = "fips")))]
 pub fn ticketer() -> Result<std::sync::Arc<dyn rustls::server::ProducesTickets>, rustls::Error> {

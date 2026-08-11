@@ -40,6 +40,7 @@ Current mesh HBONE/DNS perf status lives in
 | Native SMTP/email notification channel | Implemented — [#3329](https://github.com/ferrum-edge/ferrum-edge/issues/3329) (`src/notifications/channels/email.rs`) |
 | MongoDB replica-set change-stream wakeups | Implemented — [#3330](https://github.com/ferrum-edge/ferrum-edge/issues/3330) (`src/config/config_change_watch.rs` + `mongo_store.rs`) |
 | Multicluster poller partition / last-good live gate | Implemented — [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331) (`.github/workflows/multicluster-poller-partition-live.yml`) |
+| SPIFFE Workload API JWT-SVID mint/validate/bundles | Implemented by [#3675](https://github.com/ferrum-edge/ferrum-edge/pull/3675), resolving [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617); empty bundle success removed and the SPIRE serving boundary documented |
 | EgressGateway UDP `ServiceEntry` materialization | Implemented — [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) (external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT; no UDP/DTLS listener, by design) |
 
 ## Live dedicated trackers (current backlog)
@@ -52,7 +53,6 @@ Current mesh HBONE/DNS perf status lives in
 | Live OIDC / OAuth2 introspection coverage | [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333) | |
 | NodeWaypoint observability + promotion gates | [#3334](https://github.com/ferrum-edge/ferrum-edge/issues/3334) | |
 | Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Replaces #3335 as the sole tracker |
-| SPIFFE Workload API JWT-SVID mint/validate | [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617) | X.509-SVID path complete; JWT RPCs (`FetchJWTSVID` / `FetchJWTBundles` / `ValidateJWTSVID`) return `UNIMPLEMENTED` fail-closed — empty JWT bundle streams are not conformant |
 | Mesh/SPIRE CA-health signal + startup contract | [#3608](https://github.com/ferrum-edge/ferrum-edge/issues/3608) | |
 | CNI ferrum-cni chaining uninstall/rollback | [#3609](https://github.com/ferrum-edge/ferrum-edge/issues/3609) | |
 | Cross-region CP failover topology | [#3610](https://github.com/ferrum-edge/ferrum-edge/issues/3610) | |
@@ -81,7 +81,6 @@ Current mesh HBONE/DNS perf status lives in
 
 | Item | Notes |
 |---|---|
-| SPIFFE Workload API JWT-SVID mint/validate | X.509-SVID path complete; JWT-SVID live tracker [#3617](https://github.com/ferrum-edge/ferrum-edge/issues/3617) |
 | Admin CRUD refactor (retired `REFACTORING_PLAN.md` remainder) | Discretionary; fold into future admin-surface work |
 
 ## Explicit non-goals (unchanged)

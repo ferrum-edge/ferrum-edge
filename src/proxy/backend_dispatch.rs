@@ -215,6 +215,24 @@ pub(crate) fn direct_http_mesh_transport_refusal(
     }
 }
 
+/// Whether a network-only HTTP dispatch surface must refuse this target.
+///
+/// HTTP/3's native, cross-protocol, and WebSocket backend paths can dial only
+/// network transports. In addition to the secured mesh transports screened by
+/// [`direct_http_mesh_transport_refusal`], they must therefore refuse a
+/// `mesh.unix_socket` target rather than dialing its schema-only loopback
+/// placeholder. Keep this helper scoped to those network-only surfaces: the
+/// H1/H2 proxy has a real Unix-stream dispatch path and must not reject it.
+pub(crate) fn direct_network_http_transport_refusal(
+    target: Option<&UpstreamTarget>,
+) -> Option<&'static str> {
+    direct_http_mesh_transport_refusal(target).or_else(|| {
+        target
+            .is_some_and(crate::proxy::unix_backend::target_is_unix_backend)
+            .then_some("Unix socket dispatch required for this backend target")
+    })
+}
+
 /// Select an upstream target for the given proxy using load balancing with
 /// health-aware filtering.
 ///
@@ -1604,6 +1622,23 @@ mod tests {
                 (crate::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG, "true",),
             ]))),
             Some("cross-cluster mesh transport dispatch required for this backend target")
+        );
+    }
+
+    #[test]
+    fn direct_network_http_transport_refusal_rejects_unix_targets() {
+        let unix = target_with_tags(&[(
+            crate::proxy::unix_backend::MESH_UNIX_SOCKET_TAG,
+            "/run/ferrum/app.sock",
+        )]);
+        assert_eq!(
+            direct_http_mesh_transport_refusal(Some(&unix)),
+            None,
+            "the H1/H2 mesh-only guard must leave Unix dispatch to its real socket path"
+        );
+        assert_eq!(
+            direct_network_http_transport_refusal(Some(&unix)),
+            Some("Unix socket dispatch required for this backend target")
         );
     }
 

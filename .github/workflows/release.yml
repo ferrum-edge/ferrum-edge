@@ -749,6 +749,7 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          target: runtime-ebpf
           platforms: ${{ matrix.platform }}
           build-args: |
             FEATURES=cloud-secrets,ebpf

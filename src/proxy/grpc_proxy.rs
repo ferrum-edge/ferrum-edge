@@ -31,14 +31,12 @@ use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
@@ -62,202 +60,6 @@ use crate::tls::backend::{
     append_pool_key_component, backend_svid_generation_for_client_cert,
 };
 use crate::util::body_limit::is_length_limit_error;
-
-/// Observes the first server frame without interfering with hyper's parser.
-/// HTTP/2 requires a structurally valid initial SETTINGS frame, so completing
-/// one and giving Hyper a final validation poll proves the peer preface even
-/// when MAX_CONCURRENT_STREAMS is zero.
-///
-/// Generic over the byte transport: the direct-dial gRPC pool wraps a
-/// [`TcpStream`], and the Ambient HBONE gRPC transport wraps the CONNECT byte
-/// tunnel it runs its NESTED cleartext HTTP/2 connection over (issue #3284).
-/// Both need the same proof for the same reason — cleartext HTTP/2 has no ALPN,
-/// so a peer that merely accepted the connection must not be mistaken for an
-/// HTTP/2 server.
-struct H2cSettingsIo<T> {
-    inner: T,
-    settings_received: Arc<AtomicBool>,
-    first_frame_header: [u8; 9],
-    header_len: usize,
-    frame_remaining: Option<usize>,
-}
-
-impl<T> H2cSettingsIo<T> {
-    fn new(inner: T, settings_received: Arc<AtomicBool>) -> Self {
-        Self {
-            inner,
-            settings_received,
-            first_frame_header: [0; 9],
-            header_len: 0,
-            frame_remaining: None,
-        }
-    }
-
-    fn observe(&mut self, mut bytes: &[u8]) {
-        if self.settings_received.load(Ordering::Relaxed) {
-            return;
-        }
-        if self.header_len < self.first_frame_header.len() {
-            let copied = bytes
-                .len()
-                .min(self.first_frame_header.len() - self.header_len);
-            self.first_frame_header[self.header_len..self.header_len + copied]
-                .copy_from_slice(&bytes[..copied]);
-            self.header_len += copied;
-            bytes = &bytes[copied..];
-            if self.header_len == self.first_frame_header.len() {
-                let payload_len = (usize::from(self.first_frame_header[0]) << 16)
-                    | (usize::from(self.first_frame_header[1]) << 8)
-                    | usize::from(self.first_frame_header[2]);
-                self.frame_remaining = Some(payload_len);
-            }
-        }
-        if let Some(remaining) = self.frame_remaining.as_mut() {
-            *remaining = remaining.saturating_sub(bytes.len());
-            if *remaining == 0 && self.initial_settings_header_is_well_formed() {
-                self.settings_received.store(true, Ordering::Release);
-            }
-        }
-    }
-
-    /// Validate the peer's initial SETTINGS frame header before treating the
-    /// raw frame as establishment proof. Hyper remains the authoritative frame
-    /// parser; these checks prevent a complete but obviously invalid SETTINGS
-    /// frame from winning the readiness race before Hyper surfaces its protocol
-    /// error.
-    fn initial_settings_header_is_well_formed(&self) -> bool {
-        const DEFAULT_MAX_FRAME_SIZE: usize = 16_384;
-
-        let payload_len = (usize::from(self.first_frame_header[0]) << 16)
-            | (usize::from(self.first_frame_header[1]) << 8)
-            | usize::from(self.first_frame_header[2]);
-        let stream_id = u32::from_be_bytes([
-            self.first_frame_header[5],
-            self.first_frame_header[6],
-            self.first_frame_header[7],
-            self.first_frame_header[8],
-        ]) & 0x7fff_ffff;
-
-        self.first_frame_header[3] == 0x4
-            && self.first_frame_header[4] & 0x1 == 0
-            && stream_id == 0
-            && payload_len <= DEFAULT_MAX_FRAME_SIZE
-            && payload_len % 6 == 0
-    }
-}
-
-impl<T: AsyncRead + Unpin> AsyncRead for H2cSettingsIo<T> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let filled_before = buf.filled().len();
-        match Pin::new(&mut self.inner).poll_read(cx, buf) {
-            Poll::Ready(Ok(())) => {
-                self.observe(&buf.filled()[filled_before..]);
-                Poll::Ready(Ok(()))
-            }
-            result => result,
-        }
-    }
-}
-
-impl<T: AsyncWrite + Unpin> AsyncWrite for H2cSettingsIo<T> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-}
-
-/// Wait for positive proof that an h2c peer completed the HTTP/2 preface.
-///
-/// Unlike TLS-backed H2, h2c has no ALPN proof, so a peer that merely accepts
-/// the connection must not be treated as an HTTP/2 server. `handshake()`
-/// resolves once the *client* preface is written; readiness is the peer's
-/// complete, structurally valid initial SETTINGS frame having been observed by
-/// the transport and accepted by a subsequent Hyper connection poll.
-///
-/// `conn` is hyper's connection-driver future. Polling it drives the peer's
-/// preface and SETTINGS processing and surfaces a protocol error or close, but
-/// the future does not resolve merely because SETTINGS arrived. The short
-/// timeout therefore supplies a bounded recheck cadence for the transport
-/// observation flag while also continuing to drive the connection.
-///
-/// There is no timeout here by design; every caller already runs inside a
-/// connect budget: the direct-dial pool inside `dns::connect_candidates`
-/// (whose per-candidate share of `backend_connect_timeout_ms` moves on to the
-/// next address), and the Ambient HBONE gRPC transport inside the whole-
-/// acquisition deadline `GrpcDispatchTransport::get_sender` applies.
-async fn await_h2c_peer_settings<T>(
-    conn: &mut http2::Connection<TokioIo<H2cSettingsIo<T>>, GrpcBody, TokioExecutor>,
-    settings_received: &AtomicBool,
-) -> Result<(), String>
-where
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    // First re-read delay; the common case resolves on the first or second
-    // pass over a loopback or same-datacenter RTT.
-    const FIRST_RECHECK: Duration = Duration::from_millis(1);
-    // Ceiling for the doubling backoff, so a peer that accepts the connection
-    // and then stalls costs a bounded number of timer wakeups per candidate.
-    const MAX_RECHECK: Duration = Duration::from_millis(20);
-
-    let mut recheck = FIRST_RECHECK;
-    loop {
-        if settings_received.load(Ordering::Acquire) {
-            // The transport observer fires while Hyper is consuming the read.
-            // Poll the connection once more before accepting the peer so a
-            // protocol error discovered from that same frame wins over the raw
-            // readiness flag instead of leaving an invalid sender cached and
-            // suppressing DNS-candidate failover.
-            let post_observation = std::future::poll_fn(|cx| {
-                Poll::Ready(match Pin::new(&mut *conn).poll(cx) {
-                    Poll::Ready(Ok(())) => {
-                        Some(Err("h2c connection closed after peer SETTINGS".to_string()))
-                    }
-                    Poll::Ready(Err(error)) => Some(Err(format!("h2c handshake failed: {error}"))),
-                    Poll::Pending => None,
-                })
-            })
-            .await;
-            if let Some(result) = post_observation {
-                return result;
-            }
-            return Ok(());
-        }
-        match tokio::time::timeout(recheck, &mut *conn).await {
-            Ok(Ok(())) => {
-                return Err("h2c connection closed before peer SETTINGS".to_string());
-            }
-            Ok(Err(error)) => return Err(format!("h2c handshake failed: {error}")),
-            Err(_elapsed) => recheck = (recheck * 2).min(MAX_RECHECK),
-        }
-    }
-}
 
 /// Canonical terminal message for a gateway-owned client RPC deadline.
 ///
@@ -1311,6 +1113,14 @@ impl GrpcPoolManager {
     }
 
     /// Create an h2c (cleartext HTTP/2) connection using prior knowledge.
+    ///
+    /// Unlike TLS-backed H2, h2c has no ALPN proof, so a peer that merely
+    /// accepts TCP must not pin this pool to its DNS address. `handshake()`
+    /// resolves once the *client* preface is written; establishment is the
+    /// peer's own initial SETTINGS frame, observed by
+    /// `h2c_preface::await_peer_settings`. That wait is bounded by the
+    /// per-candidate share of `backend_connect_timeout_ms` that
+    /// `dns::connect_candidates` already enforces around this call.
     async fn create_h2c_connection(
         &self,
         tcp: TcpStream,
@@ -1318,7 +1128,10 @@ impl GrpcPoolManager {
         conn_slot: Option<SharedBackendConnectionGuard>,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let settings_received = Arc::new(AtomicBool::new(false));
-        let io = TokioIo::new(H2cSettingsIo::new(tcp, Arc::clone(&settings_received)));
+        let io = TokioIo::new(crate::proxy::h2c_preface::H2cPrefaceIo::new(
+            tcp,
+            Arc::clone(&settings_received),
+        ));
         let builder = Self::build_h2_builder(pool_config);
 
         let (sender, mut conn) = builder.handshake(io).await.map_err(|e| {
@@ -1329,7 +1142,10 @@ impl GrpcPoolManager {
             )
         })?;
 
-        if let Err(message) = await_h2c_peer_settings(&mut conn, &settings_received).await {
+        let established =
+            crate::proxy::h2c_preface::await_peer_settings(&mut conn, &settings_received).await;
+        if let Err(failure) = established {
+            let message = failure.to_string();
             return Err(GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2cHandshake,
                 message.clone(),
@@ -2578,6 +2394,23 @@ pub enum GrpcMeshDispatch {
     /// frontend path (like `MeshMtls`); [`GrpcDispatchTransport`] surfaces ride
     /// the same pool directly (issue #3284).
     MeshMtlsCrossCluster,
+    /// A Sidecar `ingress[]` **Unix-socket** backend whose listener declared an
+    /// h2c protocol (`http2` / `https` / `grpc`): dispatch through the generic
+    /// HTTP-family path, whose Unix branch reuses `proxy_to_backend_mesh_mtls`
+    /// over an h2c `UnixStream` — hyper h2 end-to-end, so gRPC request/response
+    /// streaming, deadlines, cancellation, and trailers ride it natively, the
+    /// same way [`MeshMtls`](Self::MeshMtls) does over TLS (issue #3261). Falls
+    /// through only on the H1/H2 frontend path; the H3 bridge and the direct
+    /// gRPC retry loop have no Unix transport and fail closed.
+    UnixSocketH2c,
+    /// A Sidecar `ingress[]` Unix-socket backend whose listener declared plain
+    /// **`http`**, i.e. HTTP/1.1 on the socket: refuse. gRPC requires HTTP/2
+    /// trailers, and downgrading it onto an HTTP/1.1 socket would silently
+    /// corrupt the RPC — the same reason the generic HTTP-family mesh path
+    /// cannot carry native gRPC over the HBONE byte tunnel's HTTP/1.1 inner
+    /// client (see [`Hbone`](Self::Hbone)). Refused rather than dialed, and
+    /// never downgraded to the target's placeholder `host:port`.
+    RefuseUnixSocketHttp1,
     /// CROSS-CLUSTER Ambient `mesh.hbone` east-west target: dispatch through the
     /// nested-HTTP/2 HBONE transport, exactly like [`Hbone`](Self::Hbone), over
     /// the cross-cluster dial (remote east-west gateway + destination-FQDN SNI
@@ -2674,6 +2507,17 @@ pub fn classify_grpc_mesh_dispatch(
     if mesh_mtls {
         return GrpcMeshDispatch::MeshMtls;
     }
+    // A Unix-socket backend is checked LAST because it is a strictly local
+    // transport that never carries a cross-cluster or peer-identity tag; a
+    // target carrying BOTH a mesh transport tag and the Unix tag is corrupted
+    // and resolves to the stricter mesh transport above, never to the socket.
+    if crate::proxy::unix_backend::target_is_unix_backend(target) {
+        return if crate::proxy::unix_backend::target_unix_backend_is_h2c(target) {
+            GrpcMeshDispatch::UnixSocketH2c
+        } else {
+            GrpcMeshDispatch::RefuseUnixSocketHttp1
+        };
+    }
     GrpcMeshDispatch::Direct
 }
 
@@ -2709,6 +2553,11 @@ pub fn classify_grpc_mesh_dispatch(
 /// * `RefuseCrossClusterNoTransport` never falls through because the target
 ///   is malformed: there is no HBONE or mesh-mTLS transport for the HTTP path
 ///   to use.
+/// * `UnixSocketH2c` ALWAYS falls through, for every gRPC flavor: the generic
+///   path's Unix branch IS the h2c dispatch (issue #3261).
+/// * `RefuseUnixSocketHttp1` falls through on the same pass-through-gRPC-Web
+///   terms as the HBONE classes — the socket speaks HTTP/1.1, so ordinary HTTP
+///   rides it and native / translated gRPC is refused in-branch.
 pub fn grpc_mesh_dispatch_falls_through(
     dispatch: GrpcMeshDispatch,
     request_uses_grpc_content_type: bool,
@@ -2717,9 +2566,22 @@ pub fn grpc_mesh_dispatch_falls_through(
     match dispatch {
         GrpcMeshDispatch::Direct => false,
         GrpcMeshDispatch::MeshMtls | GrpcMeshDispatch::MeshMtlsCrossCluster => true,
+        // The generic path's Unix branch IS the h2c dispatch, so it must be
+        // reached for every gRPC flavor — including wire-native
+        // `application/grpc` and plugin-translated gRPC-Web, whose responses
+        // both need the streaming trailer channel only that branch provides.
+        GrpcMeshDispatch::UnixSocketH2c => true,
         GrpcMeshDispatch::RefuseCrossClusterNoTransport
         | GrpcMeshDispatch::RefuseCrossClusterMalformed => false,
-        GrpcMeshDispatch::HboneCrossCluster | GrpcMeshDispatch::Hbone => {
+        // Pass-through gRPC-Web only. For HBONE that is because the generic
+        // HTTP-family path runs an HTTP/1.1 client inside the byte tunnel; for
+        // an HTTP/1.1 Unix socket it is because the socket itself speaks
+        // HTTP/1.1. Either way a non-gRPC-content-type request is ordinary HTTP
+        // and rides the generic path, while a genuine gRPC request must NOT and
+        // is refused by the caller instead.
+        GrpcMeshDispatch::HboneCrossCluster
+        | GrpcMeshDispatch::Hbone
+        | GrpcMeshDispatch::RefuseUnixSocketHttp1 => {
             !request_uses_grpc_content_type && !grpc_web_translated
         }
     }
@@ -2800,6 +2662,16 @@ const CROSS_CLUSTER_MALFORMED_METADATA: &str = "gRPC over cross-cluster east-wes
 const CROSS_CLUSTER_MISSING_TRANSPORT: &str =
     "gRPC over cross-cluster east-west routing requires a mesh transport tag";
 
+/// Client-visible refusal for a Sidecar `ingress[]` Unix-socket target (issue
+/// #3261). [`GrpcDispatchTransport`] materializes network transports only, and
+/// a Unix target's `host:port` is a schema-only loopback placeholder — so BOTH
+/// Unix classes fail closed here rather than dialing something else. The h2c
+/// Unix transport is reachable only through the generic HTTP-family path on the
+/// H1/H2 frontend; mesh capture is TCP-only, so an H3 frontend cannot reach a
+/// Sidecar ingress listener in practice. Names no socket path.
+const UNIX_SOCKET_TRANSPORT_UNSUPPORTED: &str =
+    "gRPC over a unix-socket backend is not supported on this dispatch path";
+
 /// Redacted, field-shaped diagnostic for a gRPC transport materialization
 /// refusal (issue #3284). Identifies WHICH mesh tag / contract failed without
 /// echoing any tag value, SPIFFE ID, SNI name, trust domain, dial address,
@@ -2822,6 +2694,10 @@ pub enum GrpcTransportDiagnostic {
     ConflictingMeshTransports,
     /// `mesh.cross_cluster` without any mesh transport tag.
     CrossClusterMissingTransport,
+    /// `mesh.unix_socket`: the target names a Unix-domain socket, which this
+    /// dispatch surface has no transport for (issue #3261). The tag NAME only —
+    /// the configured socket path is never part of a diagnostic.
+    MeshUnixSocket,
 }
 
 impl GrpcTransportDiagnostic {
@@ -2836,6 +2712,7 @@ impl GrpcTransportDiagnostic {
             Self::MeshTrustDomain => "mesh.trust_domain",
             Self::ConflictingMeshTransports => "conflicting_mesh_transports",
             Self::CrossClusterMissingTransport => "cross_cluster_missing_transport",
+            Self::MeshUnixSocket => crate::proxy::unix_backend::MESH_UNIX_SOCKET_TAG,
         }
     }
 }
@@ -3019,6 +2896,20 @@ impl<'a> GrpcDispatchTransport<'a> {
                 Err(GrpcTransportError::Unsupported {
                     message: CROSS_CLUSTER_MISSING_TRANSPORT,
                     diagnostic: GrpcTransportDiagnostic::CrossClusterMissingTransport,
+                })
+            }
+            // Both Unix classes fail closed (issue #3261). This enum models
+            // NETWORK transports; a Unix target's `host:port` is a schema-only
+            // loopback placeholder, so falling back to `Self::Direct` would dial
+            // an unrelated listener instead of the socket — the exact
+            // placeholder-TCP fallback the Unix ingress work forbids. The
+            // supported h2c Unix dispatch lives on the generic HTTP-family path
+            // (`GrpcMeshDispatch::UnixSocketH2c` falls through there), which
+            // never routes through this resolver.
+            GrpcMeshDispatch::UnixSocketH2c | GrpcMeshDispatch::RefuseUnixSocketHttp1 => {
+                Err(GrpcTransportError::Unsupported {
+                    message: UNIX_SOCKET_TRANSPORT_UNSUPPORTED,
+                    diagnostic: GrpcTransportDiagnostic::MeshUnixSocket,
                 })
             }
         }
@@ -3227,12 +3118,13 @@ fn hbone_dispatch_authority<'a>(
 /// already carries the pool's keepalive.
 ///
 /// The inner connection is admitted only once the destination app's OWN HTTP/2
-/// connection preface has been observed ([`await_h2c_peer_settings`], shared
-/// with the direct-dial h2c pool). hyper's handshake resolves as soon as the
-/// CLIENT preface is written, and the outer CONNECT only proves the relay
-/// reached the app socket — so without that gate an app that is not an HTTP/2
-/// server would be misreported as an established sender and an app that answers
-/// nothing would stall the RPC outside the connect budget.
+/// connection preface has been observed (`h2c_preface::await_peer_settings`,
+/// shared with the direct-dial h2c pool and the Unix h2c transport). hyper's
+/// handshake resolves as soon as the CLIENT preface is written, and the outer
+/// CONNECT only proves the relay reached the app socket — so without that gate
+/// an app that is not an HTTP/2 server would be misreported as an established
+/// sender and an app that answers nothing would stall the RPC outside the
+/// connect budget.
 ///
 /// The asserted source identity is left `None`, which makes the CONNECT baggage
 /// carry this gateway's own SVID — the ambient-egress default. A gRPC request
@@ -3280,7 +3172,10 @@ async fn open_hbone_grpc_sender(
     // usable, so a non-HTTP/2 app is an `H2cHandshake` failure and a silent one
     // is bounded by the caller's connect deadline instead of stalling the RPC.
     let settings_received = Arc::new(AtomicBool::new(false));
-    let io = TokioIo::new(H2cSettingsIo::new(tunnel, Arc::clone(&settings_received)));
+    let io = TokioIo::new(crate::proxy::h2c_preface::H2cPrefaceIo::new(
+        tunnel,
+        Arc::clone(&settings_received),
+    ));
     let (sender, mut connection) = builder.handshake(io).await.map_err(|error| {
         let message =
             format!("nested HTTP/2 gRPC handshake inside the HBONE tunnel failed: {error}");
@@ -3295,9 +3190,11 @@ async fn open_hbone_grpc_sender(
         )
     })?;
 
-    if let Err(message) = await_h2c_peer_settings(&mut connection, &settings_received).await {
+    let established =
+        crate::proxy::h2c_preface::await_peer_settings(&mut connection, &settings_received).await;
+    if let Err(failure) = established {
         let message =
-            format!("nested HTTP/2 gRPC handshake inside the HBONE tunnel failed: {message}");
+            format!("nested HTTP/2 gRPC handshake inside the HBONE tunnel failed: {failure}");
         return Err(GrpcProxyError::backend_unavailable_with_source(
             GrpcBackendUnavailableKind::H2cHandshake,
             message.clone(),

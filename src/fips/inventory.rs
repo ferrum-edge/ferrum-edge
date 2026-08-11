@@ -244,6 +244,18 @@ pub const INVENTORY: &[CryptoOperation] = &[
         rationale: "algorithms are screened against fips::policy::APPROVED_JWT_ALGORITHMS at \
                     config admission and the implementation is selected by the `fips` feature",
     },
+    CryptoOperation {
+        operation: "JWT-SVID authority EC public-key point validation (P-256 / P-384)",
+        location: "src/fips/mod.rs::ec_point_on_named_curve, called from \
+                   src/identity/jwt_svid/jwks.rs",
+        implementation: "crate::fips::backend agreement (ECDH P-256/P-384)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "curve membership is proven by a bounded ephemeral ECDH agreement at the \
+                    provider seam, whose peer-public-key acceptance performs the SEC1 point \
+                    validation; the shared secret is discarded, so the operation exists only to \
+                    admit or refuse an authority, and no second elliptic-curve implementation is \
+                    introduced outside the selected provider",
+    },
     // ── Hash / MAC / randomness ─────────────────────────────────────────
     CryptoOperation {
         operation: "HMAC-SHA256/512 request authentication",

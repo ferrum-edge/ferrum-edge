@@ -102,6 +102,10 @@ async fn internal_ca_signs_generate_request() {
         bundle_refresh_hint_secs: Some(60),
         default_svid_ttl_secs: 600,
         max_svid_ttl_secs: 3600,
+        jwt_signing_key_pem: None,
+        jwt_retired_key_pems: Vec::new(),
+        jwt_key_lifetime_secs: 0,
+        allow_ephemeral_jwt_key: true,
     };
     let ca = internal::InternalCa::new(cfg).expect("CA initialised");
 
@@ -137,6 +141,10 @@ async fn internal_ca_csr_svid_not_after_matches_leaf_cert() {
         bundle_refresh_hint_secs: Some(60),
         default_svid_ttl_secs: 600,
         max_svid_ttl_secs: 3600,
+        jwt_signing_key_pem: None,
+        jwt_retired_key_pems: Vec::new(),
+        jwt_key_lifetime_secs: 0,
+        allow_ephemeral_jwt_key: true,
     };
     let ca = internal::InternalCa::new(cfg).expect("CA initialised");
 
@@ -177,6 +185,10 @@ async fn internal_ca_rejects_csr_with_invalid_proof_of_possession() {
         bundle_refresh_hint_secs: Some(60),
         default_svid_ttl_secs: 600,
         max_svid_ttl_secs: 3600,
+        jwt_signing_key_pem: None,
+        jwt_retired_key_pems: Vec::new(),
+        jwt_key_lifetime_secs: 0,
+        allow_ephemeral_jwt_key: true,
     };
     let ca = internal::InternalCa::new(cfg).expect("CA initialised");
 
@@ -214,6 +226,10 @@ async fn internal_ca_rejects_csr_outside_trust_domain() {
         bundle_refresh_hint_secs: None,
         default_svid_ttl_secs: 600,
         max_svid_ttl_secs: 3600,
+        jwt_signing_key_pem: None,
+        jwt_retired_key_pems: Vec::new(),
+        jwt_key_lifetime_secs: 0,
+        allow_ephemeral_jwt_key: true,
     };
     let ca = internal::InternalCa::new(cfg).unwrap();
     let foreign = SpiffeId::new("spiffe://other.test/ns/test/sa/foo").unwrap();
@@ -237,6 +253,10 @@ async fn internal_ca_publishes_local_trust_bundle() {
         bundle_refresh_hint_secs: Some(120),
         default_svid_ttl_secs: 0,
         max_svid_ttl_secs: 0,
+        jwt_signing_key_pem: None,
+        jwt_retired_key_pems: Vec::new(),
+        jwt_key_lifetime_secs: 0,
+        allow_ephemeral_jwt_key: true,
     };
     let ca = internal::InternalCa::new(cfg).unwrap();
     let bundle = ca.trust_bundle(&trust_domain).await.unwrap();
@@ -256,6 +276,10 @@ async fn internal_ca_rejects_unknown_trust_domain_for_bundle() {
         bundle_refresh_hint_secs: None,
         default_svid_ttl_secs: 600,
         max_svid_ttl_secs: 3600,
+        jwt_signing_key_pem: None,
+        jwt_retired_key_pems: Vec::new(),
+        jwt_key_lifetime_secs: 0,
+        allow_ephemeral_jwt_key: true,
     };
     let ca = internal::InternalCa::new(cfg).unwrap();
     let other = TrustDomain::new("other-trust-domain.test").unwrap();
@@ -282,6 +306,10 @@ fn internal_ca_rejects_mismatched_cert_and_key() {
         bundle_refresh_hint_secs: None,
         default_svid_ttl_secs: 600,
         max_svid_ttl_secs: 3600,
+        jwt_signing_key_pem: None,
+        jwt_retired_key_pems: Vec::new(),
+        jwt_key_lifetime_secs: 0,
+        allow_ephemeral_jwt_key: true,
     };
     let result = internal::InternalCa::new(cfg);
     match result {
@@ -320,6 +348,10 @@ fn internal_ca_rejects_multi_block_root_pem() {
         bundle_refresh_hint_secs: None,
         default_svid_ttl_secs: 600,
         max_svid_ttl_secs: 3600,
+        jwt_signing_key_pem: None,
+        jwt_retired_key_pems: Vec::new(),
+        jwt_key_lifetime_secs: 0,
+        allow_ephemeral_jwt_key: true,
     };
     let result = internal::InternalCa::new(cfg);
     match result {

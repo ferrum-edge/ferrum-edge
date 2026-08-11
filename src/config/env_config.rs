@@ -1482,6 +1482,37 @@ pub struct EnvConfig {
     /// SVID lifetime hint (seconds) passed to the CA backend. The CA may
     /// clamp or ignore this value.
     pub mesh_cert_ttl_seconds: u64,
+    /// Expose Ferrum's own in-process SPIFFE Workload API server on a Unix
+    /// domain socket so local workloads can fetch X.509-SVIDs and JWT-SVIDs
+    /// from it. Requires a CA backend that can mint for an attested workload
+    /// identity. A bind or socket-contract failure is fatal to startup.
+    pub mesh_workload_api_enabled: bool,
+    /// Absolute path of the Unix socket the Workload API server binds. The
+    /// parent directory must already exist and must not be world-writable
+    /// without the sticky bit.
+    pub mesh_workload_api_socket_path: String,
+    /// Octal permission bits applied to the Workload API socket. World-writable
+    /// values are refused.
+    pub mesh_workload_api_socket_mode: String,
+    /// Lifetime (seconds) of X.509-SVIDs the Workload API server mints for
+    /// attested workloads. The CA clamps this to its own ceiling.
+    pub mesh_workload_api_svid_ttl_seconds: u64,
+    /// Lifetime (seconds) of JWT-SVIDs the Workload API server mints. Clamped
+    /// down to the JWT-SVID ceiling; never raised.
+    pub mesh_jwt_svid_ttl_seconds: u64,
+    /// How long an **ephemeral** (dev/test) JWT signing key stays active before
+    /// the background rotation task replaces it. `0` — the default — disables
+    /// time-based JWT key rotation.
+    ///
+    /// Must be `0` whenever `FERRUM_MESH_JWT_SIGNING_KEY_PEM` is configured:
+    /// operator-configured material rotates externally, by rolling a new
+    /// primary with the outgoing key published for verification.
+    pub mesh_jwt_key_lifetime_seconds: u64,
+    /// Peer-credential attestation rules for the Workload API server, as
+    /// `uid:<uid>=<spiffe-id>` entries. A workload
+    /// that matches no rule is refused: the Workload API never assigns an
+    /// identity it was not told to assign.
+    pub mesh_workload_api_unix_identity_rules: Vec<String>,
     /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe;
     /// `xds` consumes the Ferrum-private ADS profile; `file` loads a localized
     /// mesh config document from `FERRUM_MESH_FILE_CONFIG_PATH` (no control
@@ -1508,6 +1539,24 @@ pub struct EnvConfig {
     /// (Gateway-managed waypoints often use `<gateway-name>` or
     /// `<gateway-name>-istio`) must set this to include their names.
     pub mesh_trusted_hbone_assertors: Vec<String>,
+    /// Directories under which an Istio `Sidecar` ingress `defaultEndpoint:
+    /// unix://…` socket may live (issue #3261). **No default: empty means the
+    /// feature is OFF and every `unix://` endpoint is refused.** There is
+    /// deliberately no built-in `/run` or `/var/run` allowance — a Sidecar is
+    /// operator-authored config, and an unconstrained path would let it point
+    /// the (often privileged) Ferrum process at any local socket, e.g.
+    /// `/var/run/docker.sock`. A root must be absolute, normalized, and not
+    /// bare `/`; the socket must be a STRICT descendant. Pure path syntax is
+    /// checked at translation; the data-plane-only containment policy is
+    /// enforced at materialization and again at dial (where symlink resolution
+    /// must land inside a root too) — see `crate::util::unix_socket`.
+    pub mesh_unix_socket_allowed_roots: Vec<String>,
+    /// Owner uids admitted for a Sidecar ingress Unix-socket backend. Empty
+    /// (the default) admits ONLY the Ferrum process's own effective uid, so a
+    /// root-owned system socket that happens to sit inside an allowed root is
+    /// still refused for a non-root Ferrum. Set this when the co-located
+    /// application runs as a different uid than the sidecar.
+    pub mesh_unix_socket_allowed_uids: Vec<u32>,
     /// Comma-separated W3C `baggage` key prefixes stripped from outbound
     /// requests at dispatch. Default empty: forward unchanged. Operators set
     /// this to keep mesh-internal identity claims (e.g. `source.`) from
@@ -2843,10 +2892,20 @@ impl Default for EnvConfig {
             mesh_ca_backend: "none".to_string(),
             mesh_spire_agent_socket: "/run/spire/sockets/agent.sock".to_string(),
             mesh_cert_ttl_seconds: 3600,
+            mesh_workload_api_enabled: false,
+            mesh_workload_api_socket_path:
+                crate::identity::workload_api::DEFAULT_FERRUM_WORKLOAD_API_SOCKET.to_string(),
+            mesh_workload_api_socket_mode: "0660".to_string(),
+            mesh_workload_api_svid_ttl_seconds: 3600,
+            mesh_jwt_svid_ttl_seconds: 300,
+            mesh_jwt_key_lifetime_seconds: 0,
+            mesh_workload_api_unix_identity_rules: Vec::new(),
             mesh_config_protocol: "native".to_string(),
             mesh_file_config_path: None,
             mesh_trust_domain_aliases: Vec::new(),
             mesh_trusted_hbone_assertors: Vec::new(),
+            mesh_unix_socket_allowed_roots: Vec::new(),
+            mesh_unix_socket_allowed_uids: Vec::new(),
             mesh_egress_strip_baggage_keys: Vec::new(),
             mesh_outbound_traffic_policy: "allow_any".to_string(),
             mesh_outbound_registry_reject_status: 502,
@@ -3360,10 +3419,19 @@ impl EnvConfig {
             mesh_ca_backend: String = "FERRUM_MESH_CA_BACKEND" => "none".to_string();
             mesh_spire_agent_socket: String = "FERRUM_MESH_SPIRE_AGENT_SOCKET" => "/run/spire/sockets/agent.sock".to_string();
             mesh_cert_ttl_seconds: u64 = "FERRUM_MESH_CERT_TTL_SECONDS" => 3600u64;
+            mesh_workload_api_enabled: bool = "FERRUM_MESH_WORKLOAD_API_ENABLED" => false;
+            mesh_workload_api_socket_path: String = "FERRUM_MESH_WORKLOAD_API_SOCKET_PATH" => crate::identity::workload_api::DEFAULT_FERRUM_WORKLOAD_API_SOCKET.to_string();
+            mesh_workload_api_socket_mode: String = "FERRUM_MESH_WORKLOAD_API_SOCKET_MODE" => "0660".to_string();
+            mesh_workload_api_svid_ttl_seconds: u64 = "FERRUM_MESH_WORKLOAD_API_SVID_TTL_SECONDS" => 3600u64;
+            mesh_jwt_svid_ttl_seconds: u64 = "FERRUM_MESH_JWT_SVID_TTL_SECONDS" => 300u64;
+            mesh_jwt_key_lifetime_seconds: u64 = "FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS" => 0u64;
+            mesh_workload_api_unix_identity_rules: Vec<String> = "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES" => Vec::new();
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             mesh_file_config_path: Option<String> = "FERRUM_MESH_FILE_CONFIG_PATH";
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
             mesh_trusted_hbone_assertors: Vec<String> = "FERRUM_MESH_TRUSTED_HBONE_ASSERTORS" => Vec::new();
+            mesh_unix_socket_allowed_roots: Vec<String> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS" => Vec::new();
+            mesh_unix_socket_allowed_uids: Vec<u32> = "FERRUM_MESH_UNIX_SOCKET_ALLOWED_UIDS" => Vec::new();
             mesh_egress_strip_baggage_keys: Vec<String> = "FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS" => Vec::new();
             mesh_outbound_traffic_policy: String = "FERRUM_MESH_OUTBOUND_TRAFFIC_POLICY" => "allow_any".to_string();
             mesh_outbound_registry_reject_status: u16 = "FERRUM_MESH_OUTBOUND_REGISTRY_REJECT_STATUS" => 502u16;
@@ -4108,10 +4176,19 @@ impl EnvConfig {
             mesh_ca_backend,
             mesh_spire_agent_socket,
             mesh_cert_ttl_seconds,
+            mesh_workload_api_enabled,
+            mesh_workload_api_socket_path,
+            mesh_workload_api_socket_mode,
+            mesh_workload_api_svid_ttl_seconds,
+            mesh_jwt_svid_ttl_seconds,
+            mesh_jwt_key_lifetime_seconds,
+            mesh_workload_api_unix_identity_rules,
             mesh_config_protocol,
             mesh_file_config_path,
             mesh_trust_domain_aliases,
             mesh_trusted_hbone_assertors,
+            mesh_unix_socket_allowed_roots,
+            mesh_unix_socket_allowed_uids,
             mesh_egress_strip_baggage_keys,
             mesh_outbound_traffic_policy,
             mesh_outbound_registry_reject_status,
@@ -5394,38 +5471,43 @@ impl EnvConfig {
                 // File-based SVID material is the explicit identity override.
                 // Blank paths were normalized to `None` at parse, so a presence
                 // check is exact.
+                let any_file_workload_identity = self.gateway_svid_cert_path.is_some()
+                    || self.gateway_svid_key_path.is_some()
+                    || self.gateway_svid_trust_bundle_path.is_some();
                 let has_file_workload_identity = self.gateway_svid_cert_path.is_some()
                     && self.gateway_svid_key_path.is_some()
                     && self.gateway_svid_trust_bundle_path.is_some();
-                if mesh_ca_backend != crate::identity::ca::CaBackend::None
+                // File SVIDs deliberately override the CA-backed runtime
+                // identity source, and therefore leave no issuer for this
+                // server. Refuse the combination before validating the
+                // otherwise-suppressed backend so partial and complete file
+                // tuples receive the same decisive diagnostic.
+                if self.mesh_workload_api_enabled && any_file_workload_identity {
+                    return Err(Self::WORKLOAD_API_FILE_SVID_UNSUPPORTED.to_string());
+                }
+                let workload_spiffe_id = if mesh_ca_backend != crate::identity::ca::CaBackend::None
                     && !has_file_workload_identity
                 {
                     let workload_spiffe_id = crate::config::conf_file::resolve_ferrum_var(
                         "FERRUM_MESH_WORKLOAD_SPIFFE_ID",
                     )
-                    .filter(|value| !value.trim().is_empty());
-                    match workload_spiffe_id {
-                        None => {
-                            return Err(
-                                "FERRUM_MESH_CA_BACKEND requires FERRUM_MESH_WORKLOAD_SPIFFE_ID so \
-                                 the issued runtime SVID matches the local mesh workload identity"
-                                    .into(),
-                            );
-                        }
-                        Some(id) => {
-                            // Parse it exactly like startup's
-                            // `configured_mesh_workload_spiffe_id` so `validate`
-                            // and mesh startup agree: a non-SPIFFE value (e.g.
-                            // `not-a-spiffe-id`) must fail here, not silently pass
-                            // settings validation then abort at boot.
-                            crate::identity::SpiffeId::new(id).map_err(|e| {
-                                format!(
-                                    "FERRUM_MESH_WORKLOAD_SPIFFE_ID must be a valid SPIFFE URI when \
-                                     FERRUM_MESH_CA_BACKEND is enabled: {e}"
-                                )
-                            })?;
-                        }
-                    }
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        "FERRUM_MESH_CA_BACKEND requires FERRUM_MESH_WORKLOAD_SPIFFE_ID so \
+                         the issued runtime SVID matches the local mesh workload identity"
+                            .to_string()
+                    })?;
+                    // Parse it exactly like startup's
+                    // `configured_mesh_workload_spiffe_id` so `validate` and
+                    // mesh startup agree: a non-SPIFFE value must fail here,
+                    // not silently pass settings validation then abort at boot.
+                    let workload_spiffe_id = crate::identity::SpiffeId::new(workload_spiffe_id)
+                        .map_err(|e| {
+                            format!(
+                                "FERRUM_MESH_WORKLOAD_SPIFFE_ID must be a valid SPIFFE URI when \
+                                 FERRUM_MESH_CA_BACKEND is enabled: {e}"
+                            )
+                        })?;
                     // Mirror `bootstrap_dev_root`'s refusal so `validate` agrees
                     // with startup: the internal self-signed CA only bootstraps in
                     // non-production with FERRUM_MESH_CA_BOOTSTRAP_DEV=true. Without
@@ -5450,6 +5532,92 @@ impl EnvConfig {
                                     .into(),
                             );
                         }
+                    }
+                    Some(workload_spiffe_id)
+                } else {
+                    None
+                };
+                if self.mesh_workload_api_enabled {
+                    // The backend gate runs FIRST. A backend that cannot serve
+                    // this surface at all is the decisive diagnostic; reporting
+                    // a socket-path problem ahead of it would send the operator
+                    // to fix the wrong thing.
+                    match mesh_ca_backend {
+                        crate::identity::ca::CaBackend::None => {
+                            return Err(Self::WORKLOAD_API_REQUIRES_CA_BACKEND.to_string());
+                        }
+                        // The SPIRE backend cannot serve this surface, and the
+                        // failure would otherwise be silent-at-runtime rather
+                        // than loud-at-startup. `SpireAgentCa` fetches Ferrum's
+                        // OWN agent SVID; it has no way to issue for the
+                        // downstream identity `FetchX509SVID` attests, and
+                        // SPIRE authorizes `FetchJWTSVID` by the calling
+                        // process, so proxying it would substitute Ferrum's
+                        // SPIFFE ID. Both are terminal without SPIRE's
+                        // delegated-identity API. Refuse the combination
+                        // outright rather than bind a Workload API that can
+                        // only mis-issue or refuse.
+                        crate::identity::ca::CaBackend::SpireAgent => {
+                            return Err(Self::WORKLOAD_API_SPIRE_UNSUPPORTED.to_string());
+                        }
+                        crate::identity::ca::CaBackend::Internal => {}
+                    }
+                }
+                // JWT-SVID signing material and the Workload API socket
+                // contract are validated here so `validate` and mesh startup
+                // agree: an operator must not get a clean `validate` for a
+                // Workload API surface that cannot bind, or for a JWT authority
+                // whose keys vanish on restart.
+                self.validate_mesh_jwt_svid_settings(&mesh_ca_backend)?;
+                if self.mesh_workload_api_enabled {
+                    let socket =
+                        crate::identity::workload_api::WorkloadApiSocketConfig::from_parts(
+                            self.mesh_workload_api_socket_path.as_str(),
+                            self.mesh_workload_api_socket_mode.as_str(),
+                        )
+                        .map_err(|e| format!("Invalid FERRUM_MESH_WORKLOAD_API_* settings: {e}"))?;
+                    // The path/ownership/mode checks touch the filesystem, so
+                    // they are validated too: `validate` runs on the host that
+                    // will serve, and a missing or unsafe parent directory is
+                    // exactly the misconfiguration worth catching before boot.
+                    socket.validate().map_err(|e| {
+                        format!("Invalid FERRUM_MESH_WORKLOAD_API_SOCKET_PATH: {e}")
+                    })?;
+
+                    // Parse the attestor configuration through the same
+                    // identity-layer parser startup uses. This stays after the
+                    // backend and socket gates so their decisive diagnostics
+                    // retain priority over a malformed mapping rule.
+                    let trust_domain = workload_spiffe_id
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "internal: enabled Workload API has no parsed workload SPIFFE ID"
+                                .to_string()
+                        })?
+                        .trust_domain();
+                    let mut has_unix_attestor = false;
+                    for raw in &self.mesh_workload_api_unix_identity_rules {
+                        let entry = raw.trim();
+                        if entry.is_empty() {
+                            continue;
+                        }
+                        crate::identity::attestation::unix::parse_identity_rule(
+                            entry,
+                            trust_domain,
+                        )
+                        .map_err(|error| {
+                            format!("Invalid FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES: {error}")
+                        })?;
+                        has_unix_attestor = true;
+                    }
+                    if !has_unix_attestor && !crate::identity::allow_static_id() {
+                        return Err(
+                            "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires at least one attestor: \
+                             set FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES to map peer \
+                             credentials to SPIFFE IDs. For dev/test only, \
+                             FERRUM_MESH_ALLOW_STATIC_ID=true enables the proof-free static fallback"
+                                .into(),
+                        );
                     }
                 }
                 // Validate the production-mode flag value loudly — like
@@ -6126,6 +6294,154 @@ impl EnvConfig {
                 50051,
             ))
         }
+    }
+
+    /// Enabling the Workload API surface with no CA backend at all.
+    const WORKLOAD_API_REQUIRES_CA_BACKEND: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true requires FERRUM_MESH_CA_BACKEND so the Workload \
+         API has an authority to mint SVIDs from";
+
+    /// Enabling the Workload API while explicit file identity suppresses the
+    /// automatic CA-backed issuer at mesh startup.
+    const WORKLOAD_API_FILE_SVID_UNSUPPORTED: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true cannot be combined with \
+         FERRUM_GATEWAY_SVID_CERT_PATH, FERRUM_GATEWAY_SVID_KEY_PATH, or \
+         FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH. File-based gateway SVID material overrides \
+         automatic CA-backed issuance, so Ferrum would have no certificate authority to issue \
+         SVIDs for attested downstream workloads. Remove the FERRUM_GATEWAY_SVID_* override and \
+         use FERRUM_MESH_CA_BACKEND=internal, or disable Ferrum's Workload API";
+
+    /// Enabling the Workload API surface on the SPIRE backend, which can only
+    /// ever issue Ferrum's own identity (issue #3617).
+    const WORKLOAD_API_SPIRE_UNSUPPORTED: &str = "FERRUM_MESH_WORKLOAD_API_ENABLED=true is not supported with \
+         FERRUM_MESH_CA_BACKEND=spire. A SPIRE agent issues only the calling process's own \
+         identity, so Ferrum cannot mint an X.509-SVID or a JWT-SVID for an attested downstream \
+         workload through it — serving the surface would either fail every request or substitute \
+         Ferrum's own SPIFFE ID. Point workloads at their local SPIRE agent socket \
+         (FERRUM_MESH_SPIRE_AGENT_SOCKET) instead, or use FERRUM_MESH_CA_BACKEND=internal with \
+         FERRUM_MESH_JWT_SIGNING_KEY_PEM. Ferrum still consumes SPIRE's X.509 SVID and trust \
+         bundles for peer verification under FERRUM_MESH_CA_BACKEND=spire; only serving a \
+         Workload API is refused";
+
+    /// Configured JWT signing material rotates externally, so an in-process
+    /// cadence alongside it is refused rather than silently normalized away.
+    const JWT_KEY_LIFETIME_MUST_BE_ZERO_WHEN_CONFIGURED: &str = "FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS must be 0 when FERRUM_MESH_JWT_SIGNING_KEY_PEM is \
+         configured. Configured JWT signing material is rotated EXTERNALLY: set the new key in \
+         FERRUM_MESH_JWT_SIGNING_KEY_PEM and the outgoing one in \
+         FERRUM_MESH_JWT_PREVIOUS_SIGNING_KEY_PEM, roll the fleet, then drop the previous key \
+         once the verification overlap has elapsed. Generating a replacement in process would \
+         give every replica a different key and lose the signer of every still-live token on \
+         restart";
+
+    /// Enforce the JWT-SVID signing-material and rotation contract (issue #3617).
+    ///
+    /// The JWT authority of a trust domain is only meaningful if it is *stable*:
+    /// an ephemeral key makes every token unverifiable after a restart and makes
+    /// two replicas of one trust domain publish different JWKS. So:
+    ///
+    /// 1. Configured signing material is parsed here — not merely at first use —
+    ///    so unusable or wrong-key-type material fails `validate` and startup
+    ///    rather than the first mint. The diagnostic is `JwtSvidError`'s fixed
+    ///    string; it names no part of the key and no source reference.
+    /// 2. A **previous** key may only be configured alongside a primary. On its
+    ///    own it would mean "publish a key nothing signs with", which is an
+    ///    operator mistake worth reporting, not a posture to honour.
+    /// 3. With no material configured, the dev opt-in
+    ///    `FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY` is required — and, like the other
+    ///    identity dev shortcuts, is refused unconditionally under
+    ///    `FERRUM_MESH_PRODUCTION_MODE=true`. Absent both, the Workload API's JWT
+    ///    surface is refused rather than started with disappearing keys.
+    /// 4. Configured material rotates **externally**, so an explicit nonzero
+    ///    `FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS` alongside it is refused rather
+    ///    than silently normalized: an in-process replacement would be a random
+    ///    key per replica, lost on restart. For the ephemeral dev key — which
+    ///    has no continuity to lose — an in-process cadence is allowed, and must
+    ///    be one whose overlap guarantee is provable: a lifetime shorter than
+    ///    the overlap divided by the published-authority budget could not retain
+    ///    every still-verifiable key, so it is refused here with the exact
+    ///    minimum.
+    ///
+    /// The gate is scoped to **the backend that consumes the material**:
+    /// JWT-SVIDs are minted only by the Workload API surface, and only the
+    /// `internal` CA backend owns a JWT signing authority. A mesh that does not
+    /// serve the surface — or that serves it from a backend which never reads a
+    /// local JWT key — is not made to carry signing material it never uses.
+    fn validate_mesh_jwt_svid_settings(
+        &self,
+        mesh_ca_backend: &crate::identity::ca::CaBackend,
+    ) -> Result<(), String> {
+        if !self.mesh_workload_api_enabled
+            || *mesh_ca_backend != crate::identity::ca::CaBackend::Internal
+        {
+            return Ok(());
+        }
+        let signing_key = crate::identity::jwt_signing_key_pem();
+        let previous_key = crate::identity::jwt_previous_signing_key_pem();
+
+        if signing_key.is_none() && previous_key.is_some() {
+            return Err("FERRUM_MESH_JWT_PREVIOUS_SIGNING_KEY_PEM is set without \
+                 FERRUM_MESH_JWT_SIGNING_KEY_PEM: a retired key is published for verification \
+                 only, so there would be no key to mint with"
+                .into());
+        }
+        if signing_key.is_none() {
+            if crate::identity::production_mode() {
+                return Err(
+                    "FERRUM_MESH_PRODUCTION_MODE=true with FERRUM_MESH_WORKLOAD_API_ENABLED=true \
+                     requires FERRUM_MESH_JWT_SIGNING_KEY_PEM (an ES256 / P-256 private key, \
+                     resolvable through the _VAULT / _AWS / _AZURE / _GCP / _FILE suffixes). \
+                     Without stable signing material the trust domain's JWT authority changes on \
+                     every restart and differs on every replica, so already-issued JWT-SVIDs stop \
+                     validating"
+                        .into(),
+                );
+            }
+            if !crate::identity::allow_ephemeral_jwt_key() {
+                return Err("FERRUM_MESH_WORKLOAD_API_ENABLED=true requires \
+                     FERRUM_MESH_JWT_SIGNING_KEY_PEM so the trust domain's JWT authority survives \
+                     restart and matches every replica. For dev/test only, set \
+                     FERRUM_MESH_ALLOW_EPHEMERAL_JWT_KEY=true to accept a process-local key whose \
+                     tokens become unverifiable on restart"
+                    .into());
+            }
+        }
+
+        // Parse the material through exactly the constructor mesh startup will
+        // use, so `validate` cannot pass on a key startup would reject.
+        let mut jwt_config = crate::identity::jwt_svid::LocalJwtAuthorityConfig::new(
+            // The trust domain does not affect signing-material or cadence
+            // validation; a placeholder keeps this check independent of whether
+            // FERRUM_MESH_WORKLOAD_SPIFFE_ID has been resolved yet.
+            crate::identity::TrustDomain::new("validate.invalid".to_string())
+                .map_err(|e| format!("internal: placeholder trust domain rejected: {e}"))?,
+        );
+        let configured_material = signing_key.is_some();
+        jwt_config.signing_key_pem = signing_key;
+        jwt_config.retired_key_pems = previous_key.into_iter().collect();
+        jwt_config.key_lifetime_secs = self.mesh_jwt_key_lifetime_seconds;
+        jwt_config.allow_ephemeral_key = crate::identity::allow_ephemeral_jwt_key();
+        if self.mesh_jwt_key_lifetime_seconds > 0 {
+            if configured_material {
+                // Refused, not normalized: an operator who set a cadence
+                // believes a rotation is scheduled. It is not, and it cannot
+                // be — a process-local replacement for configured material
+                // would publish a different key on every replica and be lost
+                // on restart, stranding every token it had signed.
+                return Err(Self::JWT_KEY_LIFETIME_MUST_BE_ZERO_WHEN_CONFIGURED.to_string());
+            }
+            let minimum = crate::identity::jwt_svid::min_key_lifetime_secs(
+                crate::identity::jwt_svid::MAX_JWT_SVID_TTL_SECS,
+            );
+            if self.mesh_jwt_key_lifetime_seconds < minimum {
+                return Err(format!(
+                    "FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS must be 0 (rotation disabled) or at \
+                     least {minimum}: a shorter cadence would retire keys faster than the \
+                     rotation verification overlap releases them, so a JWT-SVID inside its \
+                     permitted lifetime could stop validating"
+                ));
+            }
+        }
+        crate::identity::jwt_svid::LocalJwtAuthority::new(jwt_config)
+            .map(|_| ())
+            .map_err(|e| format!("Invalid JWT-SVID signing configuration: {e}"))
     }
 
     /// Enforce the secure-by-default CP/DP gRPC transport policy.

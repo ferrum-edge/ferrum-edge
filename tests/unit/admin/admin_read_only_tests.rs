@@ -1139,7 +1139,7 @@ async fn test_read_only_rejection_log_context_uses_request_slot() {
 fn test_read_only_rejection_metric_renders_on_prometheus_scrape() {
     ferrum_edge::admin::reset_read_only_rejection_observability_for_test();
     let registry = ferrum_edge::plugins::prometheus_metrics::MetricsRegistry::new();
-    registry.configure(60, 3600, 0, "test-ns");
+    registry.configure(60, 3600, 0, 10_000, "test-ns");
     registry.record_admin_read_only_rejection();
     let output = registry.render_uncached();
     assert!(

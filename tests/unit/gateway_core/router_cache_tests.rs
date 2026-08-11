@@ -1857,3 +1857,21 @@ fn port_scoped_regex_beats_its_port_agnostic_fallback_on_the_exact_listener() {
         .expect("the agnostic regex remains the fallback elsewhere");
     assert_eq!(elsewhere.proxy.id, "fallback");
 }
+
+#[test]
+fn later_port_scoped_regex_cannot_shadow_an_earlier_different_pattern() {
+    let mut protected = test_proxy("protected-admin", "~^/admin/.*$");
+    protected.hosts = vec!["app.example.com".into()];
+
+    let mut scoped_fallback = test_proxy("scoped-fallback", "~^/.*$");
+    scoped_fallback.hosts = vec!["app.example.com".into()];
+    scoped_fallback.listen_port = Some(9001);
+
+    let config = test_config(vec![protected, scoped_fallback]);
+    let cache = RouterCache::new(&config, 100);
+
+    let matched = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/admin/secret", Some(9001), false)
+        .expect("the earlier protected regex must match");
+    assert_eq!(matched.proxy.id, "protected-admin");
+}

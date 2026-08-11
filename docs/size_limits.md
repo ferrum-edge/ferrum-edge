@@ -215,7 +215,7 @@ Beyond request/response size limits, the Admin API enforces validation on all co
 | `targets[].port` | ≥ 1 | Target port (non-zero) |
 | `targets[].weight` | 1–65,535 | Target weight |
 | `targets[].path` | 2048 chars | Optional per-target backend path override |
-| `targets[].tags` | 50 entries, 255 chars key/value | Target metadata tags |
+| `targets[].tags` | 50 entries, 255 chars key/value | Target metadata tags; operator-provided keys beginning with reserved `mesh.` are rejected |
 
 ### Upstream Health Check Fields
 

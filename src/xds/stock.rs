@@ -1345,6 +1345,43 @@ fn classify_listener(
     let mut refusals = Vec::new();
 
     for (index, chain) in chains.iter().enumerate() {
+        if let Some(matcher) = chain.filter_chain_match.as_ref() {
+            for (field, present) in [
+                ("prefix_ranges", !matcher.prefix_ranges.is_empty()),
+                ("address_suffix", !matcher.address_suffix.is_empty()),
+                ("suffix_len", matcher.suffix_len.is_some()),
+                (
+                    "source_prefix_ranges",
+                    !matcher.source_prefix_ranges.is_empty(),
+                ),
+                ("source_ports", !matcher.source_ports.is_empty()),
+                ("destination_port", matcher.destination_port.is_some()),
+                ("transport_protocol", !matcher.transport_protocol.is_empty()),
+                (
+                    "application_protocols",
+                    !matcher.application_protocols.is_empty(),
+                ),
+                ("server_names", !matcher.server_names.is_empty()),
+                ("source_type", matcher.source_type != 0),
+                (
+                    "direct_source_prefix_ranges",
+                    !matcher.direct_source_prefix_ranges.is_empty(),
+                ),
+            ] {
+                if present {
+                    return Err(refuse(
+                        refusal::LISTENER_EXTENSION_ESCAPE,
+                        format!("filter_chains[].filter_chain_match.{field}").as_str(),
+                    ));
+                }
+            }
+        }
+        if chain.transport_socket.is_some() {
+            return Err(refuse(
+                refusal::UNSUPPORTED_TRANSPORT_SOCKET,
+                "filter_chains[].transport_socket",
+            ));
+        }
         for filter in &chain.filters {
             if !filter.config_discovery.is_empty() {
                 return Err(refuse(
@@ -1699,14 +1736,21 @@ fn classify_virtual_host(
         }
         if let Some(matcher) = route.r#match.as_ref() {
             for (field, present) in [
+                ("path", !matcher.path.is_empty()),
+                ("safe_regex", !matcher.safe_regex.is_empty()),
+                ("connect_matcher", !matcher.connect_matcher.is_empty()),
+                (
+                    "path_separated_prefix",
+                    !matcher.path_separated_prefix.is_empty(),
+                ),
+                ("path_match_policy", !matcher.path_match_policy.is_empty()),
+                ("prefix", matcher.prefix != "/"),
                 ("headers", !matcher.headers.is_empty()),
                 ("query_parameters", !matcher.query_parameters.is_empty()),
                 ("grpc", !matcher.grpc.is_empty()),
                 ("runtime_fraction", !matcher.runtime_fraction.is_empty()),
-                ("safe_regex", !matcher.safe_regex.is_empty()),
-                ("connect_matcher", !matcher.connect_matcher.is_empty()),
+                ("tls_context", !matcher.tls_context.is_empty()),
                 ("dynamic_metadata", !matcher.dynamic_metadata.is_empty()),
-                ("path_match_policy", !matcher.path_match_policy.is_empty()),
             ] {
                 if present {
                     return Err(refuse(

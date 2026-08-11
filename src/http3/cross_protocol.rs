@@ -1240,18 +1240,19 @@ async fn run_plain_attempt_local_policy_or_reject<'a, S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    // The H3 plain bridge has no HBONE / mesh-mTLS / east-west dispatch path.
-    // A direct dial to a mesh-tagged target would bypass the secured mesh
-    // transport, so fail closed before backend admission or body relay.
+    // The H3 plain bridge has no HBONE / mesh-mTLS / east-west / Unix dispatch
+    // path. A direct network dial would either bypass the secured mesh
+    // transport or hit a Unix target's schema-only loopback placeholder, so
+    // fail closed before backend admission or body relay.
     if let Some(reason) =
-        crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(current_target)
+        crate::proxy::backend_dispatch::direct_network_http_transport_refusal(current_target)
     {
         warn!(
             proxy_id = %dispatch_proxy.id,
             target_host = current_target.map(|target| target.host.as_str()).unwrap_or(""),
             target_port = current_target.map(|target| target.port).unwrap_or(0),
             reason,
-            "cross-protocol H3→HTTP: refusing direct dial to a mesh-transport-tagged target"
+            "cross-protocol H3→HTTP: refusing direct dial to a target requiring another transport"
         );
         record_backend_outcome_no_conn_end(
             state,
@@ -4497,7 +4498,10 @@ where
 /// tag, a cross-cluster `mesh.mtls` target missing its SNI override / trust
 /// domain, a corrupted target declaring BOTH mesh transports, and any target
 /// whose pinned identity / dial metadata cannot be resolved are all refused
-/// before any dial.
+/// before any dial. A Sidecar `ingress[]` **Unix-socket** target (issue #3261)
+/// is refused for the same reason: this bridge has no Unix transport, and its
+/// `target.host:target.port` is a schema-only loopback placeholder, so a direct
+/// dial would reach an unrelated listener instead of the socket.
 fn resolve_h3_grpc_transport<'a>(
     state: &'a ProxyState,
     target: Option<&'a UpstreamTarget>,
@@ -9423,7 +9427,7 @@ mod tests {
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
             frontend_tls_source_namespace: None,
-            frontend_tls_namespace_sources: Vec::new(),
+            frontend_tls_certificate_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
             http_tls_listen_ports: Default::default(),

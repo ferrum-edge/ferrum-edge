@@ -301,10 +301,21 @@ message ListenerFilter {
 
 // envoy.config.listener.v3.FilterChainMatch
 message FilterChainMatch {
+  // Every field in this message constrains which connection reaches the chain.
+  // Presence-only message carriers keep unsupported criteria from being
+  // discarded by prost and widened into an unconditional match.
+  repeated bytes prefix_ranges = 3;
+  string address_suffix = 4;
+  UInt32Value suffix_len = 5;
+  repeated bytes source_prefix_ranges = 6;
+  repeated uint32 source_ports = 7;
   UInt32Value destination_port = 8;
   string transport_protocol = 9;
   repeated bytes application_protocols = 10;
   repeated bytes server_names = 11;
+  // ConnectionSourceType enum: ANY = 0, SAME_IP_OR_LOOPBACK = 1, EXTERNAL = 2.
+  int32 source_type = 12;
+  repeated bytes direct_source_prefix_ranges = 13;
 }
 
 // envoy.config.listener.v3.FilterChain
@@ -384,6 +395,7 @@ message RouteMatch {
   repeated bytes grpc = 8;
   repeated bytes runtime_fraction = 9;
   repeated bytes safe_regex = 10;
+  repeated bytes tls_context = 11;
   repeated bytes connect_matcher = 12;
   repeated bytes dynamic_metadata = 13;
   string path_separated_prefix = 14;

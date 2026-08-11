@@ -12,6 +12,11 @@ use dashmap::mapref::entry::Entry;
 
 use crate::identity::ca::PublishedTrustBundle;
 use crate::identity::spiffe::SpiffeId;
+use crate::modes::mesh::metric_tag_cel::{
+    MAX_METRIC_TAG_CEL_AST_NODES, MAX_METRIC_TAG_CEL_NESTING, MetricTagCelAttr,
+    MetricTagCelContext, metadata_destination_port, metadata_request_host, metadata_request_method,
+    sanitize_metric_tag_value, split_metric_tag_cel_plan,
+};
 use crate::plugins::StreamConnectionContext;
 use crate::plugins::TransactionSummary;
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
@@ -147,7 +152,8 @@ pub(crate) const MESH_GRPC_RESPONSE_MESSAGES_OVERRIDES_METADATA: &str =
 
 /// Istio Telemetry metric families Ferrum emits with mesh identity labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum MeshMetricFamily {
+#[doc(hidden)]
+pub enum MeshMetricFamily {
     RequestCount,
     RequestDuration,
     RequestSize,
@@ -215,7 +221,7 @@ impl MeshMetricFamily {
         }
     }
 
-    pub(crate) fn disabled_name(self) -> &'static str {
+    pub(crate) const fn disabled_name(self) -> &'static str {
         match self {
             Self::RequestCount => "request_count",
             Self::RequestDuration => "request_duration",
@@ -238,6 +244,28 @@ impl MeshMetricFamily {
                 | Self::TcpSentBytes
                 | Self::TcpReceivedBytes
         )
+    }
+
+    /// Stable index into per-family live-series budget arrays. Must match
+    /// [`Self::ALL`] order.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::RequestCount => 0,
+            Self::RequestDuration => 1,
+            Self::RequestSize => 2,
+            Self::ResponseSize => 3,
+            Self::TcpOpenedConnections => 4,
+            Self::TcpClosedConnections => 5,
+            Self::TcpSentBytes => 6,
+            Self::TcpReceivedBytes => 7,
+            Self::GrpcRequestMessages => 8,
+            Self::GrpcResponseMessages => 9,
+        }
+    }
+
+    /// Fixed Prometheus `family` label for dynamic-series overflow counters.
+    pub(crate) const fn overflow_family_label(self) -> &'static str {
+        self.disabled_name()
     }
 }
 
@@ -1413,7 +1441,8 @@ pub(crate) fn mesh_metric_disabled(summary: &TransactionSummary, family: MeshMet
 
 /// Apply the prevalidated, length-prefixed metric override plan emitted by
 /// `workload_metrics` to a finalized mesh key. The compact plan is parsed in
-/// place without JSON parsing, allocation, or a lock on the request-log path.
+/// place without JSON parsing, CEL text reparsing, or a lock on the request-log
+/// path. Expression opcodes evaluate against the metric-phase attribute context.
 pub(crate) fn mesh_request_key_for_family(
     summary: &TransactionSummary,
     base: &MeshRequestKey,
@@ -1423,7 +1452,14 @@ pub(crate) fn mesh_request_key_for_family(
         return base.clone();
     };
     let mut key = base.clone();
-    apply_metric_override_plan(&mut key, plan);
+    let extras = MetricTagCelExtras {
+        request_method: metadata_request_method(&summary.metadata)
+            .or(Some(summary.http_method.as_str()).filter(|value| !value.is_empty())),
+        request_host: metadata_request_host(&summary.metadata),
+        response_code: Some(summary.response_status_code),
+        destination_port: metadata_destination_port(&summary.metadata),
+    };
+    apply_metric_override_plan(&mut key, base, plan, extras);
     normalize_removed_labels(&mut key);
     key
 }
@@ -1450,12 +1486,34 @@ fn normalize_removed_labels(key: &mut MeshRequestKey) {
     }
 }
 
-fn apply_metric_override_plan(key: &mut MeshRequestKey, mut plan: &str) {
+#[derive(Debug, Clone, Copy)]
+struct MetricTagCelExtras<'a> {
+    request_method: Option<&'a str>,
+    request_host: Option<&'a str>,
+    response_code: Option<u16>,
+    destination_port: Option<u16>,
+}
+
+fn apply_metric_override_plan(
+    key: &mut MeshRequestKey,
+    attribution: &MeshRequestKey,
+    plan: &str,
+    extras: MetricTagCelExtras<'_>,
+) {
+    let Some((_, mut plan)) = split_metric_tag_cel_plan(plan) else {
+        return;
+    };
     while !plan.is_empty() {
         let Some(op) = plan.as_bytes().first().copied() else {
             return;
         };
-        plan = &plan[1..];
+        // Defensive: a hostile/corrupt plan may place a multibyte UTF-8 lead
+        // byte where an ASCII opcode is expected. `str::get` fails closed
+        // instead of panicking on a non-char-boundary index.
+        let Some(rest) = plan.get(1..) else {
+            return;
+        };
+        plan = rest;
         match op {
             b'r' => {
                 let Some((index, rest)) = take_number_until(plan, b';') else {
@@ -1520,9 +1578,201 @@ fn apply_metric_override_plan(key: &mut MeshRequestKey, mut plan: &str) {
                 key.removed_labels &= !(1u16 << label.index());
                 plan = rest;
             }
+            b'x' => {
+                let Some((index, after_index)) = take_number_until(plan, b',') else {
+                    return;
+                };
+                let Some((length, body_and_rest)) = take_number_until(after_index, b':') else {
+                    return;
+                };
+                let Some(label) = u8::try_from(index)
+                    .ok()
+                    .and_then(MeshMetricLabel::from_index)
+                else {
+                    return;
+                };
+                let Some(body) = body_and_rest.get(..length) else {
+                    return;
+                };
+                let Some(rest) = body_and_rest.get(length..) else {
+                    return;
+                };
+                let Some(rest) = rest.strip_prefix(';') else {
+                    return;
+                };
+                let value = {
+                    let live_ctx = MetricTagCelContext {
+                        source_workload: attribution.source_workload.as_ref(),
+                        source_namespace: attribution.source_namespace.as_ref(),
+                        source_principal: attribution.source_principal.as_ref(),
+                        source_app: attribution.source_app.as_ref(),
+                        source_service: attribution.source_service.as_ref(),
+                        destination_workload: attribution.destination_workload.as_ref(),
+                        destination_namespace: attribution.destination_namespace.as_ref(),
+                        destination_principal: attribution.destination_principal.as_ref(),
+                        destination_app: attribution.destination_app.as_ref(),
+                        destination_service: attribution.destination_service.as_ref(),
+                        request_protocol: attribution.request_protocol.as_ref(),
+                        response_flags: attribution.response_flags.as_ref(),
+                        connection_security_policy: attribution.connection_security_policy.as_ref(),
+                        request_method: extras.request_method,
+                        request_host: extras.request_host,
+                        // HTTP/gRPC summaries stamp extras.response_code.
+                        // Stream/TCP paths leave it None: TCP families reject
+                        // HTTP-only `response.code` at admission, so there is
+                        // no stream-side response-code evaluation path.
+                        response_code: extras.response_code,
+                        destination_port: extras.destination_port,
+                    };
+                    let Some(value) = evaluate_compact_metric_tag_cel(body, live_ctx) else {
+                        return;
+                    };
+                    value
+                };
+                set_metric_label_value(key, label, intern_label(&value));
+                key.removed_labels &= !(1u16 << label.index());
+                plan = rest;
+            }
             _ => return,
         }
     }
+}
+
+/// Validate and evaluate the reload-time compact CEL plan without rebuilding
+/// its owned AST on every metric emission. The first bounded walk validates
+/// the complete plan (including the unselected ternary branch); the second
+/// evaluates only the selected branch and allocates only the final sanitized
+/// label value.
+fn evaluate_compact_metric_tag_cel(body: &str, ctx: MetricTagCelContext<'_>) -> Option<String> {
+    if !compact_metric_tag_cel_is_valid(body) {
+        return None;
+    }
+    let mut remaining = body;
+    let value = evaluate_compact_metric_tag_cel_prefix(&mut remaining, ctx)?;
+    remaining.is_empty().then_some(value)
+}
+
+fn compact_metric_tag_cel_is_valid(body: &str) -> bool {
+    let mut nodes = 0usize;
+    compact_metric_tag_cel_is_valid_at_depth(body, 0, &mut nodes)
+}
+
+fn compact_metric_tag_cel_is_valid_at_depth(body: &str, depth: usize, nodes: &mut usize) -> bool {
+    let mut remaining = body;
+    skip_compact_metric_tag_cel_prefix(&mut remaining, depth, nodes).is_some()
+        && remaining.is_empty()
+}
+
+fn skip_compact_metric_tag_cel_prefix(
+    body: &mut &str,
+    depth: usize,
+    nodes: &mut usize,
+) -> Option<()> {
+    if depth > MAX_METRIC_TAG_CEL_NESTING || *nodes >= MAX_METRIC_TAG_CEL_AST_NODES {
+        return None;
+    }
+    *nodes += 1;
+    let op = body.as_bytes().first().copied()?;
+    // Fail closed on non-char-boundary indexes (malformed multibyte lead byte).
+    *body = body.get(1..)?;
+    match op {
+        b'L' => {
+            let (length, rest) = take_number_until(body, b':')?;
+            rest.get(..length)?;
+            *body = rest.get(length..)?;
+            Some(())
+        }
+        b'A' | b'I' => {
+            let (id, rest) = take_number_end(body)?;
+            MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?;
+            *body = rest;
+            Some(())
+        }
+        b'H' => {
+            let (id, after_id) = take_number_until(body, b',')?;
+            MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?;
+            let (then_len, after_then_len) = take_number_until(after_id, b':')?;
+            let then_body = after_then_len.get(..then_len)?;
+            let after_then = after_then_len.get(then_len..)?;
+            let (else_len, after_else_len) = take_number_until(after_then, b':')?;
+            let else_body = after_else_len.get(..else_len)?;
+            let after_else = after_else_len.get(else_len..)?;
+            *body = after_else;
+            compact_metric_tag_cel_is_valid_at_depth(then_body, depth + 1, nodes)
+                .then_some(())
+                .filter(|()| compact_metric_tag_cel_is_valid_at_depth(else_body, depth + 1, nodes))
+        }
+        _ => None,
+    }
+}
+
+fn evaluate_compact_metric_tag_cel_prefix(
+    body: &mut &str,
+    ctx: MetricTagCelContext<'_>,
+) -> Option<String> {
+    let op = body.as_bytes().first().copied()?;
+    // Fail closed on non-char-boundary indexes (malformed multibyte lead byte).
+    *body = body.get(1..)?;
+    match op {
+        b'L' => {
+            let (length, rest) = take_number_until(body, b':')?;
+            let value = sanitize_metric_tag_value(rest.get(..length)?);
+            *body = rest.get(length..)?;
+            Some(value)
+        }
+        b'A' => {
+            let (id, rest) = take_number_end(body)?;
+            let attribute = MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?;
+            *body = rest;
+            Some(sanitize_metric_tag_value(
+                ctx.string_attr(attribute).unwrap_or(""),
+            ))
+        }
+        b'I' => {
+            let (id, rest) = take_number_end(body)?;
+            let attribute = MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?;
+            *body = rest;
+            Some(
+                ctx.int_attr(attribute)
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            )
+        }
+        b'H' => {
+            let (id, after_id) = take_number_until(body, b',')?;
+            let attribute = MetricTagCelAttr::from_plan_id(u8::try_from(id).ok()?)?;
+            let (then_len, after_then_len) = take_number_until(after_id, b':')?;
+            let then_body = after_then_len.get(..then_len)?;
+            let after_then = after_then_len.get(then_len..)?;
+            let (else_len, after_else_len) = take_number_until(after_then, b':')?;
+            let else_body = after_else_len.get(..else_len)?;
+            *body = after_else_len.get(else_len..)?;
+            let mut selected = if ctx.string_attr(attribute).is_some() {
+                then_body
+            } else {
+                else_body
+            };
+            let value = evaluate_compact_metric_tag_cel_prefix(&mut selected, ctx)?;
+            selected.is_empty().then_some(value)
+        }
+        _ => None,
+    }
+}
+
+fn take_number_end(value: &str) -> Option<(usize, &str)> {
+    let mut end = 0usize;
+    for (idx, byte) in value.as_bytes().iter().enumerate() {
+        if byte.is_ascii_digit() {
+            end = idx + 1;
+            continue;
+        }
+        break;
+    }
+    if end == 0 {
+        return None;
+    }
+    let number = value.get(..end)?.parse::<usize>().ok()?;
+    Some((number, value.get(end..)?))
 }
 
 fn take_number_until(value: &str, delimiter: u8) -> Option<(usize, &str)> {
@@ -1759,7 +2009,13 @@ pub(crate) fn mesh_request_key_for_family_from_metadata(
         return base.clone();
     };
     let mut key = base.clone();
-    apply_metric_override_plan(&mut key, plan);
+    let extras = MetricTagCelExtras {
+        request_method: metadata_request_method(metadata),
+        request_host: metadata_request_host(metadata),
+        response_code: None,
+        destination_port: metadata_destination_port(metadata),
+    };
+    apply_metric_override_plan(&mut key, base, plan, extras);
     // TCP families never carry an HTTP response-code dimension. Preserve that
     // fixed schema even when an ALL_METRICS plan contains a response-code
     // UPSERT/rename intended for the HTTP/gRPC families.
@@ -2070,7 +2326,7 @@ mod tests {
                 MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
                 // Copy the source workload into destination workload, then set
                 // the source to a new value. The order is observable.
-                "n0,5;s0,4:edge;".to_string(),
+                "m0;n0,5;s0,4:edge;".to_string(),
             )]),
             ..TransactionSummary::default()
         };
@@ -2093,7 +2349,7 @@ mod tests {
                 MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
                 // Remove source_principal, rename source_workload into
                 // source_app (removing source_workload).
-                "r2;n0,3;".to_string(),
+                "m0;r2;n0,3;".to_string(),
             )]),
             ..TransactionSummary::default()
         };
@@ -2126,6 +2382,65 @@ mod tests {
         base_c.source_workload = Arc::from("checkout");
         let key_c = mesh_request_key_for_family(&summary, &base_c, MeshMetricFamily::RequestCount);
         assert_ne!(key_a, key_c);
+    }
+
+    #[test]
+    fn malformed_multibyte_override_opcode_fails_closed_without_panic() {
+        // `é` is UTF-8 C3 A9. Reading the lead byte then slicing at index 1
+        // would panic on a char-boundary check; defensive parsing must return.
+        let summary = TransactionSummary {
+            metadata: HashMap::from([(
+                MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
+                "m0;é".to_string(),
+            )]),
+            ..TransactionSummary::default()
+        };
+        let base = mesh_key();
+        let key = mesh_request_key_for_family(&summary, &base, MeshMetricFamily::RequestCount);
+        assert_eq!(key, base);
+    }
+
+    #[test]
+    fn malformed_multibyte_compact_cel_body_fails_closed_without_panic() {
+        // UPSERT CEL body whose first byte is a multibyte lead (`é` = C3 A9).
+        // Length is UTF-8 bytes so the body slice is well-formed as a str, but
+        // opcode consumption must not panic mid-character.
+        let summary = TransactionSummary {
+            metadata: HashMap::from([(
+                MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
+                "m0;x0,2:é;".to_string(),
+            )]),
+            ..TransactionSummary::default()
+        };
+        let base = mesh_key();
+        let key = mesh_request_key_for_family(&summary, &base, MeshMetricFamily::RequestCount);
+        assert_eq!(key, base);
+        assert!(!compact_metric_tag_cel_is_valid("é"));
+        assert!(
+            evaluate_compact_metric_tag_cel(
+                "é",
+                MetricTagCelContext {
+                    source_workload: "frontend",
+                    source_namespace: "default",
+                    source_principal: "source-principal",
+                    source_app: "frontend",
+                    source_service: "frontend",
+                    destination_workload: "backend",
+                    destination_namespace: "default",
+                    destination_principal: "destination-principal",
+                    destination_app: "backend",
+                    destination_service: "backend",
+                    request_protocol: "http",
+                    response_flags: "-",
+                    connection_security_policy: "mutual_tls",
+                    request_method: Some("GET"),
+                    request_host: Some("example"),
+                    response_code: Some(200),
+                    destination_port: Some(8080),
+                }
+            )
+            .is_none()
+        );
     }
 
     #[test]

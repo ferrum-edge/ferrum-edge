@@ -184,6 +184,23 @@ impl EnvValue for Vec<String> {
     }
 }
 
+/// Comma-separated unsigned 32-bit list (currently uid allowlists). A
+/// non-numeric entry is a hard startup error rather than a skipped element: a
+/// silently dropped uid would narrow a security allowlist without any signal.
+impl EnvValue for Vec<u32> {
+    fn parse_env(raw: &str, key: &str) -> Result<Self, String> {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .map_err(|_| invalid_env_value(key, raw, "a comma-separated list of uids"))
+            })
+            .collect()
+    }
+}
+
 impl EnvValue for HashMap<String, String> {
     fn parse_env(raw: &str, key: &str) -> Result<Self, String> {
         serde_json::from_str(raw).map_err(|err| {

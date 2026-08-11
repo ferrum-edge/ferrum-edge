@@ -17,10 +17,11 @@ use chrono::DateTime;
 use serde_json::Value;
 
 use super::gateway_api::{
-    allowed_route_namespaces, gateway_api_section_name_is_valid, listener_allowed_route_kinds,
-    listener_app_protocol, listener_is_materializable, listener_protocol_mode_is_supported,
-    listener_requires_frontend_tls, listener_selected_frontend_tls_source, namespace_selector,
-    namespace_selector_matches, normalize_gateway_hostname, validate_listenerset_listener_entry,
+    allowed_route_namespaces, collect_gateway_frontend_tls, gateway_api_section_name_is_valid,
+    listener_allowed_route_kinds, listener_app_protocol, listener_is_materializable,
+    listener_protocol_mode_is_supported, listener_requires_frontend_tls,
+    listener_selected_frontend_tls_source, namespace_selector, namespace_selector_matches,
+    normalize_gateway_hostname, validate_listenerset_listener_entry,
 };
 use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerConflict, GatewayApiListenerKey,
@@ -274,6 +275,8 @@ fn collect_one_listenerset(
         );
     }
 
+    collect_gateway_frontend_tls(acc, object);
+
     let accepted = saw_valid_listener;
     record_listenerset_status(
         acc,
@@ -417,7 +420,17 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
             if !candidate.eligible || conflicted.contains_key(&candidate.key) {
                 continue;
             }
-            if let Some(reason) = conflict_against_accepted(candidate, &accepted) {
+            // ListenerSet merge conflict is only applied to ListenerSet losers.
+            // Parent Gateway listeners stay accepted anchors (and keep their
+            // established co-existence, e.g. HTTPS catch-all + hostname
+            // siblings on :443). Marking Gateway-vs-Gateway siblings conflicted
+            // here wrongly suppresses routes such as HTTPRouteHTTPSListener's
+            // sectionName attachment to `https-with-hostname`. Process-wide
+            // HTTP-family vs raw TCP/TLS ProtocolConflict was already decided
+            // above; this walk only applies same-protocol HostnameConflict.
+            if let Some(reason) = conflict_against_accepted(candidate, &accepted)
+                && candidate.key.parent_kind == GatewayApiListenerParentKind::ListenerSet
+            {
                 conflicted.insert(candidate.key.clone(), reason);
                 continue;
             }
@@ -476,7 +489,6 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
 pub(crate) fn materialize_listenerset_mesh_services(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
-    namespace_tls_ready: bool,
 ) -> Result<(), K8sTranslateError> {
     let attached = acc
         .listenerset_statuses
@@ -508,7 +520,10 @@ pub(crate) fn materialize_listenerset_mesh_services(
         let Some(policy) = acc.gateway_api_listener_policies.get(&key) else {
             continue;
         };
-        if !policy.materializable || policy.conflict_reason.is_some() {
+        if !policy.materializable
+            || !policy.routes_materializable
+            || policy.conflict_reason.is_some()
+        {
             continue;
         }
         if policy.validation_error.is_some() {
@@ -518,7 +533,7 @@ pub(crate) fn materialize_listenerset_mesh_services(
             continue;
         }
         if listener_requires_frontend_tls(listener)
-            && (!namespace_tls_ready || !listener_is_materializable(acc, object, listener))
+            && !listener_is_materializable(acc, object, listener)
         {
             acc.warnings.push(format!(
                 "Gateway API ListenerSet {}/{} listener {} has unresolved TLS material and will not be exposed",

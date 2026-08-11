@@ -129,6 +129,8 @@ mod functional_tls_lifecycle_test;
 mod functional_tls_only_test;
 mod functional_transaction_debugger_body_capture_test;
 mod functional_udp_proxy_test;
+#[cfg(unix)]
+mod functional_unix_backend_test;
 mod functional_url_query_limits_test;
 mod functional_websocket_connection_limit_test;
 mod functional_websocket_frame_limit_test;

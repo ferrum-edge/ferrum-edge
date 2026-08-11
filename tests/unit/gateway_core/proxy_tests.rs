@@ -4753,7 +4753,7 @@ fn reqwest_dispatch_fails_closed_when_proxy_ttl_dns_preflight_fails() {
         (
             "initial dispatch",
             "async fn proxy_to_backend(",
-            "if dispatch_hbone {",
+            "if let Some(unix_target) = unix_target {",
             "return backend_dns_resolution_failed_dispatch_result(effective_host, &error);",
         ),
     ] {
@@ -4764,7 +4764,7 @@ fn reqwest_dispatch_fails_closed_when_proxy_ttl_dns_preflight_fails() {
             .find(if label == "retry" {
                 "let resolved_ip = match resolved_ip_result {"
             } else {
-                "let resolved_ip = if dispatch_hbone"
+                "let resolved_ip = if unix_target.is_some()"
             })
             .map(|offset| function_start + offset)
             .unwrap_or_else(|| panic!("{label}: missing DNS preflight result handling"));

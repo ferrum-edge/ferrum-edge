@@ -171,6 +171,10 @@ async fn test_prometheus_plugin_rejects_invalid_config_shapes() {
         json!({"render_cache_ttl_seconds": "5"}),
         json!({"stale_entry_ttl_seconds": -1}),
         json!({"cache_invalidation_min_age_ms": true}),
+        json!({"mesh_series_budget_per_family": 0}),
+        json!({"mesh_series_budget_per_family": 1_000_001}),
+        json!({"mesh_series_budget_per_family": -1}),
+        json!({"mesh_series_budget_per_family": "10000"}),
     ];
 
     for config in cases {
@@ -566,6 +570,14 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
     assert!(output.contains("# TYPE ferrum_node_agent_capture_state gauge"));
     assert!(output.contains("ferrum_node_agent_capture_state{state=\"starting\"} 1"));
     assert!(output.contains("ferrum_node_agent_capture_state{state=\"ready\"} 0"));
+    assert!(output.contains(
+        "ferrum_node_agent_ingress_interface_topology{state=\"disabled\",reason=\"disabled\"} 1"
+    ));
+    assert!(output.contains("ferrum_node_agent_ingress_interface_configured_interfaces 0"));
+    assert!(output.contains("ferrum_node_agent_ingress_interface_expected_interfaces 0"));
+    assert!(
+        output.contains("ferrum_node_agent_ingress_interface_family_required{family=\"ipv4\"} 0")
+    );
     // Nominal topology: gauge emitted as 0 with reason=none so dashboards
     // can always pin the expected value.
     assert!(output.contains("# TYPE ferrum_mesh_node_topology_degraded gauge"));
@@ -589,7 +601,7 @@ async fn test_registry_renders_node_agent_capture_state_condition() {
 #[tokio::test]
 async fn test_registry_renders_node_agent_capture_state_with_namespace_label() {
     let registry = MetricsRegistry::new();
-    registry.configure(5, 3600, 0, "ambient-system");
+    registry.configure(5, 3600, 0, 10_000, "ambient-system");
     let metrics = Arc::new(NodeAgentMetrics::default());
     metrics.set_capture_state(ferrum_edge::ebpf::NODE_AGENT_CAPTURE_STATE_READY);
 
@@ -1103,7 +1115,7 @@ fn request_mirror_lifecycle_counters_are_monotonic_label_safe_and_rendered() {
 #[test]
 fn request_mirror_lifecycle_counters_carry_namespace_label_when_configured() {
     let registry = MetricsRegistry::new();
-    registry.configure(5, 3600, 0, "staging");
+    registry.configure(5, 3600, 0, 10_000, "staging");
     registry.record_request_mirror_dispatched();
     let output = registry.render_uncached();
     assert!(output.contains(r#"ferrum_request_mirror_dispatched_total{namespace="staging"} 1"#));
@@ -1373,7 +1385,7 @@ async fn test_render_cache_returns_same_output() {
 async fn test_render_cache_invalidated_on_new_record() {
     let registry = MetricsRegistry::new();
     // Set min age to 0 so invalidation is immediate (test needs instant invalidation)
-    registry.configure(5, 3600, 0, "ferrum");
+    registry.configure(5, 3600, 0, 10_000, "ferrum");
     registry.record(&make_summary("inv-test-1", "GET", 200, 10.0, 5.0));
 
     let first = registry.render();
@@ -1390,7 +1402,7 @@ async fn test_render_cache_invalidated_on_new_record() {
 async fn test_render_cache_not_invalidated_when_young() {
     let registry = MetricsRegistry::new();
     // Set min age high so cache is never invalidated by record()
-    registry.configure(5, 3600, 60_000, "ferrum");
+    registry.configure(5, 3600, 60_000, 10_000, "ferrum");
     registry.record(&make_summary("young-1", "GET", 200, 10.0, 5.0));
 
     let first = registry.render();
@@ -1441,7 +1453,7 @@ async fn mesh_poll_failure_counters_are_live_across_the_render_cache() {
     // Long TTL and a high invalidation min-age so the cached body is guaranteed
     // to still be warm on the second scrape — the exact condition under which
     // the stale read used to happen.
-    registry.configure(300, 3600, 60_000, "ferrum");
+    registry.configure(300, 3600, 60_000, 10_000, "ferrum");
 
     let suffix = format!("{}-{}", std::process::id(), line!());
     let trust_domain = format!("cache-{suffix}.example");
@@ -1504,14 +1516,36 @@ async fn test_plugin_config_sets_registry_tunables() {
     let config = serde_json::json!({
         "render_cache_ttl_seconds": 10,
         "stale_entry_ttl_seconds": 7200,
-        "cache_invalidation_min_age_ms": 1000
+        "cache_invalidation_min_age_ms": 1000,
+        "mesh_series_budget_per_family": 2500
     });
-    let _plugin = PrometheusMetrics::new(&config, "ferrum").unwrap();
+    let registry = Arc::new(MetricsRegistry::new());
+    let plugin =
+        PrometheusMetrics::new_with_registry_for_test(&config, "ferrum", Arc::clone(&registry))
+            .unwrap();
+    assert_eq!(plugin.name(), "prometheus_metrics");
 
-    let _registry = global_registry();
-    // Can't read atomics directly from outside, but we can verify the plugin
-    // didn't error on valid config
-    assert_eq!(_plugin.name(), "prometheus_metrics");
+    // Exercise the same constructor wire-through as production without
+    // mutating the process-global registry shared by parallel tests.
+    assert_eq!(registry.mesh_series_budget_per_family_for_test(), 2500);
+}
+
+#[tokio::test]
+async fn test_plugin_config_rejects_unbounded_mesh_series_budget() {
+    let err = PrometheusMetrics::new(
+        &serde_json::json!({"mesh_series_budget_per_family": 0}),
+        "ferrum",
+    )
+    .err()
+    .expect("0 must be rejected — no unlimited mesh series mode");
+    assert!(
+        err.contains("mesh_series_budget_per_family"),
+        "error should name the field: {err}"
+    );
+    assert!(
+        err.contains("no unlimited mode"),
+        "error should reject unlimited mode: {err}"
+    );
 }
 
 #[tokio::test]
@@ -1529,7 +1563,7 @@ async fn test_plugin_config_saturates_extreme_tunables() {
 #[tokio::test]
 async fn test_namespace_label_present_for_default_namespace() {
     let registry = MetricsRegistry::new();
-    registry.configure(5, 3600, 0, "ferrum");
+    registry.configure(5, 3600, 0, 10_000, "ferrum");
     registry.record(&make_summary("ns-default", "GET", 200, 10.0, 5.0));
 
     let output = registry.render_uncached();
@@ -1545,7 +1579,7 @@ async fn test_namespace_label_present_for_default_namespace() {
 #[tokio::test]
 async fn test_namespace_label_present_for_non_default_namespace() {
     let registry = MetricsRegistry::new();
-    registry.configure(5, 3600, 0, "staging");
+    registry.configure(5, 3600, 0, 10_000, "staging");
     registry.record(&make_summary("ns-custom", "POST", 201, 20.0, 15.0));
 
     let output = registry.render_uncached();
@@ -1564,7 +1598,7 @@ async fn test_namespace_label_present_for_non_default_namespace() {
 #[test]
 fn test_mesh_metrics_use_distinct_gateway_namespace_label() {
     let registry = MetricsRegistry::new();
-    registry.configure(5, 3600, 0, "staging");
+    registry.configure(5, 3600, 0, 10_000, "staging");
     let mut summary = make_summary("mesh-namespace", "GET", 200, 10.0, 5.0);
     summary.metadata = HashMap::from([
         ("mesh.source.workload".to_string(), "frontend".to_string()),
@@ -1714,7 +1748,7 @@ async fn mesh_metrics_render_valid_labels_when_all_base_labels_are_removed() {
     assert!(output.contains("ferrum_mesh_request_duration_ms_sum{} 42.00"));
     assert!(output.contains("ferrum_mesh_request_duration_ms_count{} 1"));
 
-    registry.configure(5, 3600, 0, "mesh-system");
+    registry.configure(5, 3600, 0, 10_000, "mesh-system");
     let namespaced_output = registry.render_uncached();
     assert!(!namespaced_output.contains("{,"), "{namespaced_output}");
     assert!(
@@ -1758,7 +1792,7 @@ async fn mesh_metrics_render_valid_labels_when_all_base_labels_are_removed() {
 #[tokio::test]
 async fn test_namespace_label_with_stream_metrics() {
     let registry = MetricsRegistry::new();
-    registry.configure(5, 3600, 0, "prod");
+    registry.configure(5, 3600, 0, 10_000, "prod");
 
     let summary = StreamTransactionSummary {
         plugin_trigger_decisions: Default::default(),
@@ -1877,7 +1911,7 @@ async fn ai_token_metadata_records_and_renders_bounded_prometheus_families() {
         .await;
 
     let registry = MetricsRegistry::new();
-    registry.configure(0, 3600, 0, "tenant-a");
+    registry.configure(0, 3600, 0, 10_000, "tenant-a");
     let mut summary = make_summary("ai-proxy", "POST", 200, 10.0, 8.0);
     summary.ai_usage_export = ctx.authoritative_ai_usage_export();
     summary.metadata = ctx.metadata;
@@ -1902,7 +1936,7 @@ async fn ai_token_metadata_records_and_renders_bounded_prometheus_families() {
 #[test]
 fn federation_provider_aliases_use_bounded_ai_metric_families() {
     let registry = MetricsRegistry::new();
-    registry.configure(0, 3600, 0, "federation-ns");
+    registry.configure(0, 3600, 0, 10_000, "federation-ns");
     let aliases = [
         ("azure_openai", "openai"),
         ("xai", "openai"),
@@ -2071,7 +2105,7 @@ fn spoofed_backend_custom_and_malformed_ai_metadata_cannot_export_usage() {
 #[test]
 fn ai_usage_recording_is_concurrent_reload_safe_and_invalidates_render_cache() {
     let registry = Arc::new(MetricsRegistry::new());
-    registry.configure(3600, 3600, 0, "before-reload");
+    registry.configure(3600, 3600, 0, 10_000, "before-reload");
     let metadata = HashMap::from([
         ("ai_provider".to_string(), "anthropic".to_string()),
         ("ai_prompt_tokens".to_string(), "2".to_string()),
@@ -2110,7 +2144,7 @@ fn ai_usage_recording_is_concurrent_reload_safe_and_invalidates_render_cache() {
         "ferrum_ai_tokens_total{proxy_id=\"concurrent-ai\",provider=\"anthropic\",namespace=\"before-reload\"} 2400"
     ));
 
-    registry.configure(3600, 3600, 0, "after-reload");
+    registry.configure(3600, 3600, 0, 10_000, "after-reload");
     let reloaded = registry.render();
     assert!(reloaded.contains(
         "ferrum_ai_tokens_total{proxy_id=\"concurrent-ai\",provider=\"anthropic\",namespace=\"after-reload\"} 2400"
@@ -2315,7 +2349,7 @@ const SNAPSHOT_MAX_AGE_LINE: &str =
 #[test]
 fn tls_inventory_freshness_renders_timestamp_and_configured_bound() {
     let registry = MetricsRegistry::new();
-    registry.configure(5, 3600, 60_000, "ferrum");
+    registry.configure(5, 3600, 60_000, 10_000, "ferrum");
 
     registry.set_tls_inventory_freshness(Some((1_700_000_000, 300)));
 
@@ -2349,7 +2383,7 @@ async fn unchanged_tls_inventory_freshness_preserves_the_render_cache() {
     // A high invalidation min-age keeps `record()` from clearing the cache, so
     // the only candidate invalidation source is the freshness publication.
     let registry = MetricsRegistry::new();
-    registry.configure(5, 3600, 60_000, "ferrum");
+    registry.configure(5, 3600, 60_000, 10_000, "ferrum");
     registry.set_tls_inventory_freshness(Some((1_700_000_000, 300)));
 
     let first = registry.render();

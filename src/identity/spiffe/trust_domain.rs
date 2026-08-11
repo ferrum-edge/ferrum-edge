@@ -20,7 +20,10 @@ use std::str::FromStr;
 ///
 /// Example: in `spiffe://prod.example.com/ns/foo/sa/bar`, the trust domain is
 /// `prod.example.com`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// `Ord` is derived so trust domains can key a `BTreeMap` — JWT bundle
+/// responses are assembled that way so the serialized map is byte-stable
+/// across rebuilds and can be compared for change detection.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TrustDomain(String);
 
 impl Serialize for TrustDomain {

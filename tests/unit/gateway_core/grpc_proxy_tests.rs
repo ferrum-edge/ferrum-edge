@@ -528,14 +528,14 @@ fn streaming_dispatch_acquires_sender_before_wrapping_frontend_upload() {
 
 #[test]
 fn h2c_settings_observer_preserves_vectored_writes() {
-    let source = include_str!("../../../src/proxy/grpc_proxy.rs");
+    let source = include_str!("../../../src/proxy/h2c_preface.rs");
     let start = source
-        .find("impl<T: AsyncWrite + Unpin> AsyncWrite for H2cSettingsIo<T>")
-        .expect("H2cSettingsIo AsyncWrite implementation not found");
+        .find("impl<T: AsyncWrite + Unpin> AsyncWrite for H2cPrefaceIo<T>")
+        .expect("H2cPrefaceIo AsyncWrite implementation not found");
     let implementation = &source[start..];
     let end = implementation
-        .find("\n}\n\n/// Wait for positive proof")
-        .expect("H2cSettingsIo AsyncWrite implementation end not found");
+        .find("\n}\n\n/// Why an h2c connection")
+        .expect("H2cPrefaceIo AsyncWrite implementation end not found");
     let implementation = &implementation[..end];
 
     assert!(
@@ -562,6 +562,19 @@ fn h2c_settings_observer_preserves_vectored_writes() {
             && source.contains("Pin::new(&mut *conn).poll(cx)"),
         "Hyper must receive one post-observation poll so a protocol error wins the readiness race"
     );
+
+    // Both h2c transports must establish through the shared observer: hyper's
+    // client handshake proves only the client half, so a second, private
+    // implementation is exactly the drift this guard exists to prevent.
+    for consumer in [
+        include_str!("../../../src/proxy/grpc_proxy.rs"),
+        include_str!("../../../src/proxy/unix_backend.rs"),
+    ] {
+        assert!(
+            consumer.contains("await_peer_settings("),
+            "every h2c transport must gate its sender on the observed peer preface"
+        );
+    }
 }
 
 /// The NESTED HTTP/2 connection the Ambient HBONE gRPC transport runs inside its
@@ -585,13 +598,26 @@ fn nested_hbone_grpc_transport_awaits_the_destination_apps_h2c_preface() {
         .expect("the Ambient HBONE gRPC sender must terminate");
     let body = &body[..end];
 
+    // The observer lives in the shared `proxy::h2c_preface` module (issue
+    // #3261 extracted it so the Unix h2c transport reuses one implementation),
+    // so match the shared type rather than a module-private copy.
+    let observer_at = body
+        .find("h2c_preface::H2cPrefaceIo::new(")
+        .expect("the nested HTTP/2 client must run over the shared h2c preface observer");
+    let handshake_at = body
+        .find("builder.handshake(io)")
+        .expect("the nested HTTP/2 client must hand the wrapped IO to hyper's handshake");
     assert!(
-        body.contains("H2cSettingsIo::new(tunnel"),
-        "the nested HTTP/2 client must run over the shared h2c preface observer, \
-         not the bare tunnel"
+        observer_at < handshake_at,
+        "the CONNECT byte tunnel must be wrapped in the shared preface observer \
+         before hyper's handshake, not handed over bare"
     );
     assert!(
-        body.contains("await_h2c_peer_settings(&mut connection"),
+        body[observer_at..handshake_at].contains("tunnel,"),
+        "the observer must wrap the CONNECT byte tunnel itself, not another transport"
+    );
+    assert!(
+        body.contains("await_peer_settings(&mut connection"),
         "the nested sender must be admitted only after the destination app's own \
          HTTP/2 connection preface"
     );
@@ -2766,6 +2792,43 @@ async fn grpc_transport_for_untagged_and_absent_targets_is_the_direct_pool() {
     assert_eq!(direct.label(), "direct");
 }
 
+/// A Sidecar `ingress[]` Unix-socket target must FAIL CLOSED here for BOTH
+/// wire protocols (issue #3261 × #3284). `GrpcDispatchTransport` materializes
+/// network transports only; a Unix target's `host:port` is a schema-only
+/// loopback placeholder, so a `Direct` fallback would dial an unrelated
+/// listener instead of the socket — the exact placeholder-TCP fallback the Unix
+/// ingress work forbids. The supported h2c Unix dispatch is reached through the
+/// generic HTTP-family path, which never routes through this resolver.
+#[tokio::test]
+async fn grpc_transport_for_unix_socket_targets_fails_closed_for_both_protocols() {
+    let pools = TransportTestPools::new();
+    let unix = ferrum_edge::proxy::unix_backend::MESH_UNIX_SOCKET_TAG;
+    let h2c = ferrum_edge::proxy::unix_backend::MESH_UNIX_SOCKET_H2C_TAG;
+    let secret_path = "/run/ferrum/tenant-a/app.sock";
+
+    for (label, is_h2c) in [("h2c", "true"), ("http1", "false")] {
+        let target = target_with_tags(&[(unix, secret_path), (h2c, is_h2c)]);
+        let error = pools
+            .resolve(Some(&target))
+            .err()
+            .expect("a unix-socket target must never materialize a network transport");
+        assert!(
+            matches!(error, grpc_proxy::GrpcTransportError::Unsupported { .. }),
+            "{label}: a unix-socket target is unsupported here, not an identity failure"
+        );
+        assert_eq!(
+            error.diagnostic(),
+            grpc_proxy::GrpcTransportDiagnostic::MeshUnixSocket,
+            "{label}: the diagnostic must name the unix transport tag"
+        );
+        assert!(
+            !error.message().contains(secret_path)
+                && !error.diagnostic().as_str().contains(secret_path),
+            "{label}: neither the client message nor the diagnostic may echo the socket path"
+        );
+    }
+}
+
 #[tokio::test]
 async fn grpc_transport_for_same_cluster_mesh_mtls_resolves_the_sidecar_transport() {
     let pools = TransportTestPools::new();
@@ -3104,6 +3167,7 @@ async fn grpc_transport_diagnostic_labels_are_tag_names_never_values() {
         grpc_proxy::GrpcTransportDiagnostic::MeshTrustDomain,
         grpc_proxy::GrpcTransportDiagnostic::ConflictingMeshTransports,
         grpc_proxy::GrpcTransportDiagnostic::CrossClusterMissingTransport,
+        grpc_proxy::GrpcTransportDiagnostic::MeshUnixSocket,
     ] {
         let label = category.as_str();
         assert!(
@@ -3143,6 +3207,15 @@ async fn grpc_transport_diagnostic_labels_are_tag_names_never_values() {
     assert_eq!(
         grpc_proxy::GrpcTransportDiagnostic::CrossClusterMissingTransport.as_str(),
         "cross_cluster_missing_transport"
+    );
+    // The unix label is the reserved TAG NAME, never the configured path.
+    assert_eq!(
+        grpc_proxy::GrpcTransportDiagnostic::MeshUnixSocket.as_str(),
+        "mesh.unix_socket"
+    );
+    assert_eq!(
+        grpc_proxy::GrpcTransportDiagnostic::MeshUnixSocket.as_str(),
+        ferrum_edge::proxy::unix_backend::MESH_UNIX_SOCKET_TAG
     );
 }
 

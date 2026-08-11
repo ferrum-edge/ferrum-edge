@@ -5,12 +5,15 @@ on:
   pull_request:
     paths:
       - ".github/workflows/node-waypoint-ebpf-live.yml"
+      - ".dockerignore"
       - ".github/actions/package-ferrum-runtime-image/**"
       - ".github/actions/setup-kubernetes-tools/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile"
+      - "Dockerfile.iproute2-layer"
       - "Dockerfile.release"
+      - ".github/scripts/stage_iproute2_runtime.sh"
       - "build.rs"
       - "proto/**"
       - "ebpf/**"
@@ -58,6 +61,73 @@ env:
   ISTIO_CRD_SHA256: 952afcf4b1bf47d2bdf1f230d636f9e613c3ee9cc68ef53ab751f6d59e2ee205
 
 jobs:
+  production-dockerfile-smoke:
+    name: Production Dockerfile eBPF image smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Build ordinary and eBPF production targets
+        run: |
+          set -euo pipefail
+          docker build \
+            --tag ferrum-edge:production-default-smoke \
+            --file Dockerfile \
+            .
+          docker build \
+            --target runtime-ebpf \
+            --build-arg FEATURES=cloud-secrets,ebpf \
+            --tag ferrum-edge:production-ebpf-smoke \
+            --file Dockerfile \
+            .
+
+      - name: Verify distroless runtime contracts
+        run: |
+          set -euo pipefail
+          ordinary_image=ferrum-edge:production-default-smoke
+          ebpf_image=ferrum-edge:production-ebpf-smoke
+          docker run --rm --entrypoint /app/ferrum-edge "$ordinary_image" version
+          docker run --rm --entrypoint /app/ferrum-edge "$ebpf_image" version
+          docker run --rm --entrypoint /usr/sbin/ip "$ebpf_image" -V
+
+          inventory_image() {
+            image="$1"
+            output="$2"
+            container="$(docker create "$image")"
+            docker export "$container" | tar -tf - | sed -e 's#^\./##' -e 's#^/##' > "$output"
+            docker rm "$container" >/dev/null
+          }
+          inventory_image "$ordinary_image" ordinary-runtime-files.txt
+          inventory_image "$ebpf_image" ebpf-runtime-files.txt
+
+          # Positive controls prove the normalized exact-path assertion is live.
+          grep -Fxq app/ferrum-edge ordinary-runtime-files.txt
+          grep -Fxq app/ferrum-edge ebpf-runtime-files.txt
+          grep -Fxq usr/sbin/ip ebpf-runtime-files.txt
+          if grep -Fxq usr/sbin/ip ordinary-runtime-files.txt; then
+            echo "ordinary runtime unexpectedly contains eBPF-only /usr/sbin/ip" >&2
+            exit 1
+          fi
+
+          for inventory in ordinary-runtime-files.txt ebpf-runtime-files.txt; do
+            for forbidden in \
+              bin/sh usr/bin/sh bin/bash usr/bin/bash bin/dash usr/bin/dash \
+              bin/ash usr/bin/ash bin/zsh usr/bin/zsh bin/ksh usr/bin/ksh \
+              bin/busybox usr/bin/busybox sbin/apk usr/sbin/apk usr/bin/apk \
+              usr/bin/apt usr/bin/apt-cache usr/bin/apt-get \
+              usr/bin/dpkg usr/bin/dpkg-query usr/bin/rpm usr/bin/yum \
+              usr/bin/dnf usr/bin/microdnf usr/sbin/iptables \
+              usr/sbin/ip6tables usr/sbin/nft; do
+              if grep -Fxq "$forbidden" "$inventory"; then
+                echo "forbidden runtime tool is present: /$forbidden" >&2
+                exit 1
+              fi
+            done
+          done
+
   node-waypoint-ebpf-live:
     name: NodeWaypoint eBPF live datapath
     runs-on: ubuntu-24.04
@@ -95,12 +165,23 @@ jobs:
       - name: Build eBPF program
         run: cd ebpf && cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release -p ferrum-ebpf
 
-      - name: Package eBPF image
+      - name: Package eBPF base image
         uses: ./.github/actions/package-ferrum-runtime-image
         with:
           binary-path: target/pr-build/ferrum-edge
-          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf-base
           bpf-elf-path: ebpf/target/bpfel-unknown-none/release/ferrum-ebpf
+
+      - name: Add distroless iproute2 runtime closure
+        env:
+          BASE_IMAGE: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf-base
+          FINAL_IMAGE: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}-ebpf
+        run: |
+          docker build \
+            --build-arg BASE_IMAGE="$BASE_IMAGE" \
+            --file Dockerfile.iproute2-layer \
+            --tag "$FINAL_IMAGE" \
+            .
 
       - name: Install Kubernetes tools
         uses: ./.github/actions/setup-kubernetes-tools
@@ -170,6 +251,7 @@ jobs:
           FERRUM_EBPF_LIVE_ACK_DISPOSABLE: "true"
           FERRUM_LIVE_KEEP_RESOURCES: "true"
           FERRUM_LIVE_REQUIRE_DUAL_STACK: "true"
+          FERRUM_LIVE_TESTS_REQUIRED: "1"
           FERRUM_LIVE_IMAGE_REPOSITORY: ${{ env.FERRUM_IMAGE_REPOSITORY }}
           FERRUM_LIVE_IMAGE_TAG: ${{ env.FERRUM_IMAGE_TAG }}
           FERRUM_LIVE_DOCKER_NODE_EVIDENCE: "true"

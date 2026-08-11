@@ -773,13 +773,13 @@ pub(crate) async fn handle_h3_websocket(
     // connection closes. Captured out of the loop alongside the handshake.
     let backend_conn_guard;
     let backend_handshake = loop {
-        // The H3 WebSocket bridge has no `websocket_mesh_egress` fork —
-        // `connect_websocket_backend` is a plain TCP/TLS dial. A direct dial to
-        // a mesh-tagged target would bypass the secured mesh transport, so fail
-        // closed BEFORE dialing (issue #2007). Sits at the loop top so the
-        // initial target AND every retry-rotated target re-entering the loop
-        // are screened.
-        if let Some(reason) = crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(
+        // The H3 WebSocket bridge has no `websocket_mesh_egress` or Unix fork —
+        // `connect_websocket_backend` is a plain TCP/TLS dial. A direct dial
+        // would bypass the secured mesh transport or hit a Unix target's
+        // schema-only placeholder, so fail closed BEFORE dialing (issues #2007
+        // and #3261). Sits at the loop top so the initial target AND every
+        // retry-rotated target re-entering the loop are screened.
+        if let Some(reason) = crate::proxy::backend_dispatch::direct_network_http_transport_refusal(
             current_target.as_deref(),
         ) {
             warn!(
@@ -787,7 +787,7 @@ pub(crate) async fn handle_h3_websocket(
                 target_host = current_target.as_deref().map(|target| target.host.as_str()).unwrap_or(""),
                 target_port = current_target.as_deref().map(|target| target.port).unwrap_or(0),
                 reason,
-                "H3 WebSocket: refusing direct dial to a mesh-transport-tagged target"
+                "H3 WebSocket: refusing direct dial to a target requiring another transport"
             );
             // Gateway-side dispatch-policy shed with no backend dialed: neutral
             // to the breaker (releases a claimed HALF_OPEN probe slot) and to

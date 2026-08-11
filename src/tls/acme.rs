@@ -1781,15 +1781,56 @@ fn build_tls_alpn01_certified_key(
 }
 
 #[derive(Debug)]
+/// What serves a ClientHello that is NOT an `acme-tls/1`-only validation probe.
+///
+/// A single certificate is the ordinary listener; a nested resolver is the
+/// Gateway multi-certificate SNI path (#3267). Keeping ACME on the outside
+/// means TLS-ALPN-01 validation keeps working unchanged for every listener,
+/// whichever credential shape sits underneath it.
+enum AcmeResolverFallback {
+    Single(Arc<rustls::sign::CertifiedKey>),
+    Resolver(Arc<dyn rustls::server::ResolvesServerCert>),
+}
+
+impl AcmeResolverFallback {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        match self {
+            Self::Single(certified_key) => Some(certified_key.clone()),
+            Self::Resolver(resolver) => resolver.resolve(client_hello),
+        }
+    }
+}
+
 pub struct AcmeTlsAlpnResolver {
-    fallback: Arc<rustls::sign::CertifiedKey>,
+    fallback: AcmeResolverFallback,
     cache: Mutex<BTreeMap<String, Arc<rustls::sign::CertifiedKey>>>,
+}
+
+impl std::fmt::Debug for AcmeTlsAlpnResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cached_keys = self.cache.lock().map(|cache| cache.len()).unwrap_or(0);
+        f.debug_struct("AcmeTlsAlpnResolver")
+            .field("cached_keys", &cached_keys)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AcmeTlsAlpnResolver {
     pub fn new(fallback: Arc<rustls::sign::CertifiedKey>) -> Self {
         Self {
-            fallback,
+            fallback: AcmeResolverFallback::Single(fallback),
+            cache: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Wrap an inner resolver (Gateway multi-certificate SNI selection) so
+    /// ACME TLS-ALPN-01 validation still takes precedence over it.
+    pub fn with_resolver(fallback: Arc<dyn rustls::server::ResolvesServerCert>) -> Self {
+        Self {
+            fallback: AcmeResolverFallback::Resolver(fallback),
             cache: Mutex::new(BTreeMap::new()),
         }
     }
@@ -1821,7 +1862,7 @@ impl rustls::server::ResolvesServerCert for AcmeTlsAlpnResolver {
         {
             return Some(certified_key);
         }
-        Some(self.fallback.clone())
+        self.fallback.resolve(client_hello)
     }
 }
 

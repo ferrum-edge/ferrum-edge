@@ -48,6 +48,8 @@ fn test_runtime() -> MeshRuntimeConfig {
         xds_connect_timeout_seconds: 10,
         trust_domain_aliases: Vec::new(),
         trusted_hbone_assertors: Vec::new(),
+        unix_socket_allowed_roots: Vec::new(),
+        unix_socket_allowed_uids: Vec::new(),
         workload_labels: HashMap::from([("app".to_string(), "api".to_string())]),
         workload_svid_cert_path: None,
         workload_svid_key_path: None,

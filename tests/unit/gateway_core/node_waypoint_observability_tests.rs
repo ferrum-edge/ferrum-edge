@@ -215,7 +215,7 @@ fn node_waypoint_inbound_tls_failure_bypasses_metrics_render_cache() {
     let registry = MetricsRegistry::new();
     // Keep the registry body cached across the producer increment. A non-empty
     // namespace also exercises gateway_namespace label append on the live series.
-    registry.configure(5, 3600, 60_000, "ferrum");
+    registry.configure(5, 3600, 60_000, 10_000, "ferrum");
 
     // Live harness passes closed selectors; optional gateway_namespace may be
     // appended before the closing `}` when the Prometheus plugin is configured.

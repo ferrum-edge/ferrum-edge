@@ -1775,6 +1775,179 @@ fn test_api_chargeback_rejects_duplicate_proxy_group_instances() {
     assert!(error.contains("group-a") && error.contains("group-b"));
 }
 
+fn workload_metrics_family_set_overrides(metric: &str, count: usize) -> serde_json::Value {
+    // Each max-length set encodes to 264 plan bytes (`s0,256:` + 256 + `;`).
+    // 62 entries plus the `m0;` family header stay under the 16384-byte
+    // single-instance ceiling; two different-family instances at that size
+    // exceed the composed effective-chain budget.
+    let overrides: Vec<_> = (0..count)
+        .map(|_| {
+            json!({
+                "metric": metric,
+                "name": "source_workload",
+                "operation": {"type": "set", "value": "x".repeat(256)}
+            })
+        })
+        .collect();
+    json!({ "metrics": { "tag_overrides": overrides } })
+}
+
+#[test]
+fn test_workload_metrics_effective_plan_budget_rejects_multi_family_over_cap() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["wm-count", "wm-duration"])],
+        vec![
+            make_plugin_config_with_json(
+                "wm-count",
+                "workload_metrics",
+                workload_metrics_family_set_overrides("REQUEST_COUNT", 62),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "wm-duration",
+                "workload_metrics",
+                workload_metrics_family_set_overrides("REQUEST_DURATION", 62),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("composed different-family plans above 16384 must fail closed");
+    assert!(
+        error.contains("proxy_id=p1"),
+        "diagnostic must identify the proxy without echoing plans: {error}"
+    );
+    assert!(
+        error.contains("exceed 16384 encoded bytes across surviving families"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !error.contains("xxxx"),
+        "diagnostic must not echo plan/value bytes: {error}"
+    );
+}
+
+#[test]
+fn test_workload_metrics_effective_plan_budget_measures_same_family_as_replacement() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["wm-first", "wm-second"])],
+        vec![
+            make_plugin_config_with_json(
+                "wm-first",
+                "workload_metrics",
+                workload_metrics_family_set_overrides("REQUEST_COUNT", 62),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "wm-second",
+                "workload_metrics",
+                workload_metrics_family_set_overrides("REQUEST_COUNT", 62),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config)
+        .expect("same-family later replacement must be measured as replacement, not addition");
+    assert_eq!(
+        cache
+            .get_plugins("ferrum", "p1")
+            .iter()
+            .filter(|plugin| plugin.name() == "workload_metrics")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn test_workload_metrics_effective_plan_budget_retains_earlier_plan_when_trigger_can_skip() {
+    let mut earlier = make_plugin_config_with_json(
+        "wm-earlier",
+        "workload_metrics",
+        workload_metrics_family_set_overrides("REQUEST_COUNT", 62),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    earlier.priority_override = Some(9359);
+
+    let mut conditional_replacement = make_plugin_config_with_json(
+        "wm-conditional",
+        "workload_metrics",
+        workload_metrics_family_set_overrides("REQUEST_COUNT", 1),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    conditional_replacement.priority_override = Some(9360);
+    conditional_replacement.trigger = Some(
+        serde_json::from_value(json!({
+            "when": {"match": {"method": ["POST"]}}
+        }))
+        .expect("valid method trigger"),
+    );
+
+    let mut other_family = make_plugin_config_with_json(
+        "wm-duration",
+        "workload_metrics",
+        workload_metrics_family_set_overrides("REQUEST_DURATION", 1),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    other_family.priority_override = Some(9361);
+
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["wm-earlier", "wm-conditional", "wm-duration"],
+        )],
+        vec![earlier, conditional_replacement, other_family],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("a skipped replacement can leave the larger earlier plan effective");
+    assert!(
+        error.contains("exceed 16384 encoded bytes across surviving families"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn test_workload_metrics_effective_plan_budget_admits_within_budget_chain() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["wm-count", "wm-duration"])],
+        vec![
+            make_plugin_config_with_json(
+                "wm-count",
+                "workload_metrics",
+                workload_metrics_family_set_overrides("REQUEST_COUNT", 10),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "wm-duration",
+                "workload_metrics",
+                workload_metrics_family_set_overrides("REQUEST_DURATION", 10),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config)
+        .expect("within-budget multi-instance different-family chain must remain valid");
+    assert_eq!(
+        cache
+            .get_plugins("ferrum", "p1")
+            .iter()
+            .filter(|plugin| plugin.name() == "workload_metrics")
+            .count(),
+        2
+    );
+}
+
 #[test]
 fn test_api_chargeback_rejects_mixed_proxy_and_proxy_group_instances() {
     let config = make_config(

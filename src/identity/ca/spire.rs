@@ -22,6 +22,25 @@
 //! SVIDs (the in-process Workload API server) should use the internal CA
 //! or Vault PKI backend instead.
 //!
+//! ## JWT trust material (issue #3617)
+//!
+//! When this adapter is constructed directly, a second background task consumes
+//! the agent's own `FetchJWTBundles` stream and converts each JWKS document back
+//! into the SPKI-PEM form the identity subsystem speaks. It is independent of
+//! the X.509 readiness gate: a SPIRE deployment with no JWT-SVID registration
+//! entries answers `UNIMPLEMENTED`, and that is retried on the ordinary
+//! reconnect schedule rather than failing construction. A malformed bundle is
+//! never installed — the last good snapshot is retained — so hostile or corrupt
+//! material can neither widen nor blank the trusted set.
+//!
+//! The active mesh `FERRUM_MESH_CA_BACKEND=spire` path uses the dedicated X.509
+//! fetch loop and does **not** construct this adapter or start its JWT stream.
+//! Consequently this helper must not be described as live mesh SPIRE JWT-bundle
+//! consumption until that runtime wiring exists.
+//!
+//! JWT-SVID **mint** stays fail-closed here; see [`SpireAgentCa::jwt_authorities`]
+//! for why that is a terminal capability boundary rather than a deferral.
+//!
 //! ## Configuration
 //!
 //! - `FERRUM_MESH_SPIRE_AGENT_SOCKET` — path to the SPIRE Agent UDS.
@@ -43,7 +62,7 @@ use super::{
 };
 use crate::identity::SvidBundle;
 use crate::identity::spiffe::TrustDomain;
-use crate::identity::workload_api::client::WorkloadApiClient;
+use crate::identity::workload_api::client::{JwtBundleSet, WorkloadApiClient};
 
 /// Default UDS path for the SPIRE Agent. Operators override via
 /// `FERRUM_MESH_SPIRE_AGENT_SOCKET`.
@@ -96,6 +115,14 @@ pub struct SpireAgentCa {
     first_received: Arc<std::sync::atomic::AtomicBool>,
     /// Cancels the detached Workload API stream task when this CA is dropped.
     stream_task_abort: AbortHandle,
+    /// JWT authorities the agent publishes, keyed by trust domain. Fed by a
+    /// second background stream over the agent's own `FetchJWTBundles` RPC and
+    /// read lock-free. Empty until the agent pushes a bundle (or forever, when
+    /// the deployment issues no JWT-SVIDs), in which case `FetchJWTBundles` /
+    /// `ValidateJWTSVID` answer `UNIMPLEMENTED` rather than an empty map.
+    jwt_bundles: Arc<ArcSwap<JwtBundleSet>>,
+    /// Cancels the detached JWT bundle stream task when this CA is dropped.
+    jwt_stream_task_abort: AbortHandle,
 }
 
 impl SpireAgentCa {
@@ -113,14 +140,27 @@ impl SpireAgentCa {
             Arc::clone(&first_ready),
             Arc::clone(&first_received),
         ));
+        // JWT trust material rides its own stream (issue #3617). It is
+        // deliberately NOT joined to the X.509 stream's readiness: a deployment
+        // that issues no JWT-SVIDs must still start, and JWT bundles are not
+        // required to bind a listener the way an X.509 SVID is.
+        let jwt_bundles: Arc<ArcSwap<JwtBundleSet>> =
+            Arc::new(ArcSwap::new(Arc::new(JwtBundleSet::new())));
+        let jwt_stream_task = tokio::spawn(jwt_bundle_stream_loop(
+            config.socket_path.clone(),
+            Arc::clone(&jwt_bundles),
+        ));
         let ca = Self {
             config: config.clone(),
             current: Arc::clone(&current),
             first_ready: Arc::clone(&first_ready),
             first_received: Arc::clone(&first_received),
             stream_task_abort: stream_task.abort_handle(),
+            jwt_bundles: Arc::clone(&jwt_bundles),
+            jwt_stream_task_abort: jwt_stream_task.abort_handle(),
         };
         drop(stream_task);
+        drop(jwt_stream_task);
 
         // Wait for the first SVID with a timeout so startup does not hang
         // indefinitely when the agent is unreachable.
@@ -192,6 +232,7 @@ impl SpireAgentCa {
 impl Drop for SpireAgentCa {
     fn drop(&mut self) {
         self.stream_task_abort.abort();
+        self.jwt_stream_task_abort.abort();
     }
 }
 
@@ -413,29 +454,136 @@ impl CertificateAuthority for SpireAgentCa {
         Ok(published)
     }
 
+    /// Publish the JWT authorities the SPIRE agent's own `FetchJWTBundles`
+    /// stream has delivered for `td` (issue #3617).
+    ///
+    /// For a caller that explicitly constructs this adapter, Ferrum consumes
+    /// the agent's JWKS documents, converts them to the SPKI-PEM form the
+    /// identity subsystem speaks, and holds them to exactly the bounds a locally
+    /// published bundle is held to. Nothing here carries a private key. Mesh
+    /// startup currently uses its dedicated X.509 fetch loop instead and does
+    /// not construct `SpireAgentCa`, so this is helper capability rather than a
+    /// claim about live `FERRUM_MESH_CA_BACKEND=spire` runtime wiring.
+    ///
+    /// A trust domain the agent has published no JWT authorities for returns an
+    /// empty vector, which the Workload API reports as `UNIMPLEMENTED` — never
+    /// as an empty (and therefore misleading) bundle map. An `UnknownTrustDomain`
+    /// error is reserved for a domain the agent serves no trust material for at
+    /// all, so a federated peer that simply has no JWT keys is distinguishable
+    /// from one Ferrum does not federate with.
+    ///
+    /// ## Terminal capability boundary: mint stays fail-closed
+    ///
+    /// `jwt_signer()` deliberately keeps the trait default (`None`), and that is
+    /// **not** a deferral that local work can close. A SPIRE agent authorizes
+    /// `FetchJWTSVID` against the *calling process's* attested identity, so
+    /// proxying the ordinary agent Workload API would return a token whose `sub`
+    /// is Ferrum's own SPIFFE ID rather than the downstream workload's — a
+    /// silent identity substitution, which is strictly worse than
+    /// `UNIMPLEMENTED`. Minting for a delegated subject requires SPIRE's
+    /// delegated-identity / admin API, an explicitly authorized integration
+    /// Ferrum is not granted here. Until such an integration is configured, mint
+    /// must fail closed; do not "fix" this by proxying the agent's own mint RPC.
     async fn jwt_authorities(
         &self,
         td: &TrustDomain,
     ) -> Result<Vec<PublishedJwtAuthority>, CaError> {
+        // Lock-free read of the JWT bundle snapshot. Checked FIRST so a
+        // deployment whose JWT bundles have arrived but whose X.509 stream is
+        // momentarily reconnecting still serves JWT trust material.
+        let jwt_bundles = self.jwt_bundles.load();
+        if let Some(authorities) = jwt_bundles.get(td) {
+            return Ok(authorities.clone());
+        }
+        // The agent has published no JWT authorities for this domain. Fall back
+        // to whatever the X.509 bundle set carried (a native/file-sourced
+        // deployment can populate `TrustBundle.jwt_authorities` directly), and
+        // distinguish "no JWT keys" from "not a trust domain we hold at all".
         let snap = self.snapshot().ok_or_else(|| {
             CaError::Upstream("SPIRE agent has not yet pushed trust bundles".to_string())
         })?;
-
         let bundle = snap
             .bundle
             .trust_bundles
             .get(td)
             .ok_or_else(|| CaError::UnknownTrustDomain(td.to_string()))?;
-
         Ok(bundle
             .jwt_authorities
             .iter()
-            .map(|ja| PublishedJwtAuthority {
-                trust_domain: td.clone(),
-                key_id: ja.key_id.clone(),
-                public_key_pem: ja.public_key_pem.clone(),
+            .map(|ja| {
+                // The X.509 trust-bundle carrier holds a bare SPKI PEM with no
+                // `alg`, so nothing is declared here. Validation then applies the
+                // conservative undeclared-key policy rather than the key type's
+                // full family — see `jwt_svid::decoding_key_for_authority`.
+                PublishedJwtAuthority::new(td.clone(), ja.key_id.clone(), ja.public_key_pem.clone())
             })
             .collect())
+    }
+}
+
+/// Background loop consuming the SPIRE agent's `FetchJWTBundles` stream into
+/// [`SpireAgentCa::jwt_bundles`].
+///
+/// Deliberately tolerant of an agent that does not serve the RPC at all: a
+/// SPIRE deployment with no JWT-SVID entries answers `UNIMPLEMENTED`, and that
+/// must not become a reconnect storm or a startup failure. It is logged once per
+/// connection attempt at debug and retried on the same exponential backoff
+/// schedule as the X.509 stream, so a later agent upgrade is picked up with no
+/// restart.
+///
+/// A malformed bundle is *not* installed: the previous snapshot is retained, so
+/// hostile or corrupt material can neither widen nor blank the trusted set.
+async fn jwt_bundle_stream_loop(socket_path: String, jwt_bundles: Arc<ArcSwap<JwtBundleSet>>) {
+    let mut backoff = RECONNECT_BACKOFF_INITIAL;
+    loop {
+        match WorkloadApiClient::connect(&socket_path).await {
+            Ok(mut client) => match client.fetch_jwt_bundles_stream().await {
+                Ok(mut stream) => {
+                    info!(socket = %socket_path, "SPIRE agent CA: JWT bundle stream established");
+                    backoff = RECONNECT_BACKOFF_INITIAL;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(set) => {
+                                debug!(
+                                    trust_domains = set.len(),
+                                    "SPIRE agent CA: received JWT bundles"
+                                );
+                                jwt_bundles.store(Arc::new(set));
+                            }
+                            Err(e) => {
+                                // Terminal for this stream. Keep the last good
+                                // snapshot: dropping it would strand workloads
+                                // that already validate against it.
+                                warn!(
+                                    socket = %socket_path,
+                                    error = %e,
+                                    "SPIRE agent CA: JWT bundle stream failed; retaining the last \
+                                     published JWT authorities"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        socket = %socket_path,
+                        error = %e,
+                        "SPIRE agent CA: agent does not serve FetchJWTBundles (or refused it); \
+                         JWT-SVID bundle/validate stay UNIMPLEMENTED until it does"
+                    );
+                }
+            },
+            Err(e) => {
+                debug!(
+                    socket = %socket_path,
+                    error = %e,
+                    "SPIRE agent CA: JWT bundle stream connect failed"
+                );
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
     }
 }
 
@@ -477,12 +625,18 @@ mod tests {
     }
 
     fn test_ca_with_bundle(bundle: SvidBundle, stream_task_abort: AbortHandle) -> SpireAgentCa {
+        // The JWT bundle stream is inert here: these tests cover the X.509
+        // issuance boundary, and an empty set is exactly what an agent that
+        // publishes no JWT authorities produces.
+        let jwt_stream_task_abort = stream_task_abort.clone();
         SpireAgentCa {
             config: SpireAgentCaConfig::default(),
             current: Arc::new(ArcSwap::new(Arc::new(Some(AgentSnapshot { bundle })))),
             first_ready: Arc::new(Notify::new()),
             first_received: Arc::new(AtomicBool::new(true)),
             stream_task_abort,
+            jwt_bundles: Arc::new(ArcSwap::new(Arc::new(JwtBundleSet::new()))),
+            jwt_stream_task_abort,
         }
     }
 

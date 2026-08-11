@@ -10604,7 +10604,11 @@ components:
           default: {}
           additionalProperties:
             type: string
-          description: Arbitrary key-value tags
+          description: |
+            Operator-defined key-value tags. Keys beginning with `mesh.` are
+            reserved for Ferrum's trusted mesh projection and are rejected on
+            upstream create/update, API-spec import, restore, and file-config
+            admission; ordinary operator tag keys remain supported.
         locality:
           type: [string, "null"]
           maxLength: 255
@@ -11432,7 +11436,10 @@ components:
 
     MeshHealthResponse:
       type: object
-      required: [egress_scope, node_waypoint_observability]
+      required:
+        - egress_scope
+        - node_waypoint_observability
+        - udp_placement_migration
       properties:
         egress_scope:
           $ref: "#/components/schemas/MeshEgressScopeHealth"
@@ -11444,6 +11451,48 @@ components:
             `enabled` is true only when `FERRUM_MESH_TOPOLOGY=node_waypoint`.
             Counters are process-static and monotonic across config reload and
             SVID rotation; they reset on NodeWaypoint process restart.
+        udp_placement_migration:
+          $ref: "#/components/schemas/UdpPlacementMigrationStatusSnapshot"
+
+    UdpPlacementMigrationStatusSnapshot:
+      type: object
+      required: [enabled, phase, outstanding, failure_reason]
+      properties:
+        enabled:
+          type: boolean
+          description: True when the Ambient UDP placement guard is active.
+        phase:
+          type: string
+          enum:
+            - stable
+            - waiting_for_registry
+            - waiting_for_gate_ack
+            - cleaning_pod_netns
+            - cleaning_host_netns
+            - cleanup_complete
+            - finalize_blocked
+            - failed
+        outstanding:
+          type: integer
+          format: uint64
+          description: Outstanding pod network namespaces or gate acknowledgements.
+        failure_reason:
+          type: string
+          enum:
+            - none
+            - migration_required
+            - finalize_required
+            - generation_mismatch
+            - predecessor_mismatch
+            - registry_not_synchronized
+            - gate_acknowledgement_missing
+            - pod_netns_unresolved
+            - pod_cleanup_failed
+            - host_cleanup_failed
+            - cleanup_proof_missing
+            - state_persistence_failed
+            - durable_state_rejected
+          description: Closed-set node-local failure reason; never includes pod UIDs or generations.
 
     NodeWaypointObservabilitySnapshot:
       type: object
@@ -15071,6 +15120,20 @@ components:
           type: integer
           default: 3600
           description: How long idle metric entries live before eviction (seconds). Prevents unbounded memory growth from deleted/recreated proxies
+        mesh_series_budget_per_family:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 1000000
+          default: 10000
+          description: >
+            Hard ceiling on live MeshRequestKey series retained per mesh metric
+            family in the process-wide MetricsRegistry. Shared by ordinary mesh
+            identity dimensions and CEL-derived dimensions: newly observed keys
+            beyond the budget are dropped until stale_entry_ttl_seconds eviction
+            frees capacity, and counted on
+            ferrum_mesh_metric_series_overflow_total{family}. 0 is rejected —
+            there is no unlimited mode.
         cache_invalidation_min_age_ms:
           type: integer
           default: 500
@@ -16232,7 +16295,36 @@ components:
                 default: 5000
               max_cache_entries:
                 type: integer
+                format: uint64
                 default: 10000
+                minimum: 100
+                maximum: 100000
+                description: >-
+                  Per-provider hard entry ceiling. Active and negative entries
+                  receive independent 75/25 count partitions, so one result
+                  class cannot evict the other class.
+              max_cache_entry_bytes:
+                type: integer
+                format: uint64
+                default: 16384
+                minimum: 256
+                maximum: 65536
+                description: >-
+                  Maximum normalized active authorization-result bytes retained
+                  for one token. A larger valid result is used for the current
+                  request but is not cached.
+              max_cache_total_bytes:
+                type: integer
+                format: uint64
+                default: 16777216
+                minimum: 1048576
+                maximum: 67108864
+                description: >-
+                  Per-provider hard retained-byte ceiling covering fixed
+                  eviction indexes, token digests, entry state, and normalized
+                  authorization data. Must be at least the constructor-reported
+                  minimum footprint for max_cache_entries plus one
+                  max_cache_entry_bytes result.
               token_hint_param:
                 type: [string, "null"]
               required_scopes:
@@ -17718,6 +17810,7 @@ components:
           properties:
             tag_overrides:
               type: array
+              maxItems: 128
               items:
                 type: object
                 required: [name, operation]
@@ -17726,11 +17819,16 @@ components:
                     type: string
                     description: |
                       Metric family targeted by this override. Supported values
-                      are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum
-                      metric names, and `ALL_METRICS`; omitted means all metrics.
-                      Recognized Istio standard families Ferrum does not emit
-                      are accepted and ignored with a bounded construction-time
-                      warning; unknown families remain configuration errors.
+                      are `REQUEST_COUNT`, `REQUEST_DURATION`, `REQUEST_SIZE`,
+                      `RESPONSE_SIZE`, `TCP_OPENED_CONNECTIONS`,
+                      `TCP_CLOSED_CONNECTIONS`, `TCP_SENT_BYTES`,
+                      `TCP_RECEIVED_BYTES`, `GRPC_REQUEST_MESSAGES`,
+                      `GRPC_RESPONSE_MESSAGES`, their matching `ferrum_mesh_*`
+                      metric names, and `ALL_METRICS`; omitted means all
+                      metrics. Recognized Istio standard families Ferrum does
+                      not emit are accepted and ignored with a bounded
+                      construction-time warning; unknown families remain
+                      configuration errors.
                   name:
                     type: string
                     description: |
@@ -17741,12 +17839,34 @@ components:
                     required: [type]
                     description: |
                       One of `{"type": "remove"}`,
-                      `{"type": "rename", "new_name": "..."}`, or
-                      `{"type": "set", "value": "..."}`.
+                      `{"type": "rename", "new_name": "..."}`,
+                      `{"type": "set", "value": "..."}` (literal), or
+                      `{"type": "set_expr", "cel": "..."}` /
+                      `{"type": "set_expr", "expression": {...}}` (compiled
+                      Telemetry UPSERT CEL). Expressions are compiled at
+                      construction/reload; the metric hot path evaluates the
+                      precompiled plan only. Supported CEL attributes are the
+                      finalized mesh metric-key peer labels plus
+                      `request.method`, `request.host`, `response.code`, and
+                      `destination.port`. With several effective
+                      `workload_metrics` instances, inputs are stamped from the
+                      union required by the final composed per-family plans;
+                      replacing one family also replaces that family's input
+                      requirements. Exact CEL label values and ordinary mesh
+                      identity series share a finite per-family live-series
+                      budget configured on the global `prometheus_metrics`
+                      plugin as `mesh_series_budget_per_family` (default
+                      10_000, range 1–1_000_000); further distinct keys are
+                      dropped and counted on
+                      `ferrum_mesh_metric_series_overflow_total{family}` with
+                      fixed family labels only. Stale TTL eviction releases
+                      capacity. HTTP-only attributes are rejected for TCP /
+                      `ALL_METRICS` selectors. Diagnostics never echo
+                      expression text.
                     properties:
                       type:
                         type: string
-                        enum: [remove, rename, set]
+                        enum: [remove, rename, set, set_expr]
                       new_name:
                         type: string
                         description: Replacement tag name when `type` is `rename`.
@@ -17759,14 +17879,43 @@ components:
                           admission separately enforces at most 256 UTF-8 bytes,
                           so multibyte values may be rejected below 256
                           characters.
-              description: Per-metric tag overrides translated from the Istio Telemetry CRD.
+                      cel:
+                        type: string
+                        maxLength: 512
+                        description: |
+                          Bounded CEL source when `type` is `set_expr` and a
+                          compiled `expression` AST is not supplied. Limits:
+                          512 UTF-8 bytes including surrounding whitespace, 32
+                          tokens, nesting depth 8, 24 AST nodes. Supported
+                          forms: attribute reads,
+                          `string(<int attribute>)`, and
+                          `has(<string attribute>) ? <then> : <else>`.
+                          OpenAPI `maxLength` counts Unicode characters;
+                          runtime admission separately enforces the 512-byte UTF-8 limit,
+                          so a multibyte expression can be rejected
+                          below 512 characters.
+                      expression:
+                        type: object
+                        description: |
+                          Precompiled CEL AST produced by Telemetry translation
+                          / materialization (`op`: `literal`, `attribute`,
+                          `string_of_int`, `has_then_else`).
+              description: |
+                Ordered per-metric tag overrides translated from the Istio
+                Telemetry CRD. Runtime admission accepts at most 128 entries
+                and at most 16384 encoded bytes across the per-family plans
+                stamped into transaction metadata.
             disabled_metrics:
               type: array
               items:
                 type: string
               description: |
                 Names of metrics suppressed by this workload. Supported values
-                are `REQUEST_COUNT`, `REQUEST_DURATION`, their Ferrum metric
+                are `REQUEST_COUNT`, `REQUEST_DURATION`, `REQUEST_SIZE`,
+                `RESPONSE_SIZE`, `TCP_OPENED_CONNECTIONS`,
+                `TCP_CLOSED_CONNECTIONS`, `TCP_SENT_BYTES`,
+                `TCP_RECEIVED_BYTES`, `GRPC_REQUEST_MESSAGES`,
+                `GRPC_RESPONSE_MESSAGES`, their matching `ferrum_mesh_*` metric
                 names, and `ALL_METRICS`. Recognized Istio standard families
                 Ferrum does not emit are accepted and ignored with a bounded
                 construction-time warning; unknown families remain errors.

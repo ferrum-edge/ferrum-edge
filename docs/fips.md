@@ -292,6 +292,17 @@ the entry and discloses nothing.
   key and protects no secret. Non-security content-addressing digests listed in
   the inventory use the selected provider's SHA-256 seam but remain classified
   as `outside-boundary` because they are not security services.
+- JWT-SVID trust material (issue #3617) admits an EC authority only after proving
+  the published point actually lies on its named curve. That proof is a bounded
+  ephemeral ECDH agreement at the provider seam (`fips::ec_point_on_named_curve`
+  — `ring` on an ordinary build, the AWS-LC FIPS module on a `fips` build), whose
+  peer-public-key acceptance performs the SEC1 point validation; the shared
+  secret is discarded. It is routed through the seam rather than through a
+  RustCrypto elliptic implementation precisely so a FIPS build gains no second,
+  unrouted curve arithmetic on a trust-admission path. The two backends'
+  `agree_ephemeral` signatures differ, and that divergence is absorbed in
+  `src/fips/mod.rs` alongside every other provider difference rather than being
+  cfg-split at the call site.
 - Reqwest, Kubernetes, and MongoDB clients have their provider-selecting default
   features disabled. Their rustls transports follow the same mutually exclusive
   `crypto-ring` / `fips` feature pair as Ferrum's frontend, backend, and control

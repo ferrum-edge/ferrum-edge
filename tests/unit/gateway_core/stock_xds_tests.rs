@@ -1488,6 +1488,77 @@ fn stock_api_listener_and_scoped_routes_are_extension_escapes() {
     );
 }
 
+#[test]
+fn stock_filter_chain_constraints_and_transport_socket_are_refused() {
+    let constrained_matches = [
+        sp::FilterChainMatch {
+            prefix_ranges: vec![vec![1]],
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            address_suffix: "127.0.0.1".to_string(),
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            suffix_len: Some(sp::UInt32Value { value: 8 }),
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            source_prefix_ranges: vec![vec![1]],
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            source_ports: vec![15001],
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            destination_port: Some(sp::UInt32Value { value: 443 }),
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            transport_protocol: "tls".to_string(),
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            application_protocols: vec![b"h2".to_vec()],
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            server_names: vec![b"admin.example.test".to_vec()],
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            source_type: 1,
+            ..Default::default()
+        },
+        sp::FilterChainMatch {
+            direct_source_prefix_ranges: vec![vec![1]],
+            ..Default::default()
+        },
+    ];
+    for filter_chain_match in constrained_matches {
+        let mut listener = hcm_listener(
+            "0.0.0.0_9080",
+            "0.0.0.0",
+            9080,
+            "9080",
+            &["envoy.filters.http.router"],
+        );
+        listener.filter_chains[0].filter_chain_match = Some(filter_chain_match);
+        assert_eq!(
+            refusal_reasons(&lds_with(listener)),
+            vec![refusal::LISTENER_EXTENSION_ESCAPE]
+        );
+    }
+
+    let mut listener = tcp_listener("0.0.0.0_9080", "0.0.0.0", 9080, REVIEWS_CLUSTER);
+    listener.filter_chains[0].transport_socket = Some(sp::TransportSocket::default());
+    assert_eq!(
+        refusal_reasons(&lds_with(listener)),
+        vec![refusal::UNSUPPORTED_TRANSPORT_SOCKET]
+    );
+}
+
 // ── route refusals ───────────────────────────────────────────────────────
 
 fn rds_with(config: sp::RouteConfiguration) -> StockXdsAccumulator {
@@ -1534,6 +1605,55 @@ fn stock_regex_route_match_refuses_the_virtual_host() {
         accumulator.route_configs()["9080"].virtual_hosts.is_empty(),
         "a refused virtual host contributes no host alias"
     );
+}
+
+#[test]
+fn stock_route_match_constraints_refuse_the_virtual_host() {
+    let constrained_matches = [
+        (
+            sp::RouteMatch {
+                prefix: "/admin-only".to_string(),
+                ..Default::default()
+            },
+            "routes[].match.prefix",
+        ),
+        (
+            sp::RouteMatch {
+                path: "/admin-only".to_string(),
+                ..Default::default()
+            },
+            "routes[].match.path",
+        ),
+        (
+            sp::RouteMatch {
+                path_separated_prefix: "/admin".to_string(),
+                ..Default::default()
+            },
+            "routes[].match.path_separated_prefix",
+        ),
+        (
+            sp::RouteMatch {
+                prefix: "/".to_string(),
+                tls_context: vec![vec![1]],
+                ..Default::default()
+            },
+            "routes[].match.tls_context",
+        ),
+    ];
+    for (route_match, expected_detail) in constrained_matches {
+        let mut config = route_config("9080", &["10.96.0.5"], REVIEWS_CLUSTER);
+        config.virtual_hosts[0].routes[0].r#match = Some(route_match);
+        let accumulator = rds_with(config);
+        assert_eq!(
+            refusal_reasons(&accumulator),
+            vec![refusal::UNSUPPORTED_ROUTE_MATCH]
+        );
+        assert_eq!(accumulator.refusals()[0].detail, expected_detail);
+        assert!(
+            accumulator.route_configs()["9080"].virtual_hosts.is_empty(),
+            "a path-constrained virtual host must not contribute a VIP"
+        );
+    }
 }
 
 #[test]
@@ -1584,7 +1704,7 @@ fn stock_vhds_refuses_the_whole_route_configuration() {
 }
 
 #[test]
-fn stock_virtual_host_targeting_two_services_is_refused_rather_than_guessed() {
+fn stock_path_constrained_multi_service_virtual_host_is_refused_before_attribution() {
     let mut accumulator = StockXdsAccumulator::default();
     let other = "outbound|9080||ratings.default.svc.cluster.local";
     accumulator
@@ -1640,14 +1760,14 @@ fn stock_virtual_host_targeting_two_services_is_refused_rather_than_guessed() {
         discovery
             .refusals
             .iter()
-            .any(|refused| refused.reason == refusal::AMBIGUOUS_VIRTUAL_HOST_TARGET)
+            .any(|refused| refused.reason == refusal::UNSUPPORTED_ROUTE_MATCH)
     );
     assert!(
         discovery
             .services
             .iter()
             .all(|service| service.cluster_ips.is_empty()),
-        "an ambiguous virtual host must not attribute its VIP to either service"
+        "a path-constrained virtual host must not attribute its VIP to either service"
     );
 }
 
