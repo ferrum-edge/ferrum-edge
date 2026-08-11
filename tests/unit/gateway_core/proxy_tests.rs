@@ -2248,9 +2248,8 @@ fn unix_h1_keep_alive_forces_in_dispatch_buffering_for_content_length() {
     let marker = "Known-length responses\n    // therefore buffer and check in inside this function whenever";
     assert!(
         source.contains(marker)
-            || source.contains(
-                "therefore buffer and check in inside this function whenever keep-alive"
-            ),
+            || source
+                .contains("therefore buffer and check in inside this function whenever keep-alive"),
         "unix dispatch must document the Content-Length keep-alive buffering rule"
     );
     assert!(
