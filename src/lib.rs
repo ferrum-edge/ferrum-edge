@@ -2641,6 +2641,28 @@ pub mod _test_support {
         .await
     }
 
+    /// Drive the production Unix-pool shutdown drain with a hook awaited AFTER
+    /// both shutdown latches are set — the pool's checkout/check-in latch and
+    /// the driver tracker's registration latch — and BEFORE any pooled carrier
+    /// is retired or any driver is drained (issue #3764).
+    ///
+    /// That interval is the one a racing establishment used to be able to
+    /// register inside. Production `shutdown_drain` is this same function with a
+    /// ready future.
+    #[cfg(unix)]
+    pub async fn shutdown_unix_pool_with_latch_seam<F, Fut>(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        driver_budget: std::time::Duration,
+        reap_budget: std::time::Duration,
+        after_latch: F,
+    ) where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        pool.shutdown_drain_seamed(driver_budget, reap_budget, after_latch)
+            .await;
+    }
+
     /// Ask the PRODUCTION shared-h2c selector whether it would hand a pooled
     /// carrier to a request for this identity right now. Read-only; never
     /// dials.

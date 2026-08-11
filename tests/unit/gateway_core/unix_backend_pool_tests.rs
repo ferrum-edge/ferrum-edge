@@ -2700,6 +2700,126 @@ async fn an_h2c_checkout_racing_the_shutdown_latch_refuses_and_settles_exactly()
     assert_eq!(pool.tracked_drivers(), 0);
 }
 
+/// The former force-drain interval, closed: a checkout parked at the
+/// registration boundary is released while shutdown is stopped between its
+/// latches and the retirement work that follows, and it must STILL refuse.
+///
+/// Before the repair, `shutdown_drain` set the pool's latch, ran
+/// `force_drain_all`, and only then reached the tracker, whose own `closed`
+/// flag was set as the FIRST step of the tracker drain rather than with the pool
+/// latch. A checkout that had already passed the entry gate could therefore win
+/// the tracker mutex inside that interval,
+/// register successfully, and go on toward returning a sender while shutdown
+/// was in progress. Both latches now land as one step before any retirement, so
+/// the interval no longer exists.
+///
+/// Driven entirely by channel handoffs: the checkout parks at the existing
+/// pre-registration seam, shutdown parks at the post-latch seam, and each side
+/// releases the other. No sleeping and no polling — the assertions run on the
+/// instant the racing call returns.
+#[tokio::test]
+async fn a_checkout_released_inside_the_former_force_drain_interval_still_refuses() {
+    use ferrum_edge::_test_support::{
+        checkout_unix_h1_with_registration_seam, shutdown_unix_pool_with_latch_seam,
+    };
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = HoldingPeer::bind(&socket);
+    let pool = bounded_pool(4);
+    let proxy = test_proxy("unix-pool-force-drain-interval");
+    let allowed_roots = roots(&root);
+
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let (settled_tx, settled_rx) = tokio::sync::oneshot::channel::<()>();
+    let tracked_inside = AtomicUsize::new(usize::MAX);
+    let gauge_inside = AtomicUsize::new(usize::MAX);
+    let idle_inside = AtomicUsize::new(usize::MAX);
+
+    let racing_checkout = async {
+        let result = checkout_unix_h1_with_registration_seam(
+            &pool,
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &allowed_roots,
+            &[],
+            || async move {
+                let _ = reached_tx.send(());
+                let _ = release_rx.await;
+            },
+        )
+        .await;
+        // Hands control back to the seam below, which is still holding shutdown
+        // inside the interval under test.
+        let _ = settled_tx.send(());
+        result
+    };
+    let shutdown = async {
+        reached_rx
+            .await
+            .expect("the racing checkout reaches the registration boundary");
+        shutdown_unix_pool_with_latch_seam(
+            &pool,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+            || async {
+                // Both latches are set; nothing has been retired or drained yet.
+                // This is exactly where the racing registration used to succeed.
+                let _ = release_tx.send(());
+                let _ = settled_rx.await;
+                let stats = pool.stats();
+                tracked_inside.store(pool.tracked_drivers(), Ordering::SeqCst);
+                gauge_inside.store(stats.open_physical_connections as usize, Ordering::SeqCst);
+                idle_inside.store(stats.idle_h1_connections as usize, Ordering::SeqCst);
+            },
+        )
+        .await;
+    };
+    let (result, ()) = tokio::join!(racing_checkout, shutdown);
+
+    assert_eq!(
+        tracked_inside.load(Ordering::SeqCst),
+        0,
+        "a registration inside the force-drain interval must be refused, so the tracker adopts \
+         nothing there"
+    );
+    assert_eq!(
+        gauge_inside.load(Ordering::SeqCst),
+        0,
+        "a refused registration never charges the open-connection gauge"
+    );
+    assert_eq!(
+        idle_inside.load(Ordering::SeqCst),
+        0,
+        "the refusal publishes nothing, so there is nothing for the retirement pass to find"
+    );
+
+    let err = expect_refusal(
+        result,
+        "a checkout released inside the former force-drain interval must not hand back a sender",
+    );
+    assert!(
+        matches!(err, UnixBackendError::PoolShuttingDown),
+        "expected the typed shutdown refusal, got {err}"
+    );
+    assert_eq!(err.error_class(), ErrorClass::DispatchPolicyRejected);
+
+    let stats = pool.stats();
+    assert_eq!(stats.open_physical_connections, 0);
+    assert_eq!(stats.physical_connects, 0, "nothing was established");
+    assert_eq!(stats.idle_h1_connections, 0);
+    assert_eq!(stats.active_h2c_connections, 0);
+    assert_eq!(
+        pool.resident_connection_lanes(),
+        0,
+        "the refusal releases the target's connection slot before it returns"
+    );
+    assert_eq!(pool.tracked_drivers(), 0);
+}
+
 /// The one establishment budget is opened at the OUTERMOST checkout entry —
 /// before the pool's amortized idle sweep, which scans the pool's maps and
 /// `stat`s socket paths (issue #3764).
