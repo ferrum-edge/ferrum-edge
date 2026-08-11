@@ -3514,8 +3514,14 @@ mod tests {
         let parsed = parse_remote_discovery_credentials(Some(&raw), issuer, Some(key_id))
             .expect("valid credential map parses");
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed.get("b").map(|s| s.as_str()), Some(secret_b.as_str()));
-        assert_eq!(parsed.get("c").map(|s| s.as_str()), Some(secret_c.as_str()));
+        assert_eq!(
+            parsed.get("b").map(|s| s.secret_for_tests()),
+            Some(secret_b.as_str())
+        );
+        assert_eq!(
+            parsed.get("c").map(|s| s.secret_for_tests()),
+            Some(secret_c.as_str())
+        );
         // Each resolved secret carries the supplied (shared CP-DP) issuer so the
         // remote CP accepts a token minted with it.
         assert_eq!(parsed.get("b").map(|s| s.issuer()), Some(issuer));
@@ -3523,13 +3529,22 @@ mod tests {
         // bundle can select this cluster's credential. Without it every
         // per-remote credential mints a `kid`-less token such a peer refuses
         // (advisory GHSA-3f2j-wwqw-grmg).
-        assert_eq!(parsed.get("b").and_then(|s| s.key_id()), Some(key_id));
-        assert_eq!(parsed.get("c").and_then(|s| s.key_id()), Some(key_id));
+        assert_eq!(
+            parsed.get("b").and_then(|s| s.key_id_for_tests()),
+            Some(key_id)
+        );
+        assert_eq!(
+            parsed.get("c").and_then(|s| s.key_id_for_tests()),
+            Some(key_id)
+        );
         // An unset FERRUM_CP_DP_GRPC_JWT_KEY_ID stays unset rather than
         // becoming an empty `kid` no bundle can match.
         let unstamped = parse_remote_discovery_credentials(Some(&raw), issuer, None)
             .expect("valid credential map parses without a key id");
-        assert_eq!(unstamped.get("b").and_then(|s| s.key_id()), None);
+        assert_eq!(
+            unstamped.get("b").and_then(|s| s.key_id_for_tests()),
+            None
+        );
     }
 
     #[test]
@@ -4576,8 +4591,9 @@ mod tests {
                 } else {
                     GrpcAudiencePolicy::Required(MESH_LOCAL_SUBSCRIBE_AUDIENCE)
                 };
-                let verifier =
-                    crate::grpc::cp_trust::CpDpVerifier::SharedSecret(secret.as_str().to_string());
+                let verifier = crate::grpc::cp_trust::CpDpVerifier::SharedSecret(
+                    secret.secret_for_tests().to_string(),
+                );
                 verify_grpc_jwt_metadata_with_audience(
                     request.metadata(),
                     &verifier,

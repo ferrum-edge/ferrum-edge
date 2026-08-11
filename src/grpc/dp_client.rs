@@ -225,6 +225,16 @@ impl GrpcJwtSecret {
         &self.issuer
     }
 
+    #[cfg(test)]
+    pub(crate) fn secret_for_tests(&self) -> &str {
+        &self.secret
+    }
+
+    #[cfg(test)]
+    pub(crate) fn key_id_for_tests(&self) -> Option<&str> {
+        self.key_id.as_deref()
+    }
+
     /// True when this node presents an externally issued token rather than
     /// minting its own. Startup logs use this to state the posture without
     /// rendering any material.
