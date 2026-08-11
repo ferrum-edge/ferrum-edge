@@ -2506,6 +2506,25 @@ pub mod _test_support {
         crate::proxy::websocket_backend_tls_sni_unsupported(proxy)
     }
 
+    /// Drive the Unix backend pool's HTTP/1.1 check-in with a hook that runs
+    /// BETWEEN the two halves of its withdrawal fence (issue #3731).
+    ///
+    /// `between_fence_reads` runs after the pre-insert generation read and
+    /// before the insert, which is the one interleaving that defeats a
+    /// single-shot fence: a check-in that observed a live generation, then a
+    /// publication that bumps the generation and completes its retirement pass,
+    /// then the insert. Production `checkin_h1` is this same function with an
+    /// empty closure, so a test through here exercises the production path
+    /// rather than a parallel one.
+    #[cfg(unix)]
+    pub fn checkin_unix_h1_with_publication_between(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        checkout: crate::proxy::unix_backend_pool::UnixH1Checkout,
+        between_fence_reads: impl FnOnce(),
+    ) {
+        pool.checkin_h1_fenced(checkout, between_fence_reads);
+    }
+
     pub use crate::proxy::tcp_proxy::{
         StreamCopyResult, StreamIoSide, relay_failure_is_client_facing,
     };

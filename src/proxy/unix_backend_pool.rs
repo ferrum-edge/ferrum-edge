@@ -41,6 +41,48 @@
 //! allowlist are process env (`FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` /
 //! `_ALLOWED_UIDS`) and cannot change without a restart.
 //!
+//! ## The withdrawal fence
+//!
+//! Retiring the idle maps is NOT sufficient on its own. An HTTP/1.1 lease that
+//! is checked out is deliberately absent from `h1_idle`, so a publication
+//! cannot see it, and its exchange may finish long AFTER the target it belongs
+//! to was withdrawn. Nothing about a socket that is still open and still names
+//! the same inode would stop that late check-in from repopulating the idle set
+//! under a config-declared identity that no longer exists.
+//!
+//! Every retirement therefore also bumps a monotonic PUBLICATION GENERATION
+//! (`retain_live_targets`, `force_drain_all`, and hence `shutdown_drain`), and
+//! every lease records the generation that was current when it was checked out.
+//! A check-in is admitted only if the generation is UNCHANGED, which is
+//! strictly stronger than a membership test — it needs no live-set lookup, no
+//! per-request identity construction, and no allocation, just one atomic load —
+//! and it closes the same-key ABA hole a membership test leaves open: a target
+//! that is withdrawn and re-added under the exact same
+//! `(namespace, proxy id, upstream id, configured path, protocol)` tuple is a
+//! NEW incarnation, and a lease from the previous one must not re-enter it. The
+//! cost is that a lease outstanding across an unrelated publication is retired
+//! rather than reused — one connection per in-flight exchange per publication,
+//! paid off the hot path.
+//!
+//! A generation test evaluated once would still be racy: a check-in can read a
+//! current generation immediately BEFORE publication bumps it and insert
+//! immediately AFTER the retirement pass has already scanned that shard. The
+//! fence is therefore evaluated TWICE, around the insert, and publication
+//! orders its own two steps to match:
+//!
+//! 1. publication bumps the generation, THEN retires;
+//! 2. a check-in reads the generation, inserts a UNIQUELY IDENTIFIED entry,
+//!    releases the shard, and re-reads the generation. On a change it withdraws
+//!    exactly the entry it inserted.
+//!
+//! Either the insert is visible to the retirement pass (which removes it), or
+//! the retirement pass released that shard's lock before the insert acquired
+//! it — and that release/acquire pair orders the generation bump before the
+//! re-read, so the check-in withdraws its own entry. There is no interleaving
+//! in which a carrier survives under a retired identity. The same two-step
+//! fence guards the h2c publish at the end of `checkout_h2c`, which likewise
+//! inserts into a shared map after a dial that can straddle a publication.
+//!
 //! [`UnixBackendConnectionPool::force_drain_all`] retires everything but leaves
 //! the pool usable; [`UnixBackendConnectionPool::shutdown_drain`] additionally
 //! latches the pool closed so a late check-in racing graceful shutdown cannot
@@ -239,6 +281,12 @@ mod imp {
         /// failure is an idle keep-alive race worth replaying once on a fresh
         /// connection.
         reused: bool,
+        /// The pool's publication generation at the moment this lease was
+        /// acquired. The check-in fence admits the carrier back into the idle
+        /// set only while this is still the current generation, which is what
+        /// stops an exchange that outlived a withdrawal — or a withdrawal
+        /// followed by a same-identity re-add — from repopulating the pool.
+        generation: u64,
         pub sender: UnixH1Sender,
     }
 
@@ -251,6 +299,13 @@ mod imp {
         #[inline]
         pub fn key(&self) -> &UnixPoolKey {
             &self.key
+        }
+
+        /// The publication generation this lease is bound to.
+        #[inline]
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
+        pub fn generation(&self) -> u64 {
+            self.generation
         }
     }
 
@@ -282,12 +337,18 @@ mod imp {
     }
 
     struct IdleH1 {
+        /// Process-unique id, so a check-in that loses the publication race can
+        /// withdraw EXACTLY the entry it inserted and no other — including a
+        /// concurrently pooled carrier for the same key.
+        id: u64,
         sender: UnixH1Sender,
         admitted: AdmittedUnixSocket,
         last_used_at: AtomicU64,
     }
 
     struct SharedH2c {
+        /// See [`IdleH1::id`].
+        id: u64,
         sender: MeshMtlsSender,
         admitted: AdmittedUnixSocket,
         last_used_at: AtomicU64,
@@ -313,13 +374,28 @@ mod imp {
         /// Latched by [`UnixBackendConnectionPool::shutdown_drain`]. Once set,
         /// no check-in may repopulate the pool, so the drain is terminal even
         /// against a response body that reaches EOF while shutdown is running.
+        ///
+        /// The latch alone is a single read, so it does not by itself order a
+        /// check-in that observed it unset against the drain that follows;
+        /// `shutdown_drain` also bumps `publication_generation`, and the
+        /// two-step check-in fence is what makes the drain terminal against
+        /// that interleaving.
         shutting_down: AtomicBool,
+        /// Monotonic publication generation. Bumped by EVERY retirement
+        /// (`retain_live_targets`, `force_drain_all`, `shutdown_drain`) BEFORE
+        /// the retirement pass runs. A lease records the value current when it
+        /// was checked out; the check-in fence compares it twice, around the
+        /// insert. See the module-level "withdrawal fence" section.
+        publication_generation: AtomicU64,
+        /// Allocator for [`IdleH1::id`] / [`SharedH2c::id`].
+        next_entry_id: AtomicU64,
         last_prune_unix_secs: AtomicU64,
         hits: AtomicU64,
         misses: AtomicU64,
         physical_connects: AtomicU64,
         identity_retirements: AtomicU64,
         setup_failures: AtomicU64,
+        withdrawal_fenced_checkins: AtomicU64,
     }
 
     /// Bounded counters for tests and diagnostics. No per-target labels are
@@ -333,6 +409,10 @@ mod imp {
         pub setup_failures: u64,
         pub idle_h1_connections: u64,
         pub active_h2c_connections: u64,
+        /// Carriers the withdrawal fence refused to (re)pool because their
+        /// lease was bound to an older publication generation — counted both
+        /// for a refusal before the insert and for an entry withdrawn after it.
+        pub withdrawal_fenced_checkins: u64,
     }
 
     impl UnixBackendConnectionPool {
@@ -345,16 +425,20 @@ mod imp {
                 h2c_creation_locks: DashMap::with_shard_amount(shards),
                 path_identities: DashMap::with_shard_amount(shards),
                 shutting_down: AtomicBool::new(false),
+                publication_generation: AtomicU64::new(0),
+                next_entry_id: AtomicU64::new(0),
                 last_prune_unix_secs: AtomicU64::new(0),
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
                 physical_connects: AtomicU64::new(0),
                 identity_retirements: AtomicU64::new(0),
                 setup_failures: AtomicU64::new(0),
+                withdrawal_fenced_checkins: AtomicU64::new(0),
             }
         }
 
         pub fn stats(&self) -> UnixPoolStats {
+            let fenced = self.withdrawal_fenced_checkins.load(Ordering::Relaxed);
             UnixPoolStats {
                 hits: self.hits.load(Ordering::Relaxed),
                 misses: self.misses.load(Ordering::Relaxed),
@@ -371,17 +455,46 @@ mod imp {
                     .iter()
                     .map(|entry| entry.value().len() as u64)
                     .sum(),
+                withdrawal_fenced_checkins: fenced,
             }
+        }
+
+        /// The current publication generation. Exposed for diagnostics and for
+        /// the external fence regression tests.
+        #[inline]
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
+        pub fn publication_generation(&self) -> u64 {
+            self.publication_generation.load(Ordering::Acquire)
+        }
+
+        /// Invalidate every OUTSTANDING lease by advancing the publication
+        /// generation. Called BEFORE each retirement pass, never on the
+        /// request path.
+        #[inline]
+        fn advance_publication_generation(&self) {
+            self.publication_generation.fetch_add(1, Ordering::AcqRel);
+        }
+
+        #[inline]
+        fn record_withdrawal_fenced_checkin(&self) {
+            self.withdrawal_fenced_checkins
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         /// Drop every pooled connection, leaving the pool usable.
         ///
         /// A dropped sender ends its driver task once the connection closes, so
         /// this is a complete retirement of the idle set without a task
-        /// registry. In-flight exchanges are unaffected: their leases are
-        /// checked out and therefore not in these maps, and each one will fail
-        /// its own check-in re-validation or simply be dropped.
+        /// registry.
+        ///
+        /// In-flight exchanges are NOT in these maps — an HTTP/1.1 lease is
+        /// checked out precisely so that it is not — so clearing the maps
+        /// cannot reach them. The generation bump is what does: it is performed
+        /// FIRST, so every lease outstanding right now is already bound to a
+        /// superseded generation and its check-in is fenced out, whether it
+        /// lands before or after the clear.
         pub fn force_drain_all(&self) {
+            self.advance_publication_generation();
             self.h1_idle.clear();
             self.h2c_carriers.clear();
             self.h2c_creation_locks.clear();
@@ -395,7 +508,9 @@ mod imp {
         /// their `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget. The latch is what makes
         /// the drain terminal: a streaming response that reaches EOF during the
         /// final moments of the drain would otherwise check its carrier back
-        /// into a pool nobody will ever drain again.
+        /// into a pool nobody will ever drain again. `force_drain_all`'s
+        /// generation bump closes the interleaving the latch alone cannot — a
+        /// check-in that read the latch unset a moment before it was set.
         pub fn shutdown_drain(&self) {
             self.shutting_down.store(true, Ordering::Release);
             self.force_drain_all();
@@ -420,7 +535,20 @@ mod imp {
         /// Exact tuple equality on [`UnixTargetIdentity`]; never a substring or
         /// prefix test. One pass over the idle maps per publication, not per
         /// request.
+        ///
+        /// The idle maps are only HALF the retirement. A checked-out HTTP/1.1
+        /// lease is deliberately absent from `h1_idle`, so this pass cannot see
+        /// it and a comment claiming such an exchange "fails its own check-in
+        /// revalidation" would be false — nothing about a still-open socket
+        /// that still names the same inode expresses a config withdrawal. The
+        /// generation bump below is the other half: it fences every lease that
+        /// was outstanding at this instant out of the pool for good, including
+        /// one whose exact identity is withdrawn and then re-added. It happens
+        /// BEFORE the retirement pass so that a check-in racing this call
+        /// either has its entry removed by the pass or observes the new
+        /// generation on its post-insert re-read and withdraws its own entry.
         pub fn retain_live_targets(&self, live: &std::collections::HashSet<UnixTargetIdentity>) {
+            self.advance_publication_generation();
             let mut retired = 0u64;
             self.h1_idle.retain(|key, entries| {
                 if live.contains(&key.target_identity()) {
@@ -471,6 +599,11 @@ mod imp {
         /// Called when a live re-admission proves the filesystem object at that
         /// path was replaced, BEFORE any further request byte is written to a
         /// connection that may now be talking to a different peer.
+        ///
+        /// Unlike a config withdrawal this needs no generation bump: an
+        /// outstanding lease admitted against the replaced object fails its own
+        /// `still_names_checked_object` re-check at check-in, which is a real
+        /// filesystem observation rather than a claim about config.
         pub fn retire_socket_path(&self, path: &Path) {
             let mut retired = 0u64;
             self.h1_idle.retain(|key, entries| {
@@ -642,15 +775,20 @@ mod imp {
             allowed_uids: &[u32],
         ) -> Result<UnixH1Checkout, UnixBackendError> {
             self.maybe_prune_idle();
+            // Read the generation BEFORE admission and the dial, so a
+            // publication that lands anywhere between here and the check-in
+            // fences this lease out of the pool.
+            let generation = self.publication_generation.load(Ordering::Acquire);
             let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
             let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
 
-            if let Some(checkout) = self.take_idle_h1(&key, &admitted, proxy) {
+            if let Some(checkout) = self.take_idle_h1(&key, &admitted, proxy, generation) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(checkout);
             }
             self.misses.fetch_add(1, Ordering::Relaxed);
-            self.dial_h1(key, admitted, connect_timeout_ms).await
+            self.dial_h1(key, admitted, connect_timeout_ms, generation)
+                .await
         }
 
         /// Force a fresh physical HTTP/1.1 connection, bypassing the idle set.
@@ -667,10 +805,12 @@ mod imp {
             allowed_roots: &[String],
             allowed_uids: &[u32],
         ) -> Result<UnixH1Checkout, UnixBackendError> {
+            let generation = self.publication_generation.load(Ordering::Acquire);
             let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
             let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
             self.misses.fetch_add(1, Ordering::Relaxed);
-            self.dial_h1(key, admitted, connect_timeout_ms).await
+            self.dial_h1(key, admitted, connect_timeout_ms, generation)
+                .await
         }
 
         async fn dial_h1(
@@ -678,6 +818,7 @@ mod imp {
             key: UnixPoolKey,
             admitted: AdmittedUnixSocket,
             connect_timeout_ms: u64,
+            generation: u64,
         ) -> Result<UnixH1Checkout, UnixBackendError> {
             let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
             let connect = connect_admitted(&admitted, connect_timeout_ms);
@@ -719,6 +860,7 @@ mod imp {
                 key,
                 admitted,
                 reused: false,
+                generation,
                 sender,
             })
         }
@@ -728,6 +870,7 @@ mod imp {
             key: &UnixPoolKey,
             expected: &AdmittedUnixSocket,
             proxy: &Proxy,
+            generation: u64,
         ) -> Option<UnixH1Checkout> {
             let idle_timeout = self.idle_timeout_seconds(proxy);
             let now = unix_secs();
@@ -763,6 +906,7 @@ mod imp {
                     key: key.clone(),
                     admitted: entry.admitted,
                     reused: true,
+                    generation,
                     sender: entry.sender,
                 });
             }
@@ -777,16 +921,41 @@ mod imp {
         /// lease whose request was ABANDONED before it was ever sent (an invalid
         /// backend URL, an unparseable method) and for tests.
         ///
-        /// A sender that is closed, or whose socket identity changed, is dropped
+        /// A sender that is closed, whose socket identity changed, or whose
+        /// lease is bound to a superseded publication generation is dropped
         /// instead of pooled.
         pub fn checkin_h1(&self, checkout: UnixH1Checkout) {
+            self.checkin_h1_fenced(checkout, || {});
+        }
+
+        /// The check-in body, with a seam for the fence's regression tests.
+        ///
+        /// `between_fence_reads` runs after the pre-insert generation check and
+        /// before the insert, which is exactly the window a publication has to
+        /// win for the post-insert half of the fence to be the thing that saves
+        /// us. Production passes an empty closure, so this monomorphizes to the
+        /// same code with no branch and no allocation.
+        pub(crate) fn checkin_h1_fenced(
+            &self,
+            checkout: UnixH1Checkout,
+            between_fence_reads: impl FnOnce(),
+        ) {
             let UnixH1Checkout {
                 key,
                 admitted,
                 reused: _,
+                generation,
                 sender,
             } = checkout;
             if sender.is_closed() || self.is_shutting_down() {
+                return;
+            }
+            // Fence, first read. A publication that already completed retired
+            // this lease's incarnation; the carrier must not be pooled even if
+            // the socket object is untouched and the connection is healthy.
+            if self.publication_generation.load(Ordering::Acquire) != generation {
+                drop(sender);
+                self.record_withdrawal_fenced_checkin();
                 return;
             }
             if !admitted.still_names_checked_object().unwrap_or(false) {
@@ -795,19 +964,52 @@ mod imp {
                 self.retire_socket_path(&path);
                 return;
             }
+            between_fence_reads();
+            let entry_id = self.next_entry_id.fetch_add(1, Ordering::Relaxed);
             let max_idle = self.max_idle_per_key();
-            let mut entries = self.h1_idle.entry(key).or_default();
-            if entries.len() >= max_idle {
-                // Bound the idle set: drop the OLDEST idle connection, which is
-                // the one most likely to have been reaped by the peer.
-                entries.remove(0);
+            {
+                let mut entries = self.h1_idle.entry(key.clone()).or_default();
+                if entries.len() >= max_idle {
+                    // Bound the idle set: drop the OLDEST idle connection, which
+                    // is the one most likely to have been reaped by the peer.
+                    entries.remove(0);
+                    crate::runtime_metrics::global_ref()
+                        .record_pool_eviction(PoolKind::UnixBackend);
+                }
+                entries.push(IdleH1 {
+                    id: entry_id,
+                    sender,
+                    admitted,
+                    last_used_at: AtomicU64::new(unix_secs()),
+                });
+                // The shard guard is released HERE, before the second fence
+                // read: the release/acquire pair on that shard is what orders a
+                // concurrent publication's generation bump ahead of the read
+                // when the retirement pass ran before this insert.
+            }
+            // Fence, second read. Either the publication's retirement pass saw
+            // this entry and removed it, or it did not — in which case it
+            // released the shard before we took it and the bump is visible now.
+            if self.publication_generation.load(Ordering::Acquire) != generation {
+                self.withdraw_idle_h1_entry(&key, entry_id);
+            }
+        }
+
+        /// Remove EXACTLY the idle entry `entry_id` under `key`, if it is still
+        /// there. Used only by the losing side of the check-in fence, so it may
+        /// find nothing (the retirement pass already removed the whole key).
+        fn withdraw_idle_h1_entry(&self, key: &UnixPoolKey, entry_id: u64) {
+            let mut withdrawn = false;
+            if let Some(mut entries) = self.h1_idle.get_mut(key) {
+                let before = entries.len();
+                entries.retain(|entry| entry.id != entry_id);
+                withdrawn = entries.len() != before;
+            }
+            self.h1_idle.remove_if(key, |_, entries| entries.is_empty());
+            if withdrawn {
+                self.record_withdrawal_fenced_checkin();
                 crate::runtime_metrics::global_ref().record_pool_eviction(PoolKind::UnixBackend);
             }
-            entries.push(IdleH1 {
-                sender,
-                admitted,
-                last_used_at: AtomicU64::new(unix_secs()),
-            });
         }
 
         /// Return an HTTP/1.1 lease whose response body has ALREADY been read in
@@ -833,6 +1035,13 @@ mod imp {
         /// not a permitted method receiver on stable Rust.
         pub fn checkin_h1_when_idle(pool: &Arc<Self>, mut checkout: UnixH1Checkout) {
             if checkout.sender.is_closed() || pool.is_shutting_down() {
+                return;
+            }
+            // Fence early so a lease whose incarnation is already retired is
+            // dropped here rather than parked in a waiter task. `checkin_h1`
+            // re-evaluates the fence in full; this is only a fast path.
+            if pool.publication_generation.load(Ordering::Acquire) != checkout.generation {
+                pool.record_withdrawal_fenced_checkin();
                 return;
             }
             if checkout.sender.is_ready() {
@@ -885,6 +1094,10 @@ mod imp {
             allowed_uids: &[u32],
         ) -> Result<MeshMtlsSender, UnixBackendError> {
             self.maybe_prune_idle();
+            // Same fence as the H1 lease: a dial can straddle a publication, so
+            // the generation is captured before admission and re-checked after
+            // the carrier is published into the shared map.
+            let generation = self.publication_generation.load(Ordering::Acquire);
             let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
             let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::H2c);
 
@@ -930,20 +1143,48 @@ mod imp {
             crate::runtime_metrics::global_ref().record_pool_handshake(PoolKind::UnixBackend);
 
             let max_idle = self.max_idle_per_key();
+            let entry_id = self.next_entry_id.fetch_add(1, Ordering::Relaxed);
             {
-                let mut entries = self.h2c_carriers.entry(key).or_default();
+                let mut entries = self.h2c_carriers.entry(key.clone()).or_default();
                 while entries.len() >= max_idle {
                     entries.remove(0);
                     crate::runtime_metrics::global_ref()
                         .record_pool_eviction(PoolKind::UnixBackend);
                 }
                 entries.push(SharedH2c {
+                    id: entry_id,
                     sender: sender.clone(),
                     admitted,
                     last_used_at: AtomicU64::new(unix_secs()),
                 });
+                // Shard guard released before the second fence read, as in
+                // `checkin_h1_fenced`.
+            }
+            // The caller keeps this sender for the request it is already
+            // authorized to make; the fence only decides whether the carrier
+            // stays REUSABLE. A publication that landed during the dial retires
+            // it immediately.
+            if self.publication_generation.load(Ordering::Acquire) != generation {
+                self.withdraw_h2c_entry(&key, entry_id);
             }
             Ok(sender)
+        }
+
+        /// Remove EXACTLY the shared h2c carrier `entry_id` under `key`. See
+        /// [`Self::withdraw_idle_h1_entry`].
+        fn withdraw_h2c_entry(&self, key: &UnixPoolKey, entry_id: u64) {
+            let mut withdrawn = false;
+            if let Some(mut entries) = self.h2c_carriers.get_mut(key) {
+                let before = entries.len();
+                entries.retain(|entry| entry.id != entry_id);
+                withdrawn = entries.len() != before;
+            }
+            self.h2c_carriers
+                .remove_if(key, |_, entries| entries.is_empty());
+            if withdrawn {
+                self.record_withdrawal_fenced_checkin();
+                crate::runtime_metrics::global_ref().record_pool_eviction(PoolKind::UnixBackend);
+            }
         }
 
         fn take_shared_h2c(
@@ -1057,6 +1298,7 @@ mod imp {
         pub setup_failures: u64,
         pub idle_h1_connections: u64,
         pub active_h2c_connections: u64,
+        pub withdrawal_fenced_checkins: u64,
     }
 
     pub struct UnixBackendConnectionPool;
@@ -1064,6 +1306,13 @@ mod imp {
     impl UnixBackendConnectionPool {
         pub fn new(_pool_config: PoolConfig, _shard_amount: usize) -> Self {
             Self
+        }
+
+        /// Mirrors the Unix build's accessor. Nothing is ever pooled here, so
+        /// the generation never advances.
+        #[allow(dead_code)] // Parity with the Unix build; no Unix sockets to pool here.
+        pub fn publication_generation(&self) -> u64 {
+            0
         }
 
         pub fn force_drain_all(&self) {}

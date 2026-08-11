@@ -10602,6 +10602,12 @@ impl ProxyState {
         // protocol)` — never substring or prefix matching, which on a
         // security-sensitive retirement both under- and over-retires. One pass
         // per publication, never per request.
+        //
+        // The pass also advances the pool's publication generation, which is
+        // what reaches the carriers it CANNOT see: an HTTP/1.1 lease that is
+        // checked out for an in-flight exchange is deliberately absent from the
+        // idle map, and its check-in is fenced against the generation it was
+        // leased under (issue #3764).
         self.unix_backend_pool
             .retain_live_targets(&collect_live_unix_target_identities(&new_config));
 
@@ -41872,11 +41878,13 @@ async fn proxy_to_backend_unix(
         // connection is eligible for keep-alive reuse. `checkin_h1_when_idle`
         // still waits for hyper's own "dispatcher is idle" signal (the body read
         // completing here does not synchronously re-arm it) and re-checks
-        // `is_closed()` plus the socket's live inode identity before the sender
-        // re-enters the idle set — which covers a `Connection: close` response, a
-        // peer that hung up, and an errored exchange. Every error arm above
-        // returns without checking in, so a partial or failed body read retires
-        // the connection.
+        // `is_closed()`, the socket's live inode identity, and the publication
+        // generation this lease was bound to before the sender re-enters the
+        // idle set — which covers a `Connection: close` response, a peer that
+        // hung up, an errored exchange, and a config withdrawal that landed
+        // while this exchange was in flight. Every error arm above returns
+        // without checking in, so a partial or failed body read retires the
+        // connection.
         unix_backend_pool::UnixBackendConnectionPool::checkin_h1_when_idle(
             &state.unix_backend_pool,
             checkout,

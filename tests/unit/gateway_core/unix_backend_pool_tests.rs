@@ -847,6 +847,269 @@ async fn retain_live_targets_retires_only_withdrawn_unix_targets() {
     );
 }
 
+/// Build the live-target set for `proxy` over `socket`, the shape
+/// `collect_live_unix_target_identities` produces for a published config that
+/// still declares this HTTP/1.1 Unix target.
+fn live_http1_set(
+    proxy: &Proxy,
+    socket: &Path,
+) -> std::collections::HashSet<ferrum_edge::proxy::unix_backend_pool::UnixTargetIdentity> {
+    use ferrum_edge::proxy::unix_backend_pool::{UnixTargetIdentity, UnixWireProtocol};
+
+    let mut live = std::collections::HashSet::new();
+    live.insert(UnixTargetIdentity {
+        namespace: proxy.namespace.clone(),
+        proxy_id: proxy.id.clone(),
+        upstream_id: proxy.upstream_id.clone(),
+        configured_path: socket.to_str().expect("utf-8").to_string(),
+        protocol: UnixWireProtocol::Http1,
+    });
+    live
+}
+
+/// THE #3764 blocker. A checked-out HTTP/1.1 lease is deliberately absent from
+/// the idle map, so `retain_live_targets` cannot see it. When the exchange
+/// finishes — cleanly, on a healthy connection whose socket file was never
+/// touched — the check-in must still refuse to repopulate the pool, because the
+/// identity it would be pooled under no longer exists in configuration.
+#[tokio::test]
+async fn a_lease_held_across_a_withdrawal_cannot_repopulate_the_pool() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-withdrawal-fence");
+
+    // In flight when the withdrawal lands: checked out, never checked in.
+    let inflight = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "a checked-out lease is not in the idle map, which is exactly why \
+         publication cannot retire it directly"
+    );
+
+    // The published config no longer declares this target at all.
+    pool.retain_live_targets(&std::collections::HashSet::new());
+
+    // The response reaches clean EOF only now. The socket object is unchanged
+    // and the connection is live, so nothing but the fence can stop this.
+    pool.checkin_h1(inflight);
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "a check-in from an exchange that outlived its target's withdrawal must \
+         not repopulate the pool"
+    );
+    assert!(
+        pool.stats().withdrawal_fenced_checkins >= 1,
+        "the refusal must be attributed to the withdrawal fence"
+    );
+
+    // And nothing withdrawn is handed to the next request.
+    let next = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout after the withdrawal");
+    assert!(
+        !next.reused(),
+        "no carrier from the withdrawn incarnation may be reused"
+    );
+    expect_accepts(&peer, 2, "the post-withdrawal request dials fresh").await;
+}
+
+/// Same-key ABA. A withdrawal followed by a re-add of the EXACT same identity
+/// restores set membership, so a membership test alone would let a lease from
+/// the previous incarnation back in. The lease is bound to a publication
+/// generation, not to a name, so it stays out.
+#[tokio::test]
+async fn a_lease_from_a_previous_incarnation_cannot_re_enter_after_a_same_identity_re_add() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-aba");
+
+    let inflight = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+
+    // Withdraw, then re-add the identical tuple.
+    pool.retain_live_targets(&std::collections::HashSet::new());
+    pool.retain_live_targets(&live_http1_set(&proxy, &socket));
+
+    pool.checkin_h1(inflight);
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "a lease from the incarnation that was withdrawn must not re-enter the \
+         pool just because the same identity was published again"
+    );
+    assert!(pool.stats().withdrawal_fenced_checkins >= 1);
+
+    let next = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout on the re-added target");
+    assert!(
+        !next.reused(),
+        "the re-added target must start from a freshly admitted dial"
+    );
+    expect_accepts(&peer, 2, "the re-added target dials its own connection").await;
+}
+
+/// The fence must not break ordinary pooling: a lease taken AFTER a publication
+/// and checked in with no intervening publication is the current generation, so
+/// it is pooled and reused exactly as before.
+#[tokio::test]
+async fn a_current_generation_checkin_is_still_pooled_and_reused() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-current-generation");
+
+    // Publication first: this target is live.
+    pool.retain_live_targets(&live_http1_set(&proxy, &socket));
+    let generation = pool.publication_generation();
+
+    let lease = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    assert_eq!(
+        lease.generation(),
+        generation,
+        "a lease must be bound to the generation current at checkout"
+    );
+    pool.checkin_h1(lease);
+
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        1,
+        "an unfenced check-in must still pool its carrier"
+    );
+    assert_eq!(
+        pool.stats().withdrawal_fenced_checkins,
+        0,
+        "no publication intervened, so nothing may be fenced"
+    );
+    let reused = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    assert!(reused.reused(), "the pooled carrier must be handed back out");
+    expect_accepts(&peer, 1, "reuse must not open a second physical connection").await;
+}
+
+/// The interleaving a single-shot fence cannot catch: the check-in reads a live
+/// generation, publication then bumps it AND completes its retirement pass, and
+/// only afterwards does the check-in insert. The post-insert half of the fence
+/// has to withdraw exactly the entry it just inserted.
+///
+/// Driven through `_test_support`, which runs the publication inside the
+/// production check-in's own pre-read/insert window — not a re-implementation
+/// of it.
+#[tokio::test]
+async fn a_checkin_that_inserts_after_the_retirement_pass_withdraws_its_own_entry() {
+    use ferrum_edge::_test_support::checkin_unix_h1_with_publication_between;
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-fence-race");
+
+    let inflight = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+
+    let racing_pool = Arc::clone(&pool);
+    checkin_unix_h1_with_publication_between(&pool, inflight, || {
+        // The whole publication — generation bump AND retirement pass — lands
+        // here, after the check-in already decided its generation was current
+        // and before it inserts anything for the pass to find.
+        racing_pool.retain_live_targets(&std::collections::HashSet::new());
+    });
+
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "an insert that lands after the retirement pass must be withdrawn by the \
+         post-insert half of the fence"
+    );
+    assert!(
+        pool.stats().withdrawal_fenced_checkins >= 1,
+        "the withdrawn entry must be attributed to the fence"
+    );
+    let next = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout after the raced publication");
+    assert!(
+        !next.reused(),
+        "the raced carrier must not survive as a reusable connection"
+    );
+    expect_accepts(&peer, 2, "the next request dials fresh").await;
+}
+
 /// A protocol flip on the SAME path is a different identity, so the previous
 /// carrier must be retired by publication rather than silently kept alive.
 #[tokio::test]
@@ -979,5 +1242,55 @@ async fn a_closed_h2c_carrier_is_replaced_on_the_next_checkout() {
     assert!(
         peer.accepts() >= 2,
         "the replacement must be a freshly admitted physical connection"
+    );
+}
+
+/// The shared h2c carrier is published into the pool at the END of a dial that
+/// can itself straddle a publication, so it carries the same fence. A
+/// withdrawal must leave nothing multiplexable behind for the next RPC.
+#[tokio::test]
+async fn a_withdrawn_h2c_target_retains_no_shared_carrier() {
+    use ferrum_edge::proxy::unix_backend_pool::{UnixTargetIdentity, UnixWireProtocol};
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    // Long enough to hold the carrier open for the whole test.
+    let _peer = SettingsThenClosePeer::bind(&socket, std::time::Duration::from_secs(30));
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-h2c-withdrawal");
+
+    let sender = pool
+        .checkout_h2c(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("h2c checkout against a peer that completed its preface");
+    drop(sender);
+    assert_eq!(
+        pool.stats().active_h2c_connections,
+        1,
+        "a completed h2c establishment publishes exactly one shared carrier"
+    );
+
+    // The same path is now declared HTTP/1.1, so the h2c identity is withdrawn.
+    let mut live = std::collections::HashSet::new();
+    live.insert(UnixTargetIdentity {
+        namespace: proxy.namespace.clone(),
+        proxy_id: proxy.id.clone(),
+        upstream_id: proxy.upstream_id.clone(),
+        configured_path: socket.to_str().expect("utf-8").to_string(),
+        protocol: UnixWireProtocol::Http1,
+    });
+    pool.retain_live_targets(&live);
+
+    assert_eq!(
+        pool.stats().active_h2c_connections,
+        0,
+        "a withdrawn h2c identity must retain no shared carrier for the next RPC"
     );
 }
