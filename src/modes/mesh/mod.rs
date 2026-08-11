@@ -25938,6 +25938,7 @@ mod tests {
             sidecar_ingress_declared: false,
             declared_ingress_http_ports: 0,
             mesh_policies: Vec::new(),
+            ext_authz_providers: Vec::new(),
             peer_authentications: Vec::new(),
             service_entries: Vec::new(),
             request_authentications: Vec::new(),

@@ -1736,6 +1736,7 @@ struct RecoveredSliceCarriers {
     node_waypoint_capture_destinations: Vec<crate::modes::mesh::config::Workload>,
     node_waypoint_capture_peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
+    ext_authz_providers: Vec<crate::modes::mesh::config::MeshExtAuthzProvider>,
     virtual_service_cors_policies: Vec<crate::modes::mesh::config::MeshVirtualServiceCorsPolicy>,
     peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
     request_authentications: Vec<crate::modes::mesh::config::MeshRequestAuthentication>,
@@ -2198,6 +2199,7 @@ fn apply_recovered_carrier(
             recovered.virtual_service_l4_upstreams = value
         }
         MeshSliceCarrier::MeshPolicies(value) => recovered.mesh_policies = value,
+        MeshSliceCarrier::ExtAuthzProviders(value) => recovered.ext_authz_providers = value,
         MeshSliceCarrier::VirtualServiceCorsPolicies(value) => {
             recovered.virtual_service_cors_policies = value
         }

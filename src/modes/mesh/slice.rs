@@ -4662,6 +4662,7 @@ mod tests {
             sidecar_ingress_declared: false,
             declared_ingress_http_ports: 0,
             mesh_policies: vec![make_policy("p1", "ns", PolicyScope::MeshWide)],
+            ext_authz_providers: Vec::new(),
             peer_authentications: vec![make_peer_auth("pa1", "ns", None)],
             service_entries: vec![make_service_entry("se1", "ns", vec!["*".into()])],
             destination_rules: Vec::new(),
