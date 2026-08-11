@@ -6981,16 +6981,6 @@ pub mod _test_support {
         body.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
     }
 
-    /// Attach the H3-style declared-length success-on-drop gate so external
-    /// tests can prove a Unix pool lease is returned when hyper finishes a
-    /// known-length write without polling `Ready(None)` (#3731).
-    pub fn proxy_body_with_success_on_drop_after_response_bytes_for_test(
-        body: crate::proxy::ProxyBody,
-        bytes: Option<u64>,
-    ) -> crate::proxy::ProxyBody {
-        body.with_success_on_drop_after_response_bytes(bytes)
-    }
-
     pub fn proxy_body_into_grpc_web_streaming_for_test(
         body: crate::proxy::ProxyBody,
         content_type: &str,
