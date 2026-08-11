@@ -443,7 +443,7 @@ async fn connect_dtls_client(
         server_cert_verifier,
         connect_timeout_ms,
     };
-    Ok(DtlsConnection::connect(socket, params).await?)
+    DtlsConnection::connect(socket, params).await
 }
 
 async fn echo_round_trip(conn: &DtlsConnection, payload: &[u8]) {
@@ -592,7 +592,7 @@ async fn dtls_server_live_swap_crl_only_rejects_newly_revoked_client() {
         .expect("unrevoked client must connect before CRL-only rotation");
     echo_round_trip(&established, b"pre-crl").await;
 
-    let crls = build_crl(&client_ca, &[client.serial.clone()]);
+    let crls = build_crl(&client_ca, std::slice::from_ref(&client.serial));
     assert!(!crls.is_empty(), "CRL must parse from PEM");
     server.swap_frontend_config(frontend_config(&server_id, Some(&client_ca), &crls));
 

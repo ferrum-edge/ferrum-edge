@@ -1414,6 +1414,7 @@ impl StreamListenerManager {
     }
 
     /// Snapshot of the last accepted frontend DTLS generation (if any).
+    #[allow(dead_code)] // Test / introspection surface.
     pub fn snapshot_frontend_dtls_generation(
         &self,
     ) -> Option<Arc<crate::dtls::FrontendDtlsGeneration>> {
