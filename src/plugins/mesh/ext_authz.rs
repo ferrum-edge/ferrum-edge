@@ -31,7 +31,8 @@
 //! * timeout (bounded per provider, ceiling
 //!   [`crate::modes::mesh::config::MESH_EXT_AUTHZ_MAX_TIMEOUT_MS`])
 //! * concurrency ceiling reached (refused immediately; never queued)
-//! * response larger than the fixed read bound
+//! * an unreadable response, or a `200` allow response larger than the fixed
+//!   read bound
 //! * an HTTP `5xx` from the provider (it could not decide)
 //! * a body that could not be materialized for a provider that requires one
 //! * task cancellation (the future is dropped without producing an allow)
@@ -41,7 +42,9 @@
 //! failure) is a FAILED CHECK subject to `failOpen`, resolving to
 //! `statusOnError` when fail-closed; every other status (3xx / 4xx, and any
 //! non-`200` 2xx) is an explicit provider denial carrying the provider's own
-//! status.
+//! status. Because Ferrum never uses or forwards the provider response body,
+//! an unreadable or oversized body cannot turn an explicit denial into a
+//! failed check that `failOpen` would admit.
 //!
 //! THREE refusals are decided WITHOUT contacting a provider and are therefore
 //! NOT subject to `failOpen`: a request to which two DIFFERENT extension
@@ -752,12 +755,6 @@ impl MeshExtAuthzExecutor {
         };
 
         let status = response.status();
-        if response
-            .content_length()
-            .is_some_and(|length| length > MESH_EXT_AUTHZ_MAX_RESPONSE_BYTES as u64)
-        {
-            return provider.failure(MeshExtAuthzReason::ResponseTooLarge);
-        }
         // Istio/Envoy HTTP ext-auth outcome classification:
         //
         // * EXACTLY `200` allows. No other 2xx does — a `204` (or any other
@@ -782,16 +779,32 @@ impl MeshExtAuthzExecutor {
         } else {
             collect_headers(response.headers(), &provider.headers_to_downstream_on_deny)
         };
-        // Drain the body under the fixed bound even when nothing is forwarded:
-        // an unbounded provider response must be refused rather than read, and
-        // reading it bounded keeps the pooled connection reusable.
-        match read_response_body_bounded(response, MESH_EXT_AUTHZ_MAX_RESPONSE_BYTES).await {
-            Ok(_) => {}
-            Err(BoundedReadError::LimitExceeded { .. }) => {
-                return provider.failure(MeshExtAuthzReason::ResponseTooLarge);
-            }
-            Err(BoundedReadError::Stream(_)) => {
-                return provider.failure(MeshExtAuthzReason::ResponseReadFailed);
+        // The provider response body is never consumed by the authorization
+        // contract or forwarded to the client. Drain it under the fixed bound
+        // only to keep an ordinary pooled connection reusable. A malformed or
+        // oversized body on a `200` remains a failed check, but once the
+        // provider has returned an EXPLICIT denial its status is authoritative:
+        // a body error must never reclassify that denial as a failed check that
+        // `failOpen` could turn into an allow.
+        let declared_oversize = response
+            .content_length()
+            .is_some_and(|length| length > MESH_EXT_AUTHZ_MAX_RESPONSE_BYTES as u64);
+        if declared_oversize && allowed {
+            return provider.failure(MeshExtAuthzReason::ResponseTooLarge);
+        }
+        if !declared_oversize {
+            match read_response_body_bounded(response, MESH_EXT_AUTHZ_MAX_RESPONSE_BYTES).await {
+                Ok(_) => {}
+                Err(BoundedReadError::LimitExceeded { .. }) if allowed => {
+                    return provider.failure(MeshExtAuthzReason::ResponseTooLarge);
+                }
+                Err(BoundedReadError::Stream(_)) if allowed => {
+                    return provider.failure(MeshExtAuthzReason::ResponseReadFailed);
+                }
+                // The fixed denial status was already received. The discarded
+                // body is not an input to that decision, so its failure cannot
+                // weaken the denial.
+                Err(_) => {}
             }
         }
 

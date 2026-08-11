@@ -1221,10 +1221,10 @@ IPv6 literal (bracketed or bare). Userinfo (`@`), an embedded port, a path,
 query, fragment, backslash, percent-encoding, or a bracket imbalance is
 rejected at admission rather than deferred to a per-request URL parse.
 `pathPrefix` is validated as a real path: it must start with a single `/` and
-may not carry `?`, `#`, `\`, a `..` segment, or a leading `//` — each of those
-would move the request path into a different URL component. The composed base
-URL is re-parsed at config publication and must still carry only scheme, host,
-port, and path.
+may not carry `?`, `#`, `\`, percent-encoding, a `.` / `..` segment, or a
+leading `//` — those forms can be normalized or can move the request path into
+a different URL component. The composed base URL is re-parsed at config
+publication and must still carry only scheme, host, port, and path.
 
 > **Deliberate narrowing:** Istio's namespace-qualified
 > `[<namespace>/]<hostname>` service syntax is **not supported** and is
@@ -1301,8 +1301,13 @@ exactly:
 | --- | --- |
 | HTTP `200` | **allow** |
 | HTTP `5xx` | **failed check** — follows `failOpen`; `statusOnError` when fail-closed |
-| communication failure (connect / TLS / timeout / unreadable or oversize response) | **failed check** — follows `failOpen`; `statusOnError` when fail-closed |
+| communication failure (connect / TLS / timeout, or an unreadable / oversize `200` response) | **failed check** — follows `failOpen`; `statusOnError` when fail-closed |
 | any other status (3xx, 4xx, and any non-`200` 2xx such as `204`) | **explicit denial**, carrying the provider's own status |
+
+Ferrum never uses or forwards the provider response body. Once an explicit
+denial status has arrived, that status remains authoritative even if its
+discarded body is oversized or cannot be drained; `failOpen` therefore cannot
+convert a provider denial into an allow through a body-framing failure.
 
 A provider name this generation does not carry, a generation with no executor,
 an unavailable request body for a body-inspecting provider, a concurrency

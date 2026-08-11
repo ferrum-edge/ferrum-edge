@@ -22,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Istio/Envoy HTTP ext-auth protocol exactly: HTTP `200` allows, HTTP `5xx`
   and communication failures are failed checks subject to `failOpen` (resolving
   to `statusOnError` when fail-closed), and every other status is an explicit
-  denial carrying the provider's own status. The check is dispatched through a
+  denial carrying the provider's own status; an unreadable or oversized
+  discarded body cannot reclassify that denial into a `failOpen` allow. The
+  check is dispatched through a
   single-attempt seam on the shared plugin HTTP client, so an authorization
   decision is never replayed by `FERRUM_PLUGIN_HTTP_MAX_RETRIES`. It carries the
   protocol's automatic fields (original method, prefixed path, original `Host`
@@ -48,7 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unmodelled provider fields, `packAsBytes`, wildcard header entries,
   `headersToUpstreamOnAllow` / `headersToDownstreamOnAllow`, plaintext transport
   to a non-loopback provider, namespace-qualified `[<namespace>/]<hostname>`
-  service syntax, and `includeRequestBodyInCheck.allowPartialMessage: true`.
+  service syntax, URL-ambiguous `pathPrefix` percent encodings / dot segments,
+  and `includeRequestBodyInCheck.allowPartialMessage: true`.
   `maxRequestBytes` is enforced as a `413` before the check runs, matching Envoy
   without partial messages; the proxy's shared prebuffer ceiling is the maximum
   cap across the generation's providers, so the SELECTED provider's own cap is

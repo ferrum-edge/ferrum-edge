@@ -34,6 +34,12 @@ enum StubBehavior {
     Hang,
     /// Reply `200 OK` with a body far larger than the read bound.
     OversizeBody,
+    /// Reply with an explicit denial whose discarded body exceeds the read
+    /// bound. The denial must remain authoritative even under `failOpen`.
+    OversizeDenialBody,
+    /// Reply with an explicit denial and a truncated body. The denial must not
+    /// be reclassified as a failed check when the discarded body cannot drain.
+    TruncatedDenialBody,
     /// Close the connection without writing a response.
     Reset,
 }
@@ -91,6 +97,23 @@ async fn start_stub(behavior: StubBehavior) -> Stub {
                             .await;
                         let _ = stream.write_all(&body).await;
                         let _ = stream.write_all(b"\r\n0\r\n\r\n").await;
+                    }
+                    StubBehavior::OversizeDenialBody => {
+                        let body = vec![b'x'; 256 * 1024];
+                        let header = format!(
+                            "HTTP/1.1 403 Forbidden\r\ncontent-length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(&body).await;
+                    }
+                    StubBehavior::TruncatedDenialBody => {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 403 Forbidden\r\ncontent-length: 64\r\n\r\ndenied!",
+                            )
+                            .await;
+                        let _ = stream.shutdown().await;
                     }
                     StubBehavior::Reset => {
                         let _ = stream.shutdown().await;
@@ -286,6 +309,40 @@ async fn an_oversize_provider_response_fails_closed() {
             );
         }
         other => panic!("expected a fail-closed denial, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_oversize_explicit_denial_cannot_be_turned_into_a_fail_open_allow() {
+    let stub = start_stub(StubBehavior::OversizeDenialBody).await;
+    let mut source = provider(stub.port);
+    source.fail_open = true;
+    let executor = executor(vec![source]);
+    match check(&executor, "sample-ext-authz", &request_headers()).await {
+        MeshExtAuthzOutcome::Deny { status, reason, .. } => {
+            assert_eq!(status, 403);
+            assert_eq!(reason, MeshExtAuthzReason::DeniedByProvider);
+        }
+        other => panic!(
+            "a discarded oversize body must not weaken an explicit provider denial: {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn a_truncated_explicit_denial_cannot_be_turned_into_a_fail_open_allow() {
+    let stub = start_stub(StubBehavior::TruncatedDenialBody).await;
+    let mut source = provider(stub.port);
+    source.fail_open = true;
+    let executor = executor(vec![source]);
+    match check(&executor, "sample-ext-authz", &request_headers()).await {
+        MeshExtAuthzOutcome::Deny { status, reason, .. } => {
+            assert_eq!(status, 403);
+            assert_eq!(reason, MeshExtAuthzReason::DeniedByProvider);
+        }
+        other => panic!(
+            "a discarded truncated body must not weaken an explicit provider denial: {other:?}"
+        ),
     }
 }
 

@@ -798,9 +798,9 @@ pub fn validate_mesh_ext_authz_service_host(service: &str) -> Result<(), String>
 /// Validate an `extensionProviders[].pathPrefix` as a REAL URL path prefix.
 ///
 /// The prefix is concatenated ahead of the request path, so a value carrying
-/// `?`, `#`, `\`, or a leading `//` would move the remainder into the query,
-/// the fragment, or an entirely different authority — silently sending the
-/// check somewhere the operator did not name.
+/// `?`, `#`, `\`, percent-encoding, a dot segment, or a leading `//` could be
+/// reinterpreted by the URL parser — silently sending the check to a path or
+/// component the operator did not name.
 pub fn validate_mesh_ext_authz_path_prefix(prefix: &str) -> Result<(), String> {
     if !prefix.starts_with('/') {
         return Err("pathPrefix must start with '/'".to_string());
@@ -821,16 +821,19 @@ pub fn validate_mesh_ext_authz_path_prefix(prefix: &str) -> Result<(), String> {
         byte.is_ascii_control()
             || byte.is_ascii_whitespace()
             || !byte.is_ascii()
-            || matches!(byte, b'?' | b'#' | b'\\')
+            || matches!(byte, b'?' | b'#' | b'\\' | b'%')
     }) {
         return Err(
-            "pathPrefix must be printable ASCII with no '?', '#', or '\\' (those change which \
-             URL component the request path lands in)"
+            "pathPrefix must be printable ASCII with no '?', '#', '\\', or percent-encoding \
+             (those can change how the URL parser interprets the path)"
                 .to_string(),
         );
     }
-    if prefix.split('/').any(|segment| segment == "..") {
-        return Err("pathPrefix must not contain a '..' segment".to_string());
+    if prefix
+        .split('/')
+        .any(|segment| matches!(segment, "." | ".."))
+    {
+        return Err("pathPrefix must not contain a '.' or '..' segment".to_string());
     }
     Ok(())
 }

@@ -1078,7 +1078,10 @@ fn hostile_provider_path_prefixes_are_refused_at_admission() {
         "/check?x=1",
         "/check#frag",
         "/check\\evil",
+        "/check/./root",
         "/check/../../root",
+        "/check/%2e%2e/root",
+        "/check/%2Froot",
         "/check\u{7f}",
     ] {
         let mut provider = provider("p");
@@ -1094,6 +1097,55 @@ fn hostile_provider_path_prefixes_are_refused_at_admission() {
         provider.validate().is_ok(),
         "an ordinary path prefix is fine"
     );
+}
+
+#[test]
+fn non_string_ext_authz_url_fields_are_refused_instead_of_defaulted() {
+    for (field, provider) in [
+        (
+            "service",
+            r#"
+extensionProviders:
+- name: sample-ext-authz
+  envoyExtAuthzHttp:
+    service: true
+    port: 8000
+"#,
+        ),
+        (
+            "scheme",
+            r#"
+extensionProviders:
+- name: sample-ext-authz
+  envoyExtAuthzHttp:
+    service: 127.0.0.1
+    port: 8000
+    scheme: true
+"#,
+        ),
+        (
+            "pathPrefix",
+            r#"
+extensionProviders:
+- name: sample-ext-authz
+  envoyExtAuthzHttp:
+    service: 127.0.0.1
+    port: 8000
+    pathPrefix: true
+"#,
+        ),
+    ] {
+        let config_map = mesh_config_map(ROOT_NS, provider);
+        let error = translate(&[
+            config_map,
+            custom_policy(json!({ "name": "sample-ext-authz" })),
+        ])
+        .expect_err("a typed ext-authz URL field must never be silently dropped");
+        assert!(
+            error.contains(field) && error.contains("must be a string"),
+            "the refusal must name {field}: {error}"
+        );
+    }
 }
 
 // ── Fixed check headers are authoritative ─────────────────────────────────

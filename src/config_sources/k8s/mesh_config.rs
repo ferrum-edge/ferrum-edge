@@ -436,7 +436,7 @@ fn envoy_ext_authz_http_provider(
     let display = sanitize_mesh_ext_authz_diagnostic(name);
     reject_unknown_provider_keys(&display, "envoyExtAuthzHttp", config, EXT_AUTHZ_HTTP_KEYS)?;
 
-    let Some(service) = trimmed_string(config, "service") else {
+    let Some(service) = optional_ext_authz_string(&display, config, "service")? else {
         return Err(format!(
             "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp requires service"
         ));
@@ -446,7 +446,7 @@ fn envoy_ext_authz_http_provider(
             "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp requires port"
         ));
     };
-    let tls = match trimmed_string(config, "scheme").as_deref() {
+    let tls = match optional_ext_authz_string(&display, config, "scheme")?.as_deref() {
         None | Some("http") => false,
         Some("https") => true,
         Some(_) => {
@@ -464,7 +464,7 @@ fn envoy_ext_authz_http_provider(
             "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp timeout must be between 1ms and {MESH_EXT_AUTHZ_MAX_TIMEOUT_MS}ms"
         ));
     }
-    let path_prefix = match trimmed_string(config, "pathPrefix") {
+    let path_prefix = match optional_ext_authz_string(&display, config, "pathPrefix")? {
         Some(prefix) if prefix.starts_with('/') => Some(prefix),
         Some(_) => {
             return Err(format!(
@@ -526,6 +526,30 @@ fn envoy_ext_authz_http_provider(
         .validate()
         .map_err(|error| format!("meshConfig.{error}"))?;
     Ok(provider)
+}
+
+/// Parse an optional string field on the security-sensitive ext-authz block.
+///
+/// The generic meshConfig string helper intentionally treats a non-string as
+/// absent for older best-effort telemetry providers. That is not safe here:
+/// silently defaulting `scheme` or dropping `pathPrefix` changes where an
+/// authorization decision is sent. Null/empty keeps protobuf's ordinary
+/// "unset" semantics; every other non-string shape is refused by field name.
+fn optional_ext_authz_string(
+    display: &str,
+    config: &Value,
+    field: &str,
+) -> Result<Option<String>, String> {
+    match config.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            Ok((!value.is_empty()).then(|| value.to_string()))
+        }
+        Some(_) => Err(format!(
+            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp {field} must be a string"
+        )),
+    }
 }
 
 fn reject_unknown_provider_keys(
