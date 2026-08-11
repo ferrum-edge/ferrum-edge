@@ -615,7 +615,12 @@ async fn finite_server_lease_closes_every_bearer_configuration_stream() {
 #[tokio::test(start_paused = true)]
 async fn verifier_rotation_revokes_only_streams_bound_to_removed_credentials() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
-    let (addr, handle) = start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
+    // Keep the independent server lease well beyond the client-side terminal
+    // wait. With Tokio's clock paused, real loopback I/O can otherwise leave
+    // only the short server timer runnable and auto-advance it before the
+    // verifier watch notification is delivered.
+    let (addr, handle) =
+        start_all_stream_surfaces(verifier.clone(), Duration::from_secs(300)).await;
 
     let token_a = mint(
         TENANT_A_SECRET,
@@ -844,7 +849,11 @@ async fn deadlines_preempt_buffered_configuration_output() {
 #[tokio::test(start_paused = true)]
 async fn xds_revocation_terminates_sotw_and_delta_with_buffered_transport_data() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
-    let (addr, handle) = start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
+    // This test isolates credential revocation. A short server lease races the
+    // paused Tokio clock while the real transport drains buffered frames and
+    // can turn the terminal status into an unrelated Unauthenticated expiry.
+    let (addr, handle) =
+        start_all_stream_surfaces(verifier.clone(), Duration::from_secs(300)).await;
 
     let sotw_token = mint(
         TENANT_A_SECRET,

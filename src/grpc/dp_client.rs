@@ -221,16 +221,8 @@ impl GrpcJwtSecret {
         self
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.secret
-    }
-
     pub fn issuer(&self) -> &str {
         &self.issuer
-    }
-
-    pub fn key_id(&self) -> Option<&str> {
-        self.key_id.as_deref()
     }
 
     /// True when this node presents an externally issued token rather than
