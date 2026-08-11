@@ -112,6 +112,9 @@ pub enum UnixBackendError {
     /// longer be inspected. This is the check-to-connect swap, caught after the
     /// connect and before any request byte.
     SocketIdentityChanged,
+    /// The HTTP/1.1 client handshake failed on an `http`-declared Unix listener
+    /// after the admitted connect succeeded. Pre-wire: no request was issued.
+    Http1Handshake(hyper::Error),
     /// The h2c prior-knowledge HTTP/2 client handshake failed on an
     /// `http2`/`grpc`-declared listener. The socket accepted the connection but
     /// the application does not speak h2c on it — a configuration mismatch, not
@@ -165,6 +168,9 @@ impl std::fmt::Display for UnixBackendError {
                 f,
                 "unix backend socket was replaced between admission and connect"
             ),
+            Self::Http1Handshake(err) => {
+                write!(f, "unix backend HTTP/1.1 handshake failed: {err}")
+            }
             Self::H2Handshake(err) => {
                 write!(f, "unix backend h2c handshake failed: {err}")
             }
@@ -179,6 +185,16 @@ impl std::fmt::Display for UnixBackendError {
             Self::PlatformUnsupported => {
                 write!(f, "unix backends are not supported on this platform")
             }
+        }
+    }
+}
+
+impl std::error::Error for UnixBackendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connect(err) | Self::PeerCredentialsUnavailable(err) => Some(err),
+            Self::Http1Handshake(err) | Self::H2Handshake(err) => Some(err),
+            _ => None,
         }
     }
 }
@@ -218,7 +234,7 @@ impl UnixBackendError {
             // the app (it is not speaking the protocol its listener declared, or
             // it hung up before it could) — the same posture the pooled
             // transports give a failed connection setup.
-            Self::H2Handshake(_) | Self::H2ConnectionClosed => {
+            Self::Http1Handshake(_) | Self::H2Handshake(_) | Self::H2ConnectionClosed => {
                 crate::retry::ErrorClass::ConnectionPoolError
             }
             Self::H2HandshakeTimeout { .. } => crate::retry::ErrorClass::ConnectionTimeout,
@@ -302,7 +318,7 @@ pub fn effective_connect_timeout_ms(proxy_connect_timeout_ms: u64) -> u64 {
 /// fail closed rather than silently becoming an unbounded wait. Returning the
 /// effective millisecond value keeps the timeout response aligned with the
 /// default applied when the proxy-level value is zero.
-fn connect_deadline(
+pub(crate) fn connect_deadline(
     proxy_connect_timeout_ms: u64,
 ) -> Result<(u64, tokio::time::Instant), UnixBackendError> {
     let timeout_ms = effective_connect_timeout_ms(proxy_connect_timeout_ms);
@@ -463,17 +479,22 @@ pub async fn connect_admitted(
 /// directory chain, socket file type, owner uid, and mode — see
 /// [`crate::util::unix_socket::admit_socket_for_connect`] — and hands
 /// [`connect_admitted`] the identity to bind the connection to.
+///
+/// Returns the admitted identity alongside the connected stream so a pool can
+/// key and re-verify the connection against the exact `(dev, ino, owner)` that
+/// was checked.
 #[cfg(unix)]
-async fn admit_and_connect(
+pub async fn admit_and_connect(
     path: &str,
     connect_timeout_ms: u64,
     allowed_roots: &[String],
     allowed_uids: &[u32],
-) -> Result<tokio::net::UnixStream, UnixBackendError> {
+) -> Result<(AdmittedUnixSocket, tokio::net::UnixStream), UnixBackendError> {
     let admitted =
         crate::util::unix_socket::admit_socket_for_connect(path, allowed_roots, allowed_uids)
             .map_err(UnixBackendError::InadmissiblePath)?;
-    connect_admitted(&admitted, connect_timeout_ms).await
+    let stream = connect_admitted(&admitted, connect_timeout_ms).await?;
+    Ok((admitted, stream))
 }
 
 /// Dial a co-located Unix-domain STREAM socket for an HTTP/1.1 backend,
@@ -486,47 +507,21 @@ pub async fn dial_unix_backend(
     allowed_roots: &[String],
     allowed_uids: &[u32],
 ) -> Result<tokio::net::UnixStream, UnixBackendError> {
-    admit_and_connect(path, connect_timeout_ms, allowed_roots, allowed_uids).await
+    let (_admitted, stream) =
+        admit_and_connect(path, connect_timeout_ms, allowed_roots, allowed_uids).await?;
+    Ok(stream)
 }
 
-/// Dial a co-located Unix-domain STREAM socket and complete an **h2c
-/// prior-knowledge HTTP/2** client handshake on it, returning a sender of the
-/// same type the sidecar mesh-mTLS pool produces.
-///
-/// Sharing that sender type is deliberate: it lets the Unix h2c transport reuse
-/// `proxy_to_backend_mesh_mtls`'s dispatch body verbatim, so request/response
-/// streaming, gRPC deadlines and cancellation, `te: trailers` regeneration, and
-/// terminal-trailer forwarding are the SAME code on both transports and cannot
-/// drift apart. The connection is 1:1 (not pooled) and its driver task ends
-/// with the request, exactly like the mesh WebSocket / raw-TCP dials.
-///
-/// The sender is returned only once the peer has proved it speaks HTTP/2 on
-/// this socket. hyper's `handshake()` writes the CLIENT connection preface and
-/// never reads, so it resolves against a peer that accepted the socket and then
-/// said nothing; establishment is therefore the peer's own initial SETTINGS
-/// frame, observed by `crate::proxy::h2c_preface`. Admission, the connect, the
-/// client handshake, and that observation all share ONE end-to-end budget —
-/// [`effective_connect_timeout_ms`] captured before the connect — so a slow
-/// connect cannot re-arm a fresh budget for the preface, and a peer that accepts
-/// but never becomes usable cannot pin the request task past it. No request byte
-/// is written before any of this: the caller does not hold the sender until this
-/// returns.
+/// Complete an h2c prior-knowledge HTTP/2 client handshake on an already
+/// admitted + connected Unix stream, waiting for the peer's SETTINGS preface
+/// inside `deadline`.
 #[cfg(unix)]
-pub async fn dial_unix_h2c_sender(
-    path: &str,
-    connect_timeout_ms: u64,
-    allowed_roots: &[String],
-    allowed_uids: &[u32],
+pub async fn handshake_unix_h2c_sender(
+    stream: tokio::net::UnixStream,
+    deadline: tokio::time::Instant,
+    timeout_ms: u64,
 ) -> Result<crate::proxy::mesh_mtls_pool::MeshMtlsSender, UnixBackendError> {
     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-
-    let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
-
-    let connect = admit_and_connect(path, connect_timeout_ms, allowed_roots, allowed_uids);
-    let stream = match tokio::time::timeout_at(deadline, connect).await {
-        Ok(result) => result?,
-        Err(_) => return Err(UnixBackendError::ConnectTimeout { timeout_ms }),
-    };
 
     let settings_received = Arc::new(AtomicBool::new(false));
     let io = TokioIo::new(H2cPrefaceIo::new(stream, Arc::clone(&settings_received)));
@@ -546,8 +541,6 @@ pub async fn dial_unix_h2c_sender(
     };
     let (sender, mut connection) = handshake_result.map_err(UnixBackendError::H2Handshake)?;
 
-    // Establishment proper: the peer's own connection preface, on whatever is
-    // left of the budget the connect already drew from.
     let establish = await_peer_settings(&mut connection, &settings_received);
     let established = match tokio::time::timeout_at(deadline, establish).await {
         Ok(result) => result,
@@ -568,6 +561,36 @@ pub async fn dial_unix_h2c_sender(
         }
     });
     Ok(sender)
+}
+
+/// Dial a co-located Unix-domain STREAM socket and complete an **h2c
+/// prior-knowledge HTTP/2** client handshake on it, returning a sender of the
+/// same type the sidecar mesh-mTLS pool produces.
+///
+/// Sharing that sender type is deliberate: it lets the Unix h2c transport reuse
+/// `proxy_to_backend_mesh_mtls`'s dispatch body verbatim, so request/response
+/// streaming, gRPC deadlines and cancellation, `te: trailers` regeneration, and
+/// terminal-trailer forwarding are the SAME code on both transports and cannot
+/// drift apart.
+///
+/// Production dispatch prefers the pooled carrier in
+/// [`crate::proxy::unix_backend_pool`]; this 1:1 dial remains for focused
+/// admission/handshake tests and as the pool's cold-path create primitive.
+#[cfg(unix)]
+pub async fn dial_unix_h2c_sender(
+    path: &str,
+    connect_timeout_ms: u64,
+    allowed_roots: &[String],
+    allowed_uids: &[u32],
+) -> Result<crate::proxy::mesh_mtls_pool::MeshMtlsSender, UnixBackendError> {
+    let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
+
+    let connect = admit_and_connect(path, connect_timeout_ms, allowed_roots, allowed_uids);
+    let (_admitted, stream) = match tokio::time::timeout_at(deadline, connect).await {
+        Ok(result) => result?,
+        Err(_) => return Err(UnixBackendError::ConnectTimeout { timeout_ms }),
+    };
+    handshake_unix_h2c_sender(stream, deadline, timeout_ms).await
 }
 
 /// Non-Unix build: there is no Unix-domain socket to dial, so the shared

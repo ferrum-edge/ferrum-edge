@@ -100,6 +100,7 @@ mod tls_offload_tests;
 mod tls_tests;
 mod udp_dtls_idle_activity_tests;
 mod udp_reply_stop_tests;
+mod unix_backend_pool_tests;
 mod unix_backend_tests;
 mod upstream_tag_reload_tests;
 mod waf_websocket_message_tests;

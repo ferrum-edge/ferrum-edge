@@ -14507,10 +14507,15 @@ async fn functional_mesh_live_two_cluster_cross_cluster_protocol_matrix() {
 /// request with `name` plus the request line and forwarded Host, so a test can
 /// prove WHICH socket served it and that header regeneration survived the
 /// transport swap.
+/// KEEP-ALIVE: one accepted connection serves an unbounded number of
+/// pipelined-in-sequence requests. That is what makes the #3731 pooling
+/// assertion meaningful — `accepts()` counts physical connections while
+/// `hits()` counts requests, so a reusing gateway shows `accepts() < hits()`.
 #[cfg(unix)]
 struct UnixHttp1Backend {
     path: PathBuf,
     hits: Arc<AtomicUsize>,
+    accepts: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -14519,47 +14524,66 @@ impl UnixHttp1Backend {
     fn start(path: PathBuf, name: &'static str) -> Self {
         let listener = tokio::net::UnixListener::bind(&path).expect("bind unix http1 backend");
         let hits = Arc::new(AtomicUsize::new(0));
+        let accepts = Arc::new(AtomicUsize::new(0));
         let hits_task = Arc::clone(&hits);
+        let accepts_task = Arc::clone(&accepts);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
+                accepts_task.fetch_add(1, Ordering::SeqCst);
                 let hits = Arc::clone(&hits_task);
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut buf = vec![0u8; 8192];
-                    let n =
-                        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-                            .await
+                    loop {
+                        let n = match tokio::time::timeout(
+                            Duration::from_secs(5),
+                            stream.read(&mut buf),
+                        )
+                        .await
                         {
                             Ok(Ok(n)) if n > 0 => n,
                             _ => return,
                         };
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    let request_line = request.lines().next().unwrap_or("").to_string();
-                    let host = request
-                        .lines()
-                        .find(|line| line.to_ascii_lowercase().starts_with("host:"))
-                        .map(|line| line["host:".len()..].trim().to_string())
-                        .unwrap_or_default();
-                    let body = format!("{name}|{request_line}|{host}");
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.flush().await;
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let request_line = request.lines().next().unwrap_or("").to_string();
+                        let host = request
+                            .lines()
+                            .find(|line| line.to_ascii_lowercase().starts_with("host:"))
+                            .map(|line| line["host:".len()..].trim().to_string())
+                            .unwrap_or_default();
+                        let body = format!("{name}|{request_line}|{host}");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let _ = stream.flush().await;
+                    }
                 });
             }
         });
-        Self { path, hits, task }
+        Self {
+            path,
+            hits,
+            accepts,
+            task,
+        }
     }
 
     fn hits(&self) -> usize {
         self.hits.load(Ordering::SeqCst)
+    }
+
+    /// Physical connections accepted on this socket.
+    fn accepts(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
     }
 
     /// Simulate the app going away without rewriting config: stop serving and
@@ -14578,6 +14602,83 @@ impl Drop for UnixHttp1Backend {
     }
 }
 
+/// A minimal **RFC 6455 WebSocket** server on a Unix-domain stream socket
+/// (issue #3732).
+///
+/// Completes a real HTTP/1.1 upgrade (so the gateway's `101` + exact
+/// `Sec-WebSocket-Accept` validation is genuinely exercised), then echoes
+/// Text/Binary payloads back with a `echo:` prefix, answers Ping with Pong, and
+/// mirrors Close. `accepts()` proves the WebSocket session opened its OWN
+/// physical connection rather than borrowing a pooled HTTP/1.1 one.
+#[cfg(unix)]
+struct UnixWebSocketBackend {
+    path: PathBuf,
+    accepts: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl UnixWebSocketBackend {
+    fn start(path: PathBuf) -> Self {
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind unix websocket backend");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_task = Arc::clone(&accepts);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                accepts_task.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use futures_util::{SinkExt, StreamExt};
+                    use tokio_tungstenite::tungstenite::Message;
+
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = ws.next().await {
+                        let reply = match message {
+                            Message::Text(text) => Message::Text(format!("echo:{text}").into()),
+                            Message::Binary(bytes) => {
+                                let mut echoed = b"echo:".to_vec();
+                                echoed.extend_from_slice(&bytes);
+                                Message::Binary(echoed.into())
+                            }
+                            Message::Ping(payload) => Message::Pong(payload),
+                            Message::Close(frame) => {
+                                let _ = ws.send(Message::Close(frame)).await;
+                                return;
+                            }
+                            // Pong / raw frames need no reply.
+                            _ => continue,
+                        };
+                        if ws.send(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self {
+            path,
+            accepts,
+            task,
+        }
+    }
+
+    fn accepts(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixWebSocketBackend {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// A minimal **h2c prior-knowledge HTTP/2** gRPC-shaped server on a
 /// Unix-domain stream socket.
 ///
@@ -14590,6 +14691,7 @@ impl Drop for UnixHttp1Backend {
 #[cfg(unix)]
 struct UnixH2cBackend {
     path: PathBuf,
+    accepts: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -14597,11 +14699,14 @@ struct UnixH2cBackend {
 impl UnixH2cBackend {
     fn start(path: PathBuf) -> Self {
         let listener = tokio::net::UnixListener::bind(&path).expect("bind unix h2c backend");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_task = Arc::clone(&accepts);
         let task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
+                accepts_task.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     let service =
                         service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
@@ -14653,7 +14758,16 @@ impl UnixH2cBackend {
                 });
             }
         });
-        Self { path, task }
+        Self {
+            path,
+            accepts,
+            task,
+        }
+    }
+
+    /// Physical connections accepted. Multiplexed RPCs must share one.
+    fn accepts(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
     }
 }
 
@@ -14896,10 +15010,12 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
 
     let http1_socket = socket_root.join("http1.sock");
     let h2c_socket = socket_root.join("h2c.sock");
+    let ws_socket = socket_root.join("ws.sock");
     let outside_socket = outside_root.join("privileged.sock");
 
     let http1_backend = UnixHttp1Backend::start(http1_socket.clone(), "unix-http1-a");
-    let _h2c_backend = UnixH2cBackend::start(h2c_socket.clone());
+    let h2c_backend = UnixH2cBackend::start(h2c_socket.clone());
+    let ws_backend = UnixWebSocketBackend::start(ws_socket.clone());
     // A REAL, reachable socket that config points at but containment forbids:
     // the refusal must be the allowlist, not an absent socket.
     let outside_backend = UnixHttp1Backend::start(outside_socket.clone(), "must-never-be-reached");
@@ -14920,6 +15036,13 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
             listener_port: 7443,
             protocol: AppProtocol::Http,
             default_endpoint: unix_url(&outside_socket),
+        },
+        // `http`-declared, so WebSocket upgrades ride the H1 Unix carrier
+        // (issue #3732).
+        UnixIngressEntry {
+            listener_port: 6443,
+            protocol: AppProtocol::Http,
+            default_endpoint: unix_url(&ws_socket),
         },
     ];
 
@@ -15100,10 +15223,122 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
         );
     }
 
-    // ── (e) WebSocket upgrade over a unix backend is explicitly refused ──
+    // ── (e1) WebSocket over an `http`-declared unix socket WORKS (issue #3732) ──
+    // A live RFC 6455 handshake through the admitted socket, then bidirectional
+    // text, binary, ping/pong, and close — the exact payloads the backend saw.
+    {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let ws_accepts_before = ws_backend.accepts();
+        let ws_url = "ws://echo.ferrum.svc.cluster.local:6443/ws";
+        let mut ws_request = match tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+            ws_url,
+        ) {
+            Ok(request) => request,
+            Err(e) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!("building the unix-backed WebSocket request failed: {e}\n{output}");
+            }
+        };
+        // The gateway routes on Host/`:authority`; the TCP dial is the local
+        // inbound listener.
+        ws_request.headers_mut().insert(
+            "host",
+            "echo.ferrum.svc.cluster.local:6443".parse().expect("host"),
+        );
+        let tcp = match tokio::net::TcpStream::connect(("127.0.0.1", inbound_port)).await {
+            Ok(tcp) => tcp,
+            Err(e) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!("connecting to the mesh inbound listener failed: {e}\n{output}");
+            }
+        };
+        let (mut ws, response) =
+            match tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::client_async(ws_request, tcp))
+                .await
+            {
+                Ok(Ok(established)) => established,
+                Ok(Err(e)) => {
+                    let output = captured_output(&temp);
+                    kill_child(&mut child);
+                    panic!(
+                        "a WebSocket upgrade to an http-declared unix ingress socket must \
+                         complete; handshake failed: {e}\n{output}"
+                    );
+                }
+                Err(_) => {
+                    let output = captured_output(&temp);
+                    kill_child(&mut child);
+                    panic!("the unix-backed WebSocket handshake timed out\n{output}");
+                }
+            };
+        assert_eq!(
+            response.status().as_u16(),
+            101,
+            "a unix-backed WebSocket upgrade must be a real 101 Switching Protocols"
+        );
+
+        let ws_failure: Option<String>;
+        let exchange = async {
+            ws.send(Message::Text("hello-unix".into()))
+                .await
+                .map_err(|e| format!("send text: {e}"))?;
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) if text == "echo:hello-unix" => {}
+                other => return Err(format!("unexpected text echo: {other:?}")),
+            }
+            ws.send(Message::Binary(vec![1u8, 2, 3].into()))
+                .await
+                .map_err(|e| format!("send binary: {e}"))?;
+            match ws.next().await {
+                Some(Ok(Message::Binary(bytes))) if bytes.as_ref() == b"echo:\x01\x02\x03" => {}
+                other => return Err(format!("unexpected binary echo: {other:?}")),
+            }
+            ws.send(Message::Ping(vec![9u8].into()))
+                .await
+                .map_err(|e| format!("send ping: {e}"))?;
+            match ws.next().await {
+                Some(Ok(Message::Pong(payload))) if payload.as_ref() == b"\x09" => {}
+                other => return Err(format!("unexpected pong: {other:?}")),
+            }
+            ws.send(Message::Close(None))
+                .await
+                .map_err(|e| format!("send close: {e}"))?;
+            Ok::<(), String>(())
+        };
+        match tokio::time::timeout(Duration::from_secs(10), exchange).await {
+            Ok(Ok(())) => ws_failure = None,
+            Ok(Err(reason)) => ws_failure = Some(reason),
+            Err(_) => ws_failure = Some("bidirectional frame exchange timed out".to_string()),
+        }
+        if let Some(reason) = ws_failure {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!("unix-backed WebSocket relay failed: {reason}\n{output}");
+        }
+        // The session leases its OWN dedicated connection; it is never taken
+        // from (or returned to) the HTTP/1.1 idle pool.
+        if ws_backend.accepts() != ws_accepts_before + 1 {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!(
+                "a WebSocket session must open exactly one dedicated unix connection; accepts \
+                 went {ws_accepts_before} -> {}\n{output}",
+                ws_backend.accepts()
+            );
+        }
+    }
+
+    // ── (e2) WebSocket over an `http2`/`grpc`-declared socket stays REFUSED ──
+    // RFC 8441 Extended CONNECT over the h2c unix carrier is unimplemented, and
+    // it must NOT be silently downgraded to an HTTP/1.1 upgrade the h2c-only app
+    // cannot answer.
     let (ws_status, ws_body) = match plaintext_inbound_http1(
         inbound_port,
-        authority_8443,
+        authority_9443,
         "/ws",
         &[
             ("Connection", "Upgrade"),
@@ -15125,9 +15360,96 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
         let output = captured_output(&temp);
         kill_child(&mut child);
         panic!(
-            "a WebSocket upgrade to a unix-socket backend must be refused 502 with the documented \
-             message; got status {ws_status} body {ws_body:?}\n{output}"
+            "a WebSocket upgrade to an h2c unix-socket backend must be refused 502 with the \
+             documented message; got status {ws_status} body {ws_body:?}\n{output}"
         );
+    }
+
+    // ── (e3) h2c stream multiplexing over ONE admitted connection (#3731) ──
+    // Concurrent RPCs must share a single admitted physical connection instead
+    // of each paying its own connect + h2c handshake.
+    {
+        let h2c_accepts_before = h2c_backend.accepts();
+        let mut rpcs = Vec::new();
+        for _ in 0..6 {
+            rpcs.push(plaintext_inbound_grpc(
+                inbound_port,
+                authority_9443,
+                "/ferrum.Test/Echo",
+                None,
+            ));
+        }
+        let results = futures_util::future::join_all(rpcs).await;
+        for (index, result) in results.into_iter().enumerate() {
+            match result {
+                Ok((status, headers, trailers)) => {
+                    if status != 200 || grpc_status_code(&headers, &trailers) != Some(0) {
+                        let output = captured_output(&temp);
+                        kill_child(&mut child);
+                        panic!(
+                            "multiplexed unix h2c RPC {index} must succeed with terminal \
+                             trailers; status {status} headers {headers:?} trailers \
+                             {trailers:?}\n{output}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    let output = captured_output(&temp);
+                    kill_child(&mut child);
+                    panic!("multiplexed unix h2c RPC {index} failed: {e}\n{output}");
+                }
+            }
+        }
+        let new_h2c_accepts = h2c_backend.accepts() - h2c_accepts_before;
+        if new_h2c_accepts >= 6 {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!(
+                "6 concurrent RPCs over an admitted unix h2c socket must share a pooled \
+                 multiplexed connection; they opened {new_h2c_accepts} physical \
+                 connections\n{output}"
+            );
+        }
+    }
+
+    // ── (e4) HTTP/1.1 over the admitted socket never amplifies connections ──
+    // The H1 pool leases exclusively and re-pools only fully-read (buffered)
+    // responses, so the invariant a test can assert without depending on the
+    // per-route buffering decision is: every request is served correctly and no
+    // request ever costs more than one physical connection.
+    {
+        let accepts_before = http1_backend.accepts();
+        let hits_before = http1_backend.hits();
+        for index in 0..12 {
+            let (status, body) =
+                match plaintext_inbound_http1(inbound_port, authority_8443, "/", &[]).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        let output = captured_output(&temp);
+                        kill_child(&mut child);
+                        panic!("pooled unix request {index} failed: {e}\n{output}");
+                    }
+                };
+            if status != 200 || !body.contains("unix-http1-a") {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!(
+                    "pooled unix request {index} must still be served correctly; got status \
+                     {status} body {body:?}\n{output}"
+                );
+            }
+        }
+        let new_accepts = http1_backend.accepts() - accepts_before;
+        let new_hits = http1_backend.hits() - hits_before;
+        if new_hits != 12 || new_accepts > new_hits {
+            let output = captured_output(&temp);
+            kill_child(&mut child);
+            panic!(
+                "admitted unix HTTP/1.1 dispatch must serve 12 requests over at most 12 \
+                 physical connections; got {new_hits} requests over {new_accepts} \
+                 connections\n{output}"
+            );
+        }
     }
 
     // ── (f) containment: a real socket OUTSIDE the allowed roots never dials ──

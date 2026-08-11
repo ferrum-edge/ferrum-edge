@@ -104,6 +104,7 @@ pub mod udp_batch;
 pub mod udp_placement_migration;
 pub mod udp_proxy;
 pub mod unix_backend;
+pub mod unix_backend_pool;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -5865,6 +5866,9 @@ pub struct ProxyState {
     pub hbone_pool: Arc<HboneConnectionPool>,
     /// Sidecar egress SVID-mTLS HTTP/2 pool (`mesh.mtls` targets).
     pub mesh_mtls_pool: Arc<mesh_mtls_pool::MeshMtlsConnectionPool>,
+    /// Sidecar ingress Unix-domain HTTP/1.1 + h2c connection pool
+    /// (`mesh.unix_socket` targets).
+    pub unix_backend_pool: Arc<unix_backend_pool::UnixBackendConnectionPool>,
     /// HTTP/3 connection pool for QUIC backends (reuses QUIC connections)
     pub h3_pool: Arc<Http3ConnectionPool>,
     /// Startup-classified backend protocol capabilities keyed by real backend target identity.
@@ -7403,6 +7407,10 @@ impl ProxyState {
                 backend_svid_generation.clone(),
             ),
         );
+        let unix_backend_pool = Arc::new(unix_backend_pool::UnixBackendConnectionPool::new(
+            global_pool_config.clone(),
+            pool_shard_amount,
+        ));
         let h3_pool = Arc::new(Http3ConnectionPool::new_with_svid_generation(
             env_config_arc.clone(),
             dns_cache.clone(),
@@ -7755,6 +7763,7 @@ impl ProxyState {
             http2_pool,
             hbone_pool,
             mesh_mtls_pool,
+            unix_backend_pool,
             h3_pool,
             backend_capabilities,
             backend_capabilities_refresh,
@@ -12101,46 +12110,112 @@ async fn handle_websocket_request_authenticated(
         let ws_connection_proxy =
             resolve_backend_connection_proxy_for_target(&proxy, current_target.as_deref());
         let ws_dial_proxy: &Proxy = ws_connection_proxy.as_ref();
-        let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> =
-            match (&ws_mesh_egress, current_target.as_deref()) {
-                (Some(egress), Some(target)) => connect_mesh_websocket_backend(
-                    &state,
-                    ws_dial_proxy,
+        // Sidecar-ingress Unix backend (issue #3732): a `mesh.unix_socket`
+        // target whose declared wire protocol is HTTP/1.1 rides an ordinary
+        // RFC 6455 upgrade over the ADMITTED `UnixStream`. Resolved per attempt
+        // because the retry loop may rotate `current_target`.
+        //
+        // Only the `http`-declared form is dialed here. An `http2`/`grpc`-
+        // declared socket carries `mesh.unix_socket_h2c` and would need RFC 8441
+        // Extended CONNECT over the h2c carrier, which this transport does not
+        // implement — that form stays refused below with its own reason rather
+        // than being silently downgraded to an H1 upgrade the app cannot answer.
+        let ws_unix_dispatch: Option<Result<&str, &'static str>> = current_target
+            .as_deref()
+            .filter(|target| unix_backend::target_is_unix_backend(target))
+            .map(|target| {
+                if !cfg!(unix) {
+                    return Err(retry::WS_UNIX_SOCKET_INADMISSIBLE);
+                }
+                if unix_backend::target_unix_backend_is_h2c(target) {
+                    return Err(retry::WS_UNIX_H2C_EXTENDED_CONNECT_UNSUPPORTED);
+                }
+                match unix_backend::resolve_unix_socket_target(
                     target,
-                    egress,
-                    ws_client_host.as_deref(),
-                    ws_path_and_query.as_ref(),
-                    &client_headers,
-                    ws_size_limits.max_frame_bytes,
-                    ws_size_limits.max_message_bytes,
-                    state.websocket_write_buffer_size,
-                    ws_idle_tracker.clone(),
-                    // Preserve the original authenticated mesh peer's identity into
-                    // the Ambient HBONE baggage (Finding B / issue #2010 codex):
-                    // for a WS request forwarded from an authenticated source
-                    // workload, `ctx.peer_spiffe_id` is stamped as the asserted
-                    // source so the remote AuthorizationPolicy / telemetry see the
-                    // source workload, not the gateway SVID. `None` on an
-                    // unauthenticated client → gateway SVID (HTTP-path parity).
-                    ctx.peer_spiffe_id.as_ref(),
-                )
-                .await
-                .map(|handshake| WsBackendHandshake::Mesh(Box::new(handshake))),
-                _ => connect_websocket_backend(
-                    &current_backend_url,
-                    ws_dial_proxy,
-                    &env_config,
-                    &client_headers,
-                    state.tls_policy.as_deref(),
-                    &state.crls,
-                    ws_size_limits.max_frame_bytes,
-                    ws_size_limits.max_message_bytes,
-                    state.websocket_write_buffer_size,
-                    ws_idle_tracker.clone(),
-                    Some(&state.dns_cache),
-                )
-                .await
-                .map(|handshake| WsBackendHandshake::Direct(Box::new(handshake))),
+                    &state.env_config.mesh_unix_socket_allowed_roots,
+                ) {
+                    Some(Ok(path)) => Ok(path),
+                    // Fail closed: never fall through to the placeholder host.
+                    Some(Err(_)) | None => Err(retry::WS_UNIX_SOCKET_INADMISSIBLE),
+                }
+            });
+
+        // A Unix-tagged target is screened BEFORE mesh egress and before the
+        // direct dial, so no WebSocket error path can reach the placeholder
+        // loopback authority.
+        let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> =
+            if let Some(unix_dispatch) = ws_unix_dispatch {
+                match unix_dispatch {
+                    #[cfg(unix)]
+                    Ok(socket_path) => connect_unix_websocket_backend(
+                        ws_dial_proxy,
+                        &env_config,
+                        socket_path,
+                        ws_client_host.as_deref().unwrap_or_default(),
+                        ws_path_and_query.as_ref(),
+                        &client_headers,
+                        ws_size_limits.max_frame_bytes,
+                        ws_size_limits.max_message_bytes,
+                        state.websocket_write_buffer_size,
+                        ws_idle_tracker.clone(),
+                    )
+                    .await
+                    .map(|handshake| WsBackendHandshake::Unix(Box::new(handshake))),
+                    // Non-Unix builds never produce `Ok` above.
+                    #[cfg(not(unix))]
+                    Ok(_) => Err(retry::WS_UNIX_SOCKET_INADMISSIBLE.into()),
+                    Err(reason) => {
+                        warn!(
+                            proxy_id = %proxy.id,
+                            reason,
+                            "Refusing WebSocket upgrade over unix-socket backend; failing closed \
+                             rather than dialing the placeholder loopback address"
+                        );
+                        Err(reason.into())
+                    }
+                }
+            } else {
+                match (&ws_mesh_egress, current_target.as_deref()) {
+                    (Some(egress), Some(target)) => connect_mesh_websocket_backend(
+                        &state,
+                        ws_dial_proxy,
+                        target,
+                        egress,
+                        ws_client_host.as_deref(),
+                        ws_path_and_query.as_ref(),
+                        &client_headers,
+                        ws_size_limits.max_frame_bytes,
+                        ws_size_limits.max_message_bytes,
+                        state.websocket_write_buffer_size,
+                        ws_idle_tracker.clone(),
+                        // Preserve the original authenticated mesh peer's identity
+                        // into the Ambient HBONE baggage (Finding B / issue #2010
+                        // codex): for a WS request forwarded from an authenticated
+                        // source workload, `ctx.peer_spiffe_id` is stamped as the
+                        // asserted source so the remote AuthorizationPolicy /
+                        // telemetry see the source workload, not the gateway SVID.
+                        // `None` on an unauthenticated client → gateway SVID
+                        // (HTTP-path parity).
+                        ctx.peer_spiffe_id.as_ref(),
+                    )
+                    .await
+                    .map(|handshake| WsBackendHandshake::Mesh(Box::new(handshake))),
+                    _ => connect_websocket_backend(
+                        &current_backend_url,
+                        ws_dial_proxy,
+                        &env_config,
+                        &client_headers,
+                        state.tls_policy.as_deref(),
+                        &state.crls,
+                        ws_size_limits.max_frame_bytes,
+                        ws_size_limits.max_message_bytes,
+                        state.websocket_write_buffer_size,
+                        ws_idle_tracker.clone(),
+                        Some(&state.dns_cache),
+                    )
+                    .await
+                    .map(|handshake| WsBackendHandshake::Direct(Box::new(handshake))),
+                }
             };
         match ws_dial_result {
             Ok(handshake) => {
@@ -12936,6 +13011,38 @@ async fn handle_websocket_request_authenticated(
                         .await
                     }
                     WsBackendHandshake::Mesh(handshake) => {
+                        let handshake = *handshake;
+                        run_websocket_proxy(
+                            client_io,
+                            handshake.stream,
+                            &proxy_id,
+                            ws_conn_id,
+                            ws_framing_plugins,
+                            ws_frame_plugins,
+                            ws_disconnect_plugins,
+                            session_meta,
+                            ws_connection_permit,
+                            max_ws_frame,
+                            ws_write_buf,
+                            ws_tunnel,
+                            ws_tunnel_idle_disabled_safety_cap,
+                            false,
+                            ws_idle_tracker,
+                            ws_session_deadline,
+                            ws_shutdown_rx,
+                            Arc::clone(&state.overload),
+                            ws_fragment_policy,
+                            &adaptive_buf,
+                        )
+                        .await
+                    }
+                    // Sidecar-ingress Unix backend (issue #3732): the same relay,
+                    // the same plugin pipeline, the same accounting — only the
+                    // backend byte transport is an admitted `UnixStream`. The
+                    // dedicated connection is owned by this session and closes
+                    // with it; it is never returned to the #3731 idle pool.
+                    #[cfg(unix)]
+                    WsBackendHandshake::Unix(handshake) => {
                         let handshake = *handshake;
                         run_websocket_proxy(
                             client_io,
@@ -13790,17 +13897,34 @@ pub(crate) struct MeshBackendWsHandshake {
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
 }
 
-/// Unified backend WebSocket handshake: either a direct TCP/TLS upgrade (the
-/// pre-mesh / non-mesh path) or a mesh egress Extended CONNECT tunnel (Sidecar
-/// mesh-mTLS or Ambient HBONE). Both feed the SAME generic `run_websocket_proxy`
-/// frame relay — only the backend transport type differs, so the session spawn
-/// dispatches on the variant.
+/// Backend WebSocket transport for a sidecar-ingress Unix-domain backend
+/// (issue #3732): an ordinary RFC 6455 HTTP/1.1 upgrade spoken directly over an
+/// ADMITTED `UnixStream`, with the same byte-level idle adapter beneath the
+/// framer as every other backend transport. There is no TLS layer — the socket
+/// is a co-located filesystem object whose authorization is the admission gate
+/// (containment, owner/mode/type, inode identity, peer UID), not a certificate.
+#[cfg(unix)]
+type UnixBackendWsStream = WebSocketStream<WsActivityIo<tokio::net::UnixStream>>;
+
+#[cfg(unix)]
+pub(crate) struct UnixBackendWsHandshake {
+    pub stream: UnixBackendWsStream,
+    pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
+}
+
+/// Unified backend WebSocket handshake: a direct TCP/TLS upgrade (the pre-mesh /
+/// non-mesh path), a mesh egress Extended CONNECT tunnel (Sidecar mesh-mTLS or
+/// Ambient HBONE), or an admitted Unix-socket H1 upgrade (sidecar ingress). All
+/// feed the SAME generic `run_websocket_proxy` frame relay — only the backend
+/// transport type differs, so the session spawn dispatches on the variant.
 pub(crate) enum WsBackendHandshake {
-    // Both variants are boxed: the direct TCP/TLS handshake is ~1.4 KB and the
+    // Every variant is boxed: the direct TCP/TLS handshake is ~1.4 KB and the
     // mesh tunnel ~0.4 KB, so boxing keeps the enum (and every WS dispatch that
     // names it) pointer-sized.
     Direct(Box<BackendWsHandshake>),
     Mesh(Box<MeshBackendWsHandshake>),
+    #[cfg(unix)]
+    Unix(Box<UnixBackendWsHandshake>),
 }
 
 impl WsBackendHandshake {
@@ -13808,6 +13932,8 @@ impl WsBackendHandshake {
         match self {
             Self::Direct(handshake) => handshake.negotiated_subprotocol.as_ref(),
             Self::Mesh(handshake) => handshake.negotiated_subprotocol.as_ref(),
+            #[cfg(unix)]
+            Self::Unix(handshake) => handshake.negotiated_subprotocol.as_ref(),
         }
     }
 }
@@ -14009,6 +14135,143 @@ pub(crate) async fn connect_websocket_backend(
 
     Ok(BackendWsHandshake {
         stream: backend_ws_stream,
+        negotiated_subprotocol,
+    })
+}
+
+/// Open an RFC 6455 WebSocket to a sidecar-ingress Unix-domain backend
+/// (issue #3732).
+///
+/// **Never constructs a TCP URL and never touches the loopback placeholder.**
+/// A `mesh.unix_socket` target's `host:port` is a schema carrier only — on a
+/// sidecar it is the gateway's OWN inbound listener port, so a fallback dial
+/// would loop the proxy back into itself. Every error path here returns an
+/// error; there is no arm that degrades to a network dial.
+///
+/// ## Ordering — admission strictly before the first upgrade byte
+///
+/// [`unix_backend_pool::UnixBackendConnectionPool::dial_websocket_stream`] runs
+/// the complete admission gate (canonical containment, directory-chain
+/// ownership, socket file type/owner/mode, post-connect `(dev, ino)` identity
+/// re-check, peer-UID verification) and the connect inside ONE establishment
+/// deadline derived from `backend_connect_timeout_ms`. It returns only after
+/// all of that succeeds, and only then does `client_async_with_config` write the
+/// upgrade request. A replaced socket, wrong owner, wrong file type, or peer-UID
+/// mismatch therefore sends ZERO application bytes.
+///
+/// ## Lease
+///
+/// The connection is dedicated and non-reusable: an RFC 6455 upgrade consumes
+/// its HTTP/1.1 carrier for the session, so this dial deliberately bypasses the
+/// #3731 idle pool rather than leasing from it.
+///
+/// ## Policy parity with the TCP path
+///
+/// The caller supplies the same normalized `client_headers` the TCP path
+/// forwards, and tungstenite generates `Upgrade`/`Connection`/
+/// `Sec-WebSocket-Key`/`Sec-WebSocket-Version` and validates the backend's
+/// `101 Switching Protocols` + `Sec-WebSocket-Accept` before yielding the
+/// stream. The returned framer carries the identical `WebSocketConfig` bounds
+/// (frame/message size, write buffer, `auto_pong = false` for transparent Ping
+/// relay), sits over the same `WsActivityIo` idle adapter, and is handed to the
+/// same `run_websocket_proxy` relay — so frame plugins, reassembly, disconnect
+/// hooks, idle timeout, admission permits, connection accounting, cancellation,
+/// and shutdown behave exactly as on TCP. Bytes the backend coalesced with the
+/// 101 response are retained inside the framer's read buffer and replayed by
+/// `run_websocket_proxy`'s coalesced-first-bytes handling.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn connect_unix_websocket_backend(
+    proxy: &Proxy,
+    env_config: &crate::config::EnvConfig,
+    socket_path: &str,
+    backend_host: &str,
+    path_and_query: &str,
+    client_headers: &[(String, String)],
+    max_websocket_frame_size_bytes: usize,
+    max_websocket_message_size_bytes: usize,
+    websocket_write_buffer_size: usize,
+    idle_tracker: Option<Arc<WsIdleTracker>>,
+) -> Result<UnixBackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
+    let mut ws_config = WebSocketConfig::default();
+    ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
+    ws_config.max_message_size = Some(max_websocket_message_size_bytes);
+    ws_config.write_buffer_size = websocket_write_buffer_size;
+    // Transparent relay: forward Ping to the peer; do not auto-answer locally
+    // (issue #2963). Matches every other backend WebSocket transport.
+    ws_config.auto_pong = false;
+
+    // A Unix socket has no network authority, so the request line is built from
+    // the routing host the app matches on plus the preserved client path+query.
+    // The URL is parse-only — nothing is resolved or dialed from it.
+    let host = if backend_host.is_empty() {
+        "localhost"
+    } else {
+        backend_host
+    };
+    let ws_url = format!("ws://{host}{path_and_query}");
+    let mut ws_request = ws_url.into_client_request()?;
+    ws_request.headers_mut().insert(
+        hyper::header::HOST,
+        hyper::header::HeaderValue::from_str(host)?,
+    );
+    for (name, value) in client_headers {
+        if let (Ok(header_name), Ok(header_value)) = (
+            hyper::header::HeaderName::from_bytes(name.as_bytes()),
+            hyper::header::HeaderValue::from_str(value),
+        ) {
+            ws_request.headers_mut().append(header_name, header_value);
+        }
+    }
+
+    // Admission + connect, bounded end to end. Typed `UnixBackendError` so the
+    // WS failure handler classifies it through the same `error_class()` the
+    // HTTP/gRPC Unix dispatch uses (pre-wire connect classes stay retryable and
+    // are charged as setup failures, not as backend request failures).
+    let (_admitted, stream) = unix_backend_pool::UnixBackendConnectionPool::dial_websocket_stream(
+        socket_path,
+        proxy.backend_connect_timeout_ms,
+        &env_config.mesh_unix_socket_allowed_roots,
+        &env_config.mesh_unix_socket_allowed_uids,
+    )
+    .await
+    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+
+    // Bound the upgrade exchange itself by the same per-proxy connect budget: an
+    // app that accepts the socket but never answers the upgrade must not pin the
+    // request task. A timeout here is pre-wire from the client's perspective —
+    // no 101 was ever sent downstream.
+    let connect_timeout =
+        Duration::from_millis(unix_backend::effective_connect_timeout_ms(
+            proxy.backend_connect_timeout_ms,
+        ));
+    let (stream, response) = match tokio::time::timeout(
+        connect_timeout,
+        client_async_with_config(
+            ws_request,
+            WsActivityIo::new(stream, idle_tracker),
+            Some(ws_config),
+        ),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(Box::new(unix_backend::UnixBackendError::ConnectTimeout {
+                timeout_ms: unix_backend::effective_connect_timeout_ms(
+                    proxy.backend_connect_timeout_ms,
+                ),
+            }));
+        }
+    };
+
+    let negotiated_subprotocol = response
+        .headers()
+        .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+        .cloned();
+
+    Ok(UnixBackendWsHandshake {
+        stream,
         negotiated_subprotocol,
     })
 }
@@ -27972,19 +28235,25 @@ async fn handle_proxy_request_inner(
     // Early-prepared bodies already ran both hook phases above.
     let mut deferred_body_hook_ctx = (!request_body_prepared && needs_final_request_body_context)
         .then(|| ctx.clone_for_final_request_body_hooks());
-    // Fail-closed WebSocket gate for Unix-socket backends (a Sidecar `ingress[]`
-    // `defaultEndpoint: unix://…`, carried on the selected target's reserved
-    // `mesh.unix_socket` tag).
+    // Fail-closed WebSocket gate for the `http2`/`grpc`-declared form of a
+    // Unix-socket backend (a Sidecar `ingress[]` `defaultEndpoint: unix://…`,
+    // carried on the selected target's reserved `mesh.unix_socket` tag).
     //
-    // **WebSocket over a Unix ingress socket is explicitly NOT supported.** The
-    // WebSocket dial machinery below is written against TCP/TLS and the mesh
-    // H2/HBONE CONNECT tunnels; it has no Unix transport, and the target's
-    // `host:port` is a placeholder nothing listens on (on a sidecar it is the
-    // gateway's OWN inbound listener port, so a fallback dial would loop the
-    // proxy back into itself). Refusing is therefore strictly better than
-    // falling through, and mirrors the `hbone_required` / `mesh_mtls_required`
-    // contract: a mesh-tagged target that cannot dispatch over its own
-    // transport is refused, never downgraded.
+    // **`http`-declared Unix ingress now serves WebSockets** (issue #3732): the
+    // WS dial loop has a dedicated Unix branch that runs the full admission gate
+    // and then an ordinary RFC 6455 upgrade over the admitted `UnixStream`.
+    //
+    // **The `http2`/`grpc`-declared form stays refused.** That socket speaks h2c
+    // prior-knowledge only, so the upgrade would have to be RFC 8441 Extended
+    // CONNECT over the h2c carrier — not implemented. It is refused HERE rather
+    // than downgraded to an H1 upgrade the app cannot answer: silently changing
+    // the wire protocol the listener declared is exactly the fail-open the Unix
+    // transport gate exists to prevent. The target's `host:port` is also a
+    // placeholder nothing listens on (on a sidecar it is the gateway's OWN
+    // inbound listener port), so a fallback dial would loop the proxy back into
+    // itself. Mirrors the `hbone_required` / `mesh_mtls_required` contract: a
+    // mesh-tagged target that cannot dispatch over its own transport is refused,
+    // never downgraded.
     //
     // gRPC is NOT gated here (issue #3261): an `http2`/`grpc`-declared listener
     // dispatches natively over h2c through the generic path's Unix branch, and
@@ -27993,14 +28262,16 @@ async fn handle_proxy_request_inner(
     // (`GrpcMeshDispatch::RefuseUnixSocketHttp1`), which produces a
     // protocol-correct trailers response instead of this 502.
     if request_protocol == ProxyProtocol::WebSocket
-        && upstream_target
-            .as_deref()
-            .is_some_and(unix_backend::target_is_unix_backend)
+        && upstream_target.as_deref().is_some_and(|target| {
+            unix_backend::target_is_unix_backend(target)
+                && unix_backend::target_unix_backend_is_h2c(target)
+        })
     {
         warn!(
             proxy_id = %proxy.id,
-            "unix-socket backend target cannot serve a WebSocket upgrade; refusing rather \
-             than dialing the placeholder loopback address"
+            "h2c unix-socket backend target cannot serve a WebSocket upgrade (RFC 8441 \
+             Extended CONNECT over the unix h2c carrier is unimplemented); refusing rather \
+             than downgrading to HTTP/1.1 or dialing the placeholder loopback address"
         );
         // This refusal precedes any backend dispatch, so release a HALF_OPEN
         // probe slot `check_circuit_breaker` may have claimed — otherwise
@@ -28015,7 +28286,7 @@ async fn handle_proxy_request_inner(
         record_request(&state, 502);
         return Ok(build_response(
             StatusCode::BAD_GATEWAY,
-            r#"{"error":"Bad Gateway","message":"unix-socket backend does not support WebSocket dispatch"}"#,
+            r#"{"error":"Bad Gateway","message":"h2c unix-socket backend does not support WebSocket dispatch"}"#,
         ));
     }
     // Check if this is a WebSocket upgrade request. WebSocket is a runtime
@@ -40985,17 +41256,18 @@ fn unix_backend_error_response(
 /// Mirrors [`proxy_to_backend_hbone`]'s contract — an HTTP/1.1 client handshake
 /// over an arbitrary byte stream, the same header regeneration, size-limit and
 /// timeout handling, and the same streaming-vs-buffered response decision — but
-/// the stream is a fresh `UnixStream` instead of a pooled HBONE tunnel.
+/// the stream is an admitted `UnixStream` from [`unix_backend_pool`].
 ///
-/// **Not pooled.** Each request dials its own socket and drops the connection
-/// when the response completes. The destination is a co-located app on the same
-/// host, so the dial is a local `connect(2)` with no DNS, TCP handshake, or TLS;
-/// pooling is a documented follow-up rather than a correctness requirement.
+/// **Pooled.** Idle HTTP/1.1 senders are retained per admitted socket identity
+/// (canonical path + device/inode/owner + proxy identity). A socket replacement
+/// retires the pool key before any further request byte is written. Streaming
+/// responses keep the exclusive lease for the response lifetime (not returned);
+/// buffered responses return the sender for keep-alive reuse.
 ///
 /// **HTTP/1.1 only.** This function serves an `http`-declared listener. An
 /// `http2` / `https` / `grpc`-declared listener carries the
 /// `mesh.unix_socket_h2c` tag and is dispatched by `proxy_to_backend_mesh_mtls`
-/// over an h2c `UnixStream` instead, which is what gives gRPC its trailers,
+/// over a pooled h2c `UnixStream` instead, which is what gives gRPC its trailers,
 /// deadlines, and bidirectional streaming. A gRPC-flavored request that reaches
 /// an `http`-declared socket is refused with a clean gRPC UNAVAILABLE before it
 /// gets here (`GrpcMeshDispatch::RefuseUnixSocketHttp1`), never downgraded.
@@ -41029,14 +41301,18 @@ async fn proxy_to_backend_unix(
     Option<Bytes>,
     Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
-    let dial = unix_backend::dial_unix_backend(
-        socket_path,
-        proxy.backend_connect_timeout_ms,
-        &state.env_config.mesh_unix_socket_allowed_roots,
-        &state.env_config.mesh_unix_socket_allowed_uids,
-    );
-    let stream = match dial.await {
-        Ok(stream) => stream,
+    let mut checkout = match state
+        .unix_backend_pool
+        .checkout_h1(
+            proxy,
+            socket_path,
+            proxy.backend_connect_timeout_ms,
+            &state.env_config.mesh_unix_socket_allowed_roots,
+            &state.env_config.mesh_unix_socket_allowed_uids,
+        )
+        .await
+    {
+        Ok(checkout) => checkout,
         Err(err) => {
             return (
                 unix_backend_error_response(proxy, &err, resolved_ip),
@@ -41046,26 +41322,6 @@ async fn proxy_to_backend_unix(
         }
     };
 
-    let io = TokioIo::new(stream);
-    let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
-        .handshake(io)
-        .await
-    {
-        Ok(parts) => parts,
-        Err(err) => {
-            return (
-                unix_hyper_error_response(proxy, err, resolved_ip, false),
-                None,
-                None,
-            );
-        }
-    };
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            debug!("unix_backend: connection closed: {}", e);
-        }
-    });
-
     // Only `path_and_query` is read out of the computed backend URL — a Unix
     // socket has no network authority, so the request target is origin-form and
     // the Host header (below) carries the authority the app sees.
@@ -41073,6 +41329,7 @@ async fn proxy_to_backend_unix(
         Ok(uri) => uri,
         Err(e) => {
             error!(proxy_id = %proxy.id, error = %e, "Invalid unix backend URL");
+            state.unix_backend_pool.checkin_h1(checkout);
             return (
                 retry::BackendResponse {
                     status_code: 502,
@@ -41151,6 +41408,7 @@ async fn proxy_to_backend_unix(
         Ok(method) => method,
         Err(()) => {
             warn_invalid_backend_method(&proxy.id, "unix", method);
+            state.unix_backend_pool.checkin_h1(checkout);
             return (
                 retry::BackendResponse {
                     status_code: 405,
@@ -41243,31 +41501,69 @@ async fn proxy_to_backend_unix(
         );
     }
 
-    let backend_req = Request::from_parts(parts, body);
-    let send_fut = sender.send_request(backend_req);
-    let response = if proxy.backend_read_timeout_ms > 0 {
-        let timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
-        match tokio::time::timeout(timeout, send_fut).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(err)) => {
-                if body_size_exceeded.load(Ordering::Acquire) {
-                    return (
-                        unix_request_body_too_large_response(
-                            proxy,
-                            resolved_ip,
-                            effective_request_body_size_limit,
-                        ),
-                        None,
-                        None,
-                    );
+    // Send on the leased connection.
+    //
+    // `try_send_request` (not `send_request`) so a PRE-WIRE failure hands the
+    // untouched request back: when the lease came from the idle set, a closed
+    // connection is the ordinary keep-alive race (the app reaped the idle socket
+    // between check-in and now), not a backend fault. Replay it EXACTLY ONCE on
+    // a freshly admitted connection — the full admission gate runs again — and
+    // never for a lease that was already fresh, so a genuinely failing app still
+    // surfaces its error after one dial. `take_message()` returns `Some` only
+    // when hyper never put the request on the wire, so this cannot duplicate a
+    // non-idempotent request.
+    let mut backend_req = Request::from_parts(parts, body);
+    let mut replayed_idle_race = false;
+    let response = loop {
+        let send_result = {
+            let send_fut = checkout.sender.try_send_request(backend_req);
+            if proxy.backend_read_timeout_ms > 0 {
+                let timeout = Duration::from_millis(proxy.backend_read_timeout_ms);
+                match tokio::time::timeout(timeout, send_fut).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        if body_size_exceeded.load(Ordering::Acquire) {
+                            return (
+                                unix_request_body_too_large_response(
+                                    proxy,
+                                    resolved_ip,
+                                    effective_request_body_size_limit,
+                                ),
+                                None,
+                                None,
+                            );
+                        }
+                        warn!(
+                            proxy_id = %proxy.id,
+                            "Unix backend read timeout ({}ms) waiting for backend response",
+                            proxy.backend_read_timeout_ms
+                        );
+                        // The lease is dropped without check-in: a timed-out
+                        // exchange leaves the connection in an unknown framing
+                        // state and must never be reused.
+                        return (
+                            retry::BackendResponse {
+                                status_code: 504,
+                                body: ResponseBody::buffered(
+                                    r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
+                                ),
+                                headers: HashMap::new(),
+                                connection_error: false,
+                                backend_resolved_ip: resolved_ip,
+                                error_class: Some(retry::ErrorClass::ReadWriteTimeout),
+                            },
+                            None,
+                            None,
+                        );
+                    }
                 }
-                return (
-                    unix_hyper_error_response(proxy, err, resolved_ip, request_body_replayable),
-                    None,
-                    None,
-                );
+            } else {
+                send_fut.await
             }
-            Err(_) => {
+        };
+        match send_result {
+            Ok(response) => break response,
+            Err(mut try_err) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
                         unix_request_body_too_large_response(
@@ -41279,44 +41575,41 @@ async fn proxy_to_backend_unix(
                         None,
                     );
                 }
-                warn!(
-                    proxy_id = %proxy.id,
-                    "Unix backend read timeout ({}ms) waiting for backend response",
-                    proxy.backend_read_timeout_ms
-                );
-                return (
-                    retry::BackendResponse {
-                        status_code: 504,
-                        body: ResponseBody::buffered(
-                            r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: false,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ReadWriteTimeout),
-                    },
-                    None,
-                    None,
-                );
-            }
-        }
-    } else {
-        match send_fut.await {
-            Ok(response) => response,
-            Err(err) => {
-                if body_size_exceeded.load(Ordering::Acquire) {
-                    return (
-                        unix_request_body_too_large_response(
+                if checkout.reused()
+                    && !replayed_idle_race
+                    && let Some(unsent) = try_err.take_message()
+                {
+                    replayed_idle_race = true;
+                    backend_req = unsent;
+                    checkout = match state
+                        .unix_backend_pool
+                        .checkout_fresh_h1(
                             proxy,
-                            resolved_ip,
-                            effective_request_body_size_limit,
-                        ),
-                        None,
-                        None,
-                    );
+                            socket_path,
+                            proxy.backend_connect_timeout_ms,
+                            &state.env_config.mesh_unix_socket_allowed_roots,
+                            &state.env_config.mesh_unix_socket_allowed_uids,
+                        )
+                        .await
+                    {
+                        Ok(checkout) => checkout,
+                        Err(err) => {
+                            return (
+                                unix_backend_error_response(proxy, &err, resolved_ip),
+                                None,
+                                None,
+                            );
+                        }
+                    };
+                    continue;
                 }
                 return (
-                    unix_hyper_error_response(proxy, err, resolved_ip, request_body_replayable),
+                    unix_hyper_error_response(
+                        proxy,
+                        try_err.into_error(),
+                        resolved_ip,
+                        request_body_replayable,
+                    ),
                     None,
                     None,
                 );
@@ -41355,6 +41648,21 @@ async fn proxy_to_backend_unix(
     );
 
     if stream_response {
+        // A streaming response hands the body out of this function, so this
+        // function cannot observe when the last body byte is read — and hyper's
+        // HTTP/1.1 readiness signal is NOT that observation: `can_write_head()`
+        // is already true while a response body is still being read, so awaiting
+        // `SendRequest::ready()` here would re-pool the connection mid-body and
+        // let the next request pipeline onto it. Checking in after headers but
+        // before the body is exactly the H1 pooling bug this contract forbids.
+        //
+        // So a streaming response keeps a DEDICATED connection: the lease is
+        // dropped, which tells hyper "no further requests" and closes the
+        // connection once this in-flight response finishes. Pooling for
+        // streaming H1 responses needs an EOF-anchored lease handoff through
+        // `ResponseBody`, which is a follow-up rather than something to
+        // approximate unsafely here.
+        drop(checkout);
         (
             retry::BackendResponse {
                 status_code: status,
@@ -41424,6 +41732,19 @@ async fn proxy_to_backend_unix(
                 );
             }
         };
+        // The ENTIRE response body has now been read, so — and only so — the
+        // connection is eligible for keep-alive reuse. `checkin_h1_when_idle`
+        // still waits for hyper's own "dispatcher is idle" signal (the body read
+        // completing here does not synchronously re-arm it) and re-checks
+        // `is_closed()` plus the socket's live inode identity before the sender
+        // re-enters the idle set — which covers a `Connection: close` response, a
+        // peer that hung up, and an errored exchange. Every error arm above
+        // returns without checking in, so a partial or failed body read retires
+        // the connection.
+        unix_backend_pool::UnixBackendConnectionPool::checkin_h1_when_idle(
+            &state.unix_backend_pool,
+            checkout,
+        );
         (
             retry::BackendResponse {
                 status_code: status,
@@ -41907,14 +42228,17 @@ async fn proxy_to_backend_mesh_mtls(
         );
     }
 
-    // Unix h2c: a fresh 1:1 socket per request, admitted at the TOCTOU boundary
-    // (containment, symlink-resolved containment, socket file type, owner uid,
-    // mode) and bounded by the proxy's connect timeout. Not pooled — the
-    // destination is a co-located app reached by a local `connect(2)` with no
-    // DNS, TCP handshake, or TLS; pooling is a documented performance follow-up,
-    // not a correctness requirement.
+    // Unix h2c: a POOLED multiplexed carrier (issue #3731). Every physical
+    // connection is still admitted at the TOCTOU boundary (containment,
+    // symlink-resolved containment, socket file type, owner uid, mode, inode
+    // identity, peer uid) under the proxy's single connect budget; the pool adds
+    // re-verification of the live socket identity before each checkout and
+    // retires every carrier for a replaced path before another request byte.
+    // Concurrent RPCs share one connection's streams, and a closed/GOAWAY
+    // carrier is replaced rather than reused.
     let sender_result = if let Some(socket_path) = unix_socket_path {
-        let dial = unix_backend::dial_unix_h2c_sender(
+        let dial = state.unix_backend_pool.checkout_h2c(
+            proxy,
             socket_path,
             proxy.backend_connect_timeout_ms,
             &state.env_config.mesh_unix_socket_allowed_roots,
