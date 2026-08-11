@@ -45,11 +45,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use prost::Message;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
@@ -83,11 +83,23 @@ const STOCK_INITIAL_TYPE_URL_ORDER: [&str; 2] = [CDS_TYPE_URL, LDS_TYPE_URL];
 const STOCK_APPLY_DEBOUNCE: Duration = Duration::from_millis(25);
 const STOCK_APPLY_MAX_DELAY: Duration = Duration::from_millis(500);
 const STOCK_CONSECUTIVE_NACK_LIMIT: u32 = 5;
+/// Bound the complete stock bearer-token admission attempt, including waiting
+/// for an earlier timed-out reader to leave the kernel.
+const STOCK_XDS_TOKEN_FILE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum distinct refusals logged per apply. Refusals are bounded input from
 /// the control plane, so the log line is capped rather than unbounded.
 const STOCK_REFUSAL_LOG_LIMIT: usize = 12;
 
-type BearerToken = MetadataValue<tonic::metadata::Ascii>;
+/// A timed-out mount read may keep its detached OS thread blocked. The permit
+/// moves into that thread, so repeated ADS reconnects cannot accumulate more
+/// blocked readers while the same credential source remains unavailable.
+static STOCK_XDS_TOKEN_FILE_READ_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+pub(crate) fn stock_xds_token_file_read_limit() -> Arc<Semaphore> {
+    Arc::clone(STOCK_XDS_TOKEN_FILE_READ_LIMIT.get_or_init(|| Arc::new(Semaphore::new(1))))
+}
+
+pub(crate) type BearerToken = MetadataValue<tonic::metadata::Ascii>;
 
 /// Stock ADS client settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,15 +600,31 @@ async fn connect_stock_ads(
     .await
 }
 
-async fn read_bearer_token(path: &str) -> Result<BearerToken, anyhow::Error> {
-    let raw = tokio::fs::read_to_string(path)
+pub(crate) async fn read_bearer_token(path: &str) -> Result<BearerToken, anyhow::Error> {
+    use crate::secrets::credential_file::{
+        CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES, read_credential_file_detached_guarded,
+    };
+
+    let read = async {
+        let permit = stock_xds_token_file_read_limit()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("stock xDS bearer-token reader is unavailable"))?;
+        read_credential_file_detached_guarded(
+            path,
+            DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+            CredentialTrim::Ends,
+            "ferrum-stock-xds-token-file",
+            permit,
+        )
         .await
-        .map_err(|e| anyhow::anyhow!("failed to read stock xDS bearer token file: {e}"))?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("stock xDS bearer token file is empty");
-    }
-    format!("Bearer {trimmed}")
+        .map_err(|error| anyhow::anyhow!("failed to read stock xDS bearer token: {error}"))
+    };
+    let token = match tokio::time::timeout(STOCK_XDS_TOKEN_FILE_READ_TIMEOUT, read).await {
+        Ok(result) => result?,
+        Err(_) => anyhow::bail!("timed out reading stock xDS bearer token"),
+    };
+    format!("Bearer {token}")
         .parse()
         // The parse error would echo the token, so it is deliberately dropped.
         .map_err(|_| anyhow::anyhow!("stock xDS bearer token is not valid ASCII metadata"))

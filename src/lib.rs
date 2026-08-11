@@ -98,6 +98,56 @@ pub mod _test_support {
     use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
 
+    pub type TestSemaphorePermit = tokio::sync::OwnedSemaphorePermit;
+
+    /// Hold the process-wide external CP-token read slot so tests can prove a
+    /// concurrent reconnect waits without spawning another detached reader.
+    pub async fn acquire_dp_cp_token_file_read_permit_for_test() -> TestSemaphorePermit {
+        crate::grpc::dp_client::dp_cp_token_file_read_limit()
+            .acquire_owned()
+            .await
+            .expect("process-wide CP token read semaphore is never closed")
+    }
+
+    /// Hold the stock-xDS bearer-token reader slot to prove reconnects cannot
+    /// accumulate detached readers after an async timeout.
+    pub async fn acquire_stock_xds_token_file_read_permit_for_test() -> TestSemaphorePermit {
+        crate::modes::mesh::config_consumer::stock_xds_client::stock_xds_token_file_read_limit()
+            .acquire_owned()
+            .await
+            .expect("stock xDS token read semaphore is never closed")
+    }
+
+    /// Hold the Kubernetes discovery SA-token reader slot so tests can prove a
+    /// concurrent poll waits without spawning another detached reader.
+    pub async fn acquire_k8s_sa_token_file_read_permit_for_test() -> TestSemaphorePermit {
+        crate::service_discovery::kubernetes::k8s_sa_token_file_read_limit()
+            .acquire_owned()
+            .await
+            .expect("process-wide Kubernetes SA token read semaphore is never closed")
+    }
+
+    /// Exercise the crate-private stock-xDS credential boundary while keeping
+    /// its metadata representation out of the public production API.
+    pub async fn read_stock_xds_bearer_token_for_test(path: &str) -> Result<String, anyhow::Error> {
+        let token =
+            crate::modes::mesh::config_consumer::stock_xds_client::read_bearer_token(path).await?;
+        token
+            .to_str()
+            .map(str::to_string)
+            .map_err(|_| anyhow::anyhow!("stock xDS bearer token is not valid text metadata"))
+    }
+
+    /// Create a sparse oversized credential fixture without exposing a
+    /// production API solely for external regression tests.
+    pub fn write_sparse_credential_fixture_for_test(
+        path: &std::path::Path,
+        prefix: &[u8],
+        logical_len: u64,
+    ) -> std::io::Result<()> {
+        crate::secrets::credential_file::write_sparse_credential_fixture(path, prefix, logical_len)
+    }
+
     /// Exercise DP's crate-private concurrent listener supervisor without
     /// expanding the production API solely for external regression tests.
     pub async fn await_dp_listener_handles(

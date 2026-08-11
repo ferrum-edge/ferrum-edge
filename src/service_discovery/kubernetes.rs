@@ -18,6 +18,9 @@ use crate::util::endpointslice::{
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use super::http_body::{DiscoveryBodyRole, collect_discovery_response_body};
@@ -31,6 +34,23 @@ use super::http_body::{DiscoveryBodyRole, collect_discovery_response_body};
 #[derive(Debug, Deserialize)]
 struct EndpointSliceListEnvelope {
     items: Vec<serde_json::Value>,
+}
+
+/// Standard in-cluster projected service-account token path.
+pub const DEFAULT_SERVICE_ACCOUNT_TOKEN_PATH: &str =
+    "/var/run/secrets/kubernetes.io/serviceaccount/token";
+
+/// Bound for each discovery-poll SA-token admission attempt, including waiting
+/// for an earlier timed-out reader to leave the kernel. Matches DP/stock-xDS.
+pub const K8S_SA_TOKEN_FILE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A timed-out mount read may keep its detached OS thread blocked. The permit
+/// moves into that thread, so repeated discovery polls cannot accumulate more
+/// blocked readers while the same credential source remains unavailable.
+static K8S_SA_TOKEN_FILE_READ_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+pub(crate) fn k8s_sa_token_file_read_limit() -> Arc<Semaphore> {
+    Arc::clone(K8S_SA_TOKEN_FILE_READ_LIMIT.get_or_init(|| Arc::new(Semaphore::new(1))))
 }
 
 /// Characters that must be percent-encoded in a URL path segment (RFC 3986 §3.3).
@@ -83,6 +103,8 @@ pub struct KubernetesDiscoverer {
     label_selector: Option<String>,
     default_weight: u32,
     api_url_override: Option<String>,
+    /// Override for the in-cluster SA token path (tests / fixtures).
+    sa_token_path_override: Option<String>,
 }
 
 impl KubernetesDiscoverer {
@@ -102,6 +124,7 @@ impl KubernetesDiscoverer {
             label_selector,
             default_weight,
             api_url_override: None,
+            sa_token_path_override: None,
         }
     }
 
@@ -110,6 +133,20 @@ impl KubernetesDiscoverer {
     pub fn with_api_url(mut self, url: String) -> Self {
         self.api_url_override = Some(url);
         self
+    }
+
+    /// Override the service-account token path (for testing projected rotation
+    /// and fail-closed credential boundaries without touching the host path).
+    #[allow(dead_code)]
+    pub fn with_sa_token_path(mut self, path: String) -> Self {
+        self.sa_token_path_override = Some(path);
+        self
+    }
+
+    fn sa_token_path(&self) -> &str {
+        self.sa_token_path_override
+            .as_deref()
+            .unwrap_or(DEFAULT_SERVICE_ACCOUNT_TOKEN_PATH)
     }
 
     /// Build the Kubernetes API URL for listing EndpointSlices.
@@ -160,9 +197,52 @@ impl KubernetesDiscoverer {
         url
     }
 
-    /// Read the service account token from the standard in-cluster path.
-    fn read_sa_token() -> Option<String> {
-        std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token").ok()
+    /// Resolve the discovery bearer credential for this poll.
+    ///
+    /// Re-reads on every call so Kubernetes projected-token symlink rotation is
+    /// visible without restart. Open/read run on a detached OS thread through
+    /// the shared 64 KiB regular-file credential boundary. `Ok(None)` means the
+    /// configured pathname is genuinely absent
+    /// ([`crate::secrets::credential_file::CredentialFileError::PathNotFound`]);
+    /// every other failure — including a broken projected symlink — fails
+    /// closed before the Kubernetes API request.
+    async fn read_sa_token(path: &str) -> Result<Option<String>, anyhow::Error> {
+        use crate::secrets::credential_file::{
+            CredentialFileError, CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+            read_credential_file_detached_guarded,
+        };
+
+        let read = async {
+            let permit = k8s_sa_token_file_read_limit()
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "failed to read Kubernetes service-account token: reader unavailable"
+                    )
+                })?;
+            match read_credential_file_detached_guarded(
+                path,
+                DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+                CredentialTrim::Ends,
+                "ferrum-k8s-sa-token",
+                permit,
+            )
+            .await
+            {
+                Ok(token) => Ok(Some(token)),
+                Err(CredentialFileError::PathNotFound) => Ok(None),
+                Err(error) => Err(map_sa_token_error(error)),
+            }
+        };
+
+        match tokio::time::timeout(K8S_SA_TOKEN_FILE_READ_TIMEOUT, read).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "failed to read Kubernetes service-account token: timed out after {}s",
+                K8S_SA_TOKEN_FILE_READ_TIMEOUT.as_secs()
+            )),
+        }
     }
 
     /// Extract the matching port from an EndpointSlice item.
@@ -221,6 +301,13 @@ enum EndpointSlicePortAdmission {
     Invalid,
 }
 
+fn map_sa_token_error(
+    error: crate::secrets::credential_file::CredentialFileError,
+) -> anyhow::Error {
+    // CredentialFileError display never includes the source path or value.
+    anyhow::anyhow!("failed to read Kubernetes service-account token: {error}")
+}
+
 #[async_trait::async_trait]
 impl super::ServiceDiscoverer for KubernetesDiscoverer {
     async fn discover(&self) -> Result<super::DiscoverySnapshot, anyhow::Error> {
@@ -228,11 +315,21 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
 
         let mut request = self.client.get(&url);
 
-        // Add bearer token auth (re-read each poll — tokens can rotate)
-        if let Some(token) = Self::read_sa_token() {
-            request = request.bearer_auth(token);
-        } else if let Ok(kubeconfig_token) = std::env::var("KUBE_TOKEN") {
-            request = request.bearer_auth(kubeconfig_token);
+        // Add bearer token auth (re-read each poll — projected tokens rotate).
+        // Only genuine pathname absence (`CredentialFileError::PathNotFound`)
+        // may fall back to KUBE_TOKEN; an existing-but-invalid source
+        // (oversized, empty, invalid UTF-8, broken projected symlink, stall)
+        // fails closed here before the Kubernetes API request, preserving
+        // last-admitted targets.
+        match Self::read_sa_token(self.sa_token_path()).await? {
+            Some(token) => {
+                request = request.bearer_auth(token);
+            }
+            None => {
+                if let Ok(kubeconfig_token) = std::env::var("KUBE_TOKEN") {
+                    request = request.bearer_auth(kubeconfig_token);
+                }
+            }
         }
 
         let response = request.send().await?;
@@ -390,6 +487,7 @@ mod tests {
             label_selector: label_selector.map(|s| s.to_string()),
             default_weight: 1,
             api_url_override: Some("https://k8s-api:6443".to_string()),
+            sa_token_path_override: None,
         }
     }
 
@@ -434,6 +532,7 @@ mod tests {
             label_selector: None,
             default_weight: 1,
             api_url_override: None, // No override
+            sa_token_path_override: None,
         };
         let url = d.api_url();
         // May use env vars if set in the test environment, or fallback

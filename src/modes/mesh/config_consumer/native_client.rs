@@ -235,11 +235,15 @@ async fn connect_mesh_subscribe(
     // issuer — not this node — decides the `ns` and `aud` claims, so a mesh
     // node's token must be minted for the local-mesh subscribe audience by
     // whatever mints it. See `docs/cp_namespace_tenancy.md`.
-    let auth_token = jwt_secret.mint(
-        &config.node_id,
-        Some(&config.namespace),
-        Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
-    )?;
+    // External token files are read off-worker via mint_async (detached thread
+    // + shared bounded regular-file reader). Never call sync mint() here.
+    let auth_token = jwt_secret
+        .mint_async(
+            &config.node_id,
+            Some(&config.namespace),
+            Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
+        )
+        .await?;
     let token: MetadataValue<_> = format!("Bearer {auth_token}").parse()?;
 
     #[allow(clippy::result_large_err)]

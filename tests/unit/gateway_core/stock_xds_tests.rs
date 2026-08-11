@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 
 use prost::Message;
+use serial_test::serial;
 
 use ferrum_edge::modes::mesh::config::{AppProtocol, ServiceTargetPort};
 use ferrum_edge::xds::stock::{StockXdsAccumulator, StockXdsLimits, refusal};
@@ -1946,4 +1947,93 @@ fn stock_profile_never_subscribes_the_ferrum_private_carrier_types() {
         "the Ferrum-private subscription set is unchanged by the stock profile"
     );
     assert_eq!(STOCK_XDS_TYPE_URLS.len(), 4);
+}
+
+// ── reconnect credential boundary ───────────────────────────────────────
+
+#[test]
+#[serial(stock_xds_token_file_read_limit)]
+fn stock_xds_bearer_token_uses_the_shared_bounded_reader() {
+    let temp = tempfile::tempdir().unwrap();
+    let token_path = temp.path().join("stock-token");
+    std::fs::write(&token_path, b"external-stock-token\n").unwrap();
+    let oversized_path = temp.path().join("oversized-stock-token");
+    std::fs::write(
+        &oversized_path,
+        vec![b's'; ferrum_edge::secrets::credential_file::DEFAULT_CREDENTIAL_FILE_MAX_BYTES + 1],
+    )
+    .unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let token = ferrum_edge::_test_support::read_stock_xds_bearer_token_for_test(
+            token_path.to_str().unwrap(),
+        )
+        .await
+        .expect("bounded stock token");
+        assert_eq!(token, "Bearer external-stock-token");
+
+        let error = ferrum_edge::_test_support::read_stock_xds_bearer_token_for_test(
+            oversized_path.to_str().unwrap(),
+        )
+        .await
+        .expect_err("stock token must respect the shared 64 KiB ceiling");
+        let rendered = error.to_string();
+        assert!(rendered.contains("maximum of 65536 bytes"), "{rendered}");
+        assert!(!rendered.contains(oversized_path.to_str().unwrap()));
+        assert!(!rendered.contains(&"s".repeat(128)));
+    });
+}
+
+#[test]
+#[serial(stock_xds_token_file_read_limit)]
+fn stock_xds_reconnects_bound_detached_reader_occupancy() {
+    let temp = tempfile::tempdir().unwrap();
+    let token_path = temp.path().join("serialized-stock-token");
+    std::fs::write(&token_path, b"serialized-stock-token\n").unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let permit =
+            ferrum_edge::_test_support::acquire_stock_xds_token_file_read_permit_for_test().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                ferrum_edge::_test_support::read_stock_xds_bearer_token_for_test(
+                    token_path.to_str().unwrap(),
+                ),
+            )
+            .await
+            .is_err(),
+            "a reconnect must wait instead of spawning another detached token reader"
+        );
+
+        drop(permit);
+        let token = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ferrum_edge::_test_support::read_stock_xds_bearer_token_for_test(
+                token_path.to_str().unwrap(),
+            ),
+        )
+        .await
+        .expect("stock token read should resume after the reader exits")
+        .expect("bounded stock token");
+        assert_eq!(token, "Bearer serialized-stock-token");
+    });
+}
+
+#[test]
+fn stock_xds_source_has_no_unbounded_async_token_read() {
+    let source = include_str!("../../../src/modes/mesh/config_consumer/stock_xds_client.rs");
+    let secret_registry = include_str!("../../../src/secrets/registry.rs");
+    assert!(!source.contains("tokio::fs::read_to_string(path)"));
+    assert!(source.contains("read_credential_file_detached_guarded"));
+    assert!(source.contains("STOCK_XDS_TOKEN_FILE_READ_LIMIT"));
+    assert!(secret_registry.contains("\"FERRUM_MESH_STOCK_XDS_TOKEN_FILE\","));
 }
