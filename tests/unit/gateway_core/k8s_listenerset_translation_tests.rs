@@ -852,6 +852,17 @@ fn duplicate_gateway_listener_section_fails_closed() {
     assert!(translation.warnings.iter().any(|warning| {
         warning.contains("Gateway default/edge listener b-duplicate rejected: HostnameConflict")
     }));
+    let duplicate_key = GatewayApiListenerKey {
+        namespace: "default".to_string(),
+        parent_kind: GatewayApiListenerParentKind::Gateway,
+        gateway: "edge".to_string(),
+        listener: "b-duplicate".to_string(),
+    };
+    let conflict = translation
+        .listener_conflicts
+        .get(&duplicate_key)
+        .expect("duplicate Gateway listener must be recorded as conflicted");
+    assert_eq!(conflict.reason, "HostnameConflict");
     assert!(
         !translation.config.proxies.iter().any(|proxy| proxy
             .listen_path

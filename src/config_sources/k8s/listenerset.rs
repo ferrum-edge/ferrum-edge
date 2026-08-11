@@ -420,17 +420,15 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
             if !candidate.eligible || conflicted.contains_key(&candidate.key) {
                 continue;
             }
-            // ListenerSet merge conflict is only applied to ListenerSet losers.
-            // Parent Gateway listeners stay accepted anchors (and keep their
-            // established co-existence, e.g. HTTPS catch-all + hostname
-            // siblings on :443). Marking Gateway-vs-Gateway siblings conflicted
-            // here wrongly suppresses routes such as HTTPRouteHTTPSListener's
-            // sectionName attachment to `https-with-hostname`. Process-wide
-            // HTTP-family vs raw TCP/TLS ProtocolConflict was already decided
-            // above; this walk only applies same-protocol HostnameConflict.
-            if let Some(reason) = conflict_against_accepted(candidate, &accepted)
-                && candidate.key.parent_kind == GatewayApiListenerParentKind::ListenerSet
-            {
+            // Exact-duplicate same-protocol claims (equal hostname values on the
+            // same port) lose here for both Gateway and ListenerSet parents —
+            // later claim only, preserving Gateway→ListenerSet precedence.
+            // Catch-all (`None`) versus a named hostname does not conflict
+            // (`hostnames_conflict` requires equal values), so HTTPS catch-all
+            // + hostname siblings stay materializable. Process-wide HTTP-family
+            // vs raw TCP/TLS ProtocolConflict was already decided above; this
+            // walk only applies same-protocol HostnameConflict.
+            if let Some(reason) = conflict_against_accepted(candidate, &accepted) {
                 conflicted.insert(candidate.key.clone(), reason);
                 continue;
             }

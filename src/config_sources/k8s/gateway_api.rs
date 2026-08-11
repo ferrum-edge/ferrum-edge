@@ -1806,7 +1806,11 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
             if !protocol_conflict && !credential_conflict {
                 continue;
             }
-            let (reason, refused_keys, detail) = if protocol_conflict {
+            // Deterministic bounded wording: numeric port + fixed conflict
+            // category only. Never join listener keys or echo namespace /
+            // Gateway / ListenerSet / listener / hostname / credential strings
+            // (cross-tenant disclosure on Gateway.status.listeners[]).
+            let (reason, refused_keys, message) = if protocol_conflict {
                 (
                     "ProtocolConflict",
                     claims
@@ -1815,23 +1819,23 @@ pub(super) fn refuse_incompatible_same_port_listeners(acc: &mut K8sAccumulator) 
                         .chain(claims.effective_tls.iter())
                         .cloned()
                         .collect::<Vec<_>>(),
-                    "both plaintext and an effective TLS-serving claim (one socket is one or the other)",
+                    format!(
+                        "Port {port} is claimed by both plaintext and an effective TLS-serving \
+                         frontend shape, so every conflicting claim on this port is refused \
+                         (Conflicted)."
+                    ),
                 )
             } else {
                 (
                     "HostnameConflict",
                     claims.effective_tls,
-                    "effective TLS serving sets from different Gateway namespaces resolve to                      different credentials on one physical socket",
+                    format!(
+                        "Port {port} has incompatible effective TLS credential sets across \
+                         namespaces, so every conflicting claim on this port is refused \
+                         (Conflicted)."
+                    ),
                 )
             };
-            let listeners = refused_keys
-                .iter()
-                .map(|key| key.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let message = format!(
-                "Gateway API listeners [{listeners}] claim port {port} with incompatible frontend                  shapes: {detail}, so every conflicting claim on this port is refused (Conflicted)."
-            );
             warnings.push(message.clone());
             refused.extend(refused_keys.into_iter().map(|key| {
                 (
@@ -9297,11 +9301,33 @@ mod tests {
         );
         assert!(
             result.warnings.iter().any(|warning| {
-                warning.contains("incompatible frontend shapes") && warning.contains("8443")
+                warning.contains(
+                    "Port 8443 is claimed by both plaintext and an effective TLS-serving \
+                     frontend shape",
+                )
             }),
             "the refusal must be reported: {:?}",
             result.warnings
         );
+        for (key, conflict) in &result.listener_conflicts {
+            assert_eq!(conflict.reason, "ProtocolConflict");
+            assert_eq!(
+                conflict.message,
+                "Port 8443 is claimed by both plaintext and an effective TLS-serving \
+                 frontend shape, so every conflicting claim on this port is refused \
+                 (Conflicted)."
+            );
+            assert!(
+                !conflict.message.contains(&key.to_string())
+                    && !conflict.message.contains("a.example.com")
+                    && !conflict.message.contains("b.example.com")
+                    && !conflict.message.contains("app-cert")
+                    && !conflict.message.contains("Gateway API listeners ["),
+                "physical conflict message must not disclose listener identities: {} => {}",
+                key,
+                conflict.message
+            );
+        }
     }
 
     /// Adversarial: two DIFFERENT Gateways share a numeric port with a
