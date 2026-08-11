@@ -137,6 +137,10 @@ pub struct OidcRelyingParty {
     /// Set by `commit_background_tasks` once this generation is published.
     /// Discovery resolving before that must not reach readiness or metrics.
     jwks_committed: Arc<AtomicBool>,
+    /// Cleared under `jwks_publication_gate` before retirement. A discovery
+    /// task that finishes after cancellation must not publish a store or active
+    /// requirement for a generation that has already been dropped.
+    jwks_owner_live: Arc<AtomicBool>,
     /// This generation's contribution to the shared-cache active set for an
     /// asynchronously discovered JWKS endpoint. Shared with the discovery
     /// task, but always cleared by `Drop` so an aborted task cannot keep a
@@ -801,6 +805,7 @@ impl OidcRelyingParty {
         };
         let jwks_store = Arc::new(ArcSwap::from_pointee(initial_jwks_store));
         let jwks_committed = Arc::new(AtomicBool::new(false));
+        let jwks_owner_live = Arc::new(AtomicBool::new(true));
         let jwks_late_active: Arc<Mutex<Option<LateActiveRequirement>>> = Arc::new(Mutex::new(None));
         let jwks_publication_gate = Arc::new(Mutex::new(()));
         let discovery_task = if start_background_tasks {
@@ -810,6 +815,7 @@ impl OidcRelyingParty {
                     jwks_store.clone(),
                     Arc::clone(&jwks_late_active),
                     Arc::clone(&jwks_committed),
+                    Arc::clone(&jwks_owner_live),
                     Arc::clone(&jwks_publication_gate),
                     http_client.clone(),
                     url,
@@ -879,6 +885,7 @@ impl OidcRelyingParty {
             behavior,
             discovery_task,
             jwks_committed,
+            jwks_owner_live,
             jwks_late_active,
             jwks_publication_gate,
         })
@@ -1880,6 +1887,15 @@ impl OidcRelyingParty {
 
 impl Drop for OidcRelyingParty {
     fn drop(&mut self) {
+        // Serialize retirement with the discovery task's final publication.
+        // Whichever side acquires the gate second observes the other: a task
+        // that lost the race sees `owner_live == false`, while retirement
+        // that lost the race withdraws the contribution the task just added.
+        let _publication = match self.jwks_publication_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.jwks_owner_live.store(false, Ordering::Release);
         if let Some(task) = self.discovery_task.take() {
             task.abort();
         }
@@ -3283,6 +3299,7 @@ fn spawn_oidc_discovery(
     jwks_slot: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
     late_active: Arc<Mutex<Option<LateActiveRequirement>>>,
     committed: Arc<AtomicBool>,
+    owner_live: Arc<AtomicBool>,
     publication_gate: Arc<Mutex<()>>,
     http_client: PluginHttpClient,
     discovery_url: String,
@@ -3302,6 +3319,17 @@ fn spawn_oidc_discovery(
             }
             match fetch_discovery(&http_client, &discovery_url).await {
                 Ok(doc) => {
+                    // Store creation, local publication, and active-set
+                    // registration form one retirement-fenced operation. Do
+                    // not create even an inactive cache entry after the owning
+                    // generation has been dropped.
+                    let _publication = match publication_gate.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if !owner_live.load(Ordering::Acquire) {
+                        return;
+                    }
                     let store = get_or_create_jwks_store(
                         &doc.jwks_uri,
                         &http_client,
@@ -3312,22 +3340,16 @@ fn spawn_oidc_discovery(
                     let refreshable = store.is_refreshable();
                     jwks_slot.store(Arc::new(Some(store)));
                     discovery_slot.store(Arc::new(Some(doc)));
-                    {
-                        // Under the same gate `commit_background_tasks` takes,
-                        // so exactly one of the two registers this generation's
-                        // contribution and a still-staged generation registers
-                        // nothing.
-                        let _publication = match publication_gate.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        if refreshable && committed.load(Ordering::Acquire) {
-                            publish_late_active_requirement(
-                                &late_active,
-                                &resolved_jwks_uri,
-                                oidc_jwks_requirement(),
-                            );
-                        }
+                    // Under the same gate `commit_background_tasks` takes, so
+                    // exactly one of the two registers this generation's
+                    // contribution and a still-staged generation registers
+                    // nothing.
+                    if refreshable && committed.load(Ordering::Acquire) {
+                        publish_late_active_requirement(
+                            &late_active,
+                            &resolved_jwks_uri,
+                            oidc_jwks_requirement(),
+                        );
                     }
                     info!(
                         plugin = "oidc_relying_party",
