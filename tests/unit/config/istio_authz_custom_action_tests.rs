@@ -621,7 +621,7 @@ fn http_request(path: &str) -> MeshAuthzRequest {
 
 #[test]
 fn a_matching_allow_cannot_bypass_a_matching_custom_delegation() {
-    let policies = vec![
+    let policies = [
         policy_with("allow-admin", PolicyAction::Allow, &["/admin/*"]),
         policy_with(
             "delegate-admin",
@@ -646,7 +646,7 @@ fn a_matching_allow_cannot_bypass_a_matching_custom_delegation() {
 
 #[test]
 fn a_matching_deny_still_wins_after_the_delegation_allows() {
-    let policies = vec![
+    let policies = [
         policy_with("deny-admin", PolicyAction::Deny, &["/admin/*"]),
         policy_with(
             "delegate-admin",
@@ -674,7 +674,7 @@ fn a_matching_deny_still_wins_after_the_delegation_allows() {
 fn a_custom_rule_does_not_raise_the_allow_implicit_deny_floor() {
     // A CUSTOM policy DELEGATES; it does not grant. It must not turn unrelated
     // traffic into implicit-deny the way an ALLOW policy does.
-    let policies = vec![policy_with(
+    let policies = [policy_with(
         "delegate-admin",
         PolicyAction::Custom {
             provider: "p".to_string(),
@@ -698,7 +698,7 @@ fn an_unexecutable_delegation_denies_rather_than_falling_through() {
     // This is the contract the L4 / stream path and an executor-less
     // generation both rely on: the plain wrapper never lets a matched CUSTOM
     // rule reach the ALLOW tier.
-    let policies = vec![
+    let policies = [
         policy_with("allow-admin", PolicyAction::Allow, &["/admin/*"]),
         policy_with(
             "delegate-admin",
@@ -825,7 +825,7 @@ fn an_l4_custom_rule_with_http_request_match_fields_still_denies() {
             ..RequestMatch::default()
         },
     ] {
-        let policies = vec![custom_rule_policy(
+        let policies = [custom_rule_policy(
             "delegate",
             MeshRule {
                 action: custom_action(),
@@ -853,7 +853,7 @@ fn an_l4_custom_rule_with_http_only_when_conditions_still_denies() {
         "request.auth.principal",
         "request.auth.audiences",
     ] {
-        let policies = vec![custom_rule_policy(
+        let policies = [custom_rule_policy(
             "delegate",
             MeshRule {
                 action: custom_action(),
@@ -879,7 +879,7 @@ fn an_l4_custom_rule_with_http_only_when_conditions_still_denies() {
 
 #[test]
 fn several_custom_policies_naming_the_same_provider_coalesce_into_one_check() {
-    let policies = vec![
+    let policies = [
         policy_with("delegate-a", custom_action(), &["/admin/*"]),
         policy_with("delegate-b", custom_action(), &["/admin/*"]),
     ];
@@ -894,7 +894,7 @@ fn several_custom_policies_naming_the_same_provider_coalesce_into_one_check() {
 
 #[test]
 fn two_distinct_applicable_providers_are_refused_rather_than_ordered() {
-    let policies = vec![
+    let policies = [
         policy_with("delegate-a", custom_action(), &["/admin/*"]),
         policy_with(
             "delegate-b",
@@ -924,7 +924,7 @@ fn two_distinct_applicable_providers_are_refused_rather_than_ordered() {
 
 #[test]
 fn distinct_providers_on_disjoint_request_scopes_are_not_a_conflict() {
-    let policies = vec![
+    let policies = [
         policy_with("delegate-admin", custom_action(), &["/admin/*"]),
         policy_with(
             "delegate-reports",
