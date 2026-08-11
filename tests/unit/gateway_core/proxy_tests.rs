@@ -2192,9 +2192,12 @@ fn upload_deadline_exits_use_finalized_rejection_cleanup_and_logging() {
 #[test]
 fn streaming_deadline_wraps_client_visible_body_after_inspection() {
     let source = include_str!("../../../src/proxy/mod.rs");
+    // Issue #3731 takes a Unix HTTP/1.1 pool lease from response extensions
+    // before `into_body()`, so this arm binds `mut resp`. That is the legitimate
+    // body owner; the deadline must still wrap inspector output after it.
     for (arm, next_arm) in [
         (
-            "ResponseBody::StreamingH2(resp) => {",
+            "ResponseBody::StreamingH2(mut resp) => {",
             "ResponseBody::StreamingH3(h3_resp) => {",
         ),
         (
@@ -2219,6 +2222,20 @@ fn streaming_deadline_wraps_client_visible_body_after_inspection() {
             inspection < deadline,
             "{arm} must base the deadline DATA decision on inspector output"
         );
+        if arm.starts_with("ResponseBody::StreamingH2") {
+            assert!(
+                body.contains("PooledBackendLeaseSlot")
+                    && body.contains("with_pooled_backend_lease("),
+                "{arm} must re-attach any Unix pool lease outside the deadline wrapper"
+            );
+            let lease_attach = body
+                .find("with_pooled_backend_lease(")
+                .expect("lease attach");
+            assert!(
+                deadline < lease_attach,
+                "{arm} must keep the Unix pool lease outermost around the deadline wrapper"
+            );
+        }
     }
 }
 

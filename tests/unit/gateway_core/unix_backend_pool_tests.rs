@@ -401,8 +401,10 @@ async fn the_idle_set_is_bounded_by_max_idle_per_host() {
     let root = root_dir(&temp);
     let socket = root.join("app.sock");
     let _peer = HoldingPeer::bind(&socket);
-    let mut pool_config = PoolConfig::default();
-    pool_config.max_idle_per_host = 2;
+    let pool_config = PoolConfig {
+        max_idle_per_host: 2,
+        ..PoolConfig::default()
+    };
     let pool = pool(pool_config);
     let proxy = test_proxy("unix-pool-bounds");
 

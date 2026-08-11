@@ -14914,6 +14914,9 @@ async fn plaintext_inbound_http1(
     // Only default to `Connection: close` when the caller did not set its own —
     // the WebSocket case needs `Connection: Upgrade` for the flavor detector to
     // classify the request as an upgrade at all.
+    let is_upgrade = extra_headers
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case("upgrade") && !value.is_empty());
     if !extra_headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
@@ -14926,10 +14929,13 @@ async fn plaintext_inbound_http1(
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).await?;
     stream.flush().await?;
-    // A refusal on an upgrade request may leave the connection open, so read
-    // until EOF OR a short quiet period and use whatever arrived. A response
-    // that never arrives at all still fails, because the status parse below has
-    // nothing to read.
+    // Ordinary responses must be read through to TCP EOF. A quiet-after-headers
+    // early exit drops the client socket while the gateway may still be polling
+    // the streaming `ProxyBody` for `Ready(None)`, which #3731 treats as a
+    // client disconnect and retires the exclusive Unix HTTP/1.1 pool lease —
+    // producing one physical dial per request (hosted data-plane evidence).
+    // Upgrade refusals may leave the connection open without EOF, so those
+    // alone may finish on a short quiet period once headers have arrived.
     let mut raw = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut chunk = [0u8; 4096];
@@ -14938,9 +14944,7 @@ async fn plaintext_inbound_http1(
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => raw.extend_from_slice(&chunk[..n]),
             Ok(Err(e)) => return Err(Box::new(e)),
-            // Quiet socket: if headers already arrived we are done, otherwise
-            // keep waiting until the outer deadline.
-            Err(_) if raw.windows(4).any(|w| w == b"\r\n\r\n") => break,
+            Err(_) if is_upgrade && raw.windows(4).any(|w| w == b"\r\n\r\n") => break,
             Err(_) => continue,
         }
     }
@@ -15300,7 +15304,6 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
             "a unix-backed WebSocket upgrade must be a real 101 Switching Protocols"
         );
 
-        let ws_failure: Option<String>;
         let exchange = async {
             ws.send(Message::Text("hello-unix".into()))
                 .await
@@ -15328,11 +15331,12 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
                 .map_err(|e| format!("send close: {e}"))?;
             Ok::<(), String>(())
         };
-        match tokio::time::timeout(Duration::from_secs(10), exchange).await {
-            Ok(Ok(())) => ws_failure = None,
-            Ok(Err(reason)) => ws_failure = Some(reason),
-            Err(_) => ws_failure = Some("bidirectional frame exchange timed out".to_string()),
-        }
+        let ws_failure: Option<String> =
+            match tokio::time::timeout(Duration::from_secs(10), exchange).await {
+                Ok(Ok(())) => None,
+                Ok(Err(reason)) => Some(reason),
+                Err(_) => Some("bidirectional frame exchange timed out".to_string()),
+            };
         if let Some(reason) = ws_failure {
             let output = captured_output(&temp);
             kill_child(&mut child);

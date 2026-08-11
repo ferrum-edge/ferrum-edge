@@ -342,11 +342,6 @@ mod imp {
             self.reused
         }
 
-        #[inline]
-        pub fn key(&self) -> &UnixPoolKey {
-            &self.key
-        }
-
         /// The publication generation this lease is bound to.
         #[inline]
         #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
@@ -631,7 +626,13 @@ mod imp {
 
     /// Bounded counters for tests and diagnostics. No per-target labels are
     /// exported, so the metric cardinality of this pool is constant.
+    ///
+    /// Production hot paths publish through `runtime_metrics`; this snapshot is
+    /// the external unit/bench compatibility surface that proves hit/miss,
+    /// identity retirement, and withdrawal-fence accounting without expanding
+    /// Prometheus cardinality.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[allow(dead_code)] // Constructed by `stats()` for external unit/bench callers; unused in the binary tree.
     pub struct UnixPoolStats {
         pub hits: u64,
         pub misses: u64,
@@ -670,6 +671,7 @@ mod imp {
             }
         }
 
+        #[allow(dead_code)] // External unit/bench tests assert pool accounting; binary uses runtime_metrics.
         pub fn stats(&self) -> UnixPoolStats {
             let fenced = self.withdrawal_fenced_checkins.load(Ordering::Relaxed);
             UnixPoolStats {
@@ -853,6 +855,12 @@ mod imp {
 
         /// Unordered retirement entry point retained for focused pool tests and
         /// explicit drains that do not correspond to a request-epoch publish.
+        ///
+        /// Production config swaps call [`Self::retain_live_targets_for_publication`]
+        /// so an older/out-of-order publication cannot resurrect withdrawn
+        /// carriers. This unordered form is the external unit-test seam that
+        /// exercises the same retirement body without minting a request epoch.
+        #[allow(dead_code)] // External unit tests call this; production uses the generation-ordered entry point.
         pub fn retain_live_targets(&self, live: &std::collections::HashSet<UnixTargetIdentity>) {
             self.retain_live_targets_inner(live);
         }

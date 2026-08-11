@@ -497,24 +497,14 @@ pub async fn admit_and_connect(
     Ok((admitted, stream))
 }
 
-/// Dial a co-located Unix-domain STREAM socket for an HTTP/1.1 backend,
-/// re-admitting the path first and bounding the connect with
-/// `connect_timeout_ms`.
-#[cfg(unix)]
-pub async fn dial_unix_backend(
-    path: &str,
-    connect_timeout_ms: u64,
-    allowed_roots: &[String],
-    allowed_uids: &[u32],
-) -> Result<tokio::net::UnixStream, UnixBackendError> {
-    let (_admitted, stream) =
-        admit_and_connect(path, connect_timeout_ms, allowed_roots, allowed_uids).await?;
-    Ok(stream)
-}
-
 /// Complete an h2c prior-knowledge HTTP/2 client handshake on an already
 /// admitted + connected Unix stream, waiting for the peer's SETTINGS preface
 /// inside `deadline`.
+///
+/// The Unix backend pool's cold path calls this after [`connect_admitted`] so
+/// the pooled entry can retain the admitted `(dev, ino, owner)` identity; the
+/// 1:1 [`dial_unix_h2c_sender`] helper composes admission + this handshake for
+/// focused external tests.
 #[cfg(unix)]
 pub async fn handshake_unix_h2c_sender(
     stream: tokio::net::UnixStream,
@@ -573,10 +563,15 @@ pub async fn handshake_unix_h2c_sender(
 /// terminal-trailer forwarding are the SAME code on both transports and cannot
 /// drift apart.
 ///
-/// Production dispatch prefers the pooled carrier in
-/// [`crate::proxy::unix_backend_pool`]; this 1:1 dial remains for focused
-/// admission/handshake tests and as the pool's cold-path create primitive.
+/// Production dispatch uses the pooled carrier in
+/// [`crate::proxy::unix_backend_pool`], whose cold path calls
+/// [`admit_and_connect`] + [`handshake_unix_h2c_sender`] directly so it can
+/// retain the admitted identity on the pooled entry. This 1:1 helper remains
+/// the focused admission/handshake compatibility surface for external unit
+/// tests that prove the connect-budget and SETTINGS-preface contracts without
+/// constructing a pool.
 #[cfg(unix)]
+#[allow(dead_code)] // External unit tests call this; the binary/pool cold path uses the split primitives.
 pub async fn dial_unix_h2c_sender(
     path: &str,
     connect_timeout_ms: u64,
