@@ -237,10 +237,16 @@
 //!
 //! A checkout that passed that gate while the pool was still open can still
 //! reach driver registration after the drain latches. `shutdown_drain` sets
-//! BOTH latches as one step — the pool's `shutting_down` flag and the tracker's
-//! own `closed` flag, the latter under the tracker's map lock — before it
-//! retires anything, so the two sides of the boundary open at the same instant
-//! and no registration can succeed after the pool reads as closed.
+//! both latches — the tracker's own `closed` flag under the tracker's map lock,
+//! and then the pool's `shutting_down` flag — before it retires anything. They
+//! are independent state and do NOT land atomically; what the boundary
+//! guarantees is their ORDER. The tracker is closed strictly FIRST, so from the
+//! instant the pool reads as closed to anyone, driver registration has already
+//! been closed and no registration can succeed afterwards. The reverse interval
+//! is the deliberate one: between the tracker close and the pool store a
+//! checkout can still pass the entry gate and dial, which is the same bounded
+//! in-flight-establishment case as a checkout that passed the gate a moment
+//! earlier, and it settles the same way.
 //! `UnixDriverTracker` resolves the remaining race atomically — it reads the
 //! latch, spawns, and inserts under ONE acquisition of that map lock — so the
 //! losing side spawns NOTHING:
@@ -257,9 +263,11 @@
 //!   expired — the budget bounds the wait, it cannot force a task that ignores
 //!   cancellation points to be dropped sooner, and an expired reap budget is
 //!   logged;
-//! * an establishment that was already in flight when the latch was set is not
-//!   owned by that drain and may still hold its target's connection slot for
-//!   the remainder of its own bounded establishment deadline. It settles
+//! * an establishment that was already in flight when the latch was set — or
+//!   that started inside the short interval between the tracker close and the
+//!   pool store, and therefore still passed the entry gate — is not owned by
+//!   that drain and may still hold its target's connection slot for the
+//!   remainder of its own bounded establishment deadline. It settles
 //!   exactly — slot released, gauge untouched, socket closed — before its own
 //!   checkout call returns, and it can never publish a carrier or leave a task
 //!   behind.
@@ -945,10 +953,10 @@ mod imp {
     ///   release later. It refuses, and the caller fails its checkout closed.
     ///
     /// The latch is set by [`Self::close`], which
-    /// [`UnixBackendConnectionPool::shutdown_drain`] performs in the same breath
-    /// as the pool's own `shutting_down` latch and BEFORE any retirement work,
-    /// so there is no interval in which the pool is latched closed but the
-    /// tracker still adopts new drivers.
+    /// [`UnixBackendConnectionPool::shutdown_drain`] performs FIRST — before its
+    /// own `shutting_down` store and before any retirement work — so there is no
+    /// interval in which the pool is latched closed but the tracker still adopts
+    /// new drivers.
     ///
     /// Because the insert cannot be preempted by the driver's own completion
     /// (`finish` needs the same lock), there is no registration sentinel and no
@@ -1081,9 +1089,9 @@ mod imp {
         /// Every registration either wins that lock first — and is therefore
         /// fully inserted, so the drain that follows owns it — or acquires it
         /// after this store and spawns nothing at all. Because this is
-        /// synchronous and lock-scoped, [`UnixBackendConnectionPool`] can set it
-        /// in the same breath as its own `shutting_down` latch, before any
-        /// retirement work runs, leaving no interval in which a post-latch
+        /// synchronous and lock-scoped, [`UnixBackendConnectionPool`] sets it
+        /// BEFORE its own `shutting_down` store and before any retirement work
+        /// runs, leaving no interval in which the pool reads as closed while a
         /// registration could still succeed.
         ///
         /// Nothing is awaited and no other lock is taken, so this cannot
@@ -1110,10 +1118,10 @@ mod imp {
         /// cancellation rather than to an infinite wait.
         async fn drain(&self, budget: std::time::Duration, reap_budget: std::time::Duration) {
             // Idempotent defense in depth. The pool's shutdown entry points
-            // already closed the tracker, in the same step as their own latch
-            // and before they retired anything, so by the time this runs the
-            // latch is set; re-closing keeps this function terminal on its own
-            // terms for any future caller.
+            // already closed the tracker — before their own latch store and
+            // before they retired anything — so by the time this runs the latch
+            // is set; re-closing keeps this function terminal on its own terms
+            // for any future caller.
             self.close();
             let deadline = tokio::time::Instant::now().checked_add(budget);
             if let Some(deadline) = deadline {
@@ -1394,6 +1402,15 @@ mod imp {
             self.drivers.entries()
         }
 
+        /// Whether the pool's checkout/check-in shutdown latch is PUBLISHED yet.
+        /// Diagnostics and external tests: the ordering regression test reads it
+        /// from inside the inter-latch interval to prove the tracker's
+        /// registration latch was closed strictly first.
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
+        pub fn shutdown_latch_published(&self) -> bool {
+            self.is_shutting_down()
+        }
+
         /// The exported metric snapshot. O(1): every field is one atomic load,
         /// so the metrics endpoint never walks the pool's maps.
         pub fn stats(&self) -> UnixPoolStats {
@@ -1507,8 +1524,8 @@ mod imp {
         /// lands before or after the clear.
         ///
         /// This also drops the withdrawal tombstones, which is why the only
-        /// production caller is `shutdown_drain`: it latches the pool closed in
-        /// the same breath, so nothing can be pooled afterwards at all. A
+        /// production caller is `shutdown_drain`: both shutdown latches are
+        /// already set when this runs, so nothing can be pooled afterwards. A
         /// config publication must use `retain_live_targets`, which preserves
         /// them.
         pub fn force_drain_all(&self) {
@@ -1537,12 +1554,16 @@ mod imp {
         ///    check its carrier back into a pool nobody will ever drain again.
         ///    `force_drain_all`'s generation bump closes the interleaving the
         ///    latch alone cannot — a check-in that read the latch unset a moment
-        ///    before it was set. The tracker is closed in the SAME step
-        ///    ([`Self::latch_shutdown`]), before any retirement runs, so the
-        ///    checkout side of the boundary is latched at exactly the same
-        ///    instant as the check-in side: there is no interval during which
-        ///    the pool is closed but a racing establishment could still register
-        ///    a driver and go on to return a sender.
+        ///    before it was set. The tracker's registration latch is closed
+        ///    FIRST ([`Self::latch_shutdown`]), before this store and before any
+        ///    retirement runs. The two are independent state, so they are
+        ///    ordered rather than simultaneous, and the order is the guarantee:
+        ///    there is no interval during which the pool reads as closed but a
+        ///    racing establishment could still register a driver and go on to
+        ///    return a sender. A checkout that slips through the entry gate in
+        ///    the reverse interval — after the tracker closed, before this store
+        ///    — may still dial, but it is refused at registration and settles
+        ///    exactly, as described below.
         /// 2. `force_drain_all` drops every pooled carrier, which closes each
         ///    connection whose only remaining sender was the pooled one.
         /// 3. The tracker awaits every driver task that is still running —
@@ -1573,6 +1594,7 @@ mod imp {
                 DRIVER_DRAIN_BUDGET,
                 DRIVER_ABORT_REAP_BUDGET,
                 || std::future::ready(()),
+                || std::future::ready(()),
             )
             .await;
         }
@@ -1586,43 +1608,80 @@ mod imp {
             driver_budget: std::time::Duration,
             reap_budget: std::time::Duration,
         ) {
-            self.shutdown_drain_seamed(driver_budget, reap_budget, || std::future::ready(()))
-                .await;
+            self.shutdown_drain_seamed(
+                driver_budget,
+                reap_budget,
+                || std::future::ready(()),
+                || std::future::ready(()),
+            )
+            .await;
         }
 
-        /// Set BOTH shutdown latches — the pool's check-in/checkout latch and
-        /// the driver tracker's registration latch — as one step.
+        /// Set both shutdown latches in the ONE order that is safe: the driver
+        /// tracker's registration latch FIRST, under the tracker's map lock, and
+        /// only THEN the pool's own `shutting_down` Release store.
         ///
-        /// This is the whole shutdown boundary. It runs before `force_drain_all`
-        /// and before the tracker drain, so from the instant a checkout can
-        /// observe the pool closed, a racing establishment can no longer be
-        /// adopted either. Both stores are synchronous; the tracker's is taken
-        /// under its map lock, which is the lock a concurrent `register`
-        /// contends for, and no await sits between them.
-        fn latch_shutdown(&self) {
-            self.shutting_down.store(true, Ordering::Release);
+        /// The two are independent pieces of state and cannot land atomically.
+        /// What the boundary needs is not simultaneity but a direction: from the
+        /// instant ANY thread can observe the pool latched closed, driver
+        /// registration must ALREADY be closed. Storing the pool flag last is
+        /// exactly that guarantee — the tracker's `close()` completes, releasing
+        /// the map lock a concurrent [`UnixDriverTracker::register`] contends
+        /// for, before the flag this method publishes is visible to anyone. So
+        /// there is no interval in which the pool reads as shutting down while
+        /// the tracker would still adopt a driver.
+        ///
+        /// The converse interval DOES exist, and is deliberate: between the
+        /// tracker close and the pool store, a checkout can still pass
+        /// [`Self::refuse_if_shutting_down`] and go on to `connect(2)`. That is
+        /// the same bounded in-flight-establishment limitation
+        /// [`Self::shutdown_drain`] already documents for a checkout that passed
+        /// the gate a moment earlier, and it is harmless for the same reason:
+        /// its registration is already fail-closed, so it spawns nothing,
+        /// publishes nothing, charges no gauge, releases its target's connection
+        /// slot, and returns `PoolShuttingDown`.
+        ///
+        /// `between_latches` is a test seam awaited in precisely that interval;
+        /// production passes a ready future. Nothing is awaited while a lock is
+        /// held — `close()` releases the map lock before it returns.
+        async fn latch_shutdown<B, BFut>(&self, between_latches: B)
+        where
+            B: FnOnce() -> BFut,
+            BFut: std::future::Future<Output = ()>,
+        {
             self.drivers.close();
+            between_latches().await;
+            self.shutting_down.store(true, Ordering::Release);
         }
 
-        /// The production shutdown-drain body, with one test seam: an async hook
-        /// awaited AFTER both latches are set and BEFORE any retirement or
-        /// driver draining runs.
+        /// The production shutdown-drain body, with two test seams.
         ///
-        /// That is precisely the former force-drain interval — the window in
-        /// which the pool was latched closed but the tracker was not yet — and
-        /// it cannot be produced by timing alone. Production passes a ready
-        /// future, so a test through here exercises the production ordering
-        /// rather than a parallel one.
-        pub(crate) async fn shutdown_drain_seamed<F, Fut>(
+        /// `between_latches` is awaited BETWEEN the tracker's registration latch
+        /// and the pool's `shutting_down` store — the one interval that can tell
+        /// the required ordering apart from its reverse. A registration released
+        /// there must already be refused even though the pool flag is not yet
+        /// published; under the reverse (pool-first) order the same point would
+        /// find the pool closed and the tracker still adopting.
+        ///
+        /// `after_latch` is awaited after BOTH latches are set and BEFORE any
+        /// retirement or driver draining runs — the former force-drain interval.
+        ///
+        /// Neither can be produced by timing alone. Production passes ready
+        /// futures for both, so a test through here exercises the production
+        /// ordering rather than a parallel one.
+        pub(crate) async fn shutdown_drain_seamed<B, BFut, F, Fut>(
             &self,
             driver_budget: std::time::Duration,
             reap_budget: std::time::Duration,
+            between_latches: B,
             after_latch: F,
         ) where
+            B: FnOnce() -> BFut,
+            BFut: std::future::Future<Output = ()>,
             F: FnOnce() -> Fut,
             Fut: std::future::Future<Output = ()>,
         {
-            self.latch_shutdown();
+            self.latch_shutdown(between_latches).await;
             after_latch().await;
             self.force_drain_all();
             self.drivers.drain(driver_budget, reap_budget).await;
@@ -2927,6 +2986,13 @@ mod imp {
         #[allow(dead_code)] // Parity with the Unix build; no drivers to track here.
         pub fn tracked_drivers(&self) -> usize {
             0
+        }
+
+        /// Mirrors the Unix build's shutdown-latch accessor. There is no pool
+        /// state to latch on this platform, so it never reads as published.
+        #[allow(dead_code)] // Parity with the Unix build; nothing to latch here.
+        pub fn shutdown_latch_published(&self) -> bool {
+            false
         }
 
         /// Mirrors the Unix build's accessor. Nothing is ever pooled here, so

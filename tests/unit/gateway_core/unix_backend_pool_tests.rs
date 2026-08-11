@@ -2710,8 +2710,9 @@ async fn an_h2c_checkout_racing_the_shutdown_latch_refuses_and_settles_exactly()
 /// latch. A checkout that had already passed the entry gate could therefore win
 /// the tracker mutex inside that interval,
 /// register successfully, and go on toward returning a sender while shutdown
-/// was in progress. Both latches now land as one step before any retirement, so
-/// the interval no longer exists.
+/// was in progress. Both latches now land before any retirement runs, so the
+/// interval no longer exists. Their ORDER — tracker first, pool store second —
+/// is what the sibling test below pins; this one pins the retirement boundary.
 ///
 /// Driven entirely by channel handoffs: the checkout parks at the existing
 /// pre-registration seam, shutdown parks at the post-latch seam, and each side
@@ -2818,6 +2819,156 @@ async fn a_checkout_released_inside_the_former_force_drain_interval_still_refuse
         "the refusal releases the target's connection slot before it returns"
     );
     assert_eq!(pool.tracked_drivers(), 0);
+}
+
+/// The ORDER of the two shutdown latches, pinned at the only point that can
+/// distinguish it from its reverse: inside the interval between them.
+///
+/// The pool's `shutting_down` flag and the driver tracker's `closed` flag are
+/// independent state and cannot be stored atomically, so the boundary rests
+/// entirely on which one becomes observable first. Registration is closed
+/// FIRST, under the tracker's map lock; the pool's Release store follows. That
+/// is what makes "once the pool reads as closed, nothing more can be adopted"
+/// true.
+///
+/// Under the reverse (pool-first) order this test fails twice over: the seam
+/// would observe the pool already latched, and the racing checkout — released
+/// while the tracker was still open — would win the tracker mutex, register,
+/// and return a sender.
+///
+/// Driven entirely by channel handoffs, with no sleeping and no polling: the
+/// checkout parks at the production pre-registration seam and is released from
+/// inside the production inter-latch seam, which then waits for it to settle
+/// before the pool flag is ever published.
+#[tokio::test]
+async fn registration_is_already_closed_before_the_pool_latch_is_published() {
+    use ferrum_edge::_test_support::{
+        checkout_unix_h1_with_registration_seam, shutdown_unix_pool_with_inter_latch_seam,
+    };
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = HoldingPeer::bind(&socket);
+    let pool = bounded_pool(4);
+    let proxy = test_proxy("unix-pool-latch-order");
+    let allowed_roots = roots(&root);
+
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let (settled_tx, settled_rx) = tokio::sync::oneshot::channel::<()>();
+    // `usize::MAX` is an unreachable sentinel: a seam that never ran cannot be
+    // mistaken for one that observed a legitimate zero. The two latch readings
+    // record `bool` as 0/1 through the same mechanism.
+    let latch_published_on_entry = AtomicUsize::new(usize::MAX);
+    let latch_published_after_settle = AtomicUsize::new(usize::MAX);
+    let tracked_between = AtomicUsize::new(usize::MAX);
+    let gauge_between = AtomicUsize::new(usize::MAX);
+    let lanes_between = AtomicUsize::new(usize::MAX);
+    let connects_between = AtomicUsize::new(usize::MAX);
+
+    let racing_checkout = async {
+        let result = checkout_unix_h1_with_registration_seam(
+            &pool,
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &allowed_roots,
+            &[],
+            || async move {
+                let _ = reached_tx.send(());
+                let _ = release_rx.await;
+            },
+        )
+        .await;
+        // Hands control back to the inter-latch seam, which is still holding
+        // shutdown between the two latches.
+        let _ = settled_tx.send(());
+        result
+    };
+    let shutdown = async {
+        reached_rx
+            .await
+            .expect("the racing checkout reaches the registration boundary");
+        shutdown_unix_pool_with_inter_latch_seam(
+            &pool,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+            || async {
+                // The tracker is closed; the pool flag is NOT stored yet.
+                latch_published_on_entry
+                    .store(usize::from(pool.shutdown_latch_published()), Ordering::SeqCst);
+                let _ = release_tx.send(());
+                let _ = settled_rx.await;
+                // Still inside the interval: whatever refused the checkout was
+                // the tracker's latch, because this one is still unpublished.
+                latch_published_after_settle
+                    .store(usize::from(pool.shutdown_latch_published()), Ordering::SeqCst);
+                let stats = pool.stats();
+                tracked_between.store(pool.tracked_drivers(), Ordering::SeqCst);
+                gauge_between.store(stats.open_physical_connections as usize, Ordering::SeqCst);
+                lanes_between.store(pool.resident_connection_lanes(), Ordering::SeqCst);
+                connects_between.store(stats.physical_connects as usize, Ordering::SeqCst);
+            },
+        )
+        .await;
+    };
+    let (result, ()) = tokio::join!(racing_checkout, shutdown);
+
+    assert_eq!(
+        latch_published_on_entry.load(Ordering::SeqCst),
+        0,
+        "the tracker's registration latch must be closed BEFORE the pool's flag is published"
+    );
+    assert_eq!(
+        latch_published_after_settle.load(Ordering::SeqCst),
+        0,
+        "the racing checkout settled while the pool flag was still unpublished, so its refusal \
+         came from the tracker's latch and not from the pool's entry gate"
+    );
+    assert_eq!(
+        tracked_between.load(Ordering::SeqCst),
+        0,
+        "a registration released inside the inter-latch interval must adopt nothing"
+    );
+    assert_eq!(
+        gauge_between.load(Ordering::SeqCst),
+        0,
+        "nothing was spawned, so the open-connection gauge was never charged"
+    );
+    assert_eq!(
+        lanes_between.load(Ordering::SeqCst),
+        0,
+        "the refusal releases the target's connection slot before the checkout returns"
+    );
+    assert_eq!(
+        connects_between.load(Ordering::SeqCst),
+        0,
+        "an established-then-refused connection is not a completed establishment"
+    );
+
+    let err = expect_refusal(
+        result,
+        "a checkout released after the tracker closed but before the pool flag is published must \
+         still be refused",
+    );
+    assert!(
+        matches!(err, UnixBackendError::PoolShuttingDown),
+        "expected the typed shutdown refusal, got {err}"
+    );
+    assert_eq!(err.error_class(), ErrorClass::DispatchPolicyRejected);
+
+    let stats = pool.stats();
+    assert_eq!(stats.open_physical_connections, 0);
+    assert_eq!(stats.physical_connects, 0);
+    assert_eq!(stats.idle_h1_connections, 0);
+    assert_eq!(stats.active_h2c_connections, 0);
+    assert_eq!(pool.resident_connection_lanes(), 0);
+    assert_eq!(pool.tracked_drivers(), 0);
+    assert!(
+        pool.shutdown_latch_published(),
+        "the drain publishes the pool latch once it leaves the inter-latch interval"
+    );
 }
 
 /// The one establishment budget is opened at the OUTERMOST checkout entry —

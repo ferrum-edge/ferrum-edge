@@ -2642,8 +2642,8 @@ pub mod _test_support {
     }
 
     /// Drive the production Unix-pool shutdown drain with a hook awaited AFTER
-    /// both shutdown latches are set — the pool's checkout/check-in latch and
-    /// the driver tracker's registration latch — and BEFORE any pooled carrier
+    /// both shutdown latches are set — the driver tracker's registration latch
+    /// and the pool's checkout/check-in latch — and BEFORE any pooled carrier
     /// is retired or any driver is drained (issue #3764).
     ///
     /// That interval is the one a racing establishment used to be able to
@@ -2659,8 +2659,42 @@ pub mod _test_support {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        pool.shutdown_drain_seamed(driver_budget, reap_budget, after_latch)
-            .await;
+        pool.shutdown_drain_seamed(
+            driver_budget,
+            reap_budget,
+            || std::future::ready(()),
+            after_latch,
+        )
+        .await;
+    }
+
+    /// Drive the same production shutdown drain with a hook awaited BETWEEN the
+    /// two shutdown latches: after the driver tracker's registration latch is
+    /// closed under its map lock, and BEFORE the pool's `shutting_down` store is
+    /// published (issue #3764).
+    ///
+    /// This is the only point that can distinguish the required ordering from
+    /// its reverse. Inside this hook a registration must already be refused
+    /// while `shutdown_latch_published()` still reads false; under a pool-first
+    /// order the same point would find the pool latched and the tracker still
+    /// adopting drivers. Production `shutdown_drain` passes a ready future here.
+    #[cfg(unix)]
+    pub async fn shutdown_unix_pool_with_inter_latch_seam<B, BFut>(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        driver_budget: std::time::Duration,
+        reap_budget: std::time::Duration,
+        between_latches: B,
+    ) where
+        B: FnOnce() -> BFut,
+        BFut: std::future::Future<Output = ()>,
+    {
+        pool.shutdown_drain_seamed(
+            driver_budget,
+            reap_budget,
+            between_latches,
+            || std::future::ready(()),
+        )
+        .await;
     }
 
     /// Ask the PRODUCTION shared-h2c selector whether it would hand a pooled
