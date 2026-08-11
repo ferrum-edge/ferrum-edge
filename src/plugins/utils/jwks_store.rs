@@ -53,14 +53,6 @@ impl JwksTrustState {
             Self::Expired => "expired",
         }
     }
-
-    pub const fn index(self) -> usize {
-        match self {
-            Self::Fresh => 0,
-            Self::Grace => 1,
-            Self::Expired => 2,
-        }
-    }
 }
 
 /// Bounded, fixed-cardinality outcome of the latest failed refresh attempt.
@@ -400,6 +392,7 @@ impl JwksKeyStore {
     }
 
     /// Number of completed remote refresh attempts (success or failure).
+    #[allow(dead_code)] // external unit tests observe refresh sync; dead in the binary target
     pub fn refresh_completions(&self) -> u64 {
         self.refresh_completions.load(Ordering::Acquire)
     }
@@ -410,6 +403,7 @@ impl JwksKeyStore {
     /// do not need to sleep through virtual time to observe a forced refresh.
     /// Subscribe before reading the counter so a completion that races the
     /// check cannot be lost between the load and `notified().await`.
+    #[allow(dead_code)] // external unit tests observe refresh sync; dead in the binary target
     pub async fn wait_for_refresh_completion_after(&self, before: u64) {
         loop {
             let notified = self.refresh_notify.notified();
