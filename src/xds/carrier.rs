@@ -614,9 +614,7 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
             Some("ferrum-mesh-carrier/virtual-service-l4-upstreams")
         }
         FERRUM_ECDS_MESH_POLICIES_TYPE_URL => Some("ferrum-mesh-carrier/mesh-policies"),
-        FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL => {
-            Some("ferrum-mesh-carrier/ext-authz-providers")
-        }
+        FERRUM_ECDS_EXT_AUTHZ_PROVIDERS_TYPE_URL => Some("ferrum-mesh-carrier/ext-authz-providers"),
         FERRUM_ECDS_VS_CORS_POLICIES_TYPE_URL => {
             Some("ferrum-mesh-carrier/virtual-service-cors-policies")
         }
