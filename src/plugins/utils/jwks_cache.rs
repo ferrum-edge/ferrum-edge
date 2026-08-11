@@ -269,14 +269,23 @@ pub fn get_or_create_jwks_store(
         // any pending last-owner reaper before cloning the store.
         entry.retirement_epoch.fetch_add(1, Ordering::AcqRel);
         let strictest = entry.requirement.strictest(requested);
-        if strictest != entry.requirement {
+        let policy_changed = strictest != entry.requirement;
+        if policy_changed {
             reconfigure_refresh_policy(jwks_uri, entry.value_mut(), strictest);
         }
-        return Arc::clone(&entry.value().store);
+        let store = Arc::clone(&entry.value().store);
+        drop(entry);
+        if policy_changed {
+            // Never republish while the get_mut guard above is held.
+            republish_trust_health();
+        }
+        return store;
     }
 
     // Slow path: create new store (DashMap entry API handles races)
+    let mut inserted = false;
     let mut entry = cache.entry(jwks_uri.to_string()).or_insert_with(|| {
+        inserted = true;
         info!(
             "JWKS cache: creating shared store for {}",
             redacted_jwks_uri(jwks_uri)
@@ -296,12 +305,24 @@ pub fn get_or_create_jwks_store(
     });
     entry.retirement_epoch.fetch_add(1, Ordering::AcqRel);
     let strictest = entry.requirement.strictest(requested);
-    if strictest != entry.requirement {
+    let policy_changed = strictest != entry.requirement;
+    if policy_changed {
         reconfigure_refresh_policy(jwks_uri, entry.value_mut(), strictest);
     }
-    entry.value().store.clone()
+    let store = entry.value().store.clone();
+    drop(entry);
+    if inserted || policy_changed {
+        // Never republish while the entry guard above is held.
+        republish_trust_health();
+    }
+    store
 }
 
+/// Update the entry's effective policy and replace its refresh worker.
+///
+/// Caller must hold a mutable cache entry (or be inside `retain`) and must
+/// call [`republish_trust_health`] only after that guard is released.
+/// Publishing here would iterate the same `DashMap` under the held shard.
 fn reconfigure_refresh_policy(
     jwks_uri: &str,
     entry: &mut JwksCacheEntry,
@@ -328,13 +349,13 @@ fn reconfigure_refresh_policy(
         requirement.refresh_interval,
         requirement.max_stale
     );
-    // configure_trust_policy already republishes; keep an explicit republish so
-    // active-bit transitions that share this path stay coherent.
-    republish_trust_health();
 }
 
 /// Reconcile the shared cache against the exact strictest requirement of the
 /// newly committed plugin generation, then retire unreferenced stores.
+///
+/// Trust-health republication runs only after `retain` returns so it never
+/// iterates the map under the retain shard guard.
 pub fn retain_active_requirements(active_requirements: &HashMap<String, JwksRefreshRequirement>) {
     let cache = global_cache();
     cache.retain(|uri, entry| {

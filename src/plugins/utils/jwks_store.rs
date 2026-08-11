@@ -349,12 +349,17 @@ impl JwksKeyStore {
     }
 
     /// Atomically install the effective policy selected by the shared cache.
+    ///
+    /// Does not publish trust-health changes. Shared-cache callers often hold a
+    /// `DashMap` entry/`get_mut`/`retain` guard; invoking the process-wide
+    /// republish hook here would re-enter the same map and self-deadlock.
+    /// Cache boundaries republish after those guards are dropped. Refresh
+    /// success/failure still publishes through the store refresh-completion path.
     pub fn configure_trust_policy(&self, refresh_interval: Duration, max_stale: Duration) {
         self.trust_policy.store(Arc::new(JwksTrustPolicy {
             refresh_interval,
             max_stale,
         }));
-        note_trust_change();
     }
 
     /// Monotonic deadline when this remote store's retained keys become

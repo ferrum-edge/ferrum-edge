@@ -558,3 +558,103 @@ async fn active_remote_trust_health_transitions_and_excludes_inactive() {
     tokio::time::resume();
     clear_jwks_cache();
 }
+
+#[tokio::test]
+async fn shared_cache_trust_publish_stays_outside_dashmap_guards() {
+    // Contract: create / tighten / retain / relax must not invoke
+    // republish_trust_health while a DashMap get_mut, entry, or retain guard
+    // is held. configure_trust_policy must not call the trust-change hook, and
+    // reconfigure_refresh_policy must not republish under those guards — both
+    // previously self-deadlocked by re-entering the same shard. Completing
+    // these paths without hanging, and observing coherent O(1) trust health
+    // without an explicit test-side republish, encodes that publication stays
+    // at post-guard cache boundaries (refresh completions still publish).
+    use ferrum_edge::plugins::utils::jwks_cache::trust_health_snapshot;
+
+    let (server, uri) = super::jwks_auth_tests::start_jwks_server(RSA_PUBLIC_PEM).await;
+    let _guard = cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let store = get_or_create_jwks_store_with_policy(
+        &uri,
+        &client(),
+        Duration::from_secs(60),
+        Duration::from_secs(300),
+    );
+    super::jwks_auth_tests::wait_for_received_request_count(&server, 1).await;
+    let populated = std::time::Instant::now() + Duration::from_secs(2);
+    while !store.has_keys() {
+        assert!(
+            std::time::Instant::now() < populated,
+            "initial JWKS populate"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    retain_active_requirements(&HashMap::from([(
+        uri.clone(),
+        JwksRefreshRequirement::new(Duration::from_secs(60), Duration::from_secs(300)),
+    )]));
+    let active = trust_health_snapshot();
+    assert_eq!((active.fresh, active.grace, active.expired), (1, 0, 0));
+    assert!(active.ready(tokio::time::Instant::now()));
+    assert!(!active.degraded(tokio::time::Instant::now()));
+
+    // Empty responses keep the forced policy-change refresh from resetting age
+    // while still exercising post-guard publish on the get_mut reconfigure path.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [] })))
+        .mount(&server)
+        .await;
+
+    let completions_before = store.refresh_completions();
+    let tightened = get_or_create_jwks_store_with_policy(
+        &uri,
+        &client(),
+        Duration::from_secs(5),
+        Duration::from_secs(300),
+    );
+    assert!(Arc::ptr_eq(&store, &tightened));
+    assert_eq!(
+        cached_requirement(&uri),
+        Some(JwksRefreshRequirement::new(
+            Duration::from_secs(5),
+            Duration::from_secs(300),
+        ))
+    );
+    store
+        .wait_for_refresh_completion_after(completions_before)
+        .await;
+    let after_tighten = trust_health_snapshot();
+    assert_eq!(
+        (after_tighten.fresh, after_tighten.grace, after_tighten.expired),
+        (0, 1, 0),
+        "failed forced refresh must publish grace without a test-side republish"
+    );
+    assert!(after_tighten.degraded(tokio::time::Instant::now()));
+
+    retain_active_requirements(&HashMap::from([(
+        uri.clone(),
+        JwksRefreshRequirement::new(Duration::from_secs(60), Duration::from_secs(300)),
+    )]));
+    assert_eq!(
+        cached_requirement(&uri),
+        Some(JwksRefreshRequirement::new(
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+        ))
+    );
+    let after_relax = trust_health_snapshot();
+    assert_eq!(
+        (after_relax.fresh, after_relax.grace, after_relax.expired),
+        (0, 1, 0),
+        "retain must republish after its guard so grace remains visible"
+    );
+
+    retain_active_requirements(&HashMap::new());
+    let removed = trust_health_snapshot();
+    assert_eq!((removed.fresh, removed.grace, removed.expired), (0, 0, 0));
+
+    clear_jwks_cache();
+}
