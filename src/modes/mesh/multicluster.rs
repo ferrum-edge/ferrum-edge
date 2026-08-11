@@ -3541,10 +3541,7 @@ mod tests {
         // becoming an empty `kid` no bundle can match.
         let unstamped = parse_remote_discovery_credentials(Some(&raw), issuer, None)
             .expect("valid credential map parses without a key id");
-        assert_eq!(
-            unstamped.get("b").and_then(|s| s.key_id_for_tests()),
-            None
-        );
+        assert_eq!(unstamped.get("b").and_then(|s| s.key_id_for_tests()), None);
     }
 
     #[test]
