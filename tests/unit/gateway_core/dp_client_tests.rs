@@ -21,14 +21,26 @@ fn connection_state_new_disconnected() {
 #[test]
 fn grpc_jwt_secret_stores_and_retrieves() {
     let secret = GrpcJwtSecret::new("my-secret-key".to_string());
-    assert_eq!(secret.as_str(), "my-secret-key");
+    let token = secret.mint("node-1", None, None).unwrap();
+    let key = jsonwebtoken::DecodingKey::from_secret(b"my-secret-key");
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = true;
+    assert!(
+        jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation).is_ok()
+    );
 }
 
 #[test]
 fn grpc_jwt_secret_clone() {
     let secret = GrpcJwtSecret::new("test".to_string());
     let cloned = secret.clone();
-    assert_eq!(cloned.as_str(), "test");
+    let token = cloned.mint("node-1", None, None).unwrap();
+    let key = jsonwebtoken::DecodingKey::from_secret(b"test");
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = true;
+    assert!(
+        jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation).is_ok()
+    );
 }
 
 #[test]
