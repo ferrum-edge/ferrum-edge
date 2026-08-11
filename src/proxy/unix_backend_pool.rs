@@ -25,9 +25,10 @@
 //! withdrawn carriers explicitly.
 //!
 //! EVERY successfully published request epoch reconciles the pool through
-//! [`UnixBackendConnectionPool::retain_live_targets`], with the exact set of
-//! `mesh.unix_socket` target identities THE CONFIG THAT WAS ACTUALLY PUBLISHED
-//! declares. That is all three publication paths — `ProxyState::update_config`'s
+//! [`UnixBackendConnectionPool::retain_live_targets_for_publication`], with the
+//! exact set of `mesh.unix_socket` target identities THE CONFIG THAT WAS
+//! ACTUALLY PUBLISHED declares. That is all three publication paths —
+//! `ProxyState::update_config`'s
 //! initial full rebuild, its incremental delta branch, and
 //! `ProxyState::apply_incremental`'s separate database/CP-DP path — and the
 //! call happens immediately after the epoch swap, BEFORE any early return for a
@@ -70,9 +71,7 @@
 //!
 //! 1. **The lease token.** Every lease records the generation current when it
 //!    was acquired, and a check-in is refused unless that is still the current
-//!    generation. This is strictly stronger than re-testing set membership — it
-//!    needs no live-set lookup, no per-request identity construction and no
-//!    allocation, just one atomic load — and it closes same-key ABA: a target
+//!    generation. This generational test closes same-key ABA: a target
 //!    withdrawn and re-added under the exact same tuple is a NEW incarnation,
 //!    and a lease from the previous one must not re-enter it. The cost is that
 //!    a lease outstanding across ANY publication is conservatively retired
@@ -95,22 +94,22 @@
 //!    construction, a continuously-live carrier. A token can never run ahead of
 //!    the counter, so a lost update between two concurrent passes only ever
 //!    refuses reuse.
-//! 3. **The withdrawal tombstone.** A key the pass finds ABSENT from the live
-//!    set keeps its (now emptied) slot, marked withdrawn, and a check-in into a
-//!    withdrawn slot is refused. This is what stops a request still routed by a
-//!    SUPERSEDED request epoch — which can legitimately dial a withdrawn target
-//!    long after the epoch swap, and therefore holds a lease bound to the
-//!    CURRENT generation — from pooling a reusable carrier under an identity
-//!    the published config no longer declares. It is read through the same
-//!    single per-key map access the insert already performs, so it adds no
-//!    lookup, no allocation and no lock to the hot path. A later publication
-//!    that declares the identity again clears the mark, leaving the slot empty:
-//!    the re-added incarnation starts from a freshly admitted dial.
+//! 3. **The live-set snapshot and withdrawal tombstone.** Publication installs
+//!    a lock-free snapshot of the exact identities it declares. A check-in or
+//!    h2c publish compares the identity already owned by its pool key against
+//!    that snapshot, without constructing strings, before it can become
+//!    reusable. This covers a withdrawn identity even when the retirement pass
+//!    had no existing slot to tombstone. For keys the pass can see, an absent
+//!    identity also keeps its emptied slot marked withdrawn, closing the map
+//!    insertion race under the same shard guard. A later publication that
+//!    declares the identity again clears the mark, leaving the slot empty: the
+//!    re-added incarnation starts from a freshly admitted dial.
 //!
 //! ### The interleavings
 //!
-//! Publication is ordered "bump, THEN retire"; a check-in reads the generation,
-//! inserts a UNIQUELY IDENTIFIED entry, releases the shard, and re-reads.
+//! Publication is ordered "bump, install live snapshot, THEN retire"; a
+//! check-in reads the generation, inserts a UNIQUELY IDENTIFIED entry, releases
+//! the shard, and re-reads.
 //!
 //! * *Publication sees the insert.* The retirement pass finds the entry: it
 //!   removes it (withdrawn identity) or advances its token (live identity).
@@ -124,9 +123,9 @@
 //!   re-stamped into a new request.
 //! * *Same-key withdraw/re-add ABA.* Rule 1 keeps the outstanding lease out
 //!   (its token is two generations stale). Rule 3 keeps a stale-epoch dial's
-//!   late check-in out for as long as the identity is withdrawn, and the
-//!   re-add clears an EMPTY slot, so the new incarnation cannot inherit a
-//!   carrier from the old one.
+//!   late check-in out for as long as the identity is withdrawn, including
+//!   when there was no slot at withdrawal, and the re-add clears an EMPTY slot,
+//!   so the new incarnation cannot inherit a carrier from the old one.
 //! * *Late h2c publish.* `checkout_h2c` publishes its carrier into a shared map
 //!   after a dial that can straddle a publication, so it runs the identical
 //!   sequence: tombstone check, insert with a token, post-insert re-read,
@@ -134,26 +133,6 @@
 //! * *Shutdown.* `shutdown_drain` latches the pool closed AND bumps the
 //!   generation, so a check-in that read the latch unset a moment earlier is
 //!   still refused by rule 1.
-//!
-//! ### The one residual, stated exactly
-//!
-//! The retirement pass can only tombstone keys it can SEE. If an identity is
-//! withdrawn at an instant when nothing at all is pooled for it, there is no
-//! slot to mark, and a request still routed by a superseded epoch can then dial
-//! it and pool the result under the current generation. Closing that would take
-//! a live-set membership test on the check-in path, which means constructing a
-//! `UnixTargetIdentity` (four owned strings) per exchange — a per-request
-//! allocation and lookup this pool deliberately does not pay.
-//!
-//! What that carrier is, precisely: a connection dialed AFTER the withdrawal,
-//! through the complete admission gate, against the same
-//! `(dev, ino, owner_uid)` object — re-verified on every subsequent checkout and
-//! check-in — and reachable only by a request whose key matches, i.e. by
-//! another superseded-epoch request, or by a later publication that re-declares
-//! the identical tuple over the identical socket object. It is never a carrier
-//! from the incarnation that was withdrawn: rule 1 retires every lease that
-//! spans the withdrawal, and rule 3 covers every identity that had a pooled
-//! carrier when it was withdrawn.
 //!
 //! [`UnixBackendConnectionPool::force_drain_all`] retires everything but leaves
 //! the pool usable; [`UnixBackendConnectionPool::shutdown_drain`] additionally
@@ -213,6 +192,7 @@ mod imp {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+    use arc_swap::ArcSwapOption;
     use dashmap::DashMap;
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
@@ -291,15 +271,13 @@ mod imp {
     /// client-behavior segment to encode.
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
     pub struct UnixPoolKey {
-        namespace: String,
-        proxy_id: String,
-        upstream_id: Option<String>,
-        configured_path: String,
+        /// Config-reproducible identity, stored once so publication and
+        /// check-in liveness tests never allocate or rebuild it.
+        target: UnixTargetIdentity,
         path: PathBuf,
         dev: u64,
         ino: u64,
         owner_uid: u32,
-        protocol: UnixWireProtocol,
     }
 
     impl UnixPoolKey {
@@ -310,15 +288,17 @@ mod imp {
             protocol: UnixWireProtocol,
         ) -> Self {
             Self {
-                namespace: proxy.namespace.clone(),
-                proxy_id: proxy.id.clone(),
-                upstream_id: proxy.upstream_id.clone(),
-                configured_path: configured_path.to_string(),
+                target: UnixTargetIdentity {
+                    namespace: proxy.namespace.clone(),
+                    proxy_id: proxy.id.clone(),
+                    upstream_id: proxy.upstream_id.clone(),
+                    configured_path: configured_path.to_string(),
+                    protocol,
+                },
                 path: admitted.resolved_path().to_path_buf(),
                 dev: admitted.device_id(),
                 ino: admitted.inode(),
                 owner_uid: admitted.owner_uid(),
-                protocol,
             }
         }
 
@@ -329,14 +309,8 @@ mod imp {
         }
 
         /// The config-reproducible identity of this key.
-        fn target_identity(&self) -> UnixTargetIdentity {
-            UnixTargetIdentity {
-                namespace: self.namespace.clone(),
-                proxy_id: self.proxy_id.clone(),
-                upstream_id: self.upstream_id.clone(),
-                configured_path: self.configured_path.clone(),
-                protocol: self.protocol,
-            }
+        fn target_identity(&self) -> &UnixTargetIdentity {
+            &self.target
         }
     }
 
@@ -516,7 +490,7 @@ mod imp {
     ) -> u64 {
         let mut retired = 0u64;
         map.retain(|key, slot| {
-            if live.contains(&key.target_identity()) {
+            if live.contains(key.target_identity()) {
                 slot.withdrawn = false;
                 for entry in &slot.entries {
                     entry.generation().store(generation, Ordering::Release);
@@ -628,6 +602,18 @@ mod imp {
         /// was checked out; the check-in fence compares it twice, around the
         /// insert. See the module-level "withdrawal fence" section.
         publication_generation: AtomicU64,
+        /// Exact config-declared identities from the newest reconciled request
+        /// epoch. `None` exists only before the first publication, while the
+        /// serving state is still being constructed. Check-in reads this
+        /// lock-free and compares against the identity already owned by its key.
+        live_targets: ArcSwapOption<std::collections::HashSet<UnixTargetIdentity>>,
+        /// Highest request-epoch config generation reconciled into this pool.
+        ///
+        /// Config swaps are serialized, but their post-swap maintenance can
+        /// overlap. Keep the comparison and full retirement pass under this
+        /// off-hot-path lock so an older publisher that resumes late cannot
+        /// overwrite the live-set verdict of a newer published epoch.
+        last_config_reconcile_generation: std::sync::Mutex<u64>,
         /// Allocator for [`IdleH1::id`] / [`SharedH2c::id`].
         next_entry_id: AtomicU64,
         last_prune_unix_secs: AtomicU64,
@@ -667,6 +653,8 @@ mod imp {
                 path_identities: DashMap::with_shard_amount(shards),
                 shutting_down: AtomicBool::new(false),
                 publication_generation: AtomicU64::new(0),
+                live_targets: ArcSwapOption::empty(),
+                last_config_reconcile_generation: std::sync::Mutex::new(0),
                 next_entry_id: AtomicU64::new(0),
                 last_prune_unix_secs: AtomicU64::new(0),
                 hits: AtomicU64::new(0),
@@ -723,6 +711,21 @@ mod imp {
         fn record_withdrawal_fenced_checkin(&self) {
             self.withdrawal_fenced_checkins
                 .fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Whether the newest published request epoch still declares `key`.
+        ///
+        /// Before the first publication the pool is not reachable by serving
+        /// traffic, and focused pool tests intentionally exercise standalone
+        /// checkout/check-in, so an absent snapshot is treated as live. Every
+        /// production publication installs `Some`, including an empty set.
+        #[inline]
+        fn target_is_live(&self, key: &UnixPoolKey) -> bool {
+            let snapshot = self.live_targets.load();
+            match snapshot.as_ref() {
+                Some(live) => live.contains(key.target_identity()),
+                None => true,
+            }
         }
 
         /// Attribute `count` carriers the fence refused to reuse or retain.
@@ -827,12 +830,43 @@ mod imp {
         /// * either way the slot itself is retained here; the periodic sweep
         ///   reclaims empty live slots and tombstones whose socket object no
         ///   longer exists.
+        pub fn retain_live_targets_for_publication(
+            &self,
+            config_generation: u64,
+            live: &std::collections::HashSet<UnixTargetIdentity>,
+        ) {
+            let mut last_generation = self
+                .last_config_reconcile_generation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if config_generation <= *last_generation {
+                return;
+            }
+            self.retain_live_targets_inner(live);
+            *last_generation = config_generation;
+        }
+
+        /// Unordered retirement entry point retained for focused pool tests and
+        /// explicit drains that do not correspond to a request-epoch publish.
         pub fn retain_live_targets(&self, live: &std::collections::HashSet<UnixTargetIdentity>) {
+            self.retain_live_targets_inner(live);
+        }
+
+        fn retain_live_targets_inner(
+            &self,
+            live: &std::collections::HashSet<UnixTargetIdentity>,
+        ) {
             let generation = self.advance_publication_generation();
+            // Install the liveness verdict before walking existing slots. A
+            // stale-epoch dial that starts after the bump is therefore refused
+            // even if no slot existed for the retirement pass to tombstone.
+            // If a check-in races the tiny bump/store window, the slot walk
+            // that follows observes and removes its insertion.
+            self.live_targets.store(Some(Arc::new(live.clone())));
             let retired = retain_live_slots(&self.h1_idle, live, generation)
                 .saturating_add(retain_live_slots(&self.h2c_carriers, live, generation));
             self.h2c_creation_locks
-                .retain(|key, _| live.contains(&key.target_identity()));
+                .retain(|key, _| live.contains(key.target_identity()));
             // `path_identities` is the replacement memo, not a connection
             // holder. Keep it only for canonical paths that still have a pooled
             // carrier to protect. Forgetting a path with nothing pooled is
@@ -1252,6 +1286,11 @@ mod imp {
                 self.retire_socket_path(&path);
                 return;
             }
+            if !self.target_is_live(&key) {
+                drop(sender);
+                self.record_withdrawal_fenced_checkin();
+                return;
+            }
             between_fence_reads();
             let entry_id = self.next_entry_id.fetch_add(1, Ordering::Relaxed);
             let max_idle = self.max_idle_per_key();
@@ -1466,6 +1505,10 @@ mod imp {
             let entry_id = self.next_entry_id.fetch_add(1, Ordering::Relaxed);
             let mut refused_by_tombstone = false;
             before_publish();
+            if !self.target_is_live(&key) {
+                self.record_withdrawal_fenced_checkin();
+                return Ok(sender);
+            }
             {
                 let mut slot = self.h2c_carriers.entry(key.clone()).or_default();
                 if slot.withdrawn {
@@ -1673,6 +1716,13 @@ mod imp {
         pub fn force_drain_all(&self) {}
 
         pub fn shutdown_drain(&self) {}
+
+        pub fn retain_live_targets_for_publication(
+            &self,
+            _config_generation: u64,
+            _live: &std::collections::HashSet<UnixTargetIdentity>,
+        ) {
+        }
 
         pub fn retain_live_targets(&self, _live: &std::collections::HashSet<UnixTargetIdentity>) {}
 

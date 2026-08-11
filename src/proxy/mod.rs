@@ -6720,17 +6720,21 @@ impl ProxyState {
     /// carries no `ConfigDelta`, and each of those must retire the carriers the
     /// published config no longer declares.
     ///
-    /// `published` is the config the epoch swap actually made current, not the
-    /// local candidate: under a concurrent publication the swap can adopt a
-    /// different generation, and reconciling against the candidate would both
-    /// retire live carriers and retain withdrawn ones.
-    ///
+    /// `published` is the exact request epoch that just became current. The
+    /// epoch, not the local candidate, is authoritative: under a concurrent
+    /// publication the swap can adopt a different generation, and reconciling
+    /// against the candidate would both retire live carriers and retain
+    /// withdrawn ones. The pool serializes reconciliation by its monotonic
+    /// config generation, so
+    /// an older publisher that resumes late cannot overwrite this verdict.
     /// A rejected candidate and a swap that reported no change never become
     /// current, so neither reconciles nor advances the pool's publication
     /// generation.
-    fn reconcile_unix_backend_pool(&self, published: &GatewayConfig) {
-        self.unix_backend_pool
-            .retain_live_targets(&collect_live_unix_target_identities(published));
+    fn reconcile_unix_backend_pool(&self, published: &RequestEpoch) {
+        self.unix_backend_pool.retain_live_targets_for_publication(
+            published.config_generation,
+            &collect_live_unix_target_identities(&published.config),
+        );
     }
 
     /// Terminal drain of transport pools that own kernel objects the graceful
@@ -10362,7 +10366,7 @@ impl ProxyState {
             // Initial full build: nothing should be pooled yet, but this epoch
             // is now current, so it owns the generation advance like any other
             // publication (issue #3764).
-            self.reconcile_unix_backend_pool(&published.config);
+            self.reconcile_unix_backend_pool(&published);
 
             // DNS warmup for all hostnames in the new config
             let mut hostnames: Vec<(String, Option<String>, Option<u64>)> = new_config
@@ -10621,7 +10625,7 @@ impl ProxyState {
         // checked out for an in-flight exchange is deliberately absent from the
         // idle map, and its check-in is fenced against the generation it was
         // leased under (issue #3764).
-        self.reconcile_unix_backend_pool(&published.config);
+        self.reconcile_unix_backend_pool(&published);
 
         // Wake external config watchers (Gateway API listener lifecycle) on the
         // incremental path too — an add/update/delete of a port-scoped route
@@ -11169,7 +11173,7 @@ impl ProxyState {
         // behind just because it never travelled through `update_config`
         // (issue #3764). Before the no-delta early return below, for the same
         // reason as on the full path.
-        self.reconcile_unix_backend_pool(&published.config);
+        self.reconcile_unix_backend_pool(&published);
 
         // Wake socket reconciliation here as well as in the full-snapshot path;
         // otherwise a newly added/removed listener waits for the slow

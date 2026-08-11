@@ -1347,8 +1347,8 @@ async fn a_publication_that_keeps_an_identity_preserves_its_idle_carrier() {
 
 /// A request routed by a SUPERSEDED request epoch can still dial a withdrawn
 /// target, and its lease is bound to the CURRENT generation — so neither half
-/// of the generation fence sees anything wrong with it. The withdrawal
-/// tombstone is what refuses it.
+/// of the generation fence sees anything wrong with it. The published live-set
+/// snapshot and withdrawal tombstone are what refuse it.
 #[tokio::test]
 async fn a_checkin_for_a_withdrawn_identity_is_refused_after_the_withdrawal() {
     let temp = tempfile::TempDir::new().expect("temp dir");
@@ -1389,7 +1389,7 @@ async fn a_checkin_for_a_withdrawn_identity_is_refused_after_the_withdrawal() {
     assert_eq!(
         late.generation(),
         pool.publication_generation(),
-        "this lease is NOT fenced by generation — the tombstone is the only guard"
+        "this lease is NOT fenced by generation — config liveness is the guard"
     );
     pool.checkin_h1(late);
 
@@ -1402,19 +1402,23 @@ async fn a_checkin_for_a_withdrawn_identity_is_refused_after_the_withdrawal() {
     expect_accepts(&peer, 2, "two dials, neither of them pooled").await;
 }
 
-/// The h2c half of the same tombstone rule: a shared carrier established for a
-/// withdrawn identity serves the RPC it was dialed for and nothing after it.
+/// A withdrawal with no carrier and therefore no per-key slot still has to be
+/// authoritative. A late request pinned to the superseded request epoch may
+/// finish on its freshly admitted connection, but that connection must not
+/// become reusable under an identity absent from the current config.
 #[tokio::test]
-async fn an_h2c_carrier_dialed_for_a_withdrawn_identity_is_not_published() {
+async fn a_withdrawal_without_an_existing_slot_still_refuses_a_late_checkin() {
     let temp = tempfile::TempDir::new().expect("temp dir");
     let root = root_dir(&temp);
     let socket = root.join("app.sock");
-    let _peer = SettingsThenClosePeer::bind(&socket, std::time::Duration::from_secs(30));
+    let _peer = HoldingPeer::bind(&socket);
     let pool = default_pool();
-    let proxy = test_proxy("unix-pool-h2c-tombstone");
+    let proxy = test_proxy("unix-pool-slotless-withdrawal");
 
-    let sender = pool
-        .checkout_h2c(
+    // No checkout has occurred, so neither pool map has a key to tombstone.
+    pool.retain_live_targets(&std::collections::HashSet::new());
+    let late = pool
+        .checkout_h1(
             &proxy,
             socket.to_str().expect("utf-8"),
             proxy.backend_connect_timeout_ms,
@@ -1422,10 +1426,65 @@ async fn an_h2c_carrier_dialed_for_a_withdrawn_identity_is_not_published() {
             &[],
         )
         .await
-        .expect("h2c checkout");
-    drop(sender);
-    assert_eq!(pool.stats().active_h2c_connections, 1);
+        .expect("a superseded-epoch request may finish its admitted dial");
+    pool.checkin_h1(late);
 
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "the published live-set snapshot must refuse the late carrier even \
+         though the withdrawal had no slot to tombstone"
+    );
+    assert!(pool.stats().withdrawal_fenced_checkins >= 1);
+}
+
+/// Post-swap pool maintenance may overlap even though config swaps themselves
+/// are serialized. Once generation 2 has withdrawn the target, generation 1
+/// resuming late must not restore generation 1's older live-set verdict.
+#[tokio::test]
+async fn an_older_config_reconcile_cannot_overwrite_a_newer_live_set() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-ordered-publication");
+
+    pool.retain_live_targets_for_publication(2, &std::collections::HashSet::new());
+    pool.retain_live_targets_for_publication(1, &live_http1_set(&proxy, &socket));
+
+    let late = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("a stale request may finish its admitted dial");
+    pool.checkin_h1(late);
+
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "the older reconcile must be ignored after a newer withdrawal"
+    );
+}
+
+/// The h2c half of the slotless-withdrawal rule: even when no key existed for
+/// the retirement pass to tombstone, a shared carrier established for a
+/// withdrawn identity serves the RPC it was dialed for and nothing after it.
+#[tokio::test]
+async fn an_h2c_carrier_dialed_after_a_slotless_withdrawal_is_not_published() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = SettingsThenClosePeer::bind(&socket, std::time::Duration::from_secs(30));
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-h2c-tombstone");
+
+    // No checkout has occurred, so there is no h2c key to tombstone.
     pool.retain_live_targets(&std::collections::HashSet::new());
     assert_eq!(pool.stats().active_h2c_connections, 0);
 
