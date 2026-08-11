@@ -97,7 +97,6 @@ issue body alone.
 | Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Repository-owned lifecycle inventory; closes #3335 |
 | Admin CRUD refactor (retired plan remainder) | #2110 (historical) | Discretionary; fold into future admin-surface work |
 | Mesh/SPIRE CA-health signal + startup contract | #3608 | Documented SPIRE contract vs runtime wiring |
-| CNI chained-install live lifecycle evidence | #3609 | Ownership-scoped install, readiness rollback, `helm uninstall` cleanup hook and honest dependency docs shipped; no live full-chart `helm install`/`helm uninstall` gate, and a node-agent that fails *after* it was once ready is not auto-rolled back |
 | Cross-region CP failover topology | #3610 | `multi_region_ha.md` vs CP rejection/failover fence |
 | CP/K8s authoritative mesh config revision | #3611 | DP stale-fallback gate inert in flagship K8s topology |
 | Gateway API port-aware route representation | #3612 | Done — per-listener identity, real listener binding, per-listener retention |
@@ -121,4 +120,5 @@ policy (#3547, closing #3228 / #3240–#3242); `ai_stream_router` `google_gemini
 adapter (#3299); pre-first-byte stream-router fallback (#3328 — explicit admission
 rejection); native-gRPC transcript capture (#3304); native SMTP/email notification
 channel (#3329); MongoDB replica-set change-stream wakeups (#3330); multicluster
-poller partition / last-good live gate (#3331).
+poller partition / last-good live gate (#3331); CNI chained-install lifecycle
+evidence including live kind install/uninstall recovery (#3609).

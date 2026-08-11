@@ -1,0 +1,85 @@
+name: CNI Install Lifecycle Live
+
+# Live hosted proof for issue #3609. Logic lives in
+# tests/k8s/cni_lifecycle_live/run.sh so this workflow stays a thin launcher
+# (checkout → build → package → kind tools → harness), matching the other
+# live datapath suites and staying inside the trusted Cross-build policy.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/cni-lifecycle-live.yml"
+      - ".github/actions/package-ferrum-runtime-image/**"
+      - ".github/actions/setup-kubernetes-tools/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "proto/**"
+      - "src/bin/ferrum-cni.rs"
+      - "src/cni/**"
+      - "charts/ferrum-mesh/templates/cni-uninstall-hook.yaml"
+      - "charts/ferrum-mesh/templates/cni-cleanup-rbac.yaml"
+      - "charts/ferrum-mesh/templates/node-agent-daemonset.yaml"
+      - "charts/ferrum-mesh/templates/node-agent-rbac.yaml"
+      - "charts/ferrum-mesh/values.yaml"
+      - "tests/k8s/cni_lifecycle_live/**"
+      - "docs/node_agent.md"
+      - "docs/node_agent_security.md"
+      - "PRODUCTION_READINESS.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cni-lifecycle-live-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FERRUM_IMAGE_REPOSITORY: ferrum-edge
+  FERRUM_IMAGE_TAG: cni-lifecycle-live
+  KIND_CLUSTER: ferrum-cni-lifecycle
+
+jobs:
+  cni-lifecycle-live:
+    name: CNI install lifecycle live recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Ferrum Edge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          shared-key: "ci-cni-lifecycle-live"
+
+      - name: Build runtime binaries
+        run: cargo build --profile pr-build --bin ferrum-edge --bin ferrum-cni
+
+      - name: Package runtime image with ferrum-cni
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: target/pr-build/ferrum-edge
+          cni-binary-path: target/pr-build/ferrum-cni
+          image: ${{ env.FERRUM_IMAGE_REPOSITORY }}:${{ env.FERRUM_IMAGE_TAG }}
+
+      - name: Install Kubernetes tools
+        uses: ./.github/actions/setup-kubernetes-tools
+
+      - name: Run CNI lifecycle live suite
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/cni-lifecycle-live
+          FERRUM_IMAGE_REPOSITORY: ${{ env.FERRUM_IMAGE_REPOSITORY }}
+          FERRUM_IMAGE_TAG: ${{ env.FERRUM_IMAGE_TAG }}
+          KIND_CLUSTER: ${{ env.KIND_CLUSTER }}
+        run: tests/k8s/cni_lifecycle_live/run.sh
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cni-lifecycle-live-diagnostics
+          path: ${{ runner.temp }}/cni-lifecycle-live
+          if-no-files-found: ignore
+          retention-days: 14

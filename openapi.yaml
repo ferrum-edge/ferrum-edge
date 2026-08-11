@@ -193,7 +193,8 @@ paths:
         `cached_config` proxy/consumer counts,
         `database_polling` degradation, `config_rejected`, mesh state,
         `logging`, `kafka_logging`, and `ai_transcript_audit` admitted capture
-        ceilings, and fixed-cardinality `jwks_trust` aggregates — are
+        ceilings, fixed-cardinality `jwks_trust` aggregates, and the DP
+        `dp_config` staleness diagnostic — are
         returned only when the caller presents a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originates from
         `FERRUM_METRICS_ALLOWED_CIDRS`.
@@ -224,6 +225,16 @@ paths:
         traffic and admin listener failures use the
         same sticky state; authenticated responses include a sanitized
         `listener_failures` snapshot.
+
+        In **data-plane mode**, readiness is additionally bounded by the age of
+        the last validated and successfully applied CP snapshot (issue #3726).
+        Once that age reaches `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` while no
+        control plane is authoritative, `/health` returns `503` with
+        `status: "unavailable"`, `ready: false`, and — for authenticated callers
+        — a fixed-cardinality `dp_config` diagnostic. The configured maximum is
+        the boundary itself; no grace period is added to it. Readiness is
+        restored only by a snapshot that passes validation and applies, never by
+        a reconnect alone.
       tags: [Health]
       security: []
       responses:
@@ -11670,9 +11681,9 @@ components:
         remaining detailed fields (`timestamp`, `mode`, `database`,
         `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
         `config_rejected`, `mesh`, `listener_failures`, `logging`,
-        `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`)
-        are present only when the caller is authenticated (admin JWT, metrics
-        bearer token, or allowlisted CIDR).
+        `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`,
+        `dp_config`) are present only when the caller is authenticated (admin
+        JWT, metrics bearer token, or allowlisted CIDR).
       required: [status, ready]
       properties:
         status:
@@ -11959,6 +11970,136 @@ components:
               sink_healthy: true
         jwks_trust:
           $ref: "#/components/schemas/JwksTrustHealthSnapshot"
+        dp_config:
+          $ref: "#/components/schemas/DpConfigFreshnessSnapshot"
+
+    DpConfigFreshnessSnapshot:
+      type: object
+      description: |
+        Data-plane mode only, authenticated detail. Bounded age of the DP's last
+        **validated and successfully applied** control-plane configuration
+        snapshot (issue #3726). Every field is fixed-cardinality — booleans,
+        seconds, counters, and closed-set labels — and never carries a CP URL,
+        credential, namespace, node id, or configuration content.
+
+        The age is measured on a monotonic clock, so a wall-clock/NTP step can
+        neither extend nor shorten the window. Heartbeats, reconnect attempts,
+        CP transport success, fenced/rejected snapshots, rejected deltas, and
+        failed applies do not reset it; only an applied snapshot does. Once the
+        age reaches `max_stale_seconds` while no control plane is authoritative
+        (`cp_authority: lost`), `stale` latches, `/health` reports
+        `ready: false` with `status: "unavailable"`, and — under
+        `stale_action: fail_closed` — new HTTP/1.1, HTTP/2, HTTP/3, TCP,
+        UDP-session, and DTLS-session admissions are refused while
+        already-accepted work drains. The configured maximum is the boundary:
+        there is no additional grace period on top of it. Recovery requires an
+        applied snapshot, not merely a reconnect.
+      required:
+        [
+          stale,
+          reason,
+          stale_action,
+          new_traffic_blocked,
+          cp_connected,
+          cp_authority,
+          cp_disconnected_seconds,
+          max_stale_seconds,
+          applied_snapshot,
+          snapshot_age_seconds,
+          applied_total,
+          rejected_total,
+          apply_failed_total,
+          stale_transitions_total,
+        ]
+      properties:
+        stale:
+          type: boolean
+          description: >
+            Whether the applied configuration has aged past its bound while no
+            control plane is authoritative. Sticky until an applied snapshot
+            clears it.
+        reason:
+          type: string
+          enum:
+            [
+              ok,
+              awaiting_first_snapshot,
+              cp_disconnected,
+              snapshot_stale,
+              snapshot_rejected,
+              snapshot_apply_failed,
+            ]
+          description: >
+            Closed-set state label. `snapshot_rejected` is a payload refused
+            before apply (protocol shape, parse, validation, freshness fence,
+            trust side channel, or TLS staging); `snapshot_apply_failed` is one
+            that was admitted and then failed to apply. `cp_disconnected` means
+            no CP stream while the snapshot is still inside its bound.
+        stale_action:
+          type: string
+          enum: [fail_closed, readiness_only]
+          description: Configured `FERRUM_DP_CONFIG_STALE_ACTION`.
+        new_traffic_blocked:
+          type: boolean
+          description: >
+            Whether new HTTP/1.1, HTTP/2, HTTP/3, TCP, UDP-session, and
+            DTLS-session admissions are currently refused. Only ever true under
+            `fail_closed`. Established connections and sessions are unaffected
+            and drain normally.
+        cp_connected:
+          type: boolean
+          description: Whether a ConfigSync stream to some CP is established.
+        cp_authority:
+          type: string
+          enum: [connected, reconnecting, lost]
+          description: >
+            Closed-set control-plane authority state. `reconnecting` is an
+            intentional primary-retry/TLS-rotation reconnect or a healthy
+            session being re-established, and never latches the bound, so a
+            successful failover to an alternate CP does not blip traffic.
+            `lost` means a connect/subscribe attempt failed or a stream ended
+            without delivering usable authoritative config; it is the only
+            state in which the bound can latch, and it does so immediately once
+            the applied snapshot reaches `max_stale_seconds`.
+        cp_disconnected_seconds:
+          type: integer
+          format: uint64
+          description: >
+            How long every CP has been unreachable. `0` while connected.
+            Diagnostic only — the staleness boundary is the applied-snapshot
+            age, so repeated failed CP cycles cannot postpone it.
+        max_stale_seconds:
+          type: integer
+          format: uint64
+          description: >
+            Configured `FERRUM_DP_CONFIG_MAX_STALE_SECONDS`. `0` means the bound
+            is disabled and the DP serves last-known-good config indefinitely.
+        applied_snapshot:
+          type: boolean
+          description: Whether any snapshot has ever been validated and applied.
+        snapshot_age_seconds:
+          type: integer
+          format: uint64
+          description: >
+            Age of the last applied snapshot. With no applied snapshot this is
+            the age of the process, which is what the bound is measured against
+            on a DP that never reached a CP.
+        applied_total:
+          type: integer
+          format: uint64
+          description: Snapshots/deltas validated and applied since process start.
+        rejected_total:
+          type: integer
+          format: uint64
+          description: CP payloads refused before apply since process start.
+        apply_failed_total:
+          type: integer
+          format: uint64
+          description: CP snapshots that failed during apply since process start.
+        stale_transitions_total:
+          type: integer
+          format: uint64
+          description: Transitions into the stale state since process start.
 
     JwksTrustHealthSnapshot:
       type: object

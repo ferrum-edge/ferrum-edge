@@ -214,6 +214,15 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_database_delta_recoveries_total` | counter | `namespace` | `database_polling` | `documented_only` | `conditional` | Rejected database delta recovery events after an accepted incremental apply or full reload. |
 | `ferrum_database_delta_rejections_total` | counter | `resource_category`, `namespace` | `database_polling` | `documented_only` | `conditional` | Database incremental deltas rejected by validation, bucketed by bounded resource category. |
 | `ferrum_database_poll_last_completed_timestamp_seconds` | gauge | `namespace` | `database_polling` | `documented_only` | `conditional` | Unix timestamp of the most recently completed database/CP config poll attempt (including empty success). |
+| `ferrum_dp_config_cp_connected` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP currently has a ConfigSync stream to some control plane (1) or none (0). |
+| `ferrum_dp_config_max_stale_seconds` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Configured maximum applied-snapshot age before the DP degrades readiness (0 = bound disabled). |
+| `ferrum_dp_config_new_traffic_blocked` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP is refusing new HTTP/TCP/UDP-session/DTLS-session admissions because its configuration is stale (1) or not (0). |
+| `ferrum_dp_config_snapshot_age_seconds` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Age of the DP's last validated and successfully applied CP configuration snapshot, on a monotonic clock. |
+| `ferrum_dp_config_snapshot_apply_failures_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | CP snapshots that were admitted and then failed to apply since process start. |
+| `ferrum_dp_config_snapshots_applied_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | CP snapshots/deltas validated and successfully applied since process start. |
+| `ferrum_dp_config_snapshots_rejected_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | CP payloads refused before apply since process start. |
+| `ferrum_dp_config_stale` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP's applied configuration is past its bound with no authoritative CP (1) or not (0). |
+| `ferrum_dp_config_stale_transitions_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | Transitions into the stale state since process start. |
 | `ferrum_edge_overhead_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Gateway overhead (excluding backend and plugins) in milliseconds. |
 | `ferrum_grpc_config_stream_terminations_total` | counter | `surface`, `reason`, `gateway_namespace` | `grpc_config` | `documented_only` | `always` | Authenticated configuration streams ended by fixed surface and reason. |
 | `ferrum_jwks_consecutive_failures` | gauge | `class` | `jwks` | `documented_only` | `always` | Maximum current consecutive failures among active remote stores by fixed failure class. |
@@ -372,8 +381,11 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_websocket_frames_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket frames relayed by direction. |
 | `ferrum_websocket_session_duration_ms` | histogram | `proxy_id`, `result`, `direction`, `io_side`, `error_class`, `termination_reason`, `le`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket session duration in milliseconds. |
 | `ferrum_websocket_sessions_total` | counter | `proxy_id`, `result`, `direction`, `io_side`, `error_class`, `termination_reason`, `namespace` | `websocket` | `documented_only` | `conditional` | Completed WebSocket sessions by bounded terminal classification. |
+| `ferrum_xds_active_node_ids` | gauge | `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Distinct node state keys with at least one active ADS stream. |
+| `ferrum_xds_active_streams` | gauge | `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Currently active ADS streams (SotW plus Delta) admitted by the control plane. |
 | `ferrum_xds_first_slice_nacks_total` | counter | `namespace`, `type_url`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | NACKs of a required mesh-slice type while the data plane is still waiting for its first slice. |
-| `ferrum_xds_streams_rejected_total` | counter | `gateway_namespace` | `mesh` | `documented_only` | `conditional` | ADS streams rejected for exceeding the per-node concurrent-stream ceiling. |
+| `ferrum_xds_stream_admission_rejections_total` | counter | `reason`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | ADS streams rejected at admission, by bounded reason. |
+| `ferrum_xds_streams_rejected_total` | counter | `gateway_namespace` | `mesh` | `documented_only` | `conditional` | ADS streams rejected at admission by any scope (total, namespace, principal, node, node cardinality, invalid Node.id, or initial-request deadline). |
 | `ferrum_xds_warming_partial_applies_total` | counter | `namespace`, `gateway_namespace` | `mesh` | `documented_only` | `conditional` | Mesh slices applied while marked as xDS required-version skewed. Normal coherent xDS apply should not increment this. |
 
 ## Bundled observability surfaces

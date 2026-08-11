@@ -830,7 +830,9 @@ pub async fn start_dp_client_with_stream_timings(
                     backoff.current_cp_index + 1,
                     cp_count,
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                // Intentional: the DP is deliberately dropping a healthy
+                // fallback stream to retry the primary. Not authority loss.
+                update_state_disconnected(&connection_state, cp_url, is_primary, true);
                 backoff.current_cp_index = 0;
                 ConfigSyncAttemptOutcome::IntentionalDisconnect
             }
@@ -842,7 +844,8 @@ pub async fn start_dp_client_with_stream_timings(
                         .map(|reload| reload.label)
                         .unwrap_or("DP")
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                // Intentional: rotated TLS material, immediate reconnect.
+                update_state_disconnected(&connection_state, cp_url, is_primary, true);
                 ConfigSyncAttemptOutcome::IntentionalDisconnect
             }
             Ok(DpStreamEnd::Clean { received_config }) => {
@@ -852,7 +855,9 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_count,
                     cp_url
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                // A stream that delivered config was authoritative until it
+                // closed; a stream that never did is authority loss.
+                update_state_disconnected(&connection_state, cp_url, is_primary, received_config);
                 if received_config {
                     if is_fallback {
                         info!("Stream ended on fallback CP; will retry primary CP first");
@@ -876,7 +881,7 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_count,
                     cp_url
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 ConfigSyncAttemptOutcome::StaleSnapshotFenced
             }
             Ok(DpStreamEnd::InvalidDeltaFreshness) => {
@@ -894,7 +899,7 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_count,
                     cp_url
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 ConfigSyncAttemptOutcome::InvalidDeltaFreshness
             }
             Ok(DpStreamEnd::InvalidSubscriptionBase) => {
@@ -908,7 +913,7 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_count,
                     cp_url
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 ConfigSyncAttemptOutcome::InvalidSubscriptionBase
             }
             Ok(DpStreamEnd::ResyncAfterAcceptedConfig) => {
@@ -923,11 +928,17 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_count,
                     cp_url
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                // The source just supplied a payload that could not become
+                // authoritative. Treat that refusal as authority loss even
+                // though an earlier base on this stream was valid; otherwise a
+                // CP that repeatedly sends unusable resync payloads can keep an
+                // arbitrarily old last-known-good snapshot in `Reconnecting`
+                // forever and prevent the configured age bound from latching.
+                update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 ConfigSyncAttemptOutcome::ResyncAfterAcceptedConfig
             }
             Ok(DpStreamEnd::TransportFailure { received_config }) => {
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                update_state_disconnected(&connection_state, cp_url, is_primary, received_config);
                 if received_config && is_fallback {
                     info!(
                         "Transport failure on fallback CP after accepted config; will retry primary CP first"
@@ -944,7 +955,9 @@ pub async fn start_dp_client_with_stream_timings(
                     cp_url,
                     e
                 );
-                update_state_disconnected(&connection_state, cp_url, is_primary);
+                // A failed connect/subscribe attempt is the authority-loss
+                // signal the bound latches on.
+                update_state_disconnected(&connection_state, cp_url, is_primary, false);
                 // Pre-stream connect/subscribe failures never delivered config.
                 ConfigSyncAttemptOutcome::ConnectionError
             }
@@ -1110,11 +1123,29 @@ async fn wait_optional_tls_reload(mut revision_rx: Option<watch::Receiver<u64>>)
 }
 
 /// Helper: mark connection state as disconnected with the last attempted CP target.
+///
+/// `authority_retained` classifies the stream end for the bounded-config-age
+/// safety boundary (issue #3726). It is `true` only when this disconnect is not
+/// itself evidence that the DP lost its authoritative configuration source: an
+/// intentional primary-retry or TLS-rotation reconnect, or a session that had
+/// already delivered config and is being re-established. Such a disconnect
+/// leaves the DP `Reconnecting`, so a successful handoff to a fallback or
+/// alternate CP never blips traffic. Everything else — a failed attempt, a
+/// stream that never delivered usable authoritative config, a fenced snapshot,
+/// a refused delta — is a real loss of authority, and the bound may latch on it
+/// the moment the applied snapshot reaches its configured maximum age. There is
+/// deliberately no grace period on top of that maximum.
 fn update_state_disconnected(
     connection_state: &Option<Arc<ArcSwap<DpCpConnectionState>>>,
     cp_url: &str,
     is_primary: bool,
+    authority_retained: bool,
 ) {
+    if authority_retained {
+        crate::dp_config_freshness::record_cp_reconnecting();
+    } else {
+        crate::dp_config_freshness::record_cp_authority_lost();
+    }
     if let Some(cs) = connection_state {
         let prev = cs.load();
         cs.store(Arc::new(DpCpConnectionState {
@@ -1132,6 +1163,11 @@ fn update_state_disconnected(
 
 /// Helper: update last_config_received_at timestamp on successful config application.
 fn update_state_config_received(connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>) {
+    // The single freshness-resetting event (issue #3726): a snapshot or delta
+    // that passed every validation/authority check AND applied. Called on the
+    // accepted paths only, so heartbeats, reconnects, fenced snapshots, and
+    // failed applies leave the bound accruing.
+    crate::dp_config_freshness::record_snapshot_applied();
     if let Some(cs) = connection_state {
         let prev = cs.load();
         cs.store(Arc::new(DpCpConnectionState {
@@ -1152,6 +1188,11 @@ fn update_state_config_diverged(
     connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
     metrics: &ConfigSyncDivergenceMetrics,
 ) {
+    // Divergence accounting is independent of the #3726 freshness outcome
+    // counters: this helper is reached from both refused-before-apply and
+    // admitted-then-failed-apply paths, and only the call site knows which. Each
+    // of those sites records its own freshness outcome exactly once, so nothing
+    // is recorded here.
     metrics.record_rejection();
     crate::plugins::prometheus_metrics::global_registry()
         .invalidate_configsync_divergence_metrics_cache();
@@ -1178,6 +1219,8 @@ fn update_state_config_diverged(
 /// delta-rejection divergence.
 fn record_fenced_full_snapshot(metrics: &ConfigSyncDivergenceMetrics) {
     metrics.record_fenced_snapshot();
+    // Refused before apply — freshness is unchanged (issue #3726).
+    crate::dp_config_freshness::record_snapshot_rejected();
     crate::plugins::prometheus_metrics::global_registry()
         .invalidate_configsync_divergence_metrics_cache();
 }
@@ -1777,6 +1820,11 @@ async fn connect_and_subscribe_with_startup_ready_inner(
         let prev = cs.load();
         cs.store(Arc::new(prev.reconnected(cp_url, is_primary, Utc::now())));
     }
+    // An authoritative source is reachable again, so the stale-config bound
+    // stops accruing (issue #3726). Reachability is NOT freshness: this never
+    // resets the applied-snapshot age and never clears an already-raised stale
+    // state — only an applied snapshot does that.
+    crate::dp_config_freshness::record_cp_connected();
 
     loop {
         let silence_remaining = timings
@@ -1853,7 +1901,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     "Refusing ConfigSync heartbeat before an accepted, negotiated \
                      FULL_SNAPSHOT base; terminating stream"
                 );
-                return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                return Ok(refuse_unusable_snapshot(subscription.base_applied));
             }
             debug!(
                 version = %update.version,
@@ -1870,7 +1918,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 update_type = update.update_type,
                 cp_url, "Refusing heartbeat capability confirmation outside a FULL_SNAPSHOT"
             );
-            return Ok(react_to_unusable_snapshot(subscription.base_applied));
+            return Ok(refuse_unusable_snapshot(subscription.base_applied));
         }
         if update.heartbeat_negotiated && !heartbeats_negotiated {
             heartbeats_negotiated = true;
@@ -1898,7 +1946,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     Ok(config) => config,
                     Err(e) => {
                         error!("Failed to parse full config update: {}", e);
-                        return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                        return Ok(refuse_unusable_snapshot(subscription.base_applied));
                     }
                 };
                 let gateway_trust_bundle_update =
@@ -1907,7 +1955,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         Err(msg) => {
                             error!("CP config rejected — {}", msg);
                             error!("Ignoring config update with invalid gateway trust bundles");
-                            return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                            return Ok(refuse_unusable_snapshot(subscription.base_applied));
                         }
                     };
                 // Gateway trust material is delivered via the ConfigUpdate
@@ -1944,56 +1992,56 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with invalid field values");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_hosts() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with invalid hosts");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_regex_listen_paths() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with invalid regex listen_paths");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_listen_path_encodings() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with encoded-slash listen_paths");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_unique_listen_paths() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with conflicting listen paths");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_stream_proxies() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with invalid stream proxy config");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_upstream_references() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with invalid upstream references");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) = config.validate_plugin_references() {
                     for msg in &errors {
                         error!("CP config rejected — {}", msg);
                     }
                     error!("Ignoring config update with invalid plugin references");
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 if let Err(errors) =
                     crate::proxy::validate_mesh_route_dispatch_upstream_references(&config)
@@ -2004,7 +2052,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     error!(
                         "Ignoring config update with invalid mesh_route_dispatch upstream references"
                     );
-                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    return Ok(refuse_unusable_snapshot(subscription.base_applied));
                 }
                 // Freshness describes the committed body: envelope version must
                 // agree with GatewayConfig.loaded_at. Fail closed otherwise —
@@ -2118,7 +2166,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     Err(error) => {
                         error!("CP config rejected — {}", error);
                         error!("Ignoring config update with unusable frontend TLS material");
-                        return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                        return Ok(refuse_unusable_snapshot(subscription.base_applied));
                     }
                 };
 
@@ -2203,6 +2251,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         info!("Full configuration snapshot accepted from CP");
                     }
                     ConfigApplyOutcome::Rejected { .. } => {
+                        // Distinct from a fenced/refused snapshot: this one was
+                        // admitted and failed to apply. Either way the applied
+                        // config — and therefore its age — is unchanged (#3726).
+                        crate::dp_config_freshness::record_snapshot_apply_failed();
                         error!(
                             "Full configuration snapshot rejected during apply; keeping previous config"
                         );
@@ -2223,6 +2275,9 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         "Refusing DELTA before a valid FULL_SNAPSHOT base on this \
                          subscription; terminating stream without applying"
                     );
+                    // Refused before apply (issue #3726): count it once as a
+                    // rejected payload; the applied-snapshot age is untouched.
+                    crate::dp_config_freshness::record_snapshot_rejected();
                     return Ok(DpStreamEnd::InvalidSubscriptionBase);
                 }
                 match serde_json::from_str::<IncrementalResult>(&update.config_json) {
@@ -2239,6 +2294,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                     let _ = delta_rejection_stream_disposition(
                                         DeltaRejectionKind::InvalidTrustSideChannel,
                                     );
+                                    crate::dp_config_freshness::record_snapshot_rejected();
                                     update_state_config_diverged(
                                         connection_state,
                                         divergence_metrics,
@@ -2297,6 +2353,13 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                         poll_timestamp = %poll_timestamp,
                                         "Refusing DELTA with inconsistent or unorderable freshness"
                                     );
+                                    // Freshness accounting is independent of
+                                    // divergence: an empty delta is refused
+                                    // before apply just like a non-empty one and
+                                    // must be counted exactly once (#3726),
+                                    // while divergence stays deliberately
+                                    // non-empty-only.
+                                    crate::dp_config_freshness::record_snapshot_rejected();
                                     if !was_empty {
                                         update_state_config_diverged(
                                             connection_state,
@@ -2317,6 +2380,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 "Refusing DELTA with an implausibly-future committed timestamp \
                                  before it can poison the freshness watermark"
                             );
+                            crate::dp_config_freshness::record_snapshot_rejected();
                             if !was_empty {
                                 update_state_config_diverged(connection_state, divergence_metrics);
                             }
@@ -2332,6 +2396,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 poll_timestamp = %poll_timestamp,
                                 "Refusing DELTA older than the applied authority watermark"
                             );
+                            crate::dp_config_freshness::record_snapshot_rejected();
                             if !was_empty {
                                 update_state_config_diverged(connection_state, divergence_metrics);
                             }
@@ -2440,6 +2505,10 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 // freshness authority or last_config_received_at.
                                 // Do not apply trust from a rejected resource batch.
                                 let _ = gateway_trust_bundle_update;
+                                // Admitted then failed to apply, empty body or
+                                // not: this is `snapshot_apply_failed`, never a
+                                // refused-before-apply rejection (#3726).
+                                crate::dp_config_freshness::record_snapshot_apply_failed();
                                 if was_empty {
                                     tracing::debug!(
                                         "Ignoring rejected empty delta from CP (no resource changes)"
@@ -2481,6 +2550,7 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         error!("Failed to parse delta update: {}", e);
                         let _ =
                             delta_rejection_stream_disposition(DeltaRejectionKind::ParseFailure);
+                        crate::dp_config_freshness::record_snapshot_rejected();
                         update_state_config_diverged(connection_state, divergence_metrics);
                         return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
                     }
@@ -2494,10 +2564,22 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                     "Refusing unknown ConfigSync update type; terminating stream so an \
                      unrecognized authoritative message cannot be skipped before later deltas"
                 );
-                return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                return Ok(refuse_unusable_snapshot(subscription.base_applied));
             }
         }
     }
+}
+
+/// [`react_to_unusable_snapshot`] for a CP payload refused **before** apply
+/// (protocol shape, parse, validation, trust side channel, or TLS staging).
+///
+/// Nothing new is serving, so the stale bound keeps accruing; only the reason
+/// label changes (issue #3726). The apply-failure path deliberately does NOT
+/// route through here — it reports `snapshot_apply_failed` so operators can
+/// tell an admitted-then-failed snapshot from one the DP never accepted.
+fn refuse_unusable_snapshot(subscription_base_applied: bool) -> DpStreamEnd {
+    crate::dp_config_freshness::record_snapshot_rejected();
+    react_to_unusable_snapshot(subscription_base_applied)
 }
 
 /// An unusable FULL_SNAPSHOT always terminates the subscription so later
