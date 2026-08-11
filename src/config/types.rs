@@ -483,6 +483,18 @@ pub struct SubsetTrafficPolicy {
     /// sibling subsets cannot consume one another's allowance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http1_max_pending_requests: Option<u32>,
+    /// Subset-scoped HTTP idle timeout (ms), mapped from DestinationRule
+    /// `subsets[].trafficPolicy.connectionPool.http.idleTimeout`. Overlaid onto
+    /// the selected proxy's inherited dispatch fallback and projected onto
+    /// `Proxy.pool_idle_timeout_seconds` like the top-level/per-port form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_idle_timeout_ms: Option<u64>,
+    /// Subset-scoped HTTP/2 concurrent-streams cap, mapped from DestinationRule
+    /// `subsets[].trafficPolicy.connectionPool.http.http2MaxRequests`. Overlaid
+    /// onto the selected proxy's inherited dispatch fallback and projected onto
+    /// `Proxy.pool_http2_max_concurrent_streams` like the top-level/per-port form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_max_concurrent_streams: Option<u32>,
     /// Per-subset passive health (Istio `subsets[].trafficPolicy.outlierDetection`),
     /// already resolved from the Istio outlier shape. The ejection *thresholds*
     /// (consecutive errors, interval, base-ejection time, min-health) are
@@ -645,9 +657,9 @@ pub struct UpstreamPortOverride {
     /// On the reqwest pool this value is part of the client-behavior (`rcfg`)
     /// pool-key segment, so divergent per-port idle timeouts isolate distinct
     /// shared clients rather than first-creator-wins leaking. Direct-H2 / gRPC
-    /// pool keys still exclude several builder-only knobs (see those pools'
-    /// first-materializer notes). Request-only connect timeouts remain
-    /// per-request and do not fragment any pool.
+    /// pool keys carry the selected subset and the effective H2 stream cap;
+    /// request-only connect timeouts remain per-request and do not fragment
+    /// any pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_idle_timeout_ms: Option<u64>,
     /// Per-port HTTP/2 concurrent-streams cap mapped from DestinationRule
@@ -656,8 +668,11 @@ pub struct UpstreamPortOverride {
     /// into the H2/gRPC backend builders via
     /// `http2::Builder::max_concurrent_streams` (peer SETTINGS) and
     /// `initial_max_send_streams` (local outbound-stream initial cap).
-    /// Applies to direct-H2 and gRPC pool entries; reqwest's H2 path does
-    /// not expose the same builder knob today.
+    /// Applies to direct-H2 and gRPC pool entries; those pools include the
+    /// effective value in their base keys (`none` when unset) so update/delete
+    /// cannot reuse a connection built under a prior limit. Reqwest's H2 path
+    /// does not expose the same builder knob today and therefore does not
+    /// key on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub h2_max_concurrent_streams: Option<u32>,
     /// Per-port backend TLS posture, mapped from DestinationRule
@@ -873,6 +888,12 @@ impl ResolvedPortOverride {
         if let Some(pending) = subset.http1_max_pending_requests {
             self.http1_max_pending_requests = Some(pending);
         }
+        if let Some(idle_ms) = subset.http_idle_timeout_ms {
+            self.http_idle_timeout_ms = Some(idle_ms);
+        }
+        if let Some(max_streams) = subset.h2_max_concurrent_streams {
+            self.h2_max_concurrent_streams = Some(max_streams);
+        }
     }
 }
 
@@ -928,7 +949,9 @@ pub(crate) fn dispatch_port_override_fallback_for_selected_subset(
     if let Some(subset_policy) = subset_policy
         && (subset_policy.h2_upgrade_policy.is_some()
             || subset_policy.max_retries.is_some()
-            || subset_policy.http1_max_pending_requests.is_some())
+            || subset_policy.http1_max_pending_requests.is_some()
+            || subset_policy.http_idle_timeout_ms.is_some()
+            || subset_policy.h2_max_concurrent_streams.is_some())
     {
         inherited
             .get_or_insert_with(ResolvedPortOverride::default)
@@ -989,6 +1012,10 @@ pub struct ResolvedSubsetTrafficPolicy {
     pub max_retries: Option<u32>,
     /// Subset-scoped concurrent in-flight HTTP/1.1 cap.
     pub http1_max_pending_requests: Option<u32>,
+    /// Subset-scoped HTTP idle timeout (milliseconds).
+    pub http_idle_timeout_ms: Option<u64>,
+    /// Subset-scoped HTTP/2 concurrent-streams cap.
+    pub h2_max_concurrent_streams: Option<u32>,
 }
 
 impl ResolvedSubsetTrafficPolicy {
@@ -1000,6 +1027,8 @@ impl ResolvedSubsetTrafficPolicy {
         h2_upgrade_policy: Option<H2UpgradePolicy>,
         max_retries: Option<u32>,
         http1_max_pending_requests: Option<u32>,
+        http_idle_timeout_ms: Option<u64>,
+        h2_max_concurrent_streams: Option<u32>,
     ) -> Option<Self> {
         let resolved = Self {
             tls,
@@ -1007,6 +1036,8 @@ impl ResolvedSubsetTrafficPolicy {
             h2_upgrade_policy,
             max_retries,
             http1_max_pending_requests,
+            http_idle_timeout_ms,
+            h2_max_concurrent_streams,
         };
         (!resolved.is_empty()).then_some(resolved)
     }
@@ -1017,6 +1048,8 @@ impl ResolvedSubsetTrafficPolicy {
             && self.h2_upgrade_policy.is_none()
             && self.max_retries.is_none()
             && self.http1_max_pending_requests.is_none()
+            && self.http_idle_timeout_ms.is_none()
+            && self.h2_max_concurrent_streams.is_none()
     }
 }
 
@@ -1719,10 +1752,11 @@ pub struct Upstream {
     /// Inherited (non-`portLevelSettings`) DestinationRule
     /// `connectionPool.http` overlay.
     ///
-    /// This carries the top-level block for service-discovery upstreams and the
-    /// three subset-inheritable fields (`h2UpgradePolicy`, `maxRetries`, and
-    /// `http1MaxPendingRequests`) for every upstream. During proxy projection a
-    /// selected subset overlays those three fields onto this base. Dispatch
+    /// This carries the top-level `connectionPool.http` block for every
+    /// upstream (including the five subset-inheritable fields:
+    /// `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`,
+    /// `idleTimeout`, and `http2MaxRequests`). During proxy projection a
+    /// selected subset overlays those fields onto this base. Dispatch
     /// merges an explicit per-port entry first, then this inherited fallback,
     /// giving exact `port-level > subset-level > top-level` field precedence.
     /// Not serialized — derived from the matching DestinationRule.
@@ -2370,8 +2404,10 @@ pub struct Proxy {
     /// `GatewayConfig::resolve_dispatch_port_overrides()`.
     ///
     /// Service-discovery upstreams use this because target ports resolve at
-    /// runtime. All upstreams also use it for the subset-inheritable fields,
-    /// after the selected subset has overlaid the top-level values. The
+    /// runtime. All upstreams also use it for the subset-inheritable HTTP
+    /// fields (`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`,
+    /// `idleTimeout`, `http2MaxRequests`), after the selected subset has
+    /// overlaid the top-level values. The
     /// HTTP-family dispatch resolvers
     /// (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
     /// fall back to this overlay when the LB-selected target port has no
@@ -2592,8 +2628,8 @@ pub struct Proxy {
     /// H1/H2/H3 frontends.
     /// Per-proxy override; when `None`, uses the global
     /// `FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` (default: 300s / 5 min).
-    /// Set to `0` to disable for this proxy (idle sessions live forever, bounded
-    /// only by `FERRUM_WEBSOCKET_MAX_CONNECTIONS`).
+    /// Set to `0` to disable only the idle bound for this proxy; the global
+    /// absolute WebSocket lifetime still applies.
     ///
     /// HTTP/3 caveat: on QUIC frontends the transport-level connection idle
     /// timeout (`FERRUM_HTTP3_IDLE_TIMEOUT`, default 30s) can close an
@@ -2832,12 +2868,18 @@ pub struct GatewayConfig {
     /// source URI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontend_tls_source_namespace: Option<String>,
-    /// Gateway-managed frontend TLS material indexed by owning Gateway
-    /// namespace. Multi-namespace CPs keep all Gateway TLS entries here until
-    /// the per-DP namespace filter projects the matching entry into
-    /// `frontend_tls_*`.
+    /// Every Gateway-managed frontend TLS certificate, keyed by owning
+    /// **listener** identity (issues #3267 / #3268).
+    ///
+    /// This is deliberately NOT a per-namespace singleton: one listener may
+    /// carry several `certificateRefs`, and several Gateways in one namespace
+    /// may each own their own certificate. A multi-namespace CP keeps every
+    /// namespace's entries here; the per-DP namespace filter retains only the
+    /// subscribing namespace's entries and projects the deterministic default
+    /// one into `frontend_tls_*` (which stays the fallback certificate served
+    /// when a ClientHello carries no usable SNI).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub frontend_tls_namespace_sources: Vec<FrontendTlsNamespaceSource>,
+    pub frontend_tls_certificate_sources: Vec<FrontendTlsCertificateSource>,
     /// Gateway-consumable mesh trust material delivered by CPs to DPs.
     ///
     /// This mirrors the mesh config trust-bundle shape, but sits at the
@@ -2968,13 +3010,57 @@ impl K8sMeshOverlay {
     }
 }
 
+/// One Gateway-listener-owned frontend TLS certificate.
+///
+/// Identity is `(serving namespace, serialized owner, listener, cert_path)`.
+/// Gateway owners retain their resource name; ListenerSet owners are encoded
+/// as `ListenerSet:<resource namespace>:<resource name>`. Kubernetes Namespace
+/// and Object names cannot contain `:`, so this is injective and cannot
+/// collide with a Gateway resource name. The serving **Gateway** namespace is
+/// what CP/DP tenancy filters on — the Secret itself may live in another
+/// namespace when a ReferenceGrant authorizes it, so the `k8s://secret-ns/...`
+/// source URI must never be read as ownership.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct FrontendTlsNamespaceSource {
+pub struct FrontendTlsCertificateSource {
+    /// Owning Gateway namespace.
     pub namespace: String,
+    /// Serialized owning Gateway or ListenerSet identity.
+    #[serde(default)]
+    pub gateway: String,
+    /// Owning listener name.
+    #[serde(default)]
+    pub listener: String,
+    /// The listener `hostname`, ASCII-lowercased. `None` is a catch-all
+    /// listener, which contributes SNI names from the certificate itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub cert_path: String,
     pub key_path: String,
+    /// Whether this is the deterministic fallback certificate for its
+    /// namespace — the one served when a ClientHello carries no SNI, or an SNI
+    /// no certificate covers.
+    #[serde(default)]
+    pub default_certificate: bool,
 }
+
+impl FrontendTlsCertificateSource {
+    /// `serving-namespace/serialized-owner/listener` — public Kubernetes
+    /// metadata, safe to put in diagnostics. Never derived from certificate or
+    /// key material.
+    pub fn listener_identity(&self) -> String {
+        format!("{}/{}/{}", self.namespace, self.gateway, self.listener)
+    }
+}
+
+/// Upper bound on Gateway-delivered frontend TLS certificates per serving
+/// namespace in one snapshot.
+///
+/// The data plane materializes every entry into a resident rustls
+/// `CertifiedKey` and an SNI index, so the set has to be bounded by config
+/// admission rather than by cluster size. Translation drops the excess with a
+/// field-specific warning and leaves those listeners unserved (fail closed).
+pub const MAX_FRONTEND_TLS_CERTIFICATE_SOURCES: usize = 256;
 
 /// The current config schema version. Increment this when adding config migrations.
 pub const CURRENT_CONFIG_VERSION: &str = "1";
@@ -3539,6 +3625,74 @@ impl GatewayConfig {
         }
     }
 
+    /// Project Gateway-delivered frontend TLS onto one namespace's view.
+    ///
+    /// Called by BOTH the CP's per-subscriber filter and the DP's
+    /// defense-in-depth filter, so a data plane can never observe another
+    /// namespace's certificate no matter which side runs first. Retains every
+    /// certificate this namespace owns — a namespace may legitimately own many
+    /// (#3267 / #3268) — re-marks exactly one of them as the fallback, and
+    /// projects that one into the legacy `frontend_tls_*` fields.
+    ///
+    /// Ownership is the *Gateway's* namespace, never the Secret's: a
+    /// ReferenceGrant may authorize a Secret from elsewhere, so reading tenancy
+    /// off a `k8s://secret-ns/...` source URI would leak across namespaces.
+    ///
+    /// Returns how many entries this namespace was not entitled to see.
+    pub fn filter_frontend_tls_to_namespace(&mut self, namespace: &str) -> usize {
+        let before = self.frontend_tls_certificate_sources.len();
+        self.frontend_tls_certificate_sources
+            .retain(|source| source.namespace == namespace);
+        let mut removed = before - self.frontend_tls_certificate_sources.len();
+
+        // Exactly one fallback within the retained set. The CP's marker was
+        // chosen over every namespace, so re-deriving it here is what keeps a
+        // DP that filtered a multi-namespace snapshot from ending up with
+        // zero (or two) fallback certificates.
+        let default_index = self
+            .frontend_tls_certificate_sources
+            .iter()
+            .position(|source| source.default_certificate)
+            .or_else(|| {
+                self.frontend_tls_certificate_sources
+                    .iter()
+                    .position(|source| source.hostname.is_none())
+            })
+            .or(if self.frontend_tls_certificate_sources.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
+        for (index, source) in self.frontend_tls_certificate_sources.iter_mut().enumerate() {
+            source.default_certificate = Some(index) == default_index;
+        }
+
+        if let Some(default_source) = default_index
+            .and_then(|index| self.frontend_tls_certificate_sources.get(index))
+            .cloned()
+        {
+            self.frontend_tls_cert_path = Some(default_source.cert_path);
+            self.frontend_tls_key_path = Some(default_source.key_path);
+            self.frontend_tls_source_namespace = Some(default_source.namespace);
+            return removed;
+        }
+
+        // No Gateway certificate for this namespace. Material owned by another
+        // namespace is withdrawn; operator/env material (no owning namespace)
+        // is left alone.
+        if self
+            .frontend_tls_source_namespace
+            .as_deref()
+            .is_some_and(|source_namespace| source_namespace != namespace)
+        {
+            self.frontend_tls_cert_path = None;
+            self.frontend_tls_key_path = None;
+            self.frontend_tls_source_namespace = None;
+            removed += 1;
+        }
+        removed
+    }
+
     /// Normalize all proxy host entries to lowercase.
     pub fn normalize_hosts(&mut self) {
         for proxy in &mut self.proxies {
@@ -3549,10 +3703,87 @@ impl GatewayConfig {
     /// Normalize all resource fields that have canonical in-memory forms and
     /// refresh derived runtime projections skipped by serde.
     pub fn normalize_fields(&mut self) {
-        self.frontend_tls_namespace_sources
-            .sort_by(|left, right| left.namespace.cmp(&right.namespace));
-        self.frontend_tls_namespace_sources
-            .dedup_by(|left, right| left.namespace == right.namespace);
+        // Certificate sources are keyed by owning listener, NOT by namespace:
+        // one listener may serve several certificateRefs and one namespace may
+        // hold several independently owned Gateways (#3267 / #3268). Deduping
+        // by namespace here would silently collapse them back into a singleton.
+        // Stable sorting groups listeners deterministically while retaining
+        // certificateRefs order *within* each listener. Candidate order is the
+        // resolver's tie-break when several keys support the same signature
+        // schemes, so sorting by certificate path would silently rewrite it.
+        self.frontend_tls_certificate_sources
+            .sort_by(|left, right| {
+                (
+                    left.namespace.as_str(),
+                    left.gateway.as_str(),
+                    left.listener.as_str(),
+                )
+                    .cmp(&(
+                        right.namespace.as_str(),
+                        right.gateway.as_str(),
+                        right.listener.as_str(),
+                    ))
+            });
+        let mut seen_certificate_sources = HashSet::new();
+        self.frontend_tls_certificate_sources.retain(|source| {
+            // `hostname` is part of the exact serialized claim even though it
+            // is not part of listener identity. Omitting it here would erase a
+            // contradictory claim before the data-plane runtime can reject the
+            // snapshot through `validate_explicit_listener_claims()`.
+            seen_certificate_sources.insert((
+                source.namespace.clone(),
+                source.gateway.clone(),
+                source.listener.clone(),
+                source.hostname.clone(),
+                source.cert_path.clone(),
+                source.key_path.clone(),
+            ))
+        });
+
+        // Serialized/native snapshots are allowed to omit or duplicate fallback
+        // markers. Re-derive exactly one per namespace after deduplication, then
+        // project the lexicographically-first namespace's choice into the legacy
+        // single-certificate fields. This keeps the one-entry path and the SNI
+        // resolver on the same credential even for a hand-authored snapshot.
+        //
+        // Do NOT truncate an oversized set here. Normalization has no listener
+        // route-ownership map, so retaining only a certificate prefix could
+        // leave a dropped listener's routes reachable under an unrelated
+        // fallback certificate. Validation and the runtime resolver reject the
+        // whole oversized snapshot instead; Kubernetes translation applies the
+        // bound earlier, where it can withdraw the listener and its routes
+        // atomically.
+        if !self.frontend_tls_certificate_sources.is_empty() {
+            let mut default_indexes: BTreeMap<String, usize> = BTreeMap::new();
+            for preference in 0..3 {
+                for (index, source) in self.frontend_tls_certificate_sources.iter().enumerate() {
+                    let eligible = match preference {
+                        0 => source.default_certificate,
+                        1 => source.hostname.is_none(),
+                        _ => true,
+                    };
+                    if eligible {
+                        default_indexes
+                            .entry(source.namespace.clone())
+                            .or_insert(index);
+                    }
+                }
+            }
+            for (index, source) in self.frontend_tls_certificate_sources.iter_mut().enumerate() {
+                source.default_certificate =
+                    default_indexes.get(&source.namespace).copied() == Some(index);
+            }
+            if let Some(default_source) = default_indexes
+                .iter()
+                .next()
+                .and_then(|(_, index)| self.frontend_tls_certificate_sources.get(*index))
+                .cloned()
+            {
+                self.frontend_tls_cert_path = Some(default_source.cert_path);
+                self.frontend_tls_key_path = Some(default_source.key_path);
+                self.frontend_tls_source_namespace = Some(default_source.namespace);
+            }
+        }
         self.normalize_hosts();
         for consumer in &mut self.consumers {
             consumer.normalize_fields();
@@ -3690,10 +3921,10 @@ impl GatewayConfig {
             .filter(|(_, m)| !m.is_empty())
             .collect();
 
-        // Inherited top-level `connectionPool.http` fallback. The three fields
-        // supported at subset scope are overlaid per proxy via the shared
-        // selected-subset helper so admission and runtime stay aligned. The
-        // per-port map stays separate and is consulted first at dispatch,
+        // Inherited top-level `connectionPool.http` fallback. All five applied
+        // HTTP fields supported at subset scope are overlaid per proxy via the
+        // shared selected-subset helper so admission and runtime stay aligned.
+        // The per-port map stays separate and is consulted first at dispatch,
         // preserving port > subset > top-level.
         let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
             .upstreams
@@ -8500,9 +8731,9 @@ impl Upstream {
 
     /// Reject mesh-PROJECTED fields that an OPERATOR must not set directly.
     ///
-    /// `port_overrides`, `source_locality`, `source_labels`, `locality_lb_strict`,
-    /// `locality_lb_setting`, and the mesh-derived fields nested under
-    /// `subsets[].traffic_policy` are
+    /// Reserved `mesh.*` target tags, `port_overrides`, `source_locality`,
+    /// `source_labels`, `locality_lb_strict`, `locality_lb_setting`, and the
+    /// mesh-derived fields nested under `subsets[].traffic_policy` are
     /// all populated by the mesh slice-apply layer (from DestinationRules / the
     /// workload locality / labels / `FERRUM_MESH_LOCALITY_LB_STRICT`), NOT by operators.
     /// The top-level projected fields are not persisted by the SQL / MongoDB
@@ -8523,6 +8754,15 @@ impl Upstream {
     /// wrapper the file loader uses.
     pub fn validate_operator_provided_fields(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+
+        for (target_index, target) in self.targets.iter().enumerate() {
+            if target.tags.keys().any(|key| key.starts_with("mesh.")) {
+                errors.push(format!(
+                    "targets[{target_index}].tags contains a key in the reserved mesh.* namespace \
+                     and cannot be set directly via operator-provided config"
+                ));
+            }
+        }
 
         if !self.port_overrides.is_empty() {
             errors.push(
@@ -8600,6 +8840,14 @@ impl Upstream {
                     (
                         "http1_max_pending_requests",
                         policy.http1_max_pending_requests.is_some(),
+                    ),
+                    (
+                        "http_idle_timeout_ms",
+                        policy.http_idle_timeout_ms.is_some(),
+                    ),
+                    (
+                        "h2_max_concurrent_streams",
+                        policy.h2_max_concurrent_streams.is_some(),
                     ),
                 ] {
                     if configured {
@@ -9336,6 +9584,20 @@ impl GatewayConfig {
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
+        let mut frontend_tls_sources_by_namespace = std::collections::HashMap::new();
+        for source in &self.frontend_tls_certificate_sources {
+            let count = frontend_tls_sources_by_namespace
+                .entry(source.namespace.as_str())
+                .or_insert(0usize);
+            *count += 1;
+            if *count == MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1 {
+                errors.push(format!(
+                    "Gateway frontend TLS certificate source set for namespace '{}' exceeds the {} source admission limit; refusing the snapshot rather than serving a partial listener set",
+                    source.namespace, MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
+                ));
+            }
+        }
+
         // Shared cache: when multiple proxies reference the same TLS file path,
         // each file is opened and parsed only once during batch validation.
         let mut validated_tls_paths = std::collections::HashSet::new();
@@ -9413,8 +9675,8 @@ impl GatewayConfig {
 
     /// Reject mesh-PROJECTED upstream fields on operator-PROVIDED config loads.
     ///
-    /// `Upstream.{port_overrides, source_locality, source_labels,
-    /// locality_lb_strict, locality_lb_setting}` and mesh-only fields under
+    /// Reserved `mesh.*` target tags, `Upstream.{port_overrides, source_locality,
+    /// source_labels, locality_lb_strict, locality_lb_setting}`, and mesh-only fields under
     /// `Upstream.subsets[].traffic_policy` are owned by the mesh slice-apply layer
     /// (Destination rules / workload locality /
     /// `FERRUM_MESH_LOCALITY_LB_STRICT`); an operator must never set them directly.

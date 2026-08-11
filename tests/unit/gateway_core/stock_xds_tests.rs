@@ -735,6 +735,37 @@ fn stock_partial_rds_response_keeps_the_route_configs_it_did_not_mention() {
 }
 
 #[test]
+fn stock_refused_rds_replacement_drops_the_previously_accepted_route_config() {
+    let mut accumulator = converged_accumulator();
+    accumulator
+        .apply_sotw(
+            RDS_TYPE_URL,
+            &[any(
+                RDS_TYPE_URL,
+                &route_config("9080", &["10.96.0.5:9080"], REVIEWS_CLUSTER),
+            )],
+            "rds-2",
+        )
+        .expect("accepted RDS applies");
+    assert!(accumulator.route_configs().contains_key("9080"));
+
+    let mut refused = route_config("9080", &["10.96.0.5:9080"], REVIEWS_CLUSTER);
+    refused.vhds = vec![Vec::new()];
+    accumulator
+        .apply_sotw(RDS_TYPE_URL, &[any(RDS_TYPE_URL, &refused)], "rds-3")
+        .expect("a well-formed but unsupported replacement is ACKed");
+
+    assert_eq!(
+        refusal_reasons(&accumulator),
+        vec![refusal::ROUTE_EXTENSION_ESCAPE]
+    );
+    assert!(
+        !accumulator.route_configs().contains_key("9080"),
+        "an explicitly refused replacement must not leave stale accepted routing active"
+    );
+}
+
+#[test]
 fn stock_refusal_diagnostics_are_bounded_and_free_of_control_characters() {
     // Resource names are control-plane-chosen and bounded only by
     // `max_resource_bytes`, and they land verbatim in operator log lines.

@@ -3024,8 +3024,29 @@ async fn grpc_transport_for_hbone_with_unusable_dial_metadata_fails_closed() {
             grpc_proxy::GrpcTransportDiagnostic::MeshHboneAuthorityHost,
         ),
         (
+            "cross-cluster missing the CONNECT authority host",
+            vec![
+                (hbone, "true"),
+                (xc, "true"),
+                (sni, secret_sni),
+                (
+                    ferrum_edge::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG,
+                    "remote.local",
+                ),
+            ],
+            grpc_proxy::GrpcTransportDiagnostic::MeshHboneAuthorityHost,
+        ),
+        (
             "cross-cluster missing the remote trust domain",
-            vec![(hbone, "true"), (xc, "true"), (sni, secret_sni)],
+            vec![
+                (hbone, "true"),
+                (xc, "true"),
+                (sni, secret_sni),
+                (
+                    ferrum_edge::proxy::hbone_pool::HBONE_AUTHORITY_HOST_TAG,
+                    "10.244.3.9",
+                ),
+            ],
             grpc_proxy::GrpcTransportDiagnostic::MeshTrustDomain,
         ),
         (
@@ -3036,6 +3057,10 @@ async fn grpc_transport_for_hbone_with_unusable_dial_metadata_fails_closed() {
                 (
                     ferrum_edge::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG,
                     "remote.local",
+                ),
+                (
+                    ferrum_edge::proxy::hbone_pool::HBONE_AUTHORITY_HOST_TAG,
+                    "10.244.3.9",
                 ),
             ],
             grpc_proxy::GrpcTransportDiagnostic::MeshEastwestSni,

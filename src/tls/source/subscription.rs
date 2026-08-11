@@ -15,13 +15,13 @@ use futures_util::TryStreamExt;
 use futures_util::future::BoxFuture;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use super::{
     CertSource, MaterialError, MaterialKind, SourceScheme, k8s_secret_watch_target,
-    load_material_blocking,
+    load_material_blocking_with,
 };
 
 pub const DEFAULT_SECRET_REFRESH_INTERVAL_SECS: u64 = 300;
@@ -245,12 +245,22 @@ fn clamp_poll_interval(interval: Duration) -> Duration {
 }
 
 /// Fingerprint all configured sources using their material bytes.
+#[allow(dead_code)] // External unit tests; reload paths use material_set_fingerprint_with.
 pub fn material_set_fingerprint(
     sources: &[WatchedMaterialSource],
 ) -> Result<MaterialSetFingerprint, MaterialError> {
+    let max_bytes = super::effective_tls_max_material_size_bytes()?;
+    material_set_fingerprint_with(sources, max_bytes)
+}
+
+/// Fingerprint all configured sources using an explicit material byte ceiling.
+pub fn material_set_fingerprint_with(
+    sources: &[WatchedMaterialSource],
+    max_bytes: usize,
+) -> Result<MaterialSetFingerprint, MaterialError> {
     let mut entries = Vec::with_capacity(sources.len());
     for watched in sources {
-        entries.push(material_fingerprint(watched)?);
+        entries.push(material_fingerprint_with(watched, max_bytes)?);
     }
     Ok(MaterialSetFingerprint { entries })
 }
@@ -263,12 +273,21 @@ pub fn material_set_fingerprint(
 pub fn material_fingerprint(
     watched: &WatchedMaterialSource,
 ) -> Result<MaterialFingerprintEntry, MaterialError> {
+    let max_bytes = super::effective_tls_max_material_size_bytes()?;
+    material_fingerprint_with(watched, max_bytes)
+}
+
+/// Fingerprint one configured source using an explicit material byte ceiling.
+pub fn material_fingerprint_with(
+    watched: &WatchedMaterialSource,
+    max_bytes: usize,
+) -> Result<MaterialFingerprintEntry, MaterialError> {
     if let Some(entry) = opaque_key_fingerprint_entry(watched) {
         return Ok(entry);
     }
     let configured_scheme = configured_source_scheme(&watched.source);
     let started = Instant::now();
-    let material = match load_material_blocking(&watched.source, watched.kind) {
+    let material = match load_material_blocking_with(&watched.source, watched.kind, max_bytes) {
         Ok(material) => material,
         Err(error) => {
             let registry = crate::plugins::prometheus_metrics::global_registry();
@@ -340,6 +359,7 @@ fn material_error_reason(error: &MaterialError) -> &'static str {
         MaterialError::UnsupportedScheme { .. } => "unsupported_scheme",
         MaterialError::Secret { .. } => "secret",
         MaterialError::InvalidSource { .. } => "invalid_source",
+        MaterialError::Oversized { .. } => "oversized",
     }
 }
 
@@ -355,6 +375,15 @@ pub struct MaterialSetReloadConfig {
     pub interval: Duration,
     pub revision_tx: watch::Sender<u64>,
     pub rebuild: MaterialSetRebuildFn,
+    /// Validated TLS material byte ceiling snapshotted from EnvConfig (or an
+    /// explicit test limit). Avoids re-resolving a mutable env/conf value on
+    /// each poll.
+    pub max_material_bytes: usize,
+    /// Optional oneshot fired after the initial fingerprint baseline is
+    /// established (and before the loop begins accepting force/tick polls).
+    /// Tests use this as a deterministic readiness barrier; production callers
+    /// leave it `None`.
+    pub ready_tx: Option<oneshot::Sender<()>>,
 }
 
 /// Configuration for [`spawn_async_material_set_reload_task`].
@@ -364,6 +393,7 @@ pub struct AsyncMaterialSetReloadConfig {
     pub interval: Duration,
     pub revision_tx: watch::Sender<u64>,
     pub rebuild: MaterialSetAsyncRebuildFn,
+    pub max_material_bytes: usize,
 }
 
 pub type MaterialSetSourceCollectorFn =
@@ -377,6 +407,7 @@ pub struct DynamicMaterialSetReloadConfig {
     pub provider_default_interval: Duration,
     pub revision_tx: watch::Sender<u64>,
     pub rebuild: MaterialSetRebuildFn,
+    pub max_material_bytes: usize,
 }
 
 /// Spawn a polling reload task for a set of TLS material sources.
@@ -618,6 +649,8 @@ async fn run_material_set_reload_loop(
         interval,
         revision_tx,
         rebuild,
+        max_material_bytes,
+        ready_tx,
     } = config;
 
     if sources.is_empty() {
@@ -625,6 +658,9 @@ async fn run_material_set_reload_loop(
             surface,
             "TLS material reload watcher has no sources; exiting"
         );
+        if let Some(ready_tx) = ready_tx {
+            let _ = ready_tx.send(());
+        }
         force_reload_registry().remove(surface);
         return;
     }
@@ -636,7 +672,7 @@ async fn run_material_set_reload_loop(
         "TLS material source reload watcher started"
     );
 
-    let mut last_fingerprint = match material_set_fingerprint(&sources) {
+    let mut last_fingerprint = match material_set_fingerprint_with(&sources, max_material_bytes) {
         Ok(fingerprint) => Some(fingerprint),
         Err(error) => {
             record_refresh_for_sources(surface, &sources, "load_error");
@@ -650,6 +686,13 @@ async fn run_material_set_reload_loop(
         }
     };
     let mut last_load_failed = last_fingerprint.is_none();
+
+    // Deterministic readiness: force/tick handling starts only after the
+    // initial fingerprint baseline is established, so callers cannot race the
+    // baseline onto a rewritten candidate.
+    if let Some(ready_tx) = ready_tx {
+        let _ = ready_tx.send(());
+    }
 
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -689,7 +732,7 @@ async fn run_material_set_reload_loop(
             }
         }
 
-        let next_fingerprint = match material_set_fingerprint(&sources) {
+        let next_fingerprint = match material_set_fingerprint_with(&sources, max_material_bytes) {
             Ok(fingerprint) => {
                 if last_load_failed {
                     info!(
@@ -763,6 +806,7 @@ async fn run_async_material_set_reload_loop(
         interval,
         revision_tx,
         rebuild,
+        max_material_bytes,
     } = config;
 
     if sources.is_empty() {
@@ -781,7 +825,7 @@ async fn run_async_material_set_reload_loop(
         "TLS material source reload watcher started"
     );
 
-    let mut last_fingerprint = match material_set_fingerprint(&sources) {
+    let mut last_fingerprint = match material_set_fingerprint_with(&sources, max_material_bytes) {
         Ok(fingerprint) => Some(fingerprint),
         Err(error) => {
             record_refresh_for_sources(surface, &sources, "load_error");
@@ -834,7 +878,7 @@ async fn run_async_material_set_reload_loop(
             }
         }
 
-        let next_fingerprint = match material_set_fingerprint(&sources) {
+        let next_fingerprint = match material_set_fingerprint_with(&sources, max_material_bytes) {
             Ok(fingerprint) => {
                 if last_load_failed {
                     info!(
@@ -910,6 +954,7 @@ async fn run_dynamic_material_set_reload_loop(
         provider_default_interval,
         revision_tx,
         rebuild,
+        max_material_bytes,
     } = config;
 
     let mut last_fingerprint: Option<MaterialSetFingerprint> = None;
@@ -957,7 +1002,7 @@ async fn run_dynamic_material_set_reload_loop(
             continue;
         }
 
-        let next_fingerprint = match material_set_fingerprint(&sources) {
+        let next_fingerprint = match material_set_fingerprint_with(&sources, max_material_bytes) {
             Ok(fingerprint) => {
                 if last_load_failed {
                     info!(
@@ -1351,6 +1396,8 @@ mod tests {
                 interval: Duration::from_millis(50),
                 revision_tx,
                 rebuild,
+                max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+                ready_tx: None,
             },
             Some(shutdown_rx),
         );
@@ -1407,6 +1454,8 @@ mod tests {
                 interval: Duration::from_secs(3600),
                 revision_tx,
                 rebuild,
+                max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+                ready_tx: None,
             },
             Some(shutdown_rx),
         );
@@ -1456,6 +1505,7 @@ mod tests {
                 interval: Duration::from_secs(3600),
                 revision_tx,
                 rebuild,
+                max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
             },
             Some(shutdown_rx),
         );
@@ -1512,6 +1562,7 @@ mod tests {
                 file_default_interval: Duration::from_secs(3600),
                 provider_default_interval: Duration::from_secs(3600),
                 revision_tx,
+                max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
                 rebuild: Box::new(move || {
                     attempts_for_rebuild.fetch_add(1, Ordering::SeqCst);
                     Ok(())

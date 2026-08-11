@@ -26,8 +26,9 @@ use crate::proxy::body::SizeLimitedIncoming;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
     BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
-    append_backend_tls_pool_key_fields, append_optional_pool_key_component,
-    append_pool_key_component, backend_svid_generation_for_client_cert,
+    append_backend_tls_pool_key_fields, append_http2_max_concurrent_streams_pool_key,
+    append_optional_pool_key_component, append_pool_key_component,
+    backend_svid_generation_for_client_cert,
 };
 
 thread_local! {
@@ -125,6 +126,14 @@ fn write_http2_pool_key(
     // subsets cannot share an H2 sender even when their TLS material is
     // byte-identical. Empty when the proxy has no `upstream_subset`.
     append_optional_pool_key_component(buf, proxy.upstream_subset.as_deref());
+    buf.push('|');
+    // Effective `pool_http2_max_concurrent_streams` is baked into the hyper
+    // builder (`max_concurrent_streams` + `initial_max_send_streams`), so it
+    // must participate in pool identity. Placed after subset and before TLS
+    // fields so `SvidGenerationMatcher` still sees `|svidg=…` as the final
+    // (pre-shard) segment. `None` → `none` so update/delete of the cap cannot
+    // reuse a connection built under the prior limit.
+    append_http2_max_concurrent_streams_pool_key(buf, proxy.pool_http2_max_concurrent_streams);
     buf.push('|');
     append_backend_tls_pool_key_fields(
         buf,
@@ -1358,14 +1367,15 @@ impl std::fmt::Display for InternalSource {
 
 /// Zero-based field offsets of the backend mTLS client cert and key components
 /// inside a direct-H2 pool key. The key is built as
-/// `host|port|dns_override|subset|ca|cert|key|sni|san_digest|verify+svid` by
-/// `write_http2_pool_key` -> `append_backend_tls_pool_key_fields`; the cert and
-/// key fields are credential paths (or inline-PEM digests). Pool-key components
-/// escape literal `|` as `%7C` (see `append_pool_key_component`), so splitting on
-/// `|` recovers exactly these fields without a separator ever bleeding across a
-/// boundary.
-const POOL_KEY_CLIENT_CERT_FIELD: usize = 5;
-const POOL_KEY_CLIENT_KEY_FIELD: usize = 6;
+/// `host|port|dns_override|subset|h2mcs|ca|cert|key|sni|san_digest|verify+svid`
+/// by `write_http2_pool_key` -> `append_backend_tls_pool_key_fields`; the cert
+/// and key fields are credential paths (or inline-PEM digests). Pool-key
+/// components escape literal `|` as `%7C` (see `append_pool_key_component`), so
+/// splitting on `|` recovers exactly these fields without a separator ever
+/// bleeding across a boundary. `h2mcs` is the optional
+/// `pool_http2_max_concurrent_streams` segment (`none` or a decimal u32).
+const POOL_KEY_CLIENT_CERT_FIELD: usize = 6;
+const POOL_KEY_CLIENT_KEY_FIELD: usize = 7;
 
 /// Render a direct-H2 pool key with its backend mTLS client cert/key components
 /// scrubbed for safe inclusion in logs and error displays.
@@ -1897,22 +1907,22 @@ mod tests {
     }
 
     /// Redaction operates field-positionally on the `|`-delimited pool key:
-    /// only the cert (idx 5) and key (idx 6) slots are scrubbed, empty slots
+    /// only the cert (idx 6) and key (idx 7) slots are scrubbed, empty slots
     /// stay empty (no spurious `<redacted>`), and non-TLS fields are preserved.
     #[test]
     fn redact_pool_key_scrubs_only_cert_and_key_fields() {
-        // host|port|dns|subset|ca|cert|key|sni|san|verify+svid
-        let key = "backend.test|443||sub|/etc/ca.pem|/etc/client.crt|/etc/client.key|sni.test|deadbeef|1|svidg=17";
+        // host|port|dns|subset|h2mcs|ca|cert|key|sni|san|verify+svid
+        let key = "backend.test|443||sub|none|/etc/ca.pem|/etc/client.crt|/etc/client.key|sni.test|deadbeef|1|svidg=17";
         let redacted = redact_pool_key_tls_material(key);
         assert_eq!(
             redacted,
-            "backend.test|443||sub|/etc/ca.pem|<redacted>|<redacted>|sni.test|deadbeef|1|svidg=17",
+            "backend.test|443||sub|none|/etc/ca.pem|<redacted>|<redacted>|sni.test|deadbeef|1|svidg=17",
             "only the cert and key fields should be scrubbed"
         );
 
         // Empty cert/key (the common global-fallback-absent case) must not be
         // replaced with a marker — an empty field carries no credential.
-        let empty_tls = "backend.test|443|||/etc/ca.pem||||deadbeef|1|svidg=static";
+        let empty_tls = "backend.test|443|||none|/etc/ca.pem||||deadbeef|1|svidg=static";
         assert_eq!(
             redact_pool_key_tls_material(empty_tls),
             empty_tls,

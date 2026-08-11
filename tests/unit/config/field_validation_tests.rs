@@ -1135,6 +1135,35 @@ fn test_upstream_source_locality_rejected_by_admin_api() {
 }
 
 #[test]
+fn test_upstream_mesh_target_tags_rejected_in_operator_config() {
+    let mut upstream = make_upstream("test");
+    upstream.targets[0].tags = HashMap::from([
+        ("environment".to_string(), "production".to_string()),
+        (
+            "mesh.unix_socket".to_string(),
+            "/run/containerd/containerd.sock".to_string(),
+        ),
+        ("mesh.future_transport".to_string(), "enabled".to_string()),
+    ]);
+
+    let errors = upstream
+        .validate_operator_provided_fields()
+        .expect_err("operator-provided targets must not forge reserved mesh tags");
+    assert_eq!(errors.len(), 1, "ordinary target tags must remain allowed");
+    assert!(
+        errors[0].contains("targets[0].tags") && errors[0].contains("reserved mesh.* namespace"),
+        "expected a redacted reserved-tag rejection, got: {errors:?}"
+    );
+    assert!(!errors[0].contains("mesh.unix_socket"), "{errors:?}");
+    assert!(!errors[0].contains("mesh.future_transport"), "{errors:?}");
+
+    assert!(
+        upstream.validate_fields().is_ok(),
+        "mesh materialization must continue accepting its trusted transport tags"
+    );
+}
+
+#[test]
 fn test_upstream_locality_lb_strict_rejected_by_admin_api() {
     let mut upstream = make_upstream("test");
     upstream.locality_lb_strict = true;
@@ -1222,6 +1251,8 @@ fn test_upstream_mesh_projected_subset_fields_rejected_by_admin_api() {
             h2_upgrade_policy: Some(ferrum_edge::config::types::H2UpgradePolicy::Upgrade),
             max_retries: Some(2),
             http1_max_pending_requests: Some(8),
+            http_idle_timeout_ms: Some(30_000),
+            h2_max_concurrent_streams: Some(64),
             passive_health_check: Some(PassiveHealthCheck::default()),
         }),
     }]);
@@ -1235,6 +1266,8 @@ fn test_upstream_mesh_projected_subset_fields_rejected_by_admin_api() {
         "h2_upgrade_policy",
         "max_retries",
         "http1_max_pending_requests",
+        "http_idle_timeout_ms",
+        "h2_max_concurrent_streams",
         "passive_health_check",
     ] {
         assert!(

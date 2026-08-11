@@ -52,6 +52,7 @@
 //! `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR`.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -110,7 +111,17 @@ impl PodCaptureSourceIps {
 /// node-agent publishes; tests inject a fake.
 pub trait PodCaptureSource: Send + Sync {
     fn list_targets(&self) -> Vec<PodCaptureTarget>;
+
+    /// Return one complete registry snapshot suitable for a durable migration
+    /// proof. Production filesystem sources override this to fail closed on
+    /// any omitted or malformed entry; in-memory sources are already atomic.
+    fn list_targets_for_migration(&self) -> Result<Vec<PodCaptureTarget>, String> {
+        Ok(self.list_targets())
+    }
 }
+
+const MAX_MIGRATION_REGISTRY_ENTRIES: usize = 100_000;
+const MAX_MIGRATION_REGISTRY_ENTRY_BYTES: u64 = 16 * 1024;
 
 /// Filesystem registry source: the node-agent writes one file per enrolled pod,
 /// named `<pod_uid>`, whose first line is the pod cgroup path and whose
@@ -129,6 +140,76 @@ impl DirectoryCaptureSource {
     }
 }
 
+fn parse_capture_target(pod_uid: String, contents: &str) -> Result<PodCaptureTarget, String> {
+    // Line 1: pod cgroup path (required). Subsequent optional lines are
+    // family-specific source IPs (`ipv4=<addr>`, `ipv6=<addr>`).
+    let mut lines = contents.lines();
+    let cgroup_path = lines.next().unwrap_or("").trim().to_string();
+    if cgroup_path.is_empty() {
+        return Err("Ambient capture registry entry has no cgroup path".to_string());
+    }
+    let mut source_ips = PodCaptureSourceIps::default();
+    let mut source_principal = None;
+    for line in lines {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("spiffe_id=") {
+            source_principal = crate::identity::SpiffeId::new(value.trim()).ok();
+        } else if let Some(value) = line.strip_prefix("ipv4=") {
+            source_ips.ipv4 = value.trim().parse::<Ipv4Addr>().ok();
+        } else if let Some(value) = line.strip_prefix("ipv6=") {
+            source_ips.ipv6 = value.trim().parse::<Ipv6Addr>().ok();
+        }
+    }
+    let source_identity = source_principal.and_then(|principal| {
+        crate::modes::mesh::hbone::UdpSourceIdentity::new(principal, pod_uid.clone())
+    });
+    Ok(PodCaptureTarget {
+        pod_uid,
+        cgroup_path,
+        source_identity,
+        source_ips,
+    })
+}
+
+fn read_migration_registry_entry(path: &Path) -> Result<String, String> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path);
+    let file = file.map_err(|_| "could not securely open Ambient capture registry entry")?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "could not inspect Ambient capture registry entry")?;
+    if !metadata.is_file() || metadata.len() > MAX_MIGRATION_REGISTRY_ENTRY_BYTES {
+        return Err("Ambient capture registry entry is not a bounded regular file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Safety: `geteuid` is always sound and never fails.
+        let process_uid = unsafe { libc::geteuid() };
+        if metadata.nlink() != 1 || metadata.uid() != process_uid {
+            return Err(
+                "Ambient capture registry entry is not singly linked and process-owned".to_string(),
+            );
+        }
+    }
+    let mut contents = String::new();
+    file.take(MAX_MIGRATION_REGISTRY_ENTRY_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|_| "could not read Ambient capture registry entry as UTF-8")?;
+    if contents.len() as u64 > MAX_MIGRATION_REGISTRY_ENTRY_BYTES {
+        return Err("Ambient capture registry entry exceeds its size limit".to_string());
+    }
+    Ok(contents)
+}
+
 impl PodCaptureSource for DirectoryCaptureSource {
     fn list_targets(&self) -> Vec<PodCaptureTarget> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
@@ -145,36 +226,43 @@ impl PodCaptureSource for DirectoryCaptureSource {
             let Ok(contents) = std::fs::read_to_string(entry.path()) else {
                 continue;
             };
-            // Line 1: pod cgroup path (required). Subsequent optional lines are
-            // family-specific source IPs (`ipv4=<addr>`, `ipv6=<addr>`).
-            let mut lines = contents.lines();
-            let cgroup_path = lines.next().unwrap_or("").trim().to_string();
-            if cgroup_path.is_empty() {
-                continue;
+            if let Ok(target) = parse_capture_target(pod_uid, &contents) {
+                targets.push(target);
             }
-            let mut source_ips = PodCaptureSourceIps::default();
-            let mut source_principal = None;
-            for line in lines {
-                let line = line.trim();
-                if let Some(value) = line.strip_prefix("spiffe_id=") {
-                    source_principal = crate::identity::SpiffeId::new(value.trim()).ok();
-                } else if let Some(value) = line.strip_prefix("ipv4=") {
-                    source_ips.ipv4 = value.trim().parse::<Ipv4Addr>().ok();
-                } else if let Some(value) = line.strip_prefix("ipv6=") {
-                    source_ips.ipv6 = value.trim().parse::<Ipv6Addr>().ok();
-                }
-            }
-            let source_identity = source_principal.and_then(|principal| {
-                crate::modes::mesh::hbone::UdpSourceIdentity::new(principal, pod_uid.clone())
-            });
-            targets.push(PodCaptureTarget {
-                pod_uid,
-                cgroup_path,
-                source_identity,
-                source_ips,
-            });
         }
         targets
+    }
+
+    fn list_targets_for_migration(&self) -> Result<Vec<PodCaptureTarget>, String> {
+        let entries = std::fs::read_dir(&self.dir)
+            .map_err(|_| "could not scan Ambient capture registry for migration")?;
+        let mut targets = Vec::new();
+        for (index, entry) in entries.enumerate() {
+            if index >= MAX_MIGRATION_REGISTRY_ENTRIES {
+                return Err(
+                    "Ambient capture registry exceeds its migration entry limit".to_string()
+                );
+            }
+            let entry =
+                entry.map_err(|_| "could not enumerate Ambient capture registry for migration")?;
+            let pod_uid = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "Ambient capture registry entry name is not UTF-8")?;
+            if pod_uid.starts_with('.') {
+                continue;
+            }
+            if pod_uid.is_empty()
+                || pod_uid.contains("..")
+                || pod_uid.contains('/')
+                || pod_uid.contains('\\')
+            {
+                return Err("Ambient capture registry entry name is unsafe".to_string());
+            }
+            let contents = read_migration_registry_entry(&entry.path())?;
+            targets.push(parse_capture_target(pod_uid, &contents)?);
+        }
+        Ok(targets)
     }
 }
 

@@ -66,9 +66,12 @@ mesh-mode topology see [`docs/mesh.md`](mesh.md).
     (`ferrum_sock_ops` — `sock_ops`, attached once at startup).
 - Pins SOCK_OPS event and stats maps into `/sys/fs/bpf/ferrum/` so the
   co-located mesh proxy can open them by path. No additional IPC.
-- Watches `pods` and `nodes` (`get`/`list`/`watch`) via the Kubernetes API
-  using the in-cluster ServiceAccount token. The watcher is filtered
-  server-side to `spec.nodeName=$FERRUM_NODE_AGENT_NODE_NAME`.
+- Watches `pods` (`get`/`list`/`watch`) and, when proving the optional ingress
+  redirect topology, maintains one bounded cluster-wide `nodes`
+  (`list`/`watch`) cache via the Kubernetes API using the in-cluster
+  ServiceAccount token. The pod watcher is filtered server-side to
+  `spec.nodeName=$FERRUM_NODE_AGENT_NODE_NAME`; the projected Node cache retains
+  only names, PodCIDRs, the Ready truth value, and InternalIP route evidence.
 - On kernels that do not support cgroup/sockaddr BPF (< 5.7 or no cgroup v2),
   falls back to `iptables` / `ip6tables` rules invoked via `sh -c`
   ([`handle_fallback` in `src/modes/node_agent.rs`](../src/modes/node_agent.rs)).
@@ -77,9 +80,10 @@ mesh-mode topology see [`docs/mesh.md`](mesh.md).
 
 ### What it can read or modify
 
-- **Read**: every pod's metadata via the API server (within ClusterRole RBAC);
-  every cgroup path under `/sys/fs/cgroup`; every host network interface
-  name under `/sys/class/net/`; every PID's net namespace info under
+- **Read**: every pod's metadata and bounded Node PodCIDR/InternalIP topology via
+  the API server (within ClusterRole RBAC); every cgroup path under
+  `/sys/fs/cgroup`; host route state under `/proc/net/`; host network interface
+  state under `/sys/class/net/`; every PID's net namespace info under
   `/proc/{pid}/net/if_inet6` (because of `hostPID: true`).
 - **Modify**: BPF maps (`FERRUM_POD_IPS`, `FERRUM_POD_IPS6`, `FERRUM_BYPASS_UIDS`,
   `FERRUM_CIDR_*`, `FERRUM_PORT_EXCLUDE`, `FERRUM_INCLUDE_PORTS`,
@@ -166,6 +170,14 @@ choose it: it is the UDP capture path available on clusters whose Pod Security
 posture will not grant `SYS_ADMIN`/`SYS_PTRACE`. The chart derives this
 automatically — enabling the placement narrows the rendered capabilities rather
 than adding to them.
+
+The narrowing happens only after the enforced UDP placement migration completes.
+An explicit `cleanup` release from `pod-netns` or `disabled` to `host-netns`
+retains `hostPID`, `SYS_ADMIN`, and `SYS_PTRACE` so it can retire exact
+Ferrum-owned rules inside every predecessor pod netns. The incoming host
+producer does not start in that release. `finalize` is admitted only after the
+node-local durable proof exists, and only then does the chart remove the setns
+privilege set. See the [Ambient UDP migration procedure](mesh.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
 
 What it does NOT reduce is `CAP_NET_ADMIN`: the path still writes `mangle` chains,
 an `ip rule`, and an `ip route` in the host namespace, and still binds
@@ -762,7 +774,7 @@ under the `system:serviceaccount:<ns>:ferrum-node-agent` identity.
 | Privileged: true (defeats seccomp) | Chart sets `privileged: false` on the node-agent container; the trusted chart-runtime lint requires every chart `privileged` assignment to remain literal false and rejects true or dynamic Helm-controlled values | Operator + Gateway |
 | Unauthenticated /metrics on cluster network | Loopback-only default (see [`docs/node_agent.md`](node_agent.md)); explicit opt-in to broaden | Gateway |
 | ServiceAccount token theft | Use projected tokens with short `expirationSeconds`; rotate via kubelet | Operator |
-| Excessive RBAC | Chart's ClusterRole is `pods get/list/watch` + `nodes get` — verify on fork | Operator + Gateway |
+| Excessive RBAC | Chart's ClusterRole is `pods get/list/watch`; it adds read-only `nodes list/watch` only when `nodeAgent.ingressRedirectIfaces` enables the bounded topology cache — verify on fork | Operator + Gateway |
 | Audit blind spots | `auditd` rules above; agent emits structured tracing events for every attach | Operator |
 | Iptables fallback running on a bad kernel | Default `FERRUM_NODE_AGENT_FALLBACK_MODE=fail`; set `iptables` only on custom images that intentionally support it | Operator |
 | AppArmor / SELinux misconfigured | Profile in this doc allows only the documented mounts and syscalls; load before enabling | Operator |

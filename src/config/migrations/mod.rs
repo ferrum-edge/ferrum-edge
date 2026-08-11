@@ -17,6 +17,9 @@ use chrono::Utc;
 use sqlx::any::AnyRow;
 use sqlx::pool::PoolConnection;
 use sqlx::{Any, AnyConnection, AnyPool, Connection, Row};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -371,6 +374,422 @@ pub struct PendingMigration {
     pub name: String,
 }
 
+/// The migration-history namespace whose integrity could not be established.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MigrationHistoryNamespace {
+    Core,
+    CustomPlugin(String),
+}
+
+/// Stable classification for migration-history integrity failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationHistoryIntegrityKind {
+    DuplicateDeclaredNamespace,
+    NonPositiveDeclaredVersion,
+    DeclaredVersionOutOfRange,
+    DuplicateDeclaredVersion,
+    UnorderedDeclaredVersions,
+    DuplicateAppliedNamespace,
+    DuplicateAppliedVersion,
+    UnknownAppliedNamespace,
+    UnknownAppliedVersion,
+    MissingAppliedVersion,
+    ChecksumMismatch,
+}
+
+impl MigrationHistoryIntegrityKind {
+    /// Stable fixed-cardinality label for metrics, audit records, and APIs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DuplicateDeclaredNamespace => "duplicate_declared_namespace",
+            Self::NonPositiveDeclaredVersion => "non_positive_declared_version",
+            Self::DeclaredVersionOutOfRange => "declared_version_out_of_range",
+            Self::DuplicateDeclaredVersion => "duplicate_declared_version",
+            Self::UnorderedDeclaredVersions => "unordered_declared_versions",
+            Self::DuplicateAppliedNamespace => "duplicate_applied_namespace",
+            Self::DuplicateAppliedVersion => "duplicate_applied_version",
+            Self::UnknownAppliedNamespace => "unknown_applied_namespace",
+            Self::UnknownAppliedVersion => "unknown_applied_version",
+            Self::MissingAppliedVersion => "missing_applied_version",
+            Self::ChecksumMismatch => "checksum_mismatch",
+        }
+    }
+}
+
+/// Structured reason and raw metadata for a migration-history integrity error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationHistoryIntegrityReason {
+    DuplicateDeclaredNamespace,
+    NonPositiveDeclaredVersion {
+        version: i64,
+    },
+    DeclaredVersionOutOfRange {
+        version: i64,
+        max_supported_version: i64,
+    },
+    DuplicateDeclaredVersion {
+        version: i64,
+    },
+    UnorderedDeclaredVersions {
+        previous_version: i64,
+        version: i64,
+    },
+    DuplicateAppliedNamespace,
+    DuplicateAppliedVersion {
+        version: i64,
+    },
+    UnknownAppliedNamespace,
+    UnknownAppliedVersion {
+        version: i64,
+    },
+    MissingAppliedVersion {
+        expected_version: i64,
+        observed_version: i64,
+    },
+    ChecksumMismatch {
+        version: i64,
+        stored_checksum: String,
+        expected_checksum: String,
+    },
+}
+
+impl MigrationHistoryIntegrityReason {
+    pub fn kind(&self) -> MigrationHistoryIntegrityKind {
+        match self {
+            Self::DuplicateDeclaredNamespace => {
+                MigrationHistoryIntegrityKind::DuplicateDeclaredNamespace
+            }
+            Self::NonPositiveDeclaredVersion { .. } => {
+                MigrationHistoryIntegrityKind::NonPositiveDeclaredVersion
+            }
+            Self::DeclaredVersionOutOfRange { .. } => {
+                MigrationHistoryIntegrityKind::DeclaredVersionOutOfRange
+            }
+            Self::DuplicateDeclaredVersion { .. } => {
+                MigrationHistoryIntegrityKind::DuplicateDeclaredVersion
+            }
+            Self::UnorderedDeclaredVersions { .. } => {
+                MigrationHistoryIntegrityKind::UnorderedDeclaredVersions
+            }
+            Self::DuplicateAppliedNamespace => {
+                MigrationHistoryIntegrityKind::DuplicateAppliedNamespace
+            }
+            Self::DuplicateAppliedVersion { .. } => {
+                MigrationHistoryIntegrityKind::DuplicateAppliedVersion
+            }
+            Self::UnknownAppliedNamespace => MigrationHistoryIntegrityKind::UnknownAppliedNamespace,
+            Self::UnknownAppliedVersion { .. } => {
+                MigrationHistoryIntegrityKind::UnknownAppliedVersion
+            }
+            Self::MissingAppliedVersion { .. } => {
+                MigrationHistoryIntegrityKind::MissingAppliedVersion
+            }
+            Self::ChecksumMismatch { .. } => MigrationHistoryIntegrityKind::ChecksumMismatch,
+        }
+    }
+}
+
+/// A blocking failure to prove that applied migrations are an exact prefix of
+/// the binary's unambiguous ordered declarations.
+///
+/// Raw values remain available in the structured fields for programmatic
+/// handling. Human-facing formatting is deliberately limited to safe migration
+/// metadata and never includes database URLs, SQL, or connection details.
+#[derive(Debug)]
+pub struct MigrationHistoryIntegrityError {
+    pub backend: String,
+    pub namespace: MigrationHistoryNamespace,
+    pub reason: MigrationHistoryIntegrityReason,
+}
+
+impl MigrationHistoryIntegrityError {
+    pub fn kind(&self) -> MigrationHistoryIntegrityKind {
+        self.reason.kind()
+    }
+}
+
+/// Each string field in an integrity diagnostic is rendered as at most 128
+/// escaped characters plus a `...` truncation marker. This keeps diagnostics
+/// single-line and bounded even when a tracking table contains hostile TEXT.
+const INTEGRITY_DIAGNOSTIC_FIELD_MAX_ESCAPED_CHARS: usize = 128;
+
+struct BoundedIntegrityDiagnosticField<'a>(&'a str);
+
+/// Render hostile migration-ledger text as one bounded, escaped field.
+pub(crate) fn bounded_migration_diagnostic_field(value: &str) -> impl fmt::Display + '_ {
+    BoundedIntegrityDiagnosticField(value)
+}
+
+impl fmt::Display for BoundedIntegrityDiagnosticField<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut rendered = 0;
+        for character in self.0.chars() {
+            let escaped = character.escape_default();
+            let escaped_len = escaped.clone().count();
+            if rendered + escaped_len > INTEGRITY_DIAGNOSTIC_FIELD_MAX_ESCAPED_CHARS {
+                return f.write_str("...");
+            }
+            for escaped_character in escaped {
+                f.write_char(escaped_character)?;
+            }
+            rendered += escaped_len;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for MigrationHistoryIntegrityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "migration history integrity check failed: kind={} backend=\"{}\"",
+            self.kind().as_str(),
+            BoundedIntegrityDiagnosticField(&self.backend)
+        )?;
+        match &self.namespace {
+            MigrationHistoryNamespace::Core => f.write_str(" namespace=core")?,
+            MigrationHistoryNamespace::CustomPlugin(plugin_name) => write!(
+                f,
+                " namespace=custom-plugin plugin=\"{}\"",
+                BoundedIntegrityDiagnosticField(plugin_name)
+            )?,
+        }
+        match &self.reason {
+            MigrationHistoryIntegrityReason::DuplicateDeclaredNamespace
+            | MigrationHistoryIntegrityReason::DuplicateAppliedNamespace
+            | MigrationHistoryIntegrityReason::UnknownAppliedNamespace => Ok(()),
+            MigrationHistoryIntegrityReason::NonPositiveDeclaredVersion { version }
+            | MigrationHistoryIntegrityReason::DuplicateDeclaredVersion { version }
+            | MigrationHistoryIntegrityReason::DuplicateAppliedVersion { version }
+            | MigrationHistoryIntegrityReason::UnknownAppliedVersion { version } => {
+                write!(f, " version={version}")
+            }
+            MigrationHistoryIntegrityReason::DeclaredVersionOutOfRange {
+                version,
+                max_supported_version,
+            } => write!(
+                f,
+                " version={version} max_supported_version={max_supported_version}"
+            ),
+            MigrationHistoryIntegrityReason::UnorderedDeclaredVersions {
+                previous_version,
+                version,
+            } => write!(f, " previous_version={previous_version} version={version}"),
+            MigrationHistoryIntegrityReason::MissingAppliedVersion {
+                expected_version,
+                observed_version,
+            } => write!(
+                f,
+                " expected_version={expected_version} observed_version={observed_version}"
+            ),
+            MigrationHistoryIntegrityReason::ChecksumMismatch {
+                version,
+                stored_checksum,
+                expected_checksum,
+            } => write!(
+                f,
+                " version={version} stored_checksum=\"{}\" expected_checksum=\"{}\"",
+                BoundedIntegrityDiagnosticField(stored_checksum),
+                BoundedIntegrityDiagnosticField(expected_checksum)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MigrationHistoryIntegrityError {}
+
+/// One migration expected by the current binary.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredMigrationHistoryEntry {
+    pub version: i64,
+    pub checksum: String,
+}
+
+/// The ordered migration declarations for one core or plugin namespace.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredMigrationHistory {
+    pub namespace: MigrationHistoryNamespace,
+    pub migrations: Vec<DeclaredMigrationHistoryEntry>,
+}
+
+/// One database tracking row used by the shared history validator.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedMigrationHistoryEntry {
+    pub version: i64,
+    pub checksum: String,
+}
+
+/// The ordered applied rows for one core or plugin namespace.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedMigrationHistory {
+    pub namespace: MigrationHistoryNamespace,
+    pub migrations: Vec<AppliedMigrationHistoryEntry>,
+}
+
+fn integrity_error(
+    backend: &str,
+    namespace: &MigrationHistoryNamespace,
+    reason: MigrationHistoryIntegrityReason,
+) -> MigrationHistoryIntegrityError {
+    MigrationHistoryIntegrityError {
+        backend: backend.to_string(),
+        namespace: namespace.clone(),
+        reason,
+    }
+}
+
+/// Validate declaration integrity and prove that every applied namespace is an
+/// exact checksum-matching prefix of the current binary's ordered sequence.
+///
+/// This public seam lets external adapter tests exercise the same model used by
+/// the core and custom-plugin runners without executing migration SQL.
+#[doc(hidden)]
+pub fn validate_migration_history_integrity(
+    backend: &str,
+    declarations: &[DeclaredMigrationHistory],
+    applied_histories: &[AppliedMigrationHistory],
+) -> Result<(), MigrationHistoryIntegrityError> {
+    let mut declared_namespaces = HashSet::new();
+    for declaration in declarations {
+        if !declared_namespaces.insert(&declaration.namespace) {
+            return Err(integrity_error(
+                backend,
+                &declaration.namespace,
+                MigrationHistoryIntegrityReason::DuplicateDeclaredNamespace,
+            ));
+        }
+
+        let mut versions = HashSet::new();
+        let mut previous_version = None;
+        for migration in &declaration.migrations {
+            if migration.version <= 0 {
+                return Err(integrity_error(
+                    backend,
+                    &declaration.namespace,
+                    MigrationHistoryIntegrityReason::NonPositiveDeclaredVersion {
+                        version: migration.version,
+                    },
+                ));
+            }
+            if migration.version > i64::from(i32::MAX) {
+                return Err(integrity_error(
+                    backend,
+                    &declaration.namespace,
+                    MigrationHistoryIntegrityReason::DeclaredVersionOutOfRange {
+                        version: migration.version,
+                        max_supported_version: i64::from(i32::MAX),
+                    },
+                ));
+            }
+            if !versions.insert(migration.version) {
+                return Err(integrity_error(
+                    backend,
+                    &declaration.namespace,
+                    MigrationHistoryIntegrityReason::DuplicateDeclaredVersion {
+                        version: migration.version,
+                    },
+                ));
+            }
+            if let Some(previous_version) = previous_version
+                && migration.version < previous_version
+            {
+                return Err(integrity_error(
+                    backend,
+                    &declaration.namespace,
+                    MigrationHistoryIntegrityReason::UnorderedDeclaredVersions {
+                        previous_version,
+                        version: migration.version,
+                    },
+                ));
+            }
+            previous_version = Some(migration.version);
+        }
+    }
+
+    let mut applied_namespaces = HashSet::new();
+    for applied in applied_histories {
+        if !applied_namespaces.insert(&applied.namespace) {
+            return Err(integrity_error(
+                backend,
+                &applied.namespace,
+                MigrationHistoryIntegrityReason::DuplicateAppliedNamespace,
+            ));
+        }
+
+        let Some(declaration) = declarations
+            .iter()
+            .find(|declaration| declaration.namespace == applied.namespace)
+        else {
+            return Err(integrity_error(
+                backend,
+                &applied.namespace,
+                MigrationHistoryIntegrityReason::UnknownAppliedNamespace,
+            ));
+        };
+
+        let mut applied_versions = HashSet::new();
+        for migration in &applied.migrations {
+            if !applied_versions.insert(migration.version) {
+                return Err(integrity_error(
+                    backend,
+                    &applied.namespace,
+                    MigrationHistoryIntegrityReason::DuplicateAppliedVersion {
+                        version: migration.version,
+                    },
+                ));
+            }
+        }
+
+        for (index, applied_migration) in applied.migrations.iter().enumerate() {
+            let Some(declared_migration) = declaration.migrations.get(index) else {
+                return Err(integrity_error(
+                    backend,
+                    &applied.namespace,
+                    MigrationHistoryIntegrityReason::UnknownAppliedVersion {
+                        version: applied_migration.version,
+                    },
+                ));
+            };
+
+            if applied_migration.version != declared_migration.version {
+                let reason = if declaration
+                    .migrations
+                    .iter()
+                    .any(|migration| migration.version == applied_migration.version)
+                {
+                    MigrationHistoryIntegrityReason::MissingAppliedVersion {
+                        expected_version: declared_migration.version,
+                        observed_version: applied_migration.version,
+                    }
+                } else {
+                    MigrationHistoryIntegrityReason::UnknownAppliedVersion {
+                        version: applied_migration.version,
+                    }
+                };
+                return Err(integrity_error(backend, &applied.namespace, reason));
+            }
+
+            if applied_migration.checksum != declared_migration.checksum {
+                return Err(integrity_error(
+                    backend,
+                    &applied.namespace,
+                    MigrationHistoryIntegrityReason::ChecksumMismatch {
+                        version: applied_migration.version,
+                        stored_checksum: applied_migration.checksum.clone(),
+                        expected_checksum: declared_migration.checksum.clone(),
+                    },
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Runs versioned database migrations with tracking.
 pub struct MigrationRunner {
     pool: AnyPool,
@@ -485,11 +904,212 @@ impl MigrationRunner {
         Ok(records)
     }
 
-    /// Run all pending migrations in order. Returns the list of newly applied migrations.
+    fn core_history_declaration(
+        all_migrations: &[Box<dyn MigrationEntry>],
+    ) -> DeclaredMigrationHistory {
+        DeclaredMigrationHistory {
+            namespace: MigrationHistoryNamespace::Core,
+            migrations: all_migrations
+                .iter()
+                .map(|migration| DeclaredMigrationHistoryEntry {
+                    version: migration.version(),
+                    checksum: migration.checksum().to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    fn plugin_history_declarations(
+        plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+    ) -> Vec<DeclaredMigrationHistory> {
+        plugin_migrations
+            .iter()
+            .map(|(plugin_name, migrations)| DeclaredMigrationHistory {
+                namespace: MigrationHistoryNamespace::CustomPlugin((*plugin_name).to_string()),
+                migrations: migrations
+                    .iter()
+                    .map(|migration| DeclaredMigrationHistoryEntry {
+                        version: migration.version,
+                        checksum: migration.checksum.to_string(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn core_applied_history(applied: &[MigrationRecord]) -> AppliedMigrationHistory {
+        AppliedMigrationHistory {
+            namespace: MigrationHistoryNamespace::Core,
+            migrations: applied
+                .iter()
+                .map(|record| AppliedMigrationHistoryEntry {
+                    version: record.version,
+                    checksum: record.checksum.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn plugin_applied_histories(applied: &[PluginMigrationRecord]) -> Vec<AppliedMigrationHistory> {
+        let mut histories: Vec<AppliedMigrationHistory> = Vec::new();
+        let mut history_indexes: HashMap<&str, usize> = HashMap::new();
+        for record in applied {
+            if let Some(&history_index) = history_indexes.get(record.plugin_name.as_str()) {
+                histories[history_index]
+                    .migrations
+                    .push(AppliedMigrationHistoryEntry {
+                        version: record.version,
+                        checksum: record.checksum.clone(),
+                    });
+            } else {
+                let history_index = histories.len();
+                history_indexes.insert(record.plugin_name.as_str(), history_index);
+                histories.push(AppliedMigrationHistory {
+                    namespace: MigrationHistoryNamespace::CustomPlugin(record.plugin_name.clone()),
+                    migrations: vec![AppliedMigrationHistoryEntry {
+                        version: record.version,
+                        checksum: record.checksum.clone(),
+                    }],
+                });
+            }
+        }
+        histories
+    }
+
+    fn validate_core_history(
+        &self,
+        applied: &[MigrationRecord],
+        all_migrations: &[Box<dyn MigrationEntry>],
+    ) -> Result<(), anyhow::Error> {
+        let declarations = vec![Self::core_history_declaration(all_migrations)];
+        let applied_histories = vec![Self::core_applied_history(applied)];
+        validate_migration_history_integrity(&self.db_type, &declarations, &applied_histories)?;
+        Ok(())
+    }
+
+    fn validate_plugin_history(
+        &self,
+        applied: &[PluginMigrationRecord],
+        plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+    ) -> Result<(), anyhow::Error> {
+        let declarations = Self::plugin_history_declarations(plugin_migrations);
+        let applied_histories = Self::plugin_applied_histories(applied);
+        validate_migration_history_integrity(&self.db_type, &declarations, &applied_histories)?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // core-only helper for run_pending; production uses validate_known_history_locked
+    async fn validate_core_history_locked(
+        &self,
+        connection: &mut AnyConnection,
+    ) -> Result<(), anyhow::Error> {
+        let all_migrations = self.all_migrations();
+        let declarations = vec![Self::core_history_declaration(&all_migrations)];
+        validate_migration_history_integrity(&self.db_type, &declarations, &[])?;
+        let applied = if self.tracking_table_exists(connection, false).await? {
+            self.applied_versions(connection).await?
+        } else {
+            Vec::new()
+        };
+        let applied_histories = vec![Self::core_applied_history(&applied)];
+        validate_migration_history_integrity(&self.db_type, &declarations, &applied_histories)?;
+        Ok(())
+    }
+
+    async fn validate_known_history_locked(
+        &self,
+        connection: &mut AnyConnection,
+        plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+    ) -> Result<(), anyhow::Error> {
+        let all_migrations = self.all_migrations();
+        let mut declarations = vec![Self::core_history_declaration(&all_migrations)];
+        declarations.extend(Self::plugin_history_declarations(plugin_migrations));
+
+        // Declaration ambiguity is rejected before inspecting database history.
+        // This preflight runs under the same cross-process lock as migration
+        // work and before any tracking table, compatibility, schema, or history
+        // write can occur.
+        validate_migration_history_integrity(&self.db_type, &declarations, &[])?;
+
+        let core_applied = if self.tracking_table_exists(connection, false).await? {
+            self.applied_versions(connection).await?
+        } else {
+            Vec::new()
+        };
+        let plugin_applied = if self.tracking_table_exists(connection, true).await? {
+            self.applied_plugin_versions(connection).await?
+        } else {
+            Vec::new()
+        };
+        let mut applied_histories = vec![Self::core_applied_history(&core_applied)];
+        applied_histories.extend(Self::plugin_applied_histories(&plugin_applied));
+        validate_migration_history_integrity(&self.db_type, &declarations, &applied_histories)?;
+
+        Ok(())
+    }
+
+    /// Run pending core migrations after validating core history only.
+    ///
+    /// This helper is intentionally core-only. Production startup uses
+    /// [`Self::run_pending_with_plugin_history`] for combined validation.
+    #[allow(dead_code)] // exercised via external migration tests; production uses run_pending_with_plugin_history
     pub async fn run_pending(&self) -> Result<Vec<MigrationRecord>, anyhow::Error> {
         let mut migration_lock =
             MigrationConnectionLock::acquire(&self.pool, &self.db_type).await?;
-        let operation = self.run_pending_locked(migration_lock.connection()).await;
+        let operation = async {
+            self.validate_core_history_locked(migration_lock.connection())
+                .await?;
+            self.run_pending_locked(migration_lock.connection()).await
+        }
+        .await;
+        let release = migration_lock.finish(operation.is_ok()).await;
+        finish_locked_operation(operation, release)
+    }
+
+    /// Validate complete core and plugin history before applying pending core work.
+    ///
+    /// Startup uses this combined path even when automatic plugin migration
+    /// application is disabled or no plugins are currently compiled, so orphan,
+    /// missing, duplicate, unknown, or drifted plugin history cannot be hidden
+    /// by successful core migration or V001 compatibility work.
+    pub async fn run_pending_with_plugin_history(
+        &self,
+        plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+    ) -> Result<Vec<MigrationRecord>, anyhow::Error> {
+        let mut migration_lock =
+            MigrationConnectionLock::acquire(&self.pool, &self.db_type).await?;
+        let operation = async {
+            self.validate_known_history_locked(migration_lock.connection(), plugin_migrations)
+                .await?;
+            self.run_pending_locked(migration_lock.connection()).await
+        }
+        .await;
+        let release = migration_lock.finish(operation.is_ok()).await;
+        finish_locked_operation(operation, release)
+    }
+
+    /// Validate all known history, then apply core and plugin migrations under
+    /// one cross-process lock. No migration work starts until both histories
+    /// pass the complete sequence-integrity check.
+    pub async fn run_all_pending(
+        &self,
+        plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
+    ) -> Result<(Vec<MigrationRecord>, Vec<PluginMigrationRecord>), anyhow::Error> {
+        let mut migration_lock =
+            MigrationConnectionLock::acquire(&self.pool, &self.db_type).await?;
+        let operation = async {
+            self.validate_known_history_locked(migration_lock.connection(), plugin_migrations)
+                .await?;
+            let core = self.run_pending_locked(migration_lock.connection()).await?;
+            let plugins = if plugin_migrations.is_empty() {
+                Vec::new()
+            } else {
+                self.run_plugin_pending_locked(plugin_migrations, migration_lock.connection())
+                    .await?
+            };
+            Ok((core, plugins))
+        }
+        .await;
         let release = migration_lock.finish(operation.is_ok()).await;
         finish_locked_operation(operation, release)
     }
@@ -506,24 +1126,8 @@ impl MigrationRunner {
         let applied = self.applied_versions(connection).await?;
         let applied_versions: Vec<i64> = applied.iter().map(|r| r.version).collect();
 
-        // Validate checksums of applied migrations
         let all_migrations = self.all_migrations();
-        for record in &applied {
-            if let Some(migration) = all_migrations
-                .iter()
-                .find(|m| m.version() == record.version)
-                && migration.checksum() != record.checksum
-            {
-                warn!(
-                    "Migration V{} ({}) checksum mismatch: expected '{}', found '{}' in database. \
-                     This may indicate the migration source was modified after being applied.",
-                    record.version,
-                    record.name,
-                    migration.checksum(),
-                    record.checksum
-                );
-            }
-        }
+        self.validate_core_history(&applied, &all_migrations)?;
 
         let mut newly_applied = Vec::new();
 
@@ -591,7 +1195,9 @@ impl MigrationRunner {
         Ok(newly_applied)
     }
 
-    /// Get current migration status (applied and pending).
+    /// Get core migration status after validating core history only.
+    ///
+    /// Combined operator status paths must also call [`Self::plugin_status`].
     pub async fn status(&self) -> Result<MigrationStatus, anyhow::Error> {
         let mut connection = self.pool.acquire().await?;
         let applied = if self.tracking_table_exists(&mut connection, false).await? {
@@ -602,6 +1208,7 @@ impl MigrationRunner {
         let applied_versions: Vec<i64> = applied.iter().map(|r| r.version).collect();
 
         let all_migrations = self.all_migrations();
+        self.validate_core_history(&applied, &all_migrations)?;
         let pending: Vec<PendingMigration> = all_migrations
             .iter()
             .filter(|m| !applied_versions.contains(&m.version()))
@@ -703,15 +1310,19 @@ impl MigrationRunner {
         &self,
         plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
     ) -> Result<Vec<PluginMigrationRecord>, anyhow::Error> {
-        if plugin_migrations.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut migration_lock =
             MigrationConnectionLock::acquire(&self.pool, &self.db_type).await?;
-        let operation = self
-            .run_plugin_pending_locked(plugin_migrations, migration_lock.connection())
-            .await;
+        let operation = async {
+            self.validate_known_history_locked(migration_lock.connection(), plugin_migrations)
+                .await?;
+            if plugin_migrations.is_empty() {
+                Ok(Vec::new())
+            } else {
+                self.run_plugin_pending_locked(plugin_migrations, migration_lock.connection())
+                    .await
+            }
+        }
+        .await;
         let release = migration_lock.finish(operation.is_ok()).await;
         finish_locked_operation(operation, release)
     }
@@ -726,31 +1337,15 @@ impl MigrationRunner {
         // Re-read only after the cross-process lock is held so a waiter sees
         // and skips every tracking row committed by the winner.
         let applied = self.applied_plugin_versions(connection).await?;
+        self.validate_plugin_history(&applied, plugin_migrations)?;
         let mut newly_applied = Vec::new();
 
         for (plugin_name, migrations) in plugin_migrations {
-            // Validate checksums of already-applied migrations for this plugin
             let plugin_applied: Vec<&PluginMigrationRecord> = applied
                 .iter()
                 .filter(|r| r.plugin_name == *plugin_name)
                 .collect();
             let applied_versions: Vec<i64> = plugin_applied.iter().map(|r| r.version).collect();
-
-            for record in &plugin_applied {
-                if let Some(migration) = migrations.iter().find(|m| m.version == record.version)
-                    && migration.checksum != record.checksum
-                {
-                    warn!(
-                        "Plugin '{}' migration V{} ({}) checksum mismatch: expected '{}', found '{}' in database. \
-                         This may indicate the migration source was modified after being applied.",
-                        plugin_name,
-                        record.version,
-                        record.name,
-                        migration.checksum,
-                        record.checksum
-                    );
-                }
-            }
 
             for migration in migrations {
                 if applied_versions.contains(&migration.version) {
@@ -908,17 +1503,30 @@ impl MigrationRunner {
         Ok(newly_applied)
     }
 
-    /// Get current custom plugin migration status (applied and pending).
+    /// Get custom-plugin status after validating complete core and plugin history.
     pub async fn plugin_status(
         &self,
         plugin_migrations: &[(&str, Vec<CustomPluginMigration>)],
     ) -> Result<PluginMigrationStatus, anyhow::Error> {
         let mut connection = self.pool.acquire().await?;
+        let all_migrations = self.all_migrations();
+        let mut declarations = vec![Self::core_history_declaration(&all_migrations)];
+        declarations.extend(Self::plugin_history_declarations(plugin_migrations));
+        validate_migration_history_integrity(&self.db_type, &declarations, &[])?;
+
+        let core_applied = if self.tracking_table_exists(&mut connection, false).await? {
+            self.applied_versions(&mut connection).await?
+        } else {
+            Vec::new()
+        };
         let applied = if self.tracking_table_exists(&mut connection, true).await? {
             self.applied_plugin_versions(&mut connection).await?
         } else {
             Vec::new()
         };
+        let mut applied_histories = vec![Self::core_applied_history(&core_applied)];
+        applied_histories.extend(Self::plugin_applied_histories(&applied));
+        validate_migration_history_integrity(&self.db_type, &declarations, &applied_histories)?;
 
         let mut pending = Vec::new();
         for (plugin_name, migrations) in plugin_migrations {

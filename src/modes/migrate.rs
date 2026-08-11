@@ -12,7 +12,7 @@ use tracing::{error, info};
 
 use crate::config::EnvConfig;
 use crate::config::config_migration::ConfigMigrator;
-use crate::config::migrations::MigrationRunner;
+use crate::config::migrations::{MigrationRunner, bounded_migration_diagnostic_field};
 use crate::config::types::CURRENT_CONFIG_VERSION;
 
 fn sql_migration_pool_options(db_type: &str) -> sqlx::any::AnyPoolOptions {
@@ -104,52 +104,62 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
     .await?;
 
     let runner = MigrationRunner::new(pool, db_type.to_string());
+    let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
 
     if dry_run {
         info!("Dry run mode — checking pending migrations without applying");
         let status = runner.status().await?;
+        let plugin_status = runner.plugin_status(&plugin_migrations).await?;
 
         if status.pending.is_empty() {
             println!("Database schema is up to date. No pending migrations.");
         } else {
             println!("Pending migrations that would be applied:");
             for m in &status.pending {
-                println!("  V{}: {}", m.version, m.name);
+                println!(
+                    "  V{}: {}",
+                    m.version,
+                    bounded_migration_diagnostic_field(&m.name)
+                );
             }
         }
 
         // Custom plugin migrations (dry run)
-        let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
         if !plugin_migrations.is_empty() {
-            let plugin_status = runner.plugin_status(&plugin_migrations).await?;
             if plugin_status.pending.is_empty() {
                 println!("\nCustom plugin migrations are up to date. No pending migrations.");
             } else {
                 println!("\nPending custom plugin migrations that would be applied:");
                 for m in &plugin_status.pending {
-                    println!("  [{}] V{}: {}", m.plugin_name, m.version, m.name);
+                    println!(
+                        "  [{}] V{}: {}",
+                        bounded_migration_diagnostic_field(&m.plugin_name),
+                        m.version,
+                        bounded_migration_diagnostic_field(&m.name)
+                    );
                 }
             }
         }
     } else {
         info!("Running pending database migrations...");
-        let applied = runner.run_pending().await?;
+        let (applied, plugin_applied) = runner.run_all_pending(&plugin_migrations).await?;
 
         if applied.is_empty() {
             println!("Database schema is up to date. No migrations applied.");
         } else {
             println!("Applied {} migration(s):", applied.len());
             for m in &applied {
-                println!("  V{}: {} ({}ms)", m.version, m.name, m.execution_time_ms);
+                println!(
+                    "  V{}: {} ({}ms)",
+                    m.version,
+                    bounded_migration_diagnostic_field(&m.name),
+                    m.execution_time_ms
+                );
             }
         }
 
         // Custom plugin migrations
-        let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
         if !plugin_migrations.is_empty() {
-            info!("Running pending custom plugin migrations...");
-            let plugin_applied = runner.run_plugin_pending(&plugin_migrations).await?;
-
             if plugin_applied.is_empty() {
                 println!("\nCustom plugin migrations are up to date. No migrations applied.");
             } else {
@@ -160,7 +170,10 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
                 for m in &plugin_applied {
                     println!(
                         "  [{}] V{}: {} ({}ms)",
-                        m.plugin_name, m.version, m.name, m.execution_time_ms
+                        bounded_migration_diagnostic_field(&m.plugin_name),
+                        m.version,
+                        bounded_migration_diagnostic_field(&m.name),
+                        m.execution_time_ms
                     );
                 }
             }
@@ -271,6 +284,8 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
 
     let runner = MigrationRunner::new(pool, db_type.to_string());
     let status = runner.status().await?;
+    let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
+    let plugin_status = runner.plugin_status(&plugin_migrations).await?;
 
     println!("=== Ferrum Edge Migration Status ===\n");
 
@@ -281,7 +296,10 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
         for m in &status.applied {
             println!(
                 "  V{}: {} (applied: {}, checksum: {})",
-                m.version, m.name, m.applied_at, m.checksum
+                m.version,
+                bounded_migration_diagnostic_field(&m.name),
+                bounded_migration_diagnostic_field(&m.applied_at),
+                bounded_migration_diagnostic_field(&m.checksum)
             );
         }
     }
@@ -293,15 +311,16 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
     } else {
         println!("Pending migrations:");
         for m in &status.pending {
-            println!("  V{}: {}", m.version, m.name);
+            println!(
+                "  V{}: {}",
+                m.version,
+                bounded_migration_diagnostic_field(&m.name)
+            );
         }
     }
 
     // Custom plugin migration status
-    let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
     if !plugin_migrations.is_empty() {
-        let plugin_status = runner.plugin_status(&plugin_migrations).await?;
-
         println!("\n=== Custom Plugin Migration Status ===\n");
 
         if plugin_status.applied.is_empty() {
@@ -311,7 +330,11 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
             for m in &plugin_status.applied {
                 println!(
                     "  [{}] V{}: {} (applied: {}, checksum: {})",
-                    m.plugin_name, m.version, m.name, m.applied_at, m.checksum
+                    bounded_migration_diagnostic_field(&m.plugin_name),
+                    m.version,
+                    bounded_migration_diagnostic_field(&m.name),
+                    bounded_migration_diagnostic_field(&m.applied_at),
+                    bounded_migration_diagnostic_field(&m.checksum)
                 );
             }
         }
@@ -323,7 +346,12 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
         } else {
             println!("Pending plugin migrations:");
             for m in &plugin_status.pending {
-                println!("  [{}] V{}: {}", m.plugin_name, m.version, m.name);
+                println!(
+                    "  [{}] V{}: {}",
+                    bounded_migration_diagnostic_field(&m.plugin_name),
+                    m.version,
+                    bounded_migration_diagnostic_field(&m.name)
+                );
             }
         }
     }

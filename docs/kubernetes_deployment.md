@@ -936,6 +936,8 @@ This lets Ferrum Edge start with a previously exported config while database pol
 
 Ferrum Edge can discover upstream targets directly from Kubernetes `EndpointSlice` objects. When you use that feature, the service account needs permission to list EndpointSlices in the target namespace.
 
+Eligibility matches the Kubernetes controller path: endpoints with `conditions.terminating=true` are never routable (including `publishNotReadyAddresses`-style `ready=true` while terminating), explicitly non-serving endpoints are skipped, and omitted `ready`/`serving` fields follow Kubernetes tri-state defaults (missing `conditions` is eligible). Snapshot ingestion recomputes the published load-balancer target set, so an endpoint that transitions to terminating or non-serving is removed atomically on the next successful poll without affecting healthy peers.
+
 RBAC example:
 
 ```yaml

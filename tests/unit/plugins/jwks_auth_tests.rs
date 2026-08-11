@@ -4,8 +4,9 @@ use ferrum_edge::ConsumerIndex;
 use ferrum_edge::config::types::AuthMode;
 use ferrum_edge::plugins::{
     HTTP_FAMILY_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginHttpClient, RequestContext,
-    jwks_auth::JwksAuth, key_auth::KeyAuth, priority, validate_plugin_config,
-    validate_plugin_config_with_policy,
+    jwks_auth::{JwksAuth, MAX_JWKS_MAX_STALE_SECONDS},
+    key_auth::KeyAuth,
+    priority, validate_plugin_config, validate_plugin_config_with_policy,
 };
 use ferrum_edge::proxy::run_authentication_phase;
 use serde_json::{Value, json};
@@ -150,7 +151,7 @@ fn create_rs256_token_no_kid(claims: &Value, private_key_pem: &[u8]) -> String {
 }
 
 /// Build a JWKS JSON response from an RSA public key PEM.
-fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
+pub(super) fn build_rsa_jwks_from_pem(public_key_pem: &[u8]) -> serde_json::Value {
     build_rsa_jwks_from_pem_with_kid(public_key_pem, "test-key-1")
 }
 
@@ -235,7 +236,7 @@ fn parse_asn1_length(data: &[u8]) -> (usize, usize) {
 }
 
 /// Helper: start a wiremock server serving a JWKS endpoint and return (server, jwks_uri).
-async fn start_jwks_server(public_key_pem: &[u8]) -> (wiremock::MockServer, String) {
+pub(super) async fn start_jwks_server(public_key_pem: &[u8]) -> (wiremock::MockServer, String) {
     let mock_server = wiremock::MockServer::start().await;
     let jwks_json = build_rsa_jwks_from_pem(public_key_pem);
     let jwks_path = unique_jwks_path("jwks");
@@ -248,7 +249,10 @@ async fn start_jwks_server(public_key_pem: &[u8]) -> (wiremock::MockServer, Stri
     (mock_server, jwks_uri)
 }
 
-async fn wait_for_received_request_count(server: &wiremock::MockServer, at_least: usize) -> usize {
+pub(super) async fn wait_for_received_request_count(
+    server: &wiremock::MockServer,
+    at_least: usize,
+) -> usize {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
     loop {
         let count = server
@@ -372,6 +376,57 @@ async fn test_jwks_auth_rejects_zero_refresh_interval() {
             .unwrap()
             .contains("jwks_refresh_interval_secs")
     );
+}
+
+#[test]
+fn jwks_max_stale_is_finite_bounded_and_cannot_be_disabled() {
+    let base = |value| {
+        json!({
+            "providers": [{"jwks_uri": "https://keys.example.com/jwks"}],
+            "jwks_refresh_interval_secs": 30,
+            "jwks_max_stale_seconds": value
+        })
+    };
+    for invalid in [0, MAX_JWKS_MAX_STALE_SECONDS + 1] {
+        let error = JwksAuth::new(&base(invalid), default_client())
+            .err()
+            .expect("out-of-range max stale must fail");
+        assert!(error.contains("jwks_max_stale_seconds"));
+    }
+
+    let shorter_than_refresh = json!({
+        "providers": [{"jwks_uri": "https://keys.example.com/jwks"}],
+        "jwks_refresh_interval_secs": 60,
+        "jwks_max_stale_seconds": 30
+    });
+    assert!(
+        JwksAuth::new(&shorter_than_refresh, default_client())
+            .err()
+            .expect("refresh beyond trust deadline must fail")
+            .contains("must be <=")
+    );
+}
+
+#[test]
+fn provider_max_stale_override_is_reported_for_shared_store_arbitration() {
+    let uri = "https://keys.example.com/jwks";
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [
+                {"jwks_uri": uri, "jwks_max_stale_seconds": 1_800},
+                {"jwks_uri": uri, "jwks_max_stale_seconds": 600}
+            ],
+            "jwks_refresh_interval_secs": 300,
+            "jwks_max_stale_seconds": 3_600
+        }),
+        default_client(),
+    )
+    .expect("provider overrides are valid");
+
+    let requirements = plugin.active_jwks_refresh_requirements();
+    assert_eq!(requirements.len(), 2);
+    assert_eq!(requirements[0].1.max_stale.as_secs(), 1_800);
+    assert_eq!(requirements[1].1.max_stale.as_secs(), 600);
 }
 
 #[tokio::test]
@@ -2970,4 +3025,243 @@ async fn test_jwks_auth_no_request_principal_when_no_token() {
         !ctx.metadata.contains_key("mesh.request_principal"),
         "request_principal should not be set for anonymous requests"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Discovery-backed trust health parity (issue #3739)
+// ---------------------------------------------------------------------------
+
+/// Mount a discovery document plus its JWKS endpoint on one server and return
+/// `(discovery_url, jwks_uri)`.
+async fn mount_discovery_and_jwks(
+    server: &wiremock::MockServer,
+    public_key_pem: &[u8],
+) -> (String, String) {
+    let jwks_path = unique_jwks_path("trust-jwks");
+    let jwks_uri = format!("{}{jwks_path}", server.uri());
+    let discovery_path = unique_jwks_path("trust-discovery");
+    let discovery_url = format!("{}{discovery_path}", server.uri());
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(jwks_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
+        .mount(server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(discovery_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({ "jwks_uri": jwks_uri })),
+        )
+        .mount(server)
+        .await;
+    (discovery_url, jwks_uri)
+}
+
+async fn wait_for_active_remote_stores(expected: u64) -> u64 {
+    use ferrum_edge::plugins::utils::jwks_cache::trust_health_snapshot;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    loop {
+        let snapshot = trust_health_snapshot();
+        let total = snapshot.fresh + snapshot.grace + snapshot.expired;
+        if total == expected || tokio::time::Instant::now() >= deadline {
+            return total;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn discovery_resolved_after_publication_becomes_active_without_another_reload() {
+    use ferrum_edge::plugins::utils::jwks_cache::{cached_requirement, clear_jwks_cache};
+
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let server = wiremock::MockServer::start().await;
+    let (discovery_url, jwks_uri) = mount_discovery_and_jwks(&server, public_key_pem).await;
+    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"discovery_url": discovery_url, "jwks_max_stale_seconds": 900}],
+            "jwks_refresh_interval_secs": 300
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    // Publication order in PluginCache: stage workers, install the generation,
+    // reconcile requirements, then commit. Discovery here resolves only after
+    // the reconciliation, which is exactly the case that previously left the
+    // store invisible to readiness and metrics.
+    plugin
+        .start_background_tasks()
+        .expect("test runtime should start JWKS tasks");
+    ferrum_edge::plugins::utils::jwks_cache::retain_active_requirements(
+        &std::collections::HashMap::new(),
+    );
+    plugin.commit_background_tasks();
+
+    assert_eq!(
+        wait_for_active_remote_stores(1).await,
+        1,
+        "a committed discovery-backed store must join the active trust aggregate"
+    );
+    let requirement = cached_requirement(&jwks_uri).expect("discovered store is cached");
+    assert_eq!(
+        requirement.max_stale,
+        tokio::time::Duration::from_secs(900),
+        "the discovered store must carry this provider's exact max-stale bound"
+    );
+    assert_eq!(
+        requirement.refresh_interval,
+        tokio::time::Duration::from_secs(300)
+    );
+
+    drop(plugin);
+    assert_eq!(
+        wait_for_active_remote_stores(0).await,
+        0,
+        "retiring the owning generation must withdraw its contribution"
+    );
+    clear_jwks_cache();
+}
+
+#[tokio::test]
+async fn staged_discovery_is_withheld_until_commit_and_a_rejected_generation_leaves_nothing() {
+    use ferrum_edge::plugins::utils::jwks_cache::{clear_jwks_cache, trust_health_snapshot};
+
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let server = wiremock::MockServer::start().await;
+    let (discovery_url, _jwks_uri) = mount_discovery_and_jwks(&server, public_key_pem).await;
+    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let build = || {
+        JwksAuth::new(
+            &json!({
+                "providers": [{
+                    "discovery_url": discovery_url.clone(),
+                    "jwks_max_stale_seconds": 900
+                }],
+                "jwks_refresh_interval_secs": 300
+            }),
+            default_client(),
+        )
+        .unwrap()
+    };
+
+    // A staged generation whose discovery task already published into its local
+    // slot must contribute nothing, and a rejected one must not stick.
+    let rejected = build();
+    rejected
+        .start_background_tasks()
+        .expect("test runtime should start JWKS tasks");
+    wait_for_received_request_count(&server, 2).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    let staged = trust_health_snapshot();
+    assert_eq!(
+        (staged.fresh, staged.grace, staged.expired),
+        (0, 0, 0),
+        "an unpublished generation must not reach readiness or metrics"
+    );
+    drop(rejected);
+    let after_reject = trust_health_snapshot();
+    assert_eq!(
+        (after_reject.fresh, after_reject.grace, after_reject.expired),
+        (0, 0, 0),
+        "a rejected staged generation must leave no active contribution"
+    );
+
+    // The same resolution, once its generation commits, is adopted at commit
+    // rather than at some later reload.
+    let committed = build();
+    committed
+        .start_background_tasks()
+        .expect("test runtime should start JWKS tasks");
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    committed.commit_background_tasks();
+    assert_eq!(
+        wait_for_active_remote_stores(1).await,
+        1,
+        "commit must adopt a store discovery resolved while the generation was staged"
+    );
+
+    drop(committed);
+    assert_eq!(wait_for_active_remote_stores(0).await, 0);
+    clear_jwks_cache();
+}
+
+async fn wait_for_cached_max_stale(jwks_uri: &str, expected_secs: u64) {
+    use ferrum_edge::plugins::utils::jwks_cache::cached_requirement;
+    let expected = tokio::time::Duration::from_secs(expected_secs);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    loop {
+        let observed = cached_requirement(jwks_uri).map(|requirement| requirement.max_stale);
+        if observed == Some(expected) || tokio::time::Instant::now() >= deadline {
+            assert_eq!(
+                observed,
+                Some(expected),
+                "shared store must settle on the strictest active max-stale"
+            );
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn shared_discovery_uri_relaxes_only_after_the_stricter_generation_retires() {
+    use ferrum_edge::plugins::utils::jwks_cache::clear_jwks_cache;
+
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let server = wiremock::MockServer::start().await;
+    let (discovery_url, jwks_uri) = mount_discovery_and_jwks(&server, public_key_pem).await;
+    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let build = |max_stale_secs: u64| {
+        JwksAuth::new(
+            &json!({
+                "providers": [{
+                    "discovery_url": discovery_url.clone(),
+                    "jwks_max_stale_seconds": max_stale_secs
+                }],
+                "jwks_refresh_interval_secs": 300
+            }),
+            default_client(),
+        )
+        .unwrap()
+    };
+
+    // Publish the relaxed consumer first and observe its contribution land.
+    let relaxed = build(3_600);
+    start_background_tasks(&relaxed);
+    assert_eq!(wait_for_active_remote_stores(1).await, 1);
+    wait_for_cached_max_stale(&jwks_uri, 3_600).await;
+
+    // A second committed consumer of the same discovered URI tightens it.
+    let strict = build(600);
+    start_background_tasks(&strict);
+    wait_for_cached_max_stale(&jwks_uri, 600).await;
+    assert_eq!(
+        wait_for_active_remote_stores(1).await,
+        1,
+        "same-URI consumers share exactly one active store"
+    );
+
+    // Relaxation happens only once the stricter committed consumer is gone,
+    // and must not deactivate the surviving co-tenant.
+    drop(strict);
+    wait_for_cached_max_stale(&jwks_uri, 3_600).await;
+    assert_eq!(
+        wait_for_active_remote_stores(1).await,
+        1,
+        "retiring one consumer must not deactivate the surviving co-tenant"
+    );
+
+    drop(relaxed);
+    assert_eq!(wait_for_active_remote_stores(0).await, 0);
+    clear_jwks_cache();
 }

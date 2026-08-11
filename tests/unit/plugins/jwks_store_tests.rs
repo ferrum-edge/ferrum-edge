@@ -1,8 +1,17 @@
 //! Tests for JWKS key store module
 
 use ferrum_edge::plugins::utils::PluginHttpClient;
-use ferrum_edge::plugins::utils::jwks_store::{JwksKeyStore, redacted_jwks_uri};
+use ferrum_edge::plugins::utils::jwks_store::{
+    JwksFailureClass, JwksKeyStore, JwksTrustState, redacted_jwks_uri,
+};
 use serde_json::json;
+use std::time::Duration;
+
+fn has_trusted_key(store: &JwksKeyStore, kid: &str) -> bool {
+    store
+        .trusted_keys()
+        .is_some_and(|keys| keys.contains_key(kid))
+}
 
 #[test]
 fn test_empty_store_has_no_keys() {
@@ -11,7 +20,7 @@ fn test_empty_store_has_no_keys() {
         PluginHttpClient::default(),
     );
     assert!(!store.has_keys());
-    assert!(store.get_key("nonexistent").is_none());
+    assert!(!has_trusted_key(&store, "nonexistent"));
 }
 
 #[test]
@@ -22,27 +31,27 @@ fn test_jwks_uri_accessor() {
 }
 
 #[test]
-fn test_all_keys_returns_empty_map_initially() {
+fn test_trusted_keys_returns_none_initially() {
     let store = JwksKeyStore::new(
         "https://example.com/.well-known/jwks.json".to_string(),
         PluginHttpClient::default(),
     );
-    let all = store.all_keys();
-    assert!(all.is_empty());
+    let all = store.trusted_keys();
+    assert!(all.is_none());
 }
 
 #[test]
-fn test_get_key_with_various_kid_values() {
+fn test_trusted_keys_rejects_various_kid_values_in_empty_store() {
     let store = JwksKeyStore::new(
         "https://example.com/.well-known/jwks.json".to_string(),
         PluginHttpClient::default(),
     );
 
     // Various kid patterns should all return None on empty store
-    assert!(store.get_key("").is_none());
-    assert!(store.get_key("kid-123").is_none());
-    assert!(store.get_key("abc-def-ghi").is_none());
-    assert!(store.get_key("a".repeat(256).as_str()).is_none());
+    assert!(!has_trusted_key(&store, ""));
+    assert!(!has_trusted_key(&store, "kid-123"));
+    assert!(!has_trusted_key(&store, "abc-def-ghi"));
+    assert!(!has_trusted_key(&store, "a".repeat(256).as_str()));
 }
 
 #[test]
@@ -119,7 +128,7 @@ fn jwk_key_ops_must_authorize_signature_verification() {
     ] {
         let store = JwksKeyStore::from_inline_jwks(&accepted)
             .expect("verification-capable key should be accepted");
-        assert!(store.get_key("k1").is_some());
+        assert!(has_trusted_key(&store, "k1"));
     }
 
     for rejected in [
@@ -171,13 +180,11 @@ fn populated_rsa_jwks() -> serde_json::Value {
     })
 }
 
-/// Regression test for finding #28: a successful JWKS fetch that returns zero
-/// keys must NOT wipe a previously-populated cache. The first fetch populates
-/// the store; the second fetch returns `{"keys": []}` and must leave the
-/// last-known-good key in place so authentication keeps working through a
-/// transient empty 200 (e.g. a mid-rotation IdP).
+/// An empty 200 retains diagnostic/recovery keys only inside the configured
+/// grace window, then fails closed without deleting them. A later valid set
+/// atomically restores trust without a restart.
 #[tokio::test]
-async fn test_empty_fetch_retains_last_known_good_keys() {
+async fn empty_fetch_expires_bounded_trust_and_valid_recovery_restores_it() {
     let server = wiremock::MockServer::start().await;
 
     // Priority 1 (highest), exhausted after a single hit: serves the populated
@@ -202,6 +209,7 @@ async fn test_empty_fetch_retains_last_known_good_keys() {
         format!("{}/jwks", server.uri()),
         PluginHttpClient::default(),
     );
+    store.configure_trust_policy(Duration::from_millis(100), Duration::from_secs(1));
 
     // First fetch populates the cache.
     let count = store
@@ -210,27 +218,67 @@ async fn test_empty_fetch_retains_last_known_good_keys() {
         .expect("first fetch should succeed");
     assert_eq!(count, 1);
     assert!(store.has_keys());
-    assert!(store.get_key("k1").is_some());
+    assert!(has_trusted_key(&store, "k1"));
 
-    // Second fetch returns zero keys; the cache must be retained, not wiped.
-    let count = store
+    // Second fetch returns zero keys. It is a failed refresh and cannot move
+    // the trust deadline, while the retained key remains usable during grace.
+    let error = store
         .fetch_keys()
         .await
-        .expect("empty fetch should succeed without error");
-    assert_eq!(count, 1, "empty fetch must report the retained key count");
+        .expect_err("empty fetch must be a failed trust refresh");
+    assert!(error.contains("empty"));
+    assert_eq!(store.health_snapshot().trust_state, JwksTrustState::Grace);
     assert!(
         store.has_keys(),
-        "an empty 200 must not discard last-known-good keys"
+        "an empty 200 must not delete diagnostic/recovery state"
     );
     assert!(
-        store.get_key("k1").is_some(),
-        "the previously cached key must still be present"
+        has_trusted_key(&store, "k1"),
+        "the previously cached key remains trusted only during grace"
     );
+    assert!(
+        store.fetch_keys().await.is_err(),
+        "a repeated empty 200 must remain a failed refresh"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let expired = store.health_snapshot();
+    assert_eq!(expired.trust_state, JwksTrustState::Expired);
+    assert_eq!(expired.last_failure, Some(JwksFailureClass::Empty));
+    assert_eq!(expired.consecutive_failures, 2);
+    assert!(
+        store.has_keys(),
+        "expiry must preserve retained recovery state"
+    );
+    assert!(
+        !has_trusted_key(&store, "k1"),
+        "expired keys must not verify"
+    );
+
+    server.reset().await;
+    let recovered = json!({
+        "keys": [{
+            "kty": "RSA",
+            "kid": "k2",
+            "use": "sig",
+            "alg": "RS256",
+            "n": "AQAB",
+            "e": "AQAB"
+        }]
+    });
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(recovered))
+        .mount(&server)
+        .await;
+    assert_eq!(store.fetch_keys().await.expect("valid recovery fetch"), 1);
+    assert_eq!(store.health_snapshot().trust_state, JwksTrustState::Fresh);
+    assert!(!has_trusted_key(&store, "k1"));
+    assert!(has_trusted_key(&store, "k2"));
 }
 
-/// An initially-empty store that receives an empty fetch stays empty and does
-/// not error — initial population is still allowed to observe a legitimately
-/// empty JWKS (the cache-retention guard only protects a non-empty cache).
+/// An initially-empty store treats an empty 200 as a failed refresh so the
+/// background worker uses accelerated bounded retry.
 #[tokio::test]
 async fn test_empty_fetch_on_empty_store_stays_empty() {
     let server = wiremock::MockServer::start().await;
@@ -245,12 +293,13 @@ async fn test_empty_fetch_on_empty_store_stays_empty() {
         PluginHttpClient::default(),
     );
 
-    let count = store
+    let error = store
         .fetch_keys()
         .await
-        .expect("empty fetch should succeed");
-    assert_eq!(count, 0);
+        .expect_err("empty fetch must not count as a key-trust success");
+    assert!(error.contains("empty"));
     assert!(!store.has_keys());
+    assert_eq!(store.health_snapshot().trust_state, JwksTrustState::Expired);
 }
 
 #[tokio::test]
@@ -272,8 +321,43 @@ async fn test_oversized_jwks_response_is_rejected_without_populating_store() {
         .fetch_keys()
         .await
         .expect_err("oversized JWKS must be rejected");
-    assert!(error.contains("response rejected"));
+    assert!(error.contains("oversized"));
     assert!(!store.has_keys());
+    assert_eq!(
+        store.health_snapshot().last_failure,
+        Some(JwksFailureClass::Oversized)
+    );
+}
+
+#[tokio::test]
+async fn non_success_and_malformed_responses_record_bounded_failure_classes() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(wiremock::ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let store = JwksKeyStore::new(
+        format!("{}/jwks", server.uri()),
+        PluginHttpClient::default(),
+    );
+
+    assert!(store.fetch_keys().await.is_err());
+    assert_eq!(
+        store.health_snapshot().last_failure,
+        Some(JwksFailureClass::HttpStatus)
+    );
+
+    server.reset().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("not-json"))
+        .mount(&server)
+        .await;
+    assert!(store.fetch_keys().await.is_err());
+    let health = store.health_snapshot();
+    assert_eq!(health.last_failure, Some(JwksFailureClass::Malformed));
+    assert_eq!(health.consecutive_failures, 2);
 }
 
 #[tokio::test]
@@ -301,5 +385,5 @@ async fn test_oversized_refresh_retains_last_known_good_keys() {
 
     assert_eq!(store.fetch_keys().await.expect("initial fetch"), 1);
     assert!(store.fetch_keys().await.is_err());
-    assert!(store.get_key("k1").is_some());
+    assert!(has_trusted_key(&store, "k1"));
 }

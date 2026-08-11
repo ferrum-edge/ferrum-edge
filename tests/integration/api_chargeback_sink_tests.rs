@@ -24,6 +24,9 @@ fn per_event_summary(request_id: &str) -> TransactionSummary {
     let mut metadata = HashMap::new();
     metadata.insert("request_id".to_string(), request_id.to_string());
     TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         timestamp_received: "2026-05-23T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
@@ -181,6 +184,9 @@ async fn clickhouse_insert_round_trip_when_configured() {
     let mut metadata = HashMap::new();
     metadata.insert("request_id".to_string(), "it-request".to_string());
     let summary = TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         timestamp_received: "2026-05-23T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),

@@ -281,6 +281,13 @@ impl InventoryEntryBuilder {
                 entry.error = Some(source.to_string());
                 return entry;
             }
+            // `MaterialError::Oversized` deliberately falls through to the
+            // generic arm below: its `Display` is already the stable,
+            // source-redacted classification (no path, provider id, secret
+            // name, or PEM fragment), and `Invalid` is the state it needs.
+            // Re-rendering that sentence here would be a second copy of one
+            // operator-facing string that could silently drift from the
+            // `#[error]` attribute that defines it.
             Err(error) => {
                 entry.state = TlsInventoryState::Invalid;
                 entry.error = Some(error.to_string());

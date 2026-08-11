@@ -15,6 +15,9 @@
 {{- end -}}
 {{- $ambientSpireUsesNodeName := contains "$(FERRUM_K8S_NODE_NAME)" $ambientSpireWorkloadSpiffeId -}}
 {{- $ambientTopology := replace "-" "_" (lower (trim (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY")))) -}}
+{{- if and (eq $ambientTopology "ambient") (not .Values.nodeAgent.enabled) -}}
+{{- fail "ambient topology requires nodeAgent.enabled=true: the UDP placement guard and registry must remain durable even while UDP capture is disabled" -}}
+{{- end -}}
 {{- $nodeWaypointRegistryEnabled := eq $ambientTopology "node_waypoint" -}}
 {{- $nodeWaypointRegistryMountPath := toString .Values.nodeAgent.podRegistryDir -}}
 {{- if hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" -}}
@@ -54,6 +57,11 @@
 {{- if and $ambientUdpHostNetns (ne $ambientTopology "ambient") -}}
 {{- fail "ambient FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true requires FERRUM_MESH_TOPOLOGY=ambient" -}}
 {{- end -}}
+{{- $ambientUdpMigrationPhase := "stable" -}}
+{{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE" -}}
+{{- $ambientUdpMigrationPhase = index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE" | toString | trim -}}
+{{- end -}}
+{{- $ambientUdpMigrationFrom := default "" (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM") | toString | trim -}}
 {{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
 {{- /* Keep registry/cleanup wiring active for every Ambient node-agent pair,
        even when captureMode=iptables. The node-agent must then hit the Rust
@@ -86,7 +94,8 @@
        privileges. Note the disabled-cleanup manager still enters pod netns to
        reap predecessor rules, so the lifecycle term keeps them when UDP capture
        is off. */ -}}
-{{- $ambientSetnsCapture := or $nodeWaypointRegistryEnabled (and $ambientUdpLifecycle (not $ambientUdpHostNetns)) -}}
+{{- $ambientUdpMigrationNeedsSetns := and (eq $ambientUdpMigrationPhase "cleanup") (has $ambientUdpMigrationFrom (list "pod-netns" "disabled")) -}}
+{{- $ambientSetnsCapture := or $nodeWaypointRegistryEnabled (and $ambientUdpLifecycle (or (not $ambientUdpHostNetns) $ambientUdpMigrationNeedsSetns)) -}}
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
 {{- $ambientAdminPort := "9000" -}}
@@ -99,8 +108,32 @@
 {{- end -}}
 {{- $ambientAdminProbeHost := include "ferrum-mesh.adminProbeHost" $ambientAdminBindAddress -}}
 {{- $nodeAgentAdminPort := toString .Values.nodeAgent.admin.port -}}
+{{- /* Preserve integer httpsPort=0; Sprig `default` would treat 0 as empty. */ -}}
+{{- $nodeAgentAdminHttpsPort := toString .Values.nodeAgent.admin.httpsPort -}}
 {{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled (ne $ambientAdminPort "0") (eq $ambientAdminPort $nodeAgentAdminPort) -}}
 {{- fail (printf "ambient and nodeAgent both use hostNetwork and FERRUM_ADMIN_HTTP_PORT=%s; set ambient.env.FERRUM_ADMIN_HTTP_PORT or nodeAgent.admin.port to distinct ports, or set one listener port to 0" $ambientAdminPort) -}}
+{{- end -}}
+{{- /* Compare only HTTPS surfaces that will actually bind. Ambient inherits the
+       binary default HTTPS port 9443, but without admin TLS material no HTTPS
+       socket is opened — do not invent a collision against node-agent HTTPS. */ -}}
+{{- $ambientAdminHttpsPort := "9443" -}}
+{{- if hasKey $ambientEnv "FERRUM_ADMIN_HTTPS_PORT" -}}
+{{- $ambientAdminHttpsPort = toString (index $ambientEnv "FERRUM_ADMIN_HTTPS_PORT") -}}
+{{- end -}}
+{{- $ambientAdminHttpsActive := and (ne $ambientAdminHttpsPort "0") (hasKey $ambientEnv "FERRUM_ADMIN_TLS_CERT_PATH") (hasKey $ambientEnv "FERRUM_ADMIN_TLS_KEY_PATH") -}}
+{{- $nodeAgentAdminTls := .Values.nodeAgent.admin.tls | default dict -}}
+{{- $nodeAgentAdminTlsConfigured := include "ferrum-mesh.nodeAgentAdminTlsConfigured" $nodeAgentAdminTls -}}
+{{- $nodeAgentAdminHttpsActive := and (ne $nodeAgentAdminHttpsPort "0") $nodeAgentAdminTlsConfigured -}}
+{{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled $ambientAdminHttpsActive $nodeAgentAdminHttpsActive (eq $ambientAdminHttpsPort $nodeAgentAdminHttpsPort) -}}
+{{- fail (printf "ambient and nodeAgent both use hostNetwork and FERRUM_ADMIN_HTTPS_PORT=%s; set ambient.env.FERRUM_ADMIN_HTTPS_PORT or nodeAgent.admin.httpsPort to distinct ports, or set one listener port to 0" $ambientAdminHttpsPort) -}}
+{{- end -}}
+{{- /* Cross-protocol hostNetwork collisions: ambient HTTP vs node-agent HTTPS,
+       and ambient HTTPS vs node-agent HTTP, only when both surfaces bind. */ -}}
+{{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled (ne $ambientAdminPort "0") $nodeAgentAdminHttpsActive (eq $ambientAdminPort $nodeAgentAdminHttpsPort) -}}
+{{- fail (printf "ambient FERRUM_ADMIN_HTTP_PORT and nodeAgent.admin.httpsPort both use hostNetwork port %s; set distinct ports or disable one listener" $ambientAdminPort) -}}
+{{- end -}}
+{{- if and .Values.nodeAgent.enabled .Values.nodeAgent.admin.enabled $ambientAdminHttpsActive (ne $nodeAgentAdminPort "0") (eq $ambientAdminHttpsPort $nodeAgentAdminPort) -}}
+{{- fail (printf "ambient FERRUM_ADMIN_HTTPS_PORT and nodeAgent.admin.port both use hostNetwork port %s; set distinct ports or disable one listener" $ambientAdminHttpsPort) -}}
 {{- end -}}
 {{- if $nodeWaypointRegistryEnabled -}}
 {{- if eq $ambientAdminPort "0" -}}
@@ -160,6 +193,15 @@ metadata:
     app.kubernetes.io/name: ferrum-mesh-ambient
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
+  {{- if ne $ambientUdpMigrationPhase "stable" }}
+  # Migration pods intentionally stay unready until cleanup/finalization proof.
+  # Permit the explicit migration rollout to reach every node instead of
+  # deadlocking behind the DaemonSet's default one-unavailable budget.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: ferrum-mesh-ambient

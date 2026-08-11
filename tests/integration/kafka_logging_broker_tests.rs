@@ -31,6 +31,9 @@ fn bootstrap() -> Option<String> {
 
 fn summary() -> TransactionSummary {
     TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         timestamp_received: Utc::now().to_rfc3339(),
         client_ip: "203.0.113.10".to_string(),

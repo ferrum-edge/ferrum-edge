@@ -2325,3 +2325,153 @@ async fn previous_encryption_secret_accepts_pending_flow_during_rotation() {
         other => panic!("expected previous-secret rotation success, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Discovery-backed trust health parity with jwks_auth (issue #3739)
+// ---------------------------------------------------------------------------
+
+/// `oidc_relying_party` resolves its JWKS endpoint from an OIDC discovery
+/// document on a background task. That store must join the active trust
+/// aggregate as soon as its generation commits — the same guarantee a directly
+/// configured `jwks_uri` gets at publication — and must leave it again when the
+/// generation retires.
+#[tokio::test]
+async fn oidc_discovered_jwks_store_joins_active_trust_health_after_commit() {
+    use ferrum_edge::plugins::utils::jwks_cache::{
+        cached_requirement, clear_jwks_cache, retain_active_requirements, trust_health_snapshot,
+    };
+    use std::time::Duration;
+
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let server = MockServer::start().await;
+    let jwks_uri = format!("{}/oidc-trust/jwks.json", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/oidc-trust/jwks.json"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/oidc-trust/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_endpoint": format!("{}/oidc-trust/authorize", server.uri()),
+            "token_endpoint": format!("{}/oidc-trust/token", server.uri()),
+            "jwks_uri": jwks_uri,
+        })))
+        .mount(&server)
+        .await;
+
+    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let mut config = base_config();
+    config["providers"][0] = json!({
+        "issuer": "https://issuer.example.com",
+        "discovery_url": format!("{}/oidc-trust/openid-configuration", server.uri()),
+        "client_id": "ferrum-gateway",
+        "client_auth": {"method": "client_secret_basic", "client_secret": "secret"},
+        "scopes": ["openid", "profile"],
+        "redirect_uri": "https://app.example.com/oauth/callback",
+        "callback_path": "/oauth/callback",
+        "logout_path": "/oauth/logout"
+    });
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+
+    // The generation is published with no JWKS requirement — discovery has not
+    // resolved yet — and only then committed.
+    retain_active_requirements(&HashMap::new());
+    plugin.commit_background_tasks();
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    loop {
+        let snapshot = trust_health_snapshot();
+        let total = snapshot.fresh + snapshot.grace + snapshot.expired;
+        if total == 1 || tokio::time::Instant::now() >= deadline {
+            assert_eq!(
+                total, 1,
+                "a committed OIDC discovery-backed store must join the active trust aggregate"
+            );
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        cached_requirement(&jwks_uri).map(|requirement| requirement.max_stale),
+        Some(Duration::from_secs(3_600)),
+        "the discovered store must carry oidc_relying_party's finite max-stale bound"
+    );
+
+    drop(plugin);
+    let retired = trust_health_snapshot();
+    assert_eq!(
+        (retired.fresh, retired.grace, retired.expired),
+        (0, 0, 0),
+        "retiring the owning generation must withdraw its contribution"
+    );
+    clear_jwks_cache();
+}
+
+/// A staged `oidc_relying_party` generation that is never committed must not
+/// reach readiness or metrics even after its discovery task publishes.
+#[tokio::test]
+async fn oidc_staged_discovery_store_is_not_exposed_before_commit() {
+    use ferrum_edge::plugins::utils::jwks_cache::{clear_jwks_cache, trust_health_snapshot};
+
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let server = MockServer::start().await;
+    let jwks_uri = format!("{}/oidc-staged/jwks.json", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/oidc-staged/jwks.json"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/oidc-staged/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "authorization_endpoint": format!("{}/oidc-staged/authorize", server.uri()),
+            "token_endpoint": format!("{}/oidc-staged/token", server.uri()),
+            "jwks_uri": jwks_uri,
+        })))
+        .mount(&server)
+        .await;
+
+    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let mut config = base_config();
+    config["providers"][0] = json!({
+        "issuer": "https://issuer.example.com",
+        "discovery_url": format!("{}/oidc-staged/openid-configuration", server.uri()),
+        "client_id": "ferrum-gateway",
+        "client_auth": {"method": "client_secret_basic", "client_secret": "secret"},
+        "scopes": ["openid", "profile"],
+        "redirect_uri": "https://app.example.com/oauth/callback",
+        "callback_path": "/oauth/callback",
+        "logout_path": "/oauth/logout"
+    });
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+
+    // Give discovery time to publish into the plugin's local slot.
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    let staged = trust_health_snapshot();
+    assert_eq!(
+        (staged.fresh, staged.grace, staged.expired),
+        (0, 0, 0),
+        "an unpublished generation must not reach readiness or metrics"
+    );
+
+    // Committing the same generation publishes it immediately, with no reload.
+    plugin.commit_background_tasks();
+    let committed = trust_health_snapshot();
+    assert_eq!(
+        committed.fresh + committed.grace + committed.expired,
+        1,
+        "commit must adopt a store discovery resolved while the generation was staged"
+    );
+
+    drop(plugin);
+    clear_jwks_cache();
+}

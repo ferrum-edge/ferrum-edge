@@ -1702,24 +1702,25 @@ fn merge_http_tls_listen_ports(
 }
 
 fn merge_k8s_frontend_tls(merged: &mut GatewayConfig, k8s_config: &GatewayConfig) {
-    let k8s_supplies_tls = !k8s_config.frontend_tls_namespace_sources.is_empty()
+    let k8s_supplies_tls = !k8s_config.frontend_tls_certificate_sources.is_empty()
         || k8s_config.frontend_tls_cert_path.is_some()
         || k8s_config.frontend_tls_key_path.is_some();
     if k8s_supplies_tls {
         merged.frontend_tls_cert_path = k8s_config.frontend_tls_cert_path.clone();
         merged.frontend_tls_key_path = k8s_config.frontend_tls_key_path.clone();
         merged.frontend_tls_source_namespace = k8s_config.frontend_tls_source_namespace.clone();
-        merged.frontend_tls_namespace_sources = k8s_config.frontend_tls_namespace_sources.clone();
+        merged.frontend_tls_certificate_sources =
+            k8s_config.frontend_tls_certificate_sources.clone();
         return;
     }
 
     if merged.frontend_tls_source_namespace.is_some()
-        || !merged.frontend_tls_namespace_sources.is_empty()
+        || !merged.frontend_tls_certificate_sources.is_empty()
     {
         merged.frontend_tls_cert_path = None;
         merged.frontend_tls_key_path = None;
         merged.frontend_tls_source_namespace = None;
-        merged.frontend_tls_namespace_sources.clear();
+        merged.frontend_tls_certificate_sources.clear();
     }
 }
 
@@ -1738,7 +1739,7 @@ fn stable_config_value(config: &GatewayConfig) -> Value {
         "frontend_tls_cert_path": &config.frontend_tls_cert_path,
         "frontend_tls_key_path": &config.frontend_tls_key_path,
         "frontend_tls_source_namespace": &config.frontend_tls_source_namespace,
-        "frontend_tls_namespace_sources": &config.frontend_tls_namespace_sources,
+        "frontend_tls_certificate_sources": &config.frontend_tls_certificate_sources,
         // Derived Gateway-listener TLS classification. Included because a
         // listener flipping HTTP<->HTTPS leaves every other field identical,
         // and a dedupe that ignored it would keep serving the old class.
@@ -1932,7 +1933,7 @@ fn log_skipped_resource(error: &K8sTranslateError) {
 mod tests {
     use super::*;
     use crate::config::types::{
-        FrontendTlsNamespaceSource, PluginConfig, PluginScope, Proxy, Upstream,
+        FrontendTlsCertificateSource, PluginConfig, PluginScope, Proxy, Upstream,
     };
     use crate::config_sources::k8s::{K8sMetadata, K8sObject};
     use crate::identity::spiffe::SpiffeId;
@@ -2694,16 +2695,18 @@ mod tests {
             frontend_tls_cert_path: Some("k8s://ns-a/cert#tls.crt?sha256=a".to_string()),
             frontend_tls_key_path: Some("k8s://ns-a/cert#tls.key?sha256=a".to_string()),
             frontend_tls_source_namespace: Some("ns-a".to_string()),
-            frontend_tls_namespace_sources: vec![
-                FrontendTlsNamespaceSource {
+            frontend_tls_certificate_sources: vec![
+                FrontendTlsCertificateSource {
                     namespace: "ns-a".to_string(),
                     cert_path: "k8s://ns-a/cert#tls.crt?sha256=a".to_string(),
                     key_path: "k8s://ns-a/cert#tls.key?sha256=a".to_string(),
+                    ..Default::default()
                 },
-                FrontendTlsNamespaceSource {
+                FrontendTlsCertificateSource {
                     namespace: "ns-b".to_string(),
                     cert_path: "k8s://ns-b/cert#tls.crt?sha256=b".to_string(),
                     key_path: "k8s://ns-b/cert#tls.key?sha256=b".to_string(),
+                    ..Default::default()
                 },
             ],
             ..GatewayConfig::default()
@@ -2711,16 +2714,16 @@ mod tests {
 
         let merged = merge_k8s_translation(&active, &k8s, &BTreeSet::new());
 
-        assert_eq!(merged.frontend_tls_namespace_sources.len(), 2);
+        assert_eq!(merged.frontend_tls_certificate_sources.len(), 2);
         assert!(
             merged
-                .frontend_tls_namespace_sources
+                .frontend_tls_certificate_sources
                 .iter()
                 .any(|source| source.namespace == "ns-a")
         );
         assert!(
             merged
-                .frontend_tls_namespace_sources
+                .frontend_tls_certificate_sources
                 .iter()
                 .any(|source| source.namespace == "ns-b")
         );

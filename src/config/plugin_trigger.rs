@@ -266,6 +266,8 @@ impl PluginTrigger {
 pub struct CompiledPluginTrigger {
     root: CompiledNode,
     reads_authenticated_identity: bool,
+    /// First HTTP-only field name the predicate reads, if any.
+    http_only_field: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -390,11 +392,13 @@ impl CompiledPluginTrigger {
         let mut budget = CompileBudget {
             nodes: 0,
             reads_authenticated_identity: false,
+            http_only_field: None,
         };
         let root = compile_node(&trigger.when, 1, &mut budget)?;
         Ok(Self {
             root,
             reads_authenticated_identity: budget.reads_authenticated_identity,
+            http_only_field: budget.http_only_field,
         })
     }
 
@@ -405,15 +409,38 @@ impl CompiledPluginTrigger {
         self.reads_authenticated_identity
     }
 
+    /// The first HTTP-only field name (`method`, `path`, `host`, `header`,
+    /// `query`, `cookie`) any leaf reads, or `None`.
+    ///
+    /// A stream connection genuinely has no request line, header block, query
+    /// string, or cookie jar. On a plugin that ALSO serves HTTP such a predicate
+    /// is meaningful and evaluates to `false` for the stream leg. On a
+    /// STREAM-ONLY plugin it can only ever produce a constant, so publication
+    /// refuses it with this field name rather than admitting a predicate that
+    /// silently disables (or, beneath `not`, silently always-enables) the
+    /// instance.
+    pub fn http_only_field(&self) -> Option<&'static str> {
+        self.http_only_field
+    }
+
     /// Evaluate the trigger. `true` means "execute this plugin instance".
     pub fn evaluate(&self, facts: &dyn TriggerFacts) -> bool {
         eval_node(&self.root, facts)
     }
 }
 
+/// Remember the first HTTP-only field a predicate reads, for stream-only
+/// publication refusal. First occurrence wins so the diagnostic is stable.
+fn note_http_only_field(budget: &mut CompileBudget, field: &'static str) {
+    if budget.http_only_field.is_none() {
+        budget.http_only_field = Some(field);
+    }
+}
+
 struct CompileBudget {
     nodes: usize,
     reads_authenticated_identity: bool,
+    http_only_field: Option<&'static str>,
 }
 
 fn compile_node(
@@ -516,6 +543,7 @@ fn compile_match(
     }
 
     if let Some(methods) = &leaf.method {
+        note_http_only_field(budget, "method");
         let list = compile_token_list(methods, "method", |value| value.to_ascii_uppercase())?;
         for method in &list {
             if !method.bytes().all(is_http_token_byte) {
@@ -527,25 +555,30 @@ fn compile_match(
         return Ok(CompiledMatch::Method(list));
     }
     if let Some(value) = &leaf.path {
+        note_http_only_field(budget, "path");
         return Ok(CompiledMatch::Path(compile_string_match(value, "path")?));
     }
     if let Some(value) = &leaf.host {
+        note_http_only_field(budget, "host");
         return Ok(CompiledMatch::Host(compile_string_match(value, "host")?));
     }
     if let Some(value) = &leaf.sni {
         return Ok(CompiledMatch::Sni(compile_string_match(value, "sni")?));
     }
     if let Some(field) = &leaf.header {
+        note_http_only_field(budget, "header");
         return Ok(CompiledMatch::Header(compile_field_match(
             field, "header", true,
         )?));
     }
     if let Some(field) = &leaf.query {
+        note_http_only_field(budget, "query");
         return Ok(CompiledMatch::Query(compile_field_match(
             field, "query", false,
         )?));
     }
     if let Some(field) = &leaf.cookie {
+        note_http_only_field(budget, "cookie");
         return Ok(CompiledMatch::Cookie(compile_field_match(
             field, "cookie", false,
         )?));

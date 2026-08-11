@@ -586,6 +586,10 @@ pub struct RuntimeSnapshot {
     pub dns: DnsSnapshot,
     pub connections: ConnectionsSnapshot,
     pub logs: LogsSnapshot,
+    /// Fixed-cardinality counters for the per-instance execution-trigger
+    /// decision carriers. No labels, no trigger inputs, no route/identity/header
+    /// values, and nothing plugin-controlled can reach this object.
+    pub plugin_triggers: crate::plugins::trigger::PluginTriggerCarrierCounters,
     pub overload: Value,
 }
 
@@ -676,6 +680,7 @@ pub fn build_snapshot(
         dns: build_dns_snapshot(&metrics, proxy_state),
         connections: build_connections_snapshot(&metrics, proxy_state),
         logs: build_logs_snapshot(&metrics),
+        plugin_triggers: crate::plugins::trigger::carrier_counters(),
         overload: build_overload_snapshot(proxy_state),
     }
 }

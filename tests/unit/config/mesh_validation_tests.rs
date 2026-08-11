@@ -1970,6 +1970,7 @@ fn ingress_resolved_listener_endpoint_revalidation() {
         port: 8443,
         endpoint_host: "127.0.0.1".to_string(),
         endpoint_port: 8080,
+        protocol: AppProtocol::Http,
         endpoint_unix_path: None,
         endpoint_unix_h2c: false,
         owner_namespace: "default".to_string(),
@@ -2115,6 +2116,7 @@ fn ingress_carrier_rejects_an_h2c_marker_on_a_tcp_listener() {
         port: 8443,
         endpoint_host: "127.0.0.1".to_string(),
         endpoint_port: 8080,
+        protocol: AppProtocol::Http,
         endpoint_unix_path: None,
         endpoint_unix_h2c: true,
         owner_namespace: "default".to_string(),
@@ -2168,6 +2170,7 @@ fn ingress_carrier_revalidates_unix_socket_shape() {
         port: 8443,
         endpoint_host: String::new(),
         endpoint_port: 0,
+        protocol: AppProtocol::Http,
         endpoint_unix_path: Some("/var/run/app.sock".to_string()),
         endpoint_unix_h2c: false,
         owner_namespace: "default".to_string(),
@@ -2212,14 +2215,57 @@ fn ingress_carrier_revalidates_unix_socket_shape() {
 }
 
 #[test]
-fn ingress_resolve_rejects_non_http_protocol() {
+fn ingress_resolve_accepts_stream_protocols() {
+    // Issue #3260: recognized stream-family protocols resolve to a routable
+    // listener (raw-TCP inbound relay), not NonHttpProtocol.
+    for protocol in [
+        AppProtocol::Tcp,
+        AppProtocol::Tls,
+        AppProtocol::Mongo,
+        AppProtocol::Redis,
+        AppProtocol::Mysql,
+        AppProtocol::Postgres,
+    ] {
+        let resolved = ingress_entry(6379, protocol, "127.0.0.1:6380")
+            .resolve()
+            .unwrap_or_else(|_| panic!("{protocol:?} ingress must resolve"));
+        assert_eq!(resolved.port, 6379);
+        assert_eq!(resolved.endpoint_host, "127.0.0.1");
+        assert_eq!(resolved.endpoint_port, 6380);
+        assert_eq!(resolved.protocol, protocol);
+        assert!(resolved.is_stream_family());
+        assert!(!resolved.is_http_family());
+    }
+}
+
+#[test]
+fn ingress_resolve_rejects_unrecognized_or_udp_protocol() {
     assert_eq!(
-        ingress_entry(8443, AppProtocol::Tcp, "127.0.0.1:8080").resolve(),
+        ingress_entry(8443, AppProtocol::Unknown, "127.0.0.1:8080").resolve(),
         Err(IngressListenerUnsupported::NonHttpProtocol)
     );
     assert_eq!(
-        ingress_entry(8443, AppProtocol::Mongo, "127.0.0.1:8080").resolve(),
+        ingress_entry(8443, AppProtocol::Udp, "127.0.0.1:8080").resolve(),
         Err(IngressListenerUnsupported::NonHttpProtocol)
+    );
+}
+
+#[test]
+fn ingress_resolved_listener_rejects_unknown_protocol_on_revalidation() {
+    use ferrum_edge::modes::mesh::config::ResolvedIngressListener;
+    let hostile = ResolvedIngressListener {
+        port: 8443,
+        endpoint_host: "127.0.0.1".to_string(),
+        endpoint_port: 8080,
+        protocol: AppProtocol::Unknown,
+        endpoint_unix_path: None,
+        endpoint_unix_h2c: false,
+        owner_namespace: "default".to_string(),
+        owner_service: "reviews".to_string(),
+    };
+    assert!(
+        !hostile.endpoint_is_valid(NO_ROOTS),
+        "a carried Unknown protocol must fail re-validation"
     );
 }
 

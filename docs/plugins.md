@@ -172,15 +172,34 @@ The trigger is a generic layer and never replaces route selection, mesh routing,
 or a plugin's own policy matchers. It is compiled and bounded at config load,
 admin write, and plugin-cache publication — the request path only walks
 precompiled matchers. A false trigger suppresses every hook of that instance —
-request, response, and stream connect/disconnect alike — including its
-per-request buffering, body-release, and enforcement claims, so a skipped
-instance makes no external call, takes no lease, and retains no state.
+request, response, terminal transaction logging, stream connect/disconnect,
+WebSocket frame/reassembly/delivery/disconnect, and UDP/DTLS datagram hooks
+alike — including its per-request buffering, body-release, and enforcement
+claims, so a skipped instance makes no external call, takes no lease, and
+retains no state.
 
-Some surfaces cannot be gated coherently and are refused at publication rather
-than half-applied: WebSocket frame/disconnect hooks, UDP datagram hooks, the
-contextless initial response-header policy (`security_headers`), an identity
-predicate on an authentication plugin, an identity predicate on a stream-only
-plugin, fixed core request/response body ceilings, and contextless
+The contextless surfaces are gated by carrying ONE decision from the
+authoritative admission point rather than re-evaluating a predicate later.
+Terminal `log` / `log_with_mesh_key` read the decision from an opaque,
+non-serialized carrier on the transaction summary; WebSocket frame, reassembly,
+delivery, size-limit, and disconnect hooks read it from the upgrade's decision,
+which is taken before the session's capability set exists (a skipped instance
+therefore cannot force framing or pull a session off the raw tunnel path); UDP
+and DTLS datagram hooks read it from the session, decided once by the
+`on_stream_connect` chain, so no predicate is evaluated per packet. Missing
+carrier state RUNS the hook — historical behavior is preserved and the
+occurrence is counted in the unlabeled `plugin_triggers` counters on
+`GET /metrics/runtime` — so an absent carrier can never silently disable a
+security plugin.
+
+Some surfaces still cannot be gated coherently and are refused at publication
+rather than half-applied: the contextless initial response-header policy
+(`security_headers`), an identity predicate on an authentication plugin, an
+identity predicate on a stream-only plugin, an HTTP-only predicate (`method`,
+`path`, `host`, `header`, `query`, `cookie`) on a stream-only plugin — a
+datagram or byte stream has no request line, header block, query string, or
+cookie jar, so the field is named in the error instead of being reinterpreted as
+empty — fixed core request/response body ceilings, and contextless
 response-trailer ownership. An identity predicate (`consumer` / `auth_method` /
 `spiffe_id`) also never gates a stream connection at all — the one gated stream
 phase is where stream authentication itself runs — so on a plugin that serves
@@ -1677,8 +1696,14 @@ exhaustion.
 
 WebSocket teardown exports `ferrum_websocket_sessions_total`,
 `ferrum_websocket_session_duration_ms`, `ferrum_websocket_bytes_total`, and
-`ferrum_websocket_frames_total`. Terminal labels come only from bounded enums;
-peer-supplied close reasons and error messages are never metric labels.
+`ferrum_websocket_frames_total`. Session and duration series include the fixed
+`termination_reason` classes `credential_expired`, `max_lifetime`,
+`idle_timeout`, `drain`, `normal_peer_close`, and `relay_error`. The
+gateway-initiated `credential_expired`, `max_lifetime`, and `drain` closes carry
+`result="success"` and `error_class="none"` — they are policy decisions, not
+relay faults, so `result="error"` still means a transport or hook failure.
+Terminal labels come only from bounded enums; peer-supplied close reasons,
+identities, claims, tokens, and error messages are never metric labels.
 
 Certificate inventory keeps absolute validity timestamps internally and derives
 the relative expiry gauge on an uncached render. An unchanged TLS refresh does
@@ -2148,6 +2173,7 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `providers[].dpop_clock_skew_secs` | u64 (optional) | DPoP `iat`/`exp` clock skew in seconds (default: `30`, max: `300`) |
 | `providers[].dpop_jti_cache_max_entries` | usize (optional) | Per-provider DPoP replay cache capacity (default: `10000`) |
 | `providers[].dpop_jti_ttl_secs` | u64 (optional) | DPoP `jti` replay cache TTL (default: `300`, must be at least twice clock skew) |
+| `providers[].jwks_max_stale_seconds` | u64 (optional) | Per-provider maximum age of the last validated non-empty remote JWKS; overrides the plugin default (min `1`, max `86400`; remote sources only) |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
 | `consumer_identity_claim` | String | Global JWT claim for consumer lookup (default: `"sub"`) |
@@ -2156,13 +2182,16 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `claim_headers_separator` | String | Global separator for array claim header values (default: `","`) |
 | `emit_mesh_request_principal_metadata` | Boolean | Emit `mesh.request_principal` plus mesh JWT claim/audience metadata for direct `mesh_authz` request-principal and `when` condition evaluation (default: `false`) |
 | `require_exp` | Boolean | Global default for requiring an `exp` claim (default: `true`) |
-| `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`) |
+| `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`, min: `1`, max: `86400`); must not exceed each remote provider's effective maximum-stale value |
+| `jwks_max_stale_seconds` | u64 | Maximum age of the last validated non-empty remote JWKS (default: `3600`, max: `86400`). `0` is invalid and cannot disable fail-closed expiry |
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
 Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
-Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. Shared stores use the minimum refresh interval requested by active consumers, and full or incremental reloads reschedule the single refresh worker without dropping cached keys. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement.
+Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. For each remote provider, `jwks_refresh_interval_secs` must not exceed its effective `jwks_max_stale_seconds`. Shared stores use both the minimum refresh interval and the minimum maximum-stale value requested by active consumers. A newly added stricter consumer takes effect immediately; full or incremental publication deterministically reconciles the exact minima, so removing the strict consumer may relax policy without replacing the store or resetting key age. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement, but discovery success alone never refreshes key trust. A store an OIDC discovery task resolves *after* its generation was published joins the active refresh/maximum-stale arbitration and the trust aggregate at that moment rather than at the next reload, and leaves it when that generation retires or repoints to a different URI; a staged generation that is never published contributes nothing to readiness or metrics.
 
-Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A rejected refresh retains the last-known-good keys. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
+Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
+
+Authenticated `/metrics` exposes only fixed-cardinality aggregate JWKS state for **active remote** stores: `fresh`, `grace`, or `expired`, maximum trust age per state, and closed refresh-failure classes. It never labels a series with a JWKS/discovery URL, `kid`, token, claim, or key material. Authenticated `/health`/`/status` mirror the same closed-set counts under `jwks_trust`; unauthenticated probes see only coarse readiness effects (grace → degraded+ready, expired → unavailable+not-ready, none → neutral) from an O(1) cached aggregate. Choose the maximum-stale window as an explicit availability-versus-revocation trade-off; production deployments should keep it short enough for emergency key removal to take effect within their incident-response objective.
 
 ### `oauth2_introspection`
 
@@ -2189,7 +2218,9 @@ Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspecti
 | `providers[].forward_original_token` | Boolean | Forward the original token-bearing header/query param (default `true`) |
 | `providers[].positive_cache_ttl_secs` | u64 | Active-token cache TTL cap (default `60`) |
 | `providers[].negative_cache_ttl_secs` | u64 | Inactive-token cache TTL (default `10`) |
-| `providers[].max_cache_entries` | usize | Bounded per-provider token cache capacity (default `10000`) |
+| `providers[].max_cache_entries` | usize | Per-provider entry ceiling (default `10000`, range `100..=100000`) |
+| `providers[].max_cache_entry_bytes` | usize | Maximum normalized active result retained for one token (default `16384`, range `256..=65536`) |
+| `providers[].max_cache_total_bytes` | usize | Total per-provider retained cache bytes, including fixed eviction indexes and entry/key state (default `16777216`, range `1048576..=67108864`) |
 | `providers[].request_timeout_ms` | u64 | Introspection request timeout (default `5000`) |
 | `providers[].required_scopes` | String[] (optional) | Scopes that must all be present |
 | `providers[].required_roles` | String[] (optional) | Roles where any one must be present |
@@ -2202,6 +2233,10 @@ Validates opaque or structured OAuth2 bearer tokens against RFC 7662 introspecti
 Credentialed `client_auth.method` values (`client_secret_basic`, `client_secret_post`, `private_key_jwt`) require an `https` `introspection_endpoint`/`discovery_url` when the host is not loopback/localhost; `http` is only accepted for loopback endpoints so client credentials are never sent over plaintext to a remote host. The `none` method is loopback-only regardless of scheme. `client_secret_basic` form-encodes the client ID and secret separately before constructing the Basic credential, as required by OAuth 2.0. Discovery-provided introspection endpoints must use the discovery URL's exact origin (scheme, normalized host, and effective port). Claim header mappings reject reserved headers.
 
 Configuration is strict at the plugin, provider, client-auth, and header-location layers: unknown fields reject validation and reload. At most 16 providers and 8 KiB bearer tokens are accepted. Introspection work is capped at 32 concurrent calls per provider and 128 process-wide; identical in-flight token checks are coalesced by a SHA-256 token key. Introspection responses are capped at 64 KiB and discovery documents at 128 KiB.
+
+Each provider owns independent entry-count, normalized-per-entry, and aggregate retained-byte budgets. The aggregate budget must cover the configured entry ceiling's minimum key/entry/index footprint plus one maximum-sized normalized result; impossible combinations reject validation with a `max_cache_total_bytes` error. Active entries receive 75% of entry slots and negative entries receive 25%; the negative byte partition covers its fixed key/entry footprint and the remaining retained-byte capacity belongs to active results. This prevents either class from evicting the other. Provider count multiplies these local budgets, so worst-case configured retention is `providers × max_cache_total_bytes`.
+
+Active cache entries retain only the prevalidated authorization outcome, canonical identity/display values, and rendered values for configured `claim_headers`; unrelated introspection JSON members are discarded after the request. Admission reserves count and bytes before publication. A fixed 16-ticket second-chance eviction pass reclaims expired or cold entries without scanning the map or allocating proportional workspace; recently used entries get one protected pass. Contended, oversized, or saturated admissions skip caching while the valid provider result continues through normal authorization. Reloaded generations own their cache reservations and eviction indexes until the last in-flight reference drops.
 
 Authorization fallback never fans a token across providers by default. Explicit `Authorization: Bearer` locations and the implicit Authorization fallback are treated as the same routing source and both match the Bearer scheme case-insensitively. Multi-provider configurations should use distinct `from_headers` or `from_params` locations as deterministic routing hints. Without shared-trust opt-in, the first matching routing hint selects exactly one provider even if a client repeats the same token in another provider location. Set `allow_provider_fanout: true` only for providers inside one shared trust boundary. When `forward_original_token: false`, every configured occurrence of the accepted token is stripped from headers and query parameters before proxying while unrelated credentials are preserved.
 
@@ -2280,6 +2315,12 @@ config:
   behavior:
     post_login_default_path: "/"
 ```
+
+OIDC relying-party JWKS uses the same shared bounded-trust store as
+`jwks_auth`, with the secure one-hour maximum-stale default. Discovery success
+does not refresh key trust; only a validated non-empty JWKS does. When the same
+URI is also referenced by `jwks_auth`, the strictest active maximum-stale and
+refresh requirements govern the shared store.
 
 ### `jwt_auth`
 

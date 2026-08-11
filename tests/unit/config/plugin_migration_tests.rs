@@ -1,6 +1,10 @@
 //! Tests for custom plugin database migration support
 
-use ferrum_edge::config::migrations::{CustomPluginMigration, MigrationRunner};
+use ferrum_edge::config::migrations::{
+    CustomPluginMigration, MigrationHistoryIntegrityError, MigrationHistoryIntegrityKind,
+    MigrationHistoryIntegrityReason, MigrationHistoryNamespace, MigrationRunner,
+};
+use sqlx::Row;
 
 /// Create a single-connection SQLite in-memory pool for testing.
 async fn test_pool() -> sqlx::AnyPool {
@@ -16,6 +20,43 @@ async fn test_pool() -> sqlx::AnyPool {
 async fn setup_core_migrations(pool: &sqlx::AnyPool) {
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
     runner.run_pending().await.unwrap();
+}
+
+async fn table_exists(pool: &sqlx::AnyPool, table: &str) -> bool {
+    sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .bind(table)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .is_some()
+}
+
+async fn seed_plugin_history(
+    pool: &sqlx::AnyPool,
+    plugin_name: &str,
+    version: i64,
+    checksum: &str,
+) {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS _ferrum_plugin_migrations (\
+         plugin_name TEXT NOT NULL, version INTEGER NOT NULL, name TEXT NOT NULL, \
+         applied_at TEXT NOT NULL, checksum TEXT NOT NULL, execution_time_ms INTEGER NOT NULL, \
+         PRIMARY KEY (plugin_name, version))",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO _ferrum_plugin_migrations \
+         (plugin_name, version, name, applied_at, checksum, execution_time_ms) \
+         VALUES (?, ?, 'seeded', '2026-01-01T00:00:00Z', ?, 0)",
+    )
+    .bind(plugin_name)
+    .bind(version)
+    .bind(checksum)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -400,17 +441,16 @@ async fn test_multiple_plugins_independent_versions() {
 }
 
 // ---------------------------------------------------------------------------
-// Checksum mismatch detection
+// Migration-history integrity validation
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_plugin_migration_checksum_mismatch_warns_but_continues() {
+async fn plugin_checksum_drift_blocks_status_and_later_pending_migration() {
     let pool = test_pool().await;
     setup_core_migrations(&pool).await;
 
     let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
 
-    // Apply V1 with original checksum
     let migrations_v1 = vec![(
         "chk_plugin",
         vec![CustomPluginMigration {
@@ -424,8 +464,6 @@ async fn test_plugin_migration_checksum_mismatch_warns_but_continues() {
     )];
     runner.run_plugin_pending(&migrations_v1).await.unwrap();
 
-    // Now run with a different checksum for V1 + a new V2
-    // This should warn about the checksum mismatch but still apply V2
     let migrations_v1_modified = vec![(
         "chk_plugin",
         vec![
@@ -448,13 +486,495 @@ async fn test_plugin_migration_checksum_mismatch_warns_but_continues() {
         ],
     )];
 
-    // Should not error — mismatch is a warning, not a failure
-    let applied = runner
+    let status_error = runner
+        .plugin_status(&migrations_v1_modified)
+        .await
+        .expect_err("status must return a blocking error on plugin drift");
+    assert!(status_error.is::<MigrationHistoryIntegrityError>());
+
+    let apply_error = runner
         .run_plugin_pending(&migrations_v1_modified)
         .await
+        .expect_err("plugin drift must block the later pending migration");
+    let integrity_error = apply_error
+        .downcast_ref::<MigrationHistoryIntegrityError>()
+        .expect("error must retain structured integrity metadata");
+    assert_eq!(integrity_error.backend, "sqlite");
+    assert_eq!(
+        integrity_error.namespace,
+        MigrationHistoryNamespace::CustomPlugin("chk_plugin".to_string())
+    );
+    assert_eq!(
+        integrity_error.reason,
+        MigrationHistoryIntegrityReason::ChecksumMismatch {
+            version: 1,
+            stored_checksum: "original_checksum".to_string(),
+            expected_checksum: "modified_checksum".to_string(),
+        }
+    );
+    assert!(!apply_error.to_string().contains("ALTER TABLE"));
+
+    let columns = sqlx::query("PRAGMA table_info(chk_data)")
+        .fetch_all(&pool)
+        .await
         .unwrap();
-    assert_eq!(applied.len(), 1);
-    assert_eq!(applied[0].version, 2);
+    assert!(
+        columns
+            .iter()
+            .all(|row| row.try_get::<String, _>("name").unwrap() != "value"),
+        "V2 schema work must remain pending after checksum refusal"
+    );
+    let history = sqlx::query(
+        "SELECT checksum FROM _ferrum_plugin_migrations WHERE plugin_name = ? ORDER BY version",
+    )
+    .bind("chk_plugin")
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].try_get::<String, _>("checksum").unwrap(),
+        "original_checksum"
+    );
+}
+
+#[tokio::test]
+async fn plugin_checksum_drift_blocks_when_nothing_is_pending() {
+    let pool = test_pool().await;
+    setup_core_migrations(&pool).await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let original = vec![(
+        "no_pending_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_table",
+            checksum: "immutable-checksum",
+            sql: "CREATE TABLE no_pending_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    runner.run_plugin_pending(&original).await.unwrap();
+
+    let changed = vec![(
+        "no_pending_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_table",
+            checksum: "changed-checksum",
+            sql: "CREATE TABLE no_pending_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    runner
+        .run_plugin_pending(&changed)
+        .await
+        .expect_err("drift must fail even when no migration is pending");
+
+    let row = sqlx::query(
+        "SELECT checksum FROM _ferrum_plugin_migrations WHERE plugin_name = ? AND version = 1",
+    )
+    .bind("no_pending_plugin")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("checksum").unwrap(),
+        "immutable-checksum"
+    );
+}
+
+#[tokio::test]
+async fn plugin_drift_preflight_blocks_core_and_other_plugin_work() {
+    let pool = test_pool().await;
+    setup_core_migrations(&pool).await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let original = vec![(
+        "drift_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_drift_table",
+            checksum: "drift-original",
+            sql: "CREATE TABLE drift_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    runner.run_plugin_pending(&original).await.unwrap();
+    sqlx::query("DROP TABLE proxy_route_locks")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let all_plugins = vec![
+        (
+            "clean_pending_plugin",
+            vec![CustomPluginMigration {
+                version: 1,
+                name: "create_clean_table",
+                checksum: "clean-v1",
+                sql: "CREATE TABLE clean_pending_data (id TEXT PRIMARY KEY)",
+                sql_postgres: None,
+                sql_mysql: None,
+            }],
+        ),
+        (
+            "drift_plugin",
+            vec![CustomPluginMigration {
+                version: 1,
+                name: "create_drift_table",
+                checksum: "drift-changed",
+                sql: "CREATE TABLE drift_data (id TEXT PRIMARY KEY)",
+                sql_postgres: None,
+                sql_mysql: None,
+            }],
+        ),
+    ];
+
+    runner
+        .run_all_pending(&all_plugins)
+        .await
+        .expect_err("all history must be validated before any migration work");
+
+    let clean_table = sqlx::query(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'clean_pending_data'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(
+        clean_table.is_none(),
+        "other-plugin work must remain pending"
+    );
+    let core_compatibility_table = sqlx::query(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'proxy_route_locks'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(
+        core_compatibility_table.is_none(),
+        "core compatibility work must not precede plugin integrity validation"
+    );
+    let history = sqlx::query(
+        "SELECT checksum FROM _ferrum_plugin_migrations WHERE plugin_name = ? AND version = 1",
+    )
+    .bind("drift_plugin")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        history.try_get::<String, _>("checksum").unwrap(),
+        "drift-original"
+    );
+}
+
+#[tokio::test]
+async fn unknown_applied_plugin_version_blocks_all_compatibility_schema_and_history_writes() {
+    let pool = test_pool().await;
+    setup_core_migrations(&pool).await;
+    sqlx::query("DROP TABLE proxy_route_locks")
+        .execute(&pool)
+        .await
+        .unwrap();
+    seed_plugin_history(&pool, "unknown_version_plugin", 99, "unknown-checksum").await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let declarations = vec![(
+        "unknown_version_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "pending_known_version",
+            checksum: "known-checksum",
+            sql: "CREATE TABLE unknown_version_pending_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+
+    let error = runner
+        .run_all_pending(&declarations)
+        .await
+        .expect_err("an unknown applied plugin version must fail closed");
+    let integrity_error = error
+        .downcast_ref::<MigrationHistoryIntegrityError>()
+        .expect("the refusal must retain its structured type");
+    assert_eq!(
+        integrity_error.kind(),
+        MigrationHistoryIntegrityKind::UnknownAppliedVersion
+    );
+    assert_eq!(
+        integrity_error.namespace,
+        MigrationHistoryNamespace::CustomPlugin("unknown_version_plugin".to_string())
+    );
+    assert!(
+        !table_exists(&pool, "proxy_route_locks").await,
+        "V001 compatibility must remain untouched"
+    );
+    assert!(
+        !table_exists(&pool, "unknown_version_pending_data").await,
+        "pending plugin schema must remain untouched"
+    );
+    let history = sqlx::query(
+        "SELECT version, checksum FROM _ferrum_plugin_migrations \
+         WHERE plugin_name = 'unknown_version_plugin'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].try_get::<i32, _>("version").unwrap(), 99);
+    assert_eq!(
+        history[0].try_get::<String, _>("checksum").unwrap(),
+        "unknown-checksum"
+    );
+}
+
+#[tokio::test]
+async fn later_applied_plugin_version_cannot_hide_a_missing_prefix_entry() {
+    let pool = test_pool().await;
+    setup_core_migrations(&pool).await;
+    seed_plugin_history(&pool, "missing_prefix_plugin", 2, "version-2").await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let declarations = vec![(
+        "missing_prefix_plugin",
+        vec![
+            CustomPluginMigration {
+                version: 1,
+                name: "missing_version_1",
+                checksum: "version-1",
+                sql: "CREATE TABLE missing_prefix_v1_data (id TEXT PRIMARY KEY)",
+                sql_postgres: None,
+                sql_mysql: None,
+            },
+            CustomPluginMigration {
+                version: 2,
+                name: "observed_version_2",
+                checksum: "version-2",
+                sql: "CREATE TABLE missing_prefix_v2_data (id TEXT PRIMARY KEY)",
+                sql_postgres: None,
+                sql_mysql: None,
+            },
+        ],
+    )];
+
+    let error = runner
+        .run_all_pending(&declarations)
+        .await
+        .expect_err("a missing applied prefix entry must fail closed");
+    let integrity_error = error
+        .downcast_ref::<MigrationHistoryIntegrityError>()
+        .expect("the refusal must retain its structured type");
+    assert_eq!(
+        integrity_error.reason,
+        MigrationHistoryIntegrityReason::MissingAppliedVersion {
+            expected_version: 1,
+            observed_version: 2,
+        }
+    );
+    assert!(!table_exists(&pool, "missing_prefix_v1_data").await);
+    assert!(!table_exists(&pool, "missing_prefix_v2_data").await);
+}
+
+#[tokio::test]
+async fn invalid_plugin_declarations_fail_before_creating_core_or_history_tables() {
+    let out_of_range_pool = test_pool().await;
+    let out_of_range_runner = MigrationRunner::new(out_of_range_pool.clone(), "sqlite".to_string());
+    let out_of_range = vec![(
+        "out_of_range_plugin",
+        vec![CustomPluginMigration {
+            version: i64::from(i32::MAX) + 1,
+            name: "out_of_range",
+            checksum: "out-of-range",
+            sql: "CREATE TABLE out_of_range_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    let out_of_range_error = out_of_range_runner
+        .run_all_pending(&out_of_range)
+        .await
+        .expect_err("out-of-range plugin versions must fail before integer truncation");
+    assert_eq!(
+        out_of_range_error
+            .downcast_ref::<MigrationHistoryIntegrityError>()
+            .expect("out-of-range version error must remain typed")
+            .kind(),
+        MigrationHistoryIntegrityKind::DeclaredVersionOutOfRange
+    );
+    assert!(!table_exists(&out_of_range_pool, "_ferrum_migrations").await);
+    assert!(!table_exists(&out_of_range_pool, "_ferrum_plugin_migrations").await);
+    assert!(!table_exists(&out_of_range_pool, "out_of_range_data").await);
+
+    let duplicate_version_pool = test_pool().await;
+    let duplicate_version_runner =
+        MigrationRunner::new(duplicate_version_pool.clone(), "sqlite".to_string());
+    let duplicate_versions = vec![(
+        "duplicate_version_plugin",
+        vec![
+            CustomPluginMigration {
+                version: 1,
+                name: "first",
+                checksum: "first",
+                sql: "CREATE TABLE duplicate_version_first (id TEXT PRIMARY KEY)",
+                sql_postgres: None,
+                sql_mysql: None,
+            },
+            CustomPluginMigration {
+                version: 1,
+                name: "duplicate",
+                checksum: "duplicate",
+                sql: "CREATE TABLE duplicate_version_second (id TEXT PRIMARY KEY)",
+                sql_postgres: None,
+                sql_mysql: None,
+            },
+        ],
+    )];
+    let duplicate_version_error = duplicate_version_runner
+        .run_all_pending(&duplicate_versions)
+        .await
+        .expect_err("duplicate plugin version declarations must fail closed");
+    assert_eq!(
+        duplicate_version_error
+            .downcast_ref::<MigrationHistoryIntegrityError>()
+            .expect("duplicate version error must remain typed")
+            .kind(),
+        MigrationHistoryIntegrityKind::DuplicateDeclaredVersion
+    );
+    assert!(!table_exists(&duplicate_version_pool, "_ferrum_migrations").await);
+    assert!(!table_exists(&duplicate_version_pool, "_ferrum_plugin_migrations").await);
+
+    let duplicate_namespace_pool = test_pool().await;
+    let duplicate_namespace_runner =
+        MigrationRunner::new(duplicate_namespace_pool.clone(), "sqlite".to_string());
+    let duplicate_namespaces = vec![
+        (
+            "duplicate_namespace_plugin",
+            vec![CustomPluginMigration {
+                version: 1,
+                name: "first",
+                checksum: "first",
+                sql: "CREATE TABLE duplicate_namespace_first (id TEXT PRIMARY KEY)",
+                sql_postgres: None,
+                sql_mysql: None,
+            }],
+        ),
+        (
+            "duplicate_namespace_plugin",
+            vec![CustomPluginMigration {
+                version: 2,
+                name: "second",
+                checksum: "second",
+                sql: "CREATE TABLE duplicate_namespace_second (id TEXT PRIMARY KEY)",
+                sql_postgres: None,
+                sql_mysql: None,
+            }],
+        ),
+    ];
+    let duplicate_namespace_error = duplicate_namespace_runner
+        .run_all_pending(&duplicate_namespaces)
+        .await
+        .expect_err("duplicate plugin namespace declarations must fail closed");
+    assert_eq!(
+        duplicate_namespace_error
+            .downcast_ref::<MigrationHistoryIntegrityError>()
+            .expect("duplicate namespace error must remain typed")
+            .kind(),
+        MigrationHistoryIntegrityKind::DuplicateDeclaredNamespace
+    );
+    assert!(!table_exists(&duplicate_namespace_pool, "_ferrum_migrations").await);
+}
+
+#[tokio::test]
+async fn orphan_plugin_history_is_fatal_when_no_plugins_are_compiled() {
+    let pool = test_pool().await;
+    setup_core_migrations(&pool).await;
+    sqlx::query("DROP TABLE proxy_route_locks")
+        .execute(&pool)
+        .await
+        .unwrap();
+    seed_plugin_history(&pool, "orphan_plugin", 1, "orphan-checksum").await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    let error = runner
+        .run_all_pending(&[])
+        .await
+        .expect_err("orphan plugin history must fail even with no compiled plugins");
+    let integrity_error = error
+        .downcast_ref::<MigrationHistoryIntegrityError>()
+        .expect("the orphan refusal must retain its structured type");
+    assert_eq!(
+        integrity_error.kind(),
+        MigrationHistoryIntegrityKind::UnknownAppliedNamespace
+    );
+    assert_eq!(
+        integrity_error.namespace,
+        MigrationHistoryNamespace::CustomPlugin("orphan_plugin".to_string())
+    );
+    assert!(
+        !table_exists(&pool, "proxy_route_locks").await,
+        "combined preflight must reject before V001 compatibility writes"
+    );
+    let row = sqlx::query(
+        "SELECT checksum FROM _ferrum_plugin_migrations \
+         WHERE plugin_name = 'orphan_plugin' AND version = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("checksum").unwrap(),
+        "orphan-checksum"
+    );
+}
+
+#[tokio::test]
+async fn core_only_runner_and_status_remain_intentionally_core_only() {
+    let pool = test_pool().await;
+    setup_core_migrations(&pool).await;
+    seed_plugin_history(&pool, "ignored_by_core_only", 1, "orphan-checksum").await;
+    let runner = MigrationRunner::new(pool, "sqlite".to_string());
+
+    assert!(runner.run_pending().await.unwrap().is_empty());
+    assert!(runner.status().await.unwrap().pending.is_empty());
+}
+
+#[tokio::test]
+async fn combined_core_and_plugin_apply_remains_clean_and_idempotent() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    let plugins = vec![(
+        "combined_clean_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_combined_clean",
+            checksum: "combined-clean-v1",
+            sql: "CREATE TABLE combined_clean_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+
+    let (core, plugin) = runner.run_all_pending(&plugins).await.unwrap();
+    assert_eq!(core.len(), 1);
+    assert_eq!(plugin.len(), 1);
+
+    let (core_again, plugin_again) = runner.run_all_pending(&plugins).await.unwrap();
+    assert!(core_again.is_empty());
+    assert!(plugin_again.is_empty());
+    runner.status().await.unwrap();
+    runner.plugin_status(&plugins).await.unwrap();
+
+    let core_rows = sqlx::query("SELECT COUNT(*) AS row_count FROM _ferrum_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let plugin_rows = sqlx::query("SELECT COUNT(*) AS row_count FROM _ferrum_plugin_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(core_rows.try_get::<i64, _>("row_count").unwrap(), 1);
+    assert_eq!(plugin_rows.try_get::<i64, _>("row_count").unwrap(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +1456,118 @@ async fn apply_plugin_migrations_runs_pending_and_creates_schema() {
     assert!(
         pending.is_empty(),
         "no pending migrations should remain after apply"
+    );
+}
+
+#[tokio::test]
+async fn startup_plugin_probe_and_auto_apply_both_block_checksum_drift() {
+    let (store, _tmp) = test_store_with_dir().await;
+    let original: Vec<(&str, Vec<CustomPluginMigration>)> = vec![(
+        "startup_drift_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_startup_table",
+            checksum: "startup-original",
+            sql: "CREATE TABLE startup_drift_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    store.apply_plugin_migrations(&original).await.unwrap();
+
+    let changed: Vec<(&str, Vec<CustomPluginMigration>)> = vec![(
+        "startup_drift_plugin",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_startup_table",
+            checksum: "startup-changed",
+            sql: "CREATE TABLE startup_drift_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+    let probe_error = store
+        .pending_plugin_migrations(&changed)
+        .await
+        .expect_err("warn-only startup probe must not downgrade integrity drift");
+    assert!(probe_error.is::<MigrationHistoryIntegrityError>());
+
+    let apply_error = store
+        .apply_plugin_migrations(&changed)
+        .await
+        .expect_err("auto-apply startup must fail on integrity drift");
+    assert!(apply_error.is::<MigrationHistoryIntegrityError>());
+
+    let row = sqlx::query(
+        "SELECT checksum FROM _ferrum_plugin_migrations WHERE plugin_name = ? AND version = 1",
+    )
+    .bind("startup_drift_plugin")
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("checksum").unwrap(),
+        "startup-original"
+    );
+}
+
+#[tokio::test]
+async fn warn_only_startup_probe_rejects_orphan_history_with_no_compiled_plugins() {
+    let (store, _tmp) = test_store_with_dir().await;
+    seed_plugin_history(&store.pool(), "startup_orphan_plugin", 1, "orphan-checksum").await;
+
+    let probe_error = store
+        .pending_plugin_migrations(&[])
+        .await
+        .expect_err("warn-only startup probe must reject unverifiable orphan history");
+    let integrity_error = probe_error
+        .downcast_ref::<MigrationHistoryIntegrityError>()
+        .expect("startup probe error must retain its structured type");
+    assert_eq!(
+        integrity_error.kind(),
+        MigrationHistoryIntegrityKind::UnknownAppliedNamespace
+    );
+    assert_eq!(
+        integrity_error.namespace,
+        MigrationHistoryNamespace::CustomPlugin("startup_orphan_plugin".to_string())
+    );
+
+    let apply_error = store
+        .apply_plugin_migrations(&[])
+        .await
+        .expect_err("auto-apply startup path must also reject orphan history");
+    assert!(apply_error.is::<MigrationHistoryIntegrityError>());
+}
+
+#[tokio::test]
+async fn automatic_database_startup_rejects_orphan_plugin_history() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("startup_orphan_history.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+    seed_plugin_history(
+        &store.pool(),
+        "automatic_startup_orphan",
+        1,
+        "orphan-checksum",
+    )
+    .await;
+
+    let error =
+        match DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+        {
+            Ok(_) => panic!("automatic startup must refuse orphan plugin history"),
+            Err(error) => error,
+        };
+    let integrity_error = error
+        .downcast_ref::<MigrationHistoryIntegrityError>()
+        .expect("automatic startup refusal must remain typed");
+    assert_eq!(
+        integrity_error.kind(),
+        MigrationHistoryIntegrityKind::UnknownAppliedNamespace
     );
 }
 

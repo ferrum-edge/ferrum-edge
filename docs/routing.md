@@ -248,7 +248,7 @@ The router uses **two separate DashMap cache partitions**:
 
 This separation prevents regex routes with highly variable path segments (UUIDs, timestamps) from filling the cache and evicting frequently-hit prefix route entries.
 
-Both caches are bounded by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default `0`, auto-resolved to at least 10,000 entries) and use frequency-aware sample eviction when a partition reaches the threshold. Config changes rebuild and publish the route table together with its generation as one atomic snapshot, and clear lookup caches, so stale route matches are never reused across route generations.
+Both caches are bounded by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default `0`, auto-resolved to at least 10,000 entries) and use frequency-aware sample eviction when a partition reaches the threshold. Config changes publish the route table, its generation, and generation-bound Gateway-listener admission in one request epoch. A new epoch starts listener admission pending, so listener-scoped routes fail closed until the exact config generation is reconciled; acknowledging that decision advances the route-cache generation so neither positive nor negative entries survive the admission transition.
 
 ## Performance Characteristics
 
@@ -260,6 +260,6 @@ Both caches are bounded by `FERRUM_ROUTER_CACHE_MAX_ENTRIES` (default `0`, auto-
 | Cache miss, prefix match found | O(path depth) segment-boundary HashMap walk within the matched host tier |
 | Cache miss, regex match found | Prefix/exact checks plus one `RegexSet` pass for the matched host tier; captures run only for the winning regex |
 | Cache miss, no match (404) | O(all routes in all tiers) — negative entry cached for future O(1) |
-| Config reload | Route table and generation rebuilt as one ArcSwap snapshot; lookup caches cleared |
+| Config reload | Route table, generation, and pending listener admission published as one RequestEpoch; matching admission acknowledgement advances cache generation |
 
-All route table operations (sorting, regex compilation, host partitioning) happen at config load time, never on the request hot path. The request path uses only lock-free reads (`ArcSwap::load()`, `DashMap::get()`).
+All route table operations (sorting, regex compilation, host partitioning) happen at config load time, never on the request hot path. The request path uses one lock-free `RequestEpoch` load for the route table and its listener admission, followed by `DashMap::get()` for cached lookups.

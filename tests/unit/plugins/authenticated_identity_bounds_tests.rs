@@ -237,6 +237,7 @@ fn oversized_header_without_external_identity_does_not_block_consumer() {
         consumer: Some(std::sync::Arc::clone(&consumer)),
         external_identity: Some("   \t".to_string()),
         external_identity_header: Some(header.clone()),
+        credential_deadline: None,
     };
     let ctx = context();
     assert!(authentication_attempt_can_commit(&ctx, &outcome, true));
@@ -283,6 +284,7 @@ fn blank_display_header_normalization_aligned_with_preflight() {
             consumer: None,
             external_identity: Some("alice".to_string()),
             external_identity_header: Some(blank.to_string()),
+            credential_deadline: None,
         };
         let ctx = context();
         assert!(

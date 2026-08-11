@@ -485,6 +485,8 @@ fn hash_on_only_port_override_preserves_subset_algorithm_with_port_hash_key() {
             h2_upgrade_policy: None,
             max_retries: None,
             http1_max_pending_requests: None,
+            http_idle_timeout_ms: None,
+            h2_max_concurrent_streams: None,
             passive_health_check: None,
         }),
     }]);

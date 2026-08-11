@@ -8,12 +8,22 @@
 //! `reqwest::Client`) so that Consul API calls inherit the gateway's
 //! connection pool settings, DNS cache, trust store, and
 //! `FERRUM_TLS_NO_VERIFY` setting.
+//!
+//! The blocking-query cursor (`X-Consul-Index`) is returned as a pending
+//! [`super::DiscoveryCursorCommit`] and must be committed by the discovery
+//! manager only after shared target admission and successful publication.
+//! Failed status, malformed bodies, rejected snapshots, and publication
+//! failures retain the previously committed cursor.
 
 use crate::config::types::UpstreamTarget;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use tracing::debug;
+
+use super::http_body::{DiscoveryBodyRole, collect_discovery_response_body};
+use super::{DiscoveryCursorCommit, DiscoverySnapshot};
 
 /// Characters that must be percent-encoded in a URL path segment (RFC 3986 §3.3).
 /// Encodes everything except unreserved chars and sub-delims that are safe in path segments.
@@ -52,6 +62,9 @@ const QUERY_VALUE_ENCODE: &AsciiSet = &CONTROLS
     .add(b'`')
     .add(b'|');
 
+/// Maximum accepted `X-Consul-Index` header value length (decimal digits of u64).
+const MAX_CONSUL_INDEX_HEADER_LEN: usize = 20;
+
 /// Consul service discoverer.
 ///
 /// Queries Consul's `/v1/health/service/:service` endpoint to discover
@@ -65,8 +78,9 @@ pub struct ConsulDiscoverer {
     healthy_only: bool,
     token: Option<String>,
     default_weight: u32,
-    /// Last Consul index for blocking queries.
-    last_index: AtomicU64,
+    /// Last Consul index for blocking queries. Advanced only via committed
+    /// [`DiscoveryCursorCommit`] handles after snapshot admission.
+    last_index: Arc<AtomicU64>,
 }
 
 impl ConsulDiscoverer {
@@ -90,8 +104,18 @@ impl ConsulDiscoverer {
             healthy_only,
             token,
             default_weight,
-            last_index: AtomicU64::new(0),
+            last_index: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Currently committed blocking-query index (`0` means non-blocking).
+    ///
+    /// External unit tests observe cursor advancement through
+    /// `ferrum_edge::_test_support::consul_blocking_query_index_for_test`.
+    #[allow(dead_code)] // reached via `_test_support` from the external test crate
+    #[doc(hidden)]
+    pub(crate) fn blocking_query_index(&self) -> u64 {
+        self.last_index.load(Ordering::Relaxed)
     }
 
     fn build_url(&self) -> String {
@@ -132,9 +156,23 @@ impl ConsulDiscoverer {
     }
 }
 
+/// Parse `X-Consul-Index` with a bounded length check. Malformed or oversized
+/// values fail closed (no candidate cursor) without logging header contents.
+pub(crate) fn parse_consul_index_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get("X-Consul-Index")?;
+    let value = raw.to_str().ok()?;
+    if value.is_empty() || value.len() > MAX_CONSUL_INDEX_HEADER_LEN {
+        return None;
+    }
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
 #[async_trait::async_trait]
 impl super::ServiceDiscoverer for ConsulDiscoverer {
-    async fn discover(&self) -> Result<Vec<UpstreamTarget>, anyhow::Error> {
+    async fn discover(&self) -> Result<DiscoverySnapshot, anyhow::Error> {
         let url = self.build_url();
 
         let mut request = self.client.get(&url);
@@ -146,48 +184,40 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
 
         let response = request.send().await?;
 
-        // Track the Consul index for blocking queries.
-        // Per Consul docs, when a server restarts the index can reset to a
-        // lower value. Detect this and move the cursor to the new index. The
-        // current response body has already delivered that snapshot, and the
-        // next call can keep using a blocking query instead of tight-spinning
-        // on index=0 immediate responses.
-        if let Some(new_index) = response
-            .headers()
-            .get("X-Consul-Index")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            let current = self.last_index.load(Ordering::Relaxed);
-            if new_index < current {
-                warn!(
-                    "Consul index decreased from {} to {}, resetting blocking-query cursor to the new index (server likely restarted)",
-                    current, new_index
-                );
-                self.last_index.store(new_index, Ordering::Relaxed);
-            } else {
-                self.last_index.store(new_index, Ordering::Relaxed);
-            }
-        }
+        // Candidate index for this response only — never mutate `last_index`
+        // here. The manager commits after shared admission + publication.
+        let candidate_index = parse_consul_index_header(response.headers());
 
         if !response.status().is_success() {
-            let status = response.status();
-            let body = match response.text().await {
-                Ok(t) => t,
-                Err(e) => format!("<failed to read response body: {}>", e),
-            };
-            anyhow::bail!(
-                "Consul API returned {}: {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            );
+            // Fail closed without surfacing response bodies (may contain
+            // secrets). Drain under the tighter error-body ceiling, then emit
+            // fixed ACL remediation for 401/403 only.
+            let status = response.status().as_u16();
+            let _ = collect_discovery_response_body(response, DiscoveryBodyRole::Error).await;
+            if matches!(status, 401 | 403) {
+                anyhow::bail!(
+                    "Consul API returned status {status}; check Consul ACL token policy (service:read on the discovered service)"
+                );
+            }
+            anyhow::bail!("Consul API returned status {status}");
         }
 
-        let body: Vec<serde_json::Value> = response.json().await?;
+        // Distinguish transport/read failures from malformed JSON without
+        // logging body bytes, URLs, tokens, or unredacted error strings.
+        let body_bytes = collect_discovery_response_body(response, DiscoveryBodyRole::Success)
+            .await
+            .map_err(|e| e.as_anyhow("Consul"))?;
+        let body: Vec<serde_json::Value> = serde_json::from_slice(body_bytes.as_slice())
+            .map_err(|_| anyhow::anyhow!("Consul API returned malformed JSON"))?;
+        // Release the shared body-budget permit before target construction.
+        drop(body_bytes);
+        let provider_item_count = body.len();
         let mut targets = Vec::new();
         let mut missing_service = 0usize;
         let mut missing_address = 0usize;
         let mut missing_port = 0usize;
+        let mut invalid_port = 0usize;
+        let mut invalid_weight = 0usize;
 
         for entry in &body {
             let service = match entry.get("Service") {
@@ -219,20 +249,46 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
                 continue;
             }
 
-            let port = service.get("Port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
+            // Checked port admission: reject 0 / out-of-range without wrapping.
+            let port = match service.get("Port") {
+                None => {
+                    missing_port += 1;
+                    continue;
+                }
+                Some(value) => match value.as_u64() {
+                    None => {
+                        invalid_port += 1;
+                        continue;
+                    }
+                    Some(raw) => match super::admit_registry_port(raw) {
+                        Some(port) => port,
+                        None => {
+                            invalid_port += 1;
+                            continue;
+                        }
+                    },
+                },
+            };
 
-            if port == 0 {
-                missing_port += 1;
-                continue;
-            }
-
-            // Use Consul service weights if available
-            let weight = service
-                .get("Weights")
-                .and_then(|w| w.get("Passing"))
-                .and_then(|p| p.as_u64())
-                .map(|w| w as u32)
-                .unwrap_or(self.default_weight);
+            // Weight contract:
+            // - Missing `Weights` / `Passing` → configured `default_weight`
+            //   (already validated as 1..=MAX_TARGET_WEIGHT at config load).
+            // - Explicit `Passing` present → must admit as 1..=MAX_TARGET_WEIGHT;
+            //   zero, non-integer, and out-of-range values skip this entry only
+            //   (no wrap/coercion into a routable weight).
+            let weight = match service.get("Weights").and_then(|w| w.get("Passing")) {
+                None => self.default_weight,
+                Some(passing) => match passing
+                    .as_u64()
+                    .and_then(super::admit_registry_target_weight)
+                {
+                    Some(weight) => weight,
+                    None => {
+                        invalid_weight += 1;
+                        continue;
+                    }
+                },
+            };
 
             // Extract service tags as target tags
             let mut tags = HashMap::new();
@@ -260,18 +316,32 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
             targets.len(),
             self.service_name
         );
-        if targets.is_empty() && (!body.is_empty()) {
-            warn!(
+        if targets.is_empty() && provider_item_count > 0 {
+            // Admission emits the operator-facing rejection warn; keep detail here
+            // at debug to avoid duplicate warnings for the same rejection.
+            debug!(
                 service = %self.service_name,
-                records = body.len(),
+                records = provider_item_count,
                 missing_service,
                 missing_address,
                 missing_port,
+                invalid_port,
+                invalid_weight,
                 "Consul discovery produced zero valid targets from provider payload"
             );
         }
 
-        Ok(targets)
+        let snapshot = if let Some(index) = candidate_index {
+            DiscoverySnapshot::with_atomic_cursor(
+                targets,
+                provider_item_count,
+                DiscoveryCursorCommit::new(Arc::clone(&self.last_index), index),
+            )
+        } else {
+            DiscoverySnapshot::with_atomic_targets(targets, provider_item_count)
+        };
+
+        Ok(snapshot)
     }
 
     fn provider_name(&self) -> &str {
@@ -300,7 +370,7 @@ mod tests {
             healthy_only,
             token: None,
             default_weight: 1,
-            last_index: AtomicU64::new(0),
+            last_index: Arc::new(AtomicU64::new(0)),
         }
     }
 

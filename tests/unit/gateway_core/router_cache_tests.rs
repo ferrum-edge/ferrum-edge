@@ -1858,6 +1858,158 @@ fn port_scoped_regex_beats_its_port_agnostic_fallback_on_the_exact_listener() {
     assert_eq!(elsewhere.proxy.id, "fallback");
 }
 
+/// A listener refused by Gateway admission must not become reachable through
+/// the single-listener Service remap or an exact-port match, while an unrelated
+/// sibling listen_port keeps serving.
+#[test]
+fn refused_listener_ports_fail_closed_without_poisoning_siblings() {
+    use std::collections::BTreeSet;
+
+    let mut refused = test_proxy("refused", "/api");
+    refused.hosts = vec!["app.example.com".into()];
+    refused.listen_port = Some(80);
+
+    let mut refused_exact = test_proxy("refused-exact", "=/exact");
+    refused_exact.hosts = vec!["exact.example.com".into()];
+    refused_exact.listen_port = Some(80);
+
+    let mut refused_regex = test_proxy("refused-regex", "~/items/[0-9]+");
+    refused_regex.hosts = vec!["regex.example.com".into()];
+    refused_regex.listen_port = Some(80);
+
+    let mut sibling = test_proxy("sibling", "/api");
+    sibling.hosts = vec!["other.example.com".into()];
+    sibling.listen_port = Some(8080);
+
+    let sibling_namespace = sibling.namespace.clone();
+    let mut config = test_config(vec![refused, refused_exact, refused_regex, sibling]);
+    config
+        .http_tls_listen_ports
+        .insert((sibling_namespace, 8080));
+    let cache = RouterCache::new(&config, 100);
+
+    // Warm positive cache entries before the refusal is published.
+    let before = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8000), false)
+        .expect("Service remap reaches the sole nontls listener before refusal");
+    assert_eq!(before.proxy.id, "refused");
+    assert_eq!(
+        cache
+            .find_proxy_on_frontend(Some("exact.example.com"), "/exact", Some(80), false)
+            .expect("exact path before refusal")
+            .proxy
+            .id,
+        "refused-exact"
+    );
+    assert_eq!(
+        cache
+            .find_proxy_on_frontend(Some("regex.example.com"), "/items/42", Some(80), false)
+            .expect("regex path before refusal")
+            .proxy
+            .id,
+        "refused-regex"
+    );
+
+    cache.publish_listener_admission_for_test(false, BTreeSet::from([80]));
+
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8000), false)
+            .is_none(),
+        "refused listener must not escape through single-listener remapping"
+    );
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(80), false)
+            .is_none(),
+        "refused listener must not match its own listen_port either"
+    );
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("exact.example.com"), "/exact", Some(80), false)
+            .is_none(),
+        "refused listener must reject exact-path cache hits"
+    );
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("regex.example.com"), "/items/42", Some(80), false)
+            .is_none(),
+        "refused listener must reject regex cache hits"
+    );
+
+    let sibling_hit = cache
+        .find_proxy_on_frontend(Some("other.example.com"), "/api/x", Some(8080), true)
+        .expect("an unrelated listen_port must keep routing");
+    assert_eq!(sibling_hit.proxy.id, "sibling");
+}
+
+/// Withdrawing the refused-port snapshot must restore Service remap without
+/// leaving a stale fail-closed cache entry behind.
+#[test]
+fn refused_listener_withdrawal_restores_remap_and_resists_stale_cache() {
+    use std::collections::BTreeSet;
+
+    let mut scoped = test_proxy("scoped", "/api");
+    scoped.hosts = vec!["app.example.com".into()];
+    scoped.listen_port = Some(80);
+    let cache = RouterCache::new(&test_config(vec![scoped]), 100);
+
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8000), false)
+            .is_some(),
+        "baseline remap"
+    );
+
+    cache.publish_listener_admission_for_test(false, BTreeSet::from([80]));
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8000), false)
+            .is_none(),
+        "refusal must fail closed"
+    );
+
+    // Populate a negative cache entry under the refused generation.
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8000), false)
+            .is_none()
+    );
+
+    cache.publish_listener_admission_for_test(false, BTreeSet::new());
+    let restored = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/api/x", Some(8000), false)
+        .expect("withdrawing refusal must restore remap");
+    assert_eq!(restored.proxy.id, "scoped");
+}
+
+/// A positive cache hit populated before refusal must not resurrect the route
+/// after the admission snapshot flips; the hit path re-validates against the
+/// current refused-port set.
+#[test]
+fn refused_listener_invalidates_positive_cache_hits() {
+    use std::collections::BTreeSet;
+
+    let mut scoped = test_proxy("scoped", "/api");
+    scoped.hosts = vec!["app.example.com".into()];
+    scoped.listen_port = Some(80);
+    let cache = RouterCache::new(&test_config(vec![scoped]), 100);
+
+    let warm = cache
+        .find_proxy_on_frontend(Some("app.example.com"), "/api/warm", Some(80), false)
+        .expect("warm exact-port cache entry");
+    assert_eq!(warm.proxy.id, "scoped");
+    assert!(cache.cache_len() >= 1, "positive entry must be cached");
+
+    cache.publish_listener_admission_for_test(false, BTreeSet::from([80]));
+    assert!(
+        cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api/warm", Some(80), false)
+            .is_none(),
+        "cache hit must fail closed once the listener is refused"
+    );
+}
+
 #[test]
 fn later_port_scoped_regex_cannot_shadow_an_earlier_different_pattern() {
     let mut protected = test_proxy("protected-admin", "~^/admin/.*$");

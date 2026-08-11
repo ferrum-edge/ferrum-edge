@@ -101,6 +101,7 @@ pub mod stream_listener;
 pub mod stream_match;
 pub mod tcp_proxy;
 pub mod udp_batch;
+pub mod udp_placement_migration;
 pub mod udp_proxy;
 pub mod unix_backend;
 
@@ -2066,9 +2067,9 @@ fn websocket_idle_disabled_proxy_ids(
 /// Emit the resource-hoarding warning for a set of proxies with a disabled
 /// WebSocket idle bound. An upgraded WebSocket holds a dedicated backend
 /// connection plus a `websocket_max_connections` slot for its entire lifetime;
-/// with the idle timeout disabled, a silent (non-heartbeating) client can hoard
-/// that slot indefinitely. Activity from either direction — including Ping/Pong
-/// — refreshes the timer, so the disabled state is the only exposure.
+/// with the idle timeout disabled, a silent (non-heartbeating) client can retain
+/// that slot until the finite absolute session deadline. Activity from either
+/// direction — including Ping/Pong — refreshes only the idle timer.
 fn emit_websocket_idle_disabled_warning(
     disabled_proxy_ids: &[String],
     global_ws_idle_timeout_seconds: u64,
@@ -2084,10 +2085,10 @@ fn emit_websocket_idle_disabled_warning(
         ws_idle_disabled_proxy_sample = %sample,
         global_websocket_idle_timeout_seconds = global_ws_idle_timeout_seconds,
         "WebSocket idle timeout is disabled (0) for one or more HTTP-family proxies. \
-         Idle upgraded WebSocket sessions will hold a backend connection and a \
-         FERRUM_WEBSOCKET_MAX_CONNECTIONS slot indefinitely (resource-hoarding risk). \
-         Set FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (global) or the per-proxy \
-         websocket_idle_timeout_seconds to a non-zero value to bound idle lifetime."
+         Idle upgraded WebSocket sessions can hold a backend connection and a \
+         FERRUM_WEBSOCKET_MAX_CONNECTIONS slot until the finite absolute session \
+         lifetime. Set FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS (global) or the per-proxy \
+         websocket_idle_timeout_seconds to a non-zero value for an earlier idle bound."
     );
 }
 
@@ -2458,46 +2459,107 @@ fn hbone_relay_authority_host_for_mesh(host: &str) -> &str {
     }
 }
 
-/// Build a transparent inbound HBONE relay proxy that dials the CONNECT
-/// `:authority` of an authenticated mesh peer, for an Ambient/Waypoint
-/// terminator where no inbound route is materialized. Returns `None` (caller
-/// 404s) when the authority is missing/portless or is not a safe local relay
-/// target per [`inbound_hbone_relay_destination_allowed`].
+/// A synthesized inbound CONNECT relay proxy plus the authoritative CONNECT
+/// destination port to authorize on. For a Sidecar `ingress[]` remap this is
+/// the declared listener port; for ordinary and external-UDP relays it is the
+/// original authority port, which may differ from the selected dial port.
+pub(crate) struct InboundConnectRelay {
+    pub(crate) proxy: Arc<Proxy>,
+    pub(crate) ingress_listener_authz_port: Option<u16>,
+}
+
+/// Build the inbound CONNECT relay proxy for an authenticated mesh peer.
 ///
-/// `is_udp_connect` selects the SECOND, narrower admission source used only by
-/// datagram-over-mesh EgressGateway egress (issue #3263): a `udp`-marked CONNECT
-/// naming an external destination the EgressGateway's `ServiceEntry`-derived
-/// allowlist admits relays to that external host over a local `UdpSocket`, with
-/// the ServiceEntry's resolved `targetPort` as the dial port. The byte-stream
-/// relay never consults it, so a bare CONNECT stays bounded to loopback /
-/// slice-known workload targets exactly as before.
+/// Two shapes share this boundary, in strict order:
+///
+/// 1. **Sidecar `ingress[]` stream remap (issue #3260).** The identity-protected
+///    Sidecar inbound path is a fresh mesh-mTLS H2 CONNECT to `:15006`, so it
+///    never reaches the REDIRECT-captured `local_inbound_tcp_routes` table that
+///    serves direct plaintext. When the authority names the concrete local IP
+///    of THIS accepted connection on a
+///    DECLARED stream-family ingress listener port, relay to that listener's
+///    validated loopback `defaultEndpoint` — `pod-ip:16379` → `127.0.0.1:6379`
+///    — and report the DECLARED listener port so `mesh_authz` authorizes on it.
+///    A declared ingress block that does not resolve to exactly one valid,
+///    owner-stamped, stream-family mapping for that exact local IP returns
+///    `None` (caller 404s) instead of falling through to dial an unlisted or
+///    invalid port the operator replaced.
+/// 2. **Ordinary transparent relay** (Ambient / Waypoint terminators, which
+///    materialize NO inbound routes): dial the CONNECT `:authority` itself, the
+///    original destination the peer asked for. Unchanged, and unreachable for a
+///    declared ingress listener port so this can never widen it.
+///
+/// Returns `None` (caller 404s) when the authority is missing/portless or is not
+/// a safe local relay target per [`inbound_hbone_relay_destination_allowed`].
+///
+/// `is_udp_connect` is true for a datagram-over-CONNECT
+/// (`connect-udp`) request: `ingress[]` stream listeners are TCP, the UDP relay
+/// opens a `UdpSocket` straight at the resolved port, and #3260 must not widen
+/// UDP behavior. UDP additionally consults the EgressGateway's external
+/// ServiceEntry allowlist (#3263) after the ordinary local-target guard.
 fn build_inbound_hbone_relay_proxy(
     authority: Option<&http::uri::Authority>,
     mesh: Option<&crate::modes::mesh::config::MeshConfig>,
     is_udp_connect: bool,
-) -> Option<Arc<Proxy>> {
+    accepted_local_ip: Option<std::net::IpAddr>,
+) -> Option<InboundConnectRelay> {
+    use crate::modes::mesh::config::SidecarIngressConnectRelay;
     let authority = authority?;
     let host = hbone_relay_authority_host_for_mesh(authority.host());
     let port = authority.port_u16()?;
     if host.is_empty() || port == 0 {
         return None;
     }
-    if inbound_hbone_relay_destination_allowed(host, port, mesh) {
-        return Some(Arc::new(
-            crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
-        ));
+    let ingress_remap = match mesh {
+        Some(mesh) if !is_udp_connect => {
+            mesh.resolve_sidecar_ingress_connect_relay(host, port, accepted_local_ip)
+        }
+        _ => SidecarIngressConnectRelay::NotDeclared,
+    };
+    match ingress_remap {
+        SidecarIngressConnectRelay::NotDeclared => {}
+        SidecarIngressConnectRelay::Deny => {
+            debug!(
+                listener_port = port,
+                "Refusing authenticated inbound CONNECT after a Sidecar ingress block was \
+                 declared: the authority does not resolve to one valid, owner-stamped, \
+                 stream-family loopback endpoint for this accepted local address"
+            );
+            return None;
+        }
+        SidecarIngressConnectRelay::Relay {
+            listener_port,
+            endpoint_host,
+            endpoint_port,
+        } => {
+            let endpoint = endpoint_host.as_str();
+            let relay = crate::modes::mesh::mesh_ingress_relay_proxy(endpoint, endpoint_port);
+            return Some(InboundConnectRelay {
+                proxy: Arc::new(relay),
+                ingress_listener_authz_port: Some(listener_port),
+            });
+        }
     }
-    if is_udp_connect
-        && let Some((dial_host, dial_port)) =
-            mesh_egress_udp_destination_dial_endpoint(host, port, mesh)
-    {
-        // The relay dials the SELECTED ENDPOINT, not the authority: a STATIC
-        // ServiceEntry host must never be DNS-resolved here.
-        return Some(Arc::new(
-            crate::modes::mesh::mesh_inbound_hbone_relay_proxy(&dial_host, dial_port),
-        ));
+
+    if !inbound_hbone_relay_destination_allowed(host, port, mesh) {
+        if is_udp_connect
+            && let Some((dial_host, dial_port)) =
+                mesh_egress_udp_destination_dial_endpoint(host, port, mesh)
+        {
+            return Some(InboundConnectRelay {
+                proxy: Arc::new(crate::modes::mesh::mesh_inbound_hbone_relay_proxy(
+                    &dial_host, dial_port,
+                )),
+                ingress_listener_authz_port: Some(port),
+            });
+        }
+        return None;
     }
-    None
+    let relay = crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port);
+    Some(InboundConnectRelay {
+        proxy: Arc::new(relay),
+        ingress_listener_authz_port: Some(port),
+    })
 }
 
 /// A captured NodeWaypoint inbound connection resolved against the live slice:
@@ -6098,6 +6160,18 @@ fn via_header_for_backend_response_body<'a>(
 #[derive(Clone, Default)]
 struct RequestConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    /// Concrete local address of the accepted TCP connection. Unlike the
+    /// listener's wildcard bind address, this identifies the pod IP the peer
+    /// actually reached and binds a Sidecar ingress CONNECT to this replica.
+    ///
+    /// Populated only on the INBOUND mesh listener
+    /// (`mesh_direction == Some(Inbound)`, the only direction its consumer
+    /// `build_inbound_hbone_relay_proxy` runs on), and only after the accept
+    /// loop's overload / connection-permit fast-reject arms — the `getsockname`
+    /// must not be charged to every non-mesh or captured-egress accept, or to a
+    /// flood of connections the gateway is about to RST. `None` everywhere
+    /// else; its one consumer fails closed without it.
+    accepted_local_addr: Option<SocketAddr>,
     frontend_sni_hostname: Option<String>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     /// Direction stamped at listener-spawn time for mesh listeners.
@@ -6126,6 +6200,7 @@ struct RequestConnectionMetadata {
     /// connection instead of re-parsing the DER on every multiplexed request.
     peer_spiffe_extraction_cache:
         Option<Arc<crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache>>,
+    websocket_shutdown_rx: Option<watch::Receiver<bool>>,
 }
 
 fn empty_svid_bundle_slot() -> SharedSvidBundle {
@@ -6983,7 +7058,9 @@ impl ProxyState {
                     sources: watched_sources,
                     interval,
                     revision_tx,
+                    max_material_bytes: self.env_config.tls_max_material_size_bytes,
                     rebuild: Box::new(move || state.reload_frontend_dtls_material()),
+                    ready_tx: None,
                 },
                 shutdown_rx,
             ),
@@ -7022,6 +7099,7 @@ impl ProxyState {
                         self.env_config.secret_refresh_interval_seconds.max(1),
                     ),
                     revision_tx,
+                    max_material_bytes: self.env_config.tls_max_material_size_bytes,
                     rebuild: Box::new(move || rebuild_state.reload_backend_tls_material()),
                 },
                 shutdown_rx,
@@ -7417,10 +7495,19 @@ impl ProxyState {
             plugin_cache: plugin_cache.load_inner(),
             consumer_index: consumer_index.load_inner(),
             load_balancer: load_balancer_cache.load_inner(),
+            gateway_listener_admission: crate::router_cache::GatewayListenerAdmission::pending(),
             config_generation: 1,
             route_generation: 1,
             lb_generation: 1,
         }));
+        {
+            let initial_epoch = request_epoch.load();
+            router_cache.store_route_epoch_snapshot(
+                Arc::clone(&initial_epoch.route_table),
+                initial_epoch.route_generation,
+                Arc::clone(&initial_epoch.gateway_listener_admission),
+            );
+        }
         // Initialize health checker with the gateway's pool settings so active
         // probes share connection tuning (keep-alive, idle timeout, HTTP/2) with
         // regular proxy traffic.
@@ -7830,6 +7917,42 @@ impl ProxyState {
     /// withdrawal without polling.
     pub fn subscribe_config_revision(&self) -> watch::Receiver<u64> {
         self.config_revision.subscribe()
+    }
+
+    /// Publish the listener admission decision produced from `expected` only
+    /// while that exact config generation remains current. Returns `false` for
+    /// a stale reconcile so the manager can immediately process the newer one.
+    pub(crate) fn publish_gateway_listener_admission(
+        &self,
+        expected: &RequestEpoch,
+        refused_ports: std::collections::BTreeSet<u16>,
+    ) -> bool {
+        let admission = crate::router_cache::GatewayListenerAdmission::decided(refused_ports);
+        self.request_epoch
+            .publish_gateway_listener_admission(expected, admission, |published| {
+                self.router_cache.store_route_epoch_snapshot(
+                    Arc::clone(&published.route_table),
+                    published.route_generation,
+                    Arc::clone(&published.gateway_listener_admission),
+                );
+            })
+            .is_some()
+    }
+
+    /// Production route lookup exposed narrowly for external generation-race
+    /// regression tests. Both HTTP and HTTP/3 use the same epoch-bound helper.
+    #[doc(hidden)]
+    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
+    pub fn find_proxy_on_frontend_for_test(
+        &self,
+        host: Option<&str>,
+        path: &str,
+        frontend_port: Option<u16>,
+        frontend_is_tls: bool,
+    ) -> Option<crate::router_cache::RouteMatch> {
+        let epoch = self.request_epoch.load();
+        self.router_cache
+            .find_proxy_in_epoch(&epoch, host, path, frontend_port, frontend_is_tls)
     }
 
     /// The Alt-Svc value to advertise for the frontend port a request arrived
@@ -10031,14 +10154,17 @@ impl ProxyState {
         route_changed: bool,
         clear_route_caches: bool,
     ) {
-        if route_changed {
-            self.router_cache.store_route_table_snapshot(
-                Arc::clone(&published.route_table),
-                published.route_generation,
-            );
-            if clear_route_caches {
-                self.router_cache.clear_lookup_caches();
-            }
+        // Mirror route table and listener admission as one compatibility
+        // snapshot even when route content did not change. Production request
+        // paths read both directly from RequestEpoch; standalone/library
+        // lookups must not observe a partial generation either.
+        self.router_cache.store_route_epoch_snapshot(
+            Arc::clone(&published.route_table),
+            published.route_generation,
+            Arc::clone(&published.gateway_listener_admission),
+        );
+        if route_changed && clear_route_caches {
+            self.router_cache.clear_lookup_caches();
         }
         // No withdrawal pass is needed for the reqwest `maxConnections` admission
         // lanes: a lane exists only while some capped dispatch holds a lease
@@ -11312,6 +11438,7 @@ async fn handle_connection(
     state: Arc<ProxyState>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     frontend_listen_port: Option<u16>,
+    accepted_local_addr: Option<SocketAddr>,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     orig_dst: Option<SocketAddr>,
@@ -11362,11 +11489,13 @@ async fn handle_connection(
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
+    let websocket_shutdown_rx = shutdown_rx.clone();
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = Arc::clone(&state);
         let addr = remote_addr;
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port,
+            accepted_local_addr,
             frontend_sni_hostname: None,
             node_waypoint_identity: node_waypoint_identity.clone(),
             mesh_direction,
@@ -11375,6 +11504,7 @@ async fn handle_connection(
             mesh_inbound_pre_handshake_app_port,
             // Plaintext connections carry no client certificate.
             peer_spiffe_extraction_cache: None,
+            websocket_shutdown_rx: Some(websocket_shutdown_rx.clone()),
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -11642,6 +11772,44 @@ async fn handle_websocket_request_authenticated(
     // how the caller classified or constructed the request context.
     ctx.set_websocket_response_boundary(true);
     let mut current_cb_target_key = cb_target_key;
+    let ws_session_deadline =
+        effective_websocket_session_deadline(&ctx, state.env_config.websocket_max_lifetime_seconds);
+    if ws_session_deadline.at <= tokio::time::Instant::now() {
+        let (status, body, phase) = match ws_session_deadline.reason {
+            WsTerminationReason::CredentialExpired => (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"Credential expired before WebSocket upgrade"}"#,
+                "websocket_credential_expired",
+            ),
+            _ => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#,
+                "websocket_max_lifetime",
+            ),
+        };
+        log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            status.as_u16(),
+            start_time,
+            phase,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
+        record_request(&state, status.as_u16());
+        release_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            current_cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
+        return Ok(build_websocket_error_response(
+            status,
+            body,
+            &initial_response_header_policy_plugins,
+        ));
+    }
 
     // Absolute route retry ceiling retained before any DestinationRule target
     // projection. WebSocket retries authorize each attempt/candidate against
@@ -11768,8 +11936,16 @@ async fn handle_websocket_request_authenticated(
     // framer is born with the same per-proxy bounds as the client-side framer.
     // This precedes every retry attempt and uses the immutable request plugin
     // generation, so target rotation cannot change policy mid-upgrade.
-    let ws_size_limits =
-        EffectiveWsSizeLimits::from_plugins(state.max_websocket_frame_size_bytes, &plugins);
+    // Per-instance execution-trigger admission is decided HERE, before the
+    // session's parser ceilings exist, so a skipped size-limit instance
+    // constrains neither the client-side nor the backend-side framer (issue
+    // #3734). The decision is memoized on the upgrade context, so the later
+    // frame/disconnect collection reuses it rather than re-evaluating.
+    let ws_size_limit_plugins = collect_websocket_size_limit_plugins(&plugins, &mut ctx);
+    let ws_size_limits = EffectiveWsSizeLimits::from_plugins(
+        state.max_websocket_frame_size_bytes,
+        &ws_size_limit_plugins,
+    );
     // The client-sent Host: the mesh egress Extended CONNECT `:authority` is
     // derived from it (the egress route is `preserve_host_header`) so the peer's
     // inbound route matches on the SERVICE host, exactly like HTTP egress. Read
@@ -12460,6 +12636,37 @@ async fn handle_websocket_request_authenticated(
         cb.record_success(ws_cb_probe_slot_available);
     }
 
+    if ws_session_deadline.at <= tokio::time::Instant::now() {
+        let (status, body, phase) = match ws_session_deadline.reason {
+            WsTerminationReason::CredentialExpired => (
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"Credential expired before WebSocket upgrade"}"#,
+                "websocket_credential_expired",
+            ),
+            _ => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#,
+                "websocket_max_lifetime",
+            ),
+        };
+        log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            status.as_u16(),
+            start_time,
+            phase,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
+        record_request(&state, status.as_u16());
+        return Ok(build_websocket_error_response(
+            status,
+            body,
+            &initial_response_header_policy_plugins,
+        ));
+    }
+
     let ws_lb_guard =
         LoadBalancerConnectionGuard::new(current_target.clone(), upstream_balancer.clone());
     if let Some(permits) = backend_admission_permits.as_ref() {
@@ -12622,15 +12829,14 @@ async fn handle_websocket_request_authenticated(
     // lists come from the same request-cache snapshot, so neither path reloads
     // the cache or risks mixing generations.
     let (ws_framing_plugins, ws_frame_plugins) =
-        collect_websocket_relay_plugins(&plugins, requires_websocket_framing, &ctx);
+        collect_websocket_relay_plugins(&plugins, requires_websocket_framing, &mut ctx);
     // Collect disconnect-hook plugins separately. These fire exactly once at
     // session end instead of per-frame, so keeping them in their own list
-    // avoids the per-frame filter cost paid by the frame-hook path.
-    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = plugins
-        .iter()
-        .filter(|p| p.requires_ws_disconnect_hooks())
-        .cloned()
-        .collect();
+    // avoids the per-frame filter cost paid by the frame-hook path. Both lists
+    // consume the same per-instance admission decision, taken while the upgrade
+    // still holds authoritative request facts.
+    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> =
+        collect_websocket_disconnect_plugins(&plugins, &mut ctx);
 
     // Spawn bidirectional forwarding task (awaits client upgrade, then proxies)
     let proxy_id = proxy.id.clone();
@@ -12641,6 +12847,10 @@ async fn handle_websocket_request_authenticated(
     let ws_tunnel_idle_disabled_safety_cap =
         websocket_tunnel_idle_disabled_safety_cap(state.env_config.tcp_half_close_max_wait_seconds);
     let ws_fragment_policy = WsFragmentPolicy::from_env(&state.env_config);
+    let ws_shutdown_rx = ctx
+        .websocket_shutdown_rx
+        .clone()
+        .or_else(|| state.health_check_shutdown_rx.clone());
     let adaptive_buf = state.adaptive_buffer.clone();
     // Track the upgraded WebSocket session in `OverloadState.active_connections`
     // so graceful drain waits for in-flight WS sessions before exiting.
@@ -12710,7 +12920,33 @@ async fn handle_websocket_request_authenticated(
         // when no cap is configured for the destination port. Dropping it on
         // any session-end path releases the slot exactly once — no leak.
         let _backend_conn_guard = backend_conn_guard;
-        match on_upgrade.await {
+        let upgrade_result = tokio::select! {
+            biased;
+            reason = wait_for_websocket_session_stop(
+                ws_session_deadline,
+                ws_shutdown_rx.clone(),
+                &state.overload,
+            ) => {
+                // No relay ever started, and the stop is a policy decision
+                // rather than a transport failure, so the disconnect carries
+                // only `termination_reason`. Tagging a synthetic
+                // `ReadWriteTimeout` here would count a drain or an elapsed
+                // absolute lifetime as a failed session in metrics and alerts.
+                fire_ws_tunnel_disconnect_hooks_with_reason(
+                    &ws_disconnect_plugins,
+                    &proxy_id,
+                    &session_meta,
+                    0,
+                    0,
+                    None,
+                    reason,
+                )
+                .await;
+                return;
+            }
+            result = on_upgrade => result,
+        };
+        match upgrade_result {
             Ok(upgraded) => {
                 // H1/H2 frontends adapt hyper's `Upgraded` (which is
                 // `AsyncRead + AsyncWrite` in hyper-1 land) into the
@@ -12749,6 +12985,9 @@ async fn handle_websocket_request_authenticated(
                             // RFC 9220 §5 compliance.
                             false,
                             ws_idle_tracker,
+                            ws_session_deadline,
+                            ws_shutdown_rx,
+                            Arc::clone(&state.overload),
                             ws_fragment_policy,
                             &adaptive_buf,
                         )
@@ -12772,6 +13011,9 @@ async fn handle_websocket_request_authenticated(
                             ws_tunnel_idle_disabled_safety_cap,
                             false,
                             ws_idle_tracker,
+                            ws_session_deadline,
+                            ws_shutdown_rx,
+                            Arc::clone(&state.overload),
                             ws_fragment_policy,
                             &adaptive_buf,
                         )
@@ -14294,6 +14536,112 @@ pub struct WsSessionMeta {
     pub session_start_mono: Instant,
 }
 
+pub(crate) const WS_TERMINATION_METADATA_KEY: &str = "websocket.termination_reason";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WsTerminationReason {
+    CredentialExpired,
+    MaxLifetime,
+    IdleTimeout,
+    Drain,
+    NormalPeerClose,
+    RelayError,
+}
+
+impl WsTerminationReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CredentialExpired => "credential_expired",
+            Self::MaxLifetime => "max_lifetime",
+            Self::IdleTimeout => "idle_timeout",
+            Self::Drain => "drain",
+            Self::NormalPeerClose => "normal_peer_close",
+            Self::RelayError => "relay_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WsSessionDeadline {
+    pub(crate) at: tokio::time::Instant,
+    pub(crate) reason: WsTerminationReason,
+}
+
+pub(crate) fn effective_websocket_session_deadline(
+    ctx: &RequestContext,
+    max_lifetime_seconds: u64,
+) -> WsSessionDeadline {
+    let now = tokio::time::Instant::now();
+    let maximum = ctx
+        .grpc_deadline_received_at
+        .checked_add(Duration::from_secs(max_lifetime_seconds))
+        .unwrap_or(now);
+    match ctx.credential_deadline_at {
+        Some(credential) if credential <= maximum => WsSessionDeadline {
+            at: credential,
+            reason: WsTerminationReason::CredentialExpired,
+        },
+        _ => WsSessionDeadline {
+            at: maximum,
+            reason: WsTerminationReason::MaxLifetime,
+        },
+    }
+}
+
+fn ws_deadline_close_frame(reason: WsTerminationReason) -> CloseFrame {
+    let (code, text) = match reason {
+        WsTerminationReason::CredentialExpired => (CloseCode::Policy, "credential expired"),
+        WsTerminationReason::MaxLifetime => (CloseCode::Policy, "maximum lifetime reached"),
+        WsTerminationReason::Drain => (CloseCode::Away, "gateway draining"),
+        _ => (CloseCode::Away, "session ended"),
+    };
+    CloseFrame {
+        code,
+        reason: text.into(),
+    }
+}
+
+pub(crate) async fn wait_for_websocket_session_stop(
+    deadline: WsSessionDeadline,
+    mut shutdown: Option<watch::Receiver<bool>>,
+    overload: &crate::overload::OverloadState,
+) -> WsTerminationReason {
+    if deadline.at <= tokio::time::Instant::now() {
+        return deadline.reason;
+    }
+    if overload.draining.load(Ordering::Acquire)
+        || shutdown.as_ref().is_some_and(|receiver| *receiver.borrow())
+    {
+        return WsTerminationReason::Drain;
+    }
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline.at) => deadline.reason,
+        changed = async {
+            match shutdown.as_mut() {
+                Some(receiver) => receiver.changed().await.ok(),
+                None => std::future::pending().await,
+            }
+        } => {
+            let _ = changed;
+            WsTerminationReason::Drain
+        }
+        _ = overload.wait_for_drain_start() => WsTerminationReason::Drain,
+    }
+}
+
+fn ws_disconnect_metadata(
+    session_meta: &WsSessionMeta,
+    termination_reason: WsTerminationReason,
+) -> HashMap<String, String> {
+    let mut metadata = session_meta.metadata.clone();
+    metadata.insert(
+        WS_TERMINATION_METADATA_KEY.to_string(),
+        termination_reason.as_str().to_string(),
+    );
+    metadata
+}
+
 /// Fire `on_ws_disconnect` for the tunnel-mode path, where raw
 /// `copy_bidirectional` is used instead of frame-level parsing.
 ///
@@ -14320,11 +14668,46 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         Option<tcp_proxy::StreamIoSide>,
     )>,
 ) {
+    let termination_reason = if failure.is_some() {
+        WsTerminationReason::RelayError
+    } else {
+        WsTerminationReason::NormalPeerClose
+    };
+    fire_ws_tunnel_disconnect_hooks_with_reason(
+        ws_disconnect_plugins,
+        proxy_id,
+        session_meta,
+        bytes_client_to_backend,
+        bytes_backend_to_client,
+        failure,
+        termination_reason,
+    )
+    .await;
+}
+
+/// [`fire_ws_tunnel_disconnect_hooks`] with an explicit termination
+/// classification. The public wrapper derives the reason from `failure`; the
+/// absolute-deadline and drain stops pass their own reason with no failure,
+/// because a gateway-initiated policy close is not a relay fault.
+async fn fire_ws_tunnel_disconnect_hooks_with_reason(
+    ws_disconnect_plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    session_meta: &WsSessionMeta,
+    bytes_client_to_backend: u64,
+    bytes_backend_to_client: u64,
+    failure: Option<(
+        crate::plugins::Direction,
+        retry::ErrorClass,
+        Option<tcp_proxy::StreamIoSide>,
+    )>,
+    termination_reason: WsTerminationReason,
+) {
     if ws_disconnect_plugins.is_empty() {
         return;
     }
     let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
     let disconnected_at = chrono::Utc::now();
+    let metadata = ws_disconnect_metadata(session_meta, termination_reason);
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace.clone(),
         proxy_id: proxy_id.to_string(),
@@ -14346,7 +14729,7 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         error_class: failure.map(|(_, c, _)| c),
         consumer_username: session_meta.consumer_username.clone(),
         auth_method: session_meta.auth_method,
-        metadata: session_meta.metadata.clone(),
+        metadata,
     };
     for plugin in ws_disconnect_plugins {
         plugin.on_ws_disconnect(&disconnect_ctx).await;
@@ -14359,9 +14742,12 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 /// comes from `session_start_mono` (`Instant`); wall `session_start` is only
 /// used for `timestamp_connected` rendering. Takes `session_meta` by value
 /// because the framed relay consumes it at teardown.
-#[doc(hidden)]
+///
+/// `termination_reason` is the bounded classification published under
+/// [`WS_TERMINATION_METADATA_KEY`]; it always overwrites any same-named key the
+/// request accumulated, so plugin- or peer-influenced metadata cannot forge it.
 #[allow(clippy::too_many_arguments)]
-pub async fn fire_ws_framed_disconnect_hooks(
+pub(crate) async fn fire_ws_framed_disconnect_hooks_with_reason(
     ws_disconnect_plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
     session_meta: WsSessionMeta,
@@ -14374,12 +14760,14 @@ pub async fn fire_ws_framed_disconnect_hooks(
         retry::ErrorClass,
         Option<tcp_proxy::StreamIoSide>,
     )>,
+    termination_reason: WsTerminationReason,
 ) {
     if ws_disconnect_plugins.is_empty() {
         return;
     }
     let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
     let disconnected_at = chrono::Utc::now();
+    let metadata = ws_disconnect_metadata(&session_meta, termination_reason);
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace,
         proxy_id: proxy_id.to_string(),
@@ -14401,7 +14789,7 @@ pub async fn fire_ws_framed_disconnect_hooks(
         error_class: failure.map(|(_, c, _)| c),
         consumer_username: session_meta.consumer_username,
         auth_method: session_meta.auth_method,
-        metadata: session_meta.metadata,
+        metadata,
     };
     for plugin in ws_disconnect_plugins {
         plugin.on_ws_disconnect(&disconnect_ctx).await;
@@ -14556,26 +14944,85 @@ pub(crate) struct EffectiveWsSizeLimits {
 pub(crate) fn collect_websocket_relay_plugins(
     plugins: &[Arc<dyn Plugin>],
     requires_websocket_framing: bool,
-    upgrade_ctx: &RequestContext,
+    upgrade_ctx: &mut RequestContext,
 ) -> WebSocketRelayPluginLists {
     if !requires_websocket_framing {
         return (Vec::new(), Vec::new());
     }
-    let framing_plugins: Vec<_> = plugins
-        .iter()
-        .filter(|plugin| plugin.requires_websocket_framing())
-        .map(|plugin| {
+    let mut framing_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    for plugin in plugins.iter() {
+        if !plugin.requires_websocket_framing() {
+            continue;
+        }
+        // Per-instance execution-trigger admission, decided HERE — the last
+        // point at which the session still has authoritative request facts
+        // (issue #3734). A `false` instance is dropped before the session's
+        // capability set exists, so it forces neither framing nor size limits,
+        // observes no frame, reassembles nothing, and receives no delivery hook.
+        if !plugin.admits_ws_session(upgrade_ctx) {
+            continue;
+        }
+        framing_plugins.push(
             Arc::clone(plugin)
                 .bind_ws_session(upgrade_ctx)
-                .unwrap_or_else(|| Arc::clone(plugin))
-        })
-        .collect();
+                .unwrap_or_else(|| Arc::clone(plugin)),
+        );
+    }
     let frame_plugins = framing_plugins
         .iter()
         .filter(|plugin| plugin.requires_ws_frame_hooks())
         .cloned()
         .collect();
     (framing_plugins, frame_plugins)
+}
+
+/// Collect the instances whose published WebSocket size limits may constrain
+/// this session's parsers, under the same per-instance admission decision as
+/// the frame and disconnect paths.
+///
+/// Called before the backend handshake, which is the earliest point a ceiling is
+/// consumed. The decision is memoized on the upgrade context, so the frame,
+/// reassembly, delivery, and disconnect sets collected later agree with it
+/// without a second evaluation.
+pub(crate) fn collect_websocket_size_limit_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    upgrade_ctx: &mut RequestContext,
+) -> Vec<Arc<dyn Plugin>> {
+    let mut limit_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    for plugin in plugins.iter() {
+        if plugin.websocket_size_limits().is_none() {
+            continue;
+        }
+        if !plugin.admits_ws_session(upgrade_ctx) {
+            continue;
+        }
+        limit_plugins.push(Arc::clone(plugin));
+    }
+    limit_plugins
+}
+
+/// Collect the session's `on_ws_disconnect` plugins under the same admission
+/// decision as the frame path.
+///
+/// Called from both the H1/H2 and H3 WebSocket handlers, after
+/// [`collect_websocket_relay_plugins`] has memoized each triggered instance's
+/// decision on the upgrade context, so an instance that is skipped for frames is
+/// skipped for disconnect too and the two can never disagree.
+pub(crate) fn collect_websocket_disconnect_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    upgrade_ctx: &mut RequestContext,
+) -> Vec<Arc<dyn Plugin>> {
+    let mut disconnect_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    for plugin in plugins.iter() {
+        if !plugin.requires_ws_disconnect_hooks() {
+            continue;
+        }
+        if !plugin.admits_ws_session(upgrade_ctx) {
+            continue;
+        }
+        disconnect_plugins.push(Arc::clone(plugin));
+    }
+    disconnect_plugins
 }
 
 impl EffectiveWsSizeLimits {
@@ -15158,6 +15605,9 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     websocket_tunnel_idle_disabled_safety_cap: Duration,
     accept_unmasked_client_frames: bool,
     ws_idle_tracker: Option<Arc<WsIdleTracker>>,
+    session_deadline: WsSessionDeadline,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+    overload: Arc<crate::overload::OverloadState>,
     fragment_policy: WsFragmentPolicy,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
@@ -15210,26 +15660,49 @@ where
         let pre_relay_failure = {
             use tokio::io::AsyncWriteExt;
             let mut offset = 0usize;
-            let write_result = tokio::time::timeout(residual_write_timeout, async {
-                while offset < backend_read_buffer.len() {
-                    match client_io.write(&backend_read_buffer[offset..]).await {
-                        Ok(0) => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::WriteZero,
-                                "client accepted zero bytes while forwarding WebSocket backend residual bytes",
-                            ));
-                        }
-                        Ok(n) => {
-                            offset = offset.saturating_add(n);
-                        }
-                        Err(err) => {
-                            return Err(err);
+            let write_result = tokio::select! {
+                biased;
+                reason = wait_for_websocket_session_stop(
+                    session_deadline,
+                    shutdown_rx.clone(),
+                    &overload,
+                ) => {
+                    // The residual forward was cut short by policy, not by a
+                    // transport fault, so no failure is attributed; the bytes
+                    // actually handed to the client are still reported.
+                    recovered_backend_bytes_written = offset as u64;
+                    fire_ws_tunnel_disconnect_hooks_with_reason(
+                        &ws_disconnect_plugins,
+                        proxy_id,
+                        &session_meta,
+                        0,
+                        recovered_backend_bytes_written,
+                        None,
+                        reason,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                result = tokio::time::timeout(residual_write_timeout, async {
+                    while offset < backend_read_buffer.len() {
+                        match client_io.write(&backend_read_buffer[offset..]).await {
+                            Ok(0) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::WriteZero,
+                                    "client accepted zero bytes while forwarding WebSocket backend residual bytes",
+                                ));
+                            }
+                            Ok(n) => {
+                                offset = offset.saturating_add(n);
+                            }
+                            Err(err) => {
+                                return Err(err);
+                            }
                         }
                     }
-                }
-                Ok(())
-            })
-            .await;
+                    Ok(())
+                }) => result,
+            };
             recovered_backend_bytes_written = offset as u64;
             match write_result {
                 Ok(Ok(())) => None,
@@ -15286,16 +15759,49 @@ where
         } else {
             None
         };
-        let copy_result = tcp_proxy::bidirectional_copy_for_relay(
-            client_io,
-            backend,
-            websocket_idle_timeout,
-            tunnel_half_close_cap,
-            None,
-            None,
-            buf_size,
-        )
-        .await;
+        let copy_result = tokio::select! {
+            biased;
+            reason = wait_for_websocket_session_stop(
+                session_deadline,
+                shutdown_rx.clone(),
+                &overload,
+            ) => {
+                debug!(
+                    proxy_id = %proxy_id,
+                    connection_id,
+                    termination_reason = reason.as_str(),
+                    "WebSocket tunnel stopped by absolute session policy"
+                );
+                // Cancelling the raw copy forfeits its byte totals:
+                // `bidirectional_copy_for_relay` owns stack-local counters and
+                // only reports them when it returns, so a policy-stopped tunnel
+                // session reports just the pre-relay residual bytes. Frame-
+                // parsed sessions keep exact counts through shared atomics; use
+                // frame mode when byte fidelity across forced closes matters.
+                // No failure is attributed — this is a gateway policy close, not
+                // a relay fault, and `termination_reason` carries the cause.
+                fire_ws_tunnel_disconnect_hooks_with_reason(
+                    &ws_disconnect_plugins,
+                    proxy_id,
+                    &session_meta,
+                    0,
+                    recovered_backend_bytes_written,
+                    None,
+                    reason,
+                )
+                .await;
+                return Ok(());
+            }
+            result = tcp_proxy::bidirectional_copy_for_relay(
+                client_io,
+                backend,
+                websocket_idle_timeout,
+                tunnel_half_close_cap,
+                None,
+                None,
+                buf_size,
+            ) => result,
+        };
         adaptive_buffer.record_connection(
             &session_meta.namespace,
             proxy_id,
@@ -15324,7 +15830,21 @@ where
         // Fire on_ws_disconnect so plugins that opted into disconnect hooks see
         // the tunnel-mode session teardown. Frame counts are 0 because tunnel
         // mode does raw TCP bidirectional copy — no frames are parsed.
-        fire_ws_tunnel_disconnect_hooks(
+        let termination_reason = if copy_result.first_failure.is_some() {
+            if websocket_idle_timeout.is_some()
+                && copy_result
+                    .first_failure
+                    .as_ref()
+                    .is_some_and(|(_, class, _, _)| *class == retry::ErrorClass::ReadWriteTimeout)
+            {
+                WsTerminationReason::IdleTimeout
+            } else {
+                WsTerminationReason::RelayError
+            }
+        } else {
+            WsTerminationReason::NormalPeerClose
+        };
+        fire_ws_tunnel_disconnect_hooks_with_reason(
             &ws_disconnect_plugins,
             proxy_id,
             &session_meta,
@@ -15333,6 +15853,7 @@ where
                 .bytes_backend_to_client
                 .saturating_add(recovered_backend_bytes_written),
             tunnel_failure,
+            termination_reason,
         )
         .await;
         return Ok(());
@@ -15445,7 +15966,11 @@ where
     let cancel_btc = cancel.clone();
     let policy_close: Arc<std::sync::OnceLock<CloseFrame>> = Arc::new(std::sync::OnceLock::new());
     let policy_close_ctb = Arc::clone(&policy_close);
-    let policy_close_btc = policy_close;
+    let policy_close_btc = Arc::clone(&policy_close);
+    let policy_close_stop = policy_close;
+    let termination_reason = Arc::new(std::sync::OnceLock::new());
+    let termination_reason_ctb = Arc::clone(&termination_reason);
+    let termination_reason_btc = Arc::clone(&termination_reason);
 
     // Forward messages from client to backend
     let client_to_backend = async move {
@@ -15475,6 +16000,8 @@ where
                         WsNextMessage::Item(Some(msg)) => msg,
                         WsNextMessage::Item(None) => break,
                         WsNextMessage::IdleTimeout => {
+                            let _ = termination_reason_ctb
+                                .set(WsTerminationReason::IdleTimeout);
                             debug!(
                                 proxy_id = %proxy_id_ctb,
                                 connection_id,
@@ -15812,6 +16339,8 @@ where
                         WsNextMessage::Item(Some(msg)) => msg,
                         WsNextMessage::Item(None) => break,
                         WsNextMessage::IdleTimeout => {
+                            let _ = termination_reason_btc
+                                .set(WsTerminationReason::IdleTimeout);
                             debug!(
                                 proxy_id = %proxy_id_btc,
                                 connection_id,
@@ -16102,41 +16631,124 @@ where
     // upgraded sockets and `_ws_connection_permit` forever and eventually
     // starve new WebSocket sessions. Race the two halves for first-completion
     // (the exit branch each one runs calls `cancel()` on the opposite token)
-    // then wait on the remaining half with a bounded drain grace. If the
-    // grace expires the remaining future is dropped — in-flight plugin calls
-    // are cancelled and all captured sockets are released.
+    // then wait on the remaining half with a bounded drain grace while still
+    // racing the absolute session stop. If either bound fires, cancellation
+    // is published and the remaining future gets one bounded close-delivery
+    // grace before it is dropped, releasing all captured sockets.
     let mut c2b = Box::pin(client_to_backend);
     let mut b2c = Box::pin(backend_to_client);
-    let client_done = tokio::select! {
-        _ = &mut c2b => true,
-        _ = &mut b2c => false,
+    let mut stop = Box::pin(wait_for_websocket_session_stop(
+        session_deadline,
+        shutdown_rx,
+        &overload,
+    ));
+    let first_completion = tokio::select! {
+        biased;
+        reason = &mut stop => {
+            // Deliberately NOT a `first_failure`: an absolute-deadline or drain
+            // stop is a gateway-initiated policy close that delivers a real
+            // Close frame in both directions. Recording it as a relay
+            // `ReadWriteTimeout` would publish `result="error"` on
+            // `ferrum_websocket_sessions_total` and resolve to
+            // `DisconnectCause::IdleTimeout` for `proxy_alerts`, so every
+            // session that simply reached `FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS`
+            // would look like a stalled relay. `termination_reason` already
+            // carries the real cause. A genuine hang is still recorded below,
+            // when the remaining half misses `WS_DRAIN_GRACE`.
+            let _ = termination_reason.set(reason);
+            let _ = publish_ws_policy_close(
+                &policy_close_stop,
+                &cancel,
+                Some(ws_deadline_close_frame(reason)),
+            );
+            2u8
+        }
+        _ = &mut c2b => 0u8,
+        _ = &mut b2c => 1u8,
     };
     // On grace-timeout the remaining half's future is dropped (in-flight
     // plugin calls cancelled, sockets released). Record that as a failure so
     // `on_ws_disconnect` surfaces `cause=timeout` instead of looking like a
     // clean close. The direction tags which half was still running when the
     // grace expired.
-    if client_done {
-        if tokio::time::timeout(WS_DRAIN_GRACE, b2c).await.is_err() {
+    if first_completion == 0 {
+        let remaining_timed_out = tokio::select! {
+            biased;
+            reason = &mut stop => {
+                // Same reasoning as the first-completion arbiter above: the
+                // policy stop itself is not a relay failure. Only the bounded
+                // close-delivery grace below can attribute one.
+                let _ = termination_reason.set(reason);
+                let _ = publish_ws_policy_close(
+                    &policy_close_stop,
+                    &cancel,
+                    Some(ws_deadline_close_frame(reason)),
+                );
+                tokio::time::timeout(WS_DRAIN_GRACE, &mut b2c)
+                    .await
+                    .is_err()
+            }
+            result = tokio::time::timeout(WS_DRAIN_GRACE, &mut b2c) => result.is_err(),
+        };
+        if remaining_timed_out {
             let _ = first_failure.set((
                 crate::plugins::Direction::BackendToClient,
                 retry::ErrorClass::ReadWriteTimeout,
                 None,
             ));
         }
-    } else if tokio::time::timeout(WS_DRAIN_GRACE, c2b).await.is_err() {
+    } else if first_completion == 1 {
+        let remaining_timed_out = tokio::select! {
+            biased;
+            reason = &mut stop => {
+                // Same reasoning as the first-completion arbiter above: the
+                // policy stop itself is not a relay failure. Only the bounded
+                // close-delivery grace below can attribute one.
+                let _ = termination_reason.set(reason);
+                let _ = publish_ws_policy_close(
+                    &policy_close_stop,
+                    &cancel,
+                    Some(ws_deadline_close_frame(reason)),
+                );
+                tokio::time::timeout(WS_DRAIN_GRACE, &mut c2b)
+                    .await
+                    .is_err()
+            }
+            result = tokio::time::timeout(WS_DRAIN_GRACE, &mut c2b) => result.is_err(),
+        };
+        if remaining_timed_out {
+            let _ = first_failure.set((
+                crate::plugins::Direction::ClientToBackend,
+                retry::ErrorClass::ReadWriteTimeout,
+                None,
+            ));
+        }
+    } else if tokio::time::timeout(WS_DRAIN_GRACE, async {
+        tokio::join!(c2b, b2c);
+    })
+    .await
+    .is_err()
+    {
         let _ = first_failure.set((
-            crate::plugins::Direction::ClientToBackend,
+            crate::plugins::Direction::Unknown,
             retry::ErrorClass::ReadWriteTimeout,
             None,
         ));
     }
 
+    let termination_reason = termination_reason.get().copied().unwrap_or_else(|| {
+        if first_failure.get().is_some() {
+            WsTerminationReason::RelayError
+        } else {
+            WsTerminationReason::NormalPeerClose
+        }
+    });
+
     // Fire the on_ws_disconnect hook exactly once, after both forward halves
     // have wound down. When no plugin opted in the list is empty and we skip
     // the whole block — zero overhead for deployments that don't observe
     // WebSocket sessions.
-    fire_ws_framed_disconnect_hooks(
+    fire_ws_framed_disconnect_hooks_with_reason(
         &ws_disconnect_plugins,
         proxy_id,
         session_meta,
@@ -16145,6 +16757,7 @@ where
         bytes_c2b.load(Ordering::Relaxed),
         bytes_b2c.load(Ordering::Relaxed),
         first_failure.get().cloned(),
+        termination_reason,
     )
     .await;
 
@@ -16775,6 +17388,13 @@ fn mesh_inbound_peer_auth_app_port(proxy: &Proxy, upstream_target: Option<&Upstr
     // keyed by the workload app/container port behind defaultEndpoint. Route
     // overrides and upstream selection can replace that initial proxy port, so
     // the concrete target port is authoritative once one has been selected.
+    //
+    // This keeps the two inbound lanes in lock-step. Direct plaintext capture
+    // translates the captured listener port through
+    // `MeshInboundTlsPolicy.app_port_by_orig_dst_port` before selecting a
+    // posture; an authenticated CONNECT that a declared ingress listener
+    // remapped (issue #3260) arrives here with `backend_port` ALREADY equal to
+    // that same `defaultEndpoint` port, so both lanes resolve one posture.
     upstream_target
         .map(|target| target.port)
         .unwrap_or(proxy.backend_port)
@@ -16877,6 +17497,8 @@ async fn reject_mesh_inbound_peer_auth_transport_mismatch(
 
 struct TlsConnectionMetadata {
     frontend_listen_port: Option<u16>,
+    /// See [`RequestConnectionMetadata::accepted_local_addr`].
+    accepted_local_addr: Option<SocketAddr>,
     record_mesh_mtls_metric: bool,
     node_waypoint_identity: Option<Arc<NodeWaypointIdentity>>,
     mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
@@ -17190,6 +17812,7 @@ async fn run_accept_loop(
     // mesh mode. Outside it, skip the wildcard-bind `getsockname()` fallback
     // entirely so a non-mesh gateway's accept loop is byte-for-byte unchanged.
     let resolve_connection_destination_ip = frontend_bound_ip.is_none()
+        && mesh_direction.is_some()
         && state.env_config.mode == crate::config::env_config::OperatingMode::Mesh;
     // Count consecutive accept() failures to back off a busy-loop. Under fd
     // exhaustion (EMFILE/ENFILE) accept() fails WITHOUT consuming the pending
@@ -17320,6 +17943,33 @@ async fn run_accept_loop(
                         } else {
                             None
                         };
+                        // Concrete local address of the accepted connection —
+                        // the pod IP the peer actually reached, even when the
+                        // listener is bound to a wildcard address. Read only
+                        // AFTER the overload/permit fast-reject arms so a
+                        // connection flood still costs zero extra syscalls.
+                        //
+                        // Gated to the INBOUND mesh listener, the only direction
+                        // its consumer runs on: `build_inbound_hbone_relay_proxy`
+                        // is synthesized solely when `mesh_direction == Inbound`.
+                        // Computing it on the outbound capture listener would add
+                        // a `getsockname()` to every captured egress connection —
+                        // whose `orig_dst` is already present, so the value would
+                        // never be read. `connection_destination_ip` below keeps
+                        // its own LAZY wildcard fallback for that direction.
+                        let accepted_local_addr = if mesh_direction
+                            == Some(crate::modes::mesh::MeshTrafficDirection::Inbound)
+                        {
+                            frontend_bound_addr
+                                .filter(|addr| !addr.ip().is_unspecified())
+                                .or_else(|| {
+                                    resolve_connection_destination_ip
+                                        .then(|| stream.local_addr().ok())
+                                        .flatten()
+                                })
+                        } else {
+                            None
+                        };
                         // Istio `destination.ip` input for this connection. A
                         // captured original destination wins when present (it
                         // is the address the client actually dialled, whereas
@@ -17332,6 +17982,7 @@ async fn run_accept_loop(
                         // cost, and never anything a client sends.
                         let connection_destination_ip = orig_dst
                             .map(|addr| addr.ip())
+                            .or_else(|| accepted_local_addr.map(|addr| addr.ip()))
                             .or(frontend_bound_ip)
                             .or_else(|| {
                                 resolve_connection_destination_ip
@@ -17564,6 +18215,7 @@ async fn run_accept_loop(
                             let result = if let Some(tls_config) = tls_config {
                                 let tls_connection_metadata = TlsConnectionMetadata {
                                     frontend_listen_port,
+                                    accepted_local_addr,
                                     record_mesh_mtls_metric,
                                     node_waypoint_identity,
                                     mesh_direction,
@@ -17587,6 +18239,7 @@ async fn run_accept_loop(
                                     state,
                                     conn_shutdown_rx,
                                     frontend_listen_port,
+                                    accepted_local_addr,
                                     node_waypoint_identity,
                                     mesh_direction,
                                     orig_dst,
@@ -17730,6 +18383,7 @@ async fn handle_tls_connection(
 
     // WebSocket requests flow through handle_proxy_request so that authentication
     // and authorization plugins execute before the upgrade handshake.
+    let websocket_shutdown_rx = shutdown_rx.clone();
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = Arc::clone(&state);
         let addr = remote_addr;
@@ -17739,6 +18393,7 @@ async fn handle_tls_connection(
         let frontend_sni_hostname = frontend_sni_hostname.clone();
         let connection_metadata = RequestConnectionMetadata {
             frontend_listen_port: tls_connection_metadata.frontend_listen_port,
+            accepted_local_addr: tls_connection_metadata.accepted_local_addr,
             frontend_sni_hostname,
             node_waypoint_identity: tls_connection_metadata.node_waypoint_identity.clone(),
             mesh_direction: tls_connection_metadata.mesh_direction,
@@ -17747,6 +18402,7 @@ async fn handle_tls_connection(
             mesh_inbound_pre_handshake_app_port: tls_connection_metadata
                 .mesh_inbound_pre_handshake_app_port,
             peer_spiffe_extraction_cache: peer_spiffe_extraction_cache.clone(),
+            websocket_shutdown_rx: Some(websocket_shutdown_rx.clone()),
         };
         async move {
             handle_proxy_request_on_frontend_port(
@@ -24234,6 +24890,9 @@ async fn handle_proxy_request_inner(
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
+    let accepted_local_ip = connection_metadata
+        .accepted_local_addr
+        .map(|addr| addr.ip());
 
     let method = req.method().as_str().to_owned();
     let inbound_version = req.version();
@@ -24290,6 +24949,7 @@ async fn handle_proxy_request_inner(
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
     ctx.peer_spiffe_extraction_cache = connection_metadata.peer_spiffe_extraction_cache;
+    ctx.websocket_shutdown_rx = connection_metadata.websocket_shutdown_rx;
     if let Some(identity) = connection_metadata.node_waypoint_identity {
         // In node-waypoint topology, the node-agent/eBPF cookie-derived pod
         // identity is the authenticated source workload for policy. It
@@ -24777,9 +25437,8 @@ async fn handle_proxy_request_inner(
             record_status(&state, response.status().as_u16());
             return Ok(response);
         }
-        None => state.router_cache.find_proxy_in_snapshot(
-            &epoch.route_table,
-            epoch.route_generation,
+        None => state.router_cache.find_proxy_in_epoch(
+            &epoch,
             request_host.as_deref(),
             &path,
             ctx.frontend_listen_port,
@@ -24800,14 +25459,16 @@ async fn handle_proxy_request_inner(
             if crate::modes::mesh::mesh_route_direction(&rm.proxy.id)
                 .is_some_and(|route_dir| Some(route_dir) != ctx.mesh_direction) =>
         {
-            state.router_cache.resolve_route_excluding_wrong_direction(
-                &epoch.route_table,
-                request_host.as_deref(),
-                &path,
-                ctx.mesh_direction,
-                ctx.frontend_listen_port,
-                is_tls,
-            )
+            state
+                .router_cache
+                .resolve_route_excluding_wrong_direction_in_epoch(
+                    &epoch,
+                    request_host.as_deref(),
+                    &path,
+                    ctx.mesh_direction,
+                    ctx.frontend_listen_port,
+                    is_tls,
+                )
         }
         other => other,
     };
@@ -25017,7 +25678,15 @@ async fn handle_proxy_request_inner(
             // (`inbound_hbone_relay_destination_allowed`) bounds the authority to
             // a loopback / slice-known workload addr+port the same way — and is
             // then routed to the UDP unframing handler at the dispatch branch.
-            // A UDP CONNECT additionally consults the EgressGateway's
+            //
+            // The SAME boundary also remaps an authenticated byte-stream CONNECT
+            // that names a DECLARED Sidecar `ingress[]` stream listener onto that
+            // listener's `defaultEndpoint` (issue #3260) — the identity-protected
+            // counterpart of the direct plaintext capture path's
+            // `local_inbound_tcp_routes` lookup, which a fresh mesh-mTLS CONNECT
+            // to `:15006` never reaches. The remap is withheld from the `udp`
+            // flavor (`ingress[]` stream listeners are TCP; UDP behavior is
+            // unchanged). A UDP CONNECT additionally consults the EgressGateway's
             // ServiceEntry-derived external-destination allowlist (issue #3263),
             // which is empty on every other topology.
             let hbone_relay = if is_hbone_connect_any
@@ -25027,31 +25696,24 @@ async fn handle_proxy_request_inner(
                     req.uri().authority(),
                     epoch.config.mesh.as_deref(),
                     is_udp_hbone_connect,
+                    accepted_local_ip,
                 )
             } else {
                 None
             };
             match hbone_relay {
-                Some(relay_proxy) => {
-                    // Preserve the CONNECT authority port for mesh
-                    // authorization on every synthesized HBONE relay. UDP
-                    // EgressGateway may dial a ServiceEntry targetPort that
-                    // differs from this authority port; TCP relays dial the
-                    // authority port directly. Either way AuthorizationPolicy
-                    // `destination.port` must see the authority port, and the
-                    // synthesized proxy's backend_port remains the socket dial
-                    // port. Stamp unconditionally (not only for UDP) so a
-                    // missing stamp can fail closed in `mesh_inbound_app_port`
-                    // without breaking TCP HBONE, which previously relied on
-                    // falling through to backend_port.
-                    ctx.mesh_inbound_listener_authz_port = req
-                        .uri()
-                        .authority()
-                        .and_then(|authority| authority.port_u16());
+                Some(relay) => {
                     // Plugins (incl. the mesh global chain / `mesh_authz`) read
                     // `ctx.headers`, so materialize them before the chain runs.
                     ctx.materialize_headers();
-                    (relay_proxy, 0)
+                    // Sidecar ingress remaps authorize on the DECLARED listener
+                    // port, never the `defaultEndpoint` the relay dials (F6 §6.2
+                    // security, mirroring the materialized ingress HTTP routes).
+                    // Stamped before the plugin chain runs. Ordinary relays use
+                    // the authority port; external UDP keeps that port even when
+                    // its selected dial target uses a distinct targetPort.
+                    ctx.mesh_inbound_listener_authz_port = relay.ingress_listener_authz_port;
+                    (relay.proxy, 0)
                 }
                 None => {
                     // Outbound-capture route misses under effective
@@ -33799,15 +34461,16 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
     let Some(target) = upstream_target else {
         return std::borrow::Cow::Borrowed(proxy);
     };
-    // Per-port override for the LB-selected target's policy port and the service-discovery
-    // top-level `connectionPool.http` overlay (`Proxy.dispatch_port_override_fallback`)
+    // Per-port override for the LB-selected target's policy port and the
+    // inherited top-level/selected-subset `connectionPool.http` overlay
+    // (`Proxy.dispatch_port_override_fallback`)
     // are FIELD-MERGED, not wholesale-replaced: a per-port `connectionPool.http`
-    // field wins when set, otherwise the top-level overlay's value is inherited —
+    // field wins when set, otherwise the selected-subset/top-level value is inherited —
     // so an unrelated per-port field (`connectTimeout`/`tls`) no longer wipes the
     // inherited top-level `idleTimeout`/`http2MaxRequests`/`maxRetries`. This
-    // matches the NON-SD apply-time layering exactly (top-level fan-out, then a
-    // partial per-port overlay; see `apply_connection_pool_http_to_port_override`
-    // in `src/modes/mesh/mod.rs`). Resolve each field through borrowed references:
+    // matches the cold-path tiering exactly (inherited fallback, then a partial
+    // per-port overlay; see `apply_connection_pool_http_to_port_override` in
+    // `src/modes/mesh/mod.rs`). Resolve each field through borrowed references:
     // cloning the whole per-port value here would allocate on EVERY request for
     // an SD destination that combines an explicit port entry with a fallback.
     let per_port = proxy
@@ -51668,9 +52331,16 @@ mod tests {
             gate_pos < not_found_pos,
             "REGISTRY_ONLY route-miss evaluation must run before the generic 404 response"
         );
+        // Anchor on the arm's own binding rather than the bare call name: the
+        // function DEFINITION appears far earlier in this file, so a `rfind` on
+        // the name alone would still succeed if the call were deleted.
         let relay_pos = src[..not_found_pos]
-            .rfind("build_inbound_hbone_relay_proxy(")
-            .expect("inbound HBONE relay synthesis must remain in the route-miss arm");
+            .rfind("let hbone_relay = if is_hbone_connect_any")
+            .expect("inbound CONNECT relay synthesis must remain in the route-miss arm");
+        assert!(
+            src[relay_pos..not_found_pos].contains("build_inbound_hbone_relay_proxy("),
+            "the route-miss arm must still synthesize the inbound CONNECT relay"
+        );
         assert!(
             relay_pos < gate_pos,
             "inbound HBONE relay synthesis must stay ahead of the REGISTRY_ONLY route-miss gate"
@@ -53562,11 +54232,16 @@ mod tests {
         });
         let authority: http::uri::Authority = "[fd00:10:244:1::4]:8080".parse().unwrap();
 
-        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), false)
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), false, None)
             .expect("bracketed IPv6 authority should build relay");
 
-        assert_eq!(relay.backend_host, "fd00:10:244:1::4");
-        assert_eq!(relay.backend_port, 8080);
+        assert_eq!(relay.proxy.backend_host, "fd00:10:244:1::4");
+        assert_eq!(relay.proxy.backend_port, 8080);
+        assert_eq!(
+            relay.ingress_listener_authz_port,
+            Some(8080),
+            "an ordinary transparent relay authorizes on the CONNECT authority port"
+        );
     }
 
     #[test]
@@ -53663,13 +54338,14 @@ mod tests {
         // backend — the unmodified happy path that the post-override guard must
         // still accept.
         let authority: http::uri::Authority = "static.external.com:53".parse().unwrap();
-        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), true)
+        let relay = build_inbound_hbone_relay_proxy(Some(&authority), Some(&mesh), true, None)
             .expect("STATIC authority must synthesize a dial-endpoint relay");
-        assert_eq!(relay.backend_host, "198.51.100.9");
-        assert_eq!(relay.backend_port, 53);
+        assert_eq!(relay.proxy.backend_host, "198.51.100.9");
+        assert_eq!(relay.proxy.backend_port, 53);
+        assert_eq!(relay.ingress_listener_authz_port, Some(53));
         assert!(mesh_egress_udp_destination_allowed(
-            &relay.backend_host,
-            relay.backend_port,
+            &relay.proxy.backend_host,
+            relay.proxy.backend_port,
             Some(&mesh)
         ));
     }
@@ -53875,7 +54551,7 @@ mod tests {
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
             frontend_tls_source_namespace: None,
-            frontend_tls_namespace_sources: Vec::new(),
+            frontend_tls_certificate_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
             http_tls_listen_ports: Default::default(),

@@ -703,21 +703,16 @@ fn destination_rule_applied_subset_http_fields_are_not_deferred() {
     );
 }
 
-/// `idleTimeout` / `http2MaxRequests` are applied at top-level and
-/// `portLevelSettings` scope, but the subset apply layer projects only
-/// `h2UpgradePolicy` / `maxRetries` / `http1MaxPendingRequests` into
-/// `ResolvedSubsetTrafficPolicy` — a subset-scoped value reaches no effective
-/// proxy. Status must say so, or `kubectl describe` shows a fully-accepted
-/// DestinationRule whose knob silently does nothing.
+/// Successfully applied subset HTTP connection-pool fields — including
+/// `idleTimeout` / `http2MaxRequests` — must not be reported as deferred.
 #[test]
-fn destination_rule_subset_scoped_idle_timeout_and_http2_max_requests_are_deferred() {
+fn destination_rule_subset_scoped_idle_timeout_and_http2_max_requests_are_applied() {
     let obj = object(
         "networking.istio.io/v1",
         "DestinationRule",
         "reviews",
         json!({
             "host": "reviews.default.svc.cluster.local",
-            // Top-level: both fields ARE applied — must NOT be deferred.
             "trafficPolicy": {
                 "connectionPool": { "http": {
                     "idleTimeout": "30s",
@@ -729,10 +724,8 @@ fn destination_rule_subset_scoped_idle_timeout_and_http2_max_requests_are_deferr
                 "labels": { "version": "v1" },
                 "trafficPolicy": {
                     "connectionPool": { "http": {
-                        // Subset: dropped by the apply layer — must be deferred.
                         "idleTimeout": "45s",
                         "http2MaxRequests": 10,
-                        // Subset: applied — must NOT be deferred.
                         "http1MaxPendingRequests": 64
                     } }
                 }
@@ -748,27 +741,19 @@ fn destination_rule_subset_scoped_idle_timeout_and_http2_max_requests_are_deferr
         .filter_map(Value::as_str)
         .collect();
 
-    for field in ["idleTimeout", "http2MaxRequests"] {
-        let expected = format!("subsets[].trafficPolicy.connectionPool.http.{field}");
-        assert!(
-            deferred.iter().any(|l| l.starts_with(expected.as_str())),
-            "subset-scoped {field} is inert and must be reported deferred; got: {deferred:?}"
-        );
-    }
     assert!(
-        !deferred
-            .iter()
-            .any(|label| label.contains("PendingRequests")),
-        "subset http1MaxPendingRequests IS applied and must not be deferred: {deferred:?}"
+        deferred.is_empty(),
+        "subset idleTimeout/http2MaxRequests are applied and must not be deferred: {deferred:?}"
     );
-    // The top-level forms are applied; nothing may report the bare
-    // `trafficPolicy.connectionPool.http.*` labels as deferred.
+    let message = find_condition(
+        updates[0].status["conditions"].as_array().unwrap(),
+        "FerrumAccepted",
+    )["message"]
+        .as_str()
+        .unwrap();
     assert!(
-        !deferred
-            .iter()
-            .any(|label| label.starts_with("connectionPool.http.idleTimeout")
-                || label.starts_with("connectionPool.http.http2MaxRequests")),
-        "top-level idleTimeout/http2MaxRequests are applied and must not be deferred: {deferred:?}"
+        !message.contains("deferred fields"),
+        "message must not claim applied subset idleTimeout/http2MaxRequests are deferred: {message}"
     );
 }
 

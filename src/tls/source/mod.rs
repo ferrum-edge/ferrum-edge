@@ -12,10 +12,21 @@ use futures_util::stream::BoxStream;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use zeroize::Zeroizing;
+
+/// Immutable process snapshot of the validated TLS material byte ceiling.
+///
+/// Installed from `EnvConfig` so loaders and the configured field cannot
+/// independently re-resolve a mutable environment/conf value for the same
+/// process/config generation. Identical reinstall is accepted; a mismatching
+/// repeated value fails closed. Absent until install (or first effective read
+/// before EnvConfig) — never a mutable test override.
+static TLS_MAX_MATERIAL_SIZE_BYTES: OnceLock<usize> = OnceLock::new();
 
 /// TLS material kind expected from a source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -43,7 +54,6 @@ impl MaterialKind {
         }
     }
 
-    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cert => "cert",
@@ -54,6 +64,12 @@ impl MaterialKind {
             Self::Ocsp => "ocsp",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+impl fmt::Display for MaterialKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -541,6 +557,16 @@ pub enum MaterialError {
     Secret { source_id: String, details: String },
     #[error("invalid TLS material source {source_id}: {details}")]
     InvalidSource { source_id: String, details: String },
+    /// Source material exceeded `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`.
+    ///
+    /// The Display form is intentionally source-redacted: it never includes
+    /// filesystem paths, provider identifiers, secret names/values, PEM
+    /// fragments, or credentials.
+    #[error("TLS {kind} material exceeds the configured maximum of {max_bytes} bytes")]
+    Oversized {
+        kind: MaterialKind,
+        max_bytes: usize,
+    },
 }
 
 pub struct MaterializedMaterial {
@@ -629,15 +655,35 @@ pub fn load_material_blocking(
     source: &CertSource,
     fallback_kind: MaterialKind,
 ) -> Result<MaterializedMaterial, MaterialError> {
+    let max_bytes = effective_tls_max_material_size_bytes()?;
+    load_material_blocking_with(source, fallback_kind, max_bytes)
+}
+
+/// Synchronous materialization using an explicit byte ceiling.
+///
+/// Race-free for tests and for callers that already hold a validated snapshot
+/// (for example `EnvConfig.tls_max_material_size_bytes`). Does not mutate any
+/// process-global policy state. Validates `max_bytes` first so `0` /
+/// `usize::MAX` cannot bypass the finite production posture.
+pub fn load_material_blocking_with(
+    source: &CertSource,
+    fallback_kind: MaterialKind,
+    max_bytes: usize,
+) -> Result<MaterializedMaterial, MaterialError> {
+    let max_bytes = validate_explicit_tls_max_material_size_bytes(max_bytes)?;
     match source {
-        CertSource::Path(path) => load_file_material(path, fallback_kind),
-        CertSource::InlinePem(secret) => Ok(MaterializedMaterial::from_bytes(
-            secret.expose_secret().as_bytes().to_vec(),
-            SourceScheme::File,
-            "inline-pem:<redacted>".to_string(),
-            fallback_kind,
-            None,
-        )),
+        CertSource::Path(path) => load_file_material_with(path, fallback_kind, max_bytes),
+        CertSource::InlinePem(secret) => {
+            let pem = secret.expose_secret();
+            enforce_material_byte_limit_with(pem.len(), fallback_kind, max_bytes)?;
+            Ok(MaterializedMaterial::from_bytes(
+                pem.as_bytes().to_vec(),
+                SourceScheme::File,
+                "inline-pem:<redacted>".to_string(),
+                fallback_kind,
+                None,
+            ))
+        }
         CertSource::Uri(uri) if uri.scheme == SourceScheme::File => {
             if uri.has_uri_userinfo() {
                 return Err(MaterialError::InvalidSource {
@@ -650,7 +696,12 @@ pub fn load_material_blocking(
                     source_id: uri.redacted_source_id(),
                     details: "file URI has no path".to_string(),
                 })?;
-            load_file_material(Path::new(&path), uri.kind)
+            let kind = if uri.kind == MaterialKind::Unknown {
+                fallback_kind
+            } else {
+                uri.kind
+            };
+            load_file_material_with(Path::new(&path), kind, max_bytes)
         }
         CertSource::Uri(uri)
             if matches!(
@@ -658,16 +709,16 @@ pub fn load_material_blocking(
                 SourceScheme::Vault | SourceScheme::Aws | SourceScheme::Azure | SourceScheme::Gcp
             ) =>
         {
-            load_secret_material(uri, fallback_kind)
+            load_secret_material_with(uri, fallback_kind, max_bytes)
         }
         CertSource::Uri(uri) if uri.scheme == SourceScheme::K8sSecret => {
-            load_k8s_secret_material(uri, fallback_kind)
+            load_k8s_secret_material_with(uri, fallback_kind, max_bytes)
         }
         CertSource::Uri(uri) if uri.scheme == SourceScheme::Acme => {
-            load_acme_material(uri, fallback_kind)
+            load_acme_material_with(uri, fallback_kind, max_bytes)
         }
         CertSource::Uri(uri) if uri.scheme == SourceScheme::Managed => {
-            load_managed_material(uri, fallback_kind)
+            load_managed_material_with(uri, fallback_kind, max_bytes)
         }
         // `system://` lands here on purpose. It names the built-in webpki trust
         // anchors, so there is nothing to materialize; every consumer must
@@ -681,15 +732,187 @@ pub fn load_material_blocking(
     }
 }
 
-fn load_file_material(
+/// Validate an explicit TLS material byte ceiling before any read, conversion,
+/// clone, or store.
+///
+/// Rejects `0` (never unlimited). Caps values above
+/// [`crate::config::env_config::HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES`] so
+/// hostile callers cannot pass `usize::MAX` and make bounded readers
+/// practically unbounded. Does not mutate process-global policy state.
+pub fn validate_explicit_tls_max_material_size_bytes(
+    max_bytes: usize,
+) -> Result<usize, MaterialError> {
+    if max_bytes < crate::config::env_config::MIN_TLS_MAX_MATERIAL_SIZE_BYTES {
+        return Err(MaterialError::InvalidSource {
+            source_id: "tls-material-size".to_string(),
+            details: format!(
+                "TLS material byte ceiling must be at least {} byte; 0 is not unlimited",
+                crate::config::env_config::MIN_TLS_MAX_MATERIAL_SIZE_BYTES
+            ),
+        });
+    }
+    Ok(max_bytes.min(crate::config::env_config::HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES))
+}
+
+/// Install the validated TLS material byte ceiling for this process.
+///
+/// Accepts an identical repeated value. Fails closed when a different value is
+/// already installed so `EnvConfig` cannot retain a field that disagrees with
+/// the authoritative runtime ceiling. Does not silently rewrite `0` to `1`.
+pub fn install_tls_max_material_size_bytes(max_bytes: usize) -> Result<(), MaterialError> {
+    let validated = validate_explicit_tls_max_material_size_bytes(max_bytes)?;
+    if let Some(existing) = TLS_MAX_MATERIAL_SIZE_BYTES.get() {
+        return if *existing == validated {
+            Ok(())
+        } else {
+            Err(MaterialError::InvalidSource {
+                source_id: "tls-material-size".to_string(),
+                details: "TLS material byte ceiling is already installed with a different value \
+                     for this process"
+                    .to_string(),
+            })
+        };
+    }
+    match TLS_MAX_MATERIAL_SIZE_BYTES.set(validated) {
+        Ok(()) => Ok(()),
+        Err(_) => match TLS_MAX_MATERIAL_SIZE_BYTES.get() {
+            Some(existing) if *existing == validated => Ok(()),
+            Some(_) => Err(MaterialError::InvalidSource {
+                source_id: "tls-material-size".to_string(),
+                details: "TLS material byte ceiling is already installed with a different value \
+                     for this process"
+                    .to_string(),
+            }),
+            None => Err(MaterialError::InvalidSource {
+                source_id: "tls-material-size".to_string(),
+                details: "TLS material byte ceiling install raced and left no installed value"
+                    .to_string(),
+            }),
+        },
+    }
+}
+
+/// Snapshot installed by [`install_tls_max_material_size_bytes`], if any.
+pub fn installed_tls_max_material_size_bytes() -> Option<usize> {
+    TLS_MAX_MATERIAL_SIZE_BYTES.get().copied()
+}
+
+/// Effective material byte ceiling from the immutable runtime snapshot, or the
+/// shared EnvConfig/free-helper parse when no snapshot is installed yet.
+pub fn effective_tls_max_material_size_bytes() -> Result<usize, MaterialError> {
+    if let Some(max_bytes) = installed_tls_max_material_size_bytes() {
+        return Ok(max_bytes);
+    }
+    // Shared EnvConfig/free-loader parse path; tests call
+    // `parse_tls_max_material_size_bytes` directly for race-free env isolation.
+    crate::config::env_config::parse_tls_max_material_size_bytes(
+        crate::config::conf_file::resolve_ferrum_var(
+            crate::config::env_config::TLS_MAX_MATERIAL_SIZE_BYTES_KEY,
+        )
+        .as_deref(),
+    )
+    .map_err(|details| MaterialError::InvalidSource {
+        source_id: "tls-material-size".to_string(),
+        details,
+    })
+}
+
+/// Reject `len` when it exceeds an explicit TLS material byte ceiling.
+///
+/// Validates `max_bytes` first (`0` rejected; values above the hard maximum
+/// capped) so public helpers remain safe for hostile/arbitrary ceilings.
+pub fn enforce_material_byte_limit_with(
+    len: usize,
+    kind: MaterialKind,
+    max_bytes: usize,
+) -> Result<(), MaterialError> {
+    let max_bytes = validate_explicit_tls_max_material_size_bytes(max_bytes)?;
+    if len > max_bytes {
+        return Err(MaterialError::Oversized { kind, max_bytes });
+    }
+    Ok(())
+}
+
+/// Admit a provider secret string by UTF-8 byte length before `into_bytes()`.
+///
+/// Shared compiled boundary used by every cloud provider scheme that routes
+/// through [`load_secret_material_with`].
+pub fn admit_provider_secret_string_before_into_bytes(
+    byte_len: usize,
+    kind: MaterialKind,
+    max_bytes: usize,
+) -> Result<(), MaterialError> {
+    enforce_material_byte_limit_with(byte_len, kind, max_bytes)
+}
+
+/// Admit a Kubernetes Secret `ByteString` by length before clone.
+pub fn admit_k8s_secret_bytes_before_clone(
+    byte_len: usize,
+    kind: MaterialKind,
+    max_bytes: usize,
+) -> Result<(), MaterialError> {
+    enforce_material_byte_limit_with(byte_len, kind, max_bytes)
+}
+
+/// Read at most `max_bytes + 1` from `reader`, rejecting without retaining an
+/// unbounded buffer. Used after any metadata precheck so growth/TOCTOU and
+/// non-regular sources still terminate at the streaming budget.
+pub fn read_bounded_material_bytes<R: Read>(
+    reader: R,
+    kind: MaterialKind,
+    max_bytes: usize,
+) -> Result<Vec<u8>, MaterialError> {
+    let max_bytes = validate_explicit_tls_max_material_size_bytes(max_bytes)?;
+    let limit_plus_one = (max_bytes as u64).saturating_add(1);
+    let mut bytes = Vec::new();
+    reader
+        .take(limit_plus_one)
+        .read_to_end(&mut bytes)
+        .map_err(|source| MaterialError::Io {
+            source_id: "bounded-material-reader".to_string(),
+            source,
+        })?;
+    if bytes.len() > max_bytes {
+        return Err(MaterialError::Oversized { kind, max_bytes });
+    }
+    Ok(bytes)
+}
+
+fn load_file_material_with(
     path: &Path,
     fallback_kind: MaterialKind,
+    max_bytes: usize,
 ) -> Result<MaterializedMaterial, MaterialError> {
+    // File paths remain verbatim for I/O diagnostics (operator-authored local
+    // configuration). Oversized rejections never interpolate the path.
     let source_id = path.display().to_string();
-    let bytes = std::fs::read(path).map_err(|source| MaterialError::Io {
+
+    // Metadata precheck is only an optimization. Growth, non-regular files,
+    // and TOCTOU still terminate via the bounded reader below.
+    if let Ok(metadata) = std::fs::metadata(path)
+        && metadata.is_file()
+        && metadata.len() > max_bytes as u64
+    {
+        return Err(MaterialError::Oversized {
+            kind: fallback_kind,
+            max_bytes,
+        });
+    }
+
+    let file = std::fs::File::open(path).map_err(|source| MaterialError::Io {
         source_id: source_id.clone(),
         source,
     })?;
+    // Keep `source_id` for the success path; move it into Io remapping only on
+    // the error path so the success path does not need an avoidable clone.
+    let bytes = match read_bounded_material_bytes(file, fallback_kind, max_bytes) {
+        Ok(bytes) => bytes,
+        Err(MaterialError::Io { source, .. }) => {
+            return Err(MaterialError::Io { source_id, source });
+        }
+        Err(other) => return Err(other),
+    };
+
     Ok(MaterializedMaterial::from_bytes(
         bytes,
         SourceScheme::File,
@@ -699,9 +922,10 @@ fn load_file_material(
     ))
 }
 
-fn load_secret_material(
+fn load_secret_material_with(
     uri: &CertSourceUri,
     fallback_kind: MaterialKind,
+    max_bytes: usize,
 ) -> Result<MaterializedMaterial, MaterialError> {
     crate::fips::policy::check_external_secret_uri_scheme(uri.scheme.as_str()).map_err(
         |details| MaterialError::InvalidSource {
@@ -729,6 +953,11 @@ fn load_secret_material(
     let scheme = uri.scheme;
     let configured_version = uri.options.get("version").cloned();
     let key = format!("TLS {} material", uri.kind.as_str());
+    let kind = if uri.kind == MaterialKind::Unknown {
+        fallback_kind
+    } else {
+        uri.kind
+    };
 
     // Azure: merge path `/<version>` with typed `?version=` (reject conflicts)
     // into the *fetch* reference only. Configured source identity stays on
@@ -763,6 +992,10 @@ fn load_secret_material(
                 details,
             })?;
 
+    // Shared admission helper: UTF-8 byte length before `into_bytes()` so an
+    // oversized provider value never becomes a second full `Vec<u8>` allocation.
+    admit_provider_secret_string_before_into_bytes(resolved.value.len(), kind, max_bytes)?;
+
     // Azure material reports the version Key Vault actually returned. Other
     // providers keep the historical configured `?version=` metadata label.
     let version = match scheme {
@@ -775,18 +1008,15 @@ fn load_secret_material(
         resolved.value.into_bytes(),
         scheme,
         source_id,
-        if uri.kind == MaterialKind::Unknown {
-            fallback_kind
-        } else {
-            uri.kind
-        },
+        kind,
         version,
     ))
 }
 
-fn load_k8s_secret_material(
+fn load_k8s_secret_material_with(
     uri: &CertSourceUri,
     fallback_kind: MaterialKind,
+    max_bytes: usize,
 ) -> Result<MaterializedMaterial, MaterialError> {
     let reference = K8sSecretReference::parse(uri, fallback_kind)?;
     let fetched =
@@ -796,17 +1026,22 @@ fn load_k8s_secret_material(
                 details,
             })?;
 
-    let bytes = fetched
-        .data
-        .get(&reference.data_key)
-        .map(|value| value.0.clone())
-        .ok_or_else(|| MaterialError::InvalidSource {
-            source_id: reference.source_id.clone(),
-            details: format!(
-                "Kubernetes Secret {}/{} does not contain data key {}",
-                reference.namespace, reference.name, reference.data_key
-            ),
-        })?;
+    let value =
+        fetched
+            .data
+            .get(&reference.data_key)
+            .ok_or_else(|| MaterialError::InvalidSource {
+                source_id: reference.source_id.clone(),
+                details: format!(
+                    "Kubernetes Secret {}/{} does not contain data key {}",
+                    reference.namespace, reference.name, reference.data_key
+                ),
+            })?;
+
+    // Shared admission helper: ByteString length before clone so an oversized
+    // Secret entry is rejected without retaining a second copy.
+    admit_k8s_secret_bytes_before_clone(value.0.len(), reference.kind, max_bytes)?;
+    let bytes = value.0.clone();
 
     Ok(MaterializedMaterial::from_bytes(
         bytes,
@@ -817,9 +1052,10 @@ fn load_k8s_secret_material(
     ))
 }
 
-fn load_managed_material(
+fn load_managed_material_with(
     uri: &CertSourceUri,
     fallback_kind: MaterialKind,
+    max_bytes: usize,
 ) -> Result<MaterializedMaterial, MaterialError> {
     let kind = if uri.kind == MaterialKind::Unknown {
         fallback_kind
@@ -830,13 +1066,26 @@ fn load_managed_material(
         source_id: uri.redacted_source_id(),
         details,
     })?;
-    let material =
-        store
-            .material(&uri.identifier, kind)
-            .map_err(|error| MaterialError::InvalidSource {
+    let material = store
+        .material_with_limit(&uri.identifier, kind, max_bytes)
+        .map_err(|error| match error {
+            crate::tls::managed::ManagedTlsError::MaterialTooLarge => {
+                MaterialError::Oversized { kind, max_bytes }
+            }
+            crate::tls::managed::ManagedTlsError::InvalidConfiguration(details) => {
+                MaterialError::InvalidSource {
+                    source_id: "tls-material-size".to_string(),
+                    details,
+                }
+            }
+            other => MaterialError::InvalidSource {
                 source_id: uri.redacted_source_id(),
-                details: error.to_string(),
-            })?;
+                details: other.to_string(),
+            },
+        })?;
+    // Common-load boundary: corrupted pre-existing state cannot bypass the
+    // ceiling even if an older store skipped admission.
+    enforce_material_byte_limit_with(material.bytes.len(), material.kind, max_bytes)?;
     Ok(MaterializedMaterial::from_bytes(
         material.bytes,
         SourceScheme::Managed,
@@ -849,9 +1098,10 @@ fn load_managed_material(
     ))
 }
 
-fn load_acme_material(
+fn load_acme_material_with(
     uri: &CertSourceUri,
     fallback_kind: MaterialKind,
+    max_bytes: usize,
 ) -> Result<MaterializedMaterial, MaterialError> {
     let kind = if uri.kind == MaterialKind::Unknown {
         fallback_kind
@@ -863,13 +1113,24 @@ fn load_acme_material(
             source_id: uri.redacted_source_id(),
             details,
         })?;
-    let material =
-        store
-            .material(&uri.identifier, kind)
-            .map_err(|error| MaterialError::InvalidSource {
+    let material = store
+        .material_with_limit(&uri.identifier, kind, max_bytes)
+        .map_err(|error| match error {
+            crate::tls::acme::AcmeError::MaterialTooLarge => {
+                MaterialError::Oversized { kind, max_bytes }
+            }
+            crate::tls::acme::AcmeError::InvalidConfiguration(details) => {
+                MaterialError::InvalidSource {
+                    source_id: "tls-material-size".to_string(),
+                    details,
+                }
+            }
+            other => MaterialError::InvalidSource {
                 source_id: uri.redacted_source_id(),
-                details: error.to_string(),
-            })?;
+                details: other.to_string(),
+            },
+        })?;
+    enforce_material_byte_limit_with(material.bytes.len(), material.kind, max_bytes)?;
     Ok(MaterializedMaterial::from_bytes(
         material.bytes,
         SourceScheme::Acme,
@@ -1146,7 +1407,8 @@ impl MaterialLoader for FileLoader {
             source_id: uri.redacted_source_id(),
             details: "file URI has no path".to_string(),
         })?;
-        load_file_material(Path::new(&path), uri.kind)
+        let max_bytes = effective_tls_max_material_size_bytes()?;
+        load_file_material_with(Path::new(&path), uri.kind, max_bytes)
     }
 
     async fn watch(&self, _uri: &CertSourceUri) -> Result<MaterialWatch, MaterialError> {

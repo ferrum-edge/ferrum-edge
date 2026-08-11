@@ -214,15 +214,25 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Cleanup mechanism:** TTL-based expiration is checked on lookup. Admission uses atomic entry accounting to preserve the hard cap during concurrent authentication. At capacity, one existing entry is replaced for each new admission; the request path never performs a full-cache scan.
 
+### OAuth2 Introspection Cache
+
+**What it stores:** Per-provider SHA-256 token keys and bounded normalized authorization results. Active entries contain only the authorization outcome, canonical identity/display values, and rendered configured claim-header values; Ferrum does not retain the provider's arbitrary full JSON response. Negative entries record only an inactive decision and expiry.
+
+**Default limits:** 10,000 entries, 16 KiB of normalized data per active entry, and 16 MiB total retained bytes per provider. Active entries receive 75% of the entry slots and negative entries receive 25%, so inactive-token churn cannot evict active decisions and active traffic cannot consume the negative partition. The negative byte partition covers that class's fixed key/entry footprint; active results receive the remaining retained-byte capacity. Up to 16 providers may be configured, so multiply the per-provider total budget when sizing a process.
+
+**Config fields:** `providers[].max_cache_entries` (default `10000`, range `100..=100000`), `providers[].max_cache_entry_bytes` (default `16384`, range `256..=65536`), and `providers[].max_cache_total_bytes` (default `16777216`, range `1048576..=67108864`). The total must cover the configured entry ceiling's minimum token-key, entry-state, and fixed eviction-index footprint plus one maximum-sized normalized result. Invalid combinations reject configuration rather than silently reducing a limit.
+
+**Cleanup mechanism:** Expiry is removed on lookup. Saturated admission examines at most 16 deterministic second-chance tickets at a time, reclaiming expired entries before cold live entries and giving recently hit entries one protected pass. It never scans the complete map or allocates workspace proportional to cache size. Count and retained bytes are reserved before map publication and released by the owning entry on eviction, expiry, a superseded/raced admission, reload, or generation drop. Each class uses an independent non-blocking atomic admission guard; contention, an oversized normalized result, or unavailable room skips caching without changing the valid provider authorization result.
+
 ### JWKS Cache
 
 **What it stores:** JWKS key sets fetched from remote JWKS endpoints, shared across all `jwks_auth` plugin instances.
 
 **Default limit:** No hard entry cap -- bounded by the number of configured JWKS provider URLs (typically 1-3 per plugin instance).
 
-**Config field:** N/A (entry count equals configured provider count).
+**Config fields:** Entry count equals configured provider count. Trust retention is controlled by `jwks_max_stale_seconds` (default `3600` seconds / 1 hour, maximum `86400` seconds / 24 hours); `0` is invalid and cannot disable expiry. A remote provider may set a provider-specific override.
 
-**Cleanup mechanism:** Periodic background refresh (`jwks_refresh_interval_secs`, default `900` seconds). The global JWKS store is keyed by provider URL, so duplicate URLs across plugin instances share a single cache entry and use the minimum interval requested by active consumers. See the [`jwks_auth` plugin reference](plugins.md#jwks_auth).
+**Cleanup mechanism:** Periodic background refresh (`jwks_refresh_interval_secs`, default `900` seconds). The global JWKS store is keyed by provider URL, so duplicate URLs across plugin instances share a single cache entry and deterministically use the minimum refresh interval and minimum maximum-stale requirement of active consumers. The store records monotonic last-success and last-attempt times plus a bounded failure class/count. Failed, empty, malformed, oversized, or non-2xx refreshes preserve the key map for diagnostics and a finite grace interval without advancing trust; verification fails closed after the deadline. Empty and failed refreshes use a 5s/15s/30s capped retry sequence (or the shorter configured refresh interval). A later valid non-empty response atomically replaces keys and restores trust. Discovery success alone does not refresh key age. Authenticated metrics and `/health`/`/status` detail aggregate **active remote** stores only by `fresh`/`grace`/`expired` and fixed failure class, never by URL or key/token data. "Active" means claimed by a committed plugin generation: a store an OIDC discovery task resolves after that generation was published becomes active immediately, without waiting for another reload, while a staged or rejected generation never contributes. Unauthenticated `/health`/`/status` keep the coarse `status`+`ready` shape: grace degrades while remaining ready, expiry makes the gateway not-ready/`unavailable`, and no active remote JWKS stays neutral — all from an O(1) precomputed aggregate with monotonic deadlines. See the [`jwks_auth` plugin reference](plugins.md#jwks_auth).
 
 ### TCP Connection Throttle
 
@@ -288,7 +298,11 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 | `soap_ws_security` | `nonce.max_total_cache_bytes` | `67108864` | Maximum retained nonce-key UTF-8 payload bytes (one count per shared key allocation) |
 | `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results |
 | `ldap_auth` | `cache_ttl_seconds` | `0` | LDAP cache entry TTL (`0` = disabled; maximum `86400`) |
-| `jwks_auth` | `jwks_refresh_interval_secs` | `900` | JWKS key set refresh interval |
+| `oauth2_introspection` | `providers[].max_cache_entries` | `10000` | Per-provider hard entry ceiling, split 75/25 between active and negative results |
+| `oauth2_introspection` | `providers[].max_cache_entry_bytes` | `16384` | Maximum normalized active authorization-result bytes retained per token |
+| `oauth2_introspection` | `providers[].max_cache_total_bytes` | `16777216` | Per-provider total retained bytes, including fixed eviction indexes and entry/key state |
+| `jwks_auth` | `jwks_refresh_interval_secs` | `900` | JWKS key set refresh interval (`1`–`86400`; no greater than effective maximum stale) |
+| `jwks_auth` | `jwks_max_stale_seconds` | `3600` | Maximum trust age for the last validated non-empty remote JWKS (`0` invalid; maximum `86400`) |
 | `api_chargeback` | `max_entries` | `100000` | Hard ceiling on retained billing rows (complete registry entry keys) |
 | `api_chargeback` | `max_retained_bytes` | `67108864` | Hard ceiling on retained billing-row bytes |
 | `api_chargeback` | `render_cache_ttl_seconds` | `5` | Rendered output cache TTL |

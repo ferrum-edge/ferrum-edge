@@ -1824,9 +1824,8 @@ async fn handle_h3_request(
     ctx.config_generation = epoch.config_generation;
 
     // Route: host + longest prefix match via router cache
-    let route_match = state.router_cache.find_proxy_in_snapshot(
-        &epoch.route_table,
-        epoch.route_generation,
+    let route_match = state.router_cache.find_proxy_in_epoch(
+        &epoch,
         request_host.as_deref(),
         &path,
         ctx.frontend_listen_port,
@@ -1843,14 +1842,16 @@ async fn handle_h3_request(
             if crate::modes::mesh::mesh_route_direction(&rm.proxy.id)
                 .is_some_and(|route_dir| Some(route_dir) != ctx.mesh_direction) =>
         {
-            state.router_cache.resolve_route_excluding_wrong_direction(
-                &epoch.route_table,
-                request_host.as_deref(),
-                &path,
-                ctx.mesh_direction,
-                ctx.frontend_listen_port,
-                true,
-            )
+            state
+                .router_cache
+                .resolve_route_excluding_wrong_direction_in_epoch(
+                    &epoch,
+                    request_host.as_deref(),
+                    &path,
+                    ctx.mesh_direction,
+                    ctx.frontend_listen_port,
+                    true,
+                )
         }
         other => other,
     };
@@ -5321,6 +5322,9 @@ async fn handle_h3_request(
             .await;
         }
         let summary = TransactionSummary {
+            // Terminal-log trigger carrier: stamped centrally by
+            // `log_with_mirror` from the authoritative RequestContext.
+            plugin_trigger_decisions: Default::default(),
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
@@ -5833,6 +5837,9 @@ async fn handle_h3_request(
             let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
             let summary = TransactionSummary {
+                // Terminal-log trigger carrier: stamped centrally by
+                // `log_with_mirror` from the authoritative RequestContext.
+                plugin_trigger_decisions: Default::default(),
                 namespace: proxy.namespace.clone(),
                 timestamp_received: ctx.timestamp_received.to_rfc3339(),
                 client_ip: ctx.client_ip.clone(),
@@ -6384,6 +6391,9 @@ async fn handle_h3_request(
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;
         let summary = TransactionSummary {
+            // Terminal-log trigger carrier: stamped centrally by
+            // `log_with_mirror` from the authoritative RequestContext.
+            plugin_trigger_decisions: Default::default(),
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
@@ -6987,6 +6997,9 @@ async fn handle_h3_request(
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;
         let summary = TransactionSummary {
+            // Terminal-log trigger carrier: stamped centrally by
+            // `log_with_mirror` from the authoritative RequestContext.
+            plugin_trigger_decisions: Default::default(),
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
@@ -12158,6 +12171,9 @@ async fn log_h3_grpc_transaction(
         true,
     );
     let summary = TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: proxy.namespace.clone(),
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),
@@ -15787,7 +15803,7 @@ mod build_h3_backend_headers_tests {
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
             frontend_tls_source_namespace: None,
-            frontend_tls_namespace_sources: Vec::new(),
+            frontend_tls_certificate_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
             http_tls_listen_ports: Default::default(),

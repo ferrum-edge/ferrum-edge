@@ -177,8 +177,8 @@ pub(crate) async fn schedule_admin_read_replica_reconnect_if_needed(
 ///
 /// Errors propagate when auto-apply is on (a failed plugin migration is
 /// fatal — the gateway should not come up with an inconsistent schema).
-/// When auto-apply is off, the warning is informational and never fails
-/// startup.
+/// When auto-apply is off, ordinary probe failures remain warn-only, but any
+/// typed migration-history integrity failure is fatal in every mode.
 pub(crate) async fn handle_startup_plugin_migrations(
     db: &Arc<dyn DatabaseBackend>,
     auto_apply: bool,
@@ -191,9 +191,10 @@ pub(crate) async fn handle_startup_plugin_migrations(
 /// Recovery variant of [`handle_startup_plugin_migrations`].
 ///
 /// Warn-only mode (`auto_apply=false`) matches ordinary startup: a pending-state
-/// **probe failure** is logged and does not block recovered config publication
-/// (in-place recovery must not be strictly weaker than a process restart against
-/// the same database). Auto-apply mode stays fail-closed on probe/apply errors.
+/// non-integrity **probe failure** is logged and does not block recovered config
+/// publication (in-place recovery must not be strictly weaker than a process
+/// restart against the same database). History-integrity failures stay fatal;
+/// auto-apply mode remains fail-closed on every probe/apply error.
 /// A probe that **succeeds** and reports pending migrations still follows the
 /// warn-and-continue / auto-apply policy unchanged.
 pub(crate) async fn handle_recovery_plugin_migrations(
@@ -260,13 +261,18 @@ async fn handle_startup_plugin_migrations_with_list(
     mode: &str,
     plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
 ) -> Result<(), anyhow::Error> {
-    if plugin_migrations.is_empty() {
-        return Ok(());
-    }
-
     let pending = match db.pending_plugin_migrations(plugin_migrations).await {
         Ok(p) => p,
         Err(e) => {
+            if let Some(integrity_error) =
+                e.downcast_ref::<crate::config::migrations::MigrationHistoryIntegrityError>()
+            {
+                let context = format!(
+                    "custom-plugin migration history integrity validation failed (mode={mode}): \
+                     {integrity_error}"
+                );
+                return Err(e).context(context);
+            }
             if auto_apply {
                 return Err(e).with_context(|| {
                     format!(
@@ -586,6 +592,42 @@ mod tests {
         );
         assert_eq!(pending_after[0].plugin_name, "modes_handle_startup_test");
         assert_eq!(pending_after[0].version, 1);
+    }
+
+    #[tokio::test]
+    async fn warn_only_is_fatal_on_typed_plugin_history_integrity_failure() {
+        let (store, _tmp) = fresh_database_store().await;
+        let pool = store.pool();
+        let db: Arc<dyn DatabaseBackend> = store;
+        let migrations = synthetic_pending_migration();
+
+        db.apply_plugin_migrations(&migrations)
+            .await
+            .expect("seed plugin migration history");
+        sqlx::query(
+            "UPDATE _ferrum_plugin_migrations SET checksum = 'drifted' \
+             WHERE plugin_name = 'modes_handle_startup_test' AND version = 1",
+        )
+        .execute(&pool)
+        .await
+        .expect("drift stored checksum");
+
+        let error = handle_startup_plugin_migrations_with_list(&db, false, "database", &migrations)
+            .await
+            .expect_err("warn-only mode must fail closed on typed history drift");
+        let integrity_error = error
+            .downcast_ref::<crate::config::migrations::MigrationHistoryIntegrityError>()
+            .expect("integrity refusal must remain typed through startup context");
+        assert_eq!(
+            integrity_error.kind(),
+            crate::config::migrations::MigrationHistoryIntegrityKind::ChecksumMismatch
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("mode=database"));
+        assert!(rendered.contains("kind=checksum_mismatch"));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\r'));
+        assert!(!rendered.contains('\u{1b}'));
     }
 
     #[tokio::test]

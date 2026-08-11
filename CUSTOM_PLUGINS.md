@@ -1289,6 +1289,17 @@ Custom plugins that need their own database tables can declare migrations that r
    migration lock, using the dialect-specific transaction contract documented
    in [Database Migrations](docs/migrations.md#multi-statement-migrations)
 
+Ferrum validates the complete core and plugin migration histories under that
+lock before applying either core or plugin work. Declared plugin names and
+version IDs must be in the inclusive `1..=2147483647` tracking-column range,
+must be unique, and must be ordered. Applied rows
+must be an exact checksum-matching prefix of those declarations; unknown IDs,
+missing earlier rows, duplicates, checksum drift, and orphan history for a
+plugin absent from the compiled binary are blocking integrity errors for
+startup, `up`, dry-run, and `status`. Ferrum does not rewrite history or re-run
+changed migration source. See the
+[operator repair path](docs/migrations.md#migration-history-integrity-error).
+
 ### Declaring Migrations
 
 Add a `plugin_migrations()` function to your plugin file that returns a `Vec<CustomPluginMigration>`:
@@ -1331,7 +1342,7 @@ pub fn plugin_migrations() -> Vec<CustomPluginMigration> {
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `version` | `i64` | Migration version number, scoped per plugin. Must be positive and monotonically increasing. |
+| `version` | `i64` | Migration version number, scoped per plugin. Must be in `1..=2147483647`, unique, and monotonically increasing. |
 | `name` | `&'static str` | Human-readable name (e.g., `"create_audit_log"`). |
 | `checksum` | `&'static str` | Unique checksum for tamper detection. Convention: `v{N}_{name}_{short_hash}`. |
 | `sql` | `&'static str` | Default SQL for all databases. Must be SQLite/PostgreSQL/MySQL compatible when no overrides are set. |
@@ -1429,7 +1440,7 @@ Example output:
 === Ferrum Edge Migration Status ===
 
 Applied migrations:
-  V1: initial_schema (applied: 2026-04-01T..., checksum: v001_initial_schema)
+  V1: initial_schema (applied: 2026-04-01T..., checksum: sha256:<64 hex characters>)
 
 Pending migrations: (none — schema is up to date)
 
@@ -1452,7 +1463,7 @@ Plugin migrations are tracked in the `_ferrum_plugin_migrations` table with a co
 | `version` | Migration version within the plugin |
 | `name` | Human-readable migration name |
 | `applied_at` | RFC 3339 timestamp of when the migration was applied |
-| `checksum` | Checksum at the time of application (warns if source changes later) |
+| `checksum` | Checksum at the time of application (the complete ordered history, including this checksum, must remain verifiable before status, startup, or later migration work) |
 | `execution_time_ms` | How long the migration took to execute |
 
 This is separate from the core `_ferrum_migrations` table, so plugin versions never conflict with gateway versions.

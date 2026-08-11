@@ -62,6 +62,7 @@ use crate::config::types::GatewayConfig;
 use crate::identity::TrustBundleSet as RuntimeTrustBundleSet;
 use crate::modes::mesh::config::TrustBundleSet as ConfigTrustBundleSet;
 use crate::proxy::{ConfigApplyOutcome, ProxyState};
+use crate::tls::multi_cert::{GatewayCertificateInput, load_gateway_multi_cert_tls_config};
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::util::backoff::jittered_backoff;
 
@@ -1277,29 +1278,60 @@ fn stage_frontend_tls_snapshot(
                 );
             };
 
-            let mut tls_config = crate::tls::load_tls_config_with_client_auth_and_ocsp(
-                cert_path,
-                key_path,
-                proxy_state
-                    .env_config
-                    .frontend_tls_client_ca_bundle_path
-                    .as_deref(),
-                proxy_state
-                    .env_config
-                    .frontend_tls_ocsp_response_source
-                    .as_deref(),
-                false,
-                tls_policy,
-                proxy_state.env_config.tls_cert_expiry_warning_days,
-                proxy_state.crls.as_ref().as_slice(),
-            )
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "failed to materialize frontend TLS certificate source {}: {}",
-                    cert_path,
-                    error
+            // Every certificate this namespace owns is served from one
+            // listener, selected per ClientHello by SNI (#3267 / #3268). The
+            // `frontend_tls_*` pair is the fallback, so a snapshot that
+            // carries no per-listener set (an operator-configured DP, or a
+            // control plane that predates the field) still resolves to
+            // exactly the single-certificate behavior it had before.
+            let certificates = gateway_certificate_inputs(config);
+            let mut tls_config = if !certificates.is_empty() {
+                load_gateway_multi_cert_tls_config(
+                    &certificates,
+                    proxy_state
+                        .env_config
+                        .frontend_tls_client_ca_bundle_path
+                        .as_deref(),
+                    proxy_state
+                        .env_config
+                        .frontend_tls_ocsp_response_source
+                        .as_deref(),
+                    tls_policy,
+                    proxy_state.env_config.tls_cert_expiry_warning_days,
+                    proxy_state.crls.as_ref().as_slice(),
                 )
-            })?;
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to materialize {} Gateway frontend TLS certificate sources: {}",
+                        certificates.len(),
+                        error
+                    )
+                })?
+            } else {
+                crate::tls::load_tls_config_with_client_auth_and_ocsp(
+                    cert_path,
+                    key_path,
+                    proxy_state
+                        .env_config
+                        .frontend_tls_client_ca_bundle_path
+                        .as_deref(),
+                    proxy_state
+                        .env_config
+                        .frontend_tls_ocsp_response_source
+                        .as_deref(),
+                    false,
+                    tls_policy,
+                    proxy_state.env_config.tls_cert_expiry_warning_days,
+                    proxy_state.crls.as_ref().as_slice(),
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to materialize frontend TLS certificate source {}: {}",
+                        cert_path,
+                        error
+                    )
+                })?
+            };
             crate::tls::enable_early_data(&mut tls_config, tls_policy);
             if proxy_state.env_config.ktls_enabled.could_be_enabled() {
                 crate::tls::enable_secret_extraction_for_ktls(&mut tls_config);
@@ -1307,10 +1339,35 @@ fn stage_frontend_tls_snapshot(
 
             Ok(FrontendTlsSnapshotUpdate::Replace {
                 tls_config,
-                cert_source: cert_path.to_string(),
+                cert_source: if !certificates.is_empty() {
+                    format!("{} Gateway certificate(s)", certificates.len())
+                } else {
+                    cert_path.to_string()
+                },
             })
         }
     }
+}
+
+/// The Gateway certificate set this data plane must serve, in the control
+/// plane's deterministic order.
+///
+/// Sources are already namespace-filtered by `filter_config_to_namespace`, so
+/// nothing here can widen tenancy. Entries are identified only by their
+/// `serving-namespace/serialized-owner/listener` — never by certificate or key
+/// bytes.
+fn gateway_certificate_inputs(config: &GatewayConfig) -> Vec<GatewayCertificateInput> {
+    config
+        .frontend_tls_certificate_sources
+        .iter()
+        .map(|source| GatewayCertificateInput {
+            cert_source: source.cert_path.clone(),
+            key_source: source.key_path.clone(),
+            hostname: source.hostname.clone(),
+            identity: source.listener_identity(),
+            is_default: source.default_certificate,
+        })
+        .collect()
 }
 
 async fn commit_frontend_tls_snapshot(
@@ -2412,45 +2469,25 @@ fn filter_config_to_namespace(config: &mut GatewayConfig, namespace: &str) -> us
         + (pre.2 - config.plugin_configs.len())
         + (pre.3 - config.upstreams.len())
         + (pre.4 - config.http_tls_listen_ports.len())
-        + usize::from(frontend_tls_filtered)
+        + frontend_tls_filtered
 }
 
-fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespace: &str) -> bool {
-    let had_namespace_sources = !config.frontend_tls_namespace_sources.is_empty();
-    if let Some(source) = config
-        .frontend_tls_namespace_sources
-        .iter()
-        .find(|source| source.namespace == namespace)
-        .cloned()
-    {
-        config.frontend_tls_cert_path = Some(source.cert_path);
-        config.frontend_tls_key_path = Some(source.key_path);
-        config.frontend_tls_source_namespace = Some(source.namespace);
-        config.frontend_tls_namespace_sources.clear();
-        return false;
-    }
-    config.frontend_tls_namespace_sources.clear();
-    let foreign = config
-        .frontend_tls_source_namespace
-        .as_deref()
-        .is_some_and(|source_namespace| source_namespace != namespace);
-    if foreign {
-        config.frontend_tls_cert_path = None;
-        config.frontend_tls_key_path = None;
-        config.frontend_tls_source_namespace = None;
-    }
-    foreign || had_namespace_sources
+/// Defense-in-depth namespace filter for Gateway frontend TLS. Shares one
+/// implementation with the CP-side filter so a DP can never end up serving a
+/// certificate its subscription namespace does not own.
+fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespace: &str) -> usize {
+    config.filter_frontend_tls_to_namespace(namespace)
 }
 
 fn clear_frontend_tls_material(config: &mut GatewayConfig) -> bool {
     let had_material = config.frontend_tls_cert_path.is_some()
         || config.frontend_tls_key_path.is_some()
         || config.frontend_tls_source_namespace.is_some()
-        || !config.frontend_tls_namespace_sources.is_empty();
+        || !config.frontend_tls_certificate_sources.is_empty();
     config.frontend_tls_cert_path = None;
     config.frontend_tls_key_path = None;
     config.frontend_tls_source_namespace = None;
-    config.frontend_tls_namespace_sources.clear();
+    config.frontend_tls_certificate_sources.clear();
     had_material
 }
 
@@ -2645,11 +2682,12 @@ mod tests {
             frontend_tls_cert_path: Some("k8s://default/cert#tls.crt".to_string()),
             frontend_tls_key_path: Some("k8s://default/cert#tls.key".to_string()),
             frontend_tls_source_namespace: Some("default".to_string()),
-            frontend_tls_namespace_sources: vec![
-                crate::config::types::FrontendTlsNamespaceSource {
+            frontend_tls_certificate_sources: vec![
+                crate::config::types::FrontendTlsCertificateSource {
                     namespace: "default".to_string(),
                     cert_path: "k8s://default/cert#tls.crt".to_string(),
                     key_path: "k8s://default/cert#tls.key".to_string(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -2659,7 +2697,7 @@ mod tests {
         assert_eq!(config.frontend_tls_cert_path, None);
         assert_eq!(config.frontend_tls_key_path, None);
         assert_eq!(config.frontend_tls_source_namespace, None);
-        assert!(config.frontend_tls_namespace_sources.is_empty());
+        assert!(config.frontend_tls_certificate_sources.is_empty());
         assert!(!clear_frontend_tls_material(&mut config));
     }
 
@@ -2776,7 +2814,7 @@ mod tests {
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
             frontend_tls_source_namespace: None,
-            frontend_tls_namespace_sources: Vec::new(),
+            frontend_tls_certificate_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
             http_tls_listen_ports: Default::default(),
@@ -2813,7 +2851,7 @@ mod tests {
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
             frontend_tls_source_namespace: None,
-            frontend_tls_namespace_sources: Vec::new(),
+            frontend_tls_certificate_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
             http_tls_listen_ports: [
@@ -2852,7 +2890,7 @@ mod tests {
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
             frontend_tls_source_namespace: None,
-            frontend_tls_namespace_sources: Vec::new(),
+            frontend_tls_certificate_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
             http_tls_listen_ports: Default::default(),
@@ -2910,22 +2948,26 @@ mod tests {
             frontend_tls_cert_path: Some("k8s://staging/gateway-cert#tls.crt".to_string()),
             frontend_tls_key_path: Some("k8s://staging/gateway-cert#tls.key".to_string()),
             frontend_tls_source_namespace: Some("staging".to_string()),
-            frontend_tls_namespace_sources: vec![
-                crate::config::types::FrontendTlsNamespaceSource {
+            frontend_tls_certificate_sources: vec![
+                crate::config::types::FrontendTlsCertificateSource {
                     namespace: "staging".to_string(),
                     cert_path: "k8s://staging/gateway-cert#tls.crt".to_string(),
                     key_path: "k8s://staging/gateway-cert#tls.key".to_string(),
+                    ..Default::default()
                 },
-                crate::config::types::FrontendTlsNamespaceSource {
+                crate::config::types::FrontendTlsCertificateSource {
                     namespace: "production".to_string(),
                     cert_path: "k8s://production/gateway-cert#tls.crt".to_string(),
                     key_path: "k8s://production/gateway-cert#tls.key".to_string(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
         };
 
-        assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 0);
+        // The foreign `staging` entry is the one filtered away; this DP keeps
+        // every certificate its own namespace owns (#3268).
+        assert_eq!(filter_config_to_namespace(&mut cfg, "production"), 1);
         assert_eq!(
             cfg.frontend_tls_cert_path.as_deref(),
             Some("k8s://production/gateway-cert#tls.crt")
@@ -2938,7 +2980,11 @@ mod tests {
             cfg.frontend_tls_source_namespace.as_deref(),
             Some("production")
         );
-        assert!(cfg.frontend_tls_namespace_sources.is_empty());
+        assert_eq!(cfg.frontend_tls_certificate_sources.len(), 1);
+        assert_eq!(
+            cfg.frontend_tls_certificate_sources[0].namespace,
+            "production"
+        );
     }
 
     #[test]

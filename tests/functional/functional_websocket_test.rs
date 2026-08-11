@@ -42,6 +42,7 @@ const WS_FRAME_LIMIT_UNDER_TEST: usize = 64;
 const WS_OVERSIZE_FRAME_BYTES: usize = WS_FRAME_LIMIT_UNDER_TEST * 2;
 const WS_H3_FRAME_LIMIT_UNDER_TEST: usize = 64;
 const WS_H3_OVERSIZE_FRAME_BYTES: usize = WS_H3_FRAME_LIMIT_UNDER_TEST * 2;
+const WS_JWT_SECRET: &str = "ws-jwt-functional-secret-32-bytes-minimum";
 
 /// Allocate a free port by binding to port 0 and returning the assigned port.
 async fn free_port() -> u16 {
@@ -864,6 +865,46 @@ plugin_configs:
     enabled: true
 "#,
         backend_port
+    );
+
+    let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
+    file.write_all(config.as_bytes())
+        .expect("Failed to write config");
+}
+
+/// Write a WebSocket route protected by the consumer-specific HS256 JWT
+/// plugin. The signing secret stays fixture-local and is never included in
+/// assertions, diagnostics, or gateway log metadata.
+fn write_ws_jwt_auth_config(config_path: &std::path::Path, backend_port: u16) {
+    let config = format!(
+        r#"
+version: "1"
+proxies:
+  - id: "ws-jwt-proxy"
+    listen_path: "/ws-jwt"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {backend_port}
+    strip_listen_path: true
+    auth_mode: single
+    plugins:
+      - plugin_config_id: "plugin-jwt-auth-ws"
+
+consumers:
+  - id: "consumer-ws-jwt"
+    username: "ws-jwt-client"
+    credentials:
+      jwt:
+        - secret: "{WS_JWT_SECRET}"
+
+plugin_configs:
+  - id: "plugin-jwt-auth-ws"
+    plugin_name: "jwt_auth"
+    config: {{}}
+    scope: proxy
+    proxy_id: "ws-jwt-proxy"
+    enabled: true
+"#
     );
 
     let mut file = std::fs::File::create(config_path).expect("Failed to create config file");
@@ -3398,7 +3439,7 @@ async fn test_h3_websocket_env_disabled_rejects_connect_but_plain_h3_works() {
 }
 
 // ============================================================================
-// WebSocket idle timeout (FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS + per-proxy)
+// WebSocket idle timeout and absolute session lifetime
 // ============================================================================
 
 /// Read frames until the relay terminates (Close frame, stream end, or transport
@@ -3421,6 +3462,35 @@ where
             Ok(None) => return true,     // stream ended => relay torn down
             Err(_) => return false,      // deadline elapsed with no termination
         }
+    }
+}
+
+async fn active_ws_session_closed_within<S>(ws: &mut S, deadline: Duration) -> bool
+where
+    S: futures_util::Stream<Item = Result<Message, WsError>>
+        + futures_util::Sink<Message, Error = WsError>
+        + Unpin,
+{
+    let start = tokio::time::Instant::now();
+    let mut sequence = 0u64;
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= deadline {
+            return false;
+        }
+        if ws
+            .send(Message::Text(format!("lifetime-{sequence}").into()))
+            .await
+            .is_err()
+        {
+            return true;
+        }
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => return true,
+            Ok(Some(Ok(_))) | Err(_) => {}
+        }
+        sequence = sequence.saturating_add(1);
+        sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -3468,8 +3538,8 @@ async fn test_websocket_idle_timeout_closes_idle_session() {
     echo_handle.abort();
 }
 
-/// Explicit `0` must preserve the legacy "never time out" behavior so operators
-/// can intentionally opt out for genuinely long-lived silent streams.
+/// Explicit `0` disables only idle expiry; the independent absolute lifetime is
+/// intentionally much longer than this test window.
 #[ignore]
 #[tokio::test]
 async fn test_websocket_idle_timeout_disabled_keeps_session_open() {
@@ -3556,6 +3626,231 @@ async fn test_websocket_idle_timeout_activity_refreshes_then_closes() {
     assert!(
         ws_session_closed_within(&mut ws, Duration::from_secs(10)).await,
         "session should close once activity stops and the idle window elapses"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// H1 Upgrade, H2 Extended CONNECT, and H3 Extended CONNECT must all apply the
+/// same absolute lifetime even while bidirectional application frames remain
+/// active and the idle timer is disabled.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_max_lifetime_active_traffic_h1_h2_h3_parity() {
+    use bytes::Bytes;
+    use http::{Method, Version};
+    use http_body_util::Empty;
+    use hyper::client::conn::http2;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    let cert_path = "tests/certs/server.crt";
+    let key_path = "tests/certs/server.key";
+    build_gateway().expect("Failed to build gateway");
+    let extra_env = [
+        ("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS", "0"),
+        ("FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS", "2"),
+    ];
+    let (mut gateway, gateway_http_port, gateway_https_port) =
+        start_gateway_tls_with_retry_extra_env(
+            config_path.to_str().unwrap(),
+            cert_path,
+            key_path,
+            &extra_env,
+        )
+        .await;
+
+    let h1_url = format!("ws://127.0.0.1:{gateway_http_port}/ws-echo");
+    let (mut h1_ws, _) = tokio_tungstenite::connect_async(&h1_url)
+        .await
+        .expect("H1 WebSocket connect");
+    assert!(
+        active_ws_session_closed_within(&mut h1_ws, Duration::from_secs(8)).await,
+        "active H1 traffic must not extend the maximum lifetime"
+    );
+
+    let h2_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
+        .await
+        .expect("connect H2 gateway");
+    let (mut h2_sender, h2_connection) =
+        http2::handshake(TokioExecutor::new(), TokioIo::new(h2_stream))
+            .await
+            .expect("H2 handshake");
+    let h2_connection_task = tokio::spawn(async move {
+        let _ = h2_connection.await;
+    });
+    let h2_request = http::Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("http://127.0.0.1:{gateway_http_port}/ws-echo"))
+        .version(Version::HTTP_2)
+        .header(http::header::SEC_WEBSOCKET_VERSION, "13")
+        .extension(hyper::ext::Protocol::from_static("websocket"))
+        .body(Empty::<Bytes>::new())
+        .expect("build H2 WebSocket CONNECT");
+    let h2_response = h2_sender
+        .send_request(h2_request)
+        .await
+        .expect("send H2 CONNECT");
+    assert_eq!(h2_response.status(), StatusCode::OK);
+    let h2_upgraded = hyper::upgrade::on(h2_response).await.expect("H2 upgrade");
+    let mut h2_ws =
+        WebSocketStream::from_raw_socket(TokioIo::new(h2_upgraded), Role::Client, None).await;
+    assert!(
+        active_ws_session_closed_within(&mut h2_ws, Duration::from_secs(8)).await,
+        "active H2 traffic must not extend the maximum lifetime"
+    );
+    h2_connection_task.abort();
+
+    let h3_client = Http3Client::insecure().expect("H3 client");
+    let h3_url = format!("https://localhost:{gateway_https_port}/ws-echo");
+    let mut h3_ws = h3_client
+        .websocket(&h3_url, WebSocketOptions::default())
+        .await
+        .expect("H3 WebSocket connect");
+    let h3_start = tokio::time::Instant::now();
+    let mut h3_sequence = 0u64;
+    let h3_closed = loop {
+        if h3_start.elapsed() >= Duration::from_secs(8) {
+            break false;
+        }
+        if h3_ws
+            .send_text(&format!("lifetime-{h3_sequence}"))
+            .await
+            .is_err()
+        {
+            break true;
+        }
+        match tokio::time::timeout(Duration::from_secs(1), h3_ws.recv_frame()).await {
+            Ok(Ok(H3WebSocketFrame::Close(_))) | Ok(Err(_)) => break true,
+            Ok(Ok(_)) | Err(_) => {}
+        }
+        h3_sequence = h3_sequence.saturating_add(1);
+        sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        h3_closed,
+        "active H3 traffic must not extend the maximum lifetime"
+    );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// A live H1 WebSocket authenticated by a short-lived consumer JWT must stop
+/// at the validated credential deadline even while application traffic keeps
+/// flowing and the configured maximum lifetime is materially later.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_active_jwt_session_closes_at_credential_expiry() {
+    const CREDENTIAL_TTL_SECONDS: i64 = 4;
+    const CREDENTIAL_CLOSE_GRACE_SECONDS: u64 = 4;
+    const CLOSE_BOUND_SECONDS: u64 = CREDENTIAL_TTL_SECONDS as u64 + CREDENTIAL_CLOSE_GRACE_SECONDS;
+
+    let backend_port = free_port().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_port));
+    sleep(Duration::from_millis(300)).await;
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_jwt_auth_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) = start_gateway_plain_with_retry_extra_env(
+        config_path.to_str().unwrap(),
+        &[
+            ("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS", "0"),
+            ("FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS", "30"),
+        ],
+    )
+    .await;
+
+    // Mint only after the readiness barrier has proven ownership of the
+    // gateway listener, so the short-lived credential is valid at upgrade.
+    let token_minted_at = tokio::time::Instant::now();
+    let expires_at = chrono::Utc::now()
+        .timestamp()
+        .saturating_add(CREDENTIAL_TTL_SECONDS);
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &serde_json::json!({
+            "sub": "ws-jwt-client",
+            "exp": expires_at,
+            "nbf": 0,
+        }),
+        &jsonwebtoken::EncodingKey::from_secret(WS_JWT_SECRET.as_bytes()),
+    )
+    .unwrap_or_else(|_| panic!("failed to sign short-lived functional-test JWT"));
+
+    let url = format!("ws://127.0.0.1:{gateway_port}/ws-jwt");
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .expect("valid JWT WebSocket request");
+    request.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {token}")
+            .parse()
+            .unwrap_or_else(|_| panic!("signed JWT was not a valid authorization header")),
+    );
+    let (mut ws, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .unwrap_or_else(|_| panic!("JWT-authenticated WebSocket upgrade must succeed"));
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    let mut sequence = 0u64;
+    let mut successful_round_trips = 0u64;
+    let closed_at_credential_deadline = loop {
+        if token_minted_at.elapsed() >= Duration::from_secs(CLOSE_BOUND_SECONDS) {
+            break false;
+        }
+        let payload = format!("jwt-active-{sequence}");
+        if ws
+            .send(Message::Text(payload.clone().into()))
+            .await
+            .is_err()
+        {
+            break true;
+        }
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(Message::Text(reply)))) => {
+                assert_eq!(reply, format!("Echo: {payload}"));
+                successful_round_trips = successful_round_trips.saturating_add(1);
+            }
+            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => break true,
+            Ok(Some(Ok(_))) | Err(_) => {}
+        }
+        sequence = sequence.saturating_add(1);
+        sleep(Duration::from_millis(100)).await;
+    };
+    let closed_after = token_minted_at.elapsed();
+
+    assert!(
+        successful_round_trips >= 2,
+        "JWT-authenticated WebSocket must remain active before credential expiry"
+    );
+    assert!(
+        closed_at_credential_deadline,
+        "active JWT-authenticated WebSocket must close in the credential-expiry window"
+    );
+    assert!(
+        closed_after >= Duration::from_secs(2),
+        "accepted JWT session must not close immediately after upgrade"
+    );
+    assert!(
+        closed_after < Duration::from_secs(CLOSE_BOUND_SECONDS),
+        "credential expiry must close the active session well before the 30-second maximum"
     );
 
     let _ = gateway.kill();

@@ -5178,6 +5178,7 @@ mod tests {
                 port: 8443,
                 endpoint_host: "127.0.0.1".to_string(),
                 endpoint_port: 8080,
+                protocol: AppProtocol::Http,
                 endpoint_unix_path: None,
                 endpoint_unix_h2c: false,
                 owner_namespace: "default".to_string(),

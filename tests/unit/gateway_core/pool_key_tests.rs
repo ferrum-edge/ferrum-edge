@@ -697,9 +697,9 @@ async fn connection_pool_key_client_level_settings_partition() {
 fn h2_pool_key_basic_format() {
     let proxy = minimal_proxy();
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
-    // Format: host|port|dns|subset|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
+    // Format: host|port|dns|subset|h2mcs|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
     assert_eq!(
-        key, "backend.example.com|8080||||||||1|svidg=static",
+        key, "backend.example.com|8080|||none||||||1|svidg=static",
         "basic H2 key format mismatch"
     );
 }
@@ -819,8 +819,8 @@ fn h2_pool_key_pipe_delimiter_count() {
     let key = Http2ConnectionPool::pool_key_for_warmup(&proxy);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
     assert_eq!(
-        pipe_count, 10,
-        "11 fields need 10 pipe delimiters in H2 key, got {pipe_count}: {key}"
+        pipe_count, 11,
+        "12 fields need 11 pipe delimiters in H2 key, got {pipe_count}: {key}"
     );
 }
 
@@ -855,13 +855,12 @@ fn h2_pool_key_ipv6_no_collision() {
 fn h2_pool_key_policy_fields_do_not_fragment() {
     let mut p1 = minimal_proxy();
     p1.pool_http2_keep_alive_interval_seconds = Some(10);
-    p1.pool_http2_max_concurrent_streams = Some(200);
     p1.backend_connect_timeout_ms = 500;
     let p2 = minimal_proxy();
     assert_eq!(
         Http2ConnectionPool::pool_key_for_warmup(&p1),
         Http2ConnectionPool::pool_key_for_warmup(&p2),
-        "policy fields should not affect H2 pool key"
+        "request-only / non-keyed H2 keepalive policy must not affect H2 pool key"
     );
 }
 
@@ -1874,5 +1873,129 @@ fn http3_pool_key_partitions_by_upstream_subset() {
     assert_ne!(
         key_v2, key_none,
         "v2 subset and no-subset must not share H3 pool: {key_v2} vs {key_none}"
+    );
+}
+
+/// Same backend host:port with divergent subset `idleTimeout` /
+/// `http2MaxRequests` must not first-materialize each other. Reqwest isolates
+/// via `upstream_subset` plus the idle `rcfg` segment; direct-H2 / gRPC isolate
+/// via `upstream_subset` and the keyed H2 stream-cap segment.
+#[tokio::test]
+async fn same_endpoint_subset_idle_and_h2_caps_partition_pool_keys() {
+    let pool = pool_with_defaults();
+
+    let mut v1 = minimal_proxy();
+    v1.upstream_subset = Some("v1".to_string());
+    v1.pool_idle_timeout_seconds = Some(45);
+    v1.pool_http2_max_concurrent_streams = Some(10);
+
+    let mut v2 = minimal_proxy();
+    v2.upstream_subset = Some("v2".to_string());
+    v2.pool_idle_timeout_seconds = Some(12);
+    v2.pool_http2_max_concurrent_streams = Some(40);
+
+    let mut unmatched = minimal_proxy();
+    unmatched.upstream_subset = None;
+    unmatched.pool_idle_timeout_seconds = Some(60);
+    unmatched.pool_http2_max_concurrent_streams = Some(200);
+
+    let reqwest_v1 = pool.pool_key_for_warmup(&v1);
+    let reqwest_v2 = pool.pool_key_for_warmup(&v2);
+    let reqwest_none = pool.pool_key_for_warmup(&unmatched);
+    assert_ne!(reqwest_v1, reqwest_v2);
+    assert_ne!(reqwest_v1, reqwest_none);
+    assert!(
+        reqwest_v1.contains("|rcfg=i45;"),
+        "v1 idleTimeout must participate in reqwest rcfg: {reqwest_v1}"
+    );
+    assert!(
+        reqwest_v2.contains("|rcfg=i12;"),
+        "v2 idleTimeout must participate in reqwest rcfg: {reqwest_v2}"
+    );
+
+    let h2_v1 = Http2ConnectionPool::pool_key_for_warmup(&v1);
+    let h2_v2 = Http2ConnectionPool::pool_key_for_warmup(&v2);
+    assert_ne!(
+        h2_v1, h2_v2,
+        "same-endpoint subsets must not share direct-H2 connections: {h2_v1} vs {h2_v2}"
+    );
+
+    let grpc_v1 = GrpcConnectionPool::pool_key_for_warmup(&v1);
+    let grpc_v2 = GrpcConnectionPool::pool_key_for_warmup(&v2);
+    assert_ne!(
+        grpc_v1, grpc_v2,
+        "same-endpoint subsets must not share native-gRPC connections: {grpc_v1} vs {grpc_v2}"
+    );
+}
+
+/// Same backend host:port and same `upstream_subset` with divergent
+/// `pool_http2_max_concurrent_streams` must produce distinct direct-H2 and
+/// native-gRPC keys so a DestinationRule http2MaxRequests update cannot reuse
+/// a connection built under the prior Hyper builder limit.
+#[test]
+fn same_subset_divergent_h2_caps_partition_direct_h2_and_grpc_keys() {
+    let mut low = minimal_proxy();
+    low.upstream_subset = Some("canary".to_string());
+    low.pool_http2_max_concurrent_streams = Some(10);
+
+    let mut high = minimal_proxy();
+    high.upstream_subset = Some("canary".to_string());
+    high.pool_http2_max_concurrent_streams = Some(40);
+
+    let h2_low = Http2ConnectionPool::pool_key_for_warmup(&low);
+    let h2_high = Http2ConnectionPool::pool_key_for_warmup(&high);
+    assert_ne!(
+        h2_low, h2_high,
+        "same-subset divergent H2 caps must not share direct-H2 keys: {h2_low} vs {h2_high}"
+    );
+    assert!(
+        h2_low.contains("|10|") && h2_high.contains("|40|"),
+        "H2 keys must embed the configured stream caps: {h2_low} / {h2_high}"
+    );
+
+    let grpc_low = GrpcConnectionPool::pool_key_for_warmup(&low);
+    let grpc_high = GrpcConnectionPool::pool_key_for_warmup(&high);
+    assert_ne!(
+        grpc_low, grpc_high,
+        "same-subset divergent H2 caps must not share gRPC keys: {grpc_low} vs {grpc_high}"
+    );
+    assert!(
+        grpc_low.contains("|10|") && grpc_high.contains("|40|"),
+        "gRPC keys must embed the configured stream caps: {grpc_low} / {grpc_high}"
+    );
+}
+
+/// Configured-versus-removed/default H2 caps must differ so DestinationRule
+/// update/delete of http2MaxRequests retires the prior builder connection.
+#[test]
+fn h2_and_grpc_pool_keys_partition_configured_versus_default_h2_cap() {
+    let mut configured = minimal_proxy();
+    configured.upstream_subset = Some("v1".to_string());
+    configured.pool_http2_max_concurrent_streams = Some(64);
+
+    let mut removed = minimal_proxy();
+    removed.upstream_subset = Some("v1".to_string());
+    removed.pool_http2_max_concurrent_streams = None;
+
+    let h2_configured = Http2ConnectionPool::pool_key_for_warmup(&configured);
+    let h2_default = Http2ConnectionPool::pool_key_for_warmup(&removed);
+    assert_ne!(
+        h2_configured, h2_default,
+        "configured vs removed H2 cap must not share direct-H2 keys: {h2_configured} vs {h2_default}"
+    );
+    assert!(
+        h2_configured.contains("|64|") && h2_default.contains("|none|"),
+        "configured/default H2 keys must use decimal/`none` sentinels: {h2_configured} / {h2_default}"
+    );
+
+    let grpc_configured = GrpcConnectionPool::pool_key_for_warmup(&configured);
+    let grpc_default = GrpcConnectionPool::pool_key_for_warmup(&removed);
+    assert_ne!(
+        grpc_configured, grpc_default,
+        "configured vs removed H2 cap must not share gRPC keys: {grpc_configured} vs {grpc_default}"
+    );
+    assert!(
+        grpc_configured.contains("|64|") && grpc_default.contains("|none|"),
+        "configured/default gRPC keys must use decimal/`none` sentinels: {grpc_configured} / {grpc_default}"
     );
 }

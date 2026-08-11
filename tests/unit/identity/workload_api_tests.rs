@@ -2359,3 +2359,557 @@ mod socket_publication {
         );
     }
 }
+
+// ── CA/provider error redaction at the Workload API boundary (issue #3760) ──
+
+/// Sentinel values planted inside every `CaError` variant. A client-visible
+/// gRPC status must never contain any of these strings.
+const CA_ERROR_SENTINELS: &[&str] = &[
+    "/secret/operator/path",
+    "https://vault.internal.example",
+    "pki_int",
+    "mesh-workload-role",
+    "leak.example.org",
+    "spiffe://leak.example.org/ns/secret/sa/agent",
+    "vault-token=s.FakeCredentialValue99",
+    "No such file or directory (os error 2)",
+    "FERRUM_MESH_CA_KEY_PATH unset",
+];
+
+fn ca_error_cases() -> Vec<(CaError, tonic::Code, &'static str)> {
+    use tonic::Code;
+    vec![
+        (
+            CaError::BadCsr(format!(
+                "CSR rejected for {} at mount='{}' role='{}'",
+                CA_ERROR_SENTINELS[5], CA_ERROR_SENTINELS[2], CA_ERROR_SENTINELS[3]
+            )),
+            Code::InvalidArgument,
+            "certificate request rejected",
+        ),
+        (
+            CaError::UnknownTrustDomain(CA_ERROR_SENTINELS[4].to_string()),
+            Code::PermissionDenied,
+            "trust domain not authorized",
+        ),
+        (
+            CaError::Upstream(format!(
+                "Vault PKI CA at '{}' (mount='{}', role='{}') responded: {}",
+                CA_ERROR_SENTINELS[1],
+                CA_ERROR_SENTINELS[2],
+                CA_ERROR_SENTINELS[3],
+                CA_ERROR_SENTINELS[6]
+            )),
+            Code::Unavailable,
+            "certificate authority unavailable",
+        ),
+        (
+            CaError::Config(format!(
+                "{} while reading {}",
+                CA_ERROR_SENTINELS[8], CA_ERROR_SENTINELS[0]
+            )),
+            Code::Internal,
+            "certificate authority operation failed",
+        ),
+        (
+            CaError::Internal(format!(
+                "parser diagnostic near {} with {}",
+                CA_ERROR_SENTINELS[5], CA_ERROR_SENTINELS[6]
+            )),
+            Code::Internal,
+            "certificate authority operation failed",
+        ),
+        (
+            CaError::Io(format!(
+                "{} opening {}",
+                CA_ERROR_SENTINELS[7], CA_ERROR_SENTINELS[0]
+            )),
+            Code::Internal,
+            "certificate authority operation failed",
+        ),
+    ]
+}
+
+fn assert_status_redacted(err: &tonic::Status, code: tonic::Code, message: &str, context: &str) {
+    assert_eq!(err.code(), code, "{context}: unexpected gRPC code");
+    assert_eq!(err.message(), message, "{context}: unexpected gRPC message");
+    let haystack = format!("{err:?}");
+    for sentinel in CA_ERROR_SENTINELS {
+        assert!(
+            !err.message().contains(sentinel),
+            "{context}: status message leaked sentinel {sentinel:?}: {}",
+            err.message()
+        );
+        assert!(
+            !haystack.contains(sentinel),
+            "{context}: Status Debug leaked sentinel {sentinel:?}: {haystack}"
+        );
+    }
+}
+
+/// CA stub that injects a fixed `CaError` on selected operations so every
+/// Workload API boundary can be exercised with the same sentinel payloads.
+struct InjectedCa {
+    trust_domain: TrustDomain,
+    issue_error: Option<CaError>,
+    local_bundle_error: Option<CaError>,
+    federated_bundle_error: Option<CaError>,
+    jwt_authorities_error: Option<CaError>,
+}
+
+impl InjectedCa {
+    fn clone_error(error: &Option<CaError>) -> Option<CaError> {
+        error.as_ref().map(|e| match e {
+            CaError::Config(s) => CaError::Config(s.clone()),
+            CaError::BadCsr(s) => CaError::BadCsr(s.clone()),
+            CaError::UnknownTrustDomain(s) => CaError::UnknownTrustDomain(s.clone()),
+            CaError::Upstream(s) => CaError::Upstream(s.clone()),
+            CaError::Internal(s) => CaError::Internal(s.clone()),
+            CaError::Io(s) => CaError::Io(s.clone()),
+        })
+    }
+}
+
+#[async_trait]
+impl CertificateAuthority for InjectedCa {
+    async fn issue_svid(&self, req: IssuanceRequest) -> Result<SignedSvid, CaError> {
+        if let Some(err) = Self::clone_error(&self.issue_error) {
+            return Err(err);
+        }
+        let (id, ttl) = match req {
+            IssuanceRequest::Generate {
+                spiffe_id,
+                ttl_secs,
+            }
+            | IssuanceRequest::Csr {
+                spiffe_id,
+                ttl_secs,
+                ..
+            } => (spiffe_id, ttl_secs),
+        };
+        Ok(SignedSvid {
+            spiffe_id: id,
+            cert_chain_der: vec![b"injected-cert".to_vec()],
+            private_key_pkcs8_der: b"injected-key".to_vec().into(),
+            not_after: chrono::Utc::now() + chrono::Duration::seconds(ttl as i64),
+        })
+    }
+
+    async fn trust_bundle(&self, td: &TrustDomain) -> Result<PublishedTrustBundle, CaError> {
+        if td == &self.trust_domain {
+            if let Some(err) = Self::clone_error(&self.local_bundle_error) {
+                return Err(err);
+            }
+            return Ok(PublishedTrustBundle {
+                trust_domain: self.trust_domain.clone(),
+                roots_der: vec![b"injected-root".to_vec()],
+                refresh_hint_secs: Some(60),
+            });
+        }
+        if let Some(err) = Self::clone_error(&self.federated_bundle_error) {
+            return Err(err);
+        }
+        Ok(PublishedTrustBundle {
+            trust_domain: td.clone(),
+            roots_der: vec![b"injected-federated-root".to_vec()],
+            refresh_hint_secs: Some(60),
+        })
+    }
+
+    async fn jwt_authorities(
+        &self,
+        _td: &TrustDomain,
+    ) -> Result<Vec<PublishedJwtAuthority>, CaError> {
+        if let Some(err) = Self::clone_error(&self.jwt_authorities_error) {
+            return Err(err);
+        }
+        Ok(Vec::new())
+    }
+}
+
+fn injected_service(ca: InjectedCa, federated: Option<TrustDomain>) -> WorkloadApiService {
+    let trust_domain = ca.trust_domain.clone();
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
+    let attestor: Arc<dyn Attestor> = Arc::new(StubAttestor { id });
+    let svc = WorkloadApiService::new(vec![attestor], Arc::new(ca), trust_domain, 600);
+    match federated {
+        Some(td) => svc
+            .with_federated_trust_domains(vec![td])
+            .expect("one federated trust domain is within the configured cap"),
+        None => svc,
+    }
+}
+
+#[tokio::test]
+async fn workload_api_redacts_ca_errors_on_initial_x509_svid_issuance() {
+    use ferrum_edge::identity::workload_api::proto::X509svidRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    for (error, code, message) in ca_error_cases() {
+        let svc = injected_service(
+            InjectedCa {
+                trust_domain: trust_domain.clone(),
+                issue_error: Some(error),
+                local_bundle_error: None,
+                federated_bundle_error: None,
+                jwt_authorities_error: None,
+            },
+            None,
+        );
+        let err = match svc
+            .fetch_x509svid(workload_request(X509svidRequest {}))
+            .await
+        {
+            Ok(_) => panic!("expected CA issue failure to surface as Status"),
+            Err(status) => status,
+        };
+        assert_status_redacted(
+            &err,
+            code,
+            message,
+            &format!("FetchX509SVID issue_svid ({code:?})"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn workload_api_redacts_ca_errors_on_local_bundle_during_x509_svid() {
+    use ferrum_edge::identity::workload_api::proto::X509svidRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    for (error, code, message) in ca_error_cases() {
+        let svc = injected_service(
+            InjectedCa {
+                trust_domain: trust_domain.clone(),
+                issue_error: None,
+                local_bundle_error: Some(error),
+                federated_bundle_error: None,
+                jwt_authorities_error: None,
+            },
+            None,
+        );
+        let err = match svc
+            .fetch_x509svid(workload_request(X509svidRequest {}))
+            .await
+        {
+            Ok(_) => panic!("expected local bundle failure to surface as Status"),
+            Err(status) => status,
+        };
+        assert_status_redacted(
+            &err,
+            code,
+            message,
+            &format!("FetchX509SVID local trust_bundle ({code:?})"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn workload_api_redacts_ca_errors_on_federated_bundle_during_x509_svid() {
+    use ferrum_edge::identity::workload_api::proto::X509svidRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    let partner = TrustDomain::new("partner.test").unwrap();
+    for (error, code, message) in ca_error_cases() {
+        let svc = injected_service(
+            InjectedCa {
+                trust_domain: trust_domain.clone(),
+                issue_error: None,
+                local_bundle_error: None,
+                federated_bundle_error: Some(error),
+                jwt_authorities_error: None,
+            },
+            Some(partner.clone()),
+        );
+        let err = match svc
+            .fetch_x509svid(workload_request(X509svidRequest {}))
+            .await
+        {
+            Ok(_) => panic!("expected federated bundle failure to surface as Status"),
+            Err(status) => status,
+        };
+        assert_status_redacted(
+            &err,
+            code,
+            message,
+            &format!("FetchX509SVID federated trust_bundle ({code:?})"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn workload_api_redacts_ca_errors_on_bundle_only_rpc() {
+    use ferrum_edge::identity::workload_api::proto::X509BundlesRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    for (error, code, message) in ca_error_cases() {
+        let svc = injected_service(
+            InjectedCa {
+                trust_domain: trust_domain.clone(),
+                issue_error: None,
+                local_bundle_error: Some(error),
+                federated_bundle_error: None,
+                jwt_authorities_error: None,
+            },
+            None,
+        );
+        let err = match svc
+            .fetch_x509_bundles(workload_request(X509BundlesRequest {}))
+            .await
+        {
+            Ok(_) => panic!("expected bundle-only CA failure to surface as Status"),
+            Err(status) => status,
+        };
+        assert_status_redacted(
+            &err,
+            code,
+            message,
+            &format!("FetchX509Bundles local trust_bundle ({code:?})"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn workload_api_redacts_ca_errors_on_federated_bundle_only_rpc() {
+    use ferrum_edge::identity::workload_api::proto::X509BundlesRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    let partner = TrustDomain::new("partner.test").unwrap();
+    for (error, code, message) in ca_error_cases() {
+        let svc = injected_service(
+            InjectedCa {
+                trust_domain: trust_domain.clone(),
+                issue_error: None,
+                local_bundle_error: None,
+                federated_bundle_error: Some(error),
+                jwt_authorities_error: None,
+            },
+            Some(partner.clone()),
+        );
+        let err = match svc
+            .fetch_x509_bundles(workload_request(X509BundlesRequest {}))
+            .await
+        {
+            Ok(_) => panic!("expected federated bundle-only CA failure to surface as Status"),
+            Err(status) => status,
+        };
+        assert_status_redacted(
+            &err,
+            code,
+            message,
+            &format!("FetchX509Bundles federated trust_bundle ({code:?})"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn workload_api_redacts_ca_errors_on_jwt_authority_paths() {
+    use ferrum_edge::identity::workload_api::proto::JwtBundlesRequest;
+    use ferrum_edge::identity::workload_api::proto::ValidateJwtsvidRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    for (error, code, message) in ca_error_cases() {
+        let svc = injected_service(
+            InjectedCa {
+                trust_domain: trust_domain.clone(),
+                issue_error: None,
+                local_bundle_error: None,
+                federated_bundle_error: None,
+                jwt_authorities_error: Some(error),
+            },
+            None,
+        );
+
+        let bundles_err = match svc
+            .fetch_jwt_bundles(workload_request(JwtBundlesRequest {}))
+            .await
+        {
+            Ok(_) => panic!("expected JWT bundle CA failure to surface as Status"),
+            Err(status) => status,
+        };
+        assert_status_redacted(
+            &bundles_err,
+            code,
+            message,
+            &format!("FetchJWTBundles jwt_authorities ({code:?})"),
+        );
+
+        let validate_err = match svc
+            .validate_jwtsvid(workload_request(ValidateJwtsvidRequest {
+                audience: "test-audience".to_string(),
+                svid: "not.a.jwt".to_string(),
+            }))
+            .await
+        {
+            Ok(_) => panic!("expected ValidateJWTSVID CA failure to surface as Status"),
+            Err(status) => status,
+        };
+        assert_status_redacted(
+            &validate_err,
+            code,
+            message,
+            &format!("ValidateJWTSVID jwt_authorities ({code:?})"),
+        );
+    }
+}
+
+#[tokio::test]
+async fn workload_api_rotation_keeps_stream_open_on_transient_ca_failure() {
+    use ferrum_edge::identity::workload_api::proto::X509svidRequest;
+    use ferrum_edge::identity::workload_api::proto::spiffe_workload_api_server::SpiffeWorkloadApi;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::watch;
+    use tokio_stream::StreamExt;
+
+    let trust_domain = TrustDomain::new("td.test").unwrap();
+    let fail_issue = Arc::new(AtomicBool::new(false));
+
+    struct FlipCa {
+        trust_domain: TrustDomain,
+        fail_issue: Arc<AtomicBool>,
+        counter: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait]
+    impl CertificateAuthority for FlipCa {
+        async fn issue_svid(&self, req: IssuanceRequest) -> Result<SignedSvid, CaError> {
+            if self.fail_issue.load(Ordering::SeqCst) {
+                return Err(CaError::Upstream(format!(
+                    "transient upstream at {} with {}",
+                    CA_ERROR_SENTINELS[1], CA_ERROR_SENTINELS[6]
+                )));
+            }
+            let n = self.counter.fetch_add(1, Ordering::SeqCst);
+            let (id, ttl) = match req {
+                IssuanceRequest::Generate {
+                    spiffe_id,
+                    ttl_secs,
+                }
+                | IssuanceRequest::Csr {
+                    spiffe_id,
+                    ttl_secs,
+                    ..
+                } => (spiffe_id, ttl_secs),
+            };
+            Ok(SignedSvid {
+                spiffe_id: id,
+                cert_chain_der: vec![format!("flip-cert-{n}").into_bytes()],
+                private_key_pkcs8_der: b"flip-key".to_vec().into(),
+                not_after: chrono::Utc::now() + chrono::Duration::seconds(ttl as i64),
+            })
+        }
+
+        async fn trust_bundle(&self, td: &TrustDomain) -> Result<PublishedTrustBundle, CaError> {
+            if td != &self.trust_domain {
+                return Err(CaError::UnknownTrustDomain(td.to_string()));
+            }
+            Ok(PublishedTrustBundle {
+                trust_domain: self.trust_domain.clone(),
+                roots_der: vec![b"flip-root".to_vec()],
+                refresh_hint_secs: Some(60),
+            })
+        }
+
+        async fn jwt_authorities(
+            &self,
+            _td: &TrustDomain,
+        ) -> Result<Vec<PublishedJwtAuthority>, CaError> {
+            Ok(Vec::new())
+        }
+    }
+
+    let ca = Arc::new(FlipCa {
+        trust_domain: trust_domain.clone(),
+        fail_issue: Arc::clone(&fail_issue),
+        counter: std::sync::atomic::AtomicU64::new(0),
+    });
+    let id = SpiffeId::from_parts(&trust_domain, "ns/test/sa/foo").unwrap();
+    let attestor: Arc<dyn Attestor> = Arc::new(StubAttestor { id });
+    let (tx, _) = watch::channel(0u64);
+    let rotation = Arc::new(tx);
+    let svc = WorkloadApiService::with_rotation_signal(
+        vec![attestor],
+        ca.clone(),
+        trust_domain,
+        600,
+        Arc::clone(&rotation),
+    );
+
+    let resp = svc
+        .fetch_x509svid(workload_request(X509svidRequest {}))
+        .await
+        .expect("initial FetchX509SVID must succeed");
+    let mut stream = resp.into_inner();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for first message")
+        .expect("stream ended unexpectedly")
+        .expect("first message was an error");
+    assert_eq!(first.svids[0].x509_svid, b"flip-cert-0");
+
+    // A transient CA failure on rotation must stay server-side and must not
+    // terminate the healthy stream.
+    fail_issue.store(true, Ordering::SeqCst);
+    rotation.send_modify(|v| *v += 1);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+            .await
+            .is_err(),
+        "transient rotation CA failure must not publish an error or close the stream"
+    );
+
+    fail_issue.store(false, Ordering::SeqCst);
+    rotation.send_modify(|v| *v += 1);
+    let recovered = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for recovery rotation")
+        .expect("stream ended before recovery")
+        .expect("recovery rotation was an error");
+    assert_eq!(recovered.svids[0].x509_svid, b"flip-cert-1");
+}
+
+#[test]
+fn workload_api_ca_paths_must_not_interpolate_raw_ca_errors_into_status() {
+    // Source regression: production Workload API CA/provider paths must convert
+    // through `ca_status` rather than `Status::* (format!(... {e} ...))`.
+    let server = include_str!("../../../src/identity/workload_api/server.rs");
+    assert!(
+        server.contains("fn ca_status("),
+        "Workload API must keep a centralized ca_status helper"
+    );
+
+    let mut in_test_mod = false;
+    for line in server.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("#[cfg(test)]") {
+            in_test_mod = true;
+        }
+        if in_test_mod {
+            continue;
+        }
+        let lowered = trimmed.to_ascii_lowercase();
+        let looks_like_status_format = trimmed.contains("Status::") && trimmed.contains("format!(");
+        let interpolates_error = trimmed.contains("{e}")
+            || trimmed.contains("{e:?}")
+            || trimmed.contains("{e:#}")
+            || lowered.contains("{error}")
+            || trimmed.contains("{err}");
+        assert!(
+            !(looks_like_status_format && interpolates_error),
+            "production Workload API must not reintroduce Status::* (format!(...{{e}}...)); found: {trimmed}"
+        );
+        assert!(
+            !trimmed.contains("CA failed: {e}")
+                && !trimmed.contains("CA bundle fetch failed: {e}")
+                && !trimmed.contains("CA federated bundle fetch failed: {e}"),
+            "legacy raw CA Status interpolation marker returned: {trimmed}"
+        );
+    }
+}

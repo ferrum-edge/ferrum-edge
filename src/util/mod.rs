@@ -9,6 +9,7 @@ pub mod body_limit;
 pub mod cidr;
 pub mod client_identity;
 pub mod conn_limit;
+pub mod endpointslice;
 pub mod http_headers;
 pub mod json_dup_keys;
 pub mod media_type;

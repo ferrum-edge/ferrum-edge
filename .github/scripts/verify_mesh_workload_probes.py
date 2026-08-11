@@ -247,6 +247,317 @@ def validate_node_agent_port0(results_dir: Path, expectations: dict) -> None:
     print("mesh probe node-agent port 0 ok")
 
 
+def validate_node_agent_https_only(results_dir: Path, expectations: dict) -> None:
+    captures = expectations["captures"]
+    rendered = require_capture(results_dir, captures["node_agent_https_only"]).read_text(
+        encoding="utf-8"
+    )
+    resource = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
+    readiness = require_probe(resource, "ferrum-mesh-node-agent", "readinessProbe")
+    liveness = require_probe(resource, "ferrum-mesh-node-agent", "livenessProbe")
+    if "--tls" not in readiness or "--tls-no-verify" not in readiness:
+        fail(
+            "Node-agent HTTPS-only probes missing TLS",
+            "HTTPS-only admin must render health --tls --tls-no-verify",
+        )
+    if not re.search(r'(?m)^\s+-\s+"19443"\s*$', readiness):
+        fail(
+            "Node-agent HTTPS-only probe port mismatch",
+            "HTTPS-only probes must dial httpsPort 19443, not the disabled HTTP port",
+        )
+    if "19090" in readiness:
+        fail(
+            "Node-agent HTTPS-only still probes HTTP",
+            "disabled plaintext port must not remain in HTTPS-only probes",
+        )
+    if "--tls" not in liveness or "--live" not in liveness:
+        fail(
+            "Node-agent HTTPS-only liveness regress",
+            "liveness must keep --live with --tls",
+        )
+    if "FERRUM_ADMIN_TLS_CERT_PATH" not in resource:
+        fail(
+            "Node-agent HTTPS-only missing TLS env",
+            "Secret-backed admin TLS PATH env must be rendered",
+        )
+    if "node-agent-admin-tls" not in resource:
+        fail(
+            "Node-agent HTTPS-only missing TLS volume",
+            "admin TLS Secret mount must be rendered",
+        )
+    print("mesh probe node-agent HTTPS-only ok")
+
+
+def validate_node_agent_integer_port0_preserves_https_only(
+    results_dir: Path, expectations: dict
+) -> None:
+    """Integer `--set nodeAgent.admin.port=0` must not re-enable plaintext 19090."""
+
+    captures = expectations["captures"]
+    rendered = require_capture(
+        results_dir, captures["node_agent_https_only_int_port0"]
+    ).read_text(encoding="utf-8")
+    resource = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
+    if not re.search(
+        r'(?m)^\s+- name: FERRUM_ADMIN_HTTP_PORT\s*\n\s+value: "0"\s*$',
+        resource,
+    ):
+        fail(
+            "Integer admin.port=0 re-enabled plaintext",
+            "Helm --set nodeAgent.admin.port=0 must render FERRUM_ADMIN_HTTP_PORT=0",
+        )
+    if re.search(
+        r'(?m)^\s+- name: FERRUM_ADMIN_HTTP_PORT\s*\n\s+value: "19090"\s*$',
+        resource,
+    ):
+        fail(
+            "Integer admin.port=0 fell back to 19090",
+            "Sprig default must not treat integer 0 as empty for admin.port",
+        )
+    readiness = require_probe(resource, "ferrum-mesh-node-agent", "readinessProbe")
+    if "--tls" not in readiness or not re.search(r'(?m)^\s+-\s+"19443"\s*$', readiness):
+        fail(
+            "Integer port=0 HTTPS-only probe regress",
+            "integer port=0 HTTPS-only must keep TLS probes on httpsPort",
+        )
+    err_text = require_capture(
+        results_dir, captures["node_agent_https_mtls_int_port0_err"]
+    ).read_text(encoding="utf-8")
+    if not err_text.strip():
+        fail(
+            "Integer port=0 bypassed HTTPS-only mTLS guard",
+            "--set nodeAgent.admin.port=0 must keep HTTPS-only mTLS fail-closed",
+        )
+    if "client certificate" not in err_text and "clientCaKey" not in err_text:
+        fail(
+            "Integer port=0 mTLS rejection drift",
+            "stderr must mention client certificate / clientCaKey guidance",
+        )
+    print("mesh probe node-agent integer port=0 HTTPS-only/mTLS ok")
+
+
+def validate_node_agent_dual(results_dir: Path, expectations: dict) -> None:
+    captures = expectations["captures"]
+    rendered = require_capture(results_dir, captures["node_agent_dual"]).read_text(
+        encoding="utf-8"
+    )
+    resource = resource_document(rendered, "ferrum-mesh-node-agent", "DaemonSet")
+    readiness = require_probe(resource, "ferrum-mesh-node-agent", "readinessProbe")
+    # Dual keeps plaintext probes on HTTP while still mounting HTTPS TLS.
+    if "--tls" in readiness:
+        fail(
+            "Node-agent dual probes unexpectedly TLS",
+            "dual listeners with HTTP enabled should keep plaintext probe scheme",
+        )
+    if not re.search(r'(?m)^\s+-\s+"19090"\s*$', readiness):
+        fail(
+            "Node-agent dual probe port mismatch",
+            "dual listeners must probe the HTTP admin port when it is enabled",
+        )
+    if "FERRUM_ADMIN_HTTPS_PORT" not in resource or "19443" not in resource:
+        fail(
+            "Node-agent dual missing HTTPS port env",
+            "dual listeners must render FERRUM_ADMIN_HTTPS_PORT",
+        )
+    if "FERRUM_ADMIN_TLS_CLIENT_CA_BUNDLE_PATH" not in resource:
+        fail(
+            "Node-agent dual missing client CA mount env",
+            "optional mTLS clientCaKey must render CLIENT_CA_BUNDLE_PATH",
+        )
+    # Dual HTTP + mTLS HTTPS: simple Prometheus annotations cannot present a
+    # client certificate, so advertise the active plaintext HTTP listener.
+    if 'prometheus.io/scheme: "https"' in resource:
+        fail(
+            "Node-agent dual mTLS scrape prefers unusable HTTPS",
+            "dual listeners with clientCaKey must advertise http scheme/port",
+        )
+    if 'prometheus.io/scheme: "http"' not in resource:
+        fail(
+            "Node-agent dual mTLS scrape scheme missing",
+            "dual mTLS metricsScrape must advertise http",
+        )
+    if 'prometheus.io/port: "19090"' not in resource:
+        fail(
+            "Node-agent dual mTLS scrape port mismatch",
+            "dual mTLS metricsScrape must advertise the HTTP admin port",
+        )
+    if 'prometheus.io/port: "19443"' in resource:
+        fail(
+            "Node-agent dual mTLS scrape still advertises HTTPS port",
+            "mTLS HTTPS must not be advertised via simple prometheus.io annotations",
+        )
+    print("mesh probe node-agent dual ok")
+
+
+def validate_node_agent_https_no_tls_rejected(
+    results_dir: Path, expectations: dict
+) -> None:
+    captures = expectations["captures"]
+    err_path = require_capture(results_dir, captures["node_agent_https_no_tls_err"])
+    err_text = err_path.read_text(encoding="utf-8")
+    if not err_text.strip():
+        fail(
+            "Node-agent HTTPS without TLS accepted",
+            "httpsPort without complete admin.tls must fail at render",
+        )
+    if "httpsPort" not in err_text and "TLS" not in err_text:
+        fail(
+            "Node-agent HTTPS-without-TLS rejection drift",
+            "stderr must mention httpsPort/TLS fail-closed guidance",
+        )
+    print("mesh probe node-agent HTTPS without TLS rejected ok")
+
+
+def validate_node_agent_https_mtls_probe_policy(
+    results_dir: Path, expectations: dict
+) -> None:
+    captures = expectations["captures"]
+    disabled = require_capture(
+        results_dir, captures["node_agent_https_mtls_disabled"]
+    ).read_text(encoding="utf-8")
+    if "ferrum-mesh-node-agent" not in disabled:
+        fail(
+            "Node-agent HTTPS-only mTLS with disabled probes missing",
+            "disabling all computed probes must permit HTTPS-only mTLS",
+        )
+    if any(
+        probe in disabled
+        for probe in ("startupProbe:", "livenessProbe:", "readinessProbe:")
+    ):
+        fail(
+            "Node-agent HTTPS-only mTLS disabled probes still rendered",
+            "disabled probes must omit computed handlers",
+        )
+    overridden = require_capture(
+        results_dir, captures["node_agent_https_mtls_override"]
+    ).read_text(encoding="utf-8")
+    if overridden.count("/bin/true") < 3:
+        fail(
+            "Node-agent HTTPS-only mTLS override missing",
+            "safe override must replace every enabled probe (startup/liveness/readiness)",
+        )
+    if re.search(r"ferrum-edge\"?\s*\n\s*-\s*\"health\"", overridden) and "--tls" in overridden:
+        fail(
+            "Node-agent HTTPS-only mTLS override still uses computed TLS health",
+            "overrides must replace computed exec probes",
+        )
+    err_text = require_capture(
+        results_dir, captures["node_agent_https_mtls_unsafe_err"]
+    ).read_text(encoding="utf-8")
+    if not err_text.strip():
+        fail(
+            "Node-agent HTTPS-only mTLS unsafe probes accepted",
+            "enabled computed probes under HTTPS-only mTLS must fail closed",
+        )
+    if "client certificate" not in err_text and "clientCaKey" not in err_text:
+        fail(
+            "Node-agent HTTPS-only mTLS unsafe rejection drift",
+            "stderr must mention client certificate / clientCaKey guidance",
+        )
+    asymmetric = require_capture(
+        results_dir, captures["node_agent_https_mtls_asymmetric_err"]
+    ).read_text(encoding="utf-8")
+    if not asymmetric.strip():
+        fail(
+            "Node-agent HTTPS-only mTLS asymmetric override accepted",
+            "startup staying computed while liveness/readiness are overridden must fail closed",
+        )
+    if "client certificate" not in asymmetric and "clientCaKey" not in asymmetric:
+        fail(
+            "Node-agent HTTPS-only mTLS asymmetric rejection drift",
+            "stderr must mention client certificate / clientCaKey guidance",
+        )
+    scrape_err = require_capture(
+        results_dir, captures["node_agent_https_mtls_scrape_err"]
+    ).read_text(encoding="utf-8")
+    if not scrape_err.strip():
+        fail(
+            "Node-agent HTTPS-only mTLS scrape annotations accepted",
+            "metricsScrape.enabled with HTTPS-only mTLS must fail closed",
+        )
+    if "metricsScrape" not in scrape_err and "client certificate" not in scrape_err:
+        fail(
+            "Node-agent HTTPS-only mTLS scrape rejection drift",
+            "stderr must mention metricsScrape / client certificate guidance",
+        )
+    print("mesh probe node-agent HTTPS-only mTLS probe policy ok")
+
+
+def validate_node_agent_https_collision_policy(
+    results_dir: Path, expectations: dict
+) -> None:
+    captures = expectations["captures"]
+    allowed = require_capture(
+        results_dir, captures["node_agent_https_no_ambient_collision"]
+    ).read_text(encoding="utf-8")
+    if "FERRUM_ADMIN_HTTPS_PORT" not in allowed or "9443" not in allowed:
+        fail(
+            "Node-agent HTTPS without ambient TLS missing",
+            "inherited ambient HTTPS default must not block node-agent HTTPS",
+        )
+    err_text = require_capture(
+        results_dir, captures["node_agent_https_collision_err"]
+    ).read_text(encoding="utf-8")
+    if not err_text.strip():
+        fail(
+            "Ambient/node-agent HTTPS collision accepted",
+            "active ambient and node-agent HTTPS on the same port must fail",
+        )
+    if "FERRUM_ADMIN_HTTPS_PORT" not in err_text:
+        fail(
+            "Ambient/node-agent HTTPS collision rejection drift",
+            "stderr must mention FERRUM_ADMIN_HTTPS_PORT",
+        )
+    http_https = require_capture(
+        results_dir, captures["node_agent_http_https_collision_err"]
+    ).read_text(encoding="utf-8")
+    if not http_https.strip():
+        fail(
+            "Node-agent HTTP/HTTPS collision accepted",
+            "same-port node-agent HTTP+HTTPS must fail closed",
+        )
+    if "httpsPort" not in http_https and "admin.port" not in http_https:
+        fail(
+            "Node-agent HTTP/HTTPS collision rejection drift",
+            "stderr must mention admin.port / httpsPort",
+        )
+    ambient_http = require_capture(
+        results_dir, captures["ambient_http_node_https_collision_err"]
+    ).read_text(encoding="utf-8")
+    if not ambient_http.strip():
+        fail(
+            "Ambient HTTP / node-agent HTTPS collision accepted",
+            "cross-protocol hostNetwork collision must fail closed",
+        )
+    if "hostNetwork" not in ambient_http and "httpsPort" not in ambient_http:
+        fail(
+            "Ambient HTTP / node-agent HTTPS collision rejection drift",
+            "stderr must mention the cross-protocol collision",
+        )
+    ambient_https = require_capture(
+        results_dir, captures["ambient_https_node_http_collision_err"]
+    ).read_text(encoding="utf-8")
+    if not ambient_https.strip():
+        fail(
+            "Ambient HTTPS / node-agent HTTP collision accepted",
+            "cross-protocol hostNetwork collision must fail closed",
+        )
+    if "hostNetwork" not in ambient_https and "admin.port" not in ambient_https:
+        fail(
+            "Ambient HTTPS / node-agent HTTP collision rejection drift",
+            "stderr must mention the cross-protocol collision",
+        )
+    noncollision = require_capture(
+        results_dir, captures["admin_port_noncollision"]
+    ).read_text(encoding="utf-8")
+    if "ferrum-mesh-node-agent" not in noncollision or "ferrum-mesh-ambient" not in noncollision:
+        fail(
+            "Admin port noncollision control missing workloads",
+            "distinct active admin ports must still render ambient and node-agent",
+        )
+    print("mesh probe node-agent HTTPS collision policy ok")
+
+
 def validate_node_waypoint_ambient(results_dir: Path, expectations: dict) -> None:
     captures = expectations["captures"]
     rendered = require_capture(results_dir, captures["node_waypoint"]).read_text(
@@ -305,6 +616,12 @@ def main(argv: list[str]) -> int:
     validate_override(results_dir, expectations)
     validate_coupled_rejected(results_dir, expectations)
     validate_node_agent_port0(results_dir, expectations)
+    validate_node_agent_https_only(results_dir, expectations)
+    validate_node_agent_integer_port0_preserves_https_only(results_dir, expectations)
+    validate_node_agent_dual(results_dir, expectations)
+    validate_node_agent_https_no_tls_rejected(results_dir, expectations)
+    validate_node_agent_https_mtls_probe_policy(results_dir, expectations)
+    validate_node_agent_https_collision_policy(results_dir, expectations)
     validate_node_waypoint_ambient(results_dir, expectations)
     return 0
 

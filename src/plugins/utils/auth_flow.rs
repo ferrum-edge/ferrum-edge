@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
 use crate::config::types::Consumer;
@@ -104,6 +105,9 @@ pub enum VerifyOutcome {
         consumer: Option<Arc<Consumer>>,
         external_identity: Option<String>,
         external_identity_header: Option<String>,
+        /// Monotonic end of the credential's validated temporal validity.
+        /// Raw tokens and claims deliberately never cross this boundary.
+        credential_deadline: Option<tokio::time::Instant>,
     },
     NotApplicable,
     /// Credential was malformed, but the issue was only discovered during
@@ -131,12 +135,68 @@ impl VerifyOutcome {
             consumer,
             external_identity,
             external_identity_header,
+            credential_deadline: None,
         }
     }
 
     pub fn consumer(consumer: Arc<Consumer>) -> Self {
         Self::success(Some(consumer), None, None)
     }
+
+    /// Attach the authoritative credential deadline after provider validation.
+    pub fn with_credential_deadline(mut self, deadline: Option<tokio::time::Instant>) -> Self {
+        if let Self::Success {
+            credential_deadline,
+            ..
+        } = &mut self
+        {
+            *credential_deadline = deadline;
+        }
+        self
+    }
+}
+
+/// Convert a validated Unix expiry plus its validation leeway to a monotonic
+/// deadline. A wall-clock step after authentication cannot extend the result.
+pub fn credential_deadline_from_unix_seconds(
+    expires_at_unix: i64,
+    leeway_seconds: u64,
+) -> tokio::time::Instant {
+    let now_mono = tokio::time::Instant::now();
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(u64::MAX);
+    credential_deadline_from_unix_seconds_at(expires_at_unix, leeway_seconds, now_unix, now_mono)
+}
+
+fn credential_deadline_from_unix_seconds_at(
+    expires_at_unix: i64,
+    leeway_seconds: u64,
+    now_unix: u64,
+    now_mono: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let valid_until = expires_at_unix
+        .checked_add(i64::try_from(leeway_seconds).unwrap_or(i64::MAX))
+        .unwrap_or(i64::MAX);
+    let Ok(valid_until) = u64::try_from(valid_until) else {
+        return now_mono;
+    };
+    let remaining = valid_until.saturating_sub(now_unix);
+    now_mono
+        .checked_add(Duration::from_secs(remaining))
+        .unwrap_or(now_mono)
+}
+
+/// Extract an authoritative numeric `exp` from already-validated claims.
+pub fn credential_deadline_from_claims(
+    claims: &serde_json::Value,
+    leeway_seconds: u64,
+) -> Option<tokio::time::Instant> {
+    let exp = claims
+        .get("exp")
+        .and_then(|value| value.as_i64().or_else(|| value.as_u64()?.try_into().ok()))?;
+    Some(credential_deadline_from_unix_seconds(exp, leeway_seconds))
 }
 
 macro_rules! impl_auth_plugin {
@@ -277,6 +337,7 @@ pub fn commit_authentication_attempt(
         consumer,
         external_identity,
         external_identity_header,
+        credential_deadline,
     } = outcome
     else {
         return match outcome {
@@ -335,6 +396,7 @@ pub fn commit_authentication_attempt(
         if ctx.auth_method.is_none() {
             ctx.auth_method = Some(auth_method);
         }
+        ctx.credential_deadline_at = credential_deadline;
         attempt.commit_principal_state(ctx);
     }
 
@@ -357,6 +419,7 @@ pub fn authentication_attempt_can_commit(
         consumer,
         external_identity,
         external_identity_header,
+        ..
     } = outcome
     else {
         return false;
@@ -444,8 +507,9 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthMechanism, ExtractedCredential, VerifyOutcome, constant_time_eq, run_auth,
-        run_auth_external_identity,
+        AuthMechanism, AuthenticationAttempt, ExtractedCredential, VerifyOutcome,
+        commit_authentication_attempt, constant_time_eq, credential_deadline_from_unix_seconds_at,
+        run_auth, run_auth_external_identity,
     };
     use crate::config::types::{Consumer, default_namespace};
     use crate::consumer_index::ConsumerIndex;
@@ -454,6 +518,7 @@ mod tests {
     use chrono::Utc;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[derive(Clone)]
     struct FakeMechanism {
@@ -534,6 +599,7 @@ mod tests {
                 consumer: Some(Arc::clone(&consumer)),
                 external_identity: None,
                 external_identity_header: None,
+                credential_deadline: None,
             },
         };
         let mut ctx = test_ctx();
@@ -559,6 +625,7 @@ mod tests {
                 consumer: None,
                 external_identity: Some("alice@example.com".to_string()),
                 external_identity_header: None,
+                credential_deadline: None,
             },
         };
         let mut ctx = test_ctx();
@@ -587,6 +654,7 @@ mod tests {
                 consumer: Some(Arc::clone(&consumer)),
                 external_identity: Some("alice@example.com".to_string()),
                 external_identity_header: Some("Alice Example".to_string()),
+                credential_deadline: None,
             },
         };
         let mut ctx = test_ctx();
@@ -620,6 +688,7 @@ mod tests {
                 consumer: Some(Arc::clone(&consumer)),
                 external_identity: None,
                 external_identity_header: None,
+                credential_deadline: None,
             },
         };
         let mut ctx = test_ctx();
@@ -638,6 +707,7 @@ mod tests {
                 consumer: None,
                 external_identity: Some("alice@example.com".to_string()),
                 external_identity_header: None,
+                credential_deadline: None,
             },
         };
         let mut ctx = test_ctx();
@@ -684,6 +754,7 @@ mod tests {
                 consumer: None,
                 external_identity: None,
                 external_identity_header: None,
+                credential_deadline: None,
             },
         };
         let mut ctx = test_ctx();
@@ -703,6 +774,7 @@ mod tests {
                 consumer: None,
                 external_identity: Some("   \t".to_string()),
                 external_identity_header: Some(" \n".to_string()),
+                credential_deadline: None,
             },
         };
         let mut ctx = test_ctx();
@@ -754,6 +826,41 @@ mod tests {
         assert!(constant_time_eq(b"abc123", b"abc123"));
         assert!(!constant_time_eq(b"abc123", b"abc124"));
         assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
+    #[test]
+    fn credential_deadline_uses_exact_validated_expiry_and_leeway_boundary() {
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            credential_deadline_from_unix_seconds_at(1_000, 0, 1_000, now),
+            now
+        );
+        assert_eq!(
+            credential_deadline_from_unix_seconds_at(995, 5, 1_000, now),
+            now
+        );
+        assert_eq!(
+            credential_deadline_from_unix_seconds_at(1_000, 5, 1_000, now),
+            now + Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn accepted_authentication_commits_only_the_monotonic_deadline() {
+        let mut ctx = test_ctx();
+        let consumer = Arc::new(test_consumer());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let committed = commit_authentication_attempt(
+            &mut ctx,
+            AuthenticationAttempt::new(),
+            VerifyOutcome::consumer(consumer).with_credential_deadline(Some(deadline)),
+            "jwt_auth",
+            false,
+        )
+        .expect("validated success should commit");
+        assert!(committed);
+        assert_eq!(ctx.credential_deadline_at, Some(deadline));
+        assert!(ctx.metadata.values().all(|value| !value.contains("token")));
     }
 
     fn test_ctx() -> RequestContext {

@@ -557,6 +557,28 @@ pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
     }
 }
 
+/// Status, body, and transaction-log rejection phase for an H3 WebSocket
+/// upgrade refused because its session deadline already elapsed. Mirrors the
+/// H1/H2 mapping in `handle_websocket_request_authenticated` exactly so the
+/// three frontends stay auditable under the same phase names. The bodies are
+/// fixed constants: no claim, token, identity, or deadline value is echoed.
+fn h3_websocket_deadline_rejection(
+    reason: crate::proxy::WsTerminationReason,
+) -> (StatusCode, &'static str, &'static str) {
+    match reason {
+        crate::proxy::WsTerminationReason::CredentialExpired => (
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"Credential expired before WebSocket upgrade"}"#,
+            "websocket_credential_expired",
+        ),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"WebSocket maximum lifetime elapsed before upgrade"}"#,
+            "websocket_max_lifetime",
+        ),
+    }
+}
+
 /// H3 WebSocket entry point. Called from `handle_h3_request` when
 /// `HttpFlavor::WebSocket` is detected on an HTTP/3 request and
 /// `FERRUM_HTTP3_WEBSOCKET_ENABLED` is true.
@@ -636,6 +658,41 @@ pub(crate) async fn handle_h3_websocket(
         "H3 WebSocket (RFC 9220) upgrade request received"
     );
     let mut ctx = ctx;
+    let ws_session_deadline = crate::proxy::effective_websocket_session_deadline(
+        &ctx,
+        state.env_config.websocket_max_lifetime_seconds,
+    );
+    if ws_session_deadline.at <= tokio::time::Instant::now() {
+        let (status, body, phase) = h3_websocket_deadline_rejection(ws_session_deadline.reason);
+        // Same rejection record the H1/H2 path emits, so a credential-expiry or
+        // maximum-lifetime refusal is auditable on every frontend instead of
+        // only on H1 Upgrade / H2 Extended CONNECT.
+        crate::proxy::log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            status.as_u16(),
+            start_time,
+            phase,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
+        send_h3_error_body(
+            &mut stream,
+            status,
+            body,
+            &initial_response_header_policy_plugins,
+        )
+        .await;
+        crate::proxy::record_request(&state, status.as_u16());
+        release_h3_ws_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
+        return Ok(());
+    }
 
     // ── Connection admission ─────────────────────────────────────────
     let ws_connection_permit = match crate::proxy::try_acquire_websocket_connection_permit(
@@ -731,9 +788,13 @@ pub(crate) async fn handle_h3_websocket(
     // setup failures when `retry_on_connect_failure` is enabled, and rotate
     // upstream targets through the same load-balancer cache. Backend-side
     // upgrade rejections are post-wire and must not be replayed.
+    // Same admission point as H1/H2: a skipped size-limit instance must not
+    // constrain either framer (issue #3734). Memoized on the upgrade context.
+    let ws_size_limit_plugins =
+        crate::proxy::collect_websocket_size_limit_plugins(&plugins, &mut ctx);
     let ws_size_limits = crate::proxy::EffectiveWsSizeLimits::from_plugins(
         state.max_websocket_frame_size_bytes,
-        &plugins,
+        &ws_size_limit_plugins,
     );
     let mut current_backend_url = backend_url;
     // The target selection bound this request to, retained across the retry
@@ -1221,6 +1282,31 @@ pub(crate) async fn handle_h3_websocket(
         cb.record_success(ws_cb_probe_slot_available);
     }
 
+    if ws_session_deadline.at <= tokio::time::Instant::now() {
+        let (status, body, phase) = h3_websocket_deadline_rejection(ws_session_deadline.reason);
+        // The breaker already recorded this hop's success above, so only the
+        // rejection record and the request counter are owed here.
+        crate::proxy::log_rejected_request_with_path(
+            &plugins,
+            &ctx,
+            status.as_u16(),
+            start_time,
+            phase,
+            plugin_execution_ns,
+            Some(&original_request_path),
+        )
+        .await;
+        send_h3_error_body(
+            &mut stream,
+            status,
+            body,
+            &initial_response_header_policy_plugins,
+        )
+        .await;
+        crate::proxy::record_request(&state, status.as_u16());
+        return Ok(());
+    }
+
     // Capture the LB connection guard NOW — before the 200 is sent — so
     // a panic anywhere below still releases the per-target connection
     // count. The guard is moved into the session task below.
@@ -1456,13 +1542,15 @@ pub(crate) async fn handle_h3_websocket(
     }));
 
     // ── Collect parsed-relay and disconnect plugin lists ────────────
-    let (ws_framing_plugins, ws_frame_plugins) =
-        crate::proxy::collect_websocket_relay_plugins(&plugins, requires_websocket_framing, &ctx);
-    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = plugins
-        .iter()
-        .filter(|p| p.requires_ws_disconnect_hooks())
-        .cloned()
-        .collect();
+    let (ws_framing_plugins, ws_frame_plugins) = crate::proxy::collect_websocket_relay_plugins(
+        &plugins,
+        requires_websocket_framing,
+        &mut ctx,
+    );
+    // Same per-instance admission decision as the frame path, so an instance
+    // skipped for frames is skipped for disconnect on H3 Extended CONNECT too.
+    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> =
+        crate::proxy::collect_websocket_disconnect_plugins(&plugins, &mut ctx);
 
     let proxy_id_for_relay = proxy.id.clone();
     // Allocate before building session_meta so framed disconnect hooks receive
@@ -1510,6 +1598,9 @@ pub(crate) async fn handle_h3_websocket(
         // tungstenite's permissive accept-unmasked mode can normalize them.
         true,
         ws_idle_tracker,
+        ws_session_deadline,
+        state.health_check_shutdown_rx.clone(),
+        Arc::clone(&state.overload),
         crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
         &adaptive_buf,
     )

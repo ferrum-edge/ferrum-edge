@@ -806,6 +806,7 @@ jobs:
               integration::mesh_telemetry_k8s_provider_lookup_tests
               integration::mesh_telemetry_tracing_tests
               integration::mesh_bpf_metrics_scrape_tests
+              integration::node_agent_topology_metrics_tests
               integration::mesh_federation_poller_tests
               integration::mesh_file_source_tests
               integration::mesh_multicluster_discovery_tests
@@ -819,6 +820,7 @@ jobs:
               integration::mesh_peer_auth_live_reload_tests
               integration::mesh_k8s_pod_discovery_tests
               integration::mesh_hbone_tests
+              integration::udp_placement_migration_tests
               integration::cni_tests
               integration::injector_admission_tests
           - shard: mesh-protocols
@@ -855,6 +857,7 @@ jobs:
               integration::grpc_proxy_tests
               integration::policy_path_canonicalization_tests
               integration::scripted_backend_smoke_tests
+              integration::service_discovery_endpointslice_lifecycle_tests
               integration::dtls_integration_tests
               integration::dtls_accept_isolation_tests
               integration::backend_mtls_tests
@@ -866,6 +869,7 @@ jobs:
               integration::udp_fault_injection_tests
               integration::gateway_api_udproute_datapath_tests
               integration::gateway_hbone_pool_tests
+              integration::gateway_multi_cert_sni_tests
               integration::mesh_grpc_transport_tests
               integration::gateway_svid_identity_tests
               integration::workload_api_jwt_svid_tests
@@ -2191,6 +2195,17 @@ jobs:
             --set image.repository=example/ferrum-edge \
             --set image.tag=udp-cleanup \
             > "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-cleanup-rendered.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --skip-schema-validation \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/ambient-without-durable-registry.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/ambient-without-durable-registry.err"; then
+            echo "::error title=Ambient UDP guard is ephemeral::ambient topology must require the node-agent registry hostPath even while capture is disabled"
+            exit 1
+          fi
+          grep -F 'ambient topology requires nodeAgent.enabled=true' \
+            "$RUNNER_TEMP/ferrum-helm-results/ambient-without-durable-registry.err"
           registry_refs="$(grep -c 'name: node-waypoint-pod-registry' "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-cleanup-rendered.yaml")"
           if [ "$registry_refs" -lt 4 ]; then
             echo "::error title=Ambient disabled cleanup registry missing::expected registry volume and mount in both Ambient and node-agent DaemonSets"
@@ -2229,6 +2244,133 @@ jobs:
             echo "::error title=Disabled Ambient UDP capture was armed in iptables mode::lifecycle wiring must not render the producer enable flag"
             exit 1
           fi
+          # Ambient UDP placement migration (#3703): every pre-contract
+          # upgrade is rejected before the DaemonSet renders. The old release
+          # may own either placement, so an absent contract cannot safely infer
+          # even an apparently unchanged pod-netns or disabled target.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-precontract-pod.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-precontract-pod.err"; then
+            echo "::error title=Ambiguous pre-contract UDP placement rendered::a cleanup adoption release must establish durable ownership"
+            exit 1
+          fi
+          grep -F 'pre-contract Ambient UDP upgrade requires an explicit cleanup phase' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-precontract-pod.err"
+          # Helm and the runtime intentionally share one exact lowercase phase
+          # contract. The chart must not normalize a spelling that the process
+          # will reject only after rollout.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=CLEANUP \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-case \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=disabled \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=pod-netns \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-phase-case.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-phase-case.err"; then
+            echo "::error title=UDP migration phase normalized by Helm::chart and runtime admission must reject the same non-lowercase spelling"
+            exit 1
+          fi
+          grep -F 'FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE must be stable, cleanup, or finalize' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-phase-case.err"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE= \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-empty-phase.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-empty-phase.err"; then
+            echo "::error title=Empty UDP migration phase defaulted by Helm::an explicitly empty setting must be rejected like the runtime rejects it"
+            exit 1
+          fi
+          grep -F 'FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE must be stable, cleanup, or finalize' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-empty-phase.err"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string 'ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION= ci-case ' \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=disabled \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=pod-netns \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-generation-space.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-generation-space.err"; then
+            echo "::error title=UDP migration generation trimmed by Helm::generation bytes must match the runtime's exact durable marker value"
+            exit 1
+          fi
+          grep -F 'ambient UDP migration generation must be 1..=64 ASCII' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-generation-space.err"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-case \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=Pod-Netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=Host-Netns \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-tuple-case.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-tuple-case.err"; then
+            echo "::error title=UDP migration tuple normalized by Helm::chart and runtime admission must reject the same non-lowercase placement spelling"
+            exit 1
+          fi
+          grep -F 'ambient UDP migration FROM must be pod-netns, host-netns, or disabled' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-tuple-case.err"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-direct.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-direct.err"; then
+            echo "::error title=Unsafe Ambient UDP placement flip rendered::host placement must require an explicit cleanup generation"
+            exit 1
+          fi
+          grep -F 'pre-contract Ambient UDP upgrade requires an explicit cleanup phase' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-direct.err"
+          # The explicit pod->host cleanup phase renders no weaker privilege
+          # shape: it keeps setns access and passes the same generation to both
+          # node-local DaemonSets for the durable registry-relist acknowledgement.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-pod-host \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-pod-host-cleanup.yaml"
+          grep -Fq -- '- SYS_ADMIN' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-pod-host-cleanup.yaml"
+          grep -Fq -- '- SYS_PTRACE' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-pod-host-cleanup.yaml"
+          if [ "$(grep -c 'name: FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-pod-host-cleanup.yaml")" -lt 2 ]; then
+            echo "::error title=UDP migration generation not shared::ambient and node-agent must receive one generation"
+            exit 1
+          fi
+          # Reverse and enabled/disabled cleanup phases are renderable only as
+          # explicit transitions. Finalize without the installed matching
+          # cleanup ConfigMap is rejected, covering a stale/missing Helm ack.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-host-pod \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=host-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=pod-netns \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-host-pod-cleanup.yaml"
+          grep -Fq 'phase: "cleanup"' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-host-pod-cleanup.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-disable \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=disabled \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-disable-cleanup.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum --is-upgrade \
+            --set ambient.enabled=true --set nodeAgent.enabled=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=finalize \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=ci-pod-host \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns \
+            > "$RUNNER_TEMP/ferrum-helm-results/udp-placement-finalize.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/udp-placement-finalize.err"; then
+            echo "::error title=UDP finalize without cleanup contract rendered::final placement must require installed cleanup evidence"
+            exit 1
+          fi
+          grep -F 'requires the installed cleanup placement contract' "$RUNNER_TEMP/ferrum-helm-results/udp-placement-finalize.err"
           # CNI install lifecycle (#3609): the chained conflist makes the
           # node-agent a node-wide pod-creation dependency, so the chart must
           # render an ownership-stamped install, an in-pod rollback watcher,
@@ -2543,6 +2685,225 @@ jobs:
             --set nodeAgent.admin.enabled=true \
             --set-string nodeAgent.admin.port=0 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-port0.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-only.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.admin.metricsScrape.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-dual.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-no-tls.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-no-tls.err"; then
+            echo "::error title=Node-agent HTTPS without TLS accepted::httpsPort without admin.tls must fail closed"
+            exit 1
+          fi
+          # HTTPS-only mTLS is allowed when every computed probe is disabled.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.probes.startup.enabled=false \
+            --set nodeAgent.probes.liveness.enabled=false \
+            --set nodeAgent.probes.readiness.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-disabled.yaml"
+          # HTTPS-only mTLS is allowed when every enabled computed probe is overridden.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.probes.startup.override.exec.command[0]=/bin/true \
+            --set nodeAgent.probes.liveness.override.exec.command[0]=/bin/true \
+            --set nodeAgent.probes.readiness.override.exec.command[0]=/bin/true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-override.yaml"
+          # HTTPS-only mTLS with an enabled computed probe must still fail closed.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-unsafe.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-unsafe.err"; then
+            echo "::error title=Node-agent HTTPS-only mTLS computed probes accepted::unsafe computed probes must fail closed"
+            exit 1
+          fi
+          # Asymmetric: startup stays computed while liveness/readiness are overridden → fail.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.probes.liveness.override.exec.command[0]=/bin/true \
+            --set nodeAgent.probes.readiness.override.exec.command[0]=/bin/true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-asymmetric.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-asymmetric.err"; then
+            echo "::error title=Node-agent HTTPS-only mTLS asymmetric probe override accepted::startup must be overridden or disabled independently"
+            exit 1
+          fi
+          # HTTPS-only mTLS cannot be advertised via simple Prometheus annotations.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.probes.startup.enabled=false \
+            --set nodeAgent.probes.liveness.enabled=false \
+            --set nodeAgent.probes.readiness.enabled=false \
+            --set nodeAgent.admin.metricsScrape.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-scrape.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-scrape.err"; then
+            echo "::error title=Node-agent HTTPS-only mTLS scrape annotations accepted::metricsScrape with mTLS must fail closed"
+            exit 1
+          fi
+          # Integer --set port=0 must preserve zero (Sprig `default` treats 0 as
+          # empty and would silently re-enable plaintext 19090).
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set nodeAgent.admin.port=0 \
+            --set nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-only-int-port0.yaml"
+          # Integer port=0 must not bypass HTTPS-only mTLS probe fail-closed.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set nodeAgent.admin.port=0 \
+            --set nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-int-port0.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-int-port0.err"; then
+            echo "::error title=Integer port=0 bypassed HTTPS-only mTLS guard::--set nodeAgent.admin.port=0 must keep HTTPS-only mTLS fail-closed"
+            exit 1
+          fi
+          # Node-agent HTTP == HTTPS same-port collision when both would bind.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19443 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-http-https-collision.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-http-https-collision.err"; then
+            echo "::error title=Node-agent HTTP/HTTPS collision accepted::same-port HTTP+HTTPS must fail closed"
+            exit 1
+          fi
+          # Ambient HTTP vs node-agent HTTPS cross-protocol collision.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19443 \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-ambient-http-node-https-collision.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-ambient-http-node-https-collision.err"; then
+            echo "::error title=Ambient HTTP / node-agent HTTPS collision accepted::cross-protocol hostNetwork collision must fail closed"
+            exit 1
+          fi
+          # Ambient HTTPS vs node-agent HTTP cross-protocol collision.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set-string ambient.env.FERRUM_ADMIN_HTTPS_PORT=19090 \
+            --set-string ambient.env.FERRUM_ADMIN_TLS_CERT_PATH=/etc/ferrum/tls/admin/tls.crt \
+            --set-string ambient.env.FERRUM_ADMIN_TLS_KEY_PATH=/etc/ferrum/tls/admin/tls.key \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-ambient-https-node-http-collision.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-ambient-https-node-http-collision.err"; then
+            echo "::error title=Ambient HTTPS / node-agent HTTP collision accepted::cross-protocol hostNetwork collision must fail closed"
+            exit 1
+          fi
+          # Noncollision control: distinct active ports must still render.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set-string ambient.env.FERRUM_ADMIN_HTTPS_PORT=19444 \
+            --set-string ambient.env.FERRUM_ADMIN_TLS_CERT_PATH=/etc/ferrum/tls/admin/tls.crt \
+            --set-string ambient.env.FERRUM_ADMIN_TLS_KEY_PATH=/etc/ferrum/tls/admin/tls.key \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-admin-port-noncollision.yaml"
+          # Inherited ambient HTTPS default without TLS must not collide with node-agent HTTPS.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=9443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-no-ambient-collision.yaml"
+          # Genuine active ambient+node-agent HTTPS collision must still fail.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set-string ambient.env.FERRUM_ADMIN_HTTPS_PORT=19443 \
+            --set-string ambient.env.FERRUM_ADMIN_TLS_CERT_PATH=/etc/ferrum/tls/admin/tls.crt \
+            --set-string ambient.env.FERRUM_ADMIN_TLS_KEY_PATH=/etc/ferrum/tls/admin/tls.key \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-collision.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-collision.err"; then
+            echo "::error title=Ambient/node-agent HTTPS collision accepted::active HTTPS port collision must fail closed"
+            exit 1
+          fi
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set ambient.enabled=true \
             --set ambient.captureMode=ebpf \
@@ -3594,6 +3955,99 @@ jobs:
           for manifest in charts/ferrum-gateway/examples/migrate-job-*.yaml; do
             kubectl apply --dry-run=server -f "$manifest" >/dev/null
           done
+
+      - name: Validate Ambient UDP placement upgrade contract
+        run: |
+          set -euo pipefail
+          namespace=ferrum-udp-contract
+          release=ferrum-udp-contract
+          chart=./charts/ferrum-mesh
+          kubectl create namespace "$namespace"
+          helm install "$release" "$chart" -n "$namespace"
+          apply_contract() {
+            kubectl -n "$namespace" create configmap "ferrum-mesh-udp-placement-${release}" \
+              --from-literal=target="$1" --from-literal=phase="$2" \
+              --from-literal=generation="$3" --from-literal=from="$4" \
+              --from-literal=to="$5" --dry-run=client -o yaml | kubectl apply -f -
+            kubectl -n "$namespace" label --overwrite \
+              configmap/"ferrum-mesh-udp-placement-${release}" \
+              app.kubernetes.io/managed-by=Helm
+            kubectl -n "$namespace" annotate --overwrite \
+              configmap/"ferrum-mesh-udp-placement-${release}" \
+              meta.helm.sh/release-name="$release" \
+              meta.helm.sh/release-namespace="$namespace"
+          }
+          render_upgrade() {
+            helm upgrade "$release" "$chart" -n "$namespace" --dry-run=server \
+              --set ambient.enabled=true --set nodeAgent.enabled=true "$@"
+          }
+          apply_contract pod-netns stable '' '' ''
+          if render_upgrade \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true; then
+            echo "::error title=Direct UDP placement upgrade admitted::installed pod placement must reject a one-step host rollout"
+            exit 1
+          fi
+          cleanup_args=(
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=kind-pod-host
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns
+          )
+          render_upgrade "${cleanup_args[@]}" >/dev/null
+          apply_contract host-netns cleanup kind-pod-host pod-netns host-netns
+          render_upgrade "${cleanup_args[@]}" >/dev/null
+          if render_upgrade "${cleanup_args[@]/kind-pod-host/stale-generation}"; then
+            echo "::error title=Stale UDP cleanup generation admitted::an interrupted cleanup must resume only its installed tuple"
+            exit 1
+          fi
+          if render_upgrade \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true; then
+            echo "::error title=UDP cleanup skipped::stable must not bypass an installed cleanup phase"
+            exit 1
+          fi
+          if render_upgrade \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=finalize \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=wrong \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns; then
+            echo "::error title=Stale UDP finalize admitted::finalize must match the installed cleanup tuple"
+            exit 1
+          fi
+          finalize_args=(
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=finalize
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=kind-pod-host
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=pod-netns
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=host-netns
+          )
+          render_upgrade "${finalize_args[@]}" >/dev/null
+          apply_contract host-netns finalize kind-pod-host pod-netns host-netns
+          render_upgrade \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=kind-host-pod \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=host-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=pod-netns >/dev/null
+          apply_contract host-netns stable '' '' ''
+          render_upgrade \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=kind-disable \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=host-netns \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=disabled >/dev/null
+          apply_contract disabled stable '' '' ''
+          render_upgrade \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_PHASE=cleanup \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_GENERATION=kind-enable \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_FROM=disabled \
+            --set-string ambient.env.FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO=pod-netns >/dev/null
 
       - name: Default install renders no unusable control plane
         run: |

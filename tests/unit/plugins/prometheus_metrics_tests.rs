@@ -27,6 +27,9 @@ fn make_summary(
     backend_ms: f64,
 ) -> TransactionSummary {
     TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
@@ -292,10 +295,10 @@ fn test_registry_records_websocket_completion_metrics() {
 
     let output = registry.render_uncached();
     assert!(output.contains(
-        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="success",direction="unknown",io_side="unknown",error_class="none"} 1"#
+        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="normal_peer_close"} 1"#
     ));
     assert!(output.contains(
-        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset"} 1"#
+        r#"ferrum_websocket_sessions_total{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset",termination_reason="relay_error"} 1"#
     ));
     assert!(output.contains(
         r#"ferrum_websocket_bytes_total{proxy_id="ws-metrics",direction="client_to_backend"} 60"#
@@ -304,8 +307,36 @@ fn test_registry_records_websocket_completion_metrics() {
         r#"ferrum_websocket_frames_total{proxy_id="ws-metrics",direction="backend_to_client"} 10"#
     ));
     assert!(output.contains(
-        r#"ferrum_websocket_session_duration_ms_count{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset"} 1"#
+        r#"ferrum_websocket_session_duration_ms_count{proxy_id="ws-metrics",result="error",direction="backend_to_client",io_side="read",error_class="connection_reset",termination_reason="relay_error"} 1"#
     ));
+}
+
+/// A gateway-initiated policy close (credential expiry, absolute lifetime,
+/// graceful drain) is not a relay fault: it must stay on `result="success"` /
+/// `error_class="none"` and be identified only by `termination_reason`, so
+/// `result="error"` keeps meaning a real transport or hook failure.
+#[test]
+fn test_registry_records_policy_websocket_closes_as_non_error_sessions() {
+    let registry = MetricsRegistry::new();
+    for reason in ["credential_expired", "max_lifetime", "drain"] {
+        let mut policy_close = make_ws_summary("ws-policy");
+        policy_close.metadata.insert(
+            "websocket.termination_reason".to_string(),
+            reason.to_string(),
+        );
+        registry.record_ws_session(&policy_close);
+    }
+
+    let output = registry.render_uncached();
+    for reason in ["credential_expired", "max_lifetime", "drain"] {
+        assert!(
+            output.contains(&format!(
+                r#"ferrum_websocket_sessions_total{{proxy_id="ws-policy",result="success",direction="unknown",io_side="unknown",error_class="none",termination_reason="{reason}"}} 1"#
+            )),
+            "policy close {reason} must not be counted as a failed session"
+        );
+    }
+    assert!(!output.contains(r#"proxy_id="ws-policy",result="error""#));
 }
 
 #[tokio::test]
@@ -570,6 +601,14 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
     assert!(output.contains("# TYPE ferrum_node_agent_capture_state gauge"));
     assert!(output.contains("ferrum_node_agent_capture_state{state=\"starting\"} 1"));
     assert!(output.contains("ferrum_node_agent_capture_state{state=\"ready\"} 0"));
+    assert!(output.contains(
+        "ferrum_node_agent_ingress_interface_topology{state=\"disabled\",reason=\"disabled\"} 1"
+    ));
+    assert!(output.contains("ferrum_node_agent_ingress_interface_configured_interfaces 0"));
+    assert!(output.contains("ferrum_node_agent_ingress_interface_expected_interfaces 0"));
+    assert!(
+        output.contains("ferrum_node_agent_ingress_interface_family_required{family=\"ipv4\"} 0")
+    );
     // Nominal topology: gauge emitted as 0 with reason=none so dashboards
     // can always pin the expected value.
     assert!(output.contains("# TYPE ferrum_mesh_node_topology_degraded gauge"));
@@ -1111,6 +1150,49 @@ fn request_mirror_lifecycle_counters_carry_namespace_label_when_configured() {
     registry.record_request_mirror_dispatched();
     let output = registry.render_uncached();
     assert!(output.contains(r#"ferrum_request_mirror_dispatched_total{namespace="staging"} 1"#));
+}
+
+#[test]
+fn service_discovery_cursor_and_rejection_counters_are_label_safe_and_rendered() {
+    let registry = MetricsRegistry::new();
+    registry.record_service_discovery_provider_normalization_rejected();
+    registry.record_service_discovery_provider_normalization_rejected();
+    registry.record_service_discovery_shared_admission_rejected();
+    registry.record_service_discovery_cursor_advance();
+    registry.record_service_discovery_cursor_advance();
+    registry.record_service_discovery_cursor_advance();
+    registry.record_service_discovery_cursor_rollback();
+    registry.record_service_discovery_response_oversized();
+    registry.record_service_discovery_body_budget_rejected();
+    registry.record_service_discovery_malformed_envelope();
+
+    let output = registry.render_uncached();
+    assert!(output.contains("ferrum_service_discovery_provider_normalization_rejected_total 2"));
+    assert!(output.contains("ferrum_service_discovery_shared_admission_rejected_total 1"));
+    assert!(output.contains("ferrum_service_discovery_cursor_advance_total 3"));
+    assert!(output.contains("ferrum_service_discovery_cursor_rollback_total 1"));
+    assert!(output.contains("ferrum_service_discovery_response_oversized_total 1"));
+    assert!(output.contains("ferrum_service_discovery_body_budget_rejected_total 1"));
+    assert!(output.contains("ferrum_service_discovery_malformed_envelope_total 1"));
+    // No unbounded dimensions: scope the check to these families because unrelated
+    // registry metrics legitimately carry labels with the same names.
+    for line in output
+        .lines()
+        .filter(|line| line.starts_with("ferrum_service_discovery_"))
+    {
+        assert!(
+            !line.contains("reason="),
+            "service-discovery metric exposed a raw rejection reason: {line}"
+        );
+        assert!(
+            !line.contains("index="),
+            "service-discovery metric exposed a raw cursor index: {line}"
+        );
+        assert!(
+            !line.contains("upstream="),
+            "service-discovery metric exposed an upstream identity: {line}"
+        );
+    }
 }
 
 #[test]

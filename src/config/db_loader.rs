@@ -1865,7 +1865,10 @@ impl DatabaseStore {
         use crate::config::migrations::MigrationRunner;
 
         let runner = MigrationRunner::new(self.pool(), self.db_type.clone());
-        let applied = runner.run_pending().await?;
+        let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
+        let applied = runner
+            .run_pending_with_plugin_history(&plugin_migrations)
+            .await?;
 
         if applied.is_empty() {
             info!("Database schema is up to date");
@@ -9836,9 +9839,6 @@ impl DatabaseBackend for DatabaseStore {
         &self,
         plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
     ) -> Result<Vec<crate::config::migrations::PendingPluginMigration>, anyhow::Error> {
-        if plugin_migrations.is_empty() {
-            return Ok(Vec::new());
-        }
         let runner =
             crate::config::migrations::MigrationRunner::new(self.pool(), self.db_type.clone());
         let status = runner.plugin_status(plugin_migrations).await?;
@@ -9849,9 +9849,6 @@ impl DatabaseBackend for DatabaseStore {
         &self,
         plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
     ) -> Result<Vec<crate::config::migrations::PluginMigrationRecord>, anyhow::Error> {
-        if plugin_migrations.is_empty() {
-            return Ok(Vec::new());
-        }
         let runner =
             crate::config::migrations::MigrationRunner::new(self.pool(), self.db_type.clone());
         runner.run_plugin_pending(plugin_migrations).await

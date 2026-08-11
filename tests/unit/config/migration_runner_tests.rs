@@ -1,6 +1,12 @@
 //! Tests for database migration runner
 
-use ferrum_edge::config::migrations::MigrationRunner;
+use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::config::migrations::{
+    AppliedMigrationHistory, AppliedMigrationHistoryEntry, CustomPluginMigration,
+    DeclaredMigrationHistory, DeclaredMigrationHistoryEntry, MigrationHistoryIntegrityError,
+    MigrationHistoryIntegrityKind, MigrationHistoryIntegrityReason, MigrationHistoryNamespace,
+    MigrationRunner, validate_migration_history_integrity,
+};
 use sqlx::Row;
 
 /// Create a single-connection SQLite in-memory pool for testing.
@@ -474,6 +480,481 @@ async fn test_v001_checksum_is_content_derived_sha256() {
     assert!(checksum.starts_with("sha256:"));
     assert_eq!(checksum.len(), "sha256:".len() + 64);
     assert_ne!(checksum, "v001_initial_schema");
+}
+
+fn declared_history(
+    namespace: MigrationHistoryNamespace,
+    migrations: &[(i64, &str)],
+) -> DeclaredMigrationHistory {
+    DeclaredMigrationHistory {
+        namespace,
+        migrations: migrations
+            .iter()
+            .map(|(version, checksum)| DeclaredMigrationHistoryEntry {
+                version: *version,
+                checksum: (*checksum).to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn applied_history(
+    namespace: MigrationHistoryNamespace,
+    migrations: &[(i64, &str)],
+) -> AppliedMigrationHistory {
+    AppliedMigrationHistory {
+        namespace,
+        migrations: migrations
+            .iter()
+            .map(|(version, checksum)| AppliedMigrationHistoryEntry {
+                version: *version,
+                checksum: (*checksum).to_string(),
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn history_integrity_validation_is_shared_by_every_sql_adapter() {
+    let plugin_namespace = MigrationHistoryNamespace::CustomPlugin("audit_plugin".to_string());
+    let declarations = vec![
+        declared_history(
+            MigrationHistoryNamespace::Core,
+            &[(1, "core-1"), (2, "core-2")],
+        ),
+        declared_history(
+            plugin_namespace.clone(),
+            &[(3, "plugin-3"), (4, "plugin-4")],
+        ),
+    ];
+    let valid_prefix = vec![
+        applied_history(MigrationHistoryNamespace::Core, &[(1, "core-1")]),
+        applied_history(plugin_namespace.clone(), &[(3, "plugin-3")]),
+    ];
+
+    for backend in ["sqlite", "postgres", "mysql"] {
+        validate_migration_history_integrity(backend, &declarations, &valid_prefix)
+            .expect("a valid prefix with a pending suffix must remain valid");
+
+        for (namespace, version, stored_checksum) in [
+            (MigrationHistoryNamespace::Core, 1, "stored-core"),
+            (plugin_namespace.clone(), 3, "stored-plugin"),
+        ] {
+            let drift = vec![applied_history(
+                namespace.clone(),
+                &[(version, stored_checksum)],
+            )];
+            let error = validate_migration_history_integrity(backend, &declarations, &drift)
+                .expect_err("checksum drift must fail closed");
+            assert_eq!(error.backend, backend);
+            assert_eq!(error.namespace, namespace);
+            assert_eq!(
+                error.kind(),
+                MigrationHistoryIntegrityKind::ChecksumMismatch
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_history_integrity_rejects_unknown_missing_and_ambiguous_sequences() {
+    let plugin_namespace = MigrationHistoryNamespace::CustomPlugin("audit_plugin".to_string());
+    let declarations = vec![
+        declared_history(
+            MigrationHistoryNamespace::Core,
+            &[(1, "core-1"), (2, "core-2")],
+        ),
+        declared_history(
+            plugin_namespace.clone(),
+            &[(3, "plugin-3"), (4, "plugin-4")],
+        ),
+    ];
+
+    for history in [
+        applied_history(MigrationHistoryNamespace::Core, &[(99, "unknown")]),
+        applied_history(plugin_namespace.clone(), &[(99, "unknown")]),
+    ] {
+        let error = validate_migration_history_integrity("sqlite", &declarations, &[history])
+            .expect_err("an unknown applied version must fail closed");
+        assert_eq!(
+            error.kind(),
+            MigrationHistoryIntegrityKind::UnknownAppliedVersion
+        );
+    }
+
+    for history in [
+        applied_history(MigrationHistoryNamespace::Core, &[(2, "core-2")]),
+        applied_history(plugin_namespace.clone(), &[(4, "plugin-4")]),
+    ] {
+        let error = validate_migration_history_integrity("sqlite", &declarations, &[history])
+            .expect_err("a later applied version cannot hide a missing prefix entry");
+        assert_eq!(
+            error.kind(),
+            MigrationHistoryIntegrityKind::MissingAppliedVersion
+        );
+    }
+
+    let duplicate_core_version = vec![declared_history(
+        MigrationHistoryNamespace::Core,
+        &[(1, "first"), (1, "duplicate")],
+    )];
+    let error = validate_migration_history_integrity("sqlite", &duplicate_core_version, &[])
+        .expect_err("duplicate core declaration IDs must be rejected");
+    assert_eq!(
+        error.kind(),
+        MigrationHistoryIntegrityKind::DuplicateDeclaredVersion
+    );
+
+    let duplicate_plugin_namespace = vec![
+        declared_history(plugin_namespace.clone(), &[(1, "first")]),
+        declared_history(plugin_namespace, &[(2, "second")]),
+    ];
+    let error = validate_migration_history_integrity("sqlite", &duplicate_plugin_namespace, &[])
+        .expect_err("duplicate plugin namespace declarations must be rejected");
+    assert_eq!(
+        error.kind(),
+        MigrationHistoryIntegrityKind::DuplicateDeclaredNamespace
+    );
+
+    for (declaration, expected_kind) in [
+        (
+            declared_history(MigrationHistoryNamespace::Core, &[(0, "zero")]),
+            MigrationHistoryIntegrityKind::NonPositiveDeclaredVersion,
+        ),
+        (
+            declared_history(
+                MigrationHistoryNamespace::Core,
+                &[(i64::from(i32::MAX) + 1, "out-of-range")],
+            ),
+            MigrationHistoryIntegrityKind::DeclaredVersionOutOfRange,
+        ),
+        (
+            declared_history(
+                MigrationHistoryNamespace::Core,
+                &[(2, "second"), (1, "first")],
+            ),
+            MigrationHistoryIntegrityKind::UnorderedDeclaredVersions,
+        ),
+    ] {
+        let error = validate_migration_history_integrity("sqlite", &[declaration], &[])
+            .expect_err("invalid declaration ordering must fail closed");
+        assert_eq!(error.kind(), expected_kind);
+    }
+    assert_eq!(
+        MigrationHistoryIntegrityKind::DeclaredVersionOutOfRange.as_str(),
+        "declared_version_out_of_range"
+    );
+
+    let duplicate_applied = applied_history(
+        MigrationHistoryNamespace::Core,
+        &[(1, "core-1"), (1, "core-1")],
+    );
+    let error = validate_migration_history_integrity("sqlite", &declarations, &[duplicate_applied])
+        .expect_err("duplicate applied history rows must fail closed");
+    assert_eq!(
+        error.kind(),
+        MigrationHistoryIntegrityKind::DuplicateAppliedVersion
+    );
+}
+
+#[test]
+fn integrity_error_display_is_single_line_escaped_bounded_and_keeps_raw_fields() {
+    let backend = "sqlite\nbackend\u{1b}".repeat(1000);
+    let plugin_name = "audit\rplugin\u{7}".repeat(1000);
+    let stored_checksum = format!("stored\n\u{1b}{}", "x".repeat(100_000));
+    let expected_checksum = format!("expected\t{}", "y".repeat(100_000));
+    let error = MigrationHistoryIntegrityError {
+        backend: backend.clone(),
+        namespace: MigrationHistoryNamespace::CustomPlugin(plugin_name.clone()),
+        reason: MigrationHistoryIntegrityReason::ChecksumMismatch {
+            version: 7,
+            stored_checksum: stored_checksum.clone(),
+            expected_checksum: expected_checksum.clone(),
+        },
+    };
+
+    let rendered = error.to_string();
+    assert!(!rendered.contains('\n'));
+    assert!(!rendered.contains('\r'));
+    assert!(!rendered.contains('\u{1b}'));
+    assert!(!rendered.contains('\u{7}'));
+    assert!(rendered.contains("kind=checksum_mismatch"));
+    assert!(rendered.contains("namespace=custom-plugin"));
+    assert!(rendered.contains("version=7"));
+    assert!(rendered.contains("\\n"));
+    assert!(rendered.contains("\\u{1b}"));
+    assert!(
+        rendered.len() < 700,
+        "every string field must remain bounded"
+    );
+
+    assert_eq!(error.backend, backend);
+    assert_eq!(
+        error.namespace,
+        MigrationHistoryNamespace::CustomPlugin(plugin_name)
+    );
+    match error.reason {
+        MigrationHistoryIntegrityReason::ChecksumMismatch {
+            stored_checksum: raw_stored,
+            expected_checksum: raw_expected,
+            ..
+        } => {
+            assert_eq!(raw_stored, stored_checksum);
+            assert_eq!(raw_expected, expected_checksum);
+        }
+        other => panic!("unexpected integrity reason: {other:?}"),
+    }
+}
+
+#[test]
+fn integrity_error_remains_typed_through_anyhow_context() {
+    for (applied, expected_kind) in [
+        (
+            applied_history(MigrationHistoryNamespace::Core, &[(1, "stored")]),
+            MigrationHistoryIntegrityKind::ChecksumMismatch,
+        ),
+        (
+            applied_history(MigrationHistoryNamespace::Core, &[(99, "unknown")]),
+            MigrationHistoryIntegrityKind::UnknownAppliedVersion,
+        ),
+    ] {
+        let error = validate_migration_history_integrity(
+            "sqlite",
+            &[declared_history(
+                MigrationHistoryNamespace::Core,
+                &[(1, "expected")],
+            )],
+            &[applied],
+        )
+        .expect_err("invalid history must fail");
+        let wrapped = anyhow::Error::new(error).context("automatic startup migration failed");
+
+        assert!(wrapped.is::<MigrationHistoryIntegrityError>());
+        assert_eq!(
+            wrapped
+                .downcast_ref::<MigrationHistoryIntegrityError>()
+                .expect("typed source must remain in the error chain")
+                .kind(),
+            expected_kind
+        );
+    }
+}
+
+#[tokio::test]
+async fn core_checksum_drift_blocks_status_and_compatibility_writes() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    runner.run_pending().await.unwrap();
+
+    sqlx::query("UPDATE _ferrum_migrations SET checksum = ? WHERE version = 1")
+        .bind("stored-core-checksum")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE proxy_route_locks")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let before = sqlx::query(
+        "SELECT name, applied_at, checksum, execution_time_ms FROM _ferrum_migrations WHERE version = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let before = (
+        before.try_get::<String, _>("name").unwrap(),
+        before.try_get::<String, _>("applied_at").unwrap(),
+        before.try_get::<String, _>("checksum").unwrap(),
+        before.try_get::<i32, _>("execution_time_ms").unwrap(),
+    );
+
+    let status_error = runner
+        .status()
+        .await
+        .expect_err("status must return a blocking error on core drift");
+    assert!(status_error.is::<MigrationHistoryIntegrityError>());
+
+    let apply_error = runner
+        .run_pending()
+        .await
+        .expect_err("automatic core migration must fail on drift");
+    let integrity_error = apply_error
+        .downcast_ref::<MigrationHistoryIntegrityError>()
+        .expect("error must retain structured integrity metadata");
+    assert_eq!(integrity_error.backend, "sqlite");
+    assert_eq!(integrity_error.namespace, MigrationHistoryNamespace::Core);
+    match &integrity_error.reason {
+        MigrationHistoryIntegrityReason::ChecksumMismatch {
+            version,
+            stored_checksum,
+            expected_checksum,
+        } => {
+            assert_eq!(*version, 1);
+            assert_eq!(stored_checksum, "stored-core-checksum");
+            assert!(expected_checksum.starts_with("sha256:"));
+        }
+        other => panic!("unexpected integrity reason: {other:?}"),
+    }
+    assert!(!apply_error.to_string().contains("CREATE TABLE"));
+    assert!(
+        !table_exists(&pool, "proxy_route_locks").await,
+        "V001 compatibility work must not run after integrity refusal"
+    );
+
+    let after = sqlx::query(
+        "SELECT name, applied_at, checksum, execution_time_ms FROM _ferrum_migrations WHERE version = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let after = (
+        after.try_get::<String, _>("name").unwrap(),
+        after.try_get::<String, _>("applied_at").unwrap(),
+        after.try_get::<String, _>("checksum").unwrap(),
+        after.try_get::<i32, _>("execution_time_ms").unwrap(),
+    );
+    assert_eq!(after, before, "integrity refusal must not rewrite history");
+}
+
+#[tokio::test]
+async fn unknown_applied_core_version_blocks_compatibility_schema_and_history_writes() {
+    let pool = test_pool().await;
+    sqlx::query(
+        "CREATE TABLE _ferrum_migrations (\
+         version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL, \
+         checksum TEXT NOT NULL, execution_time_ms INTEGER NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO _ferrum_migrations \
+         (version, name, applied_at, checksum, execution_time_ms) \
+         VALUES (99, 'unknown', '2026-01-01T00:00:00Z', 'unknown-core-checksum', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+
+    let status_error = runner
+        .status()
+        .await
+        .expect_err("core status must reject an unknown applied version");
+    assert_eq!(
+        status_error
+            .downcast_ref::<MigrationHistoryIntegrityError>()
+            .expect("status refusal must remain typed")
+            .kind(),
+        MigrationHistoryIntegrityKind::UnknownAppliedVersion
+    );
+
+    let apply_error = runner
+        .run_pending()
+        .await
+        .expect_err("core migration must reject an unknown applied version");
+    assert!(apply_error.is::<MigrationHistoryIntegrityError>());
+    assert!(
+        !table_exists(&pool, "proxy_route_locks").await,
+        "V001 compatibility work must not run after integrity refusal"
+    );
+    assert!(
+        !table_exists(&pool, "proxies").await,
+        "V001 schema work must remain pending"
+    );
+    let row = sqlx::query("SELECT version, checksum FROM _ferrum_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.try_get::<i32, _>("version").unwrap(), 99);
+    assert_eq!(
+        row.try_get::<String, _>("checksum").unwrap(),
+        "unknown-core-checksum"
+    );
+}
+
+#[tokio::test]
+async fn core_checksum_drift_blocks_later_plugin_migration() {
+    let pool = test_pool().await;
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    runner.run_pending().await.unwrap();
+    sqlx::query("UPDATE _ferrum_migrations SET checksum = ? WHERE version = 1")
+        .bind("drift-before-plugin")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pending_plugin = vec![(
+        "pending_after_core",
+        vec![CustomPluginMigration {
+            version: 1,
+            name: "create_pending_after_core",
+            checksum: "pending-v1",
+            sql: "CREATE TABLE pending_after_core_data (id TEXT PRIMARY KEY)",
+            sql_postgres: None,
+            sql_mysql: None,
+        }],
+    )];
+
+    runner
+        .run_all_pending(&pending_plugin)
+        .await
+        .expect_err("core drift must block all later plugin work");
+
+    assert!(
+        !table_exists(&pool, "pending_after_core_data").await,
+        "later plugin schema must remain pending"
+    );
+    assert!(
+        !table_exists(&pool, "_ferrum_plugin_migrations").await,
+        "preflight refusal must happen before creating plugin history"
+    );
+    let row = sqlx::query("SELECT checksum FROM _ferrum_migrations WHERE version = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("checksum").unwrap(),
+        "drift-before-plugin"
+    );
+}
+
+#[tokio::test]
+async fn database_store_startup_surfaces_core_checksum_drift() {
+    sqlx::any::install_default_drivers();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("startup_checksum_drift.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await
+        .unwrap();
+    let runner = MigrationRunner::new(pool.clone(), "sqlite".to_string());
+    runner.run_pending().await.unwrap();
+    sqlx::query("UPDATE _ferrum_migrations SET checksum = ? WHERE version = 1")
+        .bind("startup-stored-checksum")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let error =
+        match DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+            .await
+        {
+            Ok(_) => panic!("automatic database startup must refuse checksum drift"),
+            Err(error) => error,
+        };
+    assert!(error.is::<MigrationHistoryIntegrityError>());
+
+    let row = sqlx::query("SELECT checksum FROM _ferrum_migrations WHERE version = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("checksum").unwrap(),
+        "startup-stored-checksum"
+    );
 }
 
 #[tokio::test]

@@ -5440,6 +5440,92 @@ fn test_apply_delta_rejects_unknown_jwt_auth_key_and_keeps_last_known_good() {
     assert_eq!(plugins[0].name(), "stdout_logging");
 }
 
+#[tokio::test]
+async fn rejected_staged_jwks_candidate_cannot_leave_stricter_policy_on_live_store() {
+    use ferrum_edge::_test_support::{
+        cached_jwks_refresh_generation_for_test, cached_jwks_requirement_for_test,
+        clear_jwks_cache_for_test, request_plugin_cache_reject_after_jwks_startup_for_test,
+    };
+    use std::time::Duration;
+
+    let server = wiremock::MockServer::start().await;
+    let uri = format!("{}/staged-policy/jwks.json", server.uri());
+    let _guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    clear_jwks_cache_for_test();
+
+    let published_max_stale = Duration::from_secs(7_200);
+    let candidate_max_stale = Duration::from_secs(600);
+
+    let make_jwks_config = |max_stale_secs: u64| {
+        make_config(
+            vec![make_proxy("p1", "/api", vec!["jwks"])],
+            vec![make_plugin_config_with_json(
+                "jwks",
+                "jwks_auth",
+                json!({
+                    "providers": [{
+                        "jwks_uri": uri,
+                        "jwks_max_stale_seconds": max_stale_secs
+                    }],
+                    "jwks_refresh_interval_secs": 300
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            )],
+        )
+    };
+
+    let cache = PluginCache::new(&make_jwks_config(published_max_stale.as_secs()))
+        .expect("published JWKS generation must admit");
+    let published = cached_jwks_requirement_for_test(&uri).expect("published store");
+    assert_eq!(published.max_stale, published_max_stale);
+    let published_generation = cached_jwks_refresh_generation_for_test(&uri).expect("generation");
+
+    request_plugin_cache_reject_after_jwks_startup_for_test();
+    let proxy_ids = std::collections::HashSet::from([NamespacedResourceId::new("ferrum", "p1")]);
+    let rejected = cache
+        .apply_delta(
+            &make_jwks_config(candidate_max_stale.as_secs()),
+            &proxy_ids,
+            &[],
+            false,
+        )
+        .expect_err("injected post-startup rejection must fail the staged candidate");
+    assert!(
+        rejected.contains("test-injected rejection after JWKS background startup"),
+        "unexpected rejection: {rejected}"
+    );
+
+    let after_reject = cached_jwks_requirement_for_test(&uri).expect("live store after reject");
+    assert_eq!(
+        after_reject.max_stale, published_max_stale,
+        "rejected unpublished candidate must not leave its stricter max-stale on the live store"
+    );
+    assert_eq!(after_reject.refresh_interval, Duration::from_secs(300));
+    let generation_after_reject =
+        cached_jwks_refresh_generation_for_test(&uri).expect("generation after reject");
+    assert!(
+        generation_after_reject > published_generation,
+        "rollback must replace the candidate refresh worker on the live store"
+    );
+
+    cache
+        .apply_delta(
+            &make_jwks_config(candidate_max_stale.as_secs()),
+            &proxy_ids,
+            &[],
+            false,
+        )
+        .expect("accepted publication must apply the strict candidate policy");
+    let after_accept = cached_jwks_requirement_for_test(&uri).expect("live store after accept");
+    assert_eq!(
+        after_accept.max_stale, candidate_max_stale,
+        "successful publication must install the stricter committed max-stale"
+    );
+
+    clear_jwks_cache_for_test();
+}
+
 #[test]
 fn test_apply_delta_rejects_unknown_load_testing_key_and_keeps_last_known_good() {
     let good = json!({

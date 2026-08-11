@@ -97,6 +97,7 @@ pub struct WsSessionKey {
     pub direction: &'static str,
     pub io_side: &'static str,
     pub error_class: &'static str,
+    pub termination_reason: &'static str,
 }
 
 /// Bounded directional WebSocket traffic key.
@@ -293,6 +294,23 @@ fn ws_io_side_label(side: Option<crate::proxy::tcp_proxy::StreamIoSide>) -> &'st
         Some(crate::proxy::tcp_proxy::StreamIoSide::Read) => "read",
         Some(crate::proxy::tcp_proxy::StreamIoSide::Write) => "write",
         None => "unknown",
+    }
+}
+
+fn websocket_termination_reason_label(ctx: &WsDisconnectContext) -> &'static str {
+    match ctx
+        .metadata
+        .get(crate::proxy::WS_TERMINATION_METADATA_KEY)
+        .map(String::as_str)
+    {
+        Some("credential_expired") => "credential_expired",
+        Some("max_lifetime") => "max_lifetime",
+        Some("idle_timeout") => "idle_timeout",
+        Some("drain") => "drain",
+        Some("normal_peer_close") => "normal_peer_close",
+        Some("relay_error") => "relay_error",
+        _ if ctx.error_class.is_some() => "relay_error",
+        _ => "normal_peer_close",
     }
 }
 
@@ -560,6 +578,42 @@ const DEFAULT_RENDER_CACHE_TTL_SECS: u64 = 5;
 /// At high RPS this prevents an Arc allocation on every single request.
 const DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS: u64 = 500_000_000; // 500ms
 
+const OAUTH2_INTROSPECTION_CACHE_CLASSES: [&str; 2] = ["active", "negative"];
+const OAUTH2_INTROSPECTION_CACHE_ADMISSION_SKIP_REASONS: [&str; 7] = [
+    "contention",
+    "entry_bytes",
+    "entry_count",
+    "eviction_index",
+    "expiry",
+    "superseded",
+    "total_bytes",
+];
+const OAUTH2_INTROSPECTION_CACHE_EVICTION_REASONS: [&str; 2] = ["capacity", "expired"];
+
+fn oauth2_introspection_cache_class_index(class: &str) -> Option<usize> {
+    OAUTH2_INTROSPECTION_CACHE_CLASSES
+        .iter()
+        .position(|candidate| *candidate == class)
+}
+
+fn oauth2_introspection_cache_admission_reason_index(reason: &str) -> Option<usize> {
+    OAUTH2_INTROSPECTION_CACHE_ADMISSION_SKIP_REASONS
+        .iter()
+        .position(|candidate| *candidate == reason)
+}
+
+fn oauth2_introspection_cache_eviction_reason_index(reason: &str) -> Option<usize> {
+    OAUTH2_INTROSPECTION_CACHE_EVICTION_REASONS
+        .iter()
+        .position(|candidate| *candidate == reason)
+}
+
+fn adjust_nonnegative_metric(counter: &AtomicI64, delta: i64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(delta).max(0))
+    });
+}
+
 /// Default live-series budget per mesh metric family (`MeshRequestKey` entries
 /// retained in that family's DashMap). Shared by ordinary mesh identity
 /// dimensions and CEL-derived dimensions: newly observed keys are admitted
@@ -637,6 +691,18 @@ pub struct MetricsRegistry {
     pub mesh_grpc_response_messages_counter: DashMap<MeshRequestKey, TimestampedCounter>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
+    /// Live OAuth2 introspection cache entries, partitioned into the fixed
+    /// active/negative classes. No provider or credential label is retained.
+    oauth2_introspection_cache_entries: [AtomicI64; 2],
+    /// Logical retained bytes, including each cache generation's fixed
+    /// eviction index and every published entry reservation.
+    oauth2_introspection_cache_retained_bytes: [AtomicI64; 2],
+    /// Cache admissions skipped by fixed class/reason buckets.
+    oauth2_introspection_cache_admission_skips: [[AtomicU64; 7]; 2],
+    /// Cache evictions by fixed class/reason buckets.
+    oauth2_introspection_cache_evictions: [[AtomicU64; 2]; 2],
+    /// Bounded eviction/cleanup tickets examined.
+    oauth2_introspection_cache_cleanup_work: AtomicU64,
     /// Admin configuration mutations refused because the Admin API is in
     /// read-only mode. Counted only on real admission attempts, not on
     /// observe-only health probes.
@@ -661,6 +727,24 @@ pub struct MetricsRegistry {
     request_mirror_concurrency_drops: AtomicU64,
     /// `request_mirror` attempts dropped because the retained-body budget was full.
     request_mirror_budget_drops: AtomicU64,
+    /// Service-discovery snapshots rejected because every provider catalog entry
+    /// failed provider normalization (fixed reason; no upstream/index labels).
+    service_discovery_provider_normalization_rejected: AtomicU64,
+    /// Service-discovery snapshots rejected by shared host/egress admission
+    /// (fixed reason; no upstream/index labels).
+    service_discovery_shared_admission_rejected: AtomicU64,
+    /// Blocking-query cursor rollbacks after an admitted lower-index snapshot.
+    service_discovery_cursor_rollback: AtomicU64,
+    /// Blocking-query cursor advances after an admitted higher-index snapshot.
+    service_discovery_cursor_advance: AtomicU64,
+    /// Discovery HTTP responses rejected for oversized / ambiguous body bounds.
+    service_discovery_response_oversized: AtomicU64,
+    /// Discovery HTTP responses rejected because the concurrent body budget
+    /// could not admit the next byte range.
+    service_discovery_body_budget_rejected: AtomicU64,
+    /// Kubernetes EndpointSliceList envelopes rejected as malformed (missing /
+    /// null / non-array `items`, invalid JSON, incompatible top-level shape).
+    service_discovery_malformed_envelope: AtomicU64,
     /// Current ai_federation circuits in an open/half-open recovery state.
     ai_federation_circuits_open: AtomicI64,
     /// ai_federation closed-to-open transitions.
@@ -811,6 +895,15 @@ impl MetricsRegistry {
             mesh_grpc_request_messages_counter: DashMap::new(),
             mesh_grpc_response_messages_counter: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
+            oauth2_introspection_cache_entries: std::array::from_fn(|_| AtomicI64::new(0)),
+            oauth2_introspection_cache_retained_bytes: std::array::from_fn(|_| AtomicI64::new(0)),
+            oauth2_introspection_cache_admission_skips: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            oauth2_introspection_cache_evictions: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            oauth2_introspection_cache_cleanup_work: AtomicU64::new(0),
             admin_read_only_rejected_mutations: AtomicU64::new(0),
             request_mirror_dispatched: AtomicU64::new(0),
             request_mirror_completed: AtomicU64::new(0),
@@ -822,6 +915,13 @@ impl MetricsRegistry {
             request_mirror_cancellations: AtomicU64::new(0),
             request_mirror_concurrency_drops: AtomicU64::new(0),
             request_mirror_budget_drops: AtomicU64::new(0),
+            service_discovery_provider_normalization_rejected: AtomicU64::new(0),
+            service_discovery_shared_admission_rejected: AtomicU64::new(0),
+            service_discovery_cursor_rollback: AtomicU64::new(0),
+            service_discovery_cursor_advance: AtomicU64::new(0),
+            service_discovery_response_oversized: AtomicU64::new(0),
+            service_discovery_body_budget_rejected: AtomicU64::new(0),
+            service_discovery_malformed_envelope: AtomicU64::new(0),
             ai_federation_circuits_open: AtomicI64::new(0),
             ai_federation_circuits_opened: AtomicU64::new(0),
             ai_federation_circuits_closed: AtomicU64::new(0),
@@ -1103,6 +1203,7 @@ impl MetricsRegistry {
                 .as_ref()
                 .map(ErrorClass::as_str)
                 .unwrap_or("none"),
+            termination_reason: websocket_termination_reason_label(ctx),
         };
         self.ws_session_counter
             .entry(session_key.clone())
@@ -1146,6 +1247,64 @@ impl MetricsRegistry {
     /// rate-limiter plugin.
     pub fn record_rate_limit_exceeded(&self) {
         self.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub(crate) fn adjust_oauth2_introspection_cache_retention(
+        &self,
+        class: &'static str,
+        entries_delta: i64,
+        bytes_delta: i64,
+    ) {
+        let Some(class_idx) = oauth2_introspection_cache_class_index(class) else {
+            return;
+        };
+        adjust_nonnegative_metric(
+            &self.oauth2_introspection_cache_entries[class_idx],
+            entries_delta,
+        );
+        adjust_nonnegative_metric(
+            &self.oauth2_introspection_cache_retained_bytes[class_idx],
+            bytes_delta,
+        );
+        self.maybe_invalidate_cache();
+    }
+
+    pub(crate) fn record_oauth2_introspection_cache_admission_skip(
+        &self,
+        class: &'static str,
+        reason: &'static str,
+    ) {
+        let Some(class_idx) = oauth2_introspection_cache_class_index(class) else {
+            return;
+        };
+        let Some(reason_idx) = oauth2_introspection_cache_admission_reason_index(reason) else {
+            return;
+        };
+        self.oauth2_introspection_cache_admission_skips[class_idx][reason_idx]
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub(crate) fn record_oauth2_introspection_cache_eviction(
+        &self,
+        class: &'static str,
+        reason: &'static str,
+    ) {
+        let Some(class_idx) = oauth2_introspection_cache_class_index(class) else {
+            return;
+        };
+        let Some(reason_idx) = oauth2_introspection_cache_eviction_reason_index(reason) else {
+            return;
+        };
+        self.oauth2_introspection_cache_evictions[class_idx][reason_idx]
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub(crate) fn record_oauth2_introspection_cache_cleanup_work(&self) {
+        self.oauth2_introspection_cache_cleanup_work
+            .fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
     }
 
@@ -1236,6 +1395,94 @@ impl MetricsRegistry {
         self.request_mirror_budget_drops
             .fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
+    }
+
+    /// Process-wide service-discovery admission / cursor counters. Labels are
+    /// never used: outcomes are fixed aggregate tallies with no upstream names,
+    /// URLs, indexes, or raw rejection strings as dimensions.
+    pub fn record_service_discovery_provider_normalization_rejected(&self) {
+        self.service_discovery_provider_normalization_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_shared_admission_rejected(&self) {
+        self.service_discovery_shared_admission_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_cursor_rollback(&self) {
+        self.service_discovery_cursor_rollback
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_cursor_advance(&self) {
+        self.service_discovery_cursor_advance
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_response_oversized(&self) {
+        self.service_discovery_response_oversized
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_body_budget_rejected(&self) {
+        self.service_discovery_body_budget_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_service_discovery_malformed_envelope(&self) {
+        self.service_discovery_malformed_envelope
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    // Test-crate observation seams for issue #3719 / #3718 / #3720 counters.
+    #[allow(dead_code)]
+    pub fn service_discovery_provider_normalization_rejected_total(&self) -> u64 {
+        self.service_discovery_provider_normalization_rejected
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_shared_admission_rejected_total(&self) -> u64 {
+        self.service_discovery_shared_admission_rejected
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_cursor_rollback_total(&self) -> u64 {
+        self.service_discovery_cursor_rollback
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_cursor_advance_total(&self) -> u64 {
+        self.service_discovery_cursor_advance
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_response_oversized_total(&self) -> u64 {
+        self.service_discovery_response_oversized
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_body_budget_rejected_total(&self) -> u64 {
+        self.service_discovery_body_budget_rejected
+            .load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub fn service_discovery_malformed_envelope_total(&self) -> u64 {
+        self.service_discovery_malformed_envelope
+            .load(Ordering::Relaxed)
     }
 
     pub fn record_ai_federation_circuit_opened(&self) {
@@ -2240,6 +2487,7 @@ impl MetricsRegistry {
         self.append_mesh_observability_prometheus(&mut output);
         self.append_node_waypoint_observability_prometheus(&mut output);
         self.append_grpc_stream_auth_prometheus(&mut output);
+        self.append_udp_placement_migration_prometheus(&mut output);
         output
     }
 
@@ -2287,6 +2535,18 @@ impl MetricsRegistry {
         crate::grpc::auth::render_stream_auth_metrics(output, &gateway_ns_label);
     }
 
+    /// Append the bounded Ambient UDP placement migration state outside the
+    /// render cache so phase/outstanding changes are visible immediately.
+    fn append_udp_placement_migration_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|label| label.clone())
+            .unwrap_or_default();
+        let gateway_ns_label = gateway_namespace_label(&ns_label);
+        crate::proxy::udp_placement_migration::render_prometheus(output, &gateway_ns_label);
+    }
+
     /// Render metrics without caching. Used internally and for testing.
     ///
     /// Includes the process-static mesh observability families so this stays a
@@ -2301,7 +2561,9 @@ impl MetricsRegistry {
     pub fn render_uncached(&self) -> String {
         let mut output = self.render_cacheable_body();
         self.append_mesh_observability_prometheus(&mut output);
+        self.append_node_waypoint_observability_prometheus(&mut output);
         self.append_grpc_stream_auth_prometheus(&mut output);
+        self.append_udp_placement_migration_prometheus(&mut output);
         output
     }
 
@@ -2369,7 +2631,7 @@ impl MetricsRegistry {
                 0
             }
             + if self.node_agent_metrics.load().is_some() {
-                512
+                2600
             } else {
                 0
             }
@@ -2674,6 +2936,69 @@ impl MetricsRegistry {
             ));
         }
 
+        output.push_str(
+            "# HELP ferrum_oauth2_introspection_cache_entries OAuth2 introspection cache entries retained across live plugin generations.\n",
+        );
+        output.push_str("# TYPE ferrum_oauth2_introspection_cache_entries gauge\n");
+        output.push_str(
+            "# HELP ferrum_oauth2_introspection_cache_retained_bytes OAuth2 introspection cache bytes retained across live plugin generations, including fixed eviction indexes.\n",
+        );
+        output.push_str("# TYPE ferrum_oauth2_introspection_cache_retained_bytes gauge\n");
+        for (class_idx, class) in OAUTH2_INTROSPECTION_CACHE_CLASSES.iter().enumerate() {
+            output.push_str(&format!(
+                "ferrum_oauth2_introspection_cache_entries{{class=\"{class}\"{ns_label}}} {}\n",
+                self.oauth2_introspection_cache_entries[class_idx].load(Ordering::Relaxed)
+            ));
+            output.push_str(&format!(
+                "ferrum_oauth2_introspection_cache_retained_bytes{{class=\"{class}\"{ns_label}}} {}\n",
+                self.oauth2_introspection_cache_retained_bytes[class_idx]
+                    .load(Ordering::Relaxed)
+            ));
+        }
+        output.push_str(
+            "# HELP ferrum_oauth2_introspection_cache_admission_skips_total OAuth2 introspection results not retained because a bounded cache admission could not complete.\n",
+        );
+        output.push_str("# TYPE ferrum_oauth2_introspection_cache_admission_skips_total counter\n");
+        for (class_idx, class) in OAUTH2_INTROSPECTION_CACHE_CLASSES.iter().enumerate() {
+            for (reason_idx, reason) in OAUTH2_INTROSPECTION_CACHE_ADMISSION_SKIP_REASONS
+                .iter()
+                .enumerate()
+            {
+                let value = self.oauth2_introspection_cache_admission_skips[class_idx][reason_idx]
+                    .load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_oauth2_introspection_cache_admission_skips_total{{class=\"{class}\",reason=\"{reason}\"{ns_label}}} {value}\n"
+                ));
+            }
+        }
+        output.push_str(
+            "# HELP ferrum_oauth2_introspection_cache_evictions_total OAuth2 introspection cache entries evicted by bounded cleanup or capacity admission.\n",
+        );
+        output.push_str("# TYPE ferrum_oauth2_introspection_cache_evictions_total counter\n");
+        for (class_idx, class) in OAUTH2_INTROSPECTION_CACHE_CLASSES.iter().enumerate() {
+            for (reason_idx, reason) in OAUTH2_INTROSPECTION_CACHE_EVICTION_REASONS
+                .iter()
+                .enumerate()
+            {
+                let value = self.oauth2_introspection_cache_evictions[class_idx][reason_idx]
+                    .load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "ferrum_oauth2_introspection_cache_evictions_total{{class=\"{class}\",reason=\"{reason}\"{ns_label}}} {value}\n"
+                ));
+            }
+        }
+        output.push_str(
+            "# HELP ferrum_oauth2_introspection_cache_cleanup_work_total Bounded OAuth2 introspection eviction-index tickets examined.\n",
+        );
+        output.push_str("# TYPE ferrum_oauth2_introspection_cache_cleanup_work_total counter\n");
+        render_process_counter(
+            &mut output,
+            "ferrum_oauth2_introspection_cache_cleanup_work_total",
+            self.oauth2_introspection_cache_cleanup_work
+                .load(Ordering::Relaxed),
+            &ns_label,
+        );
+
         // request_mirror lifecycle (aggregate, label-safe; no URLs/plugin IDs).
         // Terminal outcomes for dispatched tasks sum to dispatched:
         // completed + request_timeouts + request_failures + drain_timeouts +
@@ -2731,6 +3056,56 @@ impl MetricsRegistry {
                 "ferrum_request_mirror_budget_drops_total",
                 "request_mirror attempts dropped because max_retained_request_body_bytes was exhausted.",
                 self.request_mirror_budget_drops.load(Ordering::Relaxed),
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            render_process_counter(&mut output, name, value, &ns_label);
+        }
+
+        // Service-discovery admission / cursor / body-bound events (aggregate, label-safe).
+        for (name, help, value) in [
+            (
+                "ferrum_service_discovery_body_budget_rejected_total",
+                "Service-discovery HTTP responses rejected because the concurrent body budget was exhausted.",
+                self.service_discovery_body_budget_rejected
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_cursor_advance_total",
+                "Service-discovery blocking-query cursor advances after an admitted higher-index snapshot.",
+                self.service_discovery_cursor_advance
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_cursor_rollback_total",
+                "Service-discovery blocking-query cursor rollbacks after an admitted lower-index snapshot.",
+                self.service_discovery_cursor_rollback
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_malformed_envelope_total",
+                "Service-discovery Kubernetes EndpointSliceList envelopes rejected as malformed.",
+                self.service_discovery_malformed_envelope
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_provider_normalization_rejected_total",
+                "Service-discovery snapshots rejected because every provider catalog entry failed provider normalization.",
+                self.service_discovery_provider_normalization_rejected
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_response_oversized_total",
+                "Service-discovery HTTP responses rejected for oversized or ambiguous body bounds.",
+                self.service_discovery_response_oversized
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_service_discovery_shared_admission_rejected_total",
+                "Service-discovery snapshots rejected by shared host/egress target admission.",
+                self.service_discovery_shared_admission_rejected
+                    .load(Ordering::Relaxed),
             ),
         ] {
             output.push_str(&format!("# HELP {name} {help}\n"));
@@ -3036,12 +3411,13 @@ impl MetricsRegistry {
                 let count = entry.value().value.load(Ordering::Relaxed);
                 let proxy_id = escape_label_value(&key.proxy_id);
                 output.push_str(&format!(
-                    "ferrum_websocket_sessions_total{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\"{}}} {}\n",
+                    "ferrum_websocket_sessions_total{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\"{}}} {}\n",
                     proxy_id,
                     key.result,
                     key.direction,
                     key.io_side,
                     key.error_class,
+                    key.termination_reason,
                     ns_label,
                     count
                 ));
@@ -3819,6 +4195,93 @@ impl MetricsRegistry {
                 }
             }
 
+            // Ingress-interface topology proof. State and reason are closed
+            // enums; configured/expected interface names are deliberately
+            // absent from labels and values to keep cardinality bounded and
+            // avoid exposing operator- or host-controlled strings.
+            let topology = snapshot.ingress_topology;
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_topology NodeWaypoint ingress-interface topology validation state and bounded reason.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_topology gauge\n");
+            if ns_label.is_empty() {
+                output.push_str(&format!(
+                    "ferrum_node_agent_ingress_interface_topology{{state=\"{}\",reason=\"{}\"}} 1\n",
+                    topology.state.label(),
+                    topology.reason.label(),
+                ));
+            } else {
+                output.push_str(&format!(
+                    "ferrum_node_agent_ingress_interface_topology{{state=\"{}\",reason=\"{}\"{}}} 1\n",
+                    topology.state.label(),
+                    topology.reason.label(),
+                    ns_label,
+                ));
+            }
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_configured_interfaces Number of explicitly configured ingress interfaces (names are never labels).\n",
+            );
+            output.push_str(
+                "# TYPE ferrum_node_agent_ingress_interface_configured_interfaces gauge\n",
+            );
+            render_process_counter(
+                &mut output,
+                "ferrum_node_agent_ingress_interface_configured_interfaces",
+                u64::from(topology.configured_interfaces),
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_expected_interfaces Number of interfaces required by the proved node/CNI route topology (names are never labels).\n",
+            );
+            output
+                .push_str("# TYPE ferrum_node_agent_ingress_interface_expected_interfaces gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_node_agent_ingress_interface_expected_interfaces",
+                u64::from(topology.expected_interfaces),
+                &ns_label,
+            );
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_family_required Whether a route family must be covered by the configured interface set.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_family_required gauge\n");
+            for (family, required) in [
+                ("ipv4", topology.ipv4_required),
+                ("ipv6", topology.ipv6_required),
+            ] {
+                if ns_label.is_empty() {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_ingress_interface_family_required{{family=\"{family}\"}} {}\n",
+                        u64::from(required),
+                    ));
+                } else {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_ingress_interface_family_required{{family=\"{family}\"{ns_label}}} {}\n",
+                        u64::from(required),
+                    ));
+                }
+            }
+            output.push_str(
+                "# HELP ferrum_node_agent_ingress_interface_family_covered Whether the required route family is currently proved complete.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_ingress_interface_family_covered gauge\n");
+            for (family, covered) in [
+                ("ipv4", topology.ipv4_covered),
+                ("ipv6", topology.ipv6_covered),
+            ] {
+                if ns_label.is_empty() {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_ingress_interface_family_covered{{family=\"{family}\"}} {}\n",
+                        u64::from(covered),
+                    ));
+                } else {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_ingress_interface_family_covered{{family=\"{family}\"{ns_label}}} {}\n",
+                        u64::from(covered),
+                    ));
+                }
+            }
+
             // Topology-degraded gauge — emitted whenever the node-agent
             // metrics are registered so dashboards can pin "expected: 0"
             // even on healthy nodes. `reason` is a closed snake_case set
@@ -3953,12 +4416,13 @@ fn render_ws_histogram(
     for (i, boundary) in histogram.boundaries.iter().enumerate() {
         let count = histogram.counts[i].load(Ordering::Relaxed);
         output.push_str(&format!(
-            "ferrum_websocket_session_duration_ms_bucket{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",le=\"{}\"{}}} {}\n",
+            "ferrum_websocket_session_duration_ms_bucket{{proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\",le=\"{}\"{}}} {}\n",
             proxy_id,
             key.result,
             key.direction,
             key.io_side,
             key.error_class,
+            key.termination_reason,
             boundary,
             ns_label,
             count
@@ -3967,8 +4431,8 @@ fn render_ws_histogram(
     let total_count = histogram.count.load(Ordering::Relaxed);
     let sum = f64::from_bits(histogram.sum.load(Ordering::Relaxed));
     let labels = format!(
-        "proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\"",
-        proxy_id, key.result, key.direction, key.io_side, key.error_class
+        "proxy_id=\"{}\",result=\"{}\",direction=\"{}\",io_side=\"{}\",error_class=\"{}\",termination_reason=\"{}\"",
+        proxy_id, key.result, key.direction, key.io_side, key.error_class, key.termination_reason
     );
     output.push_str(&format!(
         "ferrum_websocket_session_duration_ms_bucket{{{},le=\"+Inf\"{}}} {}\n",
@@ -4247,6 +4711,38 @@ mod tests {
         assert!(output.contains("cert_id=\"certificate-test\""));
         assert!(output.contains("surface=\"frontend_tls\""));
         assert!(output.contains("source_kind=\"file\""));
+    }
+
+    #[test]
+    fn renders_fixed_cardinality_oauth2_introspection_cache_metrics() {
+        let registry = MetricsRegistry::new();
+        registry.adjust_oauth2_introspection_cache_retention("active", 1, 512);
+        registry.record_oauth2_introspection_cache_admission_skip("negative", "entry_count");
+        registry.record_oauth2_introspection_cache_eviction("active", "capacity");
+        registry.record_oauth2_introspection_cache_cleanup_work();
+
+        let output = registry.render_uncached();
+        assert!(output.contains("ferrum_oauth2_introspection_cache_entries{class=\"active\"} 1"));
+        assert!(
+            output
+                .contains("ferrum_oauth2_introspection_cache_retained_bytes{class=\"active\"} 512")
+        );
+        assert!(output.contains(
+            "ferrum_oauth2_introspection_cache_admission_skips_total{class=\"negative\",reason=\"entry_count\"} 1"
+        ));
+        assert!(output.contains(
+            "ferrum_oauth2_introspection_cache_evictions_total{class=\"active\",reason=\"capacity\"} 1"
+        ));
+        assert!(output.contains("ferrum_oauth2_introspection_cache_cleanup_work_total 1"));
+        let cache_samples = output
+            .lines()
+            .filter(|line| line.starts_with("ferrum_oauth2_introspection_cache_"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!cache_samples.contains("token="));
+        assert!(!cache_samples.contains("digest="));
+        assert!(!cache_samples.contains("subject="));
+        assert!(!cache_samples.contains("endpoint="));
     }
 
     #[test]

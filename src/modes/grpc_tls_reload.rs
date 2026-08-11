@@ -101,6 +101,7 @@ pub fn prepare_cp_grpc_server_tls_reload(
             slot: slot.clone(),
             interval,
             revision_tx,
+            max_material_bytes: env_config.tls_max_material_size_bytes,
             rebuild: Box::new(move || {
                 build_cp_grpc_server_tls_config(
                     &env_for_rebuild,
@@ -156,6 +157,7 @@ pub fn start_dp_grpc_tls_reload_task(
             sources: watched_sources,
             interval,
             revision_tx,
+            max_material_bytes: env_config.tls_max_material_size_bytes,
             rebuild: Box::new(move || {
                 crate::grpc::dp_client::build_dp_grpc_tls_config(
                     &env_for_rebuild,
@@ -164,6 +166,7 @@ pub fn start_dp_grpc_tls_reload_task(
                 )?;
                 Ok(())
             }),
+            ready_tx: None,
         },
         shutdown_rx,
     );

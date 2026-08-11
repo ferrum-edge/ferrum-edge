@@ -249,7 +249,11 @@ impl AuthMechanism for JwtAuth {
                             r#"{"error":"JWT missing nbf claim"}"#.into(),
                         );
                     }
-                    return VerifyOutcome::consumer(consumer);
+                    let deadline = auth_flow::credential_deadline_from_claims(
+                        &token_data.claims,
+                        self.validation.leeway,
+                    );
+                    return VerifyOutcome::consumer(consumer).with_credential_deadline(deadline);
                 }
             }
         }

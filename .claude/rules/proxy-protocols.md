@@ -108,12 +108,12 @@ paths:
 
 ## Pool Keys And DNS
 
-- Pool keys must include every field affecting connection identity: destination, protocol/TLS, DNS override, upstream subset, CA, mTLS cert/key, SNI, SAN digest, verification flag, and SVID generation.
+- Pool keys must include every field affecting connection identity: destination, protocol/TLS, DNS override, upstream subset, direct-H2/gRPC effective `pool_http2_max_concurrent_streams`, CA, mTLS cert/key, SNI, SAN digest, verification flag, and SVID generation.
 - HTTP key shell: `{dest}|{proto}|{dns_override}|{subset}|{ca}|{mtls_cert}|{mtls_key}|{sni}|{san_digest}|{verify}|{svid_generation}|{rcfg}`.
-- The trailing `rcfg=…` segment on the reqwest pool key encodes every client-level setting that `create_client` bakes into the shared `reqwest::Client` (idle timeout, TCP keepalive, H2 keepalive/windows/adaptive/max-frame). Adaptive window (`aw=1`) takes precedence over fixed initial windows, so `sw`/`cw` appear only when adaptive is off. Secrets never appear in pool keys or key logs.
-- gRPC and direct-H2 keys include host, port, DNS override, subset, TLS identity fields, verification, SVID generation, and shard suffix `#N`.
+- The trailing `rcfg=…` segment on the reqwest pool key encodes every client-level setting that `create_client` bakes into the shared `reqwest::Client` (idle timeout, TCP keepalive, H2 keepalive/windows/adaptive/max-frame). Adaptive window (`aw=1`) takes precedence over fixed initial windows, so `sw`/`cw` appear only when adaptive is off. Secrets never appear in pool keys or key logs. Reqwest does not consume `http2_max_concurrent_streams`, so that field stays out of `rcfg`.
+- gRPC and direct-H2 keys include host, port, DNS override, subset, effective H2 max concurrent streams (`none` or decimal), TLS identity fields, verification, SVID generation, and shard suffix `#N`.
 - H3 keys include host, port, LB target index, DNS override, subset, TLS identity fields, verification, and SVID generation.
-- Exclude request-only policy fields that dispatch can apply per request (connect/read timeouts). Exclude `max_idle_per_host` from the reqwest key by deliberate global-only tradeoff (per-proxy values would over-fragment). Direct-H2/gRPC may still document first-materializer tradeoffs for settings their builders apply that are not in those keys.
+- Exclude request-only policy fields that dispatch can apply per request (connect/read timeouts). Exclude `max_idle_per_host` from the reqwest key by deliberate global-only tradeoff (per-proxy values would over-fragment). Direct-H2/gRPC may still document first-materializer tradeoffs for remaining builder settings that are not in those keys (for example keepalive), but `pool_http2_max_concurrent_streams` is keyed.
 - Subset must partition pools so DestinationRule subset TLS overlays cannot share connections accidentally.
 - Request-only policy fields are applied per request. Shared reqwest clients must not leak request timeouts across proxies; client-baked settings are isolated by the `rcfg` key segment instead.
 - Per-request `connect_timeout` depends on the vendored reqwest patch at `vendor/reqwest-0.13.3-ferrum-patched/` (`docs/upstream-reqwest-patches/001-per-request-connect-timeout/`). Do not change pool sharing or timeout semantics without preserving that request-scoped override behavior.

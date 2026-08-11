@@ -26,6 +26,8 @@ fn subset_definition_round_trip_json() {
             h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
             max_retries: Some(2),
             http1_max_pending_requests: Some(7),
+            http_idle_timeout_ms: None,
+            h2_max_concurrent_streams: None,
             passive_health_check: None,
         }),
     };
@@ -98,6 +100,8 @@ fn subset_traffic_policy_omits_none_fields() {
         h2_upgrade_policy: None,
         max_retries: None,
         http1_max_pending_requests: None,
+        http_idle_timeout_ms: None,
+        h2_max_concurrent_streams: None,
         passive_health_check: None,
     };
     let json = serde_json::to_string(&policy).unwrap();
@@ -128,6 +132,8 @@ fn subset_traffic_policy_tls_round_trip_json() {
         h2_upgrade_policy: None,
         max_retries: None,
         http1_max_pending_requests: None,
+        http_idle_timeout_ms: None,
+        h2_max_concurrent_streams: None,
         passive_health_check: None,
     };
 
@@ -392,6 +398,8 @@ fn upstream_valid_subsets_pass_validation() {
                 h2_upgrade_policy: None,
                 max_retries: None,
                 http1_max_pending_requests: None,
+                http_idle_timeout_ms: None,
+                h2_max_concurrent_streams: None,
                 passive_health_check: None,
             }),
         },

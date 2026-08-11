@@ -4789,6 +4789,7 @@ impl SoapWsSecurity {
                 consumer,
                 external_identity: Some(identity),
                 external_identity_header: None,
+                credential_deadline: None,
             },
             SOAP_WS_SECURITY_AUTH_METHOD,
             true,

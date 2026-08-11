@@ -129,7 +129,6 @@ mod functional_tls_lifecycle_test;
 mod functional_tls_only_test;
 mod functional_transaction_debugger_body_capture_test;
 mod functional_udp_proxy_test;
-// Unix-domain-socket backends and file-mode SIGHUP reload are both Unix-only.
 #[cfg(unix)]
 mod functional_unix_backend_test;
 mod functional_url_query_limits_test;

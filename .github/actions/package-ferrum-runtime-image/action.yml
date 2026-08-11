@@ -111,6 +111,8 @@ runs:
               org.opencontainers.image.description="High-performance edge proxy built in Rust" \
               org.opencontainers.image.source="https://github.com/ferrum-edge/ferrum-edge"
 
+        USER 65532:65532
+
         ENTRYPOINT ["/app/ferrum-edge"]
         CMD ["run"]
         DOCKERFILE

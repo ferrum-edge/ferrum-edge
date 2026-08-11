@@ -21,16 +21,23 @@ use crate::consumer_index::ConsumerIndex;
 use super::utils::PluginHttpClient;
 use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::{
-    ExtractedCredential, VerifyOutcome, commit_authentication_attempt, nonblank_identity,
+    ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
+    credential_deadline_from_unix_seconds, nonblank_identity,
 };
 use super::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
-    emit_claim_headers_to_attempt, parse_claim_headers,
+    normalized_claim_header_values, parse_claim_headers,
 };
 use super::utils::claim_resolver::{
     extract_claim_string, extract_claim_string_exact, parse_claim_path_value,
 };
-use super::utils::introspection_cache::{CacheLookup, IntrospectionCache, TokenKey};
+use super::utils::introspection_cache::{
+    CacheLookup, CachedAuthorization, CachedAuthorizationError, CachedClaimHeader,
+    DEFAULT_MAX_CACHE_ENTRIES, DEFAULT_MAX_CACHE_ENTRY_BYTES, DEFAULT_MAX_CACHE_TOTAL_BYTES,
+    HARD_MAX_CACHE_ENTRIES, HARD_MAX_CACHE_ENTRY_BYTES, HARD_MAX_CACHE_TOTAL_BYTES,
+    IntrospectionCache, MIN_MAX_CACHE_ENTRIES, MIN_MAX_CACHE_ENTRY_BYTES,
+    MIN_MAX_CACHE_TOTAL_BYTES, TokenKey,
+};
 use super::utils::response_body::read_response_body_bounded;
 use super::utils::scope_role_check::{self, ScopeRoleRequirements};
 use super::utils::token_extract::{
@@ -58,7 +65,7 @@ fn global_introspection_limit() -> Arc<Semaphore> {
     )
 }
 
-type InFlightResult = Result<Arc<Value>, IntrospectionDecision>;
+type InFlightResult = Result<Arc<CachedAuthorization>, IntrospectionDecision>;
 type InFlightCell = OnceCell<InFlightResult>;
 
 struct InFlightEntryGuard {
@@ -261,6 +268,8 @@ impl Oauth2Introspection {
                     "negative_cache_ttl_secs",
                     "request_timeout_ms",
                     "max_cache_entries",
+                    "max_cache_entry_bytes",
+                    "max_cache_total_bytes",
                     "token_hint_param",
                     "required_scopes",
                     "required_roles",
@@ -308,8 +317,37 @@ impl Oauth2Introspection {
                 ranged_provider_u64(prov_obj, "negative_cache_ttl_secs", idx, 10, 0, 300)?;
             let request_timeout_ms =
                 ranged_provider_u64(prov_obj, "request_timeout_ms", idx, 5_000, 100, 30_000)?;
-            let max_cache_entries =
-                ranged_provider_usize(prov_obj, "max_cache_entries", idx, 10_000, 100, 1_000_000)?;
+            let max_cache_entries = ranged_provider_usize(
+                prov_obj,
+                "max_cache_entries",
+                idx,
+                DEFAULT_MAX_CACHE_ENTRIES,
+                MIN_MAX_CACHE_ENTRIES,
+                HARD_MAX_CACHE_ENTRIES,
+            )?;
+            let max_cache_entry_bytes = ranged_provider_usize(
+                prov_obj,
+                "max_cache_entry_bytes",
+                idx,
+                DEFAULT_MAX_CACHE_ENTRY_BYTES,
+                MIN_MAX_CACHE_ENTRY_BYTES,
+                HARD_MAX_CACHE_ENTRY_BYTES,
+            )?;
+            let max_cache_total_bytes = ranged_provider_usize(
+                prov_obj,
+                "max_cache_total_bytes",
+                idx,
+                DEFAULT_MAX_CACHE_TOTAL_BYTES,
+                MIN_MAX_CACHE_TOTAL_BYTES,
+                HARD_MAX_CACHE_TOTAL_BYTES,
+            )?;
+            let minimum_total_bytes = IntrospectionCache::minimum_total_bytes(max_cache_entries)
+                .saturating_add(max_cache_entry_bytes);
+            if max_cache_total_bytes < minimum_total_bytes {
+                return Err(format!(
+                    "oauth2_introspection: 'provider[{idx}].max_cache_total_bytes' must be at least {minimum_total_bytes} for max_cache_entries={max_cache_entries} and max_cache_entry_bytes={max_cache_entry_bytes}"
+                ));
+            }
             let token_hint_param = optional_nullable_string(prov_obj, "token_hint_param", idx)?;
             let claim_headers = parse_claim_headers(
                 prov_obj,
@@ -325,6 +363,8 @@ impl Oauth2Introspection {
             ));
             let cache = Arc::new(IntrospectionCache::new(
                 max_cache_entries,
+                max_cache_entry_bytes,
+                max_cache_total_bytes,
                 Duration::from_secs(positive_cache_ttl_secs),
                 Duration::from_secs(negative_cache_ttl_secs),
                 shard_amount,
@@ -463,20 +503,26 @@ impl Oauth2Introspection {
                         "invalid_request",
                     );
                 }
-                let (claims, candidate) = match self.validate_token(&token, &candidates).await {
-                    Ok(result) => result,
-                    Err(rejection) => return rejection.into_plugin_result(),
-                };
+                let (authorization, candidate) =
+                    match self.validate_token(&token, &candidates).await {
+                        Ok(result) => result,
+                        Err(rejection) => return rejection.into_plugin_result(),
+                    };
                 let provider = &self.providers[candidate.provider_idx];
-                if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
-                    return reject(status, body);
+                if let Some(error) = &authorization.authorization_error {
+                    return reject(error.status_code, error.body.to_string());
                 }
                 let mut attempt = AuthenticationAttempt::new();
-                self.stage_claim_headers(&mut attempt, &claims, provider);
+                self.stage_claim_headers(&mut attempt, &authorization, provider);
                 if !provider.forward_original_token {
                     self.stage_original_token_stripping(&mut attempt, ctx, &token, candidate);
                 }
-                let outcome = self.resolve_identity(&claims, provider, consumer_index);
+                let deadline = authorization
+                    .expires_at_unix
+                    .map(|expiry| credential_deadline_from_unix_seconds(expiry, 0));
+                let outcome = self
+                    .resolve_identity(&authorization, consumer_index)
+                    .with_credential_deadline(deadline);
                 apply_verify_outcome(ctx, attempt, outcome, "oauth2_introspection")
             }
         }
@@ -486,7 +532,7 @@ impl Oauth2Introspection {
         &self,
         token: &str,
         candidates: &[ProviderCandidate],
-    ) -> Result<(Arc<Value>, ProviderCandidate), IntrospectionRejection> {
+    ) -> Result<(Arc<CachedAuthorization>, ProviderCandidate), IntrospectionRejection> {
         // Fan-out is only reachable after explicit shared-trust opt-in or when
         // the request carried the same token in multiple provider-specific
         // locations. If no provider accepts, an unavailable candidate takes
@@ -528,10 +574,15 @@ impl Oauth2Introspection {
         token: &str,
         provider: &IntrospectionProvider,
         provider_idx: usize,
-    ) -> Result<Arc<Value>, IntrospectionDecision> {
+    ) -> Result<Arc<CachedAuthorization>, IntrospectionDecision> {
         let now = Instant::now();
         match provider.cache.get(token, now) {
-            CacheLookup::Active(claims) => return Ok(claims),
+            CacheLookup::Active(credential) => {
+                if credential_expired(credential.expires_at_unix) {
+                    return Err(IntrospectionDecision::Inactive);
+                }
+                return Ok(credential);
+            }
             CacheLookup::Negative => return Err(IntrospectionDecision::Inactive),
             CacheLookup::Miss => {}
         }
@@ -558,12 +609,17 @@ impl Oauth2Introspection {
         token: &str,
         provider: &IntrospectionProvider,
         provider_idx: usize,
-    ) -> Result<Arc<Value>, IntrospectionDecision> {
+    ) -> Result<Arc<CachedAuthorization>, IntrospectionDecision> {
         let now = Instant::now();
         // Another completed request can populate the cache between the caller's
         // initial lookup and installation of a new in-flight cell.
         match provider.cache.get(token, now) {
-            CacheLookup::Active(claims) => return Ok(claims),
+            CacheLookup::Active(credential) => {
+                if credential_expired(credential.expires_at_unix) {
+                    return Err(IntrospectionDecision::Inactive);
+                }
+                return Ok(credential);
+            }
             CacheLookup::Negative => return Err(IntrospectionDecision::Inactive),
             CacheLookup::Miss => {}
         }
@@ -750,12 +806,13 @@ impl Oauth2Introspection {
                 r#"{"error":"Invalid token audience"}"#.to_string(),
             ));
         }
-        let exp = claims.get("exp").and_then(Value::as_i64);
-        let claims = Arc::new(claims);
+        let expires_at_unix = validated_introspection_expiry(&claims)?;
+        let authorization =
+            Arc::new(self.normalize_authorization(&claims, provider, expires_at_unix));
         provider
             .cache
-            .insert_active(token, claims.clone(), now, exp);
-        Ok(claims)
+            .insert_active(token, Arc::clone(&authorization), now);
+        Ok(authorization)
     }
 
     fn check_claims_authorization(
@@ -783,12 +840,24 @@ impl Oauth2Introspection {
         )
     }
 
-    fn resolve_identity(
+    fn normalize_authorization(
         &self,
         claims: &Value,
         provider: &IntrospectionProvider,
-        consumer_index: &ConsumerIndex,
-    ) -> VerifyOutcome {
+        expires_at_unix: Option<i64>,
+    ) -> CachedAuthorization {
+        if let Err((status_code, body)) = self.check_claims_authorization(claims, provider) {
+            return CachedAuthorization {
+                authorization_error: Some(CachedAuthorizationError {
+                    status_code,
+                    body: body.into_boxed_str(),
+                }),
+                identity: None,
+                identity_header: None,
+                claim_headers: Box::default(),
+                expires_at_unix,
+            };
+        }
         let identity_claim = provider
             .consumer_identity_claim
             .as_deref()
@@ -803,6 +872,30 @@ impl Oauth2Introspection {
         } else {
             extract_claim_string_exact(claims, header_claim).or_else(|| identity.clone())
         };
+        let claim_headers = normalized_claim_header_values(claims, &provider.claim_headers, ",")
+            .into_iter()
+            .map(|(mapping_index, value)| CachedClaimHeader {
+                mapping_index,
+                value: value.into_boxed_str(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        CachedAuthorization {
+            authorization_error: None,
+            identity: identity.map(String::into_boxed_str),
+            identity_header: header_value.map(String::into_boxed_str),
+            claim_headers,
+            expires_at_unix,
+        }
+    }
+
+    fn resolve_identity(
+        &self,
+        authorization: &CachedAuthorization,
+        consumer_index: &ConsumerIndex,
+    ) -> VerifyOutcome {
+        let identity = authorization.identity.as_deref().map(str::to_string);
+        let header_value = authorization.identity_header.as_deref().map(str::to_string);
         let consumer = identity
             .as_deref()
             .and_then(|id| consumer_index.find_by_identity(id));
@@ -812,13 +905,15 @@ impl Oauth2Introspection {
     fn stage_claim_headers(
         &self,
         attempt: &mut AuthenticationAttempt,
-        claims: &Value,
+        authorization: &CachedAuthorization,
         provider: &IntrospectionProvider,
     ) {
-        if provider.claim_headers.is_empty() {
-            return;
+        for header in authorization.claim_headers.iter() {
+            let Some(mapping) = provider.claim_headers.get(header.mapping_index) else {
+                continue;
+            };
+            attempt.stage_claim_header(mapping.metadata_key.clone(), header.value.to_string());
         }
-        emit_claim_headers_to_attempt(attempt, claims, &provider.claim_headers, ",");
     }
 
     fn stage_original_token_stripping(
@@ -1055,6 +1150,49 @@ enum IntrospectionDecision {
     Inactive,
     Unauthorized(String),
     Unavailable,
+}
+
+fn credential_expired(expires_at_unix: Option<i64>) -> bool {
+    expires_at_unix.is_some_and(|expiry| expiry <= chrono::Utc::now().timestamp())
+}
+
+/// Resolve an introspection credential's authoritative validity once, at the
+/// provider-response boundary. Relative `expires_in` is converted immediately
+/// so cache hits and single-flight followers cannot slide the deadline.
+fn validated_introspection_expiry(claims: &Value) -> Result<Option<i64>, IntrospectionDecision> {
+    validated_introspection_expiry_at(claims, chrono::Utc::now().timestamp())
+}
+
+fn validated_introspection_expiry_at(
+    claims: &Value,
+    now: i64,
+) -> Result<Option<i64>, IntrospectionDecision> {
+    let mut deadline: Option<i64> = None;
+    for field in ["exp", "active_until"] {
+        let Some(value) = claims.get(field) else {
+            continue;
+        };
+        let expiry = value
+            .as_i64()
+            .or_else(|| value.as_u64()?.try_into().ok())
+            .ok_or(IntrospectionDecision::Unavailable)?;
+        deadline = Some(deadline.map_or(expiry, |current| current.min(expiry)));
+    }
+    if let Some(value) = claims.get("expires_in") {
+        let seconds = value
+            .as_i64()
+            .or_else(|| value.as_u64()?.try_into().ok())
+            .filter(|seconds| *seconds > 0)
+            .ok_or(IntrospectionDecision::Unavailable)?;
+        let expiry = now
+            .checked_add(seconds)
+            .ok_or(IntrospectionDecision::Unavailable)?;
+        deadline = Some(deadline.map_or(expiry, |current| current.min(expiry)));
+    }
+    if deadline.is_some_and(|expiry| expiry <= now) {
+        return Err(IntrospectionDecision::Inactive);
+    }
+    Ok(deadline)
 }
 
 impl IntrospectionDecision {
@@ -1361,7 +1499,7 @@ fn parse_client_auth(
 
     match method {
         "client_secret_basic" => {
-            let client_id = client_id.ok_or_else(|| {
+        let client_id = client_id.ok_or_else(|| {
                 format!(
                     "oauth2_introspection: provider[{provider_idx}].client_auth.client_id is required"
                 )
@@ -1388,7 +1526,7 @@ fn parse_client_auth(
             )?),
         }),
         "private_key_jwt" => {
-            let client_id = client_id.ok_or_else(|| {
+        let client_id = client_id.ok_or_else(|| {
                 format!(
                     "oauth2_introspection: provider[{provider_idx}].client_auth.client_id is required"
                 )
@@ -2103,6 +2241,31 @@ fn validate_discovered_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn introspection_expiry_uses_earliest_authoritative_bound_once() {
+        let claims = json!({
+            "exp": 1_300,
+            "active_until": 1_200,
+            "expires_in": 50
+        });
+        match validated_introspection_expiry_at(&claims, 1_000) {
+            Ok(expiry) => assert_eq!(expiry, Some(1_050)),
+            Err(_) => panic!("valid authoritative expiry claims must be accepted"),
+        }
+    }
+
+    #[test]
+    fn introspection_expiry_rejects_exact_boundary_and_malformed_values() {
+        assert!(matches!(
+            validated_introspection_expiry_at(&json!({"exp": 1_000}), 1_000),
+            Err(IntrospectionDecision::Inactive)
+        ));
+        assert!(matches!(
+            validated_introspection_expiry_at(&json!({"expires_in": "secret"}), 1_000),
+            Err(IntrospectionDecision::Unavailable)
+        ));
+    }
 
     #[test]
     fn local_introspection_host_accepts_loopback_and_localhost_only() {

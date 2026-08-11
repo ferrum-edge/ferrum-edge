@@ -1351,6 +1351,54 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_jwks_consecutive_failures",
+    "type": "gauge",
+    "help": "Maximum current consecutive failures among active remote stores by fixed failure class.",
+    "labels": [
+      "class"
+    ],
+    "subsystem": "jwks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_jwks_refresh_failures_total",
+    "type": "counter",
+    "help": "Remote JWKS refresh failures by fixed failure class.",
+    "labels": [
+      "class"
+    ],
+    "subsystem": "jwks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_jwks_trust_age_seconds",
+    "type": "gauge",
+    "help": "Maximum age of the last validated non-empty JWKS among active remote stores in each trust state.",
+    "labels": [
+      "state"
+    ],
+    "subsystem": "jwks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_jwks_trust_stores",
+    "type": "gauge",
+    "help": "Active remote JWKS stores by bounded trust state.",
+    "labels": [
+      "state"
+    ],
+    "subsystem": "jwks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_kafka_logging_accepting",
     "type": "gauge",
     "help": "Whether the Kafka logging generation still admits new records.",
@@ -2331,6 +2379,44 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_mesh_udp_placement_migration_failures_total",
+    "type": "counter",
+    "help": "Ambient UDP placement migration failures by bounded reason.",
+    "labels": [
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_udp_migration",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_udp_placement_migration_outstanding",
+    "type": "gauge",
+    "help": "Outstanding pod netns or gate acknowledgements in the current node-local migration.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_udp_migration",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_udp_placement_migration_phase",
+    "type": "gauge",
+    "help": "Ambient UDP placement migration phase (one bounded phase is 1).",
+    "labels": [
+      "phase",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_udp_migration",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_node_agent_attach_errors_total",
     "type": "counter",
     "help": "Node-agent BPF attachment or map update errors.",
@@ -2374,6 +2460,70 @@
     "type": "counter",
     "help": "Node-agent CNI socket lifecycle failures by bounded reason.",
     "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_ingress_interface_configured_interfaces",
+    "type": "gauge",
+    "help": "Number of explicitly configured ingress interfaces (names are never labels).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_ingress_interface_expected_interfaces",
+    "type": "gauge",
+    "help": "Number of interfaces required by the proved node/CNI route topology (names are never labels).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_ingress_interface_family_covered",
+    "type": "gauge",
+    "help": "Whether the required route family is currently proved complete.",
+    "labels": [
+      "family",
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_ingress_interface_family_required",
+    "type": "gauge",
+    "help": "Whether a route family must be covered by the configured interface set.",
+    "labels": [
+      "family",
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_ingress_interface_topology",
+    "type": "gauge",
+    "help": "NodeWaypoint ingress-interface topology validation state and bounded reason.",
+    "labels": [
+      "state",
       "reason",
       "namespace"
     ],
@@ -2536,6 +2686,72 @@
       "channel_type"
     ],
     "subsystem": "notifications",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_oauth2_introspection_cache_admission_skips_total",
+    "type": "counter",
+    "help": "OAuth2 introspection results not retained because a bounded cache admission could not complete.",
+    "labels": [
+      "class",
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "oauth2_introspection",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_oauth2_introspection_cache_cleanup_work_total",
+    "type": "counter",
+    "help": "Bounded OAuth2 introspection eviction-index tickets examined.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "oauth2_introspection",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_oauth2_introspection_cache_entries",
+    "type": "gauge",
+    "help": "OAuth2 introspection cache entries retained across live plugin generations.",
+    "labels": [
+      "class",
+      "namespace"
+    ],
+    "subsystem": "oauth2_introspection",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_oauth2_introspection_cache_evictions_total",
+    "type": "counter",
+    "help": "OAuth2 introspection cache entries evicted by bounded cleanup or capacity admission.",
+    "labels": [
+      "class",
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "oauth2_introspection",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_oauth2_introspection_cache_retained_bytes",
+    "type": "gauge",
+    "help": "OAuth2 introspection cache bytes retained across live plugin generations, including fixed eviction indexes.",
+    "labels": [
+      "class",
+      "namespace"
+    ],
+    "subsystem": "oauth2_introspection",
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "always"
@@ -2873,6 +3089,90 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_service_discovery_body_budget_rejected_total",
+    "type": "counter",
+    "help": "Service-discovery HTTP responses rejected because the concurrent body budget was exhausted.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_cursor_advance_total",
+    "type": "counter",
+    "help": "Service-discovery blocking-query cursor advances after an admitted higher-index snapshot.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_cursor_rollback_total",
+    "type": "counter",
+    "help": "Service-discovery blocking-query cursor rollbacks after an admitted lower-index snapshot.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_malformed_envelope_total",
+    "type": "counter",
+    "help": "Service-discovery Kubernetes EndpointSliceList envelopes rejected as malformed.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_provider_normalization_rejected_total",
+    "type": "counter",
+    "help": "Service-discovery snapshots rejected because every provider catalog entry failed provider normalization.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_response_oversized_total",
+    "type": "counter",
+    "help": "Service-discovery HTTP responses rejected for oversized or ambiguous body bounds.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_shared_admission_rejected_total",
+    "type": "counter",
+    "help": "Service-discovery snapshots rejected by shared host/egress target admission.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_stream_connections_total",
     "type": "counter",
     "help": "Total stream connections (TCP/UDP).",
@@ -3069,6 +3369,7 @@
       "direction",
       "io_side",
       "error_class",
+      "termination_reason",
       "le",
       "namespace"
     ],
@@ -3087,6 +3388,7 @@
       "direction",
       "io_side",
       "error_class",
+      "termination_reason",
       "namespace"
     ],
     "subsystem": "websocket",

@@ -230,6 +230,24 @@ pub fn append_optional_pool_key_component(buf: &mut String, component: Option<&s
     }
 }
 
+/// Append the effective optional H2 max-concurrent-streams pool-key segment.
+///
+/// Direct-H2 / native-gRPC builders bake `Proxy.pool_http2_max_concurrent_streams`
+/// into the connection (`max_concurrent_streams` + `initial_max_send_streams`),
+/// so the value must partition those pools. `None` writes the literal sentinel
+/// `none` (delimiter-safe digits-or-sentinel encoding, matching the HBONE /
+/// mesh-mTLS `write_pool_config_key` convention) so a DestinationRule update
+/// that removes the cap cannot reuse a connection built under the old limit.
+pub fn append_http2_max_concurrent_streams_pool_key(buf: &mut String, max_streams: Option<u32>) {
+    match max_streams {
+        Some(value) => {
+            use std::fmt::Write;
+            let _ = write!(buf, "{value}");
+        }
+        None => buf.push_str("none"),
+    }
+}
+
 fn append_optional_tls_source_pool_key_component(
     buf: &mut String,
     component: Option<&str>,

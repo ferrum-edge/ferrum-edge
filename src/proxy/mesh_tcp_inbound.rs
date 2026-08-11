@@ -83,13 +83,15 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     orig_dst: std::net::SocketAddr,
 ) {
     let proxy = entry.relay_proxy.as_ref();
-    // The captured app/container port (== `orig_dst.port()`, the loopback
-    // backend port) is the L4 authorization destination, NOT the shared
-    // `:15006` capture-listener port. `mesh_authz`'s stream path reads
-    // the connection destination fields (with `listen_port` as a compatibility
-    // fallback), so stamping the app port here lets a port-scoped
-    // AuthorizationPolicy DENY on the real service port be enforced.
-    let app_port = proxy.backend_port;
+    // Authorize on the captured original-destination port — the port the client
+    // dialed. For service-port default inbound that equals the container /
+    // backend port. For Sidecar `ingress[]` stream listeners (issue #3260) it is
+    // the DECLARED listener port, which may differ from `defaultEndpoint`;
+    // Istio scopes `AuthorizationPolicy` `destination.port` to that listener
+    // port, so authorizing on `proxy.backend_port` (the endpoint) would let a
+    // listener-scoped DENY fail open. `orig_dst` selected this entry, so its
+    // port is always the match key.
+    let app_port = orig_dst.port();
     // Single captured-inbound client-identity boundary (GHSA-vjwj-657f-5w9g).
     let client_ip = crate::util::client_identity::canonical_ip_string(remote_addr.ip());
     let backend_target = entry.backend_addr.to_string();

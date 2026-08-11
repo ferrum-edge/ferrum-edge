@@ -8,6 +8,9 @@ use ferrum_edge::plugins::{StreamTransactionSummary, TransactionSummary};
 /// Build a fully-populated TransactionSummary for testing.
 fn make_full_summary() -> TransactionSummary {
     TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         timestamp_received: "2026-03-25T12:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),

@@ -3153,8 +3153,61 @@ mod tests {
         (store, temp_dir)
     }
 
+    async fn finish_deferred_recovery_migrations(store: &DatabaseStore) {
+        assert!(
+            store
+                .maybe_apply_deferred_migrations()
+                .await
+                .expect("deferred recovery migrations"),
+            "offline store must begin with deferred migrations"
+        );
+    }
+
+    async fn seed_drifted_plugin_history(
+        store: &DatabaseStore,
+        plugin_migrations: &[(&str, Vec<crate::config::migrations::CustomPluginMigration>)],
+    ) -> bool {
+        let Some((plugin_name, migrations)) = plugin_migrations
+            .iter()
+            .find(|(_, migrations)| !migrations.is_empty())
+        else {
+            return false;
+        };
+        let migration = &migrations[0];
+        let pool = store.pool();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS _ferrum_plugin_migrations (
+                plugin_name TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                execution_time_ms INTEGER NOT NULL,
+                PRIMARY KEY (plugin_name, version)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("well-formed plugin tracking table");
+        sqlx::query(
+            "INSERT INTO _ferrum_plugin_migrations \
+             (plugin_name, version, name, applied_at, checksum, execution_time_ms) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(*plugin_name)
+        .bind(migration.version as i32)
+        .bind(migration.name)
+        .bind("2026-08-11T00:00:00Z")
+        .bind("drifted-checksum")
+        .bind(0_i32)
+        .execute(&pool)
+        .await
+        .expect("drifted plugin history row");
+        true
+    }
+
     #[tokio::test]
-    async fn offline_recovery_warn_only_probe_failure_matches_startup_and_allows_publication() {
+    async fn offline_recovery_warn_only_non_integrity_probe_error_allows_publication() {
         let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
         if plugin_migrations.is_empty() {
             // Default production builds deliberately compile no pedagogical
@@ -3163,6 +3216,7 @@ mod tests {
         }
 
         let (store, _temp_dir) = offline_recovery_test_store();
+        finish_deferred_recovery_migrations(&store).await;
         let pool = store.pool();
         sqlx::query("CREATE TABLE _ferrum_plugin_migrations (broken TEXT)")
             .execute(&pool)
@@ -3172,23 +3226,58 @@ mod tests {
         let db_available = AtomicBool::new(false);
         let reconcile_state = AtomicU8::new(PLUGIN_MIGRATIONS_NEED_RECONCILE);
 
-        // Warn-only probe failure must not wedge harder than a process restart
-        // (startup uses the non-strict probe path and continues).
+        // A malformed tracking-table schema produces an ordinary SQL probe
+        // failure, not a typed history-integrity classification. Warn-only
+        // recovery must match a process restart and allow publication.
         assert!(
             mark_db_available_after_successful_poll_load(
                 &db,
                 &db_available,
-                "test failed custom-plugin probe",
+                "test warn-only custom-plugin probe error",
                 false,
                 &reconcile_state,
             )
             .await,
-            "warn-only recovery must publish after a loud probe-failure warn"
+            "warn-only recovery must tolerate an unclassified probe error"
         );
         assert!(db_available.load(Ordering::Relaxed));
         assert_eq!(
             reconcile_state.load(Ordering::Acquire),
             PLUGIN_MIGRATIONS_RECONCILED
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_recovery_warn_only_typed_integrity_failure_stays_fail_closed() {
+        let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
+        if plugin_migrations.is_empty() {
+            return;
+        }
+
+        let (store, _temp_dir) = offline_recovery_test_store();
+        finish_deferred_recovery_migrations(&store).await;
+        if !seed_drifted_plugin_history(&store, &plugin_migrations).await {
+            return;
+        }
+        let db: Arc<dyn DatabaseBackend> = Arc::new(store);
+        let db_available = AtomicBool::new(false);
+        let reconcile_state = AtomicU8::new(PLUGIN_MIGRATIONS_NEED_RECONCILE);
+
+        assert!(
+            !mark_db_available_after_successful_poll_load(
+                &db,
+                &db_available,
+                "test drifted custom-plugin migration ledger",
+                false,
+                &reconcile_state,
+            )
+            .await,
+            "warn-only recovery must fail closed on typed migration-history drift"
+        );
+        assert!(!db_available.load(Ordering::Relaxed));
+        assert_eq!(
+            reconcile_state.load(Ordering::Acquire),
+            PLUGIN_MIGRATIONS_NEED_RECONCILE
         );
     }
 
@@ -3200,6 +3289,7 @@ mod tests {
         }
 
         let (store, _temp_dir) = offline_recovery_test_store();
+        finish_deferred_recovery_migrations(&store).await;
         let pool = store.pool();
         sqlx::query("CREATE TABLE _ferrum_plugin_migrations (broken TEXT)")
             .execute(&pool)
@@ -3265,18 +3355,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_recovery_validation_rejection_cannot_bypass_plugin_probe() {
+    async fn offline_recovery_validation_rejection_cannot_bypass_plugin_integrity_gate() {
         let plugin_migrations = crate::custom_plugins::collect_all_custom_plugin_migrations();
         if plugin_migrations.is_empty() {
             return;
         }
 
         let (store, _temp_dir) = offline_recovery_test_store();
-        let pool = store.pool();
-        sqlx::query("CREATE TABLE _ferrum_plugin_migrations (broken TEXT)")
-            .execute(&pool)
-            .await
-            .expect("malformed tracking table");
+        finish_deferred_recovery_migrations(&store).await;
+        if !seed_drifted_plugin_history(&store, &plugin_migrations).await {
+            return;
+        }
         let db: Arc<dyn DatabaseBackend> = Arc::new(store);
         let db_available = AtomicBool::new(false);
         let config_rejected = AtomicBool::new(false);
@@ -3294,16 +3383,16 @@ mod tests {
         )
         .await;
         assert!(config_rejected.load(Ordering::Relaxed));
-        // Warn-only probe failure matches startup (does not block writes); the
-        // independent config_rejected signal still prevents serving the bad
-        // snapshot while in-band repair remains available.
+        // A validation-rejected snapshot does not weaken the independent
+        // migration-history integrity gate. The drifted ledger must keep
+        // admin writes blocked even in warn-only mode.
         assert!(
-            db_available.load(Ordering::Relaxed),
-            "warn-only probe failure must not wedge admin writes harder than restart"
+            !db_available.load(Ordering::Relaxed),
+            "migration-history corruption must keep admin writes fail closed"
         );
         assert_eq!(
             reconcile_state.load(Ordering::Acquire),
-            PLUGIN_MIGRATIONS_RECONCILED
+            PLUGIN_MIGRATIONS_NEED_RECONCILE
         );
         assert!(
             config_rejected.load(Ordering::Relaxed),

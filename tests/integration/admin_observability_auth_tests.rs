@@ -164,6 +164,7 @@ async fn health_unauthenticated_omits_detailed_fields() {
         "cached_config",
         "database",
         "admin_writes_enabled",
+        "jwks_trust",
     ] {
         assert!(
             body.get(leaked).is_none(),
@@ -182,6 +183,25 @@ async fn health_unauthenticated_omits_detailed_fields() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body.get("mode").and_then(|v| v.as_str()), Some("file"));
     assert!(body.get("cached_config").is_some(), "detailed body: {body}");
+    // Neutral fleet (no active remote JWKS): fixed-cardinality aggregate only.
+    let jwks_trust = body
+        .get("jwks_trust")
+        .unwrap_or_else(|| panic!("authenticated /health must include jwks_trust: {body}"));
+    assert_eq!(jwks_trust.get("fresh").and_then(|v| v.as_u64()), Some(0));
+    assert_eq!(jwks_trust.get("grace").and_then(|v| v.as_u64()), Some(0));
+    assert_eq!(jwks_trust.get("expired").and_then(|v| v.as_u64()), Some(0));
+    let max_age = jwks_trust
+        .get("max_age_seconds")
+        .unwrap_or_else(|| panic!("jwks_trust.max_age_seconds required: {jwks_trust}"));
+    assert_eq!(max_age.get("fresh").and_then(|v| v.as_u64()), Some(0));
+    assert_eq!(max_age.get("grace").and_then(|v| v.as_u64()), Some(0));
+    assert_eq!(max_age.get("expired").and_then(|v| v.as_u64()), Some(0));
+    for leaked in ["uri", "jwks_uri", "kid", "keys", "token", "endpoint"] {
+        assert!(
+            jwks_trust.get(leaked).is_none(),
+            "jwks_trust must not expose `{leaked}`: {jwks_trust}"
+        );
+    }
 }
 
 #[tokio::test]

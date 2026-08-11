@@ -185,6 +185,42 @@ fn new_rejects_empty_providers() {
 }
 
 #[test]
+fn new_rejects_unbounded_and_impossible_cache_budgets() {
+    let endpoint = "http://127.0.0.1:8181/introspect";
+    let million_entries = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": endpoint,
+                "client_auth": {"method": "none"},
+                "max_cache_entries": 1_000_000
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("one million cache entries must exceed the hard maximum");
+    assert!(million_entries.contains("max_cache_entries"));
+    assert!(million_entries.contains("between 100 and 100000"));
+
+    let impossible_total = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": endpoint,
+                "client_auth": {"method": "none"},
+                "max_cache_entries": 100_000,
+                "max_cache_entry_bytes": 65_536,
+                "max_cache_total_bytes": 1_048_576
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("a total budget below the cache's minimum footprint must fail");
+    assert!(impossible_total.contains("max_cache_total_bytes"));
+    assert!(impossible_total.contains("must be at least"));
+}
+
+#[test]
 fn new_rejects_credentialed_client_auth_for_remote_http_endpoint() {
     // The invalid private-key PEM is intentional: private_key_jwt must fail on
     // the plaintext remote endpoint before any secret material is parsed.
@@ -1520,6 +1556,98 @@ async fn cache_policy_is_owned_by_each_live_plugin_instance() {
             .await,
     );
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn cache_retains_only_normalized_authorization_material() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "normalized-user",
+            "unrelated_provider_payload": "x".repeat(60 * 1024)
+        })))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/introspect", server.uri());
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": endpoint,
+                "client_auth": {"method": "none"},
+                "max_cache_entry_bytes": 256
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        let mut ctx = make_ctx("normalized-cache-token");
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some("normalized-user")
+        );
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "unrelated response JSON must not consume the normalized entry budget"
+    );
+}
+
+#[tokio::test]
+async fn oversized_normalized_result_is_authorized_but_not_cached() {
+    let server = MockServer::start().await;
+    let asserted_header = "h".repeat(512);
+    Mock::given(method("POST"))
+        .and(path("/introspect"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "active": true,
+            "username": "uncached-user",
+            "asserted": asserted_header.clone()
+        })))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/introspect", server.uri());
+    let plugin = Oauth2Introspection::new(
+        &json!({
+            "providers": [{
+                "introspection_endpoint": endpoint,
+                "client_auth": {"method": "none"},
+                "max_cache_entry_bytes": 256,
+                "claim_headers": {"asserted": "x-introspected-assertion"}
+            }]
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        let mut ctx = make_ctx("oversized-normalized-token");
+        assert_continue(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+        );
+        let mut headers = ctx.headers.clone();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            headers.get("x-introspected-assertion").map(String::as_str),
+            Some(asserted_header.as_str())
+        );
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        2,
+        "a valid oversized normalized result must work but must not be retained"
+    );
 }
 
 #[tokio::test]

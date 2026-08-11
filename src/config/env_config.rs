@@ -111,6 +111,181 @@ pub fn tls_store_instance_id_from_env() -> Option<String> {
     crate::config::conf_file::resolve_ferrum_var(key)
 }
 
+/// Settings key for the TLS material source byte ceiling.
+pub const TLS_MAX_MATERIAL_SIZE_BYTES_KEY: &str = "FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES";
+/// Default / recommended TLS material source byte ceiling (4 MiB).
+pub const DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 4 * 1024 * 1024;
+/// Minimum accepted TLS material source byte ceiling.
+pub const MIN_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 1;
+/// Hard maximum TLS material source byte ceiling (4 MiB).
+///
+/// This is intentionally finite and equal to the default: `0` is rejected (never
+/// unlimited), and the ceiling cannot be raised past the shared PEM parse
+/// admission bound.
+pub const HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Pure parse/validation for `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES`.
+///
+/// Used by [`EnvConfig`] and [`crate::tls::source::effective_tls_max_material_size_bytes`]
+/// when no runtime snapshot is installed. `None` means the key is configured
+/// nowhere. External unit tests call this helper directly so they do not race
+/// other suites on the process environment.
+pub fn parse_tls_max_material_size_bytes(raw: Option<&str>) -> Result<usize, String> {
+    let value = match raw {
+        None => return Ok(DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES),
+        Some(value) => value.trim().parse::<usize>().map_err(|_| {
+            format!(
+                "{TLS_MAX_MATERIAL_SIZE_BYTES_KEY} must be a whole number of bytes; \
+                 the configured value is not"
+            )
+        })?,
+    };
+    if value < MIN_TLS_MAX_MATERIAL_SIZE_BYTES {
+        return Err(format!(
+            "{TLS_MAX_MATERIAL_SIZE_BYTES_KEY} must be at least \
+             {MIN_TLS_MAX_MATERIAL_SIZE_BYTES} byte; 0 is not unlimited"
+        ));
+    }
+    Ok(value.min(HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES))
+}
+
+/// Settings key for the per-response discovery success-body ceiling.
+pub const SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES";
+/// Settings key for the discovery error-body ceiling.
+pub const SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES";
+/// Settings key for the process-wide concurrent discovery-body budget.
+pub const SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY: &str =
+    "FERRUM_SERVICE_DISCOVERY_BODY_BUDGET_BYTES";
+
+/// Default per-response Kubernetes/Consul discovery success-body ceiling (4 MiB).
+pub const DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Hard maximum per-response discovery success-body ceiling (16 MiB).
+pub const HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Default discovery error-body ceiling (4 KiB).
+pub const DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
+/// Hard maximum discovery error-body ceiling (64 KiB).
+pub const HARD_MAX_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// Default concurrent discovery-body budget across pollers (32 MiB).
+pub const DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// Hard maximum concurrent discovery-body budget (256 MiB).
+pub const HARD_MAX_SERVICE_DISCOVERY_BODY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Validated discovery body ceilings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryBodyLimits {
+    pub max_response_bytes: usize,
+    pub max_error_bytes: usize,
+    pub body_budget_bytes: usize,
+}
+
+impl DiscoveryBodyLimits {
+    pub const fn defaults() -> Self {
+        Self {
+            max_response_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+            max_error_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+            body_budget_bytes: DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        }
+    }
+}
+
+/// Pure parse/validation for the three discovery body env keys.
+///
+/// `None` for a key selects that key's documented default. Values above the
+/// hard maximum clamp down. `0` and malformed values fail closed. The error
+/// ceiling must not exceed the success ceiling, and the shared budget must be
+/// at least the success ceiling.
+pub fn parse_discovery_body_limits(
+    max_response: Option<&str>,
+    max_error: Option<&str>,
+    body_budget: Option<&str>,
+) -> Result<DiscoveryBodyLimits, String> {
+    let max_response_bytes = parse_discovery_body_positive_clamped(
+        max_response,
+        SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+        HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+    )?;
+    let max_error_bytes = parse_discovery_body_positive_clamped(
+        max_error,
+        SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        HARD_MAX_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+    )?;
+    let body_budget_bytes = parse_discovery_body_positive_clamped(
+        body_budget,
+        SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY,
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        HARD_MAX_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+    )?;
+    let limits = DiscoveryBodyLimits {
+        max_response_bytes,
+        max_error_bytes,
+        body_budget_bytes,
+    };
+    validate_discovery_body_limits(limits)?;
+    Ok(limits)
+}
+
+fn parse_discovery_body_positive_clamped(
+    raw: Option<&str>,
+    key: &str,
+    default: usize,
+    hard_max: usize,
+) -> Result<usize, String> {
+    let value = match raw {
+        None => return Ok(default),
+        Some(value) => value.trim().parse::<usize>().map_err(|_| {
+            format!("{key} must be a whole number of bytes; the configured value is not")
+        })?,
+    };
+    if value == 0 {
+        return Err(format!("{key} must be at least 1 byte; 0 is not unlimited"));
+    }
+    Ok(value.min(hard_max))
+}
+
+fn validate_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), String> {
+    if limits.max_response_bytes == 0
+        || limits.max_error_bytes == 0
+        || limits.body_budget_bytes == 0
+    {
+        return Err("service discovery body ceilings must be >= 1; 0 is not unlimited".to_string());
+    }
+    if limits.max_response_bytes > HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES {
+        return Err(format!(
+            "{SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY} must be <= \
+             {HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES}"
+        ));
+    }
+    if limits.max_error_bytes > HARD_MAX_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES {
+        return Err(format!(
+            "{SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY} must be <= \
+             {HARD_MAX_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES}"
+        ));
+    }
+    if limits.body_budget_bytes > HARD_MAX_SERVICE_DISCOVERY_BODY_BUDGET_BYTES {
+        return Err(format!(
+            "{SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY} must be <= \
+             {HARD_MAX_SERVICE_DISCOVERY_BODY_BUDGET_BYTES}"
+        ));
+    }
+    if limits.max_error_bytes > limits.max_response_bytes {
+        return Err(format!(
+            "{SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY} must be <= \
+             {SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY}"
+        ));
+    }
+    if limits.body_budget_bytes < limits.max_response_bytes {
+        return Err(format!(
+            "{SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY} must be >= \
+             {SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY}"
+        ));
+    }
+    Ok(())
+}
+
 /// SQL connection target for secondary consumers that must track the gateway
 /// configuration database (`FERRUM_DB_TYPE` + effective `FERRUM_DB_URL`).
 ///
@@ -1170,6 +1345,16 @@ pub struct EnvConfig {
     // Admin API
     pub admin_http_port: u16,
     pub admin_https_port: u16,
+    /// Whether `FERRUM_ADMIN_HTTPS_PORT` was present in the environment or
+    /// `ferrum.conf` (any value, including `0` or `9443`).
+    ///
+    /// The hardcoded/default value `9443` alone is **not** operator intent: raw
+    /// binary HTTP-only startups inherit that default without requesting HTTPS.
+    /// Node-agent / shared admin HTTPS planning uses
+    /// [`Self::admin_https_explicitly_requested`] so an inherited default stays
+    /// compatible while an explicitly configured nonzero HTTPS listener fails
+    /// closed on missing/partial TLS (issue #3704).
+    pub admin_https_port_configured: bool,
     pub admin_tls_cert_path: Option<String>,
     pub admin_tls_key_path: Option<String>,
     /// Bind address for Admin API listeners (HTTP, HTTPS).
@@ -1514,7 +1699,7 @@ pub struct EnvConfig {
     /// primary with the outgoing key published for verification.
     pub mesh_jwt_key_lifetime_seconds: u64,
     /// Peer-credential attestation rules for the Workload API server, as
-    /// `uid:<uid>=<spiffe-id>` / `sha256:<hex>=<spiffe-id>` entries. A workload
+    /// `uid:<uid>=<spiffe-id>` entries. A workload
     /// that matches no rule is refused: the Workload API never assigns an
     /// identity it was not told to assign.
     pub mesh_workload_api_unix_identity_rules: Vec<String>,
@@ -1953,8 +2138,8 @@ pub struct EnvConfig {
     /// Ping/Pong, or transport bytes) for this duration. Activity from EITHER
     /// direction refreshes the shared watermark, so heartbeating clients stay
     /// open. The per-proxy `websocket_idle_timeout_seconds` overrides this.
-    /// `0` = disabled (idle sessions live forever, bounded only by
-    /// `websocket_max_connections`). Default: 300 (5 minutes).
+    /// `0` disables only the idle bound; the absolute WebSocket lifetime still
+    /// applies. Default: 300 (5 minutes).
     ///
     /// HTTP/3 caveat: on QUIC frontends the transport-level connection idle
     /// timeout (`FERRUM_HTTP3_IDLE_TIMEOUT`, default 30s) can close an
@@ -1963,6 +2148,9 @@ pub struct EnvConfig {
     /// `FERRUM_HTTP3_IDLE_TIMEOUT` when isolated H3 WebSockets need a longer
     /// idle window.
     pub websocket_idle_timeout_seconds: u64,
+    /// Absolute lifetime for every accepted WebSocket session, independent of
+    /// traffic and idle activity. Must be 1..=86400 seconds. Default: 3600.
+    pub websocket_max_lifetime_seconds: u64,
     /// Maximum physical WebSocket frames a single fragmented message may consume
     /// before the connection is closed with RFC 6455 code `1008`. Counts the
     /// initial non-final Text/Binary frame plus every continuation frame that
@@ -2326,6 +2514,21 @@ pub struct EnvConfig {
     /// non-mTLS listener. Ordinary inbound TLS 1.3 uses stateless tickets.
     /// (default: 4096)
     pub tls_session_cache_size: usize,
+    /// Maximum bytes admitted from any TLS material source before whole-value
+    /// buffering (local files, inline PEM, external secret providers,
+    /// Kubernetes Secrets, managed store, and ACME store). Default and hard
+    /// maximum are both 4 MiB; `0` is rejected (not unlimited). (default: 4194304)
+    pub tls_max_material_size_bytes: usize,
+    /// Per-response Kubernetes/Consul discovery success-body ceiling in bytes.
+    /// Default 4 MiB, hard maximum 16 MiB; `0` is rejected (not unlimited).
+    pub service_discovery_max_response_body_bytes: usize,
+    /// Independent discovery error-body ceiling in bytes (tighter than success).
+    /// Default 4 KiB, hard maximum 64 KiB; `0` is rejected (not unlimited).
+    pub service_discovery_max_error_body_bytes: usize,
+    /// Process-wide concurrent discovery-body budget in bytes across all
+    /// Kubernetes/Consul pollers. Default 32 MiB, hard maximum 256 MiB; must be
+    /// at least the per-response success ceiling; `0` is rejected.
+    pub service_discovery_body_budget_bytes: usize,
     /// Number of days before certificate expiration to emit a warning log.
     /// Expired certificates are rejected at startup/config-load time.
     /// Set to 0 to disable near-expiry warnings. (default: 30)
@@ -2831,6 +3034,7 @@ impl Default for EnvConfig {
             proxy_bind_address: "0.0.0.0".into(),
             admin_http_port: 9000,
             admin_https_port: 9443,
+            admin_https_port_configured: false,
             admin_tls_cert_path: None,
             admin_tls_key_path: None,
             admin_bind_address: "127.0.0.1".into(),
@@ -2990,6 +3194,7 @@ impl Default for EnvConfig {
             websocket_write_buffer_size: 131_072, // 128 KB
             websocket_tunnel_mode: false,
             websocket_idle_timeout_seconds: 300,
+            websocket_max_lifetime_seconds: 3_600,
             websocket_max_incomplete_message_frames: 1_024,
             websocket_max_incomplete_message_seconds: 60,
             max_credentials_per_type: 2,
@@ -3079,6 +3284,11 @@ impl Default for EnvConfig {
             tls_prefer_server_cipher_order: true,
             tls_curves: None,
             tls_session_cache_size: 4096,
+            tls_max_material_size_bytes: DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+            service_discovery_max_response_body_bytes:
+                DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+            service_discovery_max_error_body_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+            service_discovery_body_budget_bytes: DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
             tls_cert_expiry_warning_days: 30,
             tls_inventory_snapshot_ttl_seconds: DEFAULT_SNAPSHOT_TTL_SECONDS,
             tls_early_data_methods: HashSet::new(),
@@ -3268,6 +3478,11 @@ impl EnvConfig {
                 => crate::admin::audit::AUDIT_MAX_DELIVERY_ATTEMPTS_DEFAULT;
             admin_require_namespace_claim: bool = "FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM" => false;
         }
+        // Durable HTTPS-intent signal: the inherited default `9443` alone is not
+        // an operator request. Capture whether the port key was actually present
+        // so node-agent / shared planners can fail closed on explicit incomplete
+        // TLS without breaking raw HTTP-only defaults (issue #3704).
+        let admin_https_port_configured = resolve_var(conf, "FERRUM_ADMIN_HTTPS_PORT").is_some();
         let audit_retention_policy = crate::admin::audit::AuditRetentionPolicy::from_parts(
             audit_retention_days,
             Some(audit_retention_max_rows),
@@ -3528,6 +3743,7 @@ impl EnvConfig {
             websocket_write_buffer_size: usize = "FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE" => 131_072usize;
             websocket_tunnel_mode: bool = "FERRUM_WEBSOCKET_TUNNEL_MODE" => false;
             websocket_idle_timeout_seconds: u64 = "FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS" => 300u64;
+            websocket_max_lifetime_seconds: u64 = "FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS" => 3_600u64;
             websocket_max_incomplete_message_frames: usize = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES" => 1_024usize;
             websocket_max_incomplete_message_seconds: u64 = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS" => 60u64;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
@@ -3624,6 +3840,32 @@ impl EnvConfig {
             tls_cert_expiry_warning_days: u64 = "FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS" => 30u64;
             tls_inventory_snapshot_ttl_seconds: u64 = "FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS" => DEFAULT_SNAPSHOT_TTL_SECONDS, clamp(0u64, 86_400u64);
         }
+
+        // Same pure parser as free-helper / loader paths. Install the validated
+        // limit as the authoritative process snapshot. Identical reinstall is
+        // accepted; a mismatching repeated value fails closed so this field
+        // cannot diverge from what production loaders enforce.
+        let tls_max_material_size_bytes = parse_tls_max_material_size_bytes(
+            resolve_var(conf, TLS_MAX_MATERIAL_SIZE_BYTES_KEY).as_deref(),
+        )?;
+        crate::tls::source::install_tls_max_material_size_bytes(tls_max_material_size_bytes)
+            .map_err(|error| match error {
+                crate::tls::source::MaterialError::InvalidSource { details, .. } => details,
+                other => other.to_string(),
+            })?;
+
+        let discovery_body_limits = parse_discovery_body_limits(
+            resolve_var(conf, SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY).as_deref(),
+            resolve_var(conf, SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY).as_deref(),
+            resolve_var(conf, SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY).as_deref(),
+        )?;
+        // Parsing stays pure: do not publish the process OnceLock here.
+        // `main` installs the accepted EnvConfig snapshot once before any
+        // discovery poller can run (identical reinstall accepted; mismatch
+        // fails closed at that seam).
+        let service_discovery_max_response_body_bytes = discovery_body_limits.max_response_bytes;
+        let service_discovery_max_error_body_bytes = discovery_body_limits.max_error_bytes;
+        let service_discovery_body_budget_bytes = discovery_body_limits.body_budget_bytes;
 
         // This binding is trusted process configuration, never connection or
         // header data. An explicit empty value deliberately clears it. When it
@@ -4118,6 +4360,7 @@ impl EnvConfig {
             proxy_bind_address,
             admin_http_port,
             admin_https_port,
+            admin_https_port_configured,
             admin_tls_cert_path,
             admin_tls_key_path,
             admin_bind_address,
@@ -4270,6 +4513,7 @@ impl EnvConfig {
             websocket_write_buffer_size,
             websocket_tunnel_mode,
             websocket_idle_timeout_seconds,
+            websocket_max_lifetime_seconds,
             websocket_max_incomplete_message_frames,
             websocket_max_incomplete_message_seconds,
             max_credentials_per_type,
@@ -4353,6 +4597,10 @@ impl EnvConfig {
             tls_prefer_server_cipher_order,
             tls_curves,
             tls_session_cache_size,
+            tls_max_material_size_bytes,
+            service_discovery_max_response_body_bytes,
+            service_discovery_max_error_body_bytes,
+            service_discovery_body_budget_bytes,
             tls_cert_expiry_warning_days,
             tls_inventory_snapshot_ttl_seconds,
             tls_early_data_methods,
@@ -4513,6 +4761,24 @@ impl EnvConfig {
         self.admin_https_port != 0
             && self.admin_tls_cert_path.is_some()
             && self.admin_tls_key_path.is_some()
+    }
+
+    /// Whether the operator explicitly requested admin HTTPS configuration.
+    ///
+    /// True when `FERRUM_ADMIN_HTTPS_PORT` was present in env/`ferrum.conf`,
+    /// either admin TLS cert/key path is set, a client CA / OCSP source is set,
+    /// or `FERRUM_ADMIN_TLS_NO_VERIFY=true`. The inherited global default port
+    /// `9443` with none of those signals is **not** an explicit request — that
+    /// is the raw binary HTTP-only compatibility posture (issue #3704). Port
+    /// `0` remains the unconditional HTTPS disable sentinel even when TLS
+    /// intent fields are present.
+    pub fn admin_https_explicitly_requested(&self) -> bool {
+        self.admin_https_port_configured
+            || self.admin_tls_cert_path.is_some()
+            || self.admin_tls_key_path.is_some()
+            || self.admin_tls_client_ca_bundle_path.is_some()
+            || self.admin_tls_ocsp_response_source.is_some()
+            || self.admin_tls_no_verify
     }
 
     /// Classify the network exposure of the **plaintext** admin HTTP listener
@@ -5267,6 +5533,11 @@ impl EnvConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        if !(1..=86_400).contains(&self.websocket_max_lifetime_seconds) {
+            return Err(
+                "FERRUM_WEBSOCKET_MAX_LIFETIME_SECONDS must be between 1 and 86400 seconds".into(),
+            );
+        }
         if let Some(gateway_ref) = self.stream_gateway_ref.as_deref() {
             crate::proxy::stream_match::validate_canonical_gateway_ref(gateway_ref)
                 .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;
@@ -5654,6 +5925,37 @@ impl EnvConfig {
                     }
                 }
                 if crate::identity::production_mode() {
+                    // Refuse gateway-wide TLS verification bypasses under
+                    // production mesh posture before any listener, service-
+                    // discovery poller, health check, plugin client, or admin
+                    // client can start. This is topology-independent (sidecar,
+                    // ambient, waypoints, east-west, egress) and lives in the
+                    // shared EnvConfig path used by both `validate` and runtime
+                    // startup. FIPS independently refuses the same switches;
+                    // keep that defense intact. Outside production the explicit
+                    // development opt-in still only warns (below).
+                    //
+                    // Offenders are collected in fixed name order so dual-flag
+                    // misconfigurations yield a deterministic diagnostic that
+                    // names every offending variable without echoing values.
+                    {
+                        let mut offenders: Vec<&'static str> = Vec::new();
+                        if self.tls_no_verify {
+                            offenders.push("FERRUM_TLS_NO_VERIFY");
+                        }
+                        if self.admin_tls_no_verify {
+                            offenders.push("FERRUM_ADMIN_TLS_NO_VERIFY");
+                        }
+                        if !offenders.is_empty() {
+                            return Err(format!(
+                                "FERRUM_MESH_PRODUCTION_MODE=true refuses TLS verification \
+                                 bypasses: {}. Disable the listed variable(s) and use verified \
+                                 TLS (system roots or FERRUM_TLS_CA_BUNDLE_PATH); these switches \
+                                 are development-only",
+                                offenders.join(", ")
+                            ));
+                        }
+                    }
                     if self.mesh_federation_poll_interval_seconds > 0
                         && self.mesh_federation_max_stale_seconds == 0
                     {

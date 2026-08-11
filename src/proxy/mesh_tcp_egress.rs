@@ -14,9 +14,13 @@
 //!   (dial the peer's `:15006`). The destination sidecar's inbound listener is
 //!   topology-agnostic — a bare H2 CONNECT is recognized + relayed by the same
 //!   `build_inbound_hbone_relay_proxy` machinery (gated by `is_hbone_connect` +
-//!   `mesh_direction == Inbound`), so no destination-side changes are involved.
-//!   Unlike HBONE there is NO capability registry: `mesh.mtls` peers are
-//!   slice-declared sidecars by construction.
+//!   `mesh_direction == Inbound`). That boundary normally dials the CONNECT
+//!   `:authority`, and additionally remaps it onto a declared Sidecar
+//!   `ingress[]` stream listener's `defaultEndpoint` when the authority names
+//!   the destination workload on such a listener port (issue #3260) — this
+//!   tunnel's authority is `pod-ip:<app port>`, so a declared ingress listener
+//!   port arrives here verbatim. Unlike HBONE there is NO capability registry:
+//!   `mesh.mtls` peers are slice-declared sidecars by construction.
 //!
 //! Fail-closed rules (mirroring the HTTP per-port orig-dst path):
 //! - the target must carry exactly one transport tag (`mesh.hbone` XOR

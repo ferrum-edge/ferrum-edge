@@ -206,6 +206,8 @@ async fn a_rejected_reload_leaves_the_matching_identity_loadable() {
             interval: Duration::from_millis(50),
             revision_tx,
             rebuild,
+            max_material_bytes:
+                ferrum_edge::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
         },
         Some(shutdown_rx),
     );

@@ -809,7 +809,9 @@ downstream behaviour:
   address.
 
 See [mesh.md](mesh.md) → "UDP TPROXY capture" and "Host-network UDP capture" for
-the capture rules, identity model, and fail-closed contract.
+the capture rules, identity model, fail-closed contract, and the mandatory
+generation-bound cleanup/finalize workflow for changing placement or enabled
+state. A direct placement flip is rejected.
 
 ## Kubernetes Gateway API (`TCPRoute` / `UDPRoute`)
 

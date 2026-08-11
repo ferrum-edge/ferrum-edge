@@ -17,15 +17,17 @@ use chrono::DateTime;
 use serde_json::Value;
 
 use super::gateway_api::{
-    allowed_route_namespaces, gateway_api_section_name_is_valid, listener_allowed_route_kinds,
-    listener_app_protocol, listener_is_materializable, listener_protocol_mode_is_supported,
-    listener_requires_frontend_tls, listener_selected_frontend_tls_source, namespace_selector,
-    namespace_selector_matches, normalize_gateway_hostname, validate_listenerset_listener_entry,
+    allowed_route_namespaces, collect_gateway_frontend_tls, gateway_api_section_name_is_valid,
+    listener_allowed_route_kinds, listener_app_protocol, listener_is_materializable,
+    listener_protocol_mode_is_supported, listener_requires_frontend_tls,
+    listener_selected_frontend_tls_source, namespace_selector, namespace_selector_matches,
+    normalize_gateway_hostname, validate_listenerset_listener_entry,
 };
 use super::{
-    GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerParentKind,
-    GatewayApiListenerPolicy, GatewayApiListenerSetStatus, K8sAccumulator, K8sObject,
-    K8sResourceKey, K8sTranslateError, includes_object_namespace, string_field,
+    GatewayApiAllowedRoutesNamespaces, GatewayApiListenerConflict, GatewayApiListenerKey,
+    GatewayApiListenerParentKind, GatewayApiListenerPolicy, GatewayApiListenerSetStatus,
+    K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError, includes_object_namespace,
+    string_field,
 };
 use crate::modes::mesh::config::{MeshService, ServicePort};
 
@@ -273,6 +275,8 @@ fn collect_one_listenerset(
         );
     }
 
+    collect_gateway_frontend_tls(acc, object);
+
     let accepted = saw_valid_listener;
     record_listenerset_status(
         acc,
@@ -345,6 +349,56 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
     }
 
     let mut conflicted: HashMap<GatewayApiListenerKey, &'static str> = HashMap::new();
+
+    // ProtocolConflict is physical and process-wide: socket ownership is not
+    // parent-Gateway-scoped (`GatewayListenerPlan::from_config` builds one
+    // global stream_ports set). For each numeric TCP port across every eligible
+    // managed Gateway and attached ListenerSet claim in this accumulator, if any
+    // eligible HTTP-family claim coexists with any eligible raw TCP/TLS-stream
+    // claim, every eligible claim in those two families is refused. UDP is a
+    // separate transport and is never withdrawn by this rule. A sequential
+    // accept/remove walk is wrong for 3+ claims (HTTP, TCP, HTTP): removing the
+    // first pair from `accepted` would let a later same-family sibling survive
+    // depending on listener/name order.
+    let mut tcp_family_by_port: BTreeMap<u64, Vec<&ConflictCandidate>> = BTreeMap::new();
+    for candidates in by_gateway.values() {
+        for candidate in candidates.iter() {
+            if !candidate.eligible {
+                continue;
+            }
+            match listener_port_family(candidate.protocol.as_str()) {
+                Some(ListenerPortFamily::Http | ListenerPortFamily::TcpStream) => {
+                    tcp_family_by_port
+                        .entry(candidate.port)
+                        .or_default()
+                        .push(candidate);
+                }
+                Some(ListenerPortFamily::Udp) | None => {}
+            }
+        }
+    }
+    for port_candidates in tcp_family_by_port.values() {
+        let has_http = port_candidates.iter().any(|candidate| {
+            listener_port_family(candidate.protocol.as_str()) == Some(ListenerPortFamily::Http)
+        });
+        let has_tcp_stream = port_candidates.iter().any(|candidate| {
+            listener_port_family(candidate.protocol.as_str()) == Some(ListenerPortFamily::TcpStream)
+        });
+        if has_http && has_tcp_stream {
+            for candidate in port_candidates {
+                conflicted.insert(candidate.key.clone(), "ProtocolConflict");
+            }
+        }
+    }
+
+    // HostnameConflict keeps Gateway→ListenerSet precedence (only the later
+    // claim loses) among otherwise compatible same-protocol claims that
+    // survived family arbitration, scoped to the parent Gateway exactly as
+    // before. Equal values conflict at every trust level; a later ListenerSet
+    // also loses when its coverage overlaps a Gateway or different ListenerSet
+    // owner. Distinct values within one owner still coexist. Plaintext-vs-TLS
+    // HTTP-family refusal stays in `refuse_incompatible_same_port_listeners` so
+    // messages stay one decision per physical shape.
     for candidates in by_gateway.values_mut() {
         candidates.sort_by(|left, right| {
             (
@@ -360,20 +414,20 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
                     right.key.listener.as_str(),
                 ))
         });
+
         let mut accepted: Vec<&ConflictCandidate> = Vec::new();
         for candidate in candidates.iter() {
-            if !candidate.eligible {
+            if !candidate.eligible || conflicted.contains_key(&candidate.key) {
                 continue;
             }
-            // ListenerSet merge conflict is only applied to ListenerSet losers.
-            // Parent Gateway listeners stay accepted anchors (and keep their
-            // established co-existence, e.g. HTTPS catch-all + hostname
-            // siblings on :443). Marking Gateway-vs-Gateway siblings conflicted
-            // here wrongly suppresses routes such as HTTPRouteHTTPSListener's
-            // sectionName attachment to `https-with-hostname`.
-            if let Some(reason) = conflict_against_accepted(candidate, &accepted)
-                && candidate.key.parent_kind == GatewayApiListenerParentKind::ListenerSet
-            {
+            // Exact-duplicate same-protocol claims lose here at every trust
+            // level. Cross-trust Gateway→ListenerSet overlap is stricter so a
+            // tenant cannot materialize inside another owner's coverage, while
+            // compatible siblings within one owner remain materializable.
+            // Process-wide HTTP-family vs raw TCP/TLS ProtocolConflict was
+            // already decided above; this walk applies only same-protocol
+            // HostnameConflict.
+            if let Some(reason) = conflict_against_accepted(candidate, &accepted) {
                 conflicted.insert(candidate.key.clone(), reason);
                 continue;
             }
@@ -382,18 +436,47 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
     }
 
     for (key, reason) in &conflicted {
-        if let Some(policy) = acc.gateway_api_listener_policies.get_mut(key) {
+        {
+            let Some(policy) = acc.gateway_api_listener_policies.get_mut(key) else {
+                continue;
+            };
             policy.conflict_reason = Some(*reason);
             policy.materializable = false;
             policy.routes_materializable = false;
-            acc.warnings.push(format!(
-                "Gateway API {} {}/{} listener {} rejected: {reason}",
-                key.parent_kind.as_str(),
-                key.namespace,
-                key.gateway,
-                key.listener
-            ));
         }
+        acc.warnings.push(format!(
+            "Gateway API {} {}/{} listener {} rejected: {reason}",
+            key.parent_kind.as_str(),
+            key.namespace,
+            key.gateway,
+            key.listener
+        ));
+        // Gateway.status.listeners[] reads only `gateway_api_listener_conflicts`.
+        // Withdrawal without an entry leaves Conflicted=False / Accepted=True
+        // while no traffic materializes.
+        let message = match *reason {
+            "ProtocolConflict" => {
+                let port = acc
+                    .gateway_api_listener_policies
+                    .get(key)
+                    .and_then(|policy| policy.port)
+                    .unwrap_or(0);
+                // Deterministic bounded wording: numeric port + families only.
+                // Never echo object/listener/hostname names (cross-tenant risk).
+                format!(
+                    "Port {port} is claimed by incompatible protocol families on the same TCP \
+                     transport (HTTP-family vs raw stream), so every conflicting claim on this \
+                     port is refused (Conflicted)."
+                )
+            }
+            "HostnameConflict" => {
+                "Listener hostname conflicts with a higher-precedence listener on the same port."
+                    .to_string()
+            }
+            other => format!("Gateway API listener rejected: {other}"),
+        };
+        acc.gateway_api_listener_conflicts
+            .insert(key.clone(), GatewayApiListenerConflict { reason, message });
     }
 
     refresh_listenerset_status_after_conflicts(acc);
@@ -403,7 +486,6 @@ pub(crate) fn finalize_listenerset_conflicts(acc: &mut K8sAccumulator, objects: 
 pub(crate) fn materialize_listenerset_mesh_services(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
-    namespace_tls_ready: bool,
 ) -> Result<(), K8sTranslateError> {
     let attached = acc
         .listenerset_statuses
@@ -435,7 +517,10 @@ pub(crate) fn materialize_listenerset_mesh_services(
         let Some(policy) = acc.gateway_api_listener_policies.get(&key) else {
             continue;
         };
-        if !policy.materializable || policy.conflict_reason.is_some() {
+        if !policy.materializable
+            || !policy.routes_materializable
+            || policy.conflict_reason.is_some()
+        {
             continue;
         }
         if policy.validation_error.is_some() {
@@ -445,7 +530,7 @@ pub(crate) fn materialize_listenerset_mesh_services(
             continue;
         }
         if listener_requires_frontend_tls(listener)
-            && (!namespace_tls_ready || !listener_is_materializable(acc, object, listener))
+            && !listener_is_materializable(acc, object, listener)
         {
             acc.warnings.push(format!(
                 "Gateway API ListenerSet {}/{} listener {} has unresolved TLS material and will not be exposed",
@@ -458,11 +543,15 @@ pub(crate) fn materialize_listenerset_mesh_services(
         };
         let port = super::port_from_u64(object, raw_port, "listeners[].port")?;
         acc.mesh.services.push(MeshService {
-            // Gateway and ListenerSet are distinct Kubernetes resources and
-            // may legally share namespace/name/listener. Keep the synthetic
-            // service identity kind-scoped so one resource can never masquerade
-            // as the other's materialization in downstream consumers.
-            name: format!("listenerset-{}-{listener_name}", object.metadata.name),
+            // Kind-scoped, length-prefixed identity — see
+            // `gateway_api_listener_mesh_service_name`. Shared with Gateway
+            // materialization so both kinds stay injective under
+            // `(namespace, name)` keying.
+            name: super::gateway_api_listener_mesh_service_name(
+                GatewayApiListenerParentKind::ListenerSet,
+                &object.metadata.name,
+                listener_name,
+            ),
             namespace: object.metadata.namespace.clone(),
             ports: vec![ServicePort {
                 port,
@@ -601,25 +690,92 @@ fn conflict_against_accepted(
         if prior.port != candidate.port {
             continue;
         }
-        if !prior.protocol.eq_ignore_ascii_case(&candidate.protocol) {
-            return Some("ProtocolConflict");
-        }
-        if hostnames_conflict(prior.hostname.as_deref(), candidate.hostname.as_deref()) {
+        // ProtocolConflict (HTTP-family vs raw TCP/TLS stream) is decided
+        // order-independently per numeric TCP port across the whole accumulator
+        // before this walk. Same protocol family: hostname distinctness only.
+        // HTTP vs HTTPS on one port is plaintext-vs-TLS physical refusal owned
+        // by `refuse_incompatible_same_port_listeners`, not a family conflict.
+        if prior.protocol.eq_ignore_ascii_case(&candidate.protocol)
+            && hostnames_conflict(prior, candidate)
+        {
             return Some("HostnameConflict");
         }
     }
     None
 }
 
-fn hostnames_conflict(left: Option<&str>, right: Option<&str>) -> bool {
-    // Pinned Gateway listener distinctness: exact, wildcard, and fallback
-    // (empty/unset hostname) are distinct values. Only equal hostname values
-    // conflict on the same protocol+port; runtime precedence handles overlap.
+/// OS/datapath family for Gateway API listener protocol conflict arbitration.
+///
+/// TCP and UDP may share a numeric port (different transports). Within TCP,
+/// HTTP-family accept loops cannot share a socket with raw TCP / TLS-passthrough
+/// stream listeners. Compatible HTTP-family siblings and opaque TCP/TLS stream
+/// siblings are not ProtocolConflict here — plaintext-vs-TLS HTTP shapes are
+/// refused by [`super::gateway_api::refuse_incompatible_same_port_listeners`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListenerPortFamily {
+    Http,
+    TcpStream,
+    Udp,
+}
+
+fn listener_port_family(protocol: &str) -> Option<ListenerPortFamily> {
+    match protocol.to_ascii_uppercase().as_str() {
+        "HTTP" | "HTTPS" | "GRPC" | "GRPCS" => Some(ListenerPortFamily::Http),
+        "TCP" | "TLS" => Some(ListenerPortFamily::TcpStream),
+        "UDP" => Some(ListenerPortFamily::Udp),
+        _ => None,
+    }
+}
+
+/// Hostname conflict arbitration for ListenerSet merge.
+///
+/// Gateway API v1.5.1 treats exact, wildcard, and unset/catch-all hostnames as
+/// distinct listener values: compatible siblings coexist and runtime precedence
+/// picks the most specific match. Identical hostname values still conflict.
+///
+/// Claims across owners are stricter. A **ListenerSet** must not materialize a
+/// hostname that overlaps coverage already owned by either the parent Gateway
+/// or another ListenerSet — including exact-vs-wildcard, nested wildcards, and
+/// unset/catch-all — or it can hijack traffic the existing owner already claims.
+fn hostnames_conflict(prior: &ConflictCandidate, candidate: &ConflictCandidate) -> bool {
+    let left = prior.hostname.as_deref();
+    let right = candidate.hostname.as_deref();
+    let different_owner = candidate.key.parent_kind == GatewayApiListenerParentKind::ListenerSet
+        && (prior.key.parent_kind == GatewayApiListenerParentKind::Gateway
+            || prior.key.namespace != candidate.key.namespace
+            || prior.key.gateway != candidate.key.gateway);
+
     match (left, right) {
         (None, None) => true,
-        (Some(left), Some(right)) => left == right,
-        (None, Some(_)) | (Some(_), None) => false,
+        (Some(left), Some(right)) if left == right => true,
+        (Some(left), Some(right)) => different_owner && hostname_coverages_overlap(left, right),
+        (None, Some(_)) | (Some(_), None) => different_owner,
     }
+}
+
+fn hostname_coverages_overlap(left: &str, right: &str) -> bool {
+    let left_suffix = left.strip_prefix("*.");
+    let right_suffix = right.strip_prefix("*.");
+    match (left_suffix, right_suffix) {
+        (None, None) => false,
+        (Some(suffix), None) => hostname_matches_suffix(right, suffix),
+        (None, Some(suffix)) => hostname_matches_suffix(left, suffix),
+        (Some(left), Some(right)) => suffix_is_within(left, right) || suffix_is_within(right, left),
+    }
+}
+
+fn hostname_matches_suffix(hostname: &str, suffix: &str) -> bool {
+    // Gateway API wildcard coverage is a DNS-suffix match below the suffix,
+    // but never includes the bare suffix apex (`*.example.com` ⊄ `example.com`).
+    hostname != suffix && suffix_is_within(hostname, suffix)
+}
+
+fn suffix_is_within(hostname: &str, suffix: &str) -> bool {
+    // Require a DNS label boundary so `notexample.com` never matches
+    // `*.example.com` via a raw string suffix.
+    hostname
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 fn listenerset_listener_names_are_duplicated(listeners: &[Value]) -> bool {

@@ -382,16 +382,17 @@ pub struct MeshSlice {
     /// Istio `Sidecar.ingress[]`. Computed at slice build (the applicable
     /// Sidecar is resolved CP-side; raw `MeshSidecar` records do not ride the
     /// slice, only this resolved view — mirroring `local_inbound_services`).
-    /// Per Istio semantics, when this is non-empty it **replaces** the default
-    /// per-service-port inbound materialization for the workload: the inbound
-    /// materializer emits one loopback route per entry (listener port → the
-    /// entry's `defaultEndpoint`) instead of the service-port defaults. Only
+    /// Per Istio semantics, when `sidecar_ingress_declared` is true the entries
+    /// here **replace** the default per-service-port inbound materialization for
+    /// the workload: the inbound materializer emits an HTTP route or raw-TCP
+    /// relay per resolved entry instead of the service-port defaults. Only
     /// resolvable entries land here; unsupported shapes (non-loopback
-    /// `defaultEndpoint`, an inadmissible Unix-socket path, or a non-HTTP-family
-    /// protocol) are dropped at resolution and reported as deferred. Admissible
-    /// Unix-socket listeners remain subject to the data plane's containment
-    /// allowlist at materialization and dial time. Empty when no Sidecar applies,
-    /// the Sidecar declares no ingress, or no entry resolved.
+    /// `defaultEndpoint`, an inadmissible Unix-socket path, or an unmodeled
+    /// `Unknown`/`Udp` protocol) are dropped at resolution and reported as
+    /// deferred. Recognized stream protocols materialize raw-TCP relays;
+    /// admissible Unix-socket listeners remain HTTP-only and subject to the data
+    /// plane's containment allowlist at materialization and dial time. Empty when
+    /// no Sidecar applies, the Sidecar declares no ingress, or no entry resolved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_ingress_listeners: Vec<ResolvedIngressListener>,
     /// Fail-closed marker: the local workload's applicable `Sidecar` declared a
@@ -8022,11 +8023,11 @@ mod tests {
         );
     }
 
-    /// Codex round-4 P2: the DECLARED HTTP-family port count counts DISTINCT
-    /// HTTP-family listener ports (resolvable or not) and EXCLUDES non-HTTP-family
-    /// entries (deferred raw-TCP, never an HTTP route) and duplicate ports. This
-    /// pins the exact boundary so the router's fail-closed ambiguity is neither
-    /// over- nor under-counted.
+    /// Declared HTTP-family port count counts DISTINCT HTTP-family listener
+    /// ports (resolvable or not) and EXCLUDES stream-family entries (they use
+    /// the raw-TCP inbound table, not HTTP sibling ambiguity) and duplicate
+    /// ports. Pins the exact boundary so the router's fail-closed ambiguity is
+    /// neither over- nor under-counted.
     #[test]
     fn sidecar_ingress_declared_count_excludes_non_http_and_dedups_ports() {
         let spiffe = "spiffe://cluster.local/ns/alpha/sa/reviews";
@@ -8071,8 +8072,8 @@ mod tests {
                 bind: None,
                 default_endpoint: "127.0.0.1:5001".to_string(),
             },
-            // Non-HTTP-family (raw TCP) → deferred, NOT counted as a declared
-            // HTTP-family port.
+            // Stream-family (raw TCP) → resolves into local_ingress_listeners but
+            // is NOT counted as a declared HTTP-family port (#3260).
             MeshSidecarIngress {
                 port: 9000,
                 protocol: AppProtocol::Tcp,
@@ -8105,11 +8106,23 @@ mod tests {
         };
         let slice = MeshSlice::from_gateway_config(&config, request);
 
-        // Resolved: only the routable HTTP listener on 8080.
+        // Resolved: routable HTTP on 8080 + routable TCP on 9000.
         assert_eq!(
             slice.local_ingress_listeners.len(),
-            1,
-            "only the routable HTTP listener resolves"
+            2,
+            "routable HTTP and TCP listeners resolve"
+        );
+        assert!(
+            slice
+                .local_ingress_listeners
+                .iter()
+                .any(|l| l.port == 8080 && l.is_http_family())
+        );
+        assert!(
+            slice
+                .local_ingress_listeners
+                .iter()
+                .any(|l| l.port == 9000 && l.is_stream_family())
         );
         // Declared HTTP-family ports: {8080, 8443} = 2. The duplicate 8080, the
         // raw-TCP 9000, and the zero-port entry are excluded.
