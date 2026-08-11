@@ -844,6 +844,7 @@ jobs:
               integration::mesh_destination_rule_visibility_tests
               integration::mesh_dr_service_entry_e2e_tests
               integration::mesh_sidecar_e2e_tests
+              integration::sidecar_ingress_bind_tests
               integration::mesh_config_revision_tests
               integration::mesh_subscribe_validation_tests
               integration::mesh_retry_rotation_tests
