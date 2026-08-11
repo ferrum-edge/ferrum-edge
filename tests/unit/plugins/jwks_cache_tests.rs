@@ -460,7 +460,10 @@ async fn discarded_candidate_does_not_reap_or_poll_active_shared_store() {
 
 #[tokio::test]
 async fn active_remote_trust_health_transitions_and_excludes_inactive() {
-    use ferrum_edge::plugins::utils::jwks_cache::{republish_trust_health, trust_health_snapshot};
+    use ferrum_edge::plugins::utils::jwks_cache::{
+        republish_trust_health, trust_health_snapshot,
+        trust_health_watch_generation_for_test,
+    };
 
     let (server, uri) = super::jwks_auth_tests::start_jwks_server(RSA_PUBLIC_PEM).await;
     let _guard = cache_test_lock().lock().await;
@@ -500,6 +503,16 @@ async fn active_remote_trust_health_transitions_and_excludes_inactive() {
     assert_eq!((fresh.fresh, fresh.grace, fresh.expired), (1, 0, 0));
     assert!(fresh.ready(tokio::time::Instant::now()));
     assert!(!fresh.degraded(tokio::time::Instant::now()));
+
+    let watch_generation = trust_health_watch_generation_for_test();
+    for _ in 0..64 {
+        republish_trust_health();
+    }
+    assert_eq!(
+        trust_health_watch_generation_for_test(),
+        watch_generation,
+        "repeated refresh/metrics publications must reuse the one earlier deadline watcher"
+    );
 
     // Prevent background refresh from resetting key age while we advance through
     // grace and expiry. Recovery re-mounts a valid document below.

@@ -30,7 +30,7 @@ use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -175,8 +175,27 @@ static LATE_ACTIVE_REQUIREMENTS: OnceLock<DashMap<u64, (String, JwksRefreshRequi
 static LATE_ACTIVE_REQUIREMENT_IDS: AtomicU64 = AtomicU64::new(0);
 /// Precomputed active-remote trust aggregate for O(1) `/health` and `/status`.
 static TRUST_HEALTH: OnceLock<arc_swap::ArcSwap<JwksTrustHealthAggregate>> = OnceLock::new();
-/// Generation for the deadline-watcher task; bumping cancels a stale sleeper.
+/// Generation for the deadline-watcher task; bumping invalidates a stale
+/// sleeper before its callback can republish.
 static TRUST_HEALTH_WATCH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The one scheduled trust-health deadline watcher.
+///
+/// Refresh failures and authenticated metrics scrapes may republish health far
+/// more frequently than the next grace/expiry transition. Retaining an
+/// abortable handle prevents those publications from accumulating one detached
+/// sleeper apiece until the deadline.
+struct TrustHealthWatch {
+    generation: u64,
+    deadline: Instant,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+static TRUST_HEALTH_WATCH: OnceLock<Mutex<Option<TrustHealthWatch>>> = OnceLock::new();
+
+fn trust_health_watch_slot() -> &'static Mutex<Option<TrustHealthWatch>> {
+    TRUST_HEALTH_WATCH.get_or_init(|| Mutex::new(None))
+}
 
 fn trust_health_slot() -> &'static arc_swap::ArcSwap<JwksTrustHealthAggregate> {
     TRUST_HEALTH
@@ -397,18 +416,89 @@ pub fn republish_trust_health() {
 }
 
 fn schedule_trust_health_watch(next_watch: Option<Instant>) {
+    let mut scheduled = match trust_health_watch_slot().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
     let Some(deadline) = next_watch else {
+        let stale = scheduled.take();
         TRUST_HEALTH_WATCH_GENERATION.fetch_add(1, Ordering::AcqRel);
+        drop(scheduled);
+        if let Some(stale) = stale {
+            stale.abort_handle.abort();
+        }
         return;
     };
+
+    // An already scheduled earlier transition is sufficient. When it fires it
+    // republishes from live store state and arms whatever later deadline is
+    // still relevant. This also makes identical high-frequency publications
+    // allocation/task neutral.
+    if scheduled
+        .as_ref()
+        .is_some_and(|current| current.deadline <= deadline)
+    {
+        return;
+    }
+
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // Drop/teardown may reconcile off-runtime. Preserve an existing later
+        // watcher rather than aborting it without a replacement; readiness
+        // still evaluates monotonic deadlines directly at read time.
+        return;
+    };
+
     let generation = TRUST_HEALTH_WATCH_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-    spawn_cache_maintenance(async move {
+    // Hold the new task behind a one-shot barrier until its abort handle is
+    // installed in the singleton slot, avoiding a near-deadline startup race.
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+    let task = runtime.spawn(async move {
+        if start_rx.await.is_err() {
+            return;
+        }
         tokio::time::sleep_until(deadline).await;
         if TRUST_HEALTH_WATCH_GENERATION.load(Ordering::Acquire) != generation {
             return;
         }
-        republish_trust_health();
+        let should_republish = {
+            let mut scheduled = match trust_health_watch_slot().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if scheduled
+                .as_ref()
+                .is_some_and(|current| current.generation == generation)
+            {
+                scheduled.take();
+                true
+            } else {
+                false
+            }
+        };
+        if should_republish {
+            republish_trust_health();
+        }
     });
+    let abort_handle = task.abort_handle();
+    drop(task);
+    let stale = scheduled.replace(TrustHealthWatch {
+        generation,
+        deadline,
+        abort_handle,
+    });
+    drop(scheduled);
+    if let Some(stale) = stale {
+        stale.abort_handle.abort();
+    }
+    let _ = start_tx.send(());
+}
+
+/// Current watcher generation for external regression tests.
+#[doc(hidden)]
+#[allow(dead_code)] // exercised by external unit tests
+pub fn trust_health_watch_generation_for_test() -> u64 {
+    TRUST_HEALTH_WATCH_GENERATION.load(Ordering::Acquire)
 }
 
 /// Get or create a shared [`JwksKeyStore`] for the given JWKS URI.
