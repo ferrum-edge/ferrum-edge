@@ -640,11 +640,6 @@ pub struct StreamAuthorizationLease {
 }
 
 impl StreamAuthorizationLease {
-    /// Matches ConfigSync's application heartbeat cadence so ADS producers and
-    /// ConfigSync response streams share the same paused-time auto-advance
-    /// ceiling while setup I/O is still in flight.
-    const KEEPALIVE_PERIOD: Duration = Duration::from_secs(60);
-
     pub fn new(
         identity: &VerifiedGrpcIdentity,
         verifier: Arc<CpDpVerifierStore>,
@@ -668,15 +663,6 @@ impl StreamAuthorizationLease {
     /// Wait without polling. Used by the task-owned bidirectional ADS loops.
     pub async fn wait_for_end(&self) -> StreamAuthEndReason {
         let mut revisions = self.verifier.subscribe();
-        // ADS producers have no application heartbeat. A short keepalive timer
-        // keeps paused-time auto-advance from leaping straight to a multi-minute
-        // server/token deadline while real loopback setup I/O is still in flight;
-        // each tick only re-enters the credential check at the top of the loop.
-        let mut keepalive = tokio::time::interval_at(
-            Instant::now() + Self::KEEPALIVE_PERIOD,
-            Self::KEEPALIVE_PERIOD,
-        );
-        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             // Credential removal is an authorization decision, so it wins
             // over a coincident expiry/server deadline. Checking the live
@@ -692,10 +678,9 @@ impl StreamAuthorizationLease {
                         return StreamAuthEndReason::VerificationKeyRemoved;
                     }
                 }
-                _ = keepalive.tick() => {}
                 _ = tokio::time::sleep_until(self.authorization_deadline) => {
-                    // A paused-time auto-advance can make this arm ready in the
-                    // same wakeup as a coalesced revocation. Re-check before
+                    // A verifier update can make this arm ready in the same
+                    // wakeup as a coalesced revocation. Re-check before
                     // classifying the closure as expiry.
                     if !self.credential_is_active() {
                         return StreamAuthEndReason::VerificationKeyRemoved;

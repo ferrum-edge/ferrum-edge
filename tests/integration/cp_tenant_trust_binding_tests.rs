@@ -612,13 +612,11 @@ async fn finite_server_lease_closes_every_bearer_configuration_stream() {
     handle.abort();
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verifier_rotation_revokes_only_streams_bound_to_removed_credentials() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
     // Keep the independent server lease well beyond the client-side terminal
-    // wait. With Tokio's clock paused, real loopback I/O can otherwise leave
-    // only the short server timer runnable and auto-advance it before the
-    // verifier watch notification is delivered.
+    // wait so this test isolates verifier rotation.
     let (addr, handle) =
         start_all_stream_surfaces(verifier.clone(), Duration::from_secs(300)).await;
 
@@ -670,10 +668,6 @@ async fn verifier_rotation_revokes_only_streams_bound_to_removed_credentials() {
     // revision. Its new generation must not resurrect a stream admitted by
     // the removed generation, while tenant B remains continuously accepted.
     verifier.replace(two_tenant_verifier());
-    // Let the verifier watch deliver to the parked tonic response streams
-    // before the client-side terminal wait starts racing auto-advance.
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
     assert_eq!(
         wait_for_terminal_status(&mut stream_a).await,
         tonic::Code::PermissionDenied
@@ -850,12 +844,11 @@ async fn deadlines_preempt_buffered_configuration_output() {
     assert_eq!(status.message(), "Stream authorization expired");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xds_revocation_terminates_sotw_and_delta_with_buffered_transport_data() {
     let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
-    // This test isolates credential revocation. A short server lease races the
-    // paused Tokio clock while the real transport drains buffered frames and
-    // can turn the terminal status into an unrelated Unauthenticated expiry.
+    // This test isolates credential revocation with the independent server
+    // lease well beyond the client-side terminal wait.
     let (addr, handle) =
         start_all_stream_surfaces(verifier.clone(), Duration::from_secs(300)).await;
 
@@ -924,8 +917,6 @@ async fn xds_revocation_terminates_sotw_and_delta_with_buffered_transport_data()
     // of client-side buffering, revocation must be the terminal stream status.
     settle().await;
     verifier.replace(tenant_b_only_verifier());
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
     assert_eq!(
         wait_for_terminal_status(&mut sotw_stream).await,
         tonic::Code::PermissionDenied
