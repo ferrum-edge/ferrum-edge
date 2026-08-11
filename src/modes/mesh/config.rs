@@ -2644,9 +2644,7 @@ impl IngressBind {
 /// Fail closed with field-specific reasons: Unix sockets, hostnames,
 /// `ip:port` forms, and non-loopback / non-unspecified addresses that are not
 /// representable as shared capture or a dedicated loopback socket.
-pub fn parse_ingress_bind(
-    bind: Option<&str>,
-) -> Result<IngressBind, IngressListenerUnsupported> {
+pub fn parse_ingress_bind(bind: Option<&str>) -> Result<IngressBind, IngressListenerUnsupported> {
     let Some(raw) = bind.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(IngressBind::SharedCapture);
     };

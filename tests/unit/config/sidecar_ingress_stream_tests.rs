@@ -175,7 +175,10 @@ fn omitted_and_unspecified_bind_stay_shared_capture() {
         let mut entry = entry(9000, AppProtocol::Tcp, "127.0.0.1:6000");
         entry.bind = bind.map(str::to_string);
         let resolved = entry.resolve().expect("shared-capture bind resolves");
-        assert_eq!(resolved.bind, None, "bind={bind:?} must stay shared capture");
+        assert_eq!(
+            resolved.bind, None,
+            "bind={bind:?} must stay shared capture"
+        );
     }
 }
 

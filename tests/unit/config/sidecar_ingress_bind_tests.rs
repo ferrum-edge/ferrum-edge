@@ -5,7 +5,12 @@ use ferrum_edge::modes::mesh::config::{
     AppProtocol, IngressBind, IngressListenerUnsupported, MeshSidecarIngress, parse_ingress_bind,
 };
 
-fn entry(port: u16, protocol: AppProtocol, endpoint: &str, bind: Option<&str>) -> MeshSidecarIngress {
+fn entry(
+    port: u16,
+    protocol: AppProtocol,
+    endpoint: &str,
+    bind: Option<&str>,
+) -> MeshSidecarIngress {
     MeshSidecarIngress {
         port,
         protocol,

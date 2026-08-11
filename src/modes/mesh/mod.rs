@@ -5186,10 +5186,7 @@ fn materialize_sidecar_ingress_dedicated_bind_proxies(
             });
             // Own a real listen_port so StreamListenerManager binds/reconciles it.
             proxy.id = proxy_id;
-            proxy.name = Some(format!(
-                "mesh ingress bind {bind_ip} {}",
-                listener.port
-            ));
+            proxy.name = Some(format!("mesh ingress bind {bind_ip} {}", listener.port));
             proxy.listen_port = Some(listener.port);
             proxy
         } else if listener.is_http_family() {
@@ -5207,10 +5204,7 @@ fn materialize_sidecar_ingress_dedicated_bind_proxies(
                 now,
             );
             proxy.listen_port = Some(listener.port);
-            proxy.name = Some(format!(
-                "mesh ingress bind {bind_ip} {}",
-                listener.port
-            ));
+            proxy.name = Some(format!("mesh ingress bind {bind_ip} {}", listener.port));
             proxy
         } else {
             continue;
@@ -5229,8 +5223,7 @@ fn materialize_sidecar_ingress_dedicated_bind_proxies(
     if materialized > 0 {
         info!(
             dedicated_binds = materialized,
-            local_spiffe,
-            "Materialized Sidecar ingress[] dedicated bind listeners"
+            local_spiffe, "Materialized Sidecar ingress[] dedicated bind listeners"
         );
     }
 }
