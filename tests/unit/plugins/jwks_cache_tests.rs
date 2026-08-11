@@ -505,7 +505,13 @@ async fn active_remote_trust_health_transitions_and_excludes_inactive() {
         .await;
 
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let between_publications = trust_health_snapshot();
+    assert!(
+        between_publications.max_age_seconds_fresh >= 5,
+        "the O(1) snapshot must project key age between cache publications"
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
     // Deadline comparison flips degraded without a client verification attempt.
     let after_grace_deadline = trust_health_snapshot();
     assert!(after_grace_deadline.ready(tokio::time::Instant::now()));

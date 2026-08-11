@@ -80,6 +80,11 @@ pub struct JwksTrustHealthAggregate {
     next_expiry_at: Option<Instant>,
     /// Earliest monotonic grace transition among currently fresh active remotes.
     next_grace_at: Option<Instant>,
+    /// Monotonic observation time for the precomputed maximum ages below.
+    age_observed_at: Option<Instant>,
+    max_age_fresh_at_observation: Option<Duration>,
+    max_age_grace_at_observation: Option<Duration>,
+    max_age_expired_at_observation: Option<Duration>,
 }
 
 impl JwksTrustHealthAggregate {
@@ -111,6 +116,29 @@ impl JwksTrustHealthAggregate {
             JwksTrustState::Grace => self.max_age_seconds_grace,
             JwksTrustState::Expired => self.max_age_seconds_expired,
         }
+    }
+
+    fn project_ages(mut self, now: Instant) -> Self {
+        let Some(observed_at) = self.age_observed_at else {
+            return self;
+        };
+        let elapsed = now.saturating_duration_since(observed_at);
+        if self.fresh > 0
+            && let Some(age) = self.max_age_fresh_at_observation
+        {
+            self.max_age_seconds_fresh = age.saturating_add(elapsed).as_secs();
+        }
+        if self.grace > 0
+            && let Some(age) = self.max_age_grace_at_observation
+        {
+            self.max_age_seconds_grace = age.saturating_add(elapsed).as_secs();
+        }
+        if self.expired > 0
+            && let Some(age) = self.max_age_expired_at_observation
+        {
+            self.max_age_seconds_expired = age.saturating_add(elapsed).as_secs();
+        }
+        self
     }
 }
 
@@ -152,7 +180,7 @@ fn discovered_jwks_uris() -> &'static DashMap<String, String> {
 /// the gateway not-ready even if the background republish task has not yet run.
 pub fn trust_health_snapshot() -> JwksTrustHealthAggregate {
     ensure_trust_health_hook();
-    **trust_health_slot().load()
+    trust_health_slot().load().project_ages(Instant::now())
 }
 
 /// Rebuild the precomputed active-remote trust aggregate and arm the next
@@ -161,6 +189,7 @@ pub fn republish_trust_health() {
     ensure_trust_health_hook();
     let now = Instant::now();
     let mut aggregate = JwksTrustHealthAggregate::default();
+    aggregate.age_observed_at = Some(now);
     let mut next_watch: Option<Instant> = None;
 
     if let Some(cache) = JWKS_CACHE.get() {
@@ -177,6 +206,11 @@ pub fn republish_trust_health() {
                 JwksTrustState::Fresh => {
                     aggregate.fresh = aggregate.fresh.saturating_add(1);
                     if let Some(age) = health.last_success_age {
+                        aggregate.max_age_fresh_at_observation = Some(
+                            aggregate
+                                .max_age_fresh_at_observation
+                                .map_or(age, |current| current.max(age)),
+                        );
                         aggregate.max_age_seconds_fresh =
                             aggregate.max_age_seconds_fresh.max(age.as_secs());
                     }
@@ -184,6 +218,11 @@ pub fn republish_trust_health() {
                 JwksTrustState::Grace => {
                     aggregate.grace = aggregate.grace.saturating_add(1);
                     if let Some(age) = health.last_success_age {
+                        aggregate.max_age_grace_at_observation = Some(
+                            aggregate
+                                .max_age_grace_at_observation
+                                .map_or(age, |current| current.max(age)),
+                        );
                         aggregate.max_age_seconds_grace =
                             aggregate.max_age_seconds_grace.max(age.as_secs());
                     }
@@ -191,6 +230,11 @@ pub fn republish_trust_health() {
                 JwksTrustState::Expired => {
                     aggregate.expired = aggregate.expired.saturating_add(1);
                     if let Some(age) = health.last_success_age {
+                        aggregate.max_age_expired_at_observation = Some(
+                            aggregate
+                                .max_age_expired_at_observation
+                                .map_or(age, |current| current.max(age)),
+                        );
                         aggregate.max_age_seconds_expired =
                             aggregate.max_age_seconds_expired.max(age.as_secs());
                     }
