@@ -1201,6 +1201,9 @@ does not model, and an approximation would silently change what a policy
 authorizes. The `envoyExtAuthzHttp` key set is **closed**: an unmodelled field
 (including the deprecated `includeHeadersInCheck`) is rejected rather than
 ignored, so an operator can never believe a field is in force when it is not.
+The enclosing extension-provider oneof is closed too: an entry carrying an
+HTTP ext-authz block plus any sibling provider variant or unknown field is
+rejected instead of choosing whichever recognized field appears first.
 
 **Provider transport.** Istio derives the ext-auth transport from the
 destination's own mesh configuration; Ferrum's provider dial does not go

@@ -289,11 +289,13 @@ fn tracing_provider_from_extension(
     entry: &Value,
 ) -> Result<ExtensionProviderKind, String> {
     if let Some(config) = object_field(entry, "envoyExtAuthzHttp")? {
+        validate_ext_authz_provider_entry_shape(name, entry, "envoyExtAuthzHttp")?;
         return Ok(ExtensionProviderKind::ExtAuthz(Box::new(
             envoy_ext_authz_http_provider(name, config)?,
         )));
     }
     if object_field(entry, "envoyExtAuthzGrpc")?.is_some() {
+        validate_ext_authz_provider_entry_shape(name, entry, "envoyExtAuthzGrpc")?;
         // Deliberate, documented gap: the Envoy gRPC check API
         // (`envoy.service.auth.v3.Authorization`) carries attributes Ferrum
         // does not model, and an approximation would silently change what an
@@ -323,6 +325,34 @@ fn tracing_provider_from_extension(
         )?));
     }
     Ok(ExtensionProviderKind::NonTracing)
+}
+
+/// Enforce the protobuf oneof shape on an ext-authz provider entry.
+///
+/// The embedded meshConfig YAML does not pass through Kubernetes structural
+/// schema validation. If an entry carries both `envoyExtAuthzHttp` and another
+/// provider variant (or a typo'd sibling field), selecting the first known key
+/// would silently change which authorization service Ferrum enforces. Once an
+/// ext-authz variant is present, the only legal top-level keys are its `name`
+/// and that one variant.
+fn validate_ext_authz_provider_entry_shape(
+    name: &str,
+    entry: &Value,
+    selected_variant: &str,
+) -> Result<(), String> {
+    let Some(object) = entry.as_object() else {
+        return Err("meshConfig.extensionProviders[] entry must be an object".to_string());
+    };
+    for key in object.keys() {
+        if key != "name" && key != selected_variant {
+            return Err(format!(
+                "meshConfig.extensionProviders '{}' {selected_variant} entry does not support sibling field '{}'; extension provider variants are mutually exclusive",
+                sanitize_mesh_ext_authz_diagnostic(name),
+                sanitize_mesh_ext_authz_diagnostic(key)
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn zipkin_provider(name: &str, config: &Value) -> Result<TracingProvider, String> {

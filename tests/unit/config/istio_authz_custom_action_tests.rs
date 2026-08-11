@@ -415,6 +415,27 @@ extensionProviders:
 }
 
 #[test]
+fn an_ext_authz_provider_with_a_second_variant_is_refused() {
+    let error = translate_provider_only(
+        r#"
+extensionProviders:
+- name: p
+  envoyExtAuthzHttp:
+    service: 127.0.0.1
+    port: 8000
+  envoyExtAuthzGrpc:
+    service: 127.0.0.1
+    port: 9000
+"#,
+    )
+    .expect_err("an extension-provider oneof must never be resolved by field order");
+    assert!(
+        error.contains("mutually exclusive") && error.contains("envoyExtAuthzGrpc"),
+        "the diagnostic must name the conflicting sibling variant: {error}"
+    );
+}
+
+#[test]
 fn wildcard_header_rules_are_refused() {
     let error = translate_provider_only(
         r#"
