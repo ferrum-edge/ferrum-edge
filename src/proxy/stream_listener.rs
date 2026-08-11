@@ -81,7 +81,7 @@ async fn with_current_frontend_dtls_generation<T>(
 ) -> T {
     let _publish_guard = publish_lock.lock().await;
     let generation = generation_slot.load_full();
-    consume(generation.as_ref())
+    consume(generation.as_ref().as_ref())
 }
 
 /// Handle for a running stream listener — keeps the shutdown channel and task handle.
