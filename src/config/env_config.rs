@@ -149,6 +149,77 @@ pub fn parse_tls_max_material_size_bytes(raw: Option<&str>) -> Result<usize, Str
     Ok(value.min(HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES))
 }
 
+/// Settings key for the shared TLS state document byte ceiling.
+pub const TLS_STORE_MAX_DOCUMENT_BYTES_KEY: &str = "FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES";
+/// Default shared TLS state document byte ceiling (16 MiB).
+pub const DEFAULT_TLS_STORE_MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+/// Minimum accepted shared TLS state document byte ceiling.
+pub const MIN_TLS_STORE_MAX_DOCUMENT_BYTES: usize = 1024;
+/// Hard maximum shared TLS state document byte ceiling (64 MiB).
+pub const HARD_MAX_TLS_STORE_MAX_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Settings key for the managed-TLS logical record cap.
+pub const TLS_MANAGED_MAX_RECORDS_KEY: &str = "FERRUM_TLS_MANAGED_MAX_RECORDS";
+/// Default managed-TLS logical record cap.
+pub const DEFAULT_TLS_MANAGED_MAX_RECORDS: usize = 1024;
+/// Minimum managed-TLS logical record cap.
+pub const MIN_TLS_MANAGED_MAX_RECORDS: usize = 1;
+/// Hard maximum managed-TLS logical record cap.
+pub const HARD_MAX_TLS_MANAGED_MAX_RECORDS: usize = 100_000;
+
+/// Settings key for the ACME certificate logical record cap.
+pub const TLS_ACME_MAX_CERTIFICATES_KEY: &str = "FERRUM_TLS_ACME_MAX_CERTIFICATES";
+/// Default ACME certificate logical record cap.
+pub const DEFAULT_TLS_ACME_MAX_CERTIFICATES: usize = 1024;
+/// Minimum ACME certificate logical record cap.
+pub const MIN_TLS_ACME_MAX_CERTIFICATES: usize = 1;
+/// Hard maximum ACME certificate logical record cap.
+pub const HARD_MAX_TLS_ACME_MAX_CERTIFICATES: usize = 100_000;
+
+/// Settings key for the ACME account logical record cap.
+pub const TLS_ACME_MAX_ACCOUNTS_KEY: &str = "FERRUM_TLS_ACME_MAX_ACCOUNTS";
+/// Default ACME account logical record cap.
+pub const DEFAULT_TLS_ACME_MAX_ACCOUNTS: usize = 256;
+/// Minimum ACME account logical record cap.
+pub const MIN_TLS_ACME_MAX_ACCOUNTS: usize = 1;
+/// Hard maximum ACME account logical record cap.
+pub const HARD_MAX_TLS_ACME_MAX_ACCOUNTS: usize = 10_000;
+
+/// Settings key for retained terminal ACME order history per certificate.
+pub const TLS_ACME_TERMINAL_ORDER_HISTORY_KEY: &str = "FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY";
+/// Default retained terminal ACME order history per certificate.
+pub const DEFAULT_TLS_ACME_TERMINAL_ORDER_HISTORY: usize = 16;
+/// Minimum retained terminal ACME order history (`0` retains none).
+pub const MIN_TLS_ACME_TERMINAL_ORDER_HISTORY: usize = 0;
+/// Hard maximum retained terminal ACME order history per certificate.
+pub const HARD_MAX_TLS_ACME_TERMINAL_ORDER_HISTORY: usize = 1024;
+
+fn parse_bounded_usize_setting(
+    key: &str,
+    raw: Option<&str>,
+    default: usize,
+    min: usize,
+    hard_max: usize,
+    zero_means: Option<&'static str>,
+) -> Result<usize, String> {
+    let value = match raw {
+        None => return Ok(default),
+        Some(value) => value
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("{key} must be a whole number; the configured value is not"))?,
+    };
+    if value < min {
+        return Err(match zero_means {
+            Some(reason) if value == 0 => {
+                format!("{key} must be at least {min}; 0 is {reason}")
+            }
+            _ => format!("{key} must be at least {min}"),
+        });
+    }
+    Ok(value.min(hard_max))
+}
+
 /// Settings key for the per-response discovery success-body ceiling.
 pub const SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY: &str =
     "FERRUM_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES";
@@ -244,6 +315,105 @@ fn parse_discovery_body_positive_clamped(
         return Err(format!("{key} must be at least 1 byte; 0 is not unlimited"));
     }
     Ok(value.min(hard_max))
+}
+
+/// Pure parse for `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES`.
+pub fn parse_tls_store_max_document_bytes(raw: Option<&str>) -> Result<usize, String> {
+    parse_bounded_usize_setting(
+        TLS_STORE_MAX_DOCUMENT_BYTES_KEY,
+        raw,
+        DEFAULT_TLS_STORE_MAX_DOCUMENT_BYTES,
+        MIN_TLS_STORE_MAX_DOCUMENT_BYTES,
+        HARD_MAX_TLS_STORE_MAX_DOCUMENT_BYTES,
+        Some("not unlimited"),
+    )
+}
+
+/// Read `FERRUM_TLS_STORE_MAX_DOCUMENT_BYTES` with conf-file precedence.
+pub fn tls_store_max_document_bytes_from_env() -> Result<usize, String> {
+    parse_tls_store_max_document_bytes(
+        crate::config::conf_file::resolve_ferrum_var(TLS_STORE_MAX_DOCUMENT_BYTES_KEY).as_deref(),
+    )
+}
+
+/// Pure parse for `FERRUM_TLS_MANAGED_MAX_RECORDS`.
+pub fn parse_tls_managed_max_records(raw: Option<&str>) -> Result<usize, String> {
+    parse_bounded_usize_setting(
+        TLS_MANAGED_MAX_RECORDS_KEY,
+        raw,
+        DEFAULT_TLS_MANAGED_MAX_RECORDS,
+        MIN_TLS_MANAGED_MAX_RECORDS,
+        HARD_MAX_TLS_MANAGED_MAX_RECORDS,
+        Some("not unlimited"),
+    )
+}
+
+/// Read `FERRUM_TLS_MANAGED_MAX_RECORDS` with conf-file precedence.
+pub fn tls_managed_max_records_from_env() -> Result<usize, String> {
+    parse_tls_managed_max_records(
+        crate::config::conf_file::resolve_ferrum_var(TLS_MANAGED_MAX_RECORDS_KEY).as_deref(),
+    )
+}
+
+/// Pure parse for `FERRUM_TLS_ACME_MAX_CERTIFICATES`.
+pub fn parse_tls_acme_max_certificates(raw: Option<&str>) -> Result<usize, String> {
+    parse_bounded_usize_setting(
+        TLS_ACME_MAX_CERTIFICATES_KEY,
+        raw,
+        DEFAULT_TLS_ACME_MAX_CERTIFICATES,
+        MIN_TLS_ACME_MAX_CERTIFICATES,
+        HARD_MAX_TLS_ACME_MAX_CERTIFICATES,
+        Some("not unlimited"),
+    )
+}
+
+/// Read `FERRUM_TLS_ACME_MAX_CERTIFICATES` with conf-file precedence.
+pub fn tls_acme_max_certificates_from_env() -> Result<usize, String> {
+    parse_tls_acme_max_certificates(
+        crate::config::conf_file::resolve_ferrum_var(TLS_ACME_MAX_CERTIFICATES_KEY).as_deref(),
+    )
+}
+
+/// Pure parse for `FERRUM_TLS_ACME_MAX_ACCOUNTS`.
+pub fn parse_tls_acme_max_accounts(raw: Option<&str>) -> Result<usize, String> {
+    parse_bounded_usize_setting(
+        TLS_ACME_MAX_ACCOUNTS_KEY,
+        raw,
+        DEFAULT_TLS_ACME_MAX_ACCOUNTS,
+        MIN_TLS_ACME_MAX_ACCOUNTS,
+        HARD_MAX_TLS_ACME_MAX_ACCOUNTS,
+        Some("not unlimited"),
+    )
+}
+
+/// Read `FERRUM_TLS_ACME_MAX_ACCOUNTS` with conf-file precedence.
+pub fn tls_acme_max_accounts_from_env() -> Result<usize, String> {
+    parse_tls_acme_max_accounts(
+        crate::config::conf_file::resolve_ferrum_var(TLS_ACME_MAX_ACCOUNTS_KEY).as_deref(),
+    )
+}
+
+/// Pure parse for `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY`.
+///
+/// `0` is valid and means retain no terminal order history (active/recoverable
+/// orders are never pruned by this setting).
+pub fn parse_tls_acme_terminal_order_history(raw: Option<&str>) -> Result<usize, String> {
+    parse_bounded_usize_setting(
+        TLS_ACME_TERMINAL_ORDER_HISTORY_KEY,
+        raw,
+        DEFAULT_TLS_ACME_TERMINAL_ORDER_HISTORY,
+        MIN_TLS_ACME_TERMINAL_ORDER_HISTORY,
+        HARD_MAX_TLS_ACME_TERMINAL_ORDER_HISTORY,
+        None,
+    )
+}
+
+/// Read `FERRUM_TLS_ACME_TERMINAL_ORDER_HISTORY` with conf-file precedence.
+pub fn tls_acme_terminal_order_history_from_env() -> Result<usize, String> {
+    parse_tls_acme_terminal_order_history(
+        crate::config::conf_file::resolve_ferrum_var(TLS_ACME_TERMINAL_ORDER_HISTORY_KEY)
+            .as_deref(),
+    )
 }
 
 fn validate_discovery_body_limits(limits: DiscoveryBodyLimits) -> Result<(), String> {

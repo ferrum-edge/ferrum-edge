@@ -6,6 +6,7 @@ use crate::unit::env_lock::ENV_LOCK;
 #[test]
 fn file_secret_reads_use_detached_os_thread_not_spawn_blocking() {
     let file_src = include_str!("../../../src/secrets/file.rs");
+    let credential_src = include_str!("../../../src/secrets/credential_file.rs");
     let registry_src = include_str!("../../../src/secrets/registry.rs");
 
     assert!(
@@ -17,7 +18,11 @@ fn file_secret_reads_use_detached_os_thread_not_spawn_blocking() {
         "detached reader threads must keep the ferrum-secret-file name"
     );
     assert!(
-        file_src.contains("drop(join_handle)"),
+        file_src.contains("read_credential_file_detached"),
+        "_FILE async reads must delegate to the shared detached credential reader"
+    );
+    assert!(
+        credential_src.contains("drop(join_handle)"),
         "JoinHandle must be dropped explicitly so the OS thread detaches"
     );
     let mut file_code_lines = file_src.lines().filter(|line| {
@@ -127,6 +132,33 @@ fn read_secret_error_for_whitespace_only_file() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.contains("is empty after trimming"));
+}
+
+#[test]
+fn read_secret_error_for_non_regular_directory_redacts_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let err = read_secret(path, "DIR_KEY").expect_err("directory");
+    assert!(err.contains("Failed to read DIR_KEY_FILE"));
+    assert!(
+        !err.contains(path),
+        "source path must not be disclosed, got: {err}"
+    );
+}
+
+#[test]
+fn read_secret_rejects_oversized_file_without_leaking_value() {
+    use ferrum_edge::secrets::credential_file::DEFAULT_CREDENTIAL_FILE_MAX_BYTES;
+
+    let mut tmp = tempfile::NamedTempFile::new().unwrap();
+    let payload = vec![b'Z'; DEFAULT_CREDENTIAL_FILE_MAX_BYTES + 1];
+    tmp.write_all(&payload).unwrap();
+    let path = tmp.path().to_str().unwrap();
+    let err = read_secret(path, "BIG_KEY").expect_err("oversize");
+    assert!(err.contains("Failed to read BIG_KEY_FILE"));
+    assert!(err.contains("exceeds the maximum"));
+    assert!(!err.contains(path), "path leaked: {err}");
+    assert!(!err.contains(&"Z".repeat(16)), "value leaked: {err}");
 }
 
 #[test]

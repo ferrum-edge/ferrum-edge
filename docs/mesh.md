@@ -423,9 +423,12 @@ Ferrum **never mints a CP/DP JWT for a stock control plane**. The only
 credential it presents is an externally issued bearer token at
 `FERRUM_MESH_STOCK_XDS_TOKEN_FILE` (typically a projected Kubernetes
 service-account token), re-read on every connection attempt so rotation is
-picked up on reconnect. `FERRUM_MESH_STOCK_XDS_URLS` is deliberately separate
-from `FERRUM_DP_CP_GRPC_URLS` so a Ferrum CP is never dialed as a stock server
-and a stock server never receives Ferrum CP/DP credentials.
+picked up on reconnect. The read uses the shared regular-file-only 64 KiB
+credential boundary on a detached OS thread, with at most one timed-out reader
+admitted while an unavailable mount remains blocked.
+`FERRUM_MESH_STOCK_XDS_URLS` is deliberately separate from
+`FERRUM_DP_CP_GRPC_URLS` so a Ferrum CP is never dialed as a stock server and a
+stock server never receives Ferrum CP/DP credentials.
 
 **What is consumed.**
 

@@ -16,7 +16,7 @@ pub mod kubernetes;
 pub mod mesh;
 
 use crate::config::types::{
-    GatewayConfig, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
+    GatewayConfig, MAX_TARGET_WEIGHT, SdProvider, ServiceDiscoveryConfig, Upstream, UpstreamTarget,
 };
 use crate::dns::DnsCache;
 use crate::health_check::HealthChecker;
@@ -1256,4 +1256,28 @@ fn is_synthetic_cross_cluster_hbone_target(target: &UpstreamTarget) -> bool {
         && target
             .tags
             .contains_key(crate::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG)
+}
+
+/// Admit an untrusted registry-reported port into a dialable `u16`.
+///
+/// Accepts `1..=u16::MAX`. Rejects `0` and any value outside that range so
+/// narrowing casts cannot wrap (for example `65537` must not become port `1`).
+/// Aligns standalone Kubernetes EndpointSlice polling with the controller
+/// path's nonzero / `<= u16::MAX` filter.
+pub(crate) fn admit_registry_port(raw: u64) -> Option<u16> {
+    u16::try_from(raw).ok().filter(|port| *port != 0)
+}
+
+/// Admit an untrusted Consul `Weights.Passing` value into a routable target weight.
+///
+/// Accepts `1..=MAX_TARGET_WEIGHT` — the same nonzero contract as static
+/// targets and `ServiceDiscoveryConfig::default_weight`. Rejects zero and
+/// values that would wrap or coerce under a narrowing cast.
+///
+/// Callers treat a *missing* `Weights` / `Passing` field separately by
+/// applying `default_weight`; only an explicitly present value is passed here.
+pub(crate) fn admit_registry_target_weight(raw: u64) -> Option<u32> {
+    u32::try_from(raw)
+        .ok()
+        .filter(|weight| (1..=MAX_TARGET_WEIGHT).contains(weight))
 }

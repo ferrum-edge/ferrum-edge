@@ -374,7 +374,18 @@ distinguishable both in the route table and on the wire:
 
 **Listener lifecycle and its bounds.** The listener set is reconciled on every
 config publication, so reload / update / delete / withdrawal reach the sockets
-without a restart. Two bounds are deliberate and tested:
+without a restart. These bounds are deliberate and tested:
+
+- **Routing admission is generation-bound.** The atomic `RequestEpoch` that
+  publishes a new route table also publishes that generation's listener
+  admission as pending. Every listener-scoped route in the pending generation
+  fails closed on exact, prefix, regex, cached, global-socket, and
+  single-listener-remap lookups. Reconcile derives its decision from that exact
+  config snapshot and acknowledges only while the same config generation is
+  still current; a stale pass is discarded and the latest generation is
+  reconciled immediately. This prevents a new route table from borrowing an
+  older generation's successful listener decision while preserving complete
+  prior snapshots for requests already in flight.
 
 - **Withdrawal is fail-closed but not instantaneous at the socket.** Routes are
   withdrawn by the atomic config swap that *precedes* the listener reconcile, so
@@ -386,12 +397,15 @@ without a restart. Two bounds are deliberate and tested:
   process-global proxy frontend on the exact requested port already satisfies
   the Gateway listener: the router sees that accepted port, so the dynamic
   manager binds no duplicate socket and reports no failure. A wrong-class
-  global proxy frontend, an admin / control-plane listener, or a TCP/UDP stream
+  global proxy frontend, an admin / control-plane listener, or a TCP/TLS stream
   proxy on the port is refused; a port the process lacks permission to bind
   (`:80` / `:443` without `CAP_NET_BIND_SERVICE`) fails and is retried. Either
   way the failure is logged and surfaced on
   `GatewayListenerManager::bind_failures`, and routes scoped to a genuinely
   refused listener stay unreachable rather than being served somewhere else.
+  Once the matching generation is acknowledged, an ordinary OS bind failure
+  remains eligible for the intentional Service-fronted remap; only admission
+  refusals suppress routing.
 - **An HTTP↔HTTPS class flip retires the old generation first.** The retiring
   accept-loop task is awaited before the replacement binds, so with
   `FERRUM_ACCEPT_THREADS > 1` the `SO_REUSEPORT` sockets of the two classes

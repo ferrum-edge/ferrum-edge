@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ferrum_edge::grpc::dp_client::{
     DpCpConnectionState, GrpcJwtSecret, generate_dp_jwt, generate_dp_jwt_with_issuer,
 };
+use serial_test::serial;
 
 #[test]
 fn connection_state_new_disconnected() {
@@ -155,3 +156,209 @@ fn should_race_primary_blocked_until_startup_ready() {
 // test would pass even with Relaxed and therefore proves nothing. The correct
 // ordering is enforced by review: Release in connect_and_subscribe_with_startup_ready,
 // Acquire in the should_race_primary guard and the admin /health endpoint.
+
+#[test]
+fn grpc_jwt_external_token_reads_bounded_regular_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("token");
+    std::fs::write(&path, b"external-bearer-token\n").unwrap();
+    let secret = GrpcJwtSecret::new("unused".to_string())
+        .with_token_file(Some(path.to_string_lossy().into_owned()));
+    let token = secret.mint("node-1", Some("default"), None).unwrap();
+    assert_eq!(token, "external-bearer-token");
+    assert!(secret.uses_external_token());
+}
+
+#[test]
+fn grpc_jwt_external_token_rotation_between_reconnect_mints() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("rotating-token");
+    std::fs::write(&path, b"token-generation-1").unwrap();
+    let secret = GrpcJwtSecret::new("unused".to_string())
+        .with_token_file(Some(path.to_string_lossy().into_owned()));
+    assert_eq!(
+        secret.mint("node-1", None, None).unwrap(),
+        "token-generation-1"
+    );
+    std::fs::write(&path, b"token-generation-2").unwrap();
+    assert_eq!(
+        secret.mint("node-1", None, None).unwrap(),
+        "token-generation-2"
+    );
+}
+
+#[test]
+#[serial(dp_cp_token_file_read_limit)]
+fn grpc_jwt_mint_async_reads_token_file_off_worker() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("async-token");
+    std::fs::write(&path, b"async-external-token\n").unwrap();
+    let secret = GrpcJwtSecret::new("unused".to_string())
+        .with_token_file(Some(path.to_string_lossy().into_owned()));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let token = rt
+        .block_on(secret.mint_async("node-1", Some("ns"), None))
+        .unwrap();
+    assert_eq!(token, "async-external-token");
+}
+
+#[test]
+#[serial(dp_cp_token_file_read_limit)]
+fn grpc_jwt_mint_async_bounds_detached_reader_occupancy() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("serialized-token");
+    std::fs::write(&path, b"serialized-external-token\n").unwrap();
+    let secret = GrpcJwtSecret::new("unused".to_string())
+        .with_token_file(Some(path.to_string_lossy().into_owned()));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let permit =
+            ferrum_edge::_test_support::acquire_dp_cp_token_file_read_permit_for_test().await;
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                secret.mint_async("node-1", Some("ns"), None),
+            )
+            .await
+            .is_err(),
+            "a concurrent reconnect must wait instead of spawning another detached reader"
+        );
+
+        drop(permit);
+        let token = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            secret.mint_async("node-1", Some("ns"), None),
+        )
+        .await
+        .expect("token read should resume after the in-flight reader exits")
+        .expect("bounded token read");
+        assert_eq!(token, "serialized-external-token");
+    });
+}
+
+#[test]
+fn grpc_jwt_mint_async_self_mint_skips_filesystem() {
+    let secret = GrpcJwtSecret::new("self-mint-secret-padding-32chars!!".to_string());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let token = rt
+        .block_on(secret.mint_async("node-1", Some("ns"), None))
+        .unwrap();
+    assert!(!token.is_empty());
+    assert!(!secret.uses_external_token());
+}
+
+#[test]
+fn grpc_jwt_oversized_token_file_is_rejected_without_leaking_value() {
+    use ferrum_edge::secrets::credential_file::DEFAULT_CREDENTIAL_FILE_MAX_BYTES;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("huge-token-sentinel");
+    let payload = vec![b'T'; DEFAULT_CREDENTIAL_FILE_MAX_BYTES + 1];
+    std::fs::write(&path, &payload).unwrap();
+    let secret = GrpcJwtSecret::new("unused".to_string())
+        .with_token_file(Some(path.to_string_lossy().into_owned()));
+    let error = secret
+        .mint("node-1", None, None)
+        .expect_err("oversized")
+        .to_string();
+    assert!(error.contains("failed to read FERRUM_DP_CP_GRPC_TOKEN_FILE"));
+    assert!(error.contains("exceeds the maximum"));
+    assert!(!error.contains("huge-token-sentinel"), "{error}");
+    assert!(!error.contains(&"T".repeat(32)), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn grpc_jwt_projected_symlink_rotation_is_visible_on_next_mint() {
+    let temp = tempfile::tempdir().unwrap();
+    let v1 = temp.path().join("v1");
+    let v2 = temp.path().join("v2");
+    std::fs::create_dir(&v1).unwrap();
+    std::fs::create_dir(&v2).unwrap();
+    std::fs::write(v1.join("token"), b"projected-v1").unwrap();
+    std::fs::write(v2.join("token"), b"projected-v2").unwrap();
+    let data = temp.path().join("..data");
+    std::os::unix::fs::symlink(&v1, &data).unwrap();
+    let link = temp.path().join("token");
+    std::os::unix::fs::symlink("..data/token", &link).unwrap();
+
+    let secret = GrpcJwtSecret::new("unused".to_string())
+        .with_token_file(Some(link.to_string_lossy().into_owned()));
+    assert_eq!(secret.mint("n", None, None).unwrap(), "projected-v1");
+
+    let tmp = temp.path().join("..data.tmp");
+    std::os::unix::fs::symlink(&v2, &tmp).unwrap();
+    std::fs::rename(&tmp, &data).unwrap();
+    assert_eq!(secret.mint("n", None, None).unwrap(), "projected-v2");
+}
+
+fn source_calls_mint_async_with_namespace_and_awaits(source: &str) -> bool {
+    let collapsed: String = source.split_whitespace().collect();
+    collapsed.contains("mint_async(node_id,Some(namespace),None).await")
+}
+
+#[test]
+fn grpc_jwt_consumers_use_mint_async_for_reconnect_paths() {
+    // Native mesh, DP ConfigSync, and Ferrum xDS ADS are the production
+    // GrpcJwtSecret::mint consumers on reconnect. They must call mint_async so
+    // token-file I/O never runs on a Tokio core worker. Stock xDS uses the same
+    // bounded credential primitive through its separate bearer-token helper.
+    let native = include_str!("../../../src/modes/mesh/config_consumer/native_client.rs");
+    let dp = include_str!("../../../src/grpc/dp_client.rs");
+    let xds = include_str!("../../../src/modes/mesh/config_consumer/xds_client.rs");
+
+    assert!(
+        native.contains("mint_async"),
+        "native MeshSubscribe reconnect must mint_async"
+    );
+    assert!(
+        source_calls_mint_async_with_namespace_and_awaits(dp),
+        "DP ConfigSync reconnect must mint_async"
+    );
+    assert!(
+        xds.contains("mint_async"),
+        "xDS ADS connect must mint_async for external tokens"
+    );
+    assert!(
+        xds.contains("AdsAuth::External"),
+        "xDS must materialize external tokens once per connection, not in the interceptor"
+    );
+
+    // Self-minted interceptor path must not call mint when a token file is set.
+    let mut code_lines = xds.lines().filter(|line| {
+        let trimmed = line.trim_start();
+        !trimmed.starts_with("//")
+    });
+    assert!(
+        code_lines.any(|line| line.contains("AdsAuth::Minted")),
+        "self-minted xDS path must remain available without file I/O"
+    );
+}
+
+#[test]
+fn grpc_jwt_debug_never_renders_token_file_path_or_secret() {
+    let secret = GrpcJwtSecret::new("super-secret-value-never-in-debug".to_string())
+        .with_token_file(Some("/run/secrets/cp-token-sentinel".to_string()));
+    let rendered = format!("{secret:?}");
+    assert!(
+        !rendered.contains("super-secret-value-never-in-debug"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("cp-token-sentinel"), "{rendered}");
+    assert!(
+        rendered.contains("token_file_configured: true"),
+        "{rendered}"
+    );
+}

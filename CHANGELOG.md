@@ -870,6 +870,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Kubernetes and Consul service discovery now reject provider-reported ports
+  outside `1..=65535` and Consul `Weights.Passing` values outside
+  `1..=MAX_TARGET_WEIGHT` without narrowing casts that could wrap (for example
+  port `65537` becoming port `1`). Malformed or out-of-range entries are
+  skipped while valid peers in the same snapshot remain published; missing
+  Consul `Weights`/`Passing` still uses `default_weight` (issue #3723).
 - Gateway API HTTPRoute / GRPCRoute no longer fall back to a listener-less,
   port-agnostic claim when they declare Gateway `parentRefs` that resolve to no
   concrete, materializable listener (issue #3612). An absent, mismatched, or

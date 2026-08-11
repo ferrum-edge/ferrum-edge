@@ -72,7 +72,9 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::tls::shared_store::{SharedStoreError, SharedStoreFile, VersionedStoreFile};
+use crate::tls::shared_store::{
+    SharedStoreError, SharedStoreFile, TlsPersistentStoreKind, VersionedStoreFile,
+};
 
 const LEASE_STORE_FILE_NAME: &str = "tls-leases.json";
 const DEFAULT_STORE_DIR: &str = "./ferrum-managed-tls";
@@ -148,6 +150,10 @@ impl VersionedStoreFile for TlsLeaseStoreFile {
     fn set_store_version(&mut self, version: u64) {
         self.version = version;
     }
+
+    fn logical_record_count(&self) -> u64 {
+        self.leases.len() as u64
+    }
 }
 
 /// Shared lease table for one managed-TLS store directory.
@@ -188,7 +194,10 @@ impl TlsLeaseStore {
                 dir.display()
             ))
         })?;
-        let file = SharedStoreFile::open(dir.join(LEASE_STORE_FILE_NAME))?;
+        let file: SharedStoreFile<TlsLeaseStoreFile> = SharedStoreFile::open(
+            dir.join(LEASE_STORE_FILE_NAME),
+            TlsPersistentStoreKind::Leases,
+        )?;
         Ok(Self { holder, file })
     }
 
@@ -288,7 +297,7 @@ impl TlsLeaseStore {
     ) -> Result<bool, TlsLeaseError> {
         let holder = self.holder.clone();
         let name = name.to_string();
-        self.file.mutate_if::<_, TlsLeaseError>(move |document| {
+        let renewed = self.file.mutate_if::<_, TlsLeaseError>(move |document| {
             let now = Utc::now();
             let Some(existing) = document.leases.get_mut(&name) else {
                 return Ok((false, false));
@@ -298,7 +307,8 @@ impl TlsLeaseStore {
             }
             existing.expires_at = now + lease_delta(ttl);
             Ok((true, true))
-        })
+        })?;
+        Ok(renewed)
     }
 
     /// Run `commit` under the lease store's exclusive lock, and only while this
@@ -354,7 +364,7 @@ impl TlsLeaseStore {
     fn release_claim(&self, name: &str, fence: u64) -> Result<bool, TlsLeaseError> {
         let holder = self.holder.clone();
         let name = name.to_string();
-        self.file.mutate_if::<_, TlsLeaseError>(move |document| {
+        let released = self.file.mutate_if::<_, TlsLeaseError>(move |document| {
             let Some(existing) = document.leases.get_mut(&name) else {
                 return Ok((false, false));
             };
@@ -367,7 +377,8 @@ impl TlsLeaseStore {
             // so the fence keeps advancing monotonically for this name.
             existing.expires_at = Utc::now();
             Ok((true, true))
-        })
+        })?;
+        Ok(released)
     }
 }
 

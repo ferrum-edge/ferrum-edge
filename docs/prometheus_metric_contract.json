@@ -3318,6 +3318,72 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_tls_store_admission_rejected_total",
+    "type": "counter",
+    "help": "Logical persistent TLS store admission refusals by store and reason.",
+    "labels": [
+      "store",
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_tls_store_document_bytes",
+    "type": "gauge",
+    "help": "Current serialized byte length of a persistent TLS store document.",
+    "labels": [
+      "store",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_tls_store_oversized_total",
+    "type": "counter",
+    "help": "Oversized persistent TLS store document refusals by store and direction.",
+    "labels": [
+      "store",
+      "direction",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_tls_store_pruned_total",
+    "type": "counter",
+    "help": "Terminal ACME order history entries pruned under the exclusive mutation lock.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_tls_store_record_count",
+    "type": "gauge",
+    "help": "Current logical record count in a persistent TLS store.",
+    "labels": [
+      "store",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_websocket_bytes_total",
     "type": "counter",
     "help": "WebSocket payload bytes relayed by direction.",

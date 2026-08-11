@@ -28,10 +28,10 @@ use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::Serialize;
 use serde_json::json;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tonic::metadata::MetadataValue;
 use tonic::transport::channel::ClientTlsConfig;
 use tonic::transport::{Certificate, Channel, Endpoint, Identity};
@@ -254,6 +254,12 @@ impl GrpcJwtSecret {
     /// plane whose trust bundle binds this node's `kid` to a namespace
     /// allow-list, or on a single-namespace control plane where there is no
     /// second tenant to reach.
+    ///
+    /// **Async callers must use [`Self::mint_async`].** A token-file read is a
+    /// blocking filesystem operation; calling this sync helper on a Tokio core
+    /// worker can stall unrelated tasks. The sync path remains for tests and
+    /// non-async call sites and still goes through the shared bounded regular-
+    /// file reader (type check, byte ceiling, UTF-8, redacted diagnostics).
     pub fn mint(
         &self,
         node_id: &str,
@@ -261,16 +267,7 @@ impl GrpcJwtSecret {
         audience: Option<&str>,
     ) -> Result<String, anyhow::Error> {
         if let Some(path) = self.token_file.as_deref() {
-            let token = std::fs::read_to_string(path).map_err(|error| {
-                anyhow::anyhow!("failed to read FERRUM_DP_CP_GRPC_TOKEN_FILE: {error}")
-            })?;
-            let token = token.trim();
-            if token.is_empty() {
-                anyhow::bail!("FERRUM_DP_CP_GRPC_TOKEN_FILE is empty");
-            }
-            // Neither the token nor its source path is logged or echoed into
-            // an error.
-            return Ok(token.to_string());
+            return read_external_cp_token_file(path);
         }
         generate_dp_jwt_full_with_key_id(
             &self.secret,
@@ -280,6 +277,100 @@ impl GrpcJwtSecret {
             audience,
             self.key_id.as_deref(),
         )
+    }
+
+    /// Async equivalent of [`Self::mint`] for reconnect / subscribe paths.
+    ///
+    /// External token files are read on a detached OS thread through the shared
+    /// credential-file primitive so a FIFO, device, stalled mount, or oversized
+    /// file cannot block a Tokio core worker. Self-minted JWTs stay in-process
+    /// and do not touch the filesystem.
+    pub async fn mint_async(
+        &self,
+        node_id: &str,
+        namespace: Option<&str>,
+        audience: Option<&str>,
+    ) -> Result<String, anyhow::Error> {
+        if let Some(path) = self.token_file.as_deref() {
+            return read_external_cp_token_file_detached(path).await;
+        }
+        generate_dp_jwt_full_with_key_id(
+            &self.secret,
+            node_id,
+            &self.issuer,
+            namespace,
+            audience,
+            self.key_id.as_deref(),
+        )
+    }
+}
+
+/// Bound for `FERRUM_DP_CP_GRPC_TOKEN_FILE` reads on reconnect. Distinct from
+/// startup `_FILE` fetch timeout: a hung reconnect must fail closed quickly so
+/// multi-CP failover can proceed.
+pub const DP_CP_TOKEN_FILE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One token-file read may remain blocked in the kernel after its async caller
+/// times out. The permit moves into that detached OS thread, so reconnects
+/// cannot accumulate abandoned readers during a persistent mount outage.
+static DP_CP_TOKEN_FILE_READ_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+pub(crate) fn dp_cp_token_file_read_limit() -> Arc<Semaphore> {
+    Arc::clone(DP_CP_TOKEN_FILE_READ_LIMIT.get_or_init(|| Arc::new(Semaphore::new(1))))
+}
+
+fn map_external_cp_token_error(
+    error: crate::secrets::credential_file::CredentialFileError,
+) -> anyhow::Error {
+    use crate::secrets::credential_file::CredentialFileError;
+    match error {
+        CredentialFileError::Empty => {
+            anyhow::anyhow!("FERRUM_DP_CP_GRPC_TOKEN_FILE is empty")
+        }
+        other => anyhow::anyhow!("failed to read FERRUM_DP_CP_GRPC_TOKEN_FILE: {other}"),
+    }
+}
+
+fn read_external_cp_token_file(path: &str) -> Result<String, anyhow::Error> {
+    use crate::secrets::credential_file::{
+        CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES, read_credential_file,
+    };
+    // Neither the token nor its source path is logged or echoed into an error.
+    read_credential_file(
+        path,
+        DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+        CredentialTrim::Ends,
+    )
+    .map_err(map_external_cp_token_error)
+}
+
+async fn read_external_cp_token_file_detached(path: &str) -> Result<String, anyhow::Error> {
+    use crate::secrets::credential_file::{
+        CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES, read_credential_file_detached_guarded,
+    };
+    let read = async {
+        let permit = dp_cp_token_file_read_limit()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("failed to read FERRUM_DP_CP_GRPC_TOKEN_FILE: reader unavailable")
+            })?;
+        read_credential_file_detached_guarded(
+            path,
+            DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+            CredentialTrim::Ends,
+            "ferrum-cp-token-file",
+            permit,
+        )
+        .await
+        .map_err(map_external_cp_token_error)
+    };
+    match tokio::time::timeout(DP_CP_TOKEN_FILE_READ_TIMEOUT, read).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "failed to read FERRUM_DP_CP_GRPC_TOKEN_FILE: timed out after {}s",
+            DP_CP_TOKEN_FILE_READ_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -1596,7 +1687,11 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     // multi-namespace CPs configured with `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`
     // accept self-minted DP tokens. Single-namespace CPs ignore the extra
     // claim — it never restricts the back-compat path.
-    let auth_token = jwt_secret.mint(node_id, Some(namespace), None)?;
+    // External token files are read off-worker via mint_async (detached thread
+    // + shared bounded regular-file reader). Never call sync mint() here.
+    let auth_token = jwt_secret
+        .mint_async(node_id, Some(namespace), None)
+        .await?;
     if jwt_secret.uses_external_token() {
         info!(
             "Presenting externally issued CP/DP token from FERRUM_DP_CP_GRPC_TOKEN_FILE \

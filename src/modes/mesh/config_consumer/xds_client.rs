@@ -62,24 +62,45 @@ const XDS_APPLY_MAX_DELAY: Duration = Duration::from_millis(500);
 
 type BearerToken = MetadataValue<tonic::metadata::Ascii>;
 
+/// Per-connection ADS credentials. External `FERRUM_DP_CP_GRPC_TOKEN_FILE`
+/// material is read once per reconnect attempt (off the Tokio worker via
+/// [`GrpcJwtSecret::mint_async`]) and cloned into each intercepted request.
+/// Self-minted JWTs stay in-process and may be refreshed per request without
+/// filesystem I/O.
 #[derive(Clone)]
-struct AdsAuth {
-    jwt_secret: GrpcJwtSecret,
-    node_id: String,
-    namespace: String,
+enum AdsAuth {
+    External {
+        token: BearerToken,
+    },
+    Minted {
+        jwt_secret: GrpcJwtSecret,
+        node_id: String,
+        namespace: String,
+    },
 }
 
 impl AdsAuth {
     fn bearer_token(&self) -> Result<BearerToken, tonic::Status> {
-        let auth_token = self
-            .jwt_secret
-            .mint(&self.node_id, Some(&self.namespace), None)
-            .map_err(|e| {
-                tonic::Status::unauthenticated(format!("failed to obtain xDS bearer token: {e}"))
-            })?;
-        format!("Bearer {auth_token}").parse().map_err(|e| {
-            tonic::Status::internal(format!("failed to build authorization metadata: {e}"))
-        })
+        match self {
+            Self::External { token } => Ok(token.clone()),
+            Self::Minted {
+                jwt_secret,
+                node_id,
+                namespace,
+            } => {
+                // Self-mint only: token_file is unset on this variant.
+                let auth_token = jwt_secret
+                    .mint(node_id, Some(namespace), None)
+                    .map_err(|e| {
+                        tonic::Status::unauthenticated(format!(
+                            "failed to obtain xDS bearer token: {e}"
+                        ))
+                    })?;
+                format!("Bearer {auth_token}").parse().map_err(|e| {
+                    tonic::Status::internal(format!("failed to build authorization metadata: {e}"))
+                })
+            }
+        }
     }
 }
 
@@ -734,10 +755,24 @@ async fn connect_ads(
     }
 
     let channel = endpoint.connect().await?;
-    let auth = AdsAuth {
-        jwt_secret: jwt_secret.clone(),
-        node_id: config.node_id.clone(),
-        namespace: config.namespace.clone(),
+    // External tokens are materialized once per connection attempt so rotation
+    // is visible on reconnect without performing file I/O inside the tonic
+    // interceptor (which runs on a Tokio worker).
+    let auth = if jwt_secret.uses_external_token() {
+        let auth_token = jwt_secret
+            .mint_async(&config.node_id, Some(&config.namespace), None)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to obtain xDS bearer token: {e}"))?;
+        let token: BearerToken = format!("Bearer {auth_token}")
+            .parse()
+            .map_err(|_| anyhow::anyhow!("failed to build authorization metadata"))?;
+        AdsAuth::External { token }
+    } else {
+        AdsAuth::Minted {
+            jwt_secret: jwt_secret.clone(),
+            node_id: config.node_id.clone(),
+            namespace: config.namespace.clone(),
+        }
     };
     let consumer = XdsConfigConsumer::new(config.clone(), state);
 

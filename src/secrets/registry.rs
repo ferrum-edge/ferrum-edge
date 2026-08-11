@@ -25,6 +25,7 @@ const FERRUM_PREFIX: &str = "FERRUM_";
 const NON_SECRET_FILE_SUFFIX_KEYS: &[&str] = &[
     "FERRUM_DNS_RESOLVER_HOSTS_FILE",
     "FERRUM_DP_CP_GRPC_TOKEN_FILE",
+    "FERRUM_MESH_STOCK_XDS_TOKEN_FILE",
 ];
 
 /// Substituted for a secret's source reference in an operator-facing error.
@@ -1299,6 +1300,7 @@ mod tests {
         assert!(match_suffix("FERRUM_DB_URL").is_none());
         assert!(match_suffix("FERRUM_DB_URL_ETCD").is_none());
         assert!(match_suffix("FERRUM_DNS_RESOLVER_HOSTS_FILE").is_none());
+        assert!(match_suffix("FERRUM_MESH_STOCK_XDS_TOKEN_FILE").is_none());
         assert!(match_suffix("").is_none());
         assert!(match_suffix("RANDOM_KEY").is_none());
     }

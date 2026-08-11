@@ -362,6 +362,11 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_tls_source_fetch_duration_seconds` | histogram | `scheme`, `kind`, `le`, `namespace` | `tls` | `documented_only` | `conditional` | TLS material source fetch duration in seconds. |
 | `ferrum_tls_source_fetch_failures_total` | counter | `scheme`, `kind`, `reason`, `namespace` | `tls` | `documented_only` | `conditional` | TLS material source fetch failures by scheme, kind, and bounded reason. |
 | `ferrum_tls_source_refresh_total` | counter | `scheme`, `kind`, `surface`, `outcome`, `namespace` | `tls` | `documented_only` | `conditional` | TLS material source refresh attempts by scheme, kind, surface, and outcome. |
+| `ferrum_tls_store_admission_rejected_total` | counter | `store`, `reason`, `namespace` | `tls` | `documented_only` | `always` | Logical persistent TLS store admission refusals by store and reason. |
+| `ferrum_tls_store_document_bytes` | gauge | `store`, `namespace` | `tls` | `documented_only` | `always` | Current serialized byte length of a persistent TLS store document. |
+| `ferrum_tls_store_oversized_total` | counter | `store`, `direction`, `namespace` | `tls` | `documented_only` | `always` | Oversized persistent TLS store document refusals by store and direction. |
+| `ferrum_tls_store_pruned_total` | counter | `namespace` | `tls` | `documented_only` | `always` | Terminal ACME order history entries pruned under the exclusive mutation lock. |
+| `ferrum_tls_store_record_count` | gauge | `store`, `namespace` | `tls` | `documented_only` | `always` | Current logical record count in a persistent TLS store. |
 | `ferrum_websocket_bytes_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket payload bytes relayed by direction. |
 | `ferrum_websocket_frames_total` | counter | `proxy_id`, `direction`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket frames relayed by direction. |
 | `ferrum_websocket_session_duration_ms` | histogram | `proxy_id`, `result`, `direction`, `io_side`, `error_class`, `termination_reason`, `le`, `namespace` | `websocket` | `documented_only` | `conditional` | WebSocket session duration in milliseconds. |

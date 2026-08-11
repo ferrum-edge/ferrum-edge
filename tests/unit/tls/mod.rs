@@ -18,3 +18,4 @@ mod san_allow_list_verifier_tests;
 mod source_redaction_tests;
 mod store_lock_timeout_config_tests;
 mod system_trust_roots_source_tests;
+mod tls_store_bounds_tests;

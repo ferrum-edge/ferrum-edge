@@ -111,7 +111,7 @@ struct RouteEntry {
 /// ports (`:80` and `:8080`) the remap is off and only an exact match serves —
 /// which is correct, because both ports are bound.
 #[derive(Clone, Copy)]
-struct HttpPortMatchContext {
+struct HttpPortMatchContext<'a> {
     frontend_port: Option<u16>,
     frontend_is_tls: bool,
     /// The one distinct non-TLS HTTP `listen_port` in the table, if there is
@@ -119,6 +119,11 @@ struct HttpPortMatchContext {
     single_nontls_listen_port: Option<u16>,
     /// Same, for the one distinct TLS-scoped HTTP `listen_port`.
     single_tls_listen_port: Option<u16>,
+    /// Listener admission published with the exact request/config generation.
+    /// A pending generation rejects every listener-scoped route. Once the
+    /// matching reconcile acknowledges it, only admission-refused ports remain
+    /// ineligible; ordinary OS bind failures stay eligible for Service remap.
+    listener_admission: &'a GatewayListenerAdmission,
 }
 
 /// A route-table candidate with its listener scope resolved at build time.
@@ -168,13 +173,16 @@ impl PortScopedProxy {
 fn port_match_priority(
     listen_port: Option<u16>,
     listen_port_tls: bool,
-    ctx: HttpPortMatchContext,
+    ctx: HttpPortMatchContext<'_>,
 ) -> Option<u8> {
     let Some(port) = listen_port else {
         // Port-agnostic route: serves any HTTP-family frontend, but always
         // loses to a listener-scoped sibling on that listener.
         return Some(2);
     };
+    if !ctx.listener_admission.allows(port) {
+        return None;
+    }
     // A listener is plaintext or TLS, never both: a request whose frontend
     // class disagrees with the listener's did not arrive on that listener.
     if listen_port_tls != ctx.frontend_is_tls {
@@ -401,9 +409,49 @@ pub(crate) struct HostRouteTable {
     mesh_udp_egress: HashMap<(std::net::IpAddr, u16), MeshTcpEgressDecision>,
 }
 
+/// Gateway listener routing admission for one exact request/config generation.
+///
+/// New config generations start pending so a newly published port-scoped route
+/// cannot use an older generation's successful decision. The listener manager
+/// replaces pending with a decided refusal set only after reconciling that same
+/// config generation. Ordinary OS bind failures are deliberately absent from
+/// the decided set so Service-fronted remapping remains available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GatewayListenerAdmission {
+    pending: bool,
+    refused_ports: BTreeSet<u16>,
+}
+
+impl GatewayListenerAdmission {
+    pub(crate) fn pending() -> Arc<Self> {
+        Arc::new(Self {
+            pending: true,
+            refused_ports: BTreeSet::new(),
+        })
+    }
+
+    pub(crate) fn decided(refused_ports: BTreeSet<u16>) -> Arc<Self> {
+        Arc::new(Self {
+            pending: false,
+            refused_ports,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn allows(&self, port: u16) -> bool {
+        !self.pending && !self.refused_ports.contains(&port)
+    }
+
+    #[inline]
+    fn explicitly_refuses(&self, port: u16) -> bool {
+        self.refused_ports.contains(&port)
+    }
+}
+
 pub(crate) struct RouteSnapshot {
     table: Arc<HostRouteTable>,
     generation: u64,
+    listener_admission: Arc<GatewayListenerAdmission>,
 }
 
 /// One routable raw-TCP egress destination: the per-port upstream to
@@ -1384,6 +1432,10 @@ impl RouterCache {
             route_snapshot: ArcSwap::new(Arc::new(RouteSnapshot {
                 table,
                 generation: 1,
+                // Standalone RouterCache users have no listener manager to
+                // acknowledge generations. Production request paths use the
+                // admission carried by RequestEpoch instead.
+                listener_admission: GatewayListenerAdmission::decided(BTreeSet::new()),
             })),
             prefix_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries, shards),
             regex_cache: DashMap::with_capacity_and_shard_amount(max_cache_entries / 4 + 1, shards),
@@ -1408,19 +1460,48 @@ impl RouterCache {
         Arc::new(Self::build_route_table(config))
     }
 
-    pub(crate) fn store_route_table_snapshot(
+    pub(crate) fn store_route_epoch_snapshot(
         &self,
         table: Arc<HostRouteTable>,
         route_generation: u64,
+        listener_admission: Arc<GatewayListenerAdmission>,
     ) {
         let previous_generation = self.route_snapshot.load().generation;
         self.route_snapshot.store(Arc::new(RouteSnapshot {
             table,
             generation: route_generation,
+            listener_admission,
         }));
         if previous_generation != route_generation {
             self.clear_lookup_caches();
         }
+    }
+
+    #[cfg(test)]
+    fn store_route_table_snapshot(&self, table: Arc<HostRouteTable>, route_generation: u64) {
+        self.store_route_epoch_snapshot(
+            table,
+            route_generation,
+            GatewayListenerAdmission::decided(BTreeSet::new()),
+        );
+    }
+
+    /// Standalone-router admission publisher for external regression tests.
+    /// Production admission is published only through `RequestEpochStore`.
+    #[doc(hidden)]
+    #[allow(dead_code)] // Library integration tests exercise this API; the binary target does not.
+    pub fn publish_listener_admission_for_test(&self, pending: bool, refused_ports: BTreeSet<u16>) {
+        let current = self.route_snapshot.load_full();
+        let listener_admission = if pending {
+            GatewayListenerAdmission::pending()
+        } else {
+            GatewayListenerAdmission::decided(refused_ports)
+        };
+        self.route_snapshot.store(Arc::new(RouteSnapshot {
+            table: Arc::clone(&current.table),
+            generation: current.generation.saturating_add(1),
+            listener_admission,
+        }));
     }
 
     pub(crate) fn clear_lookup_caches(&self) {
@@ -1563,14 +1644,14 @@ impl RouterCache {
     ///
     /// Results are cached (including misses) for O(1) repeated lookups.
     /// Prefix and regex matches use separate cache partitions.
-    /// Library/test API; request hot paths use find_proxy_in_snapshot().
+    /// Library/test API; request hot paths use find_proxy_in_epoch().
     #[allow(dead_code)]
     pub fn find_proxy(&self, host: Option<&str>, path: &str) -> Option<RouteMatch> {
         self.find_proxy_on_frontend(host, path, None, false)
     }
 
     /// Port-aware library/test lookup. Production request paths pass the
-    /// frontend accept port and TLS class into [`Self::find_proxy_in_snapshot`].
+    /// frontend accept port and TLS class into [`Self::find_proxy_in_epoch`].
     #[allow(dead_code)]
     pub fn find_proxy_on_frontend(
         &self,
@@ -1580,9 +1661,10 @@ impl RouterCache {
         frontend_is_tls: bool,
     ) -> Option<RouteMatch> {
         let snapshot = self.route_snapshot.load();
-        self.find_proxy_in_snapshot(
+        self.find_proxy_with_admission(
             &snapshot.table,
             snapshot.generation,
+            &snapshot.listener_admission,
             host,
             path,
             frontend_port,
@@ -1590,6 +1672,31 @@ impl RouterCache {
         )
     }
 
+    /// Production lookup from one complete request epoch. Keeping the route
+    /// table, cache generation, and listener admission behind this one
+    /// parameter prevents HTTP/H3 callers from pairing different generations.
+    pub(crate) fn find_proxy_in_epoch(
+        &self,
+        epoch: &crate::request_epoch::RequestEpoch,
+        host: Option<&str>,
+        path: &str,
+        frontend_port: Option<u16>,
+        frontend_is_tls: bool,
+    ) -> Option<RouteMatch> {
+        self.find_proxy_with_admission(
+            &epoch.route_table,
+            epoch.route_generation,
+            &epoch.gateway_listener_admission,
+            host,
+            path,
+            frontend_port,
+            frontend_is_tls,
+        )
+    }
+
+    /// Snapshot lookup retained for route-table generation tests. Production
+    /// callers must use [`Self::find_proxy_in_epoch`].
+    #[cfg(test)]
     pub(crate) fn find_proxy_in_snapshot(
         &self,
         table: &HostRouteTable,
@@ -1599,6 +1706,36 @@ impl RouterCache {
         frontend_port: Option<u16>,
         frontend_is_tls: bool,
     ) -> Option<RouteMatch> {
+        let admitted = GatewayListenerAdmission::decided(BTreeSet::new());
+        self.find_proxy_with_admission(
+            table,
+            route_generation,
+            &admitted,
+            host,
+            path,
+            frontend_port,
+            frontend_is_tls,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn find_proxy_with_admission(
+        &self,
+        table: &HostRouteTable,
+        route_generation: u64,
+        listener_admission: &GatewayListenerAdmission,
+        host: Option<&str>,
+        path: &str,
+        frontend_port: Option<u16>,
+        frontend_is_tls: bool,
+    ) -> Option<RouteMatch> {
+        // A withdrawn or class-flipping listener may still have an accepted
+        // connection draining after its route disappeared. Never reinterpret
+        // that listener as the process-global socket and apply the
+        // single-listener Service remap to a surviving sibling.
+        if frontend_port.is_some_and(|port| listener_admission.explicitly_refuses(port)) {
+            return None;
+        }
         let normalized = normalize_encoded_slashes(path);
         let path: &str = &normalized;
         let port_ctx = HttpPortMatchContext {
@@ -1606,6 +1743,7 @@ impl RouterCache {
             frontend_is_tls,
             single_nontls_listen_port: table.single_nontls_listen_port,
             single_tls_listen_port: table.single_tls_listen_port,
+            listener_admission,
         };
 
         // Fast path: use thread-local buffer for cache lookup to avoid String
@@ -1617,7 +1755,13 @@ impl RouterCache {
             // Fast path 1: check prefix cache (includes negative entries for total misses)
             if let Some(entry) = self.prefix_cache.get(buf.as_str()) {
                 let cached = entry.value();
-                if cached.route_generation == route_generation {
+                if cached.route_generation == route_generation
+                    && cached.proxy.as_ref().is_none_or(|proxy| {
+                        proxy
+                            .listen_port
+                            .is_none_or(|port| listener_admission.allows(port))
+                    })
+                {
                     self.frequency_sketch.increment(&buf);
                     return Some(cached.proxy.as_ref().map(|proxy| RouteMatch {
                         // Host-only proxies (listen_path == None) match any path and
@@ -1633,7 +1777,12 @@ impl RouterCache {
             // Fast path 2: check regex cache (only contains positive matches)
             if let Some(entry) = self.regex_cache.get(buf.as_str()) {
                 let cached = entry.value();
-                if cached.route_generation == route_generation {
+                if cached.route_generation == route_generation
+                    && cached
+                        .proxy
+                        .listen_port
+                        .is_none_or(|port| listener_admission.allows(port))
+                {
                     self.frequency_sketch.increment(&buf);
                     return Some(Some(RouteMatch {
                         proxy: Arc::clone(&cached.proxy),
@@ -1653,8 +1802,8 @@ impl RouterCache {
 
         // Slow path: search the host route table (cache miss). The normal lookup
         // never filters by direction; direction scoping is handled by the request
-        // handlers via `resolve_route_excluding_wrong_direction` when the cached
-        // winner turns out to be a wrong-direction mesh route.
+        // handlers via `resolve_route_excluding_wrong_direction_in_epoch` when
+        // the cached winner turns out to be a wrong-direction mesh route.
         let result = Self::search_route_table(
             table,
             host,
@@ -1854,6 +2003,33 @@ impl RouterCache {
     /// listeners share one route table, so this keeps each listener serving only
     /// its own direction's materialized routes. `req_direction == None` (a
     /// non-mesh listener) excludes every direction-scoped mesh route.
+    pub(crate) fn resolve_route_excluding_wrong_direction_in_epoch(
+        &self,
+        epoch: &crate::request_epoch::RequestEpoch,
+        host: Option<&str>,
+        path: &str,
+        req_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
+        frontend_port: Option<u16>,
+        frontend_is_tls: bool,
+    ) -> Option<RouteMatch> {
+        let normalized = normalize_encoded_slashes(path);
+        Self::search_route_table(
+            &epoch.route_table,
+            host,
+            &normalized,
+            MeshRouteDirectionFilter::MatchingDirection(req_direction),
+            HttpPortMatchContext {
+                frontend_port,
+                frontend_is_tls,
+                single_nontls_listen_port: epoch.route_table.single_nontls_listen_port,
+                single_tls_listen_port: epoch.route_table.single_tls_listen_port,
+                listener_admission: &epoch.gateway_listener_admission,
+            },
+        )
+    }
+
+    /// Standalone route-table variant retained for focused router tests.
+    #[cfg(test)]
     pub(crate) fn resolve_route_excluding_wrong_direction(
         &self,
         table: &HostRouteTable,
@@ -1864,6 +2040,7 @@ impl RouterCache {
         frontend_is_tls: bool,
     ) -> Option<RouteMatch> {
         let normalized = normalize_encoded_slashes(path);
+        let admission = GatewayListenerAdmission::decided(BTreeSet::new());
         Self::search_route_table(
             table,
             host,
@@ -1874,6 +2051,7 @@ impl RouterCache {
                 frontend_is_tls,
                 single_nontls_listen_port: table.single_nontls_listen_port,
                 single_tls_listen_port: table.single_tls_listen_port,
+                listener_admission: &admission,
             },
         )
     }
@@ -1924,8 +2102,27 @@ impl RouterCache {
         table: Arc<HostRouteTable>,
         generation: u64,
     ) {
-        self.route_snapshot
-            .store(Arc::new(RouteSnapshot { table, generation }));
+        let listener_admission = Arc::clone(&self.route_snapshot.load().listener_admission);
+        self.route_snapshot.store(Arc::new(RouteSnapshot {
+            table,
+            generation,
+            listener_admission,
+        }));
+    }
+
+    /// Test-only: publish admission without changing the route generation or
+    /// clearing lookup caches, exercising cache-hit fail-closed revalidation.
+    #[cfg(test)]
+    fn publish_listener_admission_without_clearing_for_tests(
+        &self,
+        listener_admission: Arc<GatewayListenerAdmission>,
+    ) {
+        let current = self.route_snapshot.load_full();
+        self.route_snapshot.store(Arc::new(RouteSnapshot {
+            table: Arc::clone(&current.table),
+            generation: current.generation,
+            listener_admission,
+        }));
     }
 
     /// Number of routes in the pre-sorted route table (for testing).
@@ -6653,5 +6850,41 @@ mod tests {
             table.mesh_http_egress_by_workload_decision("10.0.0.7:18080".parse().unwrap()),
             Some(MeshHttpEgressByWorkloadDecision::CloseNotRoutable)
         ));
+    }
+
+    #[test]
+    fn cache_hit_fail_closed_revalidates_refused_listener_without_clear() {
+        let mut scoped = minimal_proxy_for_routing("scoped", "/api");
+        scoped.hosts = vec!["app.example.com".into()];
+        scoped.listen_port = Some(80);
+        let config = GatewayConfig {
+            proxies: vec![scoped],
+            ..GatewayConfig::default()
+        };
+        let cache = RouterCache::new(&config, 100);
+
+        let warm = cache
+            .find_proxy_on_frontend(Some("app.example.com"), "/api/warm", Some(80), false)
+            .expect("warm exact-port entry");
+        assert_eq!(warm.proxy.id, "scoped");
+        let cached_before = cache.cache_len();
+        assert!(cached_before >= 1);
+
+        // Flip refusal without clearing so the next lookup must reject a
+        // still-resident positive cache entry on the hit path.
+        cache.publish_listener_admission_without_clearing_for_tests(
+            GatewayListenerAdmission::decided(BTreeSet::from([80])),
+        );
+        assert_eq!(
+            cache.cache_len(),
+            cached_before,
+            "test helper must leave the positive entry resident"
+        );
+        assert!(
+            cache
+                .find_proxy_on_frontend(Some("app.example.com"), "/api/warm", Some(80), false)
+                .is_none(),
+            "cache hit must fail closed against the current refused-port snapshot"
+        );
     }
 }

@@ -18,6 +18,9 @@ use crate::util::endpointslice::{
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use super::http_body::{DiscoveryBodyRole, collect_discovery_response_body};
@@ -31,6 +34,23 @@ use super::http_body::{DiscoveryBodyRole, collect_discovery_response_body};
 #[derive(Debug, Deserialize)]
 struct EndpointSliceListEnvelope {
     items: Vec<serde_json::Value>,
+}
+
+/// Standard in-cluster projected service-account token path.
+pub const DEFAULT_SERVICE_ACCOUNT_TOKEN_PATH: &str =
+    "/var/run/secrets/kubernetes.io/serviceaccount/token";
+
+/// Bound for each discovery-poll SA-token admission attempt, including waiting
+/// for an earlier timed-out reader to leave the kernel. Matches DP/stock-xDS.
+pub const K8S_SA_TOKEN_FILE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A timed-out mount read may keep its detached OS thread blocked. The permit
+/// moves into that thread, so repeated discovery polls cannot accumulate more
+/// blocked readers while the same credential source remains unavailable.
+static K8S_SA_TOKEN_FILE_READ_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+pub(crate) fn k8s_sa_token_file_read_limit() -> Arc<Semaphore> {
+    Arc::clone(K8S_SA_TOKEN_FILE_READ_LIMIT.get_or_init(|| Arc::new(Semaphore::new(1))))
 }
 
 /// Characters that must be percent-encoded in a URL path segment (RFC 3986 §3.3).
@@ -83,6 +103,8 @@ pub struct KubernetesDiscoverer {
     label_selector: Option<String>,
     default_weight: u32,
     api_url_override: Option<String>,
+    /// Override for the in-cluster SA token path (tests / fixtures).
+    sa_token_path_override: Option<String>,
 }
 
 impl KubernetesDiscoverer {
@@ -102,6 +124,7 @@ impl KubernetesDiscoverer {
             label_selector,
             default_weight,
             api_url_override: None,
+            sa_token_path_override: None,
         }
     }
 
@@ -110,6 +133,20 @@ impl KubernetesDiscoverer {
     pub fn with_api_url(mut self, url: String) -> Self {
         self.api_url_override = Some(url);
         self
+    }
+
+    /// Override the service-account token path (for testing projected rotation
+    /// and fail-closed credential boundaries without touching the host path).
+    #[allow(dead_code)]
+    pub fn with_sa_token_path(mut self, path: String) -> Self {
+        self.sa_token_path_override = Some(path);
+        self
+    }
+
+    fn sa_token_path(&self) -> &str {
+        self.sa_token_path_override
+            .as_deref()
+            .unwrap_or(DEFAULT_SERVICE_ACCOUNT_TOKEN_PATH)
     }
 
     /// Build the Kubernetes API URL for listing EndpointSlices.
@@ -160,33 +197,115 @@ impl KubernetesDiscoverer {
         url
     }
 
-    /// Read the service account token from the standard in-cluster path.
-    fn read_sa_token() -> Option<String> {
-        std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/token").ok()
+    /// Resolve the discovery bearer credential for this poll.
+    ///
+    /// Re-reads on every call so Kubernetes projected-token symlink rotation is
+    /// visible without restart. Open/read run on a detached OS thread through
+    /// the shared 64 KiB regular-file credential boundary. `Ok(None)` means the
+    /// configured pathname is genuinely absent
+    /// ([`crate::secrets::credential_file::CredentialFileError::PathNotFound`]);
+    /// every other failure — including a broken projected symlink — fails
+    /// closed before the Kubernetes API request.
+    async fn read_sa_token(path: &str) -> Result<Option<String>, anyhow::Error> {
+        use crate::secrets::credential_file::{
+            CredentialFileError, CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+            read_credential_file_detached_guarded,
+        };
+
+        let read = async {
+            let permit = k8s_sa_token_file_read_limit()
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "failed to read Kubernetes service-account token: reader unavailable"
+                    )
+                })?;
+            match read_credential_file_detached_guarded(
+                path,
+                DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+                CredentialTrim::Ends,
+                "ferrum-k8s-sa-token",
+                permit,
+            )
+            .await
+            {
+                Ok(token) => Ok(Some(token)),
+                Err(CredentialFileError::PathNotFound) => Ok(None),
+                Err(error) => Err(map_sa_token_error(error)),
+            }
+        };
+
+        match tokio::time::timeout(K8S_SA_TOKEN_FILE_READ_TIMEOUT, read).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "failed to read Kubernetes service-account token: timed out after {}s",
+                K8S_SA_TOKEN_FILE_READ_TIMEOUT.as_secs()
+            )),
+        }
     }
 
     /// Extract the matching port from an EndpointSlice item.
+    ///
+    /// Returns `None` when the named/first port is absent or outside
+    /// `1..=u16::MAX` (checked admission; never wraps).
+    #[cfg(test)]
     fn extract_port(&self, item: &serde_json::Value) -> Option<u16> {
-        let ports = item.get("ports").and_then(|v| v.as_array())?;
-
-        if let Some(ref port_name) = self.port_name {
-            // Find port by name
-            for port in ports {
-                let name = port.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                if name == port_name {
-                    return port.get("port").and_then(|p| p.as_u64()).map(|p| p as u16);
-                }
-            }
-            None
-        } else {
-            // Use first port
-            ports
-                .first()?
-                .get("port")
-                .and_then(|p| p.as_u64())
-                .map(|p| p as u16)
+        match self.classify_port(item) {
+            EndpointSlicePortAdmission::Admitted(port) => Some(port),
+            EndpointSlicePortAdmission::Missing | EndpointSlicePortAdmission::Invalid => None,
         }
     }
+
+    /// Classify the selected EndpointSlice port for structured skip tallies.
+    ///
+    /// Distinguishes a missing/unmatched port from an explicitly present value
+    /// outside `1..=u16::MAX` so out-of-range integers are not conflated with
+    /// absent fields. Never wraps. Aligns with the Kubernetes controller
+    /// EndpointSlice port filter (`nonzero && <= u16::MAX`).
+    fn classify_port(&self, item: &serde_json::Value) -> EndpointSlicePortAdmission {
+        let Some(ports) = item.get("ports").and_then(|v| v.as_array()) else {
+            return EndpointSlicePortAdmission::Missing;
+        };
+
+        let selected = if let Some(ref port_name) = self.port_name {
+            ports
+                .iter()
+                .find(|port| port.get("name").and_then(|n| n.as_str()).unwrap_or("") == port_name)
+        } else {
+            ports.first()
+        };
+
+        let Some(port_obj) = selected else {
+            return EndpointSlicePortAdmission::Missing;
+        };
+
+        match port_obj.get("port") {
+            None => EndpointSlicePortAdmission::Missing,
+            Some(value) => match value.as_u64() {
+                None => EndpointSlicePortAdmission::Invalid,
+                Some(raw) => match super::admit_registry_port(raw) {
+                    Some(port) => EndpointSlicePortAdmission::Admitted(port),
+                    None => EndpointSlicePortAdmission::Invalid,
+                },
+            },
+        }
+    }
+}
+
+/// Result of selecting and admitting one EndpointSlice port field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointSlicePortAdmission {
+    Admitted(u16),
+    Missing,
+    Invalid,
+}
+
+fn map_sa_token_error(
+    error: crate::secrets::credential_file::CredentialFileError,
+) -> anyhow::Error {
+    // CredentialFileError display never includes the source path or value.
+    anyhow::anyhow!("failed to read Kubernetes service-account token: {error}")
 }
 
 #[async_trait::async_trait]
@@ -196,11 +315,21 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
 
         let mut request = self.client.get(&url);
 
-        // Add bearer token auth (re-read each poll — tokens can rotate)
-        if let Some(token) = Self::read_sa_token() {
-            request = request.bearer_auth(token);
-        } else if let Ok(kubeconfig_token) = std::env::var("KUBE_TOKEN") {
-            request = request.bearer_auth(kubeconfig_token);
+        // Add bearer token auth (re-read each poll — projected tokens rotate).
+        // Only genuine pathname absence (`CredentialFileError::PathNotFound`)
+        // may fall back to KUBE_TOKEN; an existing-but-invalid source
+        // (oversized, empty, invalid UTF-8, broken projected symlink, stall)
+        // fails closed here before the Kubernetes API request, preserving
+        // last-admitted targets.
+        match Self::read_sa_token(self.sa_token_path()).await? {
+            Some(token) => {
+                request = request.bearer_auth(token);
+            }
+            None => {
+                if let Ok(kubeconfig_token) = std::env::var("KUBE_TOKEN") {
+                    request = request.bearer_auth(kubeconfig_token);
+                }
+            }
         }
 
         let response = request.send().await?;
@@ -234,6 +363,7 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
         let mut targets = Vec::new();
         let mut slices = 0usize;
         let mut missing_port = 0usize;
+        let mut invalid_port = 0usize;
         let mut missing_endpoints = 0usize;
         let mut not_ready = 0usize;
         let mut terminating = 0usize;
@@ -243,11 +373,18 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
 
         for item in &envelope.items {
             slices += 1;
-            // Extract ports
-            let port = self.extract_port(item);
-            if port.is_none() {
-                missing_port += 1;
-            }
+            // Extract ports with checked admission (no wrap on out-of-range).
+            let port = match self.classify_port(item) {
+                EndpointSlicePortAdmission::Admitted(port) => Some(port),
+                EndpointSlicePortAdmission::Missing => {
+                    missing_port += 1;
+                    None
+                }
+                EndpointSlicePortAdmission::Invalid => {
+                    invalid_port += 1;
+                    None
+                }
+            };
 
             // Extract endpoints
             if let Some(endpoints) = item.get("endpoints").and_then(|v| v.as_array()) {
@@ -313,6 +450,7 @@ impl super::ServiceDiscoverer for KubernetesDiscoverer {
                 service = %self.service_name,
                 slices,
                 missing_port,
+                invalid_port,
                 missing_endpoints,
                 not_ready,
                 terminating,
@@ -349,6 +487,7 @@ mod tests {
             label_selector: label_selector.map(|s| s.to_string()),
             default_weight: 1,
             api_url_override: Some("https://k8s-api:6443".to_string()),
+            sa_token_path_override: None,
         }
     }
 
@@ -393,6 +532,7 @@ mod tests {
             label_selector: None,
             default_weight: 1,
             api_url_override: None, // No override
+            sa_token_path_override: None,
         };
         let url = d.api_url();
         // May use env vars if set in the test environment, or fallback

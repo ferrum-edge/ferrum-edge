@@ -10,8 +10,17 @@
 //! but runtime teardown then waits for the blocking pool, so `run`/`validate`
 //! hung after honoring `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS`. A detached thread is
 //! owned by no runtime and is not joined at process exit.
+//!
+//! The open/read itself goes through [`crate::secrets::credential_file`]: regular
+//! file type check on the opened descriptor, metadata fast-reject, and a
+//! `limit + 1` streaming ceiling so an oversized regular file cannot allocate
+//! unbounded memory before the caller's timeout.
 
 use std::env;
+
+use super::credential_file::{
+    self, CredentialFileError, CredentialTrim, DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+};
 
 /// Check if the `{key}_FILE` env var is set and non-empty.
 /// Returns the file path if so.
@@ -22,29 +31,34 @@ pub fn resolve_ref(key: &str) -> Option<String> {
     env::var(&file_key).ok().filter(|s| !s.is_empty())
 }
 
+fn map_file_secret_error(key: &str, error: CredentialFileError) -> String {
+    match error {
+        CredentialFileError::Empty => {
+            format!("{}_FILE source is empty after trimming", key)
+        }
+        other => format!("Failed to read {}_FILE: {}", key, other),
+    }
+}
+
 /// Read a secret value from a file path. Trims trailing whitespace
 /// (trailing newlines are common in Docker secrets and heredocs).
 /// Returns an error if the file cannot be read or is empty after trimming.
 ///
-/// The errors name the suffixed variable and the `io::Error` reason ("No such
-/// file or directory", "Permission denied") but never the path itself: a
-/// secret's source reference is treated as sensitive alongside its value, and
-/// `run` logs / `validate` prints this text. `std::fs::read_to_string` does not
-/// attach the path to its `io::Error`, so the reason is safe to forward
-/// verbatim.
+/// The errors name the suffixed variable and the failure class ("credential
+/// path not found", "Permission denied", "not a regular file", oversized)
+/// but never the path itself: a secret's source reference is treated as
+/// sensitive alongside its value, and `run` logs / `validate` prints this text.
 ///
 /// Prefer [`read_secret_detached`] on async paths so a blocked open/read cannot
 /// pin Tokio runtime teardown after the configured fetch timeout.
+#[allow(dead_code)] // used only by external tests; production paths use `read_secret_detached`
 pub fn read_secret(path: &str, key: &str) -> Result<String, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}_FILE: {}", key, e))?;
-
-    let trimmed = content.trim_end().to_string();
-    if trimmed.is_empty() {
-        return Err(format!("{}_FILE source is empty after trimming", key));
-    }
-
-    Ok(trimmed)
+    credential_file::read_credential_file(
+        path,
+        DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+        CredentialTrim::TrailingWhitespace,
+    )
+    .map_err(|error| map_file_secret_error(key, error))
 }
 
 /// Read a `_FILE` secret on a **detached OS thread**.
@@ -61,38 +75,22 @@ pub fn read_secret(path: &str, key: &str) -> Result<String, String> {
 /// runtime, dropping a temporary secret-resolution runtime after a timeout
 /// returns immediately instead of waiting on a blocked blocking-pool worker.
 ///
-/// **Residual, deliberate and bounded:** startup treats a fetch timeout as
+/// Non-regular sources and known-oversized regular files are rejected by the
+/// shared credential reader without leaving a blocked reader behind (Unix open
+/// uses `O_NONBLOCK`; size checks terminate at metadata or `limit + 1`).
+///
+/// **Residual, deliberate and bounded:** a stalled mount can still park the
+/// detached opener until the mount responds. Startup treats a fetch timeout as
 /// fatal, so `run`/`validate` abandon at most one thread per configured `_FILE`
 /// source in the run that is about to exit non-zero. There is no per-request
 /// loop that can accumulate abandoned readers.
 pub async fn read_secret_detached(path: &str, key: &str) -> Result<String, String> {
-    let path = path.to_string();
-    let key = key.to_string();
-    let key_for_error = key.clone();
-
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    let join_handle = std::thread::Builder::new()
-        .name("ferrum-secret-file".to_string())
-        .spawn(move || {
-            // The receiver is gone when the caller timed out; the result is
-            // then simply dropped.
-            let _ = sender.send(read_secret(&path, &key));
-        })
-        .map_err(|err| {
-            format!(
-                "Failed to start file secret read thread for {}: {}",
-                key_for_error, err
-            )
-        })?;
-
-    // Dropping `JoinHandle` detaches the thread. Do not join: a blocked
-    // open/read must not pin runtime teardown after the caller's timeout.
-    drop(join_handle);
-
-    receiver.await.map_err(|_| {
-        format!(
-            "File secret read for {} ended without producing a result",
-            key_for_error
-        )
-    })?
+    credential_file::read_credential_file_detached(
+        path,
+        DEFAULT_CREDENTIAL_FILE_MAX_BYTES,
+        CredentialTrim::TrailingWhitespace,
+        "ferrum-secret-file",
+    )
+    .await
+    .map_err(|error| map_file_secret_error(key, error))
 }

@@ -7,10 +7,10 @@
 //! socket on `:8080` a route scoped to that listener can never be reached.
 //!
 //! [`GatewayListenerManager`] owns that socket set. It derives the desired
-//! listeners from the published [`GatewayConfig`] — every HTTP-family proxy
-//! that carries a `listen_port`, classified plaintext or TLS by
-//! `GatewayConfig::http_tls_listen_ports` — and reconciles the live set on
-//! every config publication.
+//! listeners from the exact [`crate::request_epoch::RequestEpoch`] config
+//! generation — every HTTP-family proxy that carries a `listen_port`,
+//! classified plaintext or TLS by `GatewayConfig::http_tls_listen_ports` — and
+//! reconciles the live set on every config publication.
 //!
 //! # Lifecycle contract
 //!
@@ -73,9 +73,17 @@
 //! [`GatewayListenerManager::bind_failures`] and logged, then retried on a slow
 //! tick. It is deliberately never fatal: a Gateway listener port is
 //! control-plane input, and killing the process over one unbindable port would
-//! take down every healthy listener with it. Routes scoped to a listener that
-//! did not bind simply stay unreachable, which is the fail-closed outcome —
-//! they are never served somewhere else.
+//! take down every healthy listener with it.
+//!
+//! Routing fail-closed is scoped to **admission refusals** (reserved /
+//! stream / TLS-class collisions, missing TLS material, deferred class flips),
+//! which are published in the exact request epoch so a refused listener cannot
+//! become reachable through the process-global proxy or the single-listener
+//! Service remap. Ordinary OS bind failures (for example
+//! privileged `:80` without `CAP_NET_BIND_SERVICE`) stay telemetry-only: the
+//! Service-fronted topology still remaps that listener port through
+//! `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT` when the table has
+//! exactly one listen port of that protocol class.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -330,6 +338,10 @@ pub struct GatewayListenerManager {
     bind_addr: std::net::IpAddr,
     tls: GatewayListenerTls,
     http3: Option<GatewayListenerHttp3>,
+    /// Serialize startup, supervisor, retry, and test-triggered reconciles. A
+    /// pass may await socket retirement; overlapping passes could otherwise
+    /// mutate the live listener set from different config generations.
+    reconcile_lock: Mutex<()>,
     listeners: Mutex<BTreeMap<u16, LiveListener>>,
     /// Retiring listener tasks keyed by the port whose accept socket they may
     /// still own. Finished handles are reaped on every reconcile and the rest
@@ -366,6 +378,7 @@ impl GatewayListenerManager {
             bind_addr,
             tls,
             http3: None,
+            reconcile_lock: Mutex::new(()),
             listeners: Mutex::new(BTreeMap::new()),
             draining: Mutex::new(Vec::new()),
             revisions: Mutex::new(Some(revisions)),
@@ -436,9 +449,38 @@ impl GatewayListenerManager {
     /// [`Self::bind_failures`] for operators. They are advisory: see the module
     /// docs for why an unbindable listener port is never fatal.
     pub async fn reconcile(&self) -> Vec<GatewayListenerBindFailure> {
-        let config = self.state.config.load_full();
+        let _reconcile_guard = self.reconcile_lock.lock().await;
+        loop {
+            let expected = self.state.request_epoch.load();
+            let (failures, refused_route_ports, h3_ports) =
+                self.reconcile_generation(&expected).await;
+            if !self
+                .state
+                .publish_gateway_listener_admission(&expected, refused_route_ports)
+            {
+                // The config changed while this pass awaited socket/drain
+                // work. Its decision must never govern the newer route table;
+                // immediately reconcile the latest generation instead of
+                // relying on a possibly coalesced watch notification.
+                warn!(
+                    config_generation = expected.config_generation,
+                    "Discarding stale Gateway listener admission decision and reconciling the latest generation"
+                );
+                continue;
+            }
+            self.state.publish_gateway_h3_alt_svc(&h3_ports);
+            self.bind_failures.store(Arc::new(failures.clone()));
+            return failures;
+        }
+    }
+
+    async fn reconcile_generation(
+        &self,
+        expected: &crate::request_epoch::RequestEpoch,
+    ) -> (Vec<GatewayListenerBindFailure>, BTreeSet<u16>, Vec<u16>) {
+        let config = expected.config();
         let plan = GatewayListenerPlan::from_config(
-            &config,
+            config,
             self.state.reserved_gateway_ports.as_ref(),
             &self.existing_frontends,
         );
@@ -492,6 +534,7 @@ impl GatewayListenerManager {
                 (plan.ports.get(port) != Some(&listener.class)).then_some(*port)
             })
             .collect();
+        let stale_route_ports: BTreeSet<u16> = stale.iter().copied().collect();
         // Ports whose retiring generation has not finished closing its accept
         // sockets. Rebinding them in this pass could co-serve two classes, so
         // they are left unbound and retried.
@@ -572,8 +615,22 @@ impl GatewayListenerManager {
             .map(|drain| drain.port)
             .collect();
 
+        // Admission refusals suppress remapping. Start from plan.refused
+        // (reserved / stream / TLS-class collisions) and every port whose old
+        // accept loop is still draining, including a listener withdrawn from
+        // the current plan. A request already accepted by that old listener
+        // must not be remapped to the sole surviving listener. Extend this set
+        // for other reconcile-time decisions that likewise must not leak onto
+        // the process-global proxy. Ordinary `spawn_listener` OS errors are
+        // intentionally omitted so Service-fronted `:80`/`:443` remapping
+        // survives privileged-port bind failures.
+        let mut refused_route_ports: BTreeSet<u16> = plan.refused.keys().copied().collect();
+        refused_route_ports.extend(stale_route_ports);
+        refused_route_ports.extend(retiring_ports.iter().copied());
+
         for (port, class) in &plan.ports {
             if defer_rebind.contains(port) || retiring_ports.contains(port) {
+                refused_route_ports.insert(*port);
                 if !failures.iter().any(|failure| failure.port == *port) {
                     let error = format!(
                         "port {port} still has a retiring Gateway listener task; the replacement \
@@ -601,6 +658,7 @@ impl GatewayListenerManager {
                 );
                 warn!(port = *port, "Gateway API listener refused: {error}");
                 failures.push(GatewayListenerBindFailure { port: *port, error });
+                refused_route_ports.insert(*port);
                 continue;
             }
             match self.spawn_listener(*port, *class).await {
@@ -623,10 +681,7 @@ impl GatewayListenerManager {
             .collect();
         drop(live);
 
-        // Advertise HTTP/3 only where a QUIC socket really exists.
-        self.state.publish_gateway_h3_alt_svc(&h3_ports);
-        self.bind_failures.store(Arc::new(failures.clone()));
-        failures
+        (failures, refused_route_ports, h3_ports)
     }
 
     /// Drop finished drains so completed handles cannot accumulate for the life
@@ -868,9 +923,9 @@ impl GatewayListenerManager {
     /// listener port is control-plane input (or, for `:80`/`:443`, a port the
     /// container may lack `CAP_NET_BIND_SERVICE` for), so killing the gateway
     /// would take down every healthy listener over one unbindable port. The
-    /// failure is loud, surfaced on [`Self::bind_failures`], and retried; the
-    /// affected routes stay unreachable, which is fail-closed — no request is
-    /// ever routed to a listener that did not bind.
+    /// failure is loud, surfaced on [`Self::bind_failures`], and retried.
+    /// Admission refusals stay unreachable; ordinary OS bind failures remain
+    /// eligible for the intentional single-listener Service remap.
     pub async fn run(
         self: Arc<Self>,
         mut shutdown: watch::Receiver<bool>,

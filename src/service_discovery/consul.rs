@@ -216,6 +216,8 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
         let mut missing_service = 0usize;
         let mut missing_address = 0usize;
         let mut missing_port = 0usize;
+        let mut invalid_port = 0usize;
+        let mut invalid_weight = 0usize;
 
         for entry in &body {
             let service = match entry.get("Service") {
@@ -247,20 +249,46 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
                 continue;
             }
 
-            let port = service.get("Port").and_then(|p| p.as_u64()).unwrap_or(0) as u16;
+            // Checked port admission: reject 0 / out-of-range without wrapping.
+            let port = match service.get("Port") {
+                None => {
+                    missing_port += 1;
+                    continue;
+                }
+                Some(value) => match value.as_u64() {
+                    None => {
+                        invalid_port += 1;
+                        continue;
+                    }
+                    Some(raw) => match super::admit_registry_port(raw) {
+                        Some(port) => port,
+                        None => {
+                            invalid_port += 1;
+                            continue;
+                        }
+                    },
+                },
+            };
 
-            if port == 0 {
-                missing_port += 1;
-                continue;
-            }
-
-            // Use Consul service weights if available
-            let weight = service
-                .get("Weights")
-                .and_then(|w| w.get("Passing"))
-                .and_then(|p| p.as_u64())
-                .map(|w| w as u32)
-                .unwrap_or(self.default_weight);
+            // Weight contract:
+            // - Missing `Weights` / `Passing` → configured `default_weight`
+            //   (already validated as 1..=MAX_TARGET_WEIGHT at config load).
+            // - Explicit `Passing` present → must admit as 1..=MAX_TARGET_WEIGHT;
+            //   zero, non-integer, and out-of-range values skip this entry only
+            //   (no wrap/coercion into a routable weight).
+            let weight = match service.get("Weights").and_then(|w| w.get("Passing")) {
+                None => self.default_weight,
+                Some(passing) => match passing
+                    .as_u64()
+                    .and_then(super::admit_registry_target_weight)
+                {
+                    Some(weight) => weight,
+                    None => {
+                        invalid_weight += 1;
+                        continue;
+                    }
+                },
+            };
 
             // Extract service tags as target tags
             let mut tags = HashMap::new();
@@ -297,6 +325,8 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
                 missing_service,
                 missing_address,
                 missing_port,
+                invalid_port,
+                invalid_weight,
                 "Consul discovery produced zero valid targets from provider payload"
             );
         }
