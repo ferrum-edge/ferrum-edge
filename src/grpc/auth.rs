@@ -702,12 +702,12 @@ impl StreamAuthorizationLease {
 /// as an explicit state machine so a retained-key reload re-arms without the
 /// `WatchStream` follow-up-poll hazard that can leave an idle tonic stream
 /// unwakeable for the next removal.
+type VerifierWatchFuture = Pin<
+    Box<dyn Future<Output = (Result<(), watch::error::RecvError>, watch::Receiver<u64>)> + Send>,
+>;
+
 struct VerifierWatch {
-    future: Pin<
-        Box<
-            dyn Future<Output = (Result<(), watch::error::RecvError>, watch::Receiver<u64>)> + Send,
-        >,
-    >,
+    future: VerifierWatchFuture,
 }
 
 impl VerifierWatch {
@@ -717,13 +717,7 @@ impl VerifierWatch {
         }
     }
 
-    fn wait(
-        mut rx: watch::Receiver<u64>,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = (Result<(), watch::error::RecvError>, watch::Receiver<u64>)> + Send,
-        >,
-    > {
+    fn wait(mut rx: watch::Receiver<u64>) -> VerifierWatchFuture {
         Box::pin(async move {
             let result = rx.changed().await;
             (result, rx)
