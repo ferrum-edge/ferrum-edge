@@ -198,8 +198,14 @@ fn frontend_tls_listener_admission(
         ..FrontendTlsListenerAdmission::default()
     };
     let mut winners: HashMap<(&str, &str), usize> = HashMap::new();
-    let mut source_count = 0usize;
+    // The CP accumulator can contain several tenants. Keep admission budgets
+    // independent so one namespace cannot withdraw another namespace's TLS
+    // listeners before the per-DP namespace projection runs.
+    let mut source_counts: HashMap<&str, usize> = HashMap::new();
     for (index, claim) in claims.iter().enumerate() {
+        let source_count = source_counts
+            .entry(claim.serving_namespace.as_str())
+            .or_default();
         // A listener's complete certificateRefs group must fit before its
         // explicit hostname can become visible to collision arbitration.
         if source_count.saturating_add(claim.certificate_identity.len())
@@ -226,7 +232,7 @@ fn frontend_tls_listener_admission(
             }
         }
 
-        source_count += claim.certificate_identity.len();
+        *source_count += claim.certificate_identity.len();
         admission.admitted_listeners.insert(claim.key.clone());
     }
     admission
@@ -1975,9 +1981,10 @@ pub(crate) fn collect_gateway_frontend_tls(acc: &mut K8sAccumulator, object: &K8
 /// 1. Order claims deterministically (Gateway before ListenerSet, then oldest
 ///    resource, then key).
 /// 2. Walk that order once, reserving each complete `certificateRefs` group
-///    under [`MAX_FRONTEND_TLS_CERTIFICATE_SOURCES`] before it may claim an SNI
-///    hostname. Cap losers and hostname losers consume neither capacity nor
-///    hostname ownership.
+///    under the per-serving-namespace
+///    [`MAX_FRONTEND_TLS_CERTIFICATE_SOURCES`] budget before it may claim an
+///    SNI hostname. Cap losers and hostname losers consume neither capacity
+///    nor hostname ownership.
 /// 3. Mark one deterministic default certificate per namespace (a catch-all
 ///    listener when one exists, otherwise the first claim), and project the
 ///    lexicographically-first namespace's default into the legacy
@@ -2025,7 +2032,7 @@ pub(crate) fn finalize_frontend_tls_certificates(acc: &mut K8sAccumulator) {
             }
         } else if admission.certificate_cap_losers.contains(key) {
             acc.warnings.push(format!(
-                "Gateway API {} {}/{} listener {} field spec.listeners[].tls.certificateRefs exceeds the {} Gateway frontend TLS certificate limit for one config snapshot; leaving this listener's certificate set and route traffic unmaterialized",
+                "Gateway API {} {}/{} listener {} field spec.listeners[].tls.certificateRefs exceeds the {} Gateway frontend TLS certificate limit for its serving namespace; leaving this listener's certificate set and route traffic unmaterialized",
                 key.parent_kind.as_str(),
                 key.namespace,
                 key.gateway,
@@ -4761,7 +4768,13 @@ fn mesh_services_from_gateway(
             let port = port_from_u64(object, raw_port, "listeners[].port")?;
             let name = listener_name;
             services.push(MeshService {
-                name: format!("{}-{name}", object.metadata.name),
+                // Kind-scoped, length-prefixed identity — see
+                // `gateway_api_listener_mesh_service_name`.
+                name: super::gateway_api_listener_mesh_service_name(
+                    GatewayApiListenerParentKind::Gateway,
+                    &object.metadata.name,
+                    name,
+                ),
                 namespace: object.metadata.namespace.clone(),
                 ports: vec![ServicePort {
                     port,
@@ -4775,6 +4788,8 @@ fn mesh_services_from_gateway(
                 // egress VIP mapping does not apply to them.
                 cluster_ips: Vec::new(),
             });
+            acc.gateway_api_materialized_gateway_listeners
+                .insert(listener_key);
             Ok::<(), K8sTranslateError>(())
         })?;
     Ok(services)
@@ -8367,12 +8382,12 @@ mod tests {
         assert!(
             mesh.services
                 .iter()
-                .any(|service| service.name == "sample-https-valid")
+                .any(|service| service.name == "gateway-6-sample-https-valid")
         );
         assert!(
             mesh.services
                 .iter()
-                .all(|service| service.name != "sample-https-invalid")
+                .all(|service| service.name != "gateway-6-sample-https-invalid")
         );
     }
 
@@ -8457,12 +8472,12 @@ mod tests {
         assert!(result.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .any(|service| service.name == "edge-a-https-a")
+                .any(|service| service.name == "gateway-6-edge-a-https-a")
         }));
         assert!(result.config.mesh.as_ref().is_some_and(|mesh| {
             mesh.services
                 .iter()
-                .any(|service| service.name == "edge-b-https-b")
+                .any(|service| service.name == "gateway-6-edge-b-https-b")
         }));
         assert!(
             !result.config.proxies.is_empty(),

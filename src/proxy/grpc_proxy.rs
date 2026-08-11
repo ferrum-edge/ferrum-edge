@@ -56,8 +56,9 @@ use crate::proxy::headers::{
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
     BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
-    append_backend_tls_pool_key_fields, append_optional_pool_key_component,
-    append_pool_key_component, backend_svid_generation_for_client_cert,
+    append_backend_tls_pool_key_fields, append_http2_max_concurrent_streams_pool_key,
+    append_optional_pool_key_component, append_pool_key_component,
+    backend_svid_generation_for_client_cert,
 };
 use crate::util::body_limit::is_length_limit_error;
 
@@ -438,6 +439,14 @@ fn write_grpc_pool_key(
     // TLS material is byte-identical. Empty when the proxy has no
     // `upstream_subset`.
     append_optional_pool_key_component(buf, proxy.upstream_subset.as_deref());
+    buf.push('|');
+    // Effective `pool_http2_max_concurrent_streams` is baked into the hyper
+    // builder (`max_concurrent_streams` + `initial_max_send_streams`), so it
+    // must participate in pool identity. Placed after subset and before TLS
+    // fields so `SvidGenerationMatcher` still sees `|svidg=…` as the final
+    // (pre-shard) segment. `None` → `none` so update/delete of the cap cannot
+    // reuse a connection built under the prior limit.
+    append_http2_max_concurrent_streams_pool_key(buf, proxy.pool_http2_max_concurrent_streams);
     buf.push('|');
     append_backend_tls_pool_key_fields(
         buf,

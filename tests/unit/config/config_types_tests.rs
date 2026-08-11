@@ -3004,6 +3004,8 @@ fn backend_tls_sni_with_subset_do_not_upgrade_is_admitted() {
             h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
             max_retries: Some(1),
             http1_max_pending_requests: Some(1),
+            http_idle_timeout_ms: None,
+            h2_max_concurrent_streams: None,
         },
         ResolvedSubsetTrafficPolicy {
             tls: None,
@@ -3011,6 +3013,8 @@ fn backend_tls_sni_with_subset_do_not_upgrade_is_admitted() {
             h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
             max_retries: Some(3),
             http1_max_pending_requests: Some(4),
+            http_idle_timeout_ms: None,
+            h2_max_concurrent_streams: None,
         },
     );
     let mut proxy = make_proxy("p1", "/api");
@@ -3039,6 +3043,8 @@ fn backend_tls_sni_with_sibling_subset_upgrade_does_not_false_reject() {
             h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
             max_retries: Some(1),
             http1_max_pending_requests: Some(1),
+            http_idle_timeout_ms: None,
+            h2_max_concurrent_streams: None,
         },
         ResolvedSubsetTrafficPolicy {
             tls: None,
@@ -3046,6 +3052,8 @@ fn backend_tls_sni_with_sibling_subset_upgrade_does_not_false_reject() {
             h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
             max_retries: Some(3),
             http1_max_pending_requests: Some(4),
+            http_idle_timeout_ms: None,
+            h2_max_concurrent_streams: None,
         },
     );
     let mut proxy = make_proxy("p-v2", "/api");
@@ -3073,6 +3081,8 @@ fn backend_tls_sni_ignores_sibling_subset_target_port_policy() {
             h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
             max_retries: Some(1),
             http1_max_pending_requests: Some(1),
+            http_idle_timeout_ms: None,
+            h2_max_concurrent_streams: None,
         },
         ResolvedSubsetTrafficPolicy {
             tls: None,
@@ -3080,6 +3090,8 @@ fn backend_tls_sni_ignores_sibling_subset_target_port_policy() {
             h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
             max_retries: Some(3),
             http1_max_pending_requests: Some(4),
+            http_idle_timeout_ms: None,
+            h2_max_concurrent_streams: None,
         },
     );
     upstream.targets[1].port = 8443;
@@ -3248,6 +3260,8 @@ fn selected_subset_http_policy_projects_onto_proxy_fallback_for_admission() {
             h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
             max_retries: Some(1),
             http1_max_pending_requests: Some(1),
+            http_idle_timeout_ms: Some(45_000),
+            h2_max_concurrent_streams: Some(10),
         },
         ResolvedSubsetTrafficPolicy {
             tls: None,
@@ -3255,11 +3269,21 @@ fn selected_subset_http_policy_projects_onto_proxy_fallback_for_admission() {
             h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
             max_retries: Some(3),
             http1_max_pending_requests: Some(4),
+            http_idle_timeout_ms: Some(12_000),
+            h2_max_concurrent_streams: Some(40),
         },
     );
     // No SNI for this projection-only check.
     let mut upstream = upstream;
     upstream.backend_tls_sni = None;
+    upstream.dispatch_port_override_fallback = Some(UpstreamPortOverride {
+        h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
+        max_retries: Some(5),
+        http1_max_pending_requests: Some(90),
+        http_idle_timeout_ms: Some(60_000),
+        h2_max_concurrent_streams: Some(200),
+        ..UpstreamPortOverride::default()
+    });
 
     let mut v1 = make_proxy("subset-v1", "/v1");
     v1.upstream_id = Some("sni-subset-upstream".into());
@@ -3287,11 +3311,15 @@ fn selected_subset_http_policy_projects_onto_proxy_fallback_for_admission() {
     assert_eq!(v1_fb.h2_upgrade_policy, Some(H2UpgradePolicy::DoNotUpgrade));
     assert_eq!(v1_fb.max_retries, Some(1));
     assert_eq!(v1_fb.http1_max_pending_requests, Some(1));
+    assert_eq!(v1_fb.http_idle_timeout_ms, Some(45_000));
+    assert_eq!(v1_fb.h2_max_concurrent_streams, Some(10));
 
     let v2_fb = fallback("subset-v2");
     assert_eq!(v2_fb.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
     assert_eq!(v2_fb.max_retries, Some(3));
     assert_eq!(v2_fb.http1_max_pending_requests, Some(4));
+    assert_eq!(v2_fb.http_idle_timeout_ms, Some(12_000));
+    assert_eq!(v2_fb.h2_max_concurrent_streams, Some(40));
 
     let unmatched_fb = fallback("subset-unmatched");
     assert_eq!(
@@ -3300,6 +3328,8 @@ fn selected_subset_http_policy_projects_onto_proxy_fallback_for_admission() {
     );
     assert_eq!(unmatched_fb.max_retries, Some(5));
     assert_eq!(unmatched_fb.http1_max_pending_requests, Some(90));
+    assert_eq!(unmatched_fb.http_idle_timeout_ms, Some(60_000));
+    assert_eq!(unmatched_fb.h2_max_concurrent_streams, Some(200));
 }
 
 #[test]

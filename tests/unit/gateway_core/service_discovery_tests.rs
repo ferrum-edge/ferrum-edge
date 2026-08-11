@@ -12,7 +12,10 @@ use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::request_epoch::RequestEpochStore;
 use ferrum_edge::service_discovery::consul::ConsulDiscoverer;
 use ferrum_edge::service_discovery::kubernetes::KubernetesDiscoverer;
-use ferrum_edge::service_discovery::{ServiceDiscoverer, ServiceDiscoveryManager};
+use ferrum_edge::service_discovery::{
+    ServiceDiscoverer, ServiceDiscoveryManager, SnapshotAdmission, SnapshotAdmissionPolicy,
+    admit_discovered_snapshot,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -2448,10 +2451,11 @@ async fn mesh_sd_ambient_topology_keeps_direct_remote_fallback_without_gateway()
         ..MeshConfig::default()
     };
 
-    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+    let snapshot = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
         .discover()
         .await
         .expect("discover succeeds");
+    let mut targets = snapshot.targets().to_vec();
     targets.sort_by(|a, b| a.host.cmp(&b.host));
 
     assert_eq!(targets.len(), 2);
@@ -2490,10 +2494,11 @@ async fn mesh_sd_ambient_keeps_direct_remote_fallback_when_catch_all_gateway_can
         ..MeshConfig::default()
     };
 
-    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+    let snapshot = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
         .discover()
         .await
         .expect("discover succeeds");
+    let mut targets = snapshot.targets().to_vec();
     targets.sort_by(|a, b| a.host.cmp(&b.host));
 
     assert_eq!(targets.len(), 2);
@@ -2535,10 +2540,11 @@ async fn mesh_sd_ambient_keeps_unknown_network_direct_fallback_when_catch_all_ca
         ..MeshConfig::default()
     };
 
-    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+    let snapshot = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
         .discover()
         .await
         .expect("discover succeeds");
+    let mut targets = snapshot.targets().to_vec();
     targets.sort_by(|a, b| a.host.cmp(&b.host));
 
     assert_eq!(
@@ -2733,10 +2739,11 @@ async fn mesh_sd_ambient_mixed_networks_bridge_gatewayed_and_keep_gatewayless_di
         ..MeshConfig::default()
     };
 
-    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+    let snapshot = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
         .discover()
         .await
         .expect("discover succeeds");
+    let mut targets = snapshot.targets().to_vec();
     targets.sort_by(|a, b| a.host.cmp(&b.host));
 
     assert_eq!(
@@ -2878,4 +2885,2250 @@ async fn mesh_sd_ambient_gateway_declared_non_first_port_bridges_with_alias() {
         !targets.iter().any(|t| t.host == "10.9.0.1"),
         "the remote pod must be reached via the east-west gateway, never a direct pod dial"
     );
+}
+
+// ── Consul blocking-query cursor admission (issue #3719) ──────────────
+//
+// These tests drive discover() through the exact production
+// admit → publish → cursor-commit pipeline (`apply_service_discovery_snapshot_for_test`),
+// observing LoadBalancerCache state and subsequent Consul request query params.
+// They intentionally do not call a public early-commit helper.
+
+fn consul_health_instance(host: &str, port: u16) -> serde_json::Value {
+    serde_json::json!([{
+        "Node": {"Address": host},
+        "Service": {
+            "Address": host,
+            "Port": port,
+            "Tags": [],
+            "Weights": {"Passing": 1, "Warning": 1}
+        }
+    }])
+}
+
+fn consul_invalid_entries() -> serde_json::Value {
+    serde_json::json!([
+        {"Node": {"Address": "10.0.0.1"}},
+        {
+            "Node": {"Address": ""},
+            "Service": {"Address": "", "Port": 0, "Tags": [], "Weights": {"Passing": 1}}
+        }
+    ])
+}
+
+fn consul_mixed_entries() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "Node": {"Address": ""},
+            "Service": {"Address": "", "Port": 0, "Tags": [], "Weights": {"Passing": 1}}
+        },
+        {
+            "Node": {"Address": "10.0.0.2"},
+            "Service": {
+                "Address": "10.0.0.2",
+                "Port": 8080,
+                "Tags": [],
+                "Weights": {"Passing": 1, "Warning": 1}
+            }
+        }
+    ])
+}
+
+fn cursor_index(d: &ConsulDiscoverer) -> u64 {
+    ferrum_edge::_test_support::consul_blocking_query_index_for_test(d)
+}
+
+struct ConsulPipelineHarness {
+    upstream_id: String,
+    lb_cache: Arc<LoadBalancerCache>,
+    dns_cache: ferrum_edge::dns::DnsCache,
+    health_checker: Arc<ferrum_edge::health_check::HealthChecker>,
+    request_epoch: Option<Arc<RequestEpochStore>>,
+    static_targets: Vec<UpstreamTarget>,
+    // Kept so the cancel watch sender outlives pipeline cancel checks.
+    #[allow(dead_code)]
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    state: ferrum_edge::_test_support::DiscoveryLoopStateForTest,
+}
+
+impl ConsulPipelineHarness {
+    fn new(upstream_id: &str, seed_targets: Vec<UpstreamTarget>) -> Self {
+        Self::with_dns_policy(
+            upstream_id,
+            seed_targets,
+            ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            None,
+        )
+    }
+
+    fn with_dns_policy(
+        upstream_id: &str,
+        seed_targets: Vec<UpstreamTarget>,
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy,
+        request_epoch: Option<Arc<RequestEpochStore>>,
+    ) -> Self {
+        let config = make_config_with_upstreams(vec![make_upstream(
+            upstream_id,
+            seed_targets.clone(),
+            None,
+        )]);
+        let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+        if !seed_targets.is_empty() {
+            // Simulate prior-task dynamic targets already installed in the cache.
+            lb_cache.update_targets(
+                "ferrum",
+                upstream_id,
+                seed_targets,
+                LoadBalancerAlgorithm::RoundRobin,
+                None,
+            );
+        }
+        let dns_config = ferrum_edge::dns::DnsConfig {
+            backend_allow_ips,
+            ..Default::default()
+        };
+        let dns_cache = ferrum_edge::dns::DnsCache::new(dns_config);
+        // Keep the cancel sender alive so `borrow()` stays meaningful for the
+        // production cancel checks inside the apply pipeline.
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        Self {
+            upstream_id: upstream_id.to_string(),
+            lb_cache,
+            dns_cache,
+            health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+            request_epoch,
+            static_targets: Vec::new(),
+            cancel_tx,
+            cancel_rx,
+            state: ferrum_edge::_test_support::DiscoveryLoopStateForTest::new(),
+        }
+    }
+
+    fn lb_hosts(&self) -> Vec<String> {
+        self.lb_cache
+            .get_upstream("ferrum", &self.upstream_id)
+            .map(|u| u.targets.iter().map(|t| t.host.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    async fn apply_snapshot(
+        &mut self,
+        snapshot: ferrum_edge::service_discovery::DiscoverySnapshot,
+    ) -> ferrum_edge::_test_support::DiscoveryApplyControlForTest {
+        ferrum_edge::_test_support::apply_service_discovery_snapshot_for_test(
+            "ferrum",
+            &self.upstream_id,
+            "consul",
+            snapshot,
+            &mut self.state,
+            &self.lb_cache,
+            &self.request_epoch,
+            &self.static_targets,
+            LoadBalancerAlgorithm::RoundRobin,
+            &None,
+            &self.cancel_rx,
+            &None,
+            &self.dns_cache,
+            &self.health_checker,
+        )
+        .await
+    }
+
+    async fn discover_and_apply(
+        &mut self,
+        discoverer: &ConsulDiscoverer,
+    ) -> Result<ferrum_edge::_test_support::DiscoveryApplyControlForTest, anyhow::Error> {
+        let snapshot = discoverer.discover().await?;
+        Ok(self.apply_snapshot(snapshot).await)
+    }
+}
+
+#[tokio::test]
+async fn consul_higher_index_http_500_does_not_advance_cursor() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_string("Internal Server Error")
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness
+        .discover_and_apply(&discoverer)
+        .await
+        .expect("first poll admitted");
+    assert_eq!(cursor_index(&discoverer), 10);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+
+    let err = harness
+        .discover_and_apply(&discoverer)
+        .await
+        .expect_err("500 must fail before admission");
+    assert!(err.to_string().contains("status 500"));
+    assert!(
+        !err.to_string().contains("Internal Server Error"),
+        "error path must not leak Consul response bodies"
+    );
+    assert_eq!(cursor_index(&discoverer), 10);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_higher_index_malformed_json_does_not_advance_cursor() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{not-json")
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
+
+    let err = harness
+        .discover_and_apply(&discoverer)
+        .await
+        .expect_err("malformed JSON must fail");
+    assert!(err.to_string().contains("malformed JSON"));
+    assert!(
+        !err.to_string().contains("{not-json"),
+        "error path must not leak Consul response bodies"
+    );
+    assert_eq!(cursor_index(&discoverer), 10);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_shared_admission_rejection_retains_targets_and_cursor() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("8.8.8.8", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.9", 8080))
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let public_only = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
+        ferrum_edge::config::BackendAllowIps::Public,
+    );
+    let mut harness =
+        ConsulPipelineHarness::with_dns_policy("up-consul", Vec::new(), public_only, None);
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
+    assert_eq!(harness.lb_hosts(), vec!["8.8.8.8".to_string()]);
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(
+        cursor_index(&discoverer),
+        10,
+        "shared-admission rejection must retain the prior cursor"
+    );
+    assert_eq!(
+        harness.lb_hosts(),
+        vec!["8.8.8.8".to_string()],
+        "shared-admission rejection must retain installed targets"
+    );
+}
+
+#[tokio::test]
+async fn consul_rejected_same_index_then_valid_same_index_is_admitted_and_published() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("8.8.8.8", 8080))
+                .insert_header("X-Consul-Index", "50"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "50"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.9", 8080))
+                .insert_header("X-Consul-Index", "50"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "50"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("backend.example.com", 8080))
+                .insert_header("X-Consul-Index", "50"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let public_only = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
+        ferrum_edge::config::BackendAllowIps::Public,
+    );
+    let mut harness =
+        ConsulPipelineHarness::with_dns_policy("up-consul", Vec::new(), public_only, None);
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 50);
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 50);
+    assert_eq!(harness.lb_hosts(), vec!["8.8.8.8".to_string()]);
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 50);
+    assert_eq!(harness.lb_hosts(), vec!["backend.example.com".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_successful_higher_index_publishes_then_commits() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "42"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    assert_eq!(cursor_index(&discoverer), 0);
+    let snapshot = discoverer.discover().await.unwrap();
+    assert_eq!(
+        cursor_index(&discoverer),
+        0,
+        "discover must not commit early"
+    );
+    assert_eq!(snapshot.pending_cursor_index(), Some(42));
+    harness.apply_snapshot(snapshot).await;
+    assert_eq!(cursor_index(&discoverer), 42);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+    assert!(harness.state.snapshot_installed());
+}
+
+#[tokio::test]
+async fn consul_successful_lower_index_rollback_publishes_then_commits() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "100"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.2", 8080))
+                .insert_header("X-Consul-Index", "7"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 100);
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 7);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.2".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_publication_failure_does_not_commit_cursor() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "42"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+
+    let config = make_config_with_upstreams(vec![make_upstream("up-consul", Vec::new(), None)]);
+    let base_epoch = request_epoch_store(config);
+    let failing_epoch = Arc::new(
+        ferrum_edge::_test_support::request_epoch_store_with_lb_generation_for_test(
+            &base_epoch,
+            u64::MAX,
+        ),
+    );
+    let mut harness = ConsulPipelineHarness::with_dns_policy(
+        "up-consul",
+        Vec::new(),
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        Some(failing_epoch),
+    );
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(
+        cursor_index(&discoverer),
+        0,
+        "publication failure must not commit the Consul cursor"
+    );
+    assert!(!harness.state.snapshot_installed());
+    assert!(harness.lb_hosts().is_empty());
+}
+
+#[tokio::test]
+async fn consul_legitimate_empty_first_response_clears_prior_targets_then_commits() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([]))
+                .insert_header("X-Consul-Index", "12"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    // Seed the LB with stale dynamic targets while also configuring a static
+    // target that must survive the first empty publication/clear path.
+    let prior_dynamic = vec![make_target("10.0.0.55", 8080)];
+    let static_targets = vec![make_target("static-keep.example", 8080)];
+    let mut harness = ConsulPipelineHarness::new("up-consul", prior_dynamic);
+    harness.static_targets = static_targets;
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.55".to_string()]);
+    assert!(!harness.state.snapshot_installed());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(
+        harness.lb_hosts(),
+        vec!["static-keep.example".to_string()],
+        "first empty admitted snapshot must clear prior dynamic targets while retaining static targets"
+    );
+    assert_eq!(cursor_index(&discoverer), 12);
+    assert!(harness.state.snapshot_installed());
+}
+
+#[tokio::test]
+async fn consul_unchanged_snapshot_commits_cursor_only_after_prior_install() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "20"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Same targets, higher index — publication may be skipped after install,
+    // but the cursor must still advance.
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "20"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "21"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 20);
+    assert!(harness.state.snapshot_installed());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(
+        cursor_index(&discoverer),
+        21,
+        "admitted unchanged snapshot may commit only after a prior install"
+    );
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_all_provider_entries_rejected_retains_targets_and_cursor() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_invalid_entries())
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
+
+    let snapshot = discoverer.discover().await.unwrap();
+    assert!(snapshot.targets().is_empty());
+    assert_eq!(
+        snapshot.admission_policy(),
+        SnapshotAdmissionPolicy::AtomicCursor {
+            provider_item_count: 2
+        }
+    );
+    harness.apply_snapshot(snapshot).await;
+    assert_eq!(cursor_index(&discoverer), 10);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_mixed_provider_entries_publish_valid_subset_and_commit() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_mixed_entries())
+                .insert_header("X-Consul-Index", "33"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 33);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.2".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_legitimate_empty_json_array_is_admissible() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([]))
+                .insert_header("X-Consul-Index", "5"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let snapshot = discoverer.discover().await.unwrap();
+    assert_eq!(
+        snapshot.admission_policy(),
+        SnapshotAdmissionPolicy::AtomicCursor {
+            provider_item_count: 0
+        }
+    );
+    match admit_discovered_snapshot(
+        "up-consul",
+        "consul",
+        snapshot,
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    ) {
+        SnapshotAdmission::Accepted { targets, cursor } => {
+            assert!(targets.is_empty());
+            // Cursor remains uncommitted here; only the manager/pipeline commits.
+            assert!(cursor.is_some());
+            drop(cursor);
+        }
+        SnapshotAdmission::Rejected { reason, .. } => {
+            panic!("legitimate [] must be accepted, got {reason}")
+        }
+    }
+    assert_eq!(cursor_index(&discoverer), 0);
+}
+
+#[test]
+fn non_consul_accept_filtered_empty_policy_preserves_pre_pr_semantics() {
+    // DNS-SD / Kubernetes / mesh snapshots use AcceptFilteredEmpty: even when
+    // every normalized target is removed by shared admission, the empty set is
+    // accepted (no atomic cursor rejection).
+    let snapshot =
+        ferrum_edge::service_discovery::DiscoverySnapshot::from_targets(vec![make_target(
+            "10.0.0.1", 8080,
+        )]);
+    assert_eq!(
+        snapshot.admission_policy(),
+        SnapshotAdmissionPolicy::AcceptFilteredEmpty
+    );
+    match admit_discovered_snapshot(
+        "up-dns",
+        "dns_sd",
+        snapshot,
+        ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
+            ferrum_edge::config::BackendAllowIps::Public,
+        ),
+    ) {
+        SnapshotAdmission::Accepted { targets, cursor } => {
+            assert!(targets.is_empty());
+            assert!(cursor.is_none());
+        }
+        SnapshotAdmission::Rejected { reason, .. } => {
+            panic!("non-Consul providers must accept filtered-empty, got {reason}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn consul_manager_loop_empty_first_response_clears_cache_and_uses_index_query() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([]))
+                .insert_header("X-Consul-Index", "12"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // After the empty snapshot commits index=12, the manager's next poll must
+    // use a blocking query with that cursor.
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "12"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.7", 8080))
+                .insert_header("X-Consul-Index", "13"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let upstream_id = "up-consul-mgr";
+    let config = make_config_with_upstreams(vec![make_upstream(
+        upstream_id,
+        Vec::new(),
+        Some(ServiceDiscoveryConfig {
+            provider: SdProvider::Consul,
+            dns_sd: None,
+            kubernetes: None,
+            consul: Some(ConsulConfig {
+                address: mock_server.uri(),
+                service_name: "api".to_string(),
+                datacenter: None,
+                tag: None,
+                healthy_only: false,
+                token: None,
+                poll_interval_seconds: 1,
+            }),
+            mesh: None,
+            default_weight: 1,
+        }),
+    )]);
+    let cache = Arc::new(LoadBalancerCache::new(&config));
+    cache.update_targets(
+        "ferrum",
+        upstream_id,
+        vec![make_target("10.0.0.55", 8080)],
+        LoadBalancerAlgorithm::RoundRobin,
+        None,
+    );
+    assert_eq!(
+        cache
+            .get_upstream("ferrum", upstream_id)
+            .unwrap()
+            .targets
+            .iter()
+            .map(|t| t.host.as_str())
+            .collect::<Vec<_>>(),
+        vec!["10.0.0.55"]
+    );
+
+    let dns_cache = ferrum_edge::dns::DnsCache::new(Default::default());
+    let manager = ServiceDiscoveryManager::new(
+        cache.clone(),
+        dns_cache,
+        Arc::new(ferrum_edge::health_check::HealthChecker::new()),
+        ferrum_edge::plugins::PluginHttpClient::default(),
+        None,
+    );
+    manager.start(&config, None);
+
+    // Wait until the empty snapshot publishes (clearing prior targets) and the
+    // follow-up blocking query with index=12 installs the next target.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut saw_cleared = false;
+    loop {
+        let hosts: Vec<String> = cache
+            .get_upstream("ferrum", upstream_id)
+            .map(|u| u.targets.iter().map(|t| t.host.clone()).collect())
+            .unwrap_or_default();
+        if hosts.is_empty() {
+            saw_cleared = true;
+        }
+        if hosts == vec!["10.0.0.7".to_string()] {
+            assert!(
+                saw_cleared,
+                "follow-up publish must be preceded by clearing prior dynamic targets"
+            );
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            manager.stop();
+            panic!(
+                "manager did not clear prior targets then publish via index=12 query; hosts={hosts:?}, saw_cleared={saw_cleared}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    manager.stop();
+}
+
+#[test]
+fn parse_consul_index_header_accepts_decimal_u64() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("X-Consul-Index", "42".parse().unwrap());
+    assert_eq!(
+        ferrum_edge::_test_support::parse_consul_index_header_for_test(&headers),
+        Some(42)
+    );
+}
+
+#[test]
+fn parse_consul_index_header_rejects_oversized_or_non_digit() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "X-Consul-Index",
+        "18446744073709551616".parse().unwrap(), // 2^64, 20 digits but overflows u64
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::parse_consul_index_header_for_test(&headers),
+        None
+    );
+
+    headers.clear();
+    headers.insert("X-Consul-Index", "12abc".parse().unwrap());
+    assert_eq!(
+        ferrum_edge::_test_support::parse_consul_index_header_for_test(&headers),
+        None
+    );
+
+    headers.clear();
+    headers.insert(
+        "X-Consul-Index",
+        "000000000000000000000".parse().unwrap(), // 21 digits
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::parse_consul_index_header_for_test(&headers),
+        None
+    );
+}
+
+#[tokio::test]
+async fn consul_401_acl_denied_does_not_advance_cursor_or_leak_body() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_string("ACL not found: secret-token-value")
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        Some("secret-token-value".to_string()),
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
+
+    let err = harness
+        .discover_and_apply(&discoverer)
+        .await
+        .expect_err("401 must fail closed");
+    let msg = err.to_string();
+    assert!(msg.contains("status 401"), "got: {msg}");
+    assert!(
+        msg.contains("ACL token policy"),
+        "401 must carry a fixed ACL remediation hint: {msg}"
+    );
+    assert!(
+        !msg.contains("secret-token-value"),
+        "401 path must not leak token or body: {msg}"
+    );
+    assert_eq!(cursor_index(&discoverer), 10);
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+}
+
+#[tokio::test]
+async fn consul_403_acl_denied_does_not_advance_cursor_or_leak_body() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_string("Permission denied for token abc")
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
+
+    let err = harness
+        .discover_and_apply(&discoverer)
+        .await
+        .expect_err("403 must fail closed");
+    let msg = err.to_string();
+    assert!(msg.contains("status 403"), "got: {msg}");
+    assert!(
+        msg.contains("ACL token policy"),
+        "403 must carry a fixed ACL remediation hint: {msg}"
+    );
+    assert!(
+        !msg.contains("Permission denied"),
+        "403 must not leak body: {msg}"
+    );
+    assert_eq!(cursor_index(&discoverer), 10);
+}
+
+#[tokio::test]
+async fn consul_repeated_all_rejected_retains_cursor_and_increments_rejection_metric() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Same candidate index, sustained all-rejected catalog.
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_invalid_entries())
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.service_discovery_provider_normalization_rejected_total();
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(
+        cursor_index(&discoverer),
+        10,
+        "repeated all-rejected polls must not advance the cursor"
+    );
+    assert_eq!(harness.lb_hosts(), vec!["10.0.0.1".to_string()]);
+    let after = registry.service_discovery_provider_normalization_rejected_total();
+    assert!(
+        after >= before + 2,
+        "each rejected poll must increment the bounded rejection counter (before={before}, after={after})"
+    );
+}
+
+#[tokio::test]
+async fn consul_cursor_advance_and_rollback_emit_bounded_metrics() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.1", 8080))
+                .insert_header("X-Consul-Index", "40"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "40"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.2", 8080))
+                .insert_header("X-Consul-Index", "50"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "50"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.3", 8080))
+                .insert_header("X-Consul-Index", "7"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-consul", Vec::new());
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let advance_before = registry.service_discovery_cursor_advance_total();
+    let rollback_before = registry.service_discovery_cursor_rollback_total();
+
+    harness.discover_and_apply(&discoverer).await.unwrap(); // 0 -> 40
+    harness.discover_and_apply(&discoverer).await.unwrap(); // 40 -> 50
+    harness.discover_and_apply(&discoverer).await.unwrap(); // 50 -> 7
+    assert_eq!(cursor_index(&discoverer), 7);
+
+    let advance_after = registry.service_discovery_cursor_advance_total();
+    let rollback_after = registry.service_discovery_cursor_rollback_total();
+    assert!(
+        advance_after >= advance_before + 2,
+        "higher-index commits must increment advance (before={advance_before}, after={advance_after})"
+    );
+    assert!(
+        rollback_after > rollback_before,
+        "lower-index commit must increment rollback (before={rollback_before}, after={rollback_after})"
+    );
+}
+
+#[tokio::test]
+async fn consul_shared_admission_rejection_increments_bounded_metric() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("8.8.8.8", 8080))
+                .insert_header("X-Consul-Index", "10"),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .and(query_param("index", "10"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(consul_health_instance("10.0.0.9", 8080))
+                .insert_header("X-Consul-Index", "99"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let public_only = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(
+        ferrum_edge::config::BackendAllowIps::Public,
+    );
+    let mut harness =
+        ConsulPipelineHarness::with_dns_policy("up-consul", Vec::new(), public_only, None);
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.service_discovery_shared_admission_rejected_total();
+
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 10);
+
+    let after = registry.service_discovery_shared_admission_rejected_total();
+    assert!(
+        after > before,
+        "shared-admission rejection must increment bounded counter (before={before}, after={after})"
+    );
+}
+
+// ── Discovery body ceilings + Kubernetes envelope integrity (#3718/#3720) ──
+
+fn discovery_body_test_lock() -> &'static tokio::sync::Mutex<()> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Serializes discovery-body tests that compare process counters or publish the
+/// production install seam. Custom limits and their budget counters are scoped
+/// to the calling test thread, so unrelated parallel discovery tests keep the
+/// installed/default production limits.
+struct DiscoveryBodyLimitsGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    clear_override: bool,
+}
+
+impl DiscoveryBodyLimitsGuard {
+    /// Exclusive ownership for collector / budget observation without changing
+    /// effective ceilings.
+    async fn serialize() -> Self {
+        Self {
+            _lock: discovery_body_test_lock().lock().await,
+            clear_override: false,
+        }
+    }
+
+    async fn install(max_response: usize, max_error: usize, budget: usize) -> Self {
+        let lock = discovery_body_test_lock().lock().await;
+        ferrum_edge::_test_support::override_discovery_body_limits_for_test(
+            ferrum_edge::config::env_config::DiscoveryBodyLimits {
+                max_response_bytes: max_response,
+                max_error_bytes: max_error,
+                body_budget_bytes: budget,
+            },
+        )
+        .expect("test discovery body limits");
+        Self {
+            _lock: lock,
+            clear_override: true,
+        }
+    }
+}
+
+impl Drop for DiscoveryBodyLimitsGuard {
+    fn drop(&mut self) {
+        if self.clear_override {
+            ferrum_edge::_test_support::clear_discovery_body_limits_override_for_test();
+        }
+    }
+}
+
+async fn serve_raw_http_once(status_line: &str, headers: &[(&str, &str)], body: &[u8]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw discovery fixture");
+    let addr = listener.local_addr().expect("local addr");
+    let status = status_line.to_string();
+    let header_lines: Vec<(String, String)> = headers
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    let body = body.to_vec();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = [0u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        let mut response = format!("{status}\r\n");
+        for (k, v) in &header_lines {
+            response.push_str(&format!("{k}: {v}\r\n"));
+        }
+        response.push_str("Connection: close\r\n\r\n");
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = socket.write_all(&body).await;
+        let _ = socket.shutdown().await;
+    });
+    format!("http://{addr}")
+}
+
+fn chunked_body(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Emit one chunk for the whole payload so the collector still streams
+    // through reqwest's chunk API without a Content-Length.
+    out.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(b"\r\n0\r\n\r\n");
+    out
+}
+
+#[test]
+fn discovery_body_limits_parse_rejects_zero_and_inconsistent_relationships() {
+    use ferrum_edge::config::env_config::{
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+        HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES, parse_discovery_body_limits,
+    };
+
+    let defaults = parse_discovery_body_limits(None, None, None).unwrap();
+    assert_eq!(
+        defaults.max_response_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES
+    );
+    assert_eq!(
+        defaults.max_error_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES
+    );
+    assert_eq!(
+        defaults.body_budget_bytes,
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES
+    );
+
+    assert!(
+        parse_discovery_body_limits(Some("0"), None, None)
+            .unwrap_err()
+            .contains("0 is not unlimited")
+    );
+    assert!(
+        parse_discovery_body_limits(None, Some("0"), None)
+            .unwrap_err()
+            .contains("0 is not unlimited")
+    );
+    assert!(
+        parse_discovery_body_limits(None, None, Some("0"))
+            .unwrap_err()
+            .contains("0 is not unlimited")
+    );
+    assert!(
+        parse_discovery_body_limits(Some("1024"), Some("2048"), Some("4096"))
+            .unwrap_err()
+            .contains("must be <=")
+    );
+    assert!(
+        parse_discovery_body_limits(Some("8192"), Some("1024"), Some("4096"))
+            .unwrap_err()
+            .contains("must be >=")
+    );
+    let clamped =
+        parse_discovery_body_limits(Some("999999999"), Some("1024"), Some("999999999")).unwrap();
+    assert_eq!(
+        clamped.max_response_bytes,
+        HARD_MAX_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES
+    );
+}
+
+#[test]
+fn discovery_body_limits_parsing_is_pure_across_repeated_snapshots() {
+    use ferrum_edge::config::env_config::parse_discovery_body_limits;
+
+    let first = parse_discovery_body_limits(Some("1024"), Some("512"), Some("2048")).unwrap();
+    let second = parse_discovery_body_limits(Some("4096"), Some("1024"), Some("8192")).unwrap();
+    let first_again = parse_discovery_body_limits(Some("1024"), Some("512"), Some("2048")).unwrap();
+    assert_eq!(first, first_again);
+    assert_ne!(first.max_response_bytes, second.max_response_bytes);
+    assert_eq!(second.max_response_bytes, 4096);
+}
+
+#[test]
+fn discovery_body_limits_envconfig_parse_does_not_pin_process_install() {
+    use crate::unit::env_lock::EnvGuard;
+    use ferrum_edge::config::env_config::{
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES, SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY,
+        SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY, SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY,
+    };
+
+    let env = EnvGuard::new(&[
+        "FERRUM_MODE",
+        "FERRUM_FILE_CONFIG_PATH",
+        SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY,
+        SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY,
+        SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY,
+    ]);
+    env.set("FERRUM_MODE", "file");
+    env.set(
+        "FERRUM_FILE_CONFIG_PATH",
+        "/tmp/ferrum-discovery-body-cap.yaml",
+    );
+    env.set(SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY, "2048");
+    env.set(SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY, "512");
+    env.set(SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY, "4096");
+    let first = ferrum_edge::config::EnvConfig::from_env().expect("first snapshot");
+    assert_eq!(first.service_discovery_max_response_body_bytes, 2048);
+    assert_eq!(first.service_discovery_max_error_body_bytes, 512);
+    assert_eq!(first.service_discovery_body_budget_bytes, 4096);
+
+    // A later, different but valid snapshot must still parse: from_env must not
+    // have installed the process OnceLock on the first call.
+    env.set(SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY, "8192");
+    env.set(SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY, "1024");
+    env.set(SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY, "16384");
+    let second = ferrum_edge::config::EnvConfig::from_env().expect("second snapshot");
+    assert_eq!(second.service_discovery_max_response_body_bytes, 8192);
+    assert_eq!(second.service_discovery_max_error_body_bytes, 1024);
+    assert_eq!(second.service_discovery_body_budget_bytes, 16384);
+
+    // Clearing the keys restores documented defaults without OnceLock poisoning.
+    env.unset(SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES_KEY);
+    env.unset(SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES_KEY);
+    env.unset(SERVICE_DISCOVERY_BODY_BUDGET_BYTES_KEY);
+    let defaults = ferrum_edge::config::EnvConfig::from_env().expect("default snapshot");
+    assert_eq!(
+        defaults.service_discovery_max_response_body_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES
+    );
+    assert_eq!(
+        defaults.service_discovery_max_error_body_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES
+    );
+    assert_eq!(
+        defaults.service_discovery_body_budget_bytes,
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES
+    );
+}
+
+#[tokio::test]
+async fn discovery_body_limits_install_accepts_identical_and_rejects_mismatch() {
+    use ferrum_edge::config::env_config::{
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES, DiscoveryBodyLimits,
+    };
+    use ferrum_edge::service_discovery::http_body::install_discovery_body_limits;
+
+    // Installing limits updates the same process-wide budget ceiling used by
+    // collector tests. Hold their lifetime lock so this deterministic install
+    // cannot race a test-owned override or a live budget permit.
+    let _guard = DiscoveryBodyLimitsGuard::serialize().await;
+
+    let defaults = DiscoveryBodyLimits {
+        max_response_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+        max_error_bytes: DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        body_budget_bytes: DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+    };
+    // Prefer documented defaults so this stays coherent if another suite already
+    // published the production install seam in-process.
+    install_discovery_body_limits(defaults).expect("default install");
+    install_discovery_body_limits(defaults).expect("identical reinstall");
+
+    let mismatch = install_discovery_body_limits(DiscoveryBodyLimits {
+        max_response_bytes: 1024,
+        max_error_bytes: 512,
+        body_budget_bytes: 2048,
+    })
+    .expect_err("mismatching install must fail closed");
+    assert!(
+        mismatch.contains("already installed with a different value"),
+        "{mismatch}"
+    );
+    assert!(
+        !mismatch.contains("1024") && !mismatch.contains("4194304"),
+        "mismatch diagnostic must not echo numeric ceilings: {mismatch}"
+    );
+
+    let zero = install_discovery_body_limits(DiscoveryBodyLimits {
+        max_response_bytes: 0,
+        max_error_bytes: 0,
+        body_budget_bytes: 0,
+    })
+    .expect_err("install must not accept 0");
+    assert!(
+        zero.contains("0 is not unlimited") || zero.contains("must be >= 1"),
+        "{zero}"
+    );
+}
+
+#[tokio::test]
+async fn discovery_body_test_override_does_not_leak_to_parallel_threads() {
+    use ferrum_edge::config::env_config::{
+        DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES,
+    };
+
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 32, 256).await;
+    assert_eq!(
+        ferrum_edge::service_discovery::http_body::effective_discovery_body_limits()
+            .max_response_bytes,
+        64
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_max_for_test(),
+        256
+    );
+
+    let (parallel_limits, parallel_budget) = std::thread::spawn(|| {
+        (
+            ferrum_edge::service_discovery::http_body::effective_discovery_body_limits(),
+            ferrum_edge::_test_support::discovery_body_budget_max_for_test(),
+        )
+    })
+    .join()
+    .expect("parallel discovery test thread");
+    assert_eq!(
+        parallel_limits.max_response_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES
+    );
+    assert_eq!(
+        parallel_limits.max_error_bytes,
+        DEFAULT_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES
+    );
+    assert_eq!(parallel_budget, DEFAULT_SERVICE_DISCOVERY_BODY_BUDGET_BYTES);
+}
+
+#[test]
+fn discovery_body_limits_production_publish_seam_lives_in_main() {
+    let main_src = include_str!("../../../src/main.rs");
+    let env_src = include_str!("../../../src/config/env_config.rs");
+    assert!(
+        main_src.contains("install_discovery_body_limits"),
+        "production startup must publish discovery body ceilings after EnvConfig is accepted"
+    );
+    assert!(
+        !env_src.contains("install_discovery_body_limits("),
+        "EnvConfig parsing must remain pure and must not install the process OnceLock"
+    );
+}
+
+#[tokio::test]
+async fn discovery_collector_rejects_oversized_content_length_before_body() {
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 32, 256).await;
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.service_discovery_response_oversized_total();
+
+    let base = serve_raw_http_once(
+        "HTTP/1.1 200 OK",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", "1000000"),
+        ],
+        b"{}",
+    )
+    .await;
+    let response = reqwest::Client::new()
+        .get(format!("{base}/v1"))
+        .send()
+        .await
+        .expect("send");
+    let err = ferrum_edge::_test_support::collect_discovery_response_body_for_test(response, true)
+        .await
+        .expect_err("oversized CL must fail");
+    assert_eq!(err, "response_oversized");
+    assert!(registry.service_discovery_response_oversized_total() > before);
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0,
+        "oversized CL must not charge the shared budget"
+    );
+}
+
+#[tokio::test]
+async fn discovery_collector_rejects_disagreeing_repeated_content_length() {
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 32, 256).await;
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.service_discovery_response_oversized_total();
+
+    // Two field lines that disagree: the HTTP client may reject before the
+    // collector, or the collector must fail closed on ambiguity. Either
+    // boundary preserves the early oversized-declaration contract.
+    let base = serve_raw_http_once(
+        "HTTP/1.1 200 OK",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", "32"),
+            ("Content-Length", "48"),
+        ],
+        &[b'x'; 32],
+    )
+    .await;
+    let client_result = reqwest::Client::new()
+        .get(format!("{base}/dup"))
+        .send()
+        .await;
+    match client_result {
+        Err(_) => {
+            // Client rejected conflicting Content-Length before collection.
+        }
+        Ok(response) => {
+            let err = ferrum_edge::_test_support::collect_discovery_response_body_for_test(
+                response, true,
+            )
+            .await
+            .expect_err("disagreeing CL must fail closed");
+            assert_eq!(err, "ambiguous_content_length");
+            assert!(registry.service_discovery_response_oversized_total() > before);
+        }
+    }
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn discovery_collector_accepts_agreeing_repeated_content_length() {
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 32, 256).await;
+    let body = vec![b'y'; 16];
+    let base = serve_raw_http_once(
+        "HTTP/1.1 200 OK",
+        &[
+            ("Content-Type", "application/json"),
+            ("Content-Length", "16"),
+            ("Content-Length", "16"),
+        ],
+        &body,
+    )
+    .await;
+    let client_result = reqwest::Client::new()
+        .get(format!("{base}/ok"))
+        .send()
+        .await;
+    match client_result {
+        Err(_) => {
+            // Some HTTP stacks reject even agreeing repeats; that still keeps
+            // the collector boundary fail-closed for malformed framing.
+        }
+        Ok(response) => {
+            let accepted = ferrum_edge::_test_support::collect_discovery_response_body_for_test(
+                response, true,
+            )
+            .await
+            .expect("agreeing repeated CL must be accepted when the client delivers it");
+            assert_eq!(accepted, 16);
+        }
+    }
+}
+
+#[tokio::test]
+async fn discovery_collector_does_not_preallocate_uncharged_content_length() {
+    let collector_src = include_str!("../../../src/service_discovery/http_body.rs");
+    assert!(
+        !collector_src.contains("Vec::with_capacity") && !collector_src.contains("buf.reserve"),
+        "the collector must not preallocate from untrusted Content-Length"
+    );
+
+    // A large-but-under-ceiling Content-Length must not allocate that capacity
+    // outside the shared budget. Stall after headers so only the declaration is
+    // visible; budget usage must stay zero until retained bytes are charged.
+    let _guard = DiscoveryBodyLimitsGuard::install(1024, 32, 2048).await;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled fixture");
+    let addr = listener.local_addr().expect("addr");
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = [0u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 512\r\nConnection: close\r\n\r\n";
+        let _ = socket.write_all(headers.as_bytes()).await;
+        let _ = release_rx.await;
+        let _ = socket.write_all(&[b'z'; 512]).await;
+        let _ = socket.shutdown().await;
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/stall"))
+        .send()
+        .await
+        .expect("headers");
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0,
+        "headers alone must not charge or pre-reserve against the shared budget"
+    );
+
+    let collect = tokio::spawn(async move {
+        ferrum_edge::_test_support::collect_discovery_response_body_for_test(response, true).await
+    });
+    // Give the collector a chance to observe Content-Length and (incorrectly)
+    // reserve before any body bytes arrive.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0,
+        "stalled body must not charge budget before retained bytes exist"
+    );
+    let _ = release_tx.send(());
+    let accepted = collect.await.expect("join").expect("collect");
+    assert_eq!(accepted, 512);
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0,
+        "permit must release after the collected body drops"
+    );
+}
+
+#[tokio::test]
+async fn discovery_collector_accepts_exact_limit_and_rejects_limit_plus_one_chunked() {
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 32, 256).await;
+    let exact = vec![b'a'; 64];
+    let over = vec![b'b'; 65];
+
+    let base_ok = serve_raw_http_once(
+        "HTTP/1.1 200 OK",
+        &[
+            ("Content-Type", "application/json"),
+            ("Transfer-Encoding", "chunked"),
+        ],
+        &chunked_body(&exact),
+    )
+    .await;
+    let ok = reqwest::Client::new()
+        .get(format!("{base_ok}/ok"))
+        .send()
+        .await
+        .expect("send exact");
+    let accepted = ferrum_edge::_test_support::collect_discovery_response_body_for_test(ok, true)
+        .await
+        .expect("exact limit must be accepted");
+    assert_eq!(accepted, 64);
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0,
+        "permit must release after collector result drops"
+    );
+
+    let base_over = serve_raw_http_once(
+        "HTTP/1.1 200 OK",
+        &[
+            ("Content-Type", "application/json"),
+            ("Transfer-Encoding", "chunked"),
+        ],
+        &chunked_body(&over),
+    )
+    .await;
+    let bad = reqwest::Client::new()
+        .get(format!("{base_over}/over"))
+        .send()
+        .await
+        .expect("send over");
+    let err = ferrum_edge::_test_support::collect_discovery_response_body_for_test(bad, true)
+        .await
+        .expect_err("limit+1 must fail");
+    assert_eq!(err, "response_oversized");
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn discovery_collector_bounds_error_bodies_independently() {
+    let _guard = DiscoveryBodyLimitsGuard::install(256, 16, 1024).await;
+    let body = vec![b'x'; 64];
+    let base = serve_raw_http_once(
+        "HTTP/1.1 500 Internal Server Error",
+        &[
+            ("Content-Type", "text/plain"),
+            ("Transfer-Encoding", "chunked"),
+        ],
+        &chunked_body(&body),
+    )
+    .await;
+    let response = reqwest::Client::new()
+        .get(format!("{base}/err"))
+        .send()
+        .await
+        .expect("send");
+    let err = ferrum_edge::_test_support::collect_discovery_response_body_for_test(response, false)
+        .await
+        .expect_err("error body must use tighter ceiling");
+    assert_eq!(err, "response_oversized");
+}
+
+#[tokio::test]
+async fn discovery_body_budget_rejects_concurrent_pollers_and_releases_on_cancel() {
+    let _guard = DiscoveryBodyLimitsGuard::install(64, 16, 96).await;
+    let payload = vec![b'z'; 64];
+
+    async fn one_collect(base: String) -> Result<usize, &'static str> {
+        let response = reqwest::Client::new()
+            .get(format!("{base}/body"))
+            .send()
+            .await
+            .map_err(|_| "body_read_failed")?;
+        ferrum_edge::_test_support::collect_discovery_response_body_for_test(response, true).await
+    }
+
+    // Hold one successful body (and its permit) while other pollers compete.
+    let hold_base = serve_raw_http_once(
+        "HTTP/1.1 200 OK",
+        &[
+            ("Content-Type", "application/json"),
+            ("Transfer-Encoding", "chunked"),
+        ],
+        &chunked_body(&payload),
+    )
+    .await;
+    let held_response = reqwest::Client::new()
+        .get(format!("{hold_base}/hold"))
+        .send()
+        .await
+        .expect("hold send");
+    let held = {
+        use ferrum_edge::service_discovery::http_body::{
+            DiscoveryBodyRole, collect_discovery_response_body,
+        };
+        collect_discovery_response_body(held_response, DiscoveryBodyRole::Success)
+            .await
+            .expect("first body admitted")
+    };
+    assert_eq!(held.as_slice().len(), 64);
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        64
+    );
+
+    let mut rejected = 0usize;
+    for _ in 0..4 {
+        let base = serve_raw_http_once(
+            "HTTP/1.1 200 OK",
+            &[
+                ("Content-Type", "application/json"),
+                ("Transfer-Encoding", "chunked"),
+            ],
+            &chunked_body(&payload),
+        )
+        .await;
+        match one_collect(base).await {
+            Ok(_) => {}
+            Err("body_budget_rejected") => rejected += 1,
+            Err(other) => panic!("unexpected collector failure: {other}"),
+        }
+    }
+    assert!(
+        rejected >= 1,
+        "shared budget must reject at least one concurrent poller"
+    );
+
+    // Cancellation: drop an in-flight charged body and confirm budget releases.
+    drop(held);
+    assert_eq!(
+        ferrum_edge::_test_support::discovery_body_budget_used_for_test(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn kubernetes_malformed_envelopes_fail_closed_valid_empty_withdraws() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = DiscoveryBodyLimitsGuard::serialize().await;
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.service_discovery_malformed_envelope_total();
+
+    for malformed in [
+        serde_json::json!({}),
+        serde_json::json!({"items": null}),
+        serde_json::json!({"items": {}}),
+        serde_json::json!({"items": "nope"}),
+        serde_json::json!([1, 2, 3]),
+    ] {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&malformed))
+            .mount(&mock_server)
+            .await;
+        let discoverer = KubernetesDiscoverer::new(
+            reqwest::Client::new(),
+            "default".to_string(),
+            "svc".to_string(),
+            None,
+            None,
+            1,
+        )
+        .with_api_url(mock_server.uri());
+        let err = discoverer.discover().await.expect_err("malformed envelope");
+        assert!(
+            err.to_string().contains("malformed EndpointSliceList"),
+            "unexpected error: {err}"
+        );
+    }
+    assert!(registry.service_discovery_malformed_envelope_total() > before);
+
+    // Invalid JSON
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{not-json"))
+        .mount(&mock_server)
+        .await;
+    let discoverer = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
+        "default".to_string(),
+        "svc".to_string(),
+        None,
+        None,
+        1,
+    )
+    .with_api_url(mock_server.uri());
+    assert!(discoverer.discover().await.is_err());
+
+    // Authoritative empty withdrawal
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"items": []})))
+        .mount(&mock_server)
+        .await;
+    let discoverer = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
+        "default".to_string(),
+        "svc".to_string(),
+        None,
+        None,
+        1,
+    )
+    .with_api_url(mock_server.uri());
+    let empty = discoverer.discover().await.expect("valid empty");
+    assert!(empty.targets().is_empty());
+}
+
+#[tokio::test]
+async fn kubernetes_normal_endpointslicelist_still_parses() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = DiscoveryBodyLimitsGuard::serialize().await;
+    let mock_server = MockServer::start().await;
+    let response = serde_json::json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSliceList",
+        "items": [{
+            "ports": [{"name": "http", "port": 8080}],
+            "endpoints": [{
+                "addresses": ["10.244.0.9"],
+                "conditions": {"ready": true, "serving": true}
+            }]
+        }]
+    });
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+        .mount(&mock_server)
+        .await;
+    let discoverer = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
+        "default".to_string(),
+        "svc".to_string(),
+        None,
+        None,
+        1,
+    )
+    .with_api_url(mock_server.uri());
+    let targets = discoverer.discover().await.unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].host, "10.244.0.9");
+    assert_eq!(targets[0].port, 8080);
+}
+
+#[tokio::test]
+async fn kubernetes_error_response_does_not_surface_body_bytes() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let _guard = DiscoveryBodyLimitsGuard::serialize().await;
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_string("secret-token=abc&registry-credential=xyz"),
+        )
+        .mount(&mock_server)
+        .await;
+    let discoverer = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
+        "default".to_string(),
+        "svc".to_string(),
+        None,
+        None,
+        1,
+    )
+    .with_api_url(mock_server.uri());
+    let err = discoverer.discover().await.unwrap_err().to_string();
+    assert!(err.contains("403"));
+    assert!(!err.contains("secret-token"));
+    assert!(!err.contains("registry-credential"));
+}
+
+#[tokio::test]
+async fn production_discovery_loop_retains_targets_and_cursor_on_oversized_or_malformed() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Keep the success ceiling well above valid Consul/Kubernetes fixtures
+    // (~100-150B compact JSON) while the oversized probe stays clearly over it.
+    let _guard = DiscoveryBodyLimitsGuard::install(1024, 64, 4096).await;
+
+    // Seed Consul with a healthy snapshot + cursor, then serve oversized and
+    // confirm prior LB targets + cursor remain.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("X-Consul-Index", "77")
+                .set_body_json(consul_health_instance("10.0.0.40", 8080)),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let mut harness = ConsulPipelineHarness::new("up-body-cap", Vec::new());
+    harness.discover_and_apply(&discoverer).await.unwrap();
+    assert_eq!(cursor_index(&discoverer), 77);
+    let installed = harness
+        .lb_cache
+        .get_upstream("ferrum", "up-body-cap")
+        .expect("upstream installed");
+    assert!(
+        installed
+            .targets
+            .iter()
+            .any(|t| t.host == "10.0.0.40" && t.port == 8080)
+    );
+
+    // Oversized success body must retain targets + cursor (streamed limit).
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("X-Consul-Index", "99")
+                .set_body_string("x".repeat(4096)),
+        )
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    let err = discoverer.discover().await.expect_err("oversized");
+    assert!(err.to_string().contains("byte limit"));
+    assert_eq!(cursor_index(&discoverer), 77);
+    let still = harness
+        .lb_cache
+        .get_upstream("ferrum", "up-body-cap")
+        .expect("upstream retained");
+    assert!(still.targets.iter().any(|t| t.host == "10.0.0.40"));
+
+    // Kubernetes malformed envelope through the production apply pipeline.
+    let k8s_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [{
+                "ports": [{"port": 8080}],
+                "endpoints": [{
+                    "addresses": ["10.244.1.1"],
+                    "conditions": {"ready": true}
+                }]
+            }]
+        })))
+        .up_to_n_times(1)
+        .mount(&k8s_server)
+        .await;
+    let k8s = KubernetesDiscoverer::new(
+        reqwest::Client::new(),
+        "default".to_string(),
+        "svc".to_string(),
+        None,
+        None,
+        1,
+    )
+    .with_api_url(k8s_server.uri());
+    let mut k8s_harness = ConsulPipelineHarness::new("up-k8s-envelope", Vec::new());
+    let good = k8s.discover().await.unwrap();
+    let _ = ferrum_edge::_test_support::apply_service_discovery_snapshot_for_test(
+        "ferrum",
+        "up-k8s-envelope",
+        "kubernetes",
+        good,
+        &mut k8s_harness.state,
+        &k8s_harness.lb_cache,
+        &k8s_harness.request_epoch,
+        &k8s_harness.static_targets,
+        LoadBalancerAlgorithm::RoundRobin,
+        &None,
+        &k8s_harness.cancel_rx,
+        &None,
+        &k8s_harness.dns_cache,
+        &k8s_harness.health_checker,
+    )
+    .await;
+    assert!(
+        k8s_harness
+            .lb_cache
+            .get_upstream("ferrum", "up-k8s-envelope")
+            .unwrap()
+            .targets
+            .iter()
+            .any(|t| t.host == "10.244.1.1")
+    );
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&k8s_server)
+        .await;
+    assert!(k8s.discover().await.is_err());
+    assert!(
+        k8s_harness
+            .lb_cache
+            .get_upstream("ferrum", "up-k8s-envelope")
+            .unwrap()
+            .targets
+            .iter()
+            .any(|t| t.host == "10.244.1.1"),
+        "malformed envelope must retain last admitted Kubernetes targets"
+    );
+}
+
+#[tokio::test]
+async fn consul_normal_parsing_still_works_under_bounded_collector() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/api"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("X-Consul-Index", "5")
+                .set_body_json(consul_health_instance("10.0.0.50", 9090)),
+        )
+        .mount(&mock_server)
+        .await;
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+    let snapshot = discoverer.discover().await.unwrap();
+    assert_eq!(snapshot.targets().len(), 1);
+    assert_eq!(snapshot.pending_cursor_index(), Some(5));
 }

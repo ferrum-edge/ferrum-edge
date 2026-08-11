@@ -519,11 +519,9 @@ fn destination_rule_top_level_connection_pool_http_projects_inherited_fields() {
     use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
 
     // Single target on port 8080. A top-level `trafficPolicy.connectionPool.http`
-    // block should fan out onto every port served by an upstream's targets,
-    // mirroring the T1-D `connectionPool.tcp.{maxConnections,tcpKeepalive}`
-    // fan-out pattern. Without service discovery the fan-out is bounded to
-    // the static target ports; here we expect exactly port 8080 to receive
-    // the overlay.
+    // block accumulates every applied HTTP field on the inherited fallback so a
+    // selected subset can overlay without losing source-tier identity. Explicit
+    // per-port fields remain separate and win at dispatch.
     let mut config = GatewayConfig {
         proxies: vec![proxy()],
         upstreams: vec![upstream()],
@@ -537,8 +535,6 @@ fn destination_rule_top_level_connection_pool_http_projects_inherited_fields() {
                         max_requests_per_connection: Some(75),
                         idle_timeout_ms: Some(45_000),
                         http2_max_requests: Some(250),
-                        // Subset-inheritable fields remain in the fallback so
-                        // the apply layer can preserve their precedence tier.
                         h2_upgrade_policy: Some(
                             ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade,
                         ),
@@ -558,41 +554,31 @@ fn destination_rule_top_level_connection_pool_http_projects_inherited_fields() {
     config.normalize_fields();
 
     let prepared = prepare_gateway_config_for_mesh(config, &runtime()).expect("mesh config");
-    let port_override = prepared.upstreams[0]
-        .port_overrides
-        .get(&8080)
-        .expect("top-level http overlay fan-out lands on every target port");
     assert!(
-        port_override.http_max_requests_per_connection.is_none(),
-        "maxRequestsPerConnection is deferred and must not project into port overrides"
+        !prepared.upstreams[0].port_overrides.contains_key(&8080)
+            || prepared.upstreams[0]
+                .port_overrides
+                .get(&8080)
+                .is_some_and(|o| {
+                    o.http_idle_timeout_ms.is_none()
+                        && o.h2_max_concurrent_streams.is_none()
+                        && o.h2_upgrade_policy.is_none()
+                        && o.max_retries.is_none()
+                        && o.http1_max_pending_requests.is_none()
+                }),
+        "top-level HTTP fields must not fan out onto port_overrides"
     );
-    assert_eq!(port_override.http_idle_timeout_ms, Some(45_000));
-    assert_eq!(port_override.h2_max_concurrent_streams, Some(250));
-    assert!(port_override.h2_upgrade_policy.is_none());
-    assert!(port_override.max_retries.is_none());
-    assert!(port_override.http1_max_pending_requests.is_none());
-
-    // Dispatch projection: the per-port overlay reaches every referencing
-    // proxy via `resolve_dispatch_port_overrides`.
-    let dispatch_override = prepared.proxies[0]
-        .dispatch_port_overrides
-        .as_ref()
-        .and_then(|overrides| overrides.get(&8080))
-        .expect("proxy dispatch port override projected");
-    assert!(
-        dispatch_override.http_max_requests_per_connection.is_none(),
-        "maxRequestsPerConnection must not project into dispatch overrides"
-    );
-    assert_eq!(dispatch_override.http_idle_timeout_ms, Some(45_000));
-    assert_eq!(dispatch_override.h2_max_concurrent_streams, Some(250));
-    assert!(dispatch_override.h2_upgrade_policy.is_none());
-    assert!(dispatch_override.max_retries.is_none());
-    assert!(dispatch_override.http1_max_pending_requests.is_none());
 
     let inherited = prepared.proxies[0]
         .dispatch_port_override_fallback
         .as_ref()
-        .expect("top-level subset-inheritable fields project as a fallback");
+        .expect("top-level HTTP fields project as a fallback");
+    assert!(
+        inherited.http_max_requests_per_connection.is_none(),
+        "maxRequestsPerConnection is deferred and must not project into the fallback"
+    );
+    assert_eq!(inherited.http_idle_timeout_ms, Some(45_000));
+    assert_eq!(inherited.h2_max_concurrent_streams, Some(250));
     assert_eq!(
         inherited.h2_upgrade_policy,
         Some(ferrum_edge::config::types::H2UpgradePolicy::DoNotUpgrade)
@@ -780,17 +766,16 @@ fn destination_rule_named_target_port_sd_keeps_per_port_and_fallback_separate() 
 fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out() {
     use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
 
-    // Top-level fan-out sets every field; per-port `portLevelSettings.http`
-    // overrides just one of them. The other two fields must survive the
-    // per-port apply (Istio "per-port settings layer over top-level"
-    // semantics).
+    // Top-level fallback sets every field; per-port `portLevelSettings.http`
+    // overrides just one of them. The other fields must survive via the
+    // inherited fallback at resolve time (field-level merge).
     let mut port_level_settings = HashMap::new();
     port_level_settings.insert(
         8080,
         MeshTrafficPolicy {
             connection_pool_http: Some(MeshConnectionPoolHttp {
-                // Only override http2_max_requests; the other two fields stay
-                // from the top-level fan-out.
+                // Only override http2_max_requests; the other fields stay
+                // on the inherited fallback.
                 http2_max_requests: Some(999),
                 ..MeshConnectionPoolHttp::default()
             }),
@@ -833,13 +818,22 @@ fn destination_rule_port_level_connection_pool_http_overrides_top_level_fan_out(
         .expect("per-port overlay present");
     // Per-port wins for the field it sets:
     assert_eq!(port_override.h2_max_concurrent_streams, Some(999));
-    // Supported fields not respecified by per-port survive from the fan-out;
-    // maxRequestsPerConnection is intentionally deferred and not projected.
+    // Supported fields not respecified by per-port stay on the fallback, not
+    // the port override slot; maxRequestsPerConnection is deferred.
     assert!(
         port_override.http_max_requests_per_connection.is_none(),
         "unsupported maxRequestsPerConnection must not survive as effective policy"
     );
-    assert_eq!(port_override.http_idle_timeout_ms, Some(45_000));
+    assert!(
+        port_override.http_idle_timeout_ms.is_none(),
+        "top-level idleTimeout stays on the fallback, not the partial per-port slot"
+    );
+    let fallback = prepared.proxies[0]
+        .dispatch_port_override_fallback
+        .as_ref()
+        .expect("top-level HTTP fields project as a fallback");
+    assert_eq!(fallback.http_idle_timeout_ms, Some(45_000));
+    assert_eq!(fallback.h2_max_concurrent_streams, Some(250));
 }
 
 #[test]
@@ -905,8 +899,8 @@ fn destination_rule_port_level_explicit_default_clears_inherited_h2_upgrade_poli
     use ferrum_edge::config::types::H2UpgradePolicy;
     use ferrum_edge::modes::mesh::config::MeshConnectionPoolHttp;
 
-    // codex round-1 Finding 3: a top-level `UPGRADE` fans out to every port,
-    // but an EXPLICIT port-level `DEFAULT` on 8080 must CLEAR the inherited
+    // A top-level `UPGRADE` supplies the inherited fallback, but an EXPLICIT
+    // port-level `DEFAULT` on 8080 must CLEAR the inherited
     // `UPGRADE` for that port (operator explicitly chose probe-driven), not
     // leave it inherited. `H2UpgradePolicy::Default` is carried (not collapsed
     // to `None`) precisely so the apply layer can distinguish explicit-DEFAULT
@@ -997,6 +991,9 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
             MeshTrafficPolicy {
                 connection_pool_http: Some(MeshConnectionPoolHttp {
                     h2_upgrade_policy: Some(H2UpgradePolicy::Default),
+                    // Partial port overlay: only idleTimeout among the residual
+                    // pair — http2MaxRequests must still inherit from subset/top.
+                    idle_timeout_ms: Some(15_000),
                     ..MeshConnectionPoolHttp::default()
                 }),
                 ..MeshTrafficPolicy::default()
@@ -1026,6 +1023,8 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
                             h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
                             max_retries: Some(9),
                             http1_max_pending_requests: Some(90),
+                            idle_timeout_ms: Some(60_000),
+                            http2_max_requests: Some(200),
                             ..MeshConnectionPoolHttp::default()
                         }),
                         ..MeshTrafficPolicy::default()
@@ -1047,12 +1046,17 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
             h2_upgrade_policy: Some(H2UpgradePolicy::DoNotUpgrade),
             max_retries: Some(2),
             http1_max_pending_requests: Some(1),
+            idle_timeout_ms: Some(45_000),
+            http2_max_requests: Some(10),
             ..MeshConnectionPoolHttp::default()
         }),
         Some(MeshConnectionPoolHttp {
             h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
             max_retries: Some(5),
             http1_max_pending_requests: Some(4),
+            // Partial subset overlay: only http2MaxRequests among the residual
+            // pair — idleTimeout inherits top-level until the port tier wins.
+            http2_max_requests: Some(40),
             ..MeshConnectionPoolHttp::default()
         }),
     );
@@ -1075,16 +1079,26 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
     );
     assert_eq!(stable.max_retries, Some(2));
     assert_eq!(stable.http1_max_pending_requests, Some(1));
+    assert_eq!(stable.http_idle_timeout_ms, Some(45_000));
+    assert_eq!(stable.h2_max_concurrent_streams, Some(10));
 
     let canary = inherited(&initial, "reviews-canary");
     assert_eq!(canary.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
     assert_eq!(canary.max_retries, Some(5));
     assert_eq!(canary.http1_max_pending_requests, Some(4));
+    assert_eq!(
+        canary.http_idle_timeout_ms,
+        Some(60_000),
+        "partial canary overlay inherits top-level idleTimeout"
+    );
+    assert_eq!(canary.h2_max_concurrent_streams, Some(40));
 
     let unmatched = inherited(&initial, "reviews-unmatched");
     assert_eq!(unmatched.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
     assert_eq!(unmatched.max_retries, Some(9));
     assert_eq!(unmatched.http1_max_pending_requests, Some(90));
+    assert_eq!(unmatched.http_idle_timeout_ms, Some(60_000));
+    assert_eq!(unmatched.h2_max_concurrent_streams, Some(200));
 
     for proxy in &initial.proxies {
         let port = proxy
@@ -1097,6 +1111,15 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
             Some(H2UpgradePolicy::Default),
             "explicit port-level policy is the highest-precedence tier"
         );
+        assert_eq!(
+            port.http_idle_timeout_ms,
+            Some(15_000),
+            "explicit port-level idleTimeout wins over subset and top-level"
+        );
+        assert!(
+            port.h2_max_concurrent_streams.is_none(),
+            "unrelated port-level idleTimeout must not erase subset/top http2MaxRequests"
+        );
     }
 
     let updated = build(
@@ -1104,19 +1127,29 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
             h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
             max_retries: Some(0),
             http1_max_pending_requests: Some(6),
+            idle_timeout_ms: Some(12_000),
+            http2_max_requests: Some(8),
             ..MeshConnectionPoolHttp::default()
         }),
         Some(MeshConnectionPoolHttp {
             h2_upgrade_policy: Some(H2UpgradePolicy::Upgrade),
             max_retries: Some(5),
             http1_max_pending_requests: Some(4),
+            http2_max_requests: Some(40),
             ..MeshConnectionPoolHttp::default()
         }),
     );
     let updated_stable = inherited(&updated, "reviews-stable");
     assert_eq!(updated_stable.max_retries, Some(0));
     assert_eq!(updated_stable.http1_max_pending_requests, Some(6));
+    assert_eq!(updated_stable.http_idle_timeout_ms, Some(12_000));
+    assert_eq!(updated_stable.h2_max_concurrent_streams, Some(8));
     assert_eq!(stable.max_retries, Some(2), "old snapshot stays coherent");
+    assert_eq!(
+        stable.http_idle_timeout_ms,
+        Some(45_000),
+        "old snapshot idleTimeout stays coherent across reload"
+    );
 
     let removed = build(None, None);
     for id in ["reviews-stable", "reviews-canary", "reviews-unmatched"] {
@@ -1124,6 +1157,8 @@ fn destination_rule_combined_subset_http_policy_precedence_no_leakage_and_remova
         assert_eq!(fallback.h2_upgrade_policy, Some(H2UpgradePolicy::Upgrade));
         assert_eq!(fallback.max_retries, Some(9));
         assert_eq!(fallback.http1_max_pending_requests, Some(90));
+        assert_eq!(fallback.http_idle_timeout_ms, Some(60_000));
+        assert_eq!(fallback.h2_max_concurrent_streams, Some(200));
     }
 }
 

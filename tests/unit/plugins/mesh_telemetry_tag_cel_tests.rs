@@ -166,6 +166,86 @@ async fn cel_reads_original_attribution_not_prior_label_mutations() {
 }
 
 #[tokio::test]
+async fn cel_cannot_read_a_label_removed_earlier_in_the_override_plan() {
+    let workload_metrics = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "source_principal",
+                "operation": {"type": "remove"}
+            }, {
+                "metric": "REQUEST_COUNT",
+                "name": "source_app",
+                "operation": {
+                    "type": "set_expr",
+                    "cel": "has(source.principal) ? source.principal : \"redacted\""
+                }
+            }, {
+                "metric": "REQUEST_COUNT",
+                "name": "response_code",
+                "operation": {"type": "remove"}
+            }, {
+                "metric": "REQUEST_COUNT",
+                "name": "destination_service",
+                "operation": {
+                    "type": "set_expr",
+                    "cel": "string(response.code)"
+                }
+            }]
+        }
+    }))
+    .expect("ordered remove and CEL override");
+
+    let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), "/".into());
+    let mut headers = HashMap::new();
+    workload_metrics.before_proxy(&mut ctx, &mut headers).await;
+
+    let registry = MetricsRegistry::new();
+    let summary = TransactionSummary {
+        http_method: "GET".into(),
+        response_status_code: 200,
+        metadata: mesh_identity_metadata(ctx.metadata),
+        ..TransactionSummary::default()
+    };
+    registry.record(&summary);
+    let counter = registry
+        .render_uncached()
+        .lines()
+        .find(|line| line.starts_with("ferrum_mesh_requests_total{"))
+        .expect("mesh request counter")
+        .to_string();
+
+    assert!(
+        !counter.contains("source_principal="),
+        "removed source_principal must stay absent: {counter}"
+    );
+    assert!(
+        counter.contains(r#"source_app="redacted""#),
+        "CEL must treat removed source.principal as absent: {counter}"
+    );
+    assert!(
+        !counter.contains("response_code="),
+        "removed response_code must stay absent: {counter}"
+    );
+    assert!(
+        counter.contains(r#"destination_service="""#),
+        "CEL must render a removed response.code as absent: {counter}"
+    );
+    assert!(
+        !counter.contains(r#"destination_service="200""#),
+        "removed response.code must not leak into another label: {counter}"
+    );
+    assert!(
+        !counter.contains("spiffe://cluster.local/ns/default/sa/frontend"),
+        "removed source.principal value must not leak into another label: {counter}"
+    );
+    assert!(
+        counter.contains(r#"destination_principal="spiffe://cluster.local/ns/default/sa/backend""#),
+        "unremoved destination.principal must remain available: {counter}"
+    );
+}
+
+#[tokio::test]
 async fn missing_cel_attribute_emits_empty_label_not_invented_data() {
     let workload_metrics = WorkloadMetrics::new(&json!({
         "metrics": {

@@ -1389,6 +1389,80 @@ Because only the repository-root Cargo configuration is validated, a committed
 `working-directory: fuzz`, and a nested Cargo configuration there would be an
 unreviewed place to set a target linker, runner, or rustflags.
 
+##### Admitted release image-family adoption (`-ebpf-tools`)
+
+Every job in `release.yml` that publishes by wildcard is frozen byte for byte, so
+adding a third production image family is not something an ordinary pull request
+can express: the new publisher, the new digest name space, and the new
+attestation subjects all live inside frozen text. Rather than relaxing that
+freeze, the policy admits **exactly two** shapes of the release workflow and one
+transition between them (`RELEASE_IMAGE_FAMILY_GENERATIONS`):
+
+- **two-family** — the shape on `main` today: `:<tag>` and `:<tag>-ebpf`. In this
+  shape the `-ebpf-tools` family may not be named anywhere in the file at all.
+- **three-family** — the same workflow plus the complete `-ebpf-tools` contract:
+  the `docker-ebpf-tools-manifest` job (its `needs` and its whole step list,
+  including the `docker-ebpf-tools-digest-*` download pattern, the
+  `/tmp/digests-tools` working directory, and every published tag); the tools
+  build/export/upload steps inside the single `docker-ebpf` job; sole ownership
+  of the `docker-ebpf-tools-digest-` wildcard by that same job; the extended
+  `create-release` `needs`, the gating rationale comment that shares its `name:`
+  field block, and its release notes; and an `attest-release-images` job
+  that resolves, cross-registry-compares, SBOMs, provenances, signs, attests, and
+  verifies all three families in both registries.
+
+The credentialed `docker-ebpf` producer is closed over its complete ordered
+job-field set and its entire `steps:` list in both shapes; the tools manifest is
+closed the same way after adoption. An extra context-rewrite step, an alternate
+runner, `continue-on-error`, `if`, `environment`, `container`, `services`, or
+any other added job control is therefore a contract violation even when every
+named build/upload fragment remains unchanged.
+
+A revision is classified from itself, and is then held to the complete contract of
+the shape it claims — so a partial adoption, an extra publisher or tag, an
+alternate action/runner/permission/`needs`/step, a missing attestation operation,
+and a mixed digest name space are all rejected. Which transitions are legal is a
+separate, comparative question decided from the trusted base
+(`release_image_family_transition_errors`), never from the proposal: while the
+base is still two-family a pull request may leave the workflow byte-identical or
+move it in one step to the complete three-family shape, and once the base carries
+the three-family shape reverting to two-family is refused. The
+`docker-ebpf-tools-digest-` prefix is refused to repo-local composite actions in
+both generations, because a local action is never a digest owner in any shape.
+
+The publication contract is only half of the gate. The generic pull-request scan
+also hashes every job it reads as Cross-sensitive and requires the two revisions
+to agree, and the adoption moves frozen text inside such jobs by design — the
+extended `create-release` `needs` names `build-release-arm64-cross`. That
+comparison therefore rejected the complete admitted shape, which made the
+transition unreachable. It is repaired by a projection rather than an exemption
+(`release_family_transition_surface_contents`): once both revisions have
+classified, the proposal has validated against the whole three-family contract,
+and the base carries every two-family frozen text verbatim, the proposal is
+re-rendered in the two-family text it came from — each frozen fragment
+substituted back to its original, the new manifest job removed whole — and the
+surface comparison then reads the same bytes on both sides. The substitution
+table is derived from the two contract tables themselves, so it cannot drift from
+them; every substitution must match exactly once or the projection is abandoned
+and the unmodified revisions are compared. Nothing outside those frozen fragments
+is withheld — the only non-contract text the projection removes is the comments
+and blank lines inside the removed manifest job, which that job's closed
+field set and frozen `steps:` list already prevent from carrying any surface — so
+a Cross command, a `CROSS_*` input, or any other executable
+surface added anywhere in the file — including elsewhere inside a transitioned
+job — is still rejected while the adoption is in flight, and the projection never
+applies to any other workflow, to an unchanged release workflow, or to a
+rollback.
+
+The trusted-base verifier is what reads the base and executes; the proposed
+verifier never decides its own pull request's safety. Adopting this admission
+layer therefore takes two stages, exactly like the original trusted-CI bootstrap:
+a policy-only pull request that lands the admission (its own
+`Trusted Cross Build Policy` check fails by design, because that check refuses any
+modification of the verifier it protects, and the landing is administrative after
+root review), then an ordinary pull request that adopts the release workflow
+under the now-trusted policy and runs the full hosted matrix.
+
 #### 8. Latest Release and Docker Jobs
 
 **Runs**: `ubuntu-latest`

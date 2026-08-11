@@ -172,15 +172,34 @@ The trigger is a generic layer and never replaces route selection, mesh routing,
 or a plugin's own policy matchers. It is compiled and bounded at config load,
 admin write, and plugin-cache publication — the request path only walks
 precompiled matchers. A false trigger suppresses every hook of that instance —
-request, response, and stream connect/disconnect alike — including its
-per-request buffering, body-release, and enforcement claims, so a skipped
-instance makes no external call, takes no lease, and retains no state.
+request, response, terminal transaction logging, stream connect/disconnect,
+WebSocket frame/reassembly/delivery/disconnect, and UDP/DTLS datagram hooks
+alike — including its per-request buffering, body-release, and enforcement
+claims, so a skipped instance makes no external call, takes no lease, and
+retains no state.
 
-Some surfaces cannot be gated coherently and are refused at publication rather
-than half-applied: WebSocket frame/disconnect hooks, UDP datagram hooks, the
-contextless initial response-header policy (`security_headers`), an identity
-predicate on an authentication plugin, an identity predicate on a stream-only
-plugin, fixed core request/response body ceilings, and contextless
+The contextless surfaces are gated by carrying ONE decision from the
+authoritative admission point rather than re-evaluating a predicate later.
+Terminal `log` / `log_with_mesh_key` read the decision from an opaque,
+non-serialized carrier on the transaction summary; WebSocket frame, reassembly,
+delivery, size-limit, and disconnect hooks read it from the upgrade's decision,
+which is taken before the session's capability set exists (a skipped instance
+therefore cannot force framing or pull a session off the raw tunnel path); UDP
+and DTLS datagram hooks read it from the session, decided once by the
+`on_stream_connect` chain, so no predicate is evaluated per packet. Missing
+carrier state RUNS the hook — historical behavior is preserved and the
+occurrence is counted in the unlabeled `plugin_triggers` counters on
+`GET /metrics/runtime` — so an absent carrier can never silently disable a
+security plugin.
+
+Some surfaces still cannot be gated coherently and are refused at publication
+rather than half-applied: the contextless initial response-header policy
+(`security_headers`), an identity predicate on an authentication plugin, an
+identity predicate on a stream-only plugin, an HTTP-only predicate (`method`,
+`path`, `host`, `header`, `query`, `cookie`) on a stream-only plugin — a
+datagram or byte stream has no request line, header block, query string, or
+cookie jar, so the field is named in the error instead of being reinterpreted as
+empty — fixed core request/response body ceilings, and contextless
 response-trailer ownership. An identity predicate (`consumer` / `auth_method` /
 `spiffe_id`) also never gates a stream connection at all — the one gated stream
 phase is where stream authentication itself runs — so on a plugin that serves
@@ -2154,6 +2173,7 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `providers[].dpop_clock_skew_secs` | u64 (optional) | DPoP `iat`/`exp` clock skew in seconds (default: `30`, max: `300`) |
 | `providers[].dpop_jti_cache_max_entries` | usize (optional) | Per-provider DPoP replay cache capacity (default: `10000`) |
 | `providers[].dpop_jti_ttl_secs` | u64 (optional) | DPoP `jti` replay cache TTL (default: `300`, must be at least twice clock skew) |
+| `providers[].jwks_max_stale_seconds` | u64 (optional) | Per-provider maximum age of the last validated non-empty remote JWKS; overrides the plugin default (min `1`, max `86400`; remote sources only) |
 | `scope_claim` | String | Global scope claim path (default: `"scope"`) |
 | `role_claim` | String | Global role claim path (default: `"roles"`) |
 | `consumer_identity_claim` | String | Global JWT claim for consumer lookup (default: `"sub"`) |
@@ -2162,13 +2182,16 @@ Authenticates using Bearer JWTs validated against one or more Identity Provider 
 | `claim_headers_separator` | String | Global separator for array claim header values (default: `","`) |
 | `emit_mesh_request_principal_metadata` | Boolean | Emit `mesh.request_principal` plus mesh JWT claim/audience metadata for direct `mesh_authz` request-principal and `when` condition evaluation (default: `false`) |
 | `require_exp` | Boolean | Global default for requiring an `exp` claim (default: `true`) |
-| `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`) |
+| `jwks_refresh_interval_secs` | u64 | JWKS key refresh interval in seconds (default: `900`, min: `1`, max: `86400`); must not exceed each remote provider's effective maximum-stale value |
+| `jwks_max_stale_seconds` | u64 | Maximum age of the last validated non-empty remote JWKS (default: `3600`, max: `86400`). `0` is invalid and cannot disable fail-closed expiry |
 
 Claim values are auto-detected as space-delimited strings (OAuth2 standard), JSON arrays, or nested objects via dot-notation paths.
 Claim header fan-out refuses reserved hop-by-hop, authorization, host, and consumer identity headers.
-Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. Shared stores use the minimum refresh interval requested by active consumers, and full or incremental reloads reschedule the single refresh worker without dropping cached keys. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement.
+Unknown top-level, provider, and custom-header-location fields are rejected so misspelled authentication controls cannot silently fail open. For each remote provider, `jwks_refresh_interval_secs` must not exceed its effective `jwks_max_stale_seconds`. Shared stores use both the minimum refresh interval and the minimum maximum-stale value requested by active consumers. A newly added stricter consumer takes effect immediately; full or incremental publication deterministically reconciles the exact minima, so removing the strict consumer may relax policy without replacing the store or resetting key age. Discovery-backed reloads retain the last validated URI/store until rediscovery produces a usable replacement, but discovery success alone never refreshes key trust. A store an OIDC discovery task resolves *after* its generation was published joins the active refresh/maximum-stale arbitration and the trust aggregate at that moment rather than at the next reload, and leaves it when that generation retires or repoints to a different URI; a staged generation that is never published contributes nothing to readiness or metrics.
 
-Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A rejected refresh retains the last-known-good keys. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
+Remote discovery documents are capped at 128 KiB and JWKS responses at 1 MiB/256 keys, with bounded key components. A valid non-empty JWKS atomically replaces the key map, refreshes the monotonic trust deadline, clears failure state, and can restore authentication after expiry. Empty 200 responses, malformed or oversized bodies, non-2xx status, and transport/DNS/TLS/timeout failures retain last-known-good material only for the finite grace window and use a bounded accelerated retry cadence; after the deadline, verification refuses the retained material without deleting diagnostic/recovery state. JWKs are accepted for signature verification only when `use` is absent or `sig` and `key_ops` is absent or includes `verify`; contradictory operation metadata is rejected.
+
+Authenticated `/metrics` exposes only fixed-cardinality aggregate JWKS state for **active remote** stores: `fresh`, `grace`, or `expired`, maximum trust age per state, and closed refresh-failure classes. It never labels a series with a JWKS/discovery URL, `kid`, token, claim, or key material. Authenticated `/health`/`/status` mirror the same closed-set counts under `jwks_trust`; unauthenticated probes see only coarse readiness effects (grace → degraded+ready, expired → unavailable+not-ready, none → neutral) from an O(1) cached aggregate. Choose the maximum-stale window as an explicit availability-versus-revocation trade-off; production deployments should keep it short enough for emergency key removal to take effect within their incident-response objective.
 
 ### `oauth2_introspection`
 
@@ -2292,6 +2315,12 @@ config:
   behavior:
     post_login_default_path: "/"
 ```
+
+OIDC relying-party JWKS uses the same shared bounded-trust store as
+`jwks_auth`, with the secure one-hour maximum-stale default. Discovery success
+does not refresh key trust; only a validated non-empty JWKS does. When the same
+URI is also referenced by `jwks_auth`, the strictest active maximum-stale and
+refresh requirements govern the shared store.
 
 ### `jwt_auth`
 

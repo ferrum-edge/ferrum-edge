@@ -1617,16 +1617,16 @@ fn physically_refused_same_port_listeners_are_not_emitted_as_mesh_services() {
     assert!(
         !names
             .iter()
-            .any(|name| *name == "edge-plain" || *name == "edge-secure"),
+            .any(|name| *name == "gateway-4-edge-plain" || *name == "gateway-4-edge-secure"),
         "refused same-port listeners must not become MeshServices: {names:?}"
     );
     assert!(
-        names.contains(&"edge-healthy"),
+        names.contains(&"gateway-4-edge-healthy"),
         "healthy plaintext sibling on another port must remain exposed: {names:?}"
     );
     assert!(
         services.iter().any(|service| {
-            service.name == "edge-healthy"
+            service.name == "gateway-4-edge-healthy"
                 && service.ports.len() == 1
                 && service.ports[0].port == 8080
         }),
@@ -1826,11 +1826,11 @@ fn same_namespace_tls_gateways_are_both_emitted_as_mesh_services() {
         .map(|service| service.name.as_str())
         .collect();
     assert!(
-        names.contains(&"edge-https"),
+        names.contains(&"gateway-4-edge-https"),
         "first SNI listener must remain exposed: {names:?}"
     );
     assert!(
-        names.contains(&"reference-grant-edge-https"),
+        names.contains(&"gateway-20-reference-grant-edge-https"),
         "second SNI listener must remain exposed: {names:?}"
     );
     assert_eq!(
@@ -1865,11 +1865,11 @@ fn same_namespace_tls_gateways_are_both_emitted_as_mesh_services() {
         })
         .unwrap_or_default();
     assert!(
-        reversed_names.contains(&"edge-https"),
+        reversed_names.contains(&"gateway-4-edge-https"),
         "order-independent first-listener exposure: {reversed_names:?}"
     );
     assert!(
-        reversed_names.contains(&"reference-grant-edge-https"),
+        reversed_names.contains(&"gateway-20-reference-grant-edge-https"),
         "order-independent second-listener exposure: {reversed_names:?}"
     );
 }

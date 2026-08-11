@@ -153,6 +153,7 @@ pub fn prepare_proxy_frontend_tls(
             interval,
             revision_tx,
             rebuild,
+            max_material_bytes: env_config.tls_max_material_size_bytes,
         },
         shutdown_rx,
     );
@@ -342,6 +343,7 @@ pub fn prepare_admin_frontend_tls(
             interval,
             revision_tx,
             rebuild,
+            max_material_bytes: env_config.tls_max_material_size_bytes,
         },
         shutdown_rx,
     );

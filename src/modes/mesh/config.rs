@@ -3026,10 +3026,11 @@ pub struct MeshTrafficPolicy {
     /// When present, the K8s translator has parsed at least one supported HTTP
     /// connection-pool knob (`idleTimeout`, `http2MaxRequests`,
     /// `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`); the mesh
-    /// apply layer projects these onto the matching upstream's
-    /// `port_overrides[port]` slot (top-level fan-out applies to every target
-    /// port; per-port `portLevelSettings` overrides per-port). Old DPs reading
-    /// new slices see this as a no-op via the serde default.
+    /// apply layer accumulates top-level values on the upstream's inherited
+    /// fallback and stores explicit `portLevelSettings` values separately in
+    /// `port_overrides[port]`; dispatch merges them field-by-field with the
+    /// per-port tier first. Old DPs reading new slices see this as a no-op via
+    /// the serde default.
     ///
     /// `maxRequestsPerConnection` may still deserialize for carrier/backward
     /// compatibility, but new K8s translation warns, reports it as deferred, and

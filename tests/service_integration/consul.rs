@@ -53,7 +53,7 @@ async fn discover_eventually(d: &ConsulDiscoverer, min: usize) -> Vec<UpstreamTa
     loop {
         let past = tokio::time::Instant::now() >= deadline;
         match d.discover().await {
-            Ok(t) if t.len() >= min || past => return t,
+            Ok(t) if t.len() >= min || past => return t.targets().to_vec(),
             Err(_) if past => return Vec::new(),
             _ => tokio::time::sleep(Duration::from_millis(200)).await,
         }

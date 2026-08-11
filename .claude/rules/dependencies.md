@@ -55,6 +55,21 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   still compared byte for byte, and the wiring cannot be removed once adopted. A
   committed `.cargo/config[.toml]` below the repository root is rejected
   outright.
+- `release.yml` is admitted in exactly two shapes
+  (`RELEASE_IMAGE_FAMILY_GENERATIONS`): the current two image families, or those
+  plus the complete frozen `-ebpf-tools` contract (`docker-ebpf-tools-manifest`
+  job, tools build/export/upload steps in `docker-ebpf`, sole ownership of the
+  `docker-ebpf-tools-digest-` wildcard, extended `create-release`
+  `needs`/rationale-comment/notes,
+  and three-family resolve/compare/SBOM/provenance/sign/verify coverage in
+  `attest-release-images`). The credentialed eBPF producer and tools manifest
+  have closed job-field sets and complete `steps:` contracts, so extra execution
+  controls or context-rewrite steps are rejected. A revision is held to the
+  complete contract of the shape it claims; the trusted base decides the
+  transition. While the base is
+  two-family a PR may leave the workflow byte-identical or adopt the whole
+  three-family shape, and once the base is three-family a revert is refused. See
+  `docs/ci_cd.md` → "Admitted release image-family adoption".
 
 ## Drift Guard
 

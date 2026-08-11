@@ -23,10 +23,14 @@
 //! | `response.code` | int | HTTP/gRPC response status |
 //! | `destination.port` | int | internal metric CEL stamp (same resolution as mesh authz) |
 //!
-//! `has(<string attribute>)` tests presence in the evaluation context. Mesh-key
-//! string attributes default to the sentinel `unknown` and are therefore always
-//! present — `has(source.workload)` does not test attribution resolution. Only
-//! `request.method` and `request.host` can be absent.
+//! `has(<string attribute>)` tests presence in the evaluation context. Empty
+//! string attributes and mesh-key fields cleared by earlier `REMOVE` overrides
+//! in an ordered tag plan are treated as absent (fail-closed). Integer
+//! attributes remain available only through `string(...)`; a removed integer
+//! attribute evaluates to the empty string.
+//! Unremoved mesh-key attributes that resolve to the sentinel `unknown` remain
+//! present — `has(source.workload)` does not test attribution resolution.
+//! `request.method` and `request.host` may also be absent when unset.
 //!
 //! HTTP-only attributes (`request.method`, `request.host`, `response.code`) are
 //! rejected when the override targets a TCP metric family or `ALL_METRICS`
@@ -365,6 +369,7 @@ impl<'a> MetricTagCelContext<'a> {
             MetricTagCelAttr::RequestHost => self.request_host.filter(|v| !v.is_empty()),
             MetricTagCelAttr::ResponseCode | MetricTagCelAttr::DestinationPort => None,
         }
+        .filter(|value| !value.is_empty())
     }
 
     pub fn int_attr(&self, attr: MetricTagCelAttr) -> Option<u16> {

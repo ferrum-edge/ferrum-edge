@@ -1477,7 +1477,10 @@ fn an_invalid_trigger_is_refused_at_plugin_cache_publication() {
 }
 
 #[test]
-fn a_trigger_on_a_websocket_frame_plugin_is_refused_rather_than_half_applied() {
+fn a_websocket_frame_plugin_may_now_carry_a_trigger() {
+    // Issue #3734: the frame/framing/disconnect surfaces are bound to the
+    // decision taken at upgrade admission, so publication no longer refuses
+    // them. `ws_message_size_limiting` publishes size limits AND frame hooks.
     let cfg = config(
         vec![make_proxy("api", "/api", vec!["ws"])],
         vec![with_trigger(
@@ -1485,18 +1488,17 @@ fn a_trigger_on_a_websocket_frame_plugin_is_refused_rather_than_half_applied() {
             json!({"when": {"match": {"method": ["GET"]}}}),
         )],
     );
-    let error = publication_error(&cfg);
+    PluginCache::new(&cfg).expect("a triggered WebSocket frame plugin publishes");
     assert!(
-        error.contains("cannot carry an execution trigger"),
-        "{error}"
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&cfg, None).is_ok(),
+        "candidate admission must accept a triggered WebSocket frame plugin"
     );
-    assert!(error.contains("WebSocket"), "{error}");
-    let candidate = candidate_error(&cfg);
-    assert!(candidate.contains("WebSocket"), "{candidate}");
 }
 
 #[test]
-fn a_trigger_on_a_udp_datagram_plugin_is_refused() {
+fn a_udp_datagram_plugin_may_now_carry_a_network_fact_trigger() {
+    // Issue #3734: the decision is taken once by the `on_stream_connect`
+    // admission chain and consumed when the flow's datagram-hook list is built.
     let cfg = config(
         vec![stream_proxy(
             "udp",
@@ -1509,14 +1511,65 @@ fn a_trigger_on_a_udp_datagram_plugin_is_refused() {
             json!({"when": {"match": {"source_cidr": ["10.0.0.0/8"]}}}),
         )],
     );
-    let error = publication_error(&cfg);
+    PluginCache::new(&cfg).expect("a triggered UDP datagram plugin publishes");
     assert!(
-        error.contains("cannot carry an execution trigger"),
-        "{error}"
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&cfg, None).is_ok(),
+        "candidate admission must accept a triggered UDP datagram plugin"
     );
-    assert!(error.contains("UDP datagram"), "{error}");
-    let candidate = candidate_error(&cfg);
-    assert!(candidate.contains("UDP datagram"), "{candidate}");
+}
+
+#[test]
+fn an_http_only_predicate_on_a_stream_only_plugin_is_refused_by_field() {
+    // A datagram flow has no request line, header block, query string, or
+    // cookie jar. Refuse by NAME rather than reinterpreting the absent concept
+    // as an empty string (which would silently disable the instance) or, under
+    // `not`, as a broad match (which would silently always enable it).
+    for (field, predicate) in [
+        ("method", json!({"method": ["GET"]})),
+        ("path", json!({"path": {"prefix": ["/api"]}})),
+        ("host", json!({"host": {"exact": ["api.example.com"]}})),
+        ("header", json!({"header": {"name": "x-tenant"}})),
+        ("query", json!({"query": {"name": "tenant"}})),
+        ("cookie", json!({"cookie": {"name": "session"}})),
+    ] {
+        let cfg = config(
+            vec![stream_proxy(
+                "udp",
+                BackendScheme::Udp,
+                19_412,
+                vec!["udp-rl"],
+            )],
+            vec![with_trigger(
+                builtin("udp-rl", "udp_rate_limiting", "udp"),
+                json!({"when": {"match": predicate}}),
+            )],
+        );
+        let error = publication_error(&cfg);
+        assert!(
+            error.contains("cannot carry an execution trigger"),
+            "{field}: {error}"
+        );
+        assert!(
+            error.contains(&format!("`{field}`")),
+            "the diagnostic must name the offending field ({field}): {error}"
+        );
+        let candidate = candidate_error(&cfg);
+        assert!(candidate.contains(&format!("`{field}`")), "{candidate}");
+    }
+}
+
+#[test]
+fn an_http_only_predicate_is_still_supported_on_a_dual_protocol_plugin() {
+    // `ip_restriction` serves every protocol, so a `path` predicate remains a
+    // real condition for its HTTP requests and is not refused.
+    let cfg = config(
+        vec![make_proxy("api", "/api", vec!["ipr"])],
+        vec![with_trigger(
+            builtin("ipr", "ip_restriction", "api"),
+            json!({"when": {"match": {"path": {"prefix": ["/api/admin"]}}}}),
+        )],
+    );
+    PluginCache::new(&cfg).expect("a dual-protocol plugin keeps HTTP-only predicates");
 }
 
 #[test]

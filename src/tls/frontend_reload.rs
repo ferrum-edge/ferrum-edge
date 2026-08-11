@@ -74,6 +74,8 @@ pub struct FrontendTlsReloadConfig {
     /// apply it with `Endpoint::set_server_config`. The watcher bumps this
     /// after a successful swap; the value is the rotation generation.
     pub revision_tx: watch::Sender<u64>,
+    /// Validated TLS material byte ceiling for source loads.
+    pub max_material_bytes: usize,
     /// Closure invoked on every change to rebuild the `ServerConfig`.
     /// The closure is responsible for the surface-specific options that
     /// startup applied (ALPN advertisement, early-data, kTLS opt-in, client
@@ -105,6 +107,7 @@ pub fn spawn_frontend_tls_reload_task(
         slot,
         interval,
         revision_tx,
+        max_material_bytes,
         rebuild,
     } = config;
 
@@ -121,6 +124,8 @@ pub fn spawn_frontend_tls_reload_task(
             interval,
             revision_tx,
             rebuild: publish_rebuild,
+            max_material_bytes,
+            ready_tx: None,
         },
         shutdown_rx,
     )
@@ -180,6 +185,7 @@ mod tests {
                 // parallel test's task drop this one's force sender and exit
                 // early (`cargo test --lib` runs tests concurrently).
                 surface: "test_frontend_reload_swap",
+                max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
                 sources: vec![
                     WatchedMaterialSource::new(
                         "cert",

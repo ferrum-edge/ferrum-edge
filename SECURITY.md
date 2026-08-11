@@ -54,11 +54,15 @@ Include the following information:
 1. **Use TLS everywhere**: Frontend, backend, and database connections
 2. **Enable mTLS**: For backend authentication and zero-trust architectures
 3. **Set strong JWT secrets**: Use cryptographically secure random values
-4. **Configure rate limiting**: Protect against abuse and DoS
-5. **Use IP restrictions**: Limit admin API access to trusted sources
-6. **Keep dependencies updated**: Monitor for security advisories
-7. **Enable audit logging**: Track administrative changes
-8. **Run with minimal privileges**: Don't run as root in containers
+4. **Bound remote signing-key trust**: `jwks_auth` defaults
+   `jwks_max_stale_seconds` to one hour and never permits an unlimited value.
+   Set a shorter value when emergency issuer-key revocation must converge more
+   quickly, while accounting for the availability impact of an IdP outage.
+5. **Configure rate limiting**: Protect against abuse and DoS
+6. **Use IP restrictions**: Limit admin API access to trusted sources
+7. **Keep dependencies updated**: Monitor for security advisories
+8. **Enable audit logging**: Track administrative changes
+9. **Run with minimal privileges**: Don't run as root in containers
 
 ### Security Features
 

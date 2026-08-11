@@ -8538,48 +8538,27 @@ fn apply_destination_rules(
             }
 
             // Top-level `connectionPool.http.*` applies uniformly across the
-            // upstream. The subset-inheritable fields (`h2UpgradePolicy`,
-            // `maxRetries`, and `http1MaxPendingRequests`) stay in the inherited
-            // fallback for every upstream so a selected subset can overlay them
-            // without losing source-tier identity. The remaining HTTP fields
-            // retain the established non-SD fan-out. Explicit per-port fields
-            // are stored separately below and win at dispatch.
+            // upstream. Every applied HTTP field (`h2UpgradePolicy`,
+            // `maxRetries`, `http1MaxPendingRequests`, `idleTimeout`, and
+            // `http2MaxRequests`) accumulates on the inherited fallback so a
+            // selected subset can overlay without losing source-tier identity,
+            // and an explicit per-port field still wins at dispatch. Explicit
+            // per-port fields are stored separately below.
             //
-            // Service-discovery upstreams cannot fan out: their target ports
-            // resolve at runtime, not at apply time. Instead the top-level
-            // overlay is accumulated on `dispatch_port_override_fallback`, which
-            // `resolve_dispatch_port_overrides` projects onto the proxy and the
-            // HTTP-family dispatch resolvers apply by the LB-selected port (an
-            // explicit `portLevelSettings` entry for that port still wins). This
-            // does NOT materialize discovery targets (the rejected PR #1602
-            // rework) — it only carries the cap into runtime port resolution.
-            // The overlay is applied additively (same `apply_*` helper as the
-            // fan-out) so a later matching DR layers over an earlier one.
+            // Service-discovery upstreams cannot fan out onto known apply-time
+            // ports (targets resolve at runtime); the same fallback carrier is
+            // what `resolve_dispatch_port_overrides` projects onto the proxy and
+            // HTTP-family dispatch resolvers apply by the LB-selected port.
+            // This does NOT materialize discovery targets — it only carries the
+            // overlay into runtime port resolution. Applied additively so a
+            // later matching DR layers over an earlier one.
             if let Some(ref tp) = dr.traffic_policy
                 && let Some(ref http) = tp.connection_pool_http
             {
-                if has_service_discovery {
-                    let fallback = upstream
-                        .dispatch_port_override_fallback
-                        .get_or_insert_default();
-                    apply_connection_pool_http_to_port_override(fallback, http);
-                } else {
-                    if http.h2_upgrade_policy.is_some()
-                        || http.max_retries.is_some()
-                        || http.http1_max_pending_requests.is_some()
-                    {
-                        let fallback = upstream
-                            .dispatch_port_override_fallback
-                            .get_or_insert_default();
-                        apply_subset_inheritable_connection_pool_http_to_port_override(
-                            fallback, http,
-                        );
-                    }
-                    for port in &upstream_policy_ports {
-                        let override_slot = upstream.port_overrides.entry(*port).or_default();
-                        apply_non_subset_connection_pool_http_to_port_override(override_slot, http);
-                    }
-                }
+                let fallback = upstream
+                    .dispatch_port_override_fallback
+                    .get_or_insert_default();
+                apply_connection_pool_http_to_port_override(fallback, http);
             }
 
             // Second pass: per-port traffic policy overrides land on the
@@ -8793,6 +8772,14 @@ fn apply_destination_rules(
                                     .connection_pool_http
                                     .as_ref()
                                     .and_then(|http| http.http1_max_pending_requests),
+                                http_idle_timeout_ms: sp
+                                    .connection_pool_http
+                                    .as_ref()
+                                    .and_then(|http| http.idle_timeout_ms),
+                                h2_max_concurrent_streams: sp
+                                    .connection_pool_http
+                                    .as_ref()
+                                    .and_then(|http| http.http2_max_requests),
                                 passive_health_check,
                             }
                         }),
@@ -8988,12 +8975,16 @@ fn resolve_subset_traffic_policy(
             let h2_upgrade_policy = tp.and_then(|tp| tp.h2_upgrade_policy);
             let max_retries = tp.and_then(|tp| tp.max_retries);
             let http1_max_pending_requests = tp.and_then(|tp| tp.http1_max_pending_requests);
+            let http_idle_timeout_ms = tp.and_then(|tp| tp.http_idle_timeout_ms);
+            let h2_max_concurrent_streams = tp.and_then(|tp| tp.h2_max_concurrent_streams);
             if let Some(resolved) = ResolvedSubsetTrafficPolicy::new(
                 resolved_tls,
                 passive,
                 h2_upgrade_policy,
                 max_retries,
                 http1_max_pending_requests,
+                http_idle_timeout_ms,
+                h2_max_concurrent_streams,
             ) {
                 resolved_map.insert(subset.name.clone(), resolved);
             }
@@ -9063,14 +9054,16 @@ fn apply_traffic_policy_to_port_override(
 /// Project an HTTP connection-pool overlay onto a per-port slot.
 ///
 /// Each field is overlaid independently — `None` (field absent) leaves the
-/// existing slot value untouched so a per-port partial overlay can layer over
-/// a top-level fan-out without clearing fields the operator did not respecify.
+/// existing slot value untouched. The per-port slot remains separate from the
+/// inherited top-level/subset fallback; dispatch merges them field-by-field so
+/// omitted per-port fields inherit without being cleared.
 ///
 /// **Field-level merge — intentional Ferrum semantics.** Istio treats a matching
 /// `portLevelSettings` entry as a COMPLETE REPLACEMENT of the destination-level
 /// `connectionPool` for that port; Ferrum instead does a per-field merge
-/// (top-level fan-out, then this additive per-port overlay). This is the
-/// documented product contract across every applied `connectionPool` knob.
+/// (inherited fallback first, then this additive per-port overlay at dispatch).
+/// This is the documented product contract across every applied
+/// `connectionPool` knob.
 ///
 /// `h2_upgrade_policy` carries an explicit `H2UpgradePolicy::Default` rather
 /// than collapsing Istio's `DEFAULT` to `None`. That distinction matters HERE:
@@ -9094,41 +9087,6 @@ fn apply_connection_pool_http_to_port_override(
     }
     // An explicit `Some(Default)` (port-level `DEFAULT`) overwrites an
     // inherited `Upgrade`/`DoNotUpgrade`; absent (`None`) leaves it untouched.
-    if let Some(policy) = http.h2_upgrade_policy {
-        slot.h2_upgrade_policy = Some(policy);
-    }
-    if let Some(max_retries) = http.max_retries {
-        slot.max_retries = Some(max_retries);
-    }
-    if let Some(pending) = http.http1_max_pending_requests {
-        slot.http1_max_pending_requests = Some(pending);
-    }
-}
-
-/// Project the top-level HTTP connection-pool fields that do not participate
-/// in subset inheritance onto a known non-SD port. The three subset-supported
-/// fields stay in `dispatch_port_override_fallback`; keeping them out of this
-/// fanned slot preserves enough source-tier information for cold-path
-/// `port > subset > top-level` resolution.
-fn apply_non_subset_connection_pool_http_to_port_override(
-    slot: &mut UpstreamPortOverride,
-    http: &crate::modes::mesh::config::MeshConnectionPoolHttp,
-) {
-    if let Some(idle_ms) = http.idle_timeout_ms {
-        slot.http_idle_timeout_ms = Some(idle_ms);
-    }
-    if let Some(max_streams) = http.http2_max_requests {
-        slot.h2_max_concurrent_streams = Some(max_streams);
-    }
-}
-
-/// Preserve exactly the HTTP fields supported at subset scope in the inherited
-/// fallback. The selected subset overlays this top-level base during cold-path
-/// proxy projection; explicit per-port values remain separate and win later.
-fn apply_subset_inheritable_connection_pool_http_to_port_override(
-    slot: &mut UpstreamPortOverride,
-    http: &crate::modes::mesh::config::MeshConnectionPoolHttp,
-) {
     if let Some(policy) = http.h2_upgrade_policy {
         slot.h2_upgrade_policy = Some(policy);
     }
@@ -13705,28 +13663,23 @@ fn start_mesh_admin_listeners(
         None
     } else if env_config.admin_https_listener_enabled() {
         let admin_https_addr = env_config.admin_socket_addr(env_config.admin_https_port);
-        let admin_tls_config = startup_security::load_admin_tls_material(
+        match startup_security::plan_admin_https_listener(
             env_config,
             tls_policy,
             crls,
             "Invalid mesh admin TLS configuration",
-        )?;
-        let admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
-            admin_tls_config.clone(),
-            env_config,
-            tls_policy,
-            crls,
-            Some(shutdown_tx.subscribe()),
-        );
-        if admin_reload_handles.watcher_handle.is_some() {
-            info!("Frontend TLS live reload enabled for mesh admin HTTPS");
-        }
-        Some((
             admin_https_addr,
-            admin_tls_config,
-            admin_reload_handles.slot.clone(),
-            admin_reload_handles.watcher_handle,
-        ))
+            Some(shutdown_tx.subscribe()),
+        )? {
+            startup_security::AdminHttpsListenerPlan::Enabled(planned) => {
+                if planned.reload.watcher_handle.is_some() {
+                    info!("Frontend TLS live reload enabled for mesh admin HTTPS");
+                }
+                Some(planned)
+            }
+            startup_security::AdminHttpsListenerPlan::DisabledByPort
+            | startup_security::AdminHttpsListenerPlan::DisabledByMissingTls => None,
+        }
     } else {
         info!("Mesh admin TLS not configured - HTTPS listener disabled");
         None
@@ -13777,12 +13730,13 @@ fn start_mesh_admin_listeners(
         );
     }
 
-    if let Some((admin_https_addr, admin_tls_config, admin_tls_slot, watcher_handle)) =
-        admin_https_plan
-    {
-        if let Some(handle) = watcher_handle {
+    if let Some(mut planned) = admin_https_plan {
+        if let Some(handle) = planned.reload.watcher_handle.take() {
             handles.push(handle);
         }
+        let admin_https_addr = planned.addr;
+        let admin_tls_config = planned.tls_config;
+        let admin_tls_slot = planned.reload.slot.take();
         let shutdown = shutdown_tx.subscribe();
         let admin_https_limiter = admin_conn_limiter.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();

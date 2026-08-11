@@ -384,6 +384,29 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 14. `on_stream_connect` / `on_stream_disconnect`: TCP+TLS after handshake; UDP+DTLS after DTLS handshake
 15. `on_udp_datagram`: bidirectional datagram hooks only when `requires_udp_datagram_hooks()`
 
+Per-instance execution triggers gate the CONTEXTLESS phases (12, 13, 14, 15) by
+carrying ONE opaque decision from the authoritative admission point, never by
+re-evaluating a predicate later. `TransactionSummary.plugin_trigger_decisions`
+is stamped centrally in `plugins::log_with_mirror` (the single HTTP-family
+terminal funnel, mirror entries included);
+`StreamTransactionSummary.plugin_trigger_decisions` comes from
+`on_stream_connect`; WebSocket decisions are taken in
+`proxy::collect_websocket_size_limit_plugins` /
+`collect_websocket_relay_plugins` / `collect_websocket_disconnect_plugins`
+BEFORE the session's capability set exists, so a skipped instance forces neither
+framing nor a parser ceiling and cannot pull a session off the raw tunnel path;
+UDP/DTLS decisions filter the session's datagram-hook list ONCE at first-datagram
+admission (`plugins::admitted_datagram_plugins`), so nothing is evaluated,
+allocated, hashed, or locked per packet. Carriers are non-serialized,
+crate-constructed, keyed by the compiled gate's process-local token (never chain
+position, load order, plugin name, or plugin-writable metadata), and owned by the
+plugin generation that minted the gate. Explicit `false` skips, explicit `true`
+runs, and a MISSING carrier RUNS and increments the unlabeled
+`plugin_triggers.missing_decision_carriers` counter — never silently suppress a
+security or audit hook on missing state. A stream-only plugin may not carry an
+identity predicate or an HTTP-only predicate (`method`/`path`/`host`/`header`/
+`query`/`cookie`); publication names the field.
+
 Streaming response inspectors are staged: `Normalize` runs before `Inspect`,
 with configured plugin order preserved within each stage. Do not hard-code
 plugin names or change request-side priorities to obtain response representation

@@ -376,16 +376,16 @@ fn dr_connection_pool_http_http1_max_pending_requests_supported() {
     assert_eq!(http.http1_max_pending_requests, Some(50));
 }
 
-/// All three subset-scoped HTTP pool fields are carried together on the mesh
+/// All five subset-scoped HTTP pool fields are carried together on the mesh
 /// slice. Apply-time precedence and no-leakage are covered by the integration
 /// DestinationRule port-policy suite.
 #[test]
 fn dr_subset_connection_pool_http_combined() {
     register_feature!(
         category = CATEGORY,
-        feature = "subsets[].trafficPolicy.connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}",
+        feature = "subsets[].trafficPolicy.connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests,idleTimeout,http2MaxRequests}",
         status = Status::Supported,
-        notes = "Preserved per subset; runtime precedence is explicit port-level > selected subset > top-level. H1 admission is keyed by subset and retry caps never synthesize retry policy.",
+        notes = "Preserved per subset; runtime precedence is explicit port-level > selected subset > top-level. H1 admission is keyed by subset; retry caps never synthesize retry policy; idleTimeout projects onto pool_idle_timeout_seconds (reqwest rcfg identity); http2MaxRequests projects onto direct-H2/native-gRPC builders (reqwest H2 has no equivalent builder knob). Shared-client keys already carry upstream_subset so sibling subsets cannot first-materialize each other.",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
@@ -395,7 +395,9 @@ fn dr_subset_connection_pool_http_combined() {
             "trafficPolicy": {"connectionPool": {"http": {
                 "h2UpgradePolicy": "DO_NOT_UPGRADE",
                 "maxRetries": 2,
-                "http1MaxPendingRequests": 7
+                "http1MaxPendingRequests": 7,
+                "idleTimeout": "45s",
+                "http2MaxRequests": 10
             }}}
         }]
     }));
@@ -410,21 +412,21 @@ fn dr_subset_connection_pool_http_combined() {
     );
     assert_eq!(http.max_retries, Some(2));
     assert_eq!(http.http1_max_pending_requests, Some(7));
+    assert_eq!(http.idle_timeout_ms, Some(45_000));
+    assert_eq!(http.http2_max_requests, Some(10));
 }
 
 /// `subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}`
-/// are validated exactly like their top-level forms but dropped by the subset
-/// apply layer (`ResolvedSubsetTrafficPolicy` carries neither), so subset scope
-/// must warn. The identical fields at top-level scope ARE applied and must stay
-/// silent — otherwise every DR with a top-level `idleTimeout` grows a spurious
-/// "not applied" warning.
+/// are validated and projected like their top-level forms. Translation must
+/// not emit a subset-scope "not applied" warning — otherwise every DR with a
+/// subset idleTimeout / http2MaxRequests looks partially deferred.
 #[test]
-fn dr_subset_connection_pool_http_idle_timeout_and_h2_max_requests_deferred() {
+fn dr_subset_connection_pool_http_idle_timeout_and_h2_max_requests_supported() {
     register_feature!(
         category = CATEGORY,
         feature = "subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}",
-        status = Status::Deferred,
-        notes = "Parsed and validated, but not projected at subset scope: ResolvedSubsetTrafficPolicy carries only h2UpgradePolicy, maxRetries, and http1MaxPendingRequests. Translation warns and status reports the fields as deferred; set them at trafficPolicy or portLevelSettings scope.",
+        status = Status::Supported,
+        notes = "Projected into ResolvedSubsetTrafficPolicy and overlaid onto the selected proxy's inherited dispatch fallback with field-level precedence portLevelSettings > selected subset > top-level. idleTimeout → pool_idle_timeout_seconds (reqwest rcfg). http2MaxRequests → pool_http2_max_concurrent_streams on direct-H2/native-gRPC builders and those pools' keys (`none` when unset); reqwest H2 has no equivalent knob. Pool keys also carry upstream_subset so same-endpoint sibling subsets stay isolated.",
     );
     let result = translate_k8s_objects(
         &[destination_rule(json!({
@@ -451,18 +453,28 @@ fn dr_subset_connection_pool_http_idle_timeout_and_h2_max_requests_deferred() {
             .iter()
             .filter(|warning| warning.contains(field) && warning.contains("not applied"))
             .collect();
-        assert_eq!(
-            matching.len(),
-            1,
-            "exactly the SUBSET-scoped {field} must warn (top-level is applied): {:?}",
+        assert!(
+            matching.is_empty(),
+            "subset-scoped {field} is applied and must not warn: {:?}",
             result.warnings
         );
-        assert!(
-            matching[0].contains("subsets[].trafficPolicy.connectionPool.http"),
-            "the warning must name the subset scope: {}",
-            matching[0]
-        );
     }
+
+    let dr = result
+        .config
+        .mesh
+        .as_ref()
+        .expect("mesh")
+        .destination_rules
+        .first()
+        .expect("destination rule");
+    let http = dr.subsets[0]
+        .traffic_policy
+        .as_ref()
+        .and_then(|policy| policy.connection_pool_http.as_ref())
+        .expect("subset HTTP pool");
+    assert_eq!(http.idle_timeout_ms, Some(45_000));
+    assert_eq!(http.http2_max_requests, Some(10));
 }
 
 /// `trafficPolicy.loadBalancer.simple = ROUND_ROBIN` → `RoundRobin`.

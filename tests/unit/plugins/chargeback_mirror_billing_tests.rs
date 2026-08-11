@@ -48,6 +48,9 @@ impl Plugin for CapturingLogger {
 
 fn primary_summary(consumer: &str, proxy_id: &str, status: u16) -> TransactionSummary {
     TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),

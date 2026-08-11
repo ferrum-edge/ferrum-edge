@@ -205,12 +205,13 @@ The current run records these `deferred` entries:
   any scope.
 - `istio_destination_rule` —
   `subsets[].trafficPolicy.connectionPool.http.{idleTimeout,http2MaxRequests}`
-  are validated like their top-level forms but dropped by the subset apply
-  layer (`ResolvedSubsetTrafficPolicy` carries only `h2UpgradePolicy`,
-  `maxRetries`, and `http1MaxPendingRequests`); set those fields at
-  `trafficPolicy` or `portLevelSettings` scope instead. The three shipped
-  subset fields (`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`)
-  are `supported` at subset scope (PR #3547).
+  are now `supported` at subset scope alongside `h2UpgradePolicy`,
+  `maxRetries`, and `http1MaxPendingRequests` (issue #3735): projected into
+  `ResolvedSubsetTrafficPolicy`, overlaid onto the selected proxy's inherited
+  fallback with field-level precedence `portLevelSettings` > selected subset >
+  top-level. Direct-H2 / native-gRPC pool keys include the effective stream cap;
+  Reqwest's H2 path still lacks an `http2MaxRequests` builder knob
+  (documented transport caveat).
 
 Previously deferred and now flipped to `supported`:
 

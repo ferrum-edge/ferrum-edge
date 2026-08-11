@@ -553,6 +553,9 @@ fn scan_production_type_literals() -> BTreeMap<String, BTreeSet<String>> {
 
 fn make_summary(proxy_id: &str) -> TransactionSummary {
     TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
@@ -745,6 +748,7 @@ fn representative_exposition() -> String {
     );
 
     let mut output = registry.render_uncached();
+    output.push_str(&ferrum_edge::plugins::utils::jwks_cache::render_prometheus());
     output.push_str(&ferrum_edge::observability_delivery::render_prometheus());
     output.push_str(&ferrum_edge::notifications::render_delivery_prometheus());
 

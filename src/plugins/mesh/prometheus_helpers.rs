@@ -1601,27 +1601,85 @@ fn apply_metric_override_plan(
                     return;
                 };
                 let value = {
+                    let visible = |label: MeshMetricLabel, value| {
+                        (key.removed_labels & (1u16 << label.index()) == 0).then_some(value)
+                    };
                     let live_ctx = MetricTagCelContext {
-                        source_workload: attribution.source_workload.as_ref(),
-                        source_namespace: attribution.source_namespace.as_ref(),
-                        source_principal: attribution.source_principal.as_ref(),
-                        source_app: attribution.source_app.as_ref(),
-                        source_service: attribution.source_service.as_ref(),
-                        destination_workload: attribution.destination_workload.as_ref(),
-                        destination_namespace: attribution.destination_namespace.as_ref(),
-                        destination_principal: attribution.destination_principal.as_ref(),
-                        destination_app: attribution.destination_app.as_ref(),
-                        destination_service: attribution.destination_service.as_ref(),
-                        request_protocol: attribution.request_protocol.as_ref(),
-                        response_flags: attribution.response_flags.as_ref(),
-                        connection_security_policy: attribution.connection_security_policy.as_ref(),
+                        source_workload: visible(
+                            MeshMetricLabel::SourceWorkload,
+                            attribution.source_workload.as_ref(),
+                        )
+                        .unwrap_or(""),
+                        source_namespace: visible(
+                            MeshMetricLabel::SourceNamespace,
+                            attribution.source_namespace.as_ref(),
+                        )
+                        .unwrap_or(""),
+                        source_principal: visible(
+                            MeshMetricLabel::SourcePrincipal,
+                            attribution.source_principal.as_ref(),
+                        )
+                        .unwrap_or(""),
+                        source_app: visible(
+                            MeshMetricLabel::SourceApp,
+                            attribution.source_app.as_ref(),
+                        )
+                        .unwrap_or(""),
+                        source_service: visible(
+                            MeshMetricLabel::SourceService,
+                            attribution.source_service.as_ref(),
+                        )
+                        .unwrap_or(""),
+                        destination_workload: visible(
+                            MeshMetricLabel::DestinationWorkload,
+                            attribution.destination_workload.as_ref(),
+                        )
+                        .unwrap_or(""),
+                        destination_namespace: visible(
+                            MeshMetricLabel::DestinationNamespace,
+                            attribution.destination_namespace.as_ref(),
+                        )
+                        .unwrap_or(""),
+                        destination_principal: visible(
+                            MeshMetricLabel::DestinationPrincipal,
+                            attribution.destination_principal.as_ref(),
+                        )
+                        .unwrap_or(""),
+                        destination_app: visible(
+                            MeshMetricLabel::DestinationApp,
+                            attribution.destination_app.as_ref(),
+                        )
+                        .unwrap_or(""),
+                        destination_service: visible(
+                            MeshMetricLabel::DestinationService,
+                            attribution.destination_service.as_ref(),
+                        )
+                        .unwrap_or(""),
+                        request_protocol: visible(
+                            MeshMetricLabel::RequestProtocol,
+                            attribution.request_protocol.as_ref(),
+                        )
+                        .unwrap_or(""),
+                        response_flags: visible(
+                            MeshMetricLabel::ResponseFlags,
+                            attribution.response_flags.as_ref(),
+                        )
+                        .unwrap_or(""),
+                        connection_security_policy: visible(
+                            MeshMetricLabel::ConnectionSecurityPolicy,
+                            attribution.connection_security_policy.as_ref(),
+                        )
+                        .unwrap_or(""),
                         request_method: extras.request_method,
                         request_host: extras.request_host,
                         // HTTP/gRPC summaries stamp extras.response_code.
                         // Stream/TCP paths leave it None: TCP families reject
                         // HTTP-only `response.code` at admission, so there is
                         // no stream-side response-code evaluation path.
-                        response_code: extras.response_code,
+                        response_code: extras.response_code.filter(|_| {
+                            key.removed_labels & (1u16 << MeshMetricLabel::ResponseCode.index())
+                                == 0
+                        }),
                         destination_port: extras.destination_port,
                     };
                     let Some(value) = evaluate_compact_metric_tag_cel(body, live_ctx) else {

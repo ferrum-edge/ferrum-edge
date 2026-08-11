@@ -2686,6 +2686,225 @@ jobs:
             --set-string nodeAgent.admin.port=0 \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-port0.yaml"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-only.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.admin.metricsScrape.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-dual.yaml"
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-no-tls.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-no-tls.err"; then
+            echo "::error title=Node-agent HTTPS without TLS accepted::httpsPort without admin.tls must fail closed"
+            exit 1
+          fi
+          # HTTPS-only mTLS is allowed when every computed probe is disabled.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.probes.startup.enabled=false \
+            --set nodeAgent.probes.liveness.enabled=false \
+            --set nodeAgent.probes.readiness.enabled=false \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-disabled.yaml"
+          # HTTPS-only mTLS is allowed when every enabled computed probe is overridden.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.probes.startup.override.exec.command[0]=/bin/true \
+            --set nodeAgent.probes.liveness.override.exec.command[0]=/bin/true \
+            --set nodeAgent.probes.readiness.override.exec.command[0]=/bin/true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-override.yaml"
+          # HTTPS-only mTLS with an enabled computed probe must still fail closed.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-unsafe.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-unsafe.err"; then
+            echo "::error title=Node-agent HTTPS-only mTLS computed probes accepted::unsafe computed probes must fail closed"
+            exit 1
+          fi
+          # Asymmetric: startup stays computed while liveness/readiness are overridden → fail.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.probes.liveness.override.exec.command[0]=/bin/true \
+            --set nodeAgent.probes.readiness.override.exec.command[0]=/bin/true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-asymmetric.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-asymmetric.err"; then
+            echo "::error title=Node-agent HTTPS-only mTLS asymmetric probe override accepted::startup must be overridden or disabled independently"
+            exit 1
+          fi
+          # HTTPS-only mTLS cannot be advertised via simple Prometheus annotations.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=0 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            --set nodeAgent.probes.startup.enabled=false \
+            --set nodeAgent.probes.liveness.enabled=false \
+            --set nodeAgent.probes.readiness.enabled=false \
+            --set nodeAgent.admin.metricsScrape.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-scrape.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-scrape.err"; then
+            echo "::error title=Node-agent HTTPS-only mTLS scrape annotations accepted::metricsScrape with mTLS must fail closed"
+            exit 1
+          fi
+          # Integer --set port=0 must preserve zero (Sprig `default` treats 0 as
+          # empty and would silently re-enable plaintext 19090).
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set nodeAgent.admin.port=0 \
+            --set nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-only-int-port0.yaml"
+          # Integer port=0 must not bypass HTTPS-only mTLS probe fail-closed.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set nodeAgent.admin.port=0 \
+            --set nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            --set nodeAgent.admin.tls.clientCaKey=ca.crt \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-int-port0.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-mtls-int-port0.err"; then
+            echo "::error title=Integer port=0 bypassed HTTPS-only mTLS guard::--set nodeAgent.admin.port=0 must keep HTTPS-only mTLS fail-closed"
+            exit 1
+          fi
+          # Node-agent HTTP == HTTPS same-port collision when both would bind.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19443 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-http-https-collision.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-http-https-collision.err"; then
+            echo "::error title=Node-agent HTTP/HTTPS collision accepted::same-port HTTP+HTTPS must fail closed"
+            exit 1
+          fi
+          # Ambient HTTP vs node-agent HTTPS cross-protocol collision.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19443 \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-ambient-http-node-https-collision.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-ambient-http-node-https-collision.err"; then
+            echo "::error title=Ambient HTTP / node-agent HTTPS collision accepted::cross-protocol hostNetwork collision must fail closed"
+            exit 1
+          fi
+          # Ambient HTTPS vs node-agent HTTP cross-protocol collision.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set-string ambient.env.FERRUM_ADMIN_HTTPS_PORT=19090 \
+            --set-string ambient.env.FERRUM_ADMIN_TLS_CERT_PATH=/etc/ferrum/tls/admin/tls.crt \
+            --set-string ambient.env.FERRUM_ADMIN_TLS_KEY_PATH=/etc/ferrum/tls/admin/tls.key \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-ambient-https-node-http-collision.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-ambient-https-node-http-collision.err"; then
+            echo "::error title=Ambient HTTPS / node-agent HTTP collision accepted::cross-protocol hostNetwork collision must fail closed"
+            exit 1
+          fi
+          # Noncollision control: distinct active ports must still render.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set-string ambient.env.FERRUM_ADMIN_HTTPS_PORT=19444 \
+            --set-string ambient.env.FERRUM_ADMIN_TLS_CERT_PATH=/etc/ferrum/tls/admin/tls.crt \
+            --set-string ambient.env.FERRUM_ADMIN_TLS_KEY_PATH=/etc/ferrum/tls/admin/tls.key \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-admin-port-noncollision.yaml"
+          # Inherited ambient HTTPS default without TLS must not collide with node-agent HTTPS.
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=9443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-no-ambient-collision.yaml"
+          # Genuine active ambient+node-agent HTTPS collision must still fail.
+          if helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set ambient.captureMode=ebpf \
+            --set-string ambient.env.FERRUM_ADMIN_HTTP_PORT=19091 \
+            --set-string ambient.env.FERRUM_ADMIN_HTTPS_PORT=19443 \
+            --set-string ambient.env.FERRUM_ADMIN_TLS_CERT_PATH=/etc/ferrum/tls/admin/tls.crt \
+            --set-string ambient.env.FERRUM_ADMIN_TLS_KEY_PATH=/etc/ferrum/tls/admin/tls.key \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.admin.enabled=true \
+            --set-string nodeAgent.admin.port=19090 \
+            --set-string nodeAgent.admin.httpsPort=19443 \
+            --set nodeAgent.admin.tls.enabled=true \
+            --set nodeAgent.admin.tls.secretName=node-agent-admin-tls \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-collision.yaml" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-probes-node-agent-https-collision.err"; then
+            echo "::error title=Ambient/node-agent HTTPS collision accepted::active HTTPS port collision must fail closed"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             --set ambient.enabled=true \
             --set ambient.captureMode=ebpf \
             --set ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint \

@@ -5321,6 +5321,9 @@ async fn handle_h3_request(
             .await;
         }
         let summary = TransactionSummary {
+            // Terminal-log trigger carrier: stamped centrally by
+            // `log_with_mirror` from the authoritative RequestContext.
+            plugin_trigger_decisions: Default::default(),
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
@@ -5833,6 +5836,9 @@ async fn handle_h3_request(
             let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
             let summary = TransactionSummary {
+                // Terminal-log trigger carrier: stamped centrally by
+                // `log_with_mirror` from the authoritative RequestContext.
+                plugin_trigger_decisions: Default::default(),
                 namespace: proxy.namespace.clone(),
                 timestamp_received: ctx.timestamp_received.to_rfc3339(),
                 client_ip: ctx.client_ip.clone(),
@@ -6384,6 +6390,9 @@ async fn handle_h3_request(
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;
         let summary = TransactionSummary {
+            // Terminal-log trigger carrier: stamped centrally by
+            // `log_with_mirror` from the authoritative RequestContext.
+            plugin_trigger_decisions: Default::default(),
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
@@ -6987,6 +6996,9 @@ async fn handle_h3_request(
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;
         let summary = TransactionSummary {
+            // Terminal-log trigger carrier: stamped centrally by
+            // `log_with_mirror` from the authoritative RequestContext.
+            plugin_trigger_decisions: Default::default(),
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
             client_ip: ctx.client_ip.clone(),
@@ -12158,6 +12170,9 @@ async fn log_h3_grpc_transaction(
         true,
     );
     let summary = TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: proxy.namespace.clone(),
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
         client_ip: ctx.client_ip.clone(),

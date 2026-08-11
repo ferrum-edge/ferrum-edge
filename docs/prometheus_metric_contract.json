@@ -1337,6 +1337,54 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_jwks_consecutive_failures",
+    "type": "gauge",
+    "help": "Maximum current consecutive failures among active remote stores by fixed failure class.",
+    "labels": [
+      "class"
+    ],
+    "subsystem": "jwks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_jwks_refresh_failures_total",
+    "type": "counter",
+    "help": "Remote JWKS refresh failures by fixed failure class.",
+    "labels": [
+      "class"
+    ],
+    "subsystem": "jwks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_jwks_trust_age_seconds",
+    "type": "gauge",
+    "help": "Maximum age of the last validated non-empty JWKS among active remote stores in each trust state.",
+    "labels": [
+      "state"
+    ],
+    "subsystem": "jwks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_jwks_trust_stores",
+    "type": "gauge",
+    "help": "Active remote JWKS stores by bounded trust state.",
+    "labels": [
+      "state"
+    ],
+    "subsystem": "jwks",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
     "name": "ferrum_kafka_logging_accepting",
     "type": "gauge",
     "help": "Whether the Kafka logging generation still admits new records.",
@@ -3024,6 +3072,90 @@
     "subsystem": "prometheus_metrics",
     "export_surface": "/metrics",
     "bundled": "dashboard",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_body_budget_rejected_total",
+    "type": "counter",
+    "help": "Service-discovery HTTP responses rejected because the concurrent body budget was exhausted.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_cursor_advance_total",
+    "type": "counter",
+    "help": "Service-discovery blocking-query cursor advances after an admitted higher-index snapshot.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_cursor_rollback_total",
+    "type": "counter",
+    "help": "Service-discovery blocking-query cursor rollbacks after an admitted lower-index snapshot.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_malformed_envelope_total",
+    "type": "counter",
+    "help": "Service-discovery Kubernetes EndpointSliceList envelopes rejected as malformed.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_provider_normalization_rejected_total",
+    "type": "counter",
+    "help": "Service-discovery snapshots rejected because every provider catalog entry failed provider normalization.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_response_oversized_total",
+    "type": "counter",
+    "help": "Service-discovery HTTP responses rejected for oversized or ambiguous body bounds.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_service_discovery_shared_admission_rejected_total",
+    "type": "counter",
+    "help": "Service-discovery snapshots rejected by shared host/egress target admission.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "service_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
     "emission": "always"
   },
   {

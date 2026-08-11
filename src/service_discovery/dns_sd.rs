@@ -30,7 +30,7 @@ impl DnsSdDiscoverer {
 
 #[async_trait::async_trait]
 impl super::ServiceDiscoverer for DnsSdDiscoverer {
-    async fn discover(&self) -> Result<Vec<UpstreamTarget>, anyhow::Error> {
+    async fn discover(&self) -> Result<super::DiscoverySnapshot, anyhow::Error> {
         let srv_results = self.dns_cache.resolve_srv(&self.service_name).await?;
 
         let targets: Vec<UpstreamTarget> = srv_results
@@ -50,7 +50,7 @@ impl super::ServiceDiscoverer for DnsSdDiscoverer {
             })
             .collect();
 
-        Ok(targets)
+        Ok(super::DiscoverySnapshot::from_targets(targets))
     }
 
     fn provider_name(&self) -> &str {

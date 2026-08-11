@@ -46,14 +46,29 @@
 //! no authoritative peer SPIFFE fact at all (see
 //! [`StreamTriggerFacts::spiffe_id`]).
 //!
-//! # Stream connect / disconnect symmetry
+//! # Contextless phases carry the decision
 //!
-//! `on_stream_disconnect` receives only a `StreamTransactionSummary`. The
-//! connect-time decision travels with it in an opaque, non-serialized carrier
-//! (`StreamTransactionSummary::plugin_trigger_decisions`) that only this crate
-//! can populate, so a false connect trigger suppresses the disconnect hook too
-//! and no plugin can forge or erase that authority through the summary's public
-//! `metadata` map.
+//! Four surfaces run with no context in hand. None of them re-evaluates a
+//! predicate; each consumes one decision taken where authoritative facts still
+//! existed, in an opaque, non-serialized carrier that only this crate can
+//! populate — never the public, plugin-writable `metadata` map:
+//!
+//! * `on_stream_disconnect` reads `StreamTransactionSummary`, so a false connect
+//!   trigger suppresses the disconnect hook too.
+//! * `log` / `log_with_mesh_key` read `TransactionSummary`, stamped centrally by
+//!   `plugins::log_with_mirror` from the authoritative `RequestContext`.
+//! * WebSocket frame, reassembly, delivery, size-limit, and disconnect hooks
+//!   read the decision the relay took at upgrade admission, BEFORE the session's
+//!   capability set is computed, so a skipped instance forces no framing and no
+//!   parser ceiling.
+//! * `on_udp_datagram` reads the decision the `on_stream_connect` chain memoized
+//!   on the session; the hook list is filtered once at first-datagram admission,
+//!   so no predicate runs per packet.
+//!
+//! In all four, an explicit `false` skips, an explicit `true` runs, and a
+//! MISSING decision RUNS while incrementing a bounded, unlabeled invariant
+//! counter. Missing state must never become an accidental suppression of a
+//! security or audit hook.
 //!
 //! # Redaction
 //!
@@ -74,11 +89,54 @@ use crate::config::plugin_trigger::{
 use crate::config::types::{HttpFlavor, HttpWireTransport};
 use crate::plugins::{
     RequestContext, StreamConnectionContext, StreamFrontendTransport, StreamTransactionSummary,
+    StreamTriggerDecisions, TransactionSummary,
 };
 
 /// Process-local token generator. Tokens are opaque and never persisted; they
 /// only have to be unique among the instances a single request can observe.
 static NEXT_TRIGGER_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Fixed-cardinality observability for the contextless decision carriers.
+///
+/// These are three process-global counters with NO labels at all: no trigger
+/// input, no route, no identity, no header value, no plugin-controlled string,
+/// and no secret can reach them. They answer only "how often did a carried
+/// decision suppress a terminal/session hook" and "how often did a hook run
+/// because no decision was carried" (the fail-open compatibility path, which is
+/// an invariant signal rather than an error).
+static SKIPPED_TERMINAL_LOG_HOOKS: AtomicU64 = AtomicU64::new(0);
+static SKIPPED_SESSION_HOOKS: AtomicU64 = AtomicU64::new(0);
+static MISSING_DECISION_CARRIERS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the trigger-carrier counters for the runtime metrics endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PluginTriggerCarrierCounters {
+    /// Terminal `log` / `log_with_mesh_key` invocations suppressed because the
+    /// summary carried an explicit `false` decision for that instance.
+    pub skipped_terminal_log_hooks: u64,
+    /// WebSocket-session / UDP-DTLS-flow hook sets suppressed because the
+    /// session carried an explicit `false` decision for that instance.
+    pub skipped_session_hooks: u64,
+    /// Contextless hooks that RAN because no decision was carried for the
+    /// instance. Backward compatible by design; a sustained nonzero rate on a
+    /// triggered deployment means a summary/session path is not stamping the
+    /// carrier.
+    pub missing_decision_carriers: u64,
+}
+
+/// Read the trigger-carrier counters. Monotonic, process-lifetime.
+pub fn carrier_counters() -> PluginTriggerCarrierCounters {
+    PluginTriggerCarrierCounters {
+        skipped_terminal_log_hooks: SKIPPED_TERMINAL_LOG_HOOKS.load(Ordering::Relaxed),
+        skipped_session_hooks: SKIPPED_SESSION_HOOKS.load(Ordering::Relaxed),
+        missing_decision_carriers: MISSING_DECISION_CARRIERS.load(Ordering::Relaxed),
+    }
+}
+
+#[inline]
+fn record_missing_carrier() {
+    MISSING_DECISION_CARRIERS.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Lifecycle position of the hook asking for a decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +175,13 @@ impl PluginTriggerGate {
     /// Whether the compiled predicate reads authenticated identity.
     pub fn reads_authenticated_identity(&self) -> bool {
         self.compiled.reads_authenticated_identity()
+    }
+
+    /// First HTTP-only field the predicate reads (`method`, `path`, `host`,
+    /// `header`, `query`, `cookie`), if any. Publication refuses one of these on
+    /// a stream-only (TCP / UDP / DTLS) instance.
+    pub fn http_only_field(&self) -> Option<&'static str> {
+        self.compiled.http_only_field()
     }
 
     /// Decide whether this instance runs for `ctx`, memoizing the outcome.
@@ -165,10 +230,83 @@ impl PluginTriggerGate {
     /// chain never reached this instance's `on_stream_connect`), so a trigger
     /// can only ever remove work.
     pub fn stream_disconnect_decision_or_run(&self, summary: &StreamTransactionSummary) -> bool {
-        summary
-            .plugin_trigger_decisions
-            .decision(self.token)
-            .unwrap_or(true)
+        match summary.plugin_trigger_decisions.decision(self.token) {
+            Some(decision) => {
+                if !decision {
+                    SKIPPED_SESSION_HOOKS.fetch_add(1, Ordering::Relaxed);
+                }
+                decision
+            }
+            None => {
+                record_missing_carrier();
+                true
+            }
+        }
+    }
+
+    /// Read the decision this instance took during the request lifecycle,
+    /// carried on the terminal transaction summary.
+    ///
+    /// `log` / `log_with_mesh_key` receive only a [`TransactionSummary`], so the
+    /// request-phase outcome travels with it in an opaque, non-serialized,
+    /// crate-constructed carrier rather than through the summary's
+    /// plugin-writable `metadata` map. Explicit `false` skips; explicit `true`
+    /// runs; a MISSING carrier runs and records a bounded invariant signal, so
+    /// missing state can never become an accidental suppression of a security or
+    /// audit record.
+    pub fn transaction_log_decision_or_run(&self, summary: &TransactionSummary) -> bool {
+        match summary.plugin_trigger_decisions.decision(self.token) {
+            Some(decision) => {
+                if !decision {
+                    SKIPPED_TERMINAL_LOG_HOOKS.fetch_add(1, Ordering::Relaxed);
+                }
+                decision
+            }
+            None => {
+                record_missing_carrier();
+                true
+            }
+        }
+    }
+
+    /// Read the decision this instance took at UDP/DTLS session admission,
+    /// carried on the generation-owned session.
+    ///
+    /// Consumed ONCE, when the session's datagram-hook list is built, so every
+    /// later datagram hook is a plain list traversal with no predicate
+    /// evaluation, allocation, hashing, or locking. Missing state runs and
+    /// records the same bounded invariant signal.
+    pub fn stream_session_decision_or_run(&self, decisions: &StreamTriggerDecisions) -> bool {
+        match decisions.decision(self.token) {
+            Some(decision) => {
+                if !decision {
+                    SKIPPED_SESSION_HOOKS.fetch_add(1, Ordering::Relaxed);
+                }
+                decision
+            }
+            None => {
+                record_missing_carrier();
+                true
+            }
+        }
+    }
+
+    /// Decide, at WebSocket upgrade admission, whether this instance takes part
+    /// in the accepted session.
+    ///
+    /// The upgrade is past the authentication boundary, so this is an ordinary
+    /// [`TriggerPhase::PostAuth`] evaluation against the live request facts, and
+    /// the outcome is memoized on the context exactly like any other phase — the
+    /// frame, reassembly, delivery, size-limit, and disconnect sets are all
+    /// derived from this one decision. Counted once per session per instance,
+    /// even though the relay asks for the frame and disconnect sets separately.
+    pub fn admits_ws_session(&self, ctx: &mut RequestContext) -> bool {
+        let already_decided = ctx.plugin_trigger_decision(self.token).is_some();
+        let run = self.admits_request(ctx, TriggerPhase::PostAuth);
+        if !run && !already_decided {
+            SKIPPED_SESSION_HOOKS.fetch_add(1, Ordering::Relaxed);
+        }
+        run
     }
 
     /// Decide whether this instance runs for a stream connection, memoizing the

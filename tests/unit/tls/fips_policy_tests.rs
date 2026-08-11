@@ -806,10 +806,10 @@ fn remote_external_secret_uri_schemes_are_refused_when_enforced() {
 fn tls_remote_secret_loader_enforces_fips_policy_before_resolution() {
     let source = include_str!("../../../src/tls/source/mod.rs");
     let loader = source
-        .split("fn load_secret_material(")
+        .split("fn load_secret_material_with(")
         .nth(1)
         .expect("remote secret loader exists")
-        .split("fn load_k8s_secret_material(")
+        .split("fn load_k8s_secret_material_with(")
         .next()
         .expect("remote secret loader has an end");
     let gate = loader

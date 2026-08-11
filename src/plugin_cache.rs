@@ -16,9 +16,9 @@
 //! lists (including their stateful instances) and only rebuild affected proxies.
 
 use arc_swap::ArcSwap;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::config::db_backend::{
     NamespacedResourceId, namespaced_runtime_key, write_namespaced_runtime_key,
@@ -35,7 +35,7 @@ use crate::adaptive_concurrency::{
 };
 use crate::config::types::PluginConfig;
 use crate::plugins::tcp_connection_throttle::{TcpConnectionThrottle, TcpConnectionThrottleState};
-use crate::plugins::utils::jwks_cache::retain_active_requirements;
+use crate::plugins::utils::jwks_cache::{JwksRefreshRequirement, retain_active_requirements};
 use crate::plugins::utils::policy_digest::presentation_policy_digest;
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, ResponsePresentationPolicy,
@@ -102,14 +102,19 @@ use async_trait::async_trait;
 /// `DeferredCorsPlugin` and its trigger still governs both hooks that wrapper
 /// forwards.
 ///
-/// # Phase boundary
+/// # Contextless phases
 ///
-/// `WS frame`, `UDP datagram`, WS-disconnect, the initial response-header
-/// policy, and the `log` phase have no request context at the point they run, so
-/// they cannot be gated coherently. Plugin-cache admission REFUSES a trigger on
-/// an instance that declares the first four rather than silently half-applying
-/// one; the `log` phase is the documented ungated boundary and is forwarded
-/// unconditionally. See `trigger_composition_error`.
+/// The `log` phase, WS frame/reassembly/delivery/disconnect, and UDP datagram
+/// hooks have no request context at the point they run. They are still gated,
+/// by consuming ONE decision taken where authoritative facts existed and carried
+/// to the hook: `TransactionSummary` / `StreamTransactionSummary` for the
+/// terminal hooks, the upgrade's memoized decision for WebSocket (consumed while
+/// the relay builds the session's plugin lists, before any capability set), and
+/// the session's `StreamTriggerDecisions` for UDP/DTLS. Explicit `false` skips,
+/// explicit `true` runs, and a MISSING carrier runs — missing state never
+/// suppresses a security or audit hook. The initial response-header policy and
+/// the other generation-folded capabilities remain REFUSED at publication rather
+/// than half-applied. See `trigger_composition_error`.
 struct PluginInstanceWrapper {
     inner: Arc<dyn Plugin>,
     priority: u16,
@@ -141,6 +146,16 @@ impl PluginInstanceWrapper {
     fn runs_stream(&self, ctx: &mut StreamConnectionContext) -> bool {
         match &self.trigger {
             Some(gate) => gate.admits_stream(ctx),
+            None => true,
+        }
+    }
+
+    /// Read the decision carried on a terminal transaction summary. Explicit
+    /// `false` skips, explicit `true` runs, missing runs (and is counted).
+    #[inline]
+    fn runs_terminal_log(&self, summary: &TransactionSummary) -> bool {
+        match &self.trigger {
+            Some(gate) => gate.transaction_log_decision_or_run(summary),
             None => true,
         }
     }
@@ -765,13 +780,15 @@ pub(crate) fn validate_plugin_security_composition(
 ///
 /// The refused surfaces are:
 ///
-/// * **WebSocket frame, WS-disconnect, and UDP datagram hooks.** They run with
-///   no `RequestContext` / `StreamConnectionContext` in hand (`on_ws_frame`
-///   takes only a proxy id, connection id, direction, and message), so there is
-///   nothing authoritative left to evaluate. Gating the upgrade but not the
-///   frames would let a "skipped" WAF stop inspecting the handshake while still
-///   inspecting — or stop inspecting — the messages. Tracked for a typed
-///   frame-phase predicate surface in a follow-up.
+/// WebSocket frame / framing / disconnect and UDP datagram hooks used to be
+/// refused here. They are now ADMITTED, because every capability those surfaces
+/// publish is bound to one decision taken where authoritative facts still exist —
+/// the upgrade's `RequestContext` for WebSocket, the first-datagram
+/// `on_stream_connect` chain for UDP/DTLS — and carried on the session, so no
+/// hook of that surface is left half-gated (issue #3734). What remains refused:
+///
+/// * **Stream-only instances with an HTTP-only predicate.** See
+///   `stream_only_trigger_field_error`.
 /// * **The initial response-header policy.** `apply_initial_response_header_policy`
 ///   is a synchronous, contextless re-assertion of a plugin-owned header set
 ///   (`security_headers`), invoked from paths that hold no `RequestContext` at
@@ -810,25 +827,14 @@ fn trigger_composition_error(
     plugin: &dyn Plugin,
     gate: &PluginTriggerGate,
 ) -> Option<&'static str> {
-    if plugin.requires_ws_frame_hooks() || plugin.observes_ws_frame_decisions() {
-        return Some(
-            "the plugin runs WebSocket frame hooks, which execute without a request context and therefore cannot be gated by a trigger",
-        );
-    }
-    if plugin.requires_websocket_framing() {
-        return Some(
-            "the plugin requires WebSocket framing, whose per-frame phase cannot be gated by a trigger",
-        );
-    }
-    if plugin.requires_ws_disconnect_hooks() {
-        return Some(
-            "the plugin runs WebSocket disconnect hooks, which execute without a request context and therefore cannot be gated by a trigger",
-        );
-    }
-    if plugin.requires_udp_datagram_hooks() {
-        return Some(
-            "the plugin runs UDP datagram hooks, which execute without a connection context and therefore cannot be gated by a trigger",
-        );
+    // WebSocket frame / framing / disconnect and UDP datagram hooks are no
+    // longer refused: every capability those surfaces publish is now bound to
+    // ONE decision taken at upgrade / first-datagram admission and carried on
+    // the session (issue #3734). A UDP/DTLS-only instance still cannot carry a
+    // predicate whose fact that transport never establishes — see
+    // `stream_only_trigger_field_error`.
+    if let Some(reason) = stream_only_trigger_field_error(plugin, gate) {
+        return Some(reason);
     }
     if plugin.is_initial_response_header_policy() {
         return Some(
@@ -866,6 +872,51 @@ fn trigger_composition_error(
         );
     }
     None
+}
+
+/// Refuse a predicate field that a stream-only (TCP / UDP / DTLS) instance can
+/// never establish authoritatively.
+///
+/// A UDP/DTLS flow has a proxy/namespace, a direct and policy client IP, a
+/// listener port, a transport protocol identity, and — for DTLS termination and
+/// DTLS/TLS passthrough — an SNI from the ClientHello. It has no request line,
+/// header block, query string, or cookie jar, and never will.
+///
+/// On a plugin that ALSO serves HTTP, an HTTP-only predicate is meaningful: it
+/// evaluates to `false` for the stream leg and normally for the plugin's HTTP
+/// requests, which is the documented per-protocol limitation. On a STREAM-ONLY
+/// plugin the same predicate is a constant — silently "never runs", or, beneath
+/// `not`, silently "always runs" — so it is refused at publication with the
+/// offending field named, rather than reinterpreting an absent HTTP concept as
+/// an empty string or a broad match.
+fn stream_only_trigger_field_error(
+    plugin: &dyn Plugin,
+    gate: &PluginTriggerGate,
+) -> Option<&'static str> {
+    if !is_stream_only_plugin(plugin) {
+        return None;
+    }
+    match gate.http_only_field()? {
+        "method" => Some(
+            "a stream-only (TCP/UDP/DTLS) plugin cannot be gated on `method`: a datagram or byte stream has no request line, so the predicate would be a constant rather than a condition",
+        ),
+        "path" => Some(
+            "a stream-only (TCP/UDP/DTLS) plugin cannot be gated on `path`: a datagram or byte stream has no request target, so the predicate would be a constant rather than a condition",
+        ),
+        "host" => Some(
+            "a stream-only (TCP/UDP/DTLS) plugin cannot be gated on `host`: a datagram or byte stream has no request authority; use `sni` for DTLS/TLS ClientHello routing facts",
+        ),
+        "header" => Some(
+            "a stream-only (TCP/UDP/DTLS) plugin cannot be gated on `header`: a datagram or byte stream has no header block, so the predicate would be a constant rather than a condition",
+        ),
+        "query" => Some(
+            "a stream-only (TCP/UDP/DTLS) plugin cannot be gated on `query`: a datagram or byte stream has no request target, so the predicate would be a constant rather than a condition",
+        ),
+        "cookie" => Some(
+            "a stream-only (TCP/UDP/DTLS) plugin cannot be gated on `cookie`: a datagram or byte stream has no header block, so the predicate would be a constant rather than a condition",
+        ),
+        _ => None,
+    }
 }
 
 /// Protocols whose plugin lifecycle is the stream connect/disconnect pair rather
@@ -1853,18 +1904,30 @@ impl Plugin for PluginInstanceWrapper {
             .on_response_stream_terminated(ctx, response_status, outcome)
             .await;
     }
+    /// Terminal transaction logging agrees with the instance's request/response
+    /// hooks (issue #3733). The decision travels on the summary in an opaque
+    /// crate-constructed carrier, never through the summary's plugin-writable
+    /// `metadata` map, so a skipped instance cannot be re-admitted here by
+    /// another plugin's metadata write and a mirror entry inherits the decision
+    /// that applied to its originating request. A MISSING carrier RUNS.
     async fn log(&self, summary: &TransactionSummary) {
+        if !self.runs_terminal_log(summary) {
+            return;
+        }
         self.inner.log(summary).await;
     }
     /// Must forward: the trait default degrades to `log()`, so a wrapped mesh
     /// observability sink would silently lose its precomputed RED key purely
-    /// because the instance carries a `priority_override` or a trigger. The
-    /// `log` phase is the documented ungated boundary, so no gate here.
+    /// because the instance carries a `priority_override` or a trigger. Gated by
+    /// the same carried decision as [`Self::log`].
     async fn log_with_mesh_key(
         &self,
         summary: &TransactionSummary,
         mesh_key: Option<&crate::plugins::mesh::prometheus_helpers::MeshRequestKey>,
     ) {
+        if !self.runs_terminal_log(summary) {
+            return;
+        }
         self.inner.log_with_mesh_key(summary, mesh_key).await;
     }
     fn is_auth_plugin(&self) -> bool {
@@ -1921,9 +1984,34 @@ impl Plugin for PluginInstanceWrapper {
     fn requires_websocket_framing(&self) -> bool {
         self.inner.requires_websocket_framing()
     }
+    /// Evaluate (and memoize) this instance's execution trigger while the
+    /// upgrade still holds authoritative request facts (issue #3734).
+    ///
+    /// The relay drops a `false` instance from every WebSocket list before it
+    /// computes the session's capability set, so the skip costs nothing per
+    /// frame and cannot force framing on a session that would otherwise be a raw
+    /// tunnel.
+    fn admits_ws_session(&self, ctx: &mut RequestContext) -> bool {
+        match &self.trigger {
+            Some(gate) => gate.admits_ws_session(ctx),
+            None => true,
+        }
+    }
+    /// Consume the decision this instance took at UDP/DTLS session admission.
+    /// Missing state runs, matching the historical behavior, and is counted.
+    fn admits_stream_session_hooks(
+        &self,
+        decisions: &crate::plugins::StreamTriggerDecisions,
+    ) -> bool {
+        match &self.trigger {
+            Some(gate) => gate.stream_session_decision_or_run(decisions),
+            None => true,
+        }
+    }
     /// Priority override affects chain ORDER, which the relay has already
     /// applied by the time sessions bind, so the inner plugin's session-bound
-    /// substitute is returned directly.
+    /// substitute is returned directly. Admission is decided separately by
+    /// [`Plugin::admits_ws_session`], which the relay calls first.
     fn bind_ws_session(self: Arc<Self>, ctx: &RequestContext) -> Option<Arc<dyn Plugin>> {
         Arc::clone(&self.inner).bind_ws_session(ctx)
     }
@@ -2030,7 +2118,7 @@ impl Plugin for PluginInstanceWrapper {
     fn active_jwks_uris(&self) -> Vec<String> {
         self.inner.active_jwks_uris()
     }
-    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, JwksRefreshRequirement)> {
         self.inner.active_jwks_refresh_requirements()
     }
 }
@@ -4778,20 +4866,97 @@ fn build_protocol_snapshot(
 fn collect_active_jwks_requirements(
     proxy_map: &ProxyPluginMap,
     globals: &[Arc<dyn Plugin>],
-) -> HashMap<String, Duration> {
+) -> HashMap<String, JwksRefreshRequirement> {
     let mut requirements = HashMap::new();
     for plugin in globals
         .iter()
         .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
     {
-        for (uri, interval) in plugin.active_jwks_refresh_requirements() {
+        for (uri, requirement) in plugin.active_jwks_refresh_requirements() {
             requirements
                 .entry(uri)
-                .and_modify(|current: &mut Duration| *current = (*current).min(interval))
-                .or_insert(interval);
+                .and_modify(|current: &mut JwksRefreshRequirement| {
+                    *current = current.strictest(requirement)
+                })
+                .or_insert(requirement);
         }
     }
     requirements
+}
+
+thread_local! {
+    /// One-shot seam: reject a staged PluginCache after JWKS background startup
+    /// on the requesting test thread. Thread-local state prevents an unrelated
+    /// parallel PluginCache test from consuming the injected rejection.
+    static REJECT_AFTER_JWKS_STARTUP_FOR_TEST: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arm a single post-JWKS-startup rejection for the next staged PluginCache
+/// build. Consumed once by [`reject_after_jwks_startup_if_requested_for_test`].
+#[doc(hidden)]
+#[allow(dead_code)] // Bin target omits lib::_test_support; external tests call through its wrapper.
+pub fn request_reject_after_jwks_startup_for_test() {
+    REJECT_AFTER_JWKS_STARTUP_FOR_TEST.with(|requested| requested.set(true));
+}
+
+fn reject_after_jwks_startup_if_requested_for_test() -> Result<(), String> {
+    let requested = REJECT_AFTER_JWKS_STARTUP_FOR_TEST.with(|requested| requested.replace(false));
+    if requested {
+        Err(
+            "test-injected rejection after JWKS background startup (unpublished policy must not stick)"
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
+/// Restores process-wide JWKS refresh/max-stale policy to a previously
+/// published generation when a staged PluginCache is discarded.
+///
+/// Candidate construction may tighten shared stores (and replace refresh
+/// workers) before publication. Dropping this guard without [`Self::disarm`]
+/// reconciles the exact published requirements after the candidate maps have
+/// been dropped, so a rejected generation cannot leave unpublished policy on
+/// the still-live cache. Disarm only after the candidate has been published;
+/// callers then call [`PluginCache::retain_active_uris_for_inner`] with the
+/// committed generation (including relaxations).
+pub(crate) struct StagedJwksPolicyRollback {
+    restore: Option<HashMap<String, JwksRefreshRequirement>>,
+}
+
+impl StagedJwksPolicyRollback {
+    /// Capture the exact JWKS requirements of a still-published generation.
+    pub(crate) fn for_published(inner: &PluginCacheInner) -> Self {
+        Self {
+            restore: Some(collect_active_jwks_requirements(
+                &inner.proxy_plugins,
+                &inner.global_plugins,
+            )),
+        }
+    }
+
+    /// Initial startup has no published generation; a failed stage retires any
+    /// stores the candidate acquired.
+    pub(crate) fn empty() -> Self {
+        Self {
+            restore: Some(HashMap::new()),
+        }
+    }
+
+    /// Successful publication path: leave shared-store policy alone until the
+    /// caller reconciles the committed generation.
+    pub(crate) fn disarm(mut self) {
+        self.restore = None;
+    }
+}
+
+impl Drop for StagedJwksPolicyRollback {
+    fn drop(&mut self) {
+        if let Some(requirements) = self.restore.take() {
+            retain_active_requirements(&requirements);
+        }
+    }
 }
 
 /// Stage fallible background setup for every distinct plugin instance in a
@@ -5904,11 +6069,16 @@ impl PluginCache {
         config: &GatewayConfig,
         http_client: PluginHttpClient,
     ) -> Result<Self, String> {
+        // Capture empty published requirements so a failed initial stage cannot
+        // leave candidate JWKS policy/workers in the process-wide store.
+        let jwks_rollback = StagedJwksPolicyRollback::empty();
         let inner = Self::build_inner(config, &http_client)?;
+        jwks_rollback.disarm();
         // Arm per-proxy ownership generations on the initial generation so
         // admission tokens are enforced even before the first incremental
         // update. No prior live instance exists yet, so this cannot mutate a
         // still-served cache the way a pre-commit retain on a staged build would.
+        Self::retain_active_uris_for_inner(&inner);
         Self::retain_active_proxy_lifecycle_for_inner(&inner, config);
         let cache = Self {
             inner: ArcSwap::new(Arc::clone(&inner)),
@@ -6008,14 +6178,20 @@ impl PluginCache {
         config: &GatewayConfig,
     ) -> Result<Arc<PluginCacheInner>, String> {
         let current = self.inner.load();
-        Self::build_inner_with_prior_states(
+        let jwks_rollback = StagedJwksPolicyRollback::for_published(&current);
+        let inner = Self::build_inner_with_prior_states(
             config,
             &self.http_client,
             &current.adaptive_concurrency_instances,
             &current.tcp_connection_throttle_instances,
             &current.proxy_lifecycle_generations,
             current.proxy_lifecycle_generation_high_water,
-        )
+        )?;
+        // A successful candidate remains protected by its publication site's
+        // outer rollback guard. This inner guard exists for build failures that
+        // occur before those sites receive a candidate to publish.
+        jwks_rollback.disarm();
+        Ok(inner)
     }
 
     pub(crate) fn store_inner(&self, inner: Arc<PluginCacheInner>) {
@@ -6239,7 +6415,12 @@ impl PluginCache {
     ///
     /// Returns `Err` if any enabled plugin config cannot be resolved or fails validation.
     pub fn rebuild(&self, config: &GatewayConfig) -> Result<(), String> {
+        let current = self.inner.load();
+        let jwks_rollback = StagedJwksPolicyRollback::for_published(&current);
         let inner = self.build_inner_with_existing_client(config)?;
+        // Candidate maps from a failed build are already dropped; disarm only
+        // after a successful stage so Drop cannot undo the committed policy.
+        jwks_rollback.disarm();
 
         // Single atomic swap — readers see either the old or new generation.
         self.store_inner(Arc::clone(&inner));
@@ -6462,6 +6643,11 @@ impl PluginCache {
         restrict_country_mmdb_refresh_to_rebuild_scope: bool,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
+        // All candidate plugin maps are declared after this guard, so an error
+        // drops their shared-store references before restoring the exact live
+        // requirements. Outer publication guards remain responsible for an
+        // otherwise valid candidate that is abandoned after this returns.
+        let jwks_rollback = StagedJwksPolicyRollback::for_published(current);
         let mut plugin_errors: Vec<String> = Vec::new();
         let mut proxy_ids_to_rebuild = proxy_ids_to_rebuild.clone();
         let mut rebuild_adaptive_globals = false;
@@ -7075,6 +7261,18 @@ impl PluginCache {
             }
             return Err(format!("Config reload rejected: {error}"));
         }
+        if let Err(error) = reject_after_jwks_startup_if_requested_for_test() {
+            if rebuild_globals {
+                crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                    |registry_error| {
+                        format!(
+                            "Config reload rejected: {error}; registry abort also failed: {registry_error}"
+                        )
+                    },
+                )?;
+            }
+            return Err(format!("Config reload rejected: {error}"));
+        }
 
         // Rebuild protocol snapshot (plugins + phase data) for changed proxies.
         // Clone-and-patch from the current snapshot so unchanged proxies are preserved.
@@ -7191,7 +7389,7 @@ impl PluginCache {
         let node_waypoint_destination_authz_ready =
             compute_node_waypoint_destination_authz_ready(config, &new_global_proto);
 
-        Ok(Arc::new(PluginCacheInner::new(
+        let inner = Arc::new(PluginCacheInner::new(
             new_map,
             new_globals,
             new_buffering,
@@ -7215,7 +7413,9 @@ impl PluginCache {
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
             mesh_bpf_metrics_exporter,
-        )))
+        ));
+        jwks_rollback.disarm();
+        Ok(inner)
     }
 
     pub fn apply_delta(
@@ -7226,6 +7426,7 @@ impl PluginCache {
         rebuild_globals: bool,
     ) -> Result<(), String> {
         let current = self.inner.load();
+        let jwks_rollback = StagedJwksPolicyRollback::for_published(&current);
         let inner = self.build_delta_inner(
             &current,
             config,
@@ -7234,6 +7435,7 @@ impl PluginCache {
             rebuild_globals,
             CountryMmdbLoadMode::Standard,
         )?;
+        jwks_rollback.disarm();
 
         // Single atomic swap — readers see old or new, never a partial state.
         self.store_inner(Arc::clone(&inner));
@@ -7800,6 +8002,16 @@ impl PluginCache {
         };
 
         if let Err(error) = start_background_tasks(&proxy_map, &global_plugins) {
+            crate::plugins::utils::log_schema::registry::abort_reload().map_err(
+                |registry_error| {
+                    format!(
+                        "Gateway startup aborted: {error}; registry abort also failed: {registry_error}"
+                    )
+                },
+            )?;
+            return Err(format!("Gateway startup aborted: {error}"));
+        }
+        if let Err(error) = reject_after_jwks_startup_if_requested_for_test() {
             crate::plugins::utils::log_schema::registry::abort_reload().map_err(
                 |registry_error| {
                     format!(

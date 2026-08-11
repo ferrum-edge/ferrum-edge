@@ -4,9 +4,14 @@
 //! Kubernetes, Consul) to discover backend targets for upstreams. Discovered
 //! targets are merged with static targets and pushed into the LoadBalancerCache
 //! via atomic updates, keeping the hot proxy path lock-free.
+//!
+//! Provider-specific blocking-query cursors (Consul `X-Consul-Index`) travel
+//! with each [`DiscoverySnapshot`] and are committed only after shared target
+//! admission and successful publication by the discovery manager.
 
 pub mod consul;
 pub mod dns_sd;
+pub mod http_body;
 pub mod kubernetes;
 pub mod mesh;
 
@@ -35,11 +40,263 @@ struct TaskEntry {
     handle: JoinHandle<()>,
 }
 
+/// Pending provider cursor update produced with a successfully parsed snapshot.
+///
+/// Dropping without [`DiscoveryCursorCommit::commit`] retains the previously
+/// committed cursor. Only the discovery manager (via
+/// [`apply_discovered_snapshot`]) may commit after shared admission and
+/// successful publication — or after confirming an already-installed snapshot.
+pub struct DiscoveryCursorCommit {
+    slot: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    index: u64,
+}
+
+impl DiscoveryCursorCommit {
+    /// Create a commit handle for a shared atomic cursor slot.
+    pub(crate) fn new(slot: std::sync::Arc<std::sync::atomic::AtomicU64>, index: u64) -> Self {
+        Self { slot, index }
+    }
+
+    /// Index that will be stored on [`commit`](Self::commit).
+    pub(crate) fn index(&self) -> u64 {
+        self.index
+    }
+
+    /// Persist the candidate index as the next blocking-query cursor.
+    ///
+    /// Crate-private so external `ServiceDiscoverer` callers cannot commit
+    /// before load-balancer publication.
+    pub(crate) fn commit(self) {
+        use std::sync::atomic::Ordering;
+        let previous = self.slot.load(Ordering::Relaxed);
+        self.slot.store(self.index, Ordering::Relaxed);
+        let registry = crate::plugins::prometheus_metrics::global_registry();
+        if self.index < previous {
+            registry.record_service_discovery_cursor_rollback();
+            warn!(
+                previous_index = previous,
+                new_index = self.index,
+                reason = "consul_index_rollback",
+                "Service discovery: blocking-query cursor rolled back after admitted snapshot (registry likely restarted)"
+            );
+        } else if self.index > previous {
+            registry.record_service_discovery_cursor_advance();
+            debug!(
+                previous_index = previous,
+                new_index = self.index,
+                reason = "consul_index_advance",
+                "Service discovery: blocking-query cursor advanced after admitted snapshot"
+            );
+        }
+    }
+}
+
+/// Typed snapshot admission policy. Carried with each poll result so Consul
+/// atomic cursor rules do not change DNS-SD / Kubernetes / mesh semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotAdmissionPolicy {
+    /// Pre-PR behavior: after shared filtering, an empty target set is accepted
+    /// (including when every normalized entry was removed).
+    AcceptFilteredEmpty,
+    /// Consul atomic cursor admission: distinguish a legitimate empty catalog
+    /// (`provider_item_count == 0`) from a non-empty provider payload whose
+    /// every entry was rejected during provider normalization or shared
+    /// host/egress admission.
+    AtomicCursor {
+        /// Raw provider catalog item count before provider normalization
+        /// (Consul JSON array length).
+        provider_item_count: usize,
+    },
+}
+
+/// Successfully parsed discovery poll result.
+///
+/// Targets and optional cursor stay associated until the manager admits and
+/// installs (or confirms) this exact snapshot. Dropping without a manager
+/// commit retains the prior cursor. Ordinary callers cannot detach the cursor
+/// or swap the target set while keeping the pending index.
+pub struct DiscoverySnapshot {
+    targets: Vec<UpstreamTarget>,
+    cursor: Option<DiscoveryCursorCommit>,
+    admission_policy: SnapshotAdmissionPolicy,
+}
+
+impl DiscoverySnapshot {
+    /// Snapshot with no provider cursor (DNS-SD, Kubernetes, mesh).
+    pub fn from_targets(targets: Vec<UpstreamTarget>) -> Self {
+        Self {
+            targets,
+            cursor: None,
+            admission_policy: SnapshotAdmissionPolicy::AcceptFilteredEmpty,
+        }
+    }
+
+    /// Consul snapshot paired with a pending cursor and atomic admission policy.
+    pub(crate) fn with_atomic_cursor(
+        targets: Vec<UpstreamTarget>,
+        provider_item_count: usize,
+        cursor: DiscoveryCursorCommit,
+    ) -> Self {
+        Self {
+            targets,
+            cursor: Some(cursor),
+            admission_policy: SnapshotAdmissionPolicy::AtomicCursor {
+                provider_item_count,
+            },
+        }
+    }
+
+    /// Consul snapshot when `X-Consul-Index` was absent/unusable (no cursor).
+    pub(crate) fn with_atomic_targets(
+        targets: Vec<UpstreamTarget>,
+        provider_item_count: usize,
+    ) -> Self {
+        Self {
+            targets,
+            cursor: None,
+            admission_policy: SnapshotAdmissionPolicy::AtomicCursor {
+                provider_item_count,
+            },
+        }
+    }
+
+    /// Provider-normalized targets (before shared host/egress admission).
+    #[allow(dead_code)] // exercised by external tests; dead in the binary target
+    pub fn targets(&self) -> &[UpstreamTarget] {
+        &self.targets
+    }
+
+    /// Pending blocking-query index for this snapshot, if any.
+    pub fn pending_cursor_index(&self) -> Option<u64> {
+        self.cursor.as_ref().map(DiscoveryCursorCommit::index)
+    }
+
+    /// Admission policy carried with this snapshot.
+    #[allow(dead_code)] // exercised by external unit tests; dead in the binary target
+    pub fn admission_policy(&self) -> SnapshotAdmissionPolicy {
+        self.admission_policy
+    }
+}
+
+impl std::fmt::Debug for DiscoverySnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscoverySnapshot")
+            .field("target_count", &self.targets.len())
+            .field("pending_cursor_index", &self.pending_cursor_index())
+            .field("admission_policy", &self.admission_policy)
+            .finish()
+    }
+}
+
+impl std::ops::Deref for DiscoverySnapshot {
+    type Target = [UpstreamTarget];
+
+    fn deref(&self) -> &Self::Target {
+        &self.targets
+    }
+}
+
+/// Result of shared target admission for a parsed discovery snapshot.
+pub enum SnapshotAdmission {
+    /// Snapshot may be published; the manager commits `cursor` only after
+    /// publication succeeds (or when the admitted set already matches an
+    /// installed snapshot).
+    Accepted {
+        targets: Vec<UpstreamTarget>,
+        cursor: Option<DiscoveryCursorCommit>,
+    },
+    /// Snapshot rejected atomically; the provider cursor must not advance and
+    /// last-known targets must be retained.
+    Rejected {
+        /// Bounded structured reason for logs/metrics correlation.
+        reason: &'static str,
+        /// Candidate blocking-query index from the rejected snapshot, if any.
+        /// Retained only for deduplicated diagnostics — never committed.
+        candidate_index: Option<u64>,
+        /// Raw provider catalog item count (bounded diagnostic field).
+        provider_items: usize,
+        /// Provider-normalized target count before shared host/egress filtering.
+        normalized_targets: usize,
+    },
+}
+
+/// Apply shared host/egress validation and the snapshot's typed admission
+/// policy.
+///
+/// - [`SnapshotAdmissionPolicy::AcceptFilteredEmpty`] preserves pre-PR DNS-SD /
+///   Kubernetes / mesh behavior (empty after filtering is accepted).
+/// - [`SnapshotAdmissionPolicy::AtomicCursor`] accepts a legitimate empty
+///   Consul catalog (`provider_item_count == 0`) and mixed subsets, but rejects
+///   a non-empty provider payload that yields zero admitted targets.
+///
+/// Operator-facing rejection warnings are emitted by
+/// [`apply_discovered_snapshot`] with bounded duplicate suppression. This
+/// function only classifies admission.
+pub fn admit_discovered_snapshot(
+    upstream_id: &str,
+    provider_name: &str,
+    snapshot: DiscoverySnapshot,
+    backend_allow_ips: crate::config::BackendEgressPolicy,
+) -> SnapshotAdmission {
+    let DiscoverySnapshot {
+        targets: raw,
+        cursor,
+        admission_policy,
+    } = snapshot;
+    let candidate_index = cursor.as_ref().map(DiscoveryCursorCommit::index);
+
+    match admission_policy {
+        SnapshotAdmissionPolicy::AcceptFilteredEmpty => {
+            let filtered =
+                filter_discovered_targets(upstream_id, provider_name, raw, backend_allow_ips);
+            // Propagate any pending cursor so commit still occurs strictly after
+            // publication (DNS-SD / Kubernetes / mesh currently carry none).
+            SnapshotAdmission::Accepted {
+                targets: filtered,
+                cursor,
+            }
+        }
+        SnapshotAdmissionPolicy::AtomicCursor {
+            provider_item_count,
+        } => {
+            if provider_item_count > 0 && raw.is_empty() {
+                // Drop the pending cursor without committing (fail closed).
+                drop(cursor);
+                return SnapshotAdmission::Rejected {
+                    reason: "provider_normalization_rejected",
+                    candidate_index,
+                    provider_items: provider_item_count,
+                    normalized_targets: 0,
+                };
+            }
+            let raw_len = raw.len();
+            let filtered =
+                filter_discovered_targets(upstream_id, provider_name, raw, backend_allow_ips);
+            if provider_item_count > 0 && filtered.is_empty() {
+                drop(cursor);
+                return SnapshotAdmission::Rejected {
+                    reason: "shared_admission_rejected",
+                    candidate_index,
+                    provider_items: provider_item_count,
+                    normalized_targets: raw_len,
+                };
+            }
+            SnapshotAdmission::Accepted {
+                targets: filtered,
+                cursor,
+            }
+        }
+    }
+}
+
 /// Trait for service discovery providers.
 #[async_trait::async_trait]
 pub trait ServiceDiscoverer: Send + Sync {
     /// Discover current targets from the external registry.
-    async fn discover(&self) -> Result<Vec<UpstreamTarget>, anyhow::Error>;
+    ///
+    /// On success, any provider cursor in the snapshot must be committed by the
+    /// manager only after shared admission and successful publication.
+    async fn discover(&self) -> Result<DiscoverySnapshot, anyhow::Error>;
     /// Human-readable provider name for logging.
     fn provider_name(&self) -> &str;
 }
@@ -487,6 +744,290 @@ pub(crate) fn proxy_targets_discovered_upstream(
     proxy.namespace == upstream_namespace && proxy.upstream_id.as_deref() == Some(upstream_id)
 }
 
+/// Bounded key for suppressing duplicate all-rejected warnings while a Consul
+/// catalog stays rejected at the same candidate index for the same reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RejectionWarnKey {
+    reason: &'static str,
+    candidate_index: Option<u64>,
+}
+
+/// Per-task state retained across discovery poll iterations.
+#[derive(Debug, Default)]
+pub(crate) struct DiscoveryLoopState {
+    /// Last admitted discovered targets that this loop installed (or confirmed).
+    last_discovered: Vec<UpstreamTarget>,
+    /// Whether this loop has successfully published/confirmed at least one
+    /// admitted snapshot. The first admitted snapshot must take the publication
+    /// path even when empty so prior LB cache contents cannot outlive an
+    /// uncommitted empty Consul catalog.
+    snapshot_installed: bool,
+    /// Last rejection warn already emitted for this task. Suppresses sustained
+    /// duplicate warnings for the same reason/candidate without unbounded
+    /// cardinality (fixed reason strings + optional u64 index only).
+    last_rejection_warn: Option<RejectionWarnKey>,
+}
+
+impl DiscoveryLoopState {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    #[allow(dead_code)] // reached via `_test_support` from the external test crate
+    pub(crate) fn snapshot_installed(&self) -> bool {
+        self.snapshot_installed
+    }
+
+    #[allow(dead_code)] // reached via `_test_support` from the external test crate
+    pub(crate) fn last_discovered(&self) -> &[UpstreamTarget] {
+        &self.last_discovered
+    }
+}
+
+/// Control flow after processing one discovery poll result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiscoveryApplyControl {
+    /// Keep polling.
+    Continue,
+    /// Exit the discovery task (cancel/shutdown observed around publication).
+    Stop,
+}
+
+/// Exact production admission → publication → cursor-commit pipeline for one
+/// successful `discover()` result. Used by [`run_discovery_loop`] and exposed
+/// to external tests through `_test_support` so coverage cannot bypass the
+/// manager boundary with an early public cursor commit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_discovered_snapshot(
+    upstream_namespace: &str,
+    upstream_id: &str,
+    provider_name: &str,
+    snapshot: DiscoverySnapshot,
+    state: &mut DiscoveryLoopState,
+    lb_cache: &LoadBalancerCache,
+    request_epoch: &Option<Arc<RequestEpochStore>>,
+    static_targets: &[UpstreamTarget],
+    algorithm: crate::config::types::LoadBalancerAlgorithm,
+    hash_on: &Option<String>,
+    cancel_rx: &tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: &Option<tokio::sync::watch::Receiver<bool>>,
+    dns_cache: &DnsCache,
+    health_checker: &HealthChecker,
+) -> DiscoveryApplyControl {
+    let admission = admit_discovered_snapshot(
+        upstream_id,
+        provider_name,
+        snapshot,
+        dns_cache.backend_allow_ips(),
+    );
+    let (discovered, pending_cursor) = match admission {
+        SnapshotAdmission::Accepted { targets, cursor } => {
+            state.last_rejection_warn = None;
+            (targets, cursor)
+        }
+        SnapshotAdmission::Rejected {
+            reason,
+            candidate_index,
+            provider_items,
+            normalized_targets,
+        } => {
+            let registry = crate::plugins::prometheus_metrics::global_registry();
+            match reason {
+                "provider_normalization_rejected" => {
+                    registry.record_service_discovery_provider_normalization_rejected();
+                }
+                "shared_admission_rejected" => {
+                    registry.record_service_discovery_shared_admission_rejected();
+                }
+                _ => {}
+            }
+
+            let warn_key = RejectionWarnKey {
+                reason,
+                candidate_index,
+            };
+            if state.last_rejection_warn != Some(warn_key) {
+                match reason {
+                    "provider_normalization_rejected" => {
+                        warn!(
+                            upstream = %upstream_id,
+                            provider = provider_name,
+                            provider_items,
+                            reason,
+                            "Service discovery: non-empty provider catalog produced zero normalized targets; retaining last-known targets and blocking-query cursor"
+                        );
+                    }
+                    "shared_admission_rejected" => {
+                        warn!(
+                            upstream = %upstream_id,
+                            provider = provider_name,
+                            provider_items,
+                            normalized_targets,
+                            reason,
+                            "Service discovery: snapshot rejected by shared target validation; retaining last-known targets and blocking-query cursor"
+                        );
+                    }
+                    _ => {
+                        warn!(
+                            upstream = %upstream_id,
+                            provider = provider_name,
+                            reason,
+                            "Service discovery: snapshot rejected; retaining last-known targets and blocking-query cursor"
+                        );
+                    }
+                }
+                state.last_rejection_warn = Some(warn_key);
+            } else {
+                debug!(
+                    upstream = %upstream_id,
+                    provider = provider_name,
+                    reason,
+                    "Service discovery: snapshot not admitted (same rejection as prior poll); retaining last-known targets and blocking-query cursor"
+                );
+            }
+            return DiscoveryApplyControl::Continue;
+        }
+    };
+
+    // A canceled task may have completed its discover() call after the cancel
+    // signal fired. Check before publishing so we never overwrite the new
+    // config's LB state with stale data. Drop the pending cursor without
+    // committing.
+    if *cancel_rx.borrow() {
+        info!(
+            "Service discovery: task for upstream {} canceled during discovery, discarding results",
+            upstream_id,
+        );
+        return DiscoveryApplyControl::Stop;
+    }
+    if let Some(rx) = shutdown_rx
+        && *rx.borrow()
+    {
+        info!(
+            "Service discovery: shutting down task for upstream {} during discovery, discarding results",
+            upstream_id,
+        );
+        return DiscoveryApplyControl::Stop;
+    }
+
+    // First admitted snapshot always publishes (even when empty) so prior
+    // dynamic targets in the LB cache cannot remain installed while a Consul
+    // empty catalog cursor would otherwise commit against a fresh empty local
+    // vector. Later polls may skip publication when the admitted set already
+    // matches the installed discovered set — and may still commit the cursor.
+    let needs_publish =
+        !state.snapshot_installed || !targets_equal(&discovered, &state.last_discovered);
+
+    if needs_publish {
+        if !state.snapshot_installed {
+            // Avoid the misleading `0 -> 0 targets changed` wording for an
+            // intentional first install (including an empty catalog that clears
+            // stale shared LB state after task restart/reconcile).
+            info!(
+                "Service discovery [{}]: upstream {} installing initial discovered snapshot ({} discovered targets)",
+                provider_name,
+                upstream_id,
+                discovered.len(),
+            );
+        } else {
+            info!(
+                "Service discovery [{}]: upstream {} targets changed ({} -> {} discovered targets)",
+                provider_name,
+                upstream_id,
+                state.last_discovered.len(),
+                discovered.len(),
+            );
+        }
+
+        let merged = merge_targets(static_targets, &discovered);
+
+        let hostnames: Vec<(String, Option<String>, Option<u64>)> = discovered
+            .iter()
+            .map(|t| (t.host.clone(), None, None))
+            .collect();
+        if !hostnames.is_empty() {
+            dns_cache.warmup(hostnames).await;
+        }
+
+        // Cancellation could have fired during the DNS warmup await.
+        if *cancel_rx.borrow() {
+            debug!(
+                "Service discovery: task for upstream {} canceled during DNS warmup, discarding results",
+                upstream_id,
+            );
+            return DiscoveryApplyControl::Stop;
+        }
+        if let Some(rx) = shutdown_rx
+            && *rx.borrow()
+        {
+            debug!(
+                "Service discovery: shutting down task for upstream {} during DNS warmup, discarding results",
+                upstream_id,
+            );
+            return DiscoveryApplyControl::Stop;
+        }
+
+        if let Some(epoch_store) = request_epoch {
+            let published = epoch_store.update_load_balancer(
+                |current| {
+                    Some(LoadBalancerCache::build_update_targets_inner(
+                        &current.load_balancer,
+                        upstream_namespace,
+                        upstream_id,
+                        merged.clone(),
+                        algorithm,
+                        hash_on.clone(),
+                    ))
+                },
+                |published| {
+                    lb_cache.store_inner(Arc::clone(&published.load_balancer));
+                },
+            );
+            if let Err(error) = published {
+                warn!(
+                    "Service discovery [{}]: upstream {} target publication failed: {}. Keeping last-known targets and blocking-query cursor.",
+                    provider_name, upstream_id, error,
+                );
+                // Drop pending cursor without committing.
+                return DiscoveryApplyControl::Continue;
+            }
+        } else {
+            lb_cache.update_targets(
+                upstream_namespace,
+                upstream_id,
+                merged.clone(),
+                algorithm,
+                hash_on.clone(),
+            );
+        }
+
+        health_checker.remove_stale_targets(upstream_namespace, upstream_id, &merged);
+        if let Some(epoch_store) = request_epoch {
+            let epoch = epoch_store.load();
+            for proxy in epoch.config.proxies.iter().filter(|proxy| {
+                proxy_targets_discovered_upstream(proxy, upstream_namespace, upstream_id)
+            }) {
+                health_checker.remove_stale_passive_targets_for_proxy(
+                    &proxy.namespace,
+                    &proxy.id,
+                    &merged,
+                );
+            }
+        }
+
+        state.last_discovered = discovered;
+        state.snapshot_installed = true;
+    }
+
+    // Snapshot is installed (just published, or already matched after a prior
+    // install). Commit the provider cursor for this exact admitted response.
+    if let Some(cursor) = pending_cursor {
+        cursor.commit();
+    }
+
+    DiscoveryApplyControl::Continue
+}
+
 /// Background discovery loop for a single upstream.
 ///
 /// Exits when either the global `shutdown_rx` fires or the per-task
@@ -508,7 +1049,7 @@ async fn run_discovery_loop(
     health_checker: &HealthChecker,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_interval_seconds));
-    let mut last_discovered: Vec<UpstreamTarget> = Vec::new();
+    let mut state = DiscoveryLoopState::new();
 
     loop {
         // Wait for next tick, global shutdown, or per-task cancel.
@@ -535,133 +1076,31 @@ async fn run_discovery_loop(
             }
         }
 
-        // Discover targets
+        // Discover targets. Provider cursors (e.g. Consul X-Consul-Index) stay
+        // pending until shared admission and publication succeed for this exact
+        // snapshot — dropping the commit handle retains the prior cursor.
         match discoverer.discover().await {
-            Ok(discovered_raw) => {
-                let discovered = filter_discovered_targets(
+            Ok(snapshot) => {
+                match apply_discovered_snapshot(
+                    upstream_namespace,
                     upstream_id,
                     discoverer.provider_name(),
-                    discovered_raw,
-                    dns_cache.backend_allow_ips(),
-                );
-                // A canceled task may have completed its discover() call after
-                // the cancel signal fired.  Check before publishing so we never
-                // overwrite the new config's LB state with stale data.
-                if *cancel_rx.borrow() {
-                    info!(
-                        "Service discovery: task for upstream {} canceled during discovery, discarding results",
-                        upstream_id,
-                    );
-                    return;
-                }
-                if let Some(ref rx) = shutdown_rx
-                    && *rx.borrow()
+                    snapshot,
+                    &mut state,
+                    lb_cache,
+                    &request_epoch,
+                    static_targets,
+                    algorithm,
+                    &hash_on,
+                    &cancel_rx,
+                    &shutdown_rx,
+                    dns_cache,
+                    health_checker,
+                )
+                .await
                 {
-                    info!(
-                        "Service discovery: shutting down task for upstream {} during discovery, discarding results",
-                        upstream_id,
-                    );
-                    return;
-                }
-
-                // Check if targets changed
-                if !targets_equal(&discovered, &last_discovered) {
-                    info!(
-                        "Service discovery [{}]: upstream {} targets changed ({} -> {} discovered targets)",
-                        discoverer.provider_name(),
-                        upstream_id,
-                        last_discovered.len(),
-                        discovered.len(),
-                    );
-
-                    // Merge static + discovered targets
-                    let merged = merge_targets(static_targets, &discovered);
-
-                    // DNS warmup for new hostnames
-                    let hostnames: Vec<(String, Option<String>, Option<u64>)> = discovered
-                        .iter()
-                        .map(|t| (t.host.clone(), None, None))
-                        .collect();
-                    if !hostnames.is_empty() {
-                        dns_cache.warmup(hostnames).await;
-                    }
-
-                    // Cancellation could have fired during the DNS warmup await.
-                    // Re-check before publishing so we never overwrite the new
-                    // config's LB state with stale data.
-                    if *cancel_rx.borrow() {
-                        debug!(
-                            "Service discovery: task for upstream {} canceled during DNS warmup, discarding results",
-                            upstream_id,
-                        );
-                        return;
-                    }
-                    if let Some(ref rx) = shutdown_rx
-                        && *rx.borrow()
-                    {
-                        debug!(
-                            "Service discovery: shutting down task for upstream {} during DNS warmup, discarding results",
-                            upstream_id,
-                        );
-                        return;
-                    }
-
-                    // Publish the LB-only epoch under the request-epoch write lock.
-                    if let Some(epoch_store) = &request_epoch {
-                        let published = epoch_store.update_load_balancer(
-                            |current| {
-                                Some(LoadBalancerCache::build_update_targets_inner(
-                                    &current.load_balancer,
-                                    upstream_namespace,
-                                    upstream_id,
-                                    merged.clone(),
-                                    algorithm,
-                                    hash_on.clone(),
-                                ))
-                            },
-                            |published| {
-                                lb_cache.store_inner(Arc::clone(&published.load_balancer));
-                            },
-                        );
-                        if let Err(error) = published {
-                            warn!(
-                                "Service discovery [{}]: upstream {} target publication failed: {}. Keeping last-known targets.",
-                                discoverer.provider_name(),
-                                upstream_id,
-                                error,
-                            );
-                            continue;
-                        }
-                    } else {
-                        lb_cache.update_targets(
-                            upstream_namespace,
-                            upstream_id,
-                            merged.clone(),
-                            algorithm,
-                            hash_on.clone(),
-                        );
-                    }
-
-                    // Clean up stale health state for targets that were removed
-                    health_checker.remove_stale_targets(upstream_namespace, upstream_id, &merged);
-                    if let Some(epoch_store) = &request_epoch {
-                        let epoch = epoch_store.load();
-                        for proxy in epoch.config.proxies.iter().filter(|proxy| {
-                            proxy_targets_discovered_upstream(
-                                proxy,
-                                upstream_namespace,
-                                upstream_id,
-                            )
-                        }) {
-                            health_checker.remove_stale_passive_targets_for_proxy(
-                                &proxy.namespace,
-                                &proxy.id,
-                                &merged,
-                            );
-                        }
-                    }
-
-                    last_discovered = discovered;
+                    DiscoveryApplyControl::Continue => {}
+                    DiscoveryApplyControl::Stop => return,
                 }
             }
             Err(e) => {

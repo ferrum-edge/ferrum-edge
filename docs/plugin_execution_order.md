@@ -1320,19 +1320,77 @@ policy **unprovable**. Response caching stores and replays nothing, and request
 deduplication refuses to retain or replay a representation, rather than crossing
 a trigger decision.
 
+### Session- and flow-bound decisions (WebSocket, UDP/DTLS)
+
+`on_ws_frame`, `on_ws_reassembly_frames`, `prepare_ws_frame_delivery` /
+`emit_ws_frame_delivery`, `on_ws_disconnect`, and `on_udp_datagram` carry no
+request or connection context of their own. They are nevertheless fully gated,
+because the decision is taken **once, where authoritative facts still exist**,
+and carried on the session:
+
+* **WebSocket.** The relay's per-session plugin-collection step evaluates each
+  triggered instance against the upgrade's authoritative `RequestContext` and
+  memoizes the outcome. The decision is taken before the session's capability set
+  is computed, so a `false` instance is absent from the parser-policy,
+  frame-hook, reassembly, delivery, size-limit, and disconnect sets. It therefore
+  forces neither framing nor a frame/message ceiling on either framer, observes
+  no frame, and — because tunnel mode is chosen from the resulting parser-policy
+  list — cannot pull a session off the raw tunnel path. A `true` instance keeps
+  its configured priority and frame-chain position exactly as before. The same
+  decision governs H1 `Upgrade` and H2/H3 Extended CONNECT. Session binding
+  (`Plugin::bind_ws_session`) happens after admission, so a skipped instance is
+  never bound at all.
+* **UDP / DTLS.** The trigger is evaluated once per session by the
+  `on_stream_connect` admission chain, against the flow's authoritative facts:
+  proxy id and namespace, direct and policy client IP, listener port, transport
+  protocol (`udp` / `dtls`), and the DTLS/TLS ClientHello SNI where the listener
+  reads one. The resulting per-instance decisions live on the generation-owned
+  session; the session's datagram-hook list is filtered from them once, at
+  first-datagram admission, before the first hook runs and before the
+  hook-ingress channel is allocated. Every later datagram is a traversal of an
+  already-filtered list — no predicate is re-evaluated, no fact re-read, and
+  nothing allocated, hashed, or locked per packet. Session expiry, client-tuple
+  reuse, target/proxy reload, and generation replacement all build a new session
+  through a fresh admission chain, so a decision can never leak to a new flow or
+  a new plugin generation.
+
+An instance whose protocols are **stream-only** (TCP / UDP / DTLS) may not carry
+an HTTP-only predicate (`method`, `path`, `host`, `header`, `query`, `cookie`).
+A datagram or byte stream has no request line, header block, query string, or
+cookie jar, so the predicate would be a constant — silently "never runs", or
+beneath `not` silently "always runs". Publication refuses it with the offending
+field named rather than reinterpreting an absent HTTP concept as an empty string
+or a broad match. On a plugin that also serves HTTP the same predicate stays
+supported: it evaluates to `false` for the stream leg and normally for that
+instance's HTTP requests.
+
+### Terminal transaction logging
+
+The `log` phase (12) is gated too. `log` / `log_with_mesh_key` receive only a
+`TransactionSummary`, so the request-phase decisions are copied onto the summary
+in an opaque, non-serialized, crate-constructed carrier — never through the
+summary's plugin-writable `metadata` map, which a plugin could forge. Stamping
+happens in the single terminal funnel every HTTP-family path reaches, so the
+decision is preserved for buffered responses, streaming completion / drop /
+cancel, early and synthetic rejects, auth and policy failures, backend errors and
+timeouts, native gRPC including trailers-only, gRPC-Web, H1/H2/H3, the HBONE
+relay, the WebSocket upgrade summary, mirror completion and timeout, and
+delayed/deferred logging. A mirror entry is derived from the already-stamped
+primary summary, so it inherits the decision that applied to its request and
+cannot be re-admitted by mirror metadata or completion ordering.
+
+The rule at the hook is: explicit `false` skips, explicit `true` runs, and a
+**missing** carrier RUNS. Missing state must never become an accidental
+suppression of a security or audit record, so the historical behavior is
+preserved and the occurrence is counted instead (see "Observability" below).
+
+The stream counterpart, `on_stream_disconnect`, is gated the same way through
+`StreamTransactionSummary`.
+
 ### Phases outside the trigger boundary (fail-closed)
 
-`on_ws_frame`, `on_ws_reassembly_frames`, `on_ws_disconnect`, and
-`on_udp_datagram` run with no request or connection context in hand, so there is
-nothing authoritative left to evaluate at that point. Rather than half-applying a
-trigger, plugin-cache publication **rejects** a trigger on any instance that
-declares those hooks (`requires_ws_frame_hooks`, `observes_ws_frame_decisions`,
-`requires_websocket_framing`, `requires_ws_disconnect_hooks`,
-`requires_udp_datagram_hooks`). A typed frame/datagram-phase predicate surface is
-tracked as follow-up work.
-
 The **initial response-header policy** (`is_initial_response_header_policy` —
-`security_headers`) is refused for the same reason. Its
+`security_headers`) is refused. Its
 `apply_initial_response_header_policy` re-assertion runs from paths that hold no
 `RequestContext`, including the gateway's own error/short-circuit header
 assembly, and the names it declares are folded into a per-generation list the H3
@@ -1348,12 +1406,6 @@ applies to contextless response-trailer declarations (`Names`,
 without asking the instance again. `RequestConditionalUnbounded` remains
 supported because its per-request predicate is evaluated through the triggered
 wrapper.
-
-The `log` phase (12) receives only a `TransactionSummary` and is likewise not
-gated; a triggered logger still emits its record for a request whose earlier
-hooks were skipped. The skip is visible in that record — see below. (The stream
-counterpart, `on_stream_disconnect`, *is* gated: it agrees with
-`on_stream_connect` through the carrier described above.)
 
 An **authentication** plugin may not carry an identity predicate: `authenticate`
 is the phase that establishes `consumer` / `auth_method` / `spiffe_id`, so such a
@@ -1405,6 +1457,20 @@ A skipped instance records exactly one bounded metadata pair,
 transaction summary through the ordinary redacted-metadata path. Cardinality is
 bounded by the configured instance count. No header, cookie, query value, claim,
 token, or body byte is ever copied into it or logged.
+
+The authenticated `GET /metrics/runtime` snapshot additionally carries three
+**unlabeled** process-wide counters under `plugin_triggers`:
+
+| Counter | Meaning |
+|---|---|
+| `skipped_terminal_log_hooks` | terminal `log` / `log_with_mesh_key` calls suppressed by an explicit false decision |
+| `skipped_session_hooks` | WebSocket-session and UDP/DTLS-flow hook sets suppressed by an explicit false decision |
+| `missing_decision_carriers` | contextless hooks that ran because no decision was carried (compatibility path) |
+
+They have no labels at all: no trigger input, route, identity, header value,
+plugin-controlled string, or secret can reach them. A sustained nonzero
+`missing_decision_carriers` on a deployment that uses triggers means some summary
+or session path is not stamping the carrier.
 
 ## Priority Bands
 

@@ -18,3 +18,4 @@ FROM runtime-base
 COPY --from=iproute2-runtime /iproute2-root/usr/sbin/ip /usr/sbin/ip
 COPY --from=iproute2-runtime /iproute2-root/usr/lib/ /usr/lib/
 COPY --from=iproute2-runtime /iproute2-root/usr/lib64/ /usr/lib64/
+USER 65532:65532

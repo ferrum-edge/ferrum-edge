@@ -20,24 +20,20 @@ pub async fn verify_jwt_with_jwks(
     store: &JwksKeyStore,
     params: &JwtVerifyParams<'_>,
 ) -> Option<Value> {
-    if !store.has_keys() {
-        debug!("JWKS store has no cached keys; rejecting without hot-path fetch");
-        return None;
-    }
+    let all_keys = store.trusted_keys()?;
 
     let header = decode_header(token).ok()?;
 
     if let Some(kid) = &header.kid {
-        if let Some(cached_key) = store.get_key(kid) {
+        if let Some(cached_key) = all_keys.get(kid) {
             let validation = build_validation(cached_key.algorithm, params);
             if let Ok(td) = decode::<Value>(token, &cached_key.decoding_key, &validation) {
                 return Some(td.claims);
             }
         }
-        debug!("JWKS key not found for kid={}, trying all keys", kid);
+        debug!("JWKS key identifier did not select a valid key; trying the bounded key set");
     }
 
-    let all_keys = store.all_keys();
     for cached_key in all_keys.values() {
         let validation = build_validation(cached_key.algorithm, params);
         if let Ok(td) = decode::<Value>(token, &cached_key.decoding_key, &validation) {

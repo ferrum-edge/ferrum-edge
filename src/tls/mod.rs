@@ -99,7 +99,10 @@ const PEM_TRUST_ROOT_ADMISSION_FAILURE_CLASS: &str = "certificate failed trust-a
 /// Inline PEM has a tighter 1 MiB configuration limit, but file/provider
 /// sources reach this shared parser directly. Rejecting oversized material
 /// before decoding prevents hostile sources from driving unbounded PEM work.
-pub(crate) const MAX_PEM_MATERIAL_BYTES: usize = 4 * 1024 * 1024;
+/// Kept equal to [`crate::config::env_config::HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES`]
+/// so the source ceiling and parse admission cannot drift.
+pub(crate) const MAX_PEM_MATERIAL_BYTES: usize =
+    crate::config::env_config::HARD_MAX_TLS_MAX_MATERIAL_SIZE_BYTES;
 
 /// A bundle this large is already far beyond a practical TLS chain or trust
 /// store. Keep record enumeration bounded independently of the byte ceiling.

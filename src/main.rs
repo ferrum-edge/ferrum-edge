@@ -786,6 +786,23 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         }
     };
 
+    // Publish discovery body ceilings before any mode can start Kubernetes /
+    // Consul pollers, so the process OnceLock matches the accepted EnvConfig
+    // snapshot rather than being pinned by an earlier parse/validate call.
+    if let Err(e) = crate::service_discovery::http_body::install_discovery_body_limits(
+        crate::config::env_config::DiscoveryBodyLimits {
+            max_response_bytes: env_config.service_discovery_max_response_body_bytes,
+            max_error_bytes: env_config.service_discovery_max_error_body_bytes,
+            body_budget_bytes: env_config.service_discovery_body_budget_bytes,
+        },
+    ) {
+        error!(
+            "Configuration error: {}",
+            secrets::redact_external_secret_values(&e)
+        );
+        return 1;
+    }
+
     // Apply the delayed-work admission budget before any listener can accept
     // traffic, so a fault-injection delay is never admitted against the
     // compiled-in default when the operator configured a smaller bound.

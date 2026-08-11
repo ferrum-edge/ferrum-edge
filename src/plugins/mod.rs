@@ -4691,6 +4691,27 @@ impl RequestContext {
         run
     }
 
+    /// Whether this request evaluated any per-instance execution trigger.
+    ///
+    /// The overwhelmingly common configuration has no trigger at all, so the
+    /// terminal-logging funnel reads this one boolean instead of building or
+    /// copying a carrier.
+    pub(crate) fn has_plugin_trigger_decisions(&self) -> bool {
+        !self.plugin_trigger_decisions.is_empty()
+    }
+
+    /// Snapshot the request's execution-trigger decisions for a terminal
+    /// transaction summary.
+    ///
+    /// `log` / `log_with_mesh_key` see only a [`TransactionSummary`], so this is
+    /// how a request-phase skip reaches the terminal hook. The carrier is opaque
+    /// and crate-constructed, so a plugin can neither author nor erase another
+    /// instance's decision through the summary's public `metadata` map. Bounded
+    /// by the number of triggered instances that actually evaluated.
+    pub(crate) fn plugin_trigger_decisions(&self) -> PluginTriggerDecisions {
+        PluginTriggerDecisions::from_pairs(&self.plugin_trigger_decisions)
+    }
+
     pub(crate) fn is_native_grpc_request(&self) -> bool {
         matches!(self.request_http_flavor, HttpFlavor::Grpc)
     }
@@ -6847,6 +6868,24 @@ pub struct TransactionSummary {
     /// delete→recreate incarnation of the same proxy ID.
     #[doc(hidden)]
     pub proxy_lifecycle_generation: Option<u64>,
+    /// Per-instance execution-trigger decisions memoized on the authoritative
+    /// `RequestContext`, carried so the terminal `log` / `log_with_mesh_key`
+    /// hooks agree with the request/response hooks of the same instance. Not
+    /// serialized, so log output and schemas are unchanged.
+    ///
+    /// The value is opaque: outside this crate the only constructible form is
+    /// the empty [`PluginTriggerDecisions::default()`], which fails closed to
+    /// "the instance runs". A plugin therefore cannot restate, forge, or erase
+    /// another instance's decision here, and a summary produced by a path that
+    /// predates trigger evaluation keeps the historical "always log" behavior.
+    ///
+    /// Stamped centrally by [`log_with_mirror`], which is the single terminal
+    /// funnel for every HTTP-family path (buffered, streaming/deferred, early
+    /// and synthetic rejects, native gRPC including trailers-only, gRPC-Web,
+    /// H1/H2/H3, HBONE relay, WebSocket upgrade summaries, and mirror
+    /// completion/timeout).
+    #[doc(hidden)]
+    pub plugin_trigger_decisions: PluginTriggerDecisions,
 }
 
 impl Serialize for TransactionSummary {
@@ -7102,6 +7141,34 @@ pub async fn log_with_mirror(
     summary: &TransactionSummary,
     ctx: &RequestContext,
 ) {
+    // Copy the memoized per-instance execution-trigger decisions from the
+    // authoritative request context onto the terminal summary, so `log` /
+    // `log_with_mesh_key` decide exactly as the instance's request and response
+    // hooks did. This is the single funnel every HTTP-family terminal path
+    // reaches — buffered, streaming/deferred, early and synthetic rejects,
+    // auth/policy failures, backend error and timeout, native gRPC (including
+    // trailers-only), gRPC-Web, H1/H2/H3, the HBONE relay, and the WebSocket
+    // upgrade summary — so no call site has to remember to carry it.
+    //
+    // The clone happens only when this request actually evaluated a trigger and
+    // the summary does not already carry one; the untriggered default
+    // configuration pays one `is_empty()` check and no allocation.
+    // Keep the conditional clone out of this async future's inline state. A
+    // `TransactionSummary` is deliberately broad; storing it inline here grows
+    // every request future (including the allocation-free, untriggered case)
+    // and can exhaust a worker stack under instrumentation. The triggered path
+    // already clones owned summary data, so one box does not change the common
+    // path and bounds the future itself to a pointer-sized optional value.
+    let mut stamped =
+        if ctx.has_plugin_trigger_decisions() && summary.plugin_trigger_decisions.is_empty() {
+            Some(Box::new(summary.clone()))
+        } else {
+            None
+        };
+    if let Some(stamped) = stamped.as_deref_mut() {
+        stamped.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
+    }
+    let summary = stamped.as_deref().unwrap_or(summary);
     let precompute_mesh_key = plugins
         .iter()
         .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
@@ -7493,7 +7560,9 @@ impl StreamConnectionContext {
     /// path must carry it; the carrier is opaque and crate-constructed so a
     /// plugin cannot author or erase another instance's admission decision.
     pub(crate) fn plugin_trigger_decisions(&self) -> StreamTriggerDecisions {
-        StreamTriggerDecisions(self.plugin_trigger_decisions.clone())
+        StreamTriggerDecisions(PluginTriggerDecisions::from_pairs(
+            &self.plugin_trigger_decisions,
+        ))
     }
 
     /// Return the stable authenticated identity for stream policies. A mapped
@@ -7552,27 +7621,105 @@ impl StreamConnectionContext {
     }
 }
 
-/// Opaque carrier for the per-instance execution-trigger decisions taken during
-/// `on_stream_connect`, so `on_stream_disconnect` can agree with them.
+/// Opaque, non-serialized carrier for the per-instance execution-trigger
+/// decisions taken at the one authoritative admission point of a request,
+/// connection, WebSocket session, or UDP/DTLS flow.
 ///
 /// Deliberately not constructible with real content outside this crate: the only
 /// public way to make one is [`Default`] (no decisions, which fails closed to
 /// "the instance runs"). The tokens inside are process-local, opaque, and never
-/// serialized, so this can carry an admission authority that a plugin can
-/// neither read as configuration nor forge — unlike the summary's public
-/// `metadata` map.
+/// serialized, so this carries an admission authority that a plugin can neither
+/// read as configuration nor forge — unlike a summary's public `metadata` map.
+///
+/// Keying is by the compiled gate's process-local token, which is minted once
+/// per compiled instance per plugin generation. Chain position, load order, and
+/// plugin name are never part of the key, so two instances of the same plugin
+/// stay independent and a reload can never bind a retired generation's decision
+/// to a new instance: the replacement gate carries a different token and simply
+/// finds no decision (which fails closed to "runs").
+///
+/// Cardinality is bounded by the number of triggered instances that actually
+/// evaluated for that request/session, which is bounded by the configured
+/// instance count.
 #[derive(Debug, Clone, Default)]
-pub struct StreamTriggerDecisions(Vec<(u64, bool)>);
+pub struct PluginTriggerDecisions(Vec<(u64, bool)>);
 
-impl StreamTriggerDecisions {
-    /// The decision recorded for `token`, or `None` when this connection never
-    /// evaluated that instance's trigger.
+impl PluginTriggerDecisions {
+    pub(crate) fn from_pairs(pairs: &[(u64, bool)]) -> Self {
+        Self(pairs.to_vec())
+    }
+
+    /// The decision recorded for `token`, or `None` when this request/session
+    /// never evaluated that instance's trigger.
     pub(crate) fn decision(&self, token: u64) -> Option<bool> {
         self.0
             .iter()
             .find(|(candidate, _)| *candidate == token)
             .map(|(_, decision)| *decision)
     }
+
+    /// Whether any decision is carried. Used only to keep the terminal-logging
+    /// funnel allocation-free for the untriggered default configuration.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Opaque carrier for the per-instance execution-trigger decisions taken during
+/// `on_stream_connect`, so `on_stream_disconnect` and every per-datagram hook of
+/// that flow agree with them.
+///
+/// A thin newtype over [`PluginTriggerDecisions`] so stream/UDP call sites keep
+/// their explicit type while sharing one implementation.
+#[derive(Debug, Clone, Default)]
+pub struct StreamTriggerDecisions(PluginTriggerDecisions);
+
+impl StreamTriggerDecisions {
+    /// The decision recorded for `token`, or `None` when this connection never
+    /// evaluated that instance's trigger.
+    pub(crate) fn decision(&self, token: u64) -> Option<bool> {
+        self.0.decision(token)
+    }
+}
+
+/// Bind a UDP/DTLS flow's datagram-hook list to the decisions taken by the
+/// `on_stream_connect` admission chain for that session (issue #3734).
+///
+/// Called exactly ONCE per session, at first-datagram admission, before any
+/// datagram hook runs and before the session's hook-ingress channel is even
+/// created. Every later datagram then traverses an already-filtered list: no
+/// predicate is re-evaluated, no fact is re-read, and nothing is allocated,
+/// hashed, or locked on the per-packet path.
+///
+/// The common case — no triggered instance, or every instance admitted —
+/// returns the original `Arc` without allocating.
+///
+/// Retirement is structural: the list belongs to the session, the session
+/// belongs to one plugin generation, and a reload builds a new session from the
+/// new generation's gates. A reused client tuple gets a new session and a fresh
+/// admission chain, so no decision can leak across flows or generations.
+pub(crate) fn admitted_datagram_plugins(
+    datagram_plugins: &Arc<[Arc<dyn Plugin>]>,
+    decisions: &StreamTriggerDecisions,
+) -> Arc<[Arc<dyn Plugin>]> {
+    if datagram_plugins.is_empty() {
+        return Arc::clone(datagram_plugins);
+    }
+    let Some(first_rejected) = datagram_plugins
+        .iter()
+        .position(|plugin| !plugin.admits_stream_session_hooks(decisions))
+    else {
+        return Arc::clone(datagram_plugins);
+    };
+    let mut admitted = Vec::with_capacity(datagram_plugins.len().saturating_sub(1));
+    admitted.extend(datagram_plugins[..first_rejected].iter().cloned());
+    admitted.extend(
+        datagram_plugins[first_rejected + 1..]
+            .iter()
+            .filter(|plugin| plugin.admits_stream_session_hooks(decisions))
+            .cloned(),
+    );
+    Arc::from(admitted)
 }
 
 /// Transaction summary for stream proxy (TCP/UDP) logging plugins.
@@ -9937,6 +10084,44 @@ pub trait Plugin: Send + Sync {
         self.requires_ws_frame_hooks() || self.websocket_size_limits().is_some()
     }
 
+    /// Decide, at WebSocket upgrade admission, whether this instance
+    /// participates in the accepted session at all.
+    ///
+    /// Called exactly once per upgraded connection, from the shared H1/H2/H3
+    /// relay plugin-collection step, while the upgrade still holds its
+    /// authoritative, mutable [`RequestContext`] — the last point at which a
+    /// declarative per-instance execution trigger can be evaluated with real
+    /// request facts. The decision is memoized on that context and is immutable
+    /// for the session.
+    ///
+    /// Returning `false` removes the instance from the session's parser-policy,
+    /// frame-hook, reassembly, delivery, size-limit, and disconnect sets BEFORE
+    /// the request-specific capability set is computed, so a skipped instance
+    /// performs no per-frame work and cannot force a session out of raw tunnel
+    /// mode. Returning `true` preserves current behavior and priority order.
+    ///
+    /// The default is `true`: a plugin carrying no execution trigger behaves
+    /// exactly as before. Only the plugin-cache instance wrapper overrides it.
+    fn admits_ws_session(&self, _ctx: &mut RequestContext) -> bool {
+        true
+    }
+
+    /// Decide whether this instance participates in the datagram hooks of one
+    /// admitted UDP/DTLS flow.
+    ///
+    /// Consumed exactly once per session, right after the `on_stream_connect`
+    /// admission chain has memoized the decision on the generation-owned
+    /// session, so every subsequent datagram hook is a plain traversal of an
+    /// already-filtered list with no predicate re-evaluation, allocation,
+    /// hashing, or locking on the per-packet path.
+    ///
+    /// The default is `true`; only the plugin-cache instance wrapper overrides
+    /// it. A missing decision runs the hooks (historical behavior) and records a
+    /// bounded invariant signal.
+    fn admits_stream_session_hooks(&self, _decisions: &StreamTriggerDecisions) -> bool {
+        true
+    }
+
     /// Bind this plugin to one accepted WebSocket session.
     ///
     /// Called exactly once per upgraded connection, from the shared H1/H2/H3
@@ -10218,10 +10403,12 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
-    /// Returns the refresh interval required for each actively referenced
-    /// shared JWKS URI. The plugin cache reconciles duplicate consumers to the
-    /// minimum interval after every full or incremental publication.
-    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+    /// Returns refresh and bounded-staleness requirements for each actively
+    /// referenced shared JWKS URI. The plugin cache reconciles duplicate
+    /// consumers to the strictest pair of minima after every publication.
+    fn active_jwks_refresh_requirements(
+        &self,
+    ) -> Vec<(String, utils::jwks_cache::JwksRefreshRequirement)> {
         Vec::new()
     }
 }

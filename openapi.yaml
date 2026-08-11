@@ -193,7 +193,7 @@ paths:
         `cached_config` proxy/consumer counts,
         `database_polling` degradation, `config_rejected`, mesh state,
         `logging`, `kafka_logging`, and `ai_transcript_audit` admitted capture
-        ceilings — are
+        ceilings, and fixed-cardinality `jwks_trust` aggregates — are
         returned only when the caller presents a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originates from
         `FERRUM_METRICS_ALLOWED_CIDRS`.
@@ -203,7 +203,8 @@ paths:
         complete it returns `200 OK` with `status` set to `"ok"` or
         `"degraded"` (DB disconnected / admin writes blocked / database
         incremental polling repeatedly rejecting the same delta while serving
-        last known-good config; or, in database, control-plane, or file mode, a
+        last known-good config; an active remote JWKS store in grace; or, in
+        database, control-plane, or file mode, a
         full config load/reload rejected while the previous generation keeps
         serving — `config_rejected: true`. In database/CP, rejection is by the
         runtime-config validation contract or by typed SQL row decoding while the
@@ -218,7 +219,9 @@ paths:
         outage. In CP/DP/mesh modes, if a supervised serving
         listener later exits with an error, `/health` returns `503` with
         `status: "unavailable"`, `ready: false` durably (sticky across a later
-        readiness restore). Mesh traffic and admin listener failures use the
+        readiness restore). The same unavailable/not-ready outcome applies when
+        an active remote JWKS store's maximum-stale deadline expires. Mesh
+        traffic and admin listener failures use the
         same sticky state; authenticated responses include a sanitized
         `listener_failures` snapshot.
       tags: [Health]
@@ -406,6 +409,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -462,6 +467,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "408":
           $ref: "#/components/responses/RequestTimeout"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -740,6 +747,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "501":
@@ -804,6 +813,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -870,6 +881,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -952,6 +965,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1016,6 +1031,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1098,6 +1115,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1160,6 +1179,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1242,6 +1263,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1304,6 +1327,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1386,6 +1411,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1448,6 +1475,8 @@ paths:
           $ref: "#/components/responses/RequestTimeout"
         "409":
           $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
@@ -1716,7 +1745,8 @@ paths:
         right now?": process CPU and memory, file descriptors, ephemeral-port
         pressure, HTTP status rates, error classes, DNS cache outcomes, pool
         churn, TCP resets, log-event counters, bounded stdout/stderr sink
-        health/loss/last-failure diagnostics, and the inline overload state.
+        health/loss/last-failure diagnostics, unlabeled plugin execution-trigger
+        carrier counters, and the inline overload state.
 
         The response is cached briefly (default 1000 ms, configurable with
         `FERRUM_METRICS_RUNTIME_CACHE_MS`) because system metrics are sampled in
@@ -6225,6 +6255,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: Request body or admitted TLS material exceeds its configured byte limit
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     Conflict:
       description: >
         Resource already exists, conflicts with an existing resource, a managed TLS
@@ -10706,6 +10742,20 @@ components:
             Subset concurrent in-flight HTTP/1.1 admission cap projected from
             a mesh DestinationRule. Admission is isolated by selected subset;
             direct admin/file configuration is rejected.
+        http_idle_timeout_ms:
+          type: [integer, "null"]
+          format: uint64
+          readOnly: true
+          description: >-
+            Subset backend HTTP idle timeout in milliseconds projected from a
+            mesh DestinationRule. Direct admin/file configuration is rejected.
+        h2_max_concurrent_streams:
+          type: [integer, "null"]
+          format: uint32
+          readOnly: true
+          description: >-
+            Subset HTTP/2 concurrent-stream cap projected from a mesh
+            DestinationRule. Direct admin/file configuration is rejected.
         passive_health_check:
           oneOf:
             - $ref: "#/components/schemas/PassiveHealthCheck"
@@ -11609,9 +11659,9 @@ components:
         remaining detailed fields (`timestamp`, `mode`, `database`,
         `admin_writes_enabled`, `fips`, `cached_config`, `database_polling`,
         `config_rejected`, `mesh`, `listener_failures`, `logging`,
-        `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`) are
-        present only when the caller is authenticated (admin JWT, metrics bearer
-        token, or allowlisted CIDR).
+        `kafka_logging`, `ai_transcript_audit`, `audit_pipeline`, `jwks_trust`)
+        are present only when the caller is authenticated (admin JWT, metrics
+        bearer token, or allowlisted CIDR).
       required: [status, ready]
       properties:
         status:
@@ -11622,32 +11672,40 @@ components:
             `ok` — fully ready and healthy (200). Also returned for
             intentionally read-only deployments (admin API in read-only mode
             with a healthy DB) — `admin_writes_enabled` is the right signal
-            for that, not `status`.
+            for that, not `status`. With no active remote JWKS the coarse
+            status stays `ok` when otherwise healthy.
             `degraded` — ready but the configured database is currently
             unavailable (still 200; the gateway continues to serve from
-            cached config), or the admin audit pipeline cannot durably record
-            committed mutations (see `audit_pipeline`). Intentional read-only
-            mode does NOT set `degraded`.
+            cached config), the admin audit pipeline cannot durably record
+            committed mutations (see `audit_pipeline`), or an active remote
+            JWKS store is in grace after its refresh interval. Intentional
+            read-only mode does NOT set `degraded`.
             `starting` — startup not yet complete (returned with 503 and
             `ready: false`).
             `unavailable` — the gateway became ready but a supervised serving
             listener task later exited with an error (CP gRPC or admin HTTP/HTTPS
             server, a DP proxy/admin listener, or a mesh traffic/admin
             listener), or — in control-plane mode — the database config poll
-            task exited unexpectedly. This is a sticky, monotonic
-            degradation: it stays set across a later readiness restore
-            (returned with 503 and `ready: false`). CP, DP, and mesh modes
-            report it.
+            task exited unexpectedly, or an active remote JWKS store's
+            maximum-stale deadline expired. Listener/poll failures are sticky
+            and monotonic across a later readiness restore (returned with 503
+            and `ready: false`). Expired JWKS trust clears after a later
+            validated non-empty refresh. CP, DP, and mesh modes report the
+            sticky listener/poll form.
         ready:
           type: boolean
           description: |
             `true` once the gateway has finished startup AND no supervised
             serving listener (or, in control-plane mode, the database config
-            poll task) has failed unexpectedly since. While `false`, the endpoint
-            returns `503 Service Unavailable`. In CP/DP/mesh modes a post-startup
-            serving-listener failure sets `ready: false` durably (sticky) even
-            though internal startup completed. In CP mode an unexpected database
-            poll-task exit uses the same sticky not-ready path.
+            poll task) has failed unexpectedly since AND no active remote JWKS
+            store is past its maximum-stale deadline. While `false`, the
+            endpoint returns `503 Service Unavailable`. In CP/DP/mesh modes a
+            post-startup serving-listener failure sets `ready: false` durably
+            (sticky) even though internal startup completed. In CP mode an
+            unexpected database poll-task exit uses the same sticky not-ready
+            path. Active remote JWKS expiry is evaluated from a precomputed
+            O(1) aggregate with monotonic deadlines — inactive/retired entries
+            and inline JWKS never participate.
         admin_writes_enabled:
           type: boolean
           description: |
@@ -11888,6 +11946,53 @@ components:
               ack_max_bytes: 65536
               ack_timeout_ms: 1000
               sink_healthy: true
+        jwks_trust:
+          $ref: "#/components/schemas/JwksTrustHealthSnapshot"
+
+    JwksTrustHealthSnapshot:
+      type: object
+      description: |
+        Authenticated `/health`/`/status` aggregate of **active remote** JWKS
+        trust stores (issue #3739). Counts and ages are fixed-cardinality only —
+        never JWKS/discovery URLs, `kid` values, tokens, claims, credentials,
+        or key material. Inactive/retired cache entries and inline JWKS are
+        excluded. Unauthenticated probes never receive this object; they see
+        only the coarse `status`/`ready` effects (grace → degraded+ready;
+        expired → unavailable+not-ready; none → neutral).
+      required: [fresh, grace, expired, max_age_seconds]
+      properties:
+        fresh:
+          type: integer
+          format: uint64
+          description: Active remote stores still within their refresh interval.
+        grace:
+          type: integer
+          format: uint64
+          description: >
+            Active remote stores past refresh but inside `jwks_max_stale_seconds`.
+            Coarse health remains ready with `status: degraded`.
+        expired:
+          type: integer
+          format: uint64
+          description: >
+            Active remote stores past maximum-stale. Coarse health is not-ready
+            with `status: unavailable`.
+        max_age_seconds:
+          type: object
+          required: [fresh, grace, expired]
+          description: >
+            Maximum age in seconds of the last validated non-empty JWKS among
+            active remotes currently in each trust state.
+          properties:
+            fresh:
+              type: integer
+              format: uint64
+            grace:
+              type: integer
+              format: uint64
+            expired:
+              type: integer
+              format: uint64
 
     AiTranscriptAuditStatusSnapshot:
       type: object
@@ -12533,7 +12638,7 @@ components:
     # ── Runtime metrics ─────────────────────────────────────────────
     RuntimeMetricsSnapshot:
       type: object
-      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, overload]
+      required: [timestamp, uptime_seconds, mode, ferrum_version, system, http, errors, dns, connections, logs, plugin_triggers, overload]
       properties:
         timestamp:
           type: string
@@ -12558,8 +12663,42 @@ components:
           $ref: "#/components/schemas/RuntimeConnectionsSnapshot"
         logs:
           $ref: "#/components/schemas/RuntimeLogsSnapshot"
+        plugin_triggers:
+          $ref: "#/components/schemas/RuntimePluginTriggerSnapshot"
         overload:
           $ref: "#/components/schemas/OverloadSnapshot"
+
+    RuntimePluginTriggerSnapshot:
+      type: object
+      description: |
+        Fixed-cardinality counters for per-instance plugin execution-trigger
+        decision carriers. These counters carry no labels: no trigger input,
+        route, identity, header value, plugin-controlled string, or secret is
+        ever recorded. Monotonic for the process lifetime.
+      required: [skipped_terminal_log_hooks, skipped_session_hooks, missing_decision_carriers]
+      properties:
+        skipped_terminal_log_hooks:
+          type: integer
+          format: uint64
+          description: |
+            Terminal `log` / `log_with_mesh_key` invocations suppressed because
+            the transaction summary carried an explicit false decision for that
+            instance.
+        skipped_session_hooks:
+          type: integer
+          format: uint64
+          description: |
+            WebSocket-session and UDP/DTLS-flow hook sets suppressed because the
+            session carried an explicit false decision for that instance.
+        missing_decision_carriers:
+          type: integer
+          format: uint64
+          description: |
+            Contextless hooks that RAN because no decision was carried for the
+            instance. Backward compatible by design (missing state never
+            suppresses a security or audit hook); a sustained nonzero rate on a
+            triggered deployment means a summary or session path is not stamping
+            the carrier.
 
     RuntimeSystemSnapshot:
       type: object
@@ -16166,6 +16305,16 @@ components:
                 format: uint64
                 default: 300
                 description: DPoP jti replay cache TTL in seconds
+              jwks_max_stale_seconds:
+                type: integer
+                format: uint64
+                minimum: 1
+                maximum: 86400
+                description: >-
+                  Per-provider maximum monotonic age of the last validated
+                  non-empty remote JWKS. Overrides the plugin default. Zero is
+                  invalid and cannot disable bounded stale-key expiry. Applies
+                  only to jwks_uri and discovery_url sources.
           description: Array of identity provider configurations
         scope_claim:
           type: string
@@ -16208,8 +16357,22 @@ components:
         jwks_refresh_interval_secs:
           type: integer
           format: uint64
+          minimum: 1
+          maximum: 86400
           default: 900
-          description: JWKS key refresh interval in seconds
+          description: >-
+            JWKS key refresh interval in seconds. Must not exceed the effective
+            jwks_max_stale_seconds for any remote provider.
+        jwks_max_stale_seconds:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 86400
+          default: 3600
+          description: >-
+            Maximum monotonic age of the last validated non-empty remote JWKS.
+            Cached keys fail closed at this deadline even if refreshes keep
+            failing or return empty. Zero is invalid and cannot disable expiry.
 
     Oauth2IntrospectionConfig:
       type: object

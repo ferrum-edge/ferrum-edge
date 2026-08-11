@@ -1436,19 +1436,16 @@ fn traffic_policy_has_applied_fields(policy: &MeshTrafficPolicy) -> bool {
 }
 
 /// Where a `trafficPolicy` block sits in a DestinationRule. All supported HTTP
-/// connection-pool fields are preserved in every scope; the scope remains
-/// explicit because the apply layer gives subset policy its own precedence tier
-/// AND enforces a narrower field set there.
+/// connection-pool fields are preserved and enforced in every scope; the scope
+/// remains explicit because the apply layer gives subset policy its own
+/// precedence tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrafficPolicyScope {
     /// `spec.trafficPolicy` or a `spec.trafficPolicy.portLevelSettings[]` entry.
-    /// `connectionPool.http.{idleTimeout,http2MaxRequests,h2UpgradePolicy,
-    /// maxRetries,http1MaxPendingRequests}` are all projected here.
     TopLevelOrPort,
-    /// `spec.subsets[].trafficPolicy`. Only
-    /// `connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests}`
-    /// are projected (`ResolvedSubsetTrafficPolicy`); `idleTimeout` and
-    /// `http2MaxRequests` are warned about and reported deferred.
+    /// `spec.subsets[].trafficPolicy`. Same applied HTTP connection-pool fields
+    /// as top-level/port, resolved with field-level precedence
+    /// `portLevelSettings` > selected subset > top-level.
     Subset,
 }
 
@@ -1665,16 +1662,11 @@ fn parse_keepalive_duration_seconds(
 /// "block was present but no supported field was set" so the caller can skip
 /// emitting an empty overlay on the slice.
 ///
-/// **Exact enforcement scopes** — carriage is scope-uniform, enforcement is
-/// not:
-///
-/// * `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests` — enforced at
-///   top-level, `portLevelSettings`, AND subset scope.
-/// * `idleTimeout`, `http2MaxRequests` — enforced at top-level and
-///   `portLevelSettings` scope only. `ResolvedSubsetTrafficPolicy` carries
-///   neither, so a subset-scoped value is dropped by the apply layer; this
-///   function warns for it and `istio_status.rs` reports it in
-///   `status.ferrum.translation.deferred_fields`.
+/// All five applied fields are enforced at top-level, `portLevelSettings`, AND
+/// subset scope with field-level precedence
+/// `portLevelSettings` > selected subset > top-level. Reqwest's H2 path does
+/// not expose the same `http2MaxRequests` builder knob as direct-H2/native
+/// gRPC; that transport caveat is documented in `docs/mesh.md`.
 ///
 /// `maxRetries` semantics differ honestly from Envoy: Envoy's
 /// `connectionPool.http.maxRetries` is a cluster-wide outstanding-retry
@@ -1691,16 +1683,13 @@ fn parse_keepalive_duration_seconds(
 /// "upstream overflow" → 503). Scoped to the reqwest/H1 dispatch path; validated
 /// as a positive integer here (zero rejected) like the other uint32 knobs.
 ///
-/// `scope` selects the operator-visible warnings. Validation and carriage are
-/// identical in all scopes and cold-path apply resolves the exact
-/// `port-level > subset-level > top-level` precedence, but the subset apply
-/// layer projects only the three subset-enforced fields — so `Subset` scope
-/// additionally warns for `idleTimeout` / `http2MaxRequests`.
+/// `scope` is retained for call-site clarity; validation and carriage are
+/// identical in all scopes.
 fn translate_connection_pool_http(
     acc: &mut K8sAccumulator,
     object: &K8sObject,
     http: &Value,
-    scope: TrafficPolicyScope,
+    _scope: TrafficPolicyScope,
 ) -> Result<Option<crate::modes::mesh::config::MeshConnectionPoolHttp>, K8sTranslateError> {
     use crate::modes::mesh::config::MeshConnectionPoolHttp;
 
@@ -1724,26 +1713,6 @@ fn translate_connection_pool_http(
         Some(v) => Some(translate_http_uint32(object, "http2MaxRequests", v, false)?),
         None => None,
     };
-    // `idleTimeout` / `http2MaxRequests` are enforced at top-level and per-port
-    // scope, but the subset apply layer projects only `h2UpgradePolicy`,
-    // `maxRetries`, and `http1MaxPendingRequests` into
-    // `ResolvedSubsetTrafficPolicy` — a subset-scoped value here reaches no
-    // effective proxy. Say so instead of silently accepting an inert knob. Keep
-    // in sync with `DEFERRED_SUBSET_ONLY_CONNECTION_POOL_HTTP_FIELDS` in
-    // `src/k8s_controller/istio_status.rs`.
-    if matches!(scope, TrafficPolicyScope::Subset) {
-        for (field, present) in [
-            ("idleTimeout", idle_timeout_ms.is_some()),
-            ("http2MaxRequests", http2_max_requests.is_some()),
-        ] {
-            if present {
-                acc.warnings.push(format!(
-                    "DestinationRule {}/{}: subsets[].trafficPolicy.connectionPool.http.{field} is parsed and validated but not applied (subset-scoped {field} is unsupported); set it at trafficPolicy or portLevelSettings scope",
-                    object.metadata.namespace, object.metadata.name
-                ));
-            }
-        }
-    }
     let h2_upgrade_policy = match http.get("h2UpgradePolicy") {
         Some(v) => translate_h2_upgrade_policy(object, v)?,
         None => None,

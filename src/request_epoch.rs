@@ -1613,7 +1613,16 @@ impl RequestEpochStore {
         // ArcSwap still holds the last complete epoch, so continuing is safe.
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let current = self.current.load_full();
+        // Staging may tighten shared JWKS stores before this epoch publishes.
+        // Declare the rollback before `build` so a rejected or abandoned stage
+        // drops candidate plugin Arcs first, then restores the published
+        // requirements (Drop order is reverse declaration order).
+        let jwks_rollback =
+            crate::plugin_cache::StagedJwksPolicyRollback::for_published(&current.plugin_cache);
         let Some(staged) = build(&current)? else {
+            // No generation was published. Keep the rollback armed in case the
+            // builder acquired or tightened a shared store before deciding
+            // there was no epoch to install.
             return Ok(None);
         };
 
@@ -1662,6 +1671,7 @@ impl RequestEpochStore {
         // is still held so service discovery and config reloads cannot publish
         // newer epochs and then be overwritten by an older post-lock mirror.
         mirror(&next);
+        jwks_rollback.disarm();
         Ok(Some(next))
     }
 

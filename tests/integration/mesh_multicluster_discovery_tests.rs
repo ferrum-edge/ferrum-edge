@@ -20,6 +20,9 @@ use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, MeshSdTopology, Upstream, UpstreamLocalityLbSetting,
     UpstreamTarget,
 };
+use ferrum_edge::config_sources::k8s::{
+    GatewayApiListenerParentKind, gateway_api_listener_mesh_service_name,
+};
 use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::load_balancer::{HealthContext, LoadBalancerCache};
@@ -142,6 +145,88 @@ fn epoch_store(mesh: MeshConfig) -> Arc<RequestEpochStore> {
         &consumer_index,
         &load_balancer_cache,
     ))
+}
+
+/// The production multicluster merge indexes local services by
+/// `(namespace, name)`. Length-framed Gateway and ListenerSet identities must
+/// keep adversarial hyphen joins distinct through that real index, not only in
+/// the translator's source vector.
+#[test]
+fn gateway_listener_identities_survive_multicluster_service_keying() {
+    let gateway_ab_c =
+        gateway_api_listener_mesh_service_name(GatewayApiListenerParentKind::Gateway, "a-b", "c");
+    let gateway_a_bc =
+        gateway_api_listener_mesh_service_name(GatewayApiListenerParentKind::Gateway, "a", "b-c");
+    let listenerset_ab_c = gateway_api_listener_mesh_service_name(
+        GatewayApiListenerParentKind::ListenerSet,
+        "a-b",
+        "c",
+    );
+    let listenerset_a_bc = gateway_api_listener_mesh_service_name(
+        GatewayApiListenerParentKind::ListenerSet,
+        "a",
+        "b-c",
+    );
+
+    let mut local_services = vec![
+        service(&gateway_ab_c, &[]),
+        service(&gateway_a_bc, &[]),
+        service(&listenerset_ab_c, &[]),
+        service(&listenerset_a_bc, &[]),
+    ];
+    for (service, port) in local_services
+        .iter_mut()
+        .zip([80_u16, 81_u16, 8080_u16, 8081_u16])
+    {
+        service.ports[0].port = port;
+    }
+
+    let gateway_remote_id = "spiffe://remote.local/ns/default/sa/gateway";
+    let listenerset_remote_id = "spiffe://remote.local/ns/default/sa/listenerset";
+    let snapshot = remote_snapshot(RemoteClusterEndpoints {
+        workloads: Vec::new(),
+        services: vec![
+            service(&gateway_ab_c, &[gateway_remote_id]),
+            service(&listenerset_ab_c, &[listenerset_remote_id]),
+        ],
+    });
+
+    let (_, merged) = merge_remote_endpoints_into_mesh(
+        &[],
+        &local_services,
+        &snapshot,
+        Some(&admitting_candidate()),
+        true,
+    );
+
+    let by_port = |port| {
+        merged
+            .iter()
+            .find(|service| service.ports[0].port == port)
+            .unwrap_or_else(|| panic!("service on port {port}"))
+    };
+    assert_eq!(by_port(80).name, gateway_ab_c);
+    assert_eq!(by_port(81).name, gateway_a_bc);
+    assert_eq!(by_port(8080).name, listenerset_ab_c);
+    assert_eq!(by_port(8081).name, listenerset_a_bc);
+    assert_eq!(
+        by_port(80).workloads[0].spiffe_id,
+        spiffe(gateway_remote_id),
+        "the Gateway remote ref must merge into the exact parent/listener service"
+    );
+    assert!(
+        by_port(81).workloads.is_empty(),
+        "the adversarial Gateway sibling must not receive the other listener's ref"
+    );
+    assert_eq!(
+        by_port(8080).workloads[0].spiffe_id,
+        spiffe(listenerset_remote_id),
+        "the ListenerSet remote ref must merge into the exact parent/listener service"
+    );
+    assert!(
+        by_port(8081).workloads.is_empty(),
+        "the adversarial ListenerSet sibling must not receive the other listener's ref"
+    );
 }
 
 /// The discoverer resolves BOTH local and remote workloads for a service, and

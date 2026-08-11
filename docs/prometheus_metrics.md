@@ -215,6 +215,10 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_database_delta_rejections_total` | counter | `resource_category`, `namespace` | `database_polling` | `documented_only` | `conditional` | Database incremental deltas rejected by validation, bucketed by bounded resource category. |
 | `ferrum_database_poll_last_completed_timestamp_seconds` | gauge | `namespace` | `database_polling` | `documented_only` | `conditional` | Unix timestamp of the most recently completed database/CP config poll attempt (including empty success). |
 | `ferrum_edge_overhead_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Gateway overhead (excluding backend and plugins) in milliseconds. |
+| `ferrum_jwks_consecutive_failures` | gauge | `class` | `jwks` | `documented_only` | `always` | Maximum current consecutive failures among active remote stores by fixed failure class. |
+| `ferrum_jwks_refresh_failures_total` | counter | `class` | `jwks` | `documented_only` | `always` | Remote JWKS refresh failures by fixed failure class. |
+| `ferrum_jwks_trust_age_seconds` | gauge | `state` | `jwks` | `documented_only` | `always` | Maximum age of the last validated non-empty JWKS among active remote stores in each trust state. |
+| `ferrum_jwks_trust_stores` | gauge | `state` | `jwks` | `documented_only` | `always` | Active remote JWKS stores by bounded trust state. |
 | `ferrum_kafka_logging_accepting` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation still admits new records. |
 | `ferrum_kafka_logging_healthy` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Whether the Kafka logging generation recovered from its latest failure. |
 | `ferrum_kafka_logging_in_flight` | gauge | `generation` | `kafka_logging` | `documented_only` | `when_plugin_enabled` | Records waiting in librdkafka for terminal delivery. |
@@ -340,6 +344,13 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_request_mirror_request_failures_total` | counter | `namespace` | `request_mirror` | `documented_only` | `always` | request_mirror pre-response transport failures (DNS, refused, reset, TLS, …). |
 | `ferrum_request_mirror_request_timeouts_total` | counter | `namespace` | `request_mirror` | `documented_only` | `always` | request_mirror request-phase deadline expiries (connect/headers/body). |
 | `ferrum_requests_total` | counter | `proxy_id`, `method`, `status_code`, `grpc_status`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Total number of requests processed. |
+| `ferrum_service_discovery_body_budget_rejected_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery HTTP responses rejected because the concurrent body budget was exhausted. |
+| `ferrum_service_discovery_cursor_advance_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery blocking-query cursor advances after an admitted higher-index snapshot. |
+| `ferrum_service_discovery_cursor_rollback_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery blocking-query cursor rollbacks after an admitted lower-index snapshot. |
+| `ferrum_service_discovery_malformed_envelope_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery Kubernetes EndpointSliceList envelopes rejected as malformed. |
+| `ferrum_service_discovery_provider_normalization_rejected_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery snapshots rejected because every provider catalog entry failed provider normalization. |
+| `ferrum_service_discovery_response_oversized_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery HTTP responses rejected for oversized or ambiguous body bounds. |
+| `ferrum_service_discovery_shared_admission_rejected_total` | counter | `namespace` | `service_discovery` | `documented_only` | `always` | Service-discovery snapshots rejected by shared host/egress target admission. |
 | `ferrum_stream_connections_total` | counter | `proxy_id`, `protocol`, `namespace` | `stream` | `dashboard` | `conditional` | Total stream connections (TCP/UDP). |
 | `ferrum_stream_disconnects_total` | counter | `proxy_id`, `protocol`, `cause`, `direction`, `namespace` | `stream` | `dashboard` | `conditional` | Stream disconnects (TCP/UDP) by cause and direction. |
 | `ferrum_stream_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `stream` | `documented_only` | `conditional` | Stream connection duration in milliseconds. |

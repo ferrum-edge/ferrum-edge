@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
-use crate::config::types::GatewayConfig;
 use crate::config_sources::k8s::backend_tls_policy::{
     MAX_POLICY_ANCESTORS, policy_status_ancestor_capacity, policy_status_ancestor_services,
 };
@@ -1255,7 +1254,7 @@ fn gateway_status(
     let references = gateway_reference_status(object, indexes);
     let (accepted, materialized, resolved_refs, programmed, message) = match result {
         Ok(translation) => {
-            let materialized = gateway_programmed(object, &translation.config);
+            let materialized = gateway_programmed(object, translation);
             (
                 true,
                 materialized,
@@ -1807,7 +1806,6 @@ fn gateway_listener_statuses(
     gateway_accepted: bool,
     data_plane_ready: bool,
 ) -> Vec<Value> {
-    let config = translation.map(|translation| &translation.config);
     gateway
         .spec
         .get("listeners")
@@ -1868,8 +1866,9 @@ fn gateway_listener_statuses(
             let accepted = spec_accepted && physical_conflict.is_none();
             let resolved_refs =
                 spec_accepted && references.resolved && route_kinds.route_kinds_valid;
-            let materialized = config
-                .is_some_and(|config| gateway_listener_programmed(gateway, listener, config));
+            let materialized = translation.is_some_and(|translation| {
+                gateway_listener_programmed(gateway, listener, translation)
+            });
             let programmed = resolved_refs
                 && materialized
                 && data_plane_ready
@@ -3536,35 +3535,32 @@ fn route_parent_ref_key_for_namespace(route_namespace: &str, parent_ref: &Value)
     format!("{group}/{kind}/{namespace}/{name}/{section}/{port}")
 }
 
-fn gateway_programmed(object: &K8sObject, config: &GatewayConfig) -> bool {
+fn gateway_programmed(object: &K8sObject, translation: &K8sTranslation) -> bool {
     let Some(listeners) = object.spec.get("listeners").and_then(Value::as_array) else {
         return false;
     };
     listeners
         .iter()
-        .any(|listener| gateway_listener_programmed(object, listener, config))
+        .any(|listener| gateway_listener_programmed(object, listener, translation))
 }
 
 fn gateway_listener_programmed(
     object: &K8sObject,
     listener: &Value,
-    config: &GatewayConfig,
+    translation: &K8sTranslation,
 ) -> bool {
-    // Mesh services derived from this Gateway are named `{gateway.name}-{listener.name}`
-    // (see `mesh_services_from_gateway` in `gateway_api.rs`). Use exact match against
-    // the listener name to avoid a false positive when another Gateway's name is a
-    // prefix of this one (e.g. `edge` matching `edge-internal-http`).
-    let Some(mesh) = config.mesh.as_ref() else {
-        return false;
-    };
     let listener_name = listener
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or("listener");
-    let expected = format!("{}-{}", object.metadata.name, listener_name);
-    mesh.services
-        .iter()
-        .any(|service| service.namespace == object.metadata.namespace && service.name == expected)
+    translation.materialized_gateway_listeners.contains(
+        &crate::config_sources::k8s::GatewayApiListenerKey {
+            namespace: object.metadata.namespace.clone(),
+            parent_kind: GatewayApiListenerParentKind::Gateway,
+            gateway: object.metadata.name.clone(),
+            listener: listener_name.to_string(),
+        },
+    )
 }
 
 fn route_unresolved_backend_ref_reason(

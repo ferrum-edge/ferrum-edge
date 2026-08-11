@@ -27,6 +27,9 @@ fn make_summary(
     backend_ms: f64,
 ) -> TransactionSummary {
     TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         timestamp_received: "2025-01-01T00:00:00Z".to_string(),
         client_ip: "127.0.0.1".to_string(),
@@ -1147,6 +1150,49 @@ fn request_mirror_lifecycle_counters_carry_namespace_label_when_configured() {
     registry.record_request_mirror_dispatched();
     let output = registry.render_uncached();
     assert!(output.contains(r#"ferrum_request_mirror_dispatched_total{namespace="staging"} 1"#));
+}
+
+#[test]
+fn service_discovery_cursor_and_rejection_counters_are_label_safe_and_rendered() {
+    let registry = MetricsRegistry::new();
+    registry.record_service_discovery_provider_normalization_rejected();
+    registry.record_service_discovery_provider_normalization_rejected();
+    registry.record_service_discovery_shared_admission_rejected();
+    registry.record_service_discovery_cursor_advance();
+    registry.record_service_discovery_cursor_advance();
+    registry.record_service_discovery_cursor_advance();
+    registry.record_service_discovery_cursor_rollback();
+    registry.record_service_discovery_response_oversized();
+    registry.record_service_discovery_body_budget_rejected();
+    registry.record_service_discovery_malformed_envelope();
+
+    let output = registry.render_uncached();
+    assert!(output.contains("ferrum_service_discovery_provider_normalization_rejected_total 2"));
+    assert!(output.contains("ferrum_service_discovery_shared_admission_rejected_total 1"));
+    assert!(output.contains("ferrum_service_discovery_cursor_advance_total 3"));
+    assert!(output.contains("ferrum_service_discovery_cursor_rollback_total 1"));
+    assert!(output.contains("ferrum_service_discovery_response_oversized_total 1"));
+    assert!(output.contains("ferrum_service_discovery_body_budget_rejected_total 1"));
+    assert!(output.contains("ferrum_service_discovery_malformed_envelope_total 1"));
+    // No unbounded dimensions: scope the check to these families because unrelated
+    // registry metrics legitimately carry labels with the same names.
+    for line in output
+        .lines()
+        .filter(|line| line.starts_with("ferrum_service_discovery_"))
+    {
+        assert!(
+            !line.contains("reason="),
+            "service-discovery metric exposed a raw rejection reason: {line}"
+        );
+        assert!(
+            !line.contains("index="),
+            "service-discovery metric exposed a raw cursor index: {line}"
+        );
+        assert!(
+            !line.contains("upstream="),
+            "service-discovery metric exposed an upstream identity: {line}"
+        );
+    }
 }
 
 #[test]

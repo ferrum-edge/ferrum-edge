@@ -71,11 +71,75 @@ use super::proto::{
     X509svid, X509svidRequest, X509svidResponse,
 };
 use crate::identity::attestation::{Attestor, PeerInfo, attest_chain};
-use crate::identity::ca::{CertificateAuthority, IssuanceRequest, PublishedJwtAuthority};
+use crate::identity::ca::{CaError, CertificateAuthority, IssuanceRequest, PublishedJwtAuthority};
 use crate::identity::jwt_svid::{
     self, DEFAULT_JWT_SVID_TTL_SECS, JwtSvidError, MAX_JWT_BUNDLE_TRUST_DOMAINS,
 };
 use crate::identity::spiffe::TrustDomain;
+
+/// Fixed-cardinality class label for a [`CaError`] variant.
+///
+/// Used only in structured server logs/metrics. Never interpolate the
+/// arbitrary inner `CaError` string — those payloads can carry credentials,
+/// provider responses, URLs, paths, mounts, roles, trust domains, or OS detail.
+fn ca_error_class(error: &CaError) -> &'static str {
+    match error {
+        CaError::Config(_) => "config",
+        CaError::BadCsr(_) => "bad_csr",
+        CaError::UnknownTrustDomain(_) => "unknown_trust_domain",
+        CaError::Upstream(_) => "upstream",
+        CaError::Internal(_) => "internal",
+        CaError::Io(_) => "io",
+    }
+}
+
+/// Map a CA failure onto a stable client-visible gRPC status at the Workload
+/// API trust boundary.
+///
+/// Logs only fixed-cardinality `operation` + `error_class` fields. The
+/// arbitrary inner `CaError` string stays server-side and is never copied into
+/// the status message (or into log/metric label values).
+fn ca_status(operation: &'static str, error: &CaError) -> Status {
+    let error_class = ca_error_class(error);
+    match error {
+        CaError::BadCsr(_) => {
+            warn!(
+                operation,
+                error_class, "certificate authority rejected certificate request"
+            );
+            Status::invalid_argument("certificate request rejected")
+        }
+        CaError::UnknownTrustDomain(_) => {
+            warn!(
+                operation,
+                error_class, "certificate authority rejected trust domain"
+            );
+            Status::permission_denied("trust domain not authorized")
+        }
+        CaError::Upstream(_) => {
+            error!(operation, error_class, "certificate authority unavailable");
+            Status::unavailable("certificate authority unavailable")
+        }
+        CaError::Config(_) | CaError::Internal(_) | CaError::Io(_) => {
+            error!(
+                operation,
+                error_class, "certificate authority operation failed"
+            );
+            Status::internal("certificate authority operation failed")
+        }
+    }
+}
+
+/// Structured rotation-path log for a CA failure that must not terminate a
+/// healthy Workload API stream. Same redaction contract as [`ca_status`]:
+/// fixed-cardinality fields only — never the raw `CaError` detail.
+fn warn_ca_rotation_failure(rpc: &'static str, error: &CaError) {
+    warn!(
+        rpc,
+        error_class = ca_error_class(error),
+        "rotation push failed"
+    );
+}
 
 const WORKLOAD_METADATA_KEY: &str = "workload.spiffe.io";
 const WORKLOAD_METADATA_VAL: &str = "true";
@@ -351,23 +415,20 @@ impl WorkloadApiService {
                 ttl_secs: self.svid_ttl_secs,
             })
             .await
-            .map_err(|e| {
-                error!(error = %e, "CA failed to issue SVID");
-                Status::internal(format!("CA failed: {e}"))
-            })?;
+            .map_err(|e| ca_status("issue_svid", &e))?;
 
         let bundle = self
             .ca
             .trust_bundle(&self.trust_domain)
             .await
-            .map_err(|e| Status::internal(format!("CA bundle fetch failed: {e}")))?;
+            .map_err(|e| ca_status("trust_bundle", &e))?;
 
         let chain_concat: Vec<u8> = svid.cert_chain_der.iter().flatten().copied().collect();
         let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
         let federated_bundles =
             Self::build_federated_x509_bundle_map(&self.ca, &self.federated_trust_domains)
                 .await
-                .map_err(|e| Status::internal(format!("CA federated bundle fetch failed: {e}")))?;
+                .map_err(|e| ca_status("federated_trust_bundle", &e))?;
 
         let proto_svid = X509svid {
             spiffe_id: svid.spiffe_id.to_string(),
@@ -401,21 +462,18 @@ impl WorkloadApiService {
                 ttl_secs,
             })
             .await
-            .map_err(|e| {
-                error!(error = %e, "CA failed to issue SVID");
-                Status::internal(format!("CA failed: {e}"))
-            })?;
+            .map_err(|e| ca_status("issue_svid", &e))?;
 
         let bundle = ca
             .trust_bundle(trust_domain)
             .await
-            .map_err(|e| Status::internal(format!("CA bundle fetch failed: {e}")))?;
+            .map_err(|e| ca_status("trust_bundle", &e))?;
 
         let chain_concat: Vec<u8> = svid.cert_chain_der.iter().flatten().copied().collect();
         let bundle_concat: Vec<u8> = bundle.roots_der.iter().flatten().copied().collect();
         let federated_bundles = Self::build_federated_x509_bundle_map(ca, federated_trust_domains)
             .await
-            .map_err(|e| Status::internal(format!("CA federated bundle fetch failed: {e}")))?;
+            .map_err(|e| ca_status("federated_trust_bundle", &e))?;
 
         let proto_svid = X509svid {
             spiffe_id: svid.spiffe_id.to_string(),
@@ -490,19 +548,19 @@ impl WorkloadApiService {
         ca: &Arc<dyn CertificateAuthority>,
         trust_domain: &TrustDomain,
         federated_trust_domains: &[TrustDomain],
-    ) -> Result<BTreeMap<TrustDomain, Vec<PublishedJwtAuthority>>, JwtSvidError> {
+    ) -> Result<BTreeMap<TrustDomain, Vec<PublishedJwtAuthority>>, Status> {
         let mut bundles: BTreeMap<TrustDomain, Vec<PublishedJwtAuthority>> = BTreeMap::new();
 
-        let local = ca.jwt_authorities(trust_domain).await.map_err(|e| {
-            warn!(error = %e, "CA failed to publish local JWT authorities");
-            JwtSvidError::Internal("CA failed to publish JWT authorities".to_string())
-        })?;
+        let local = ca
+            .jwt_authorities(trust_domain)
+            .await
+            .map_err(|e| ca_status("jwt_authorities", &e))?;
         if local.is_empty() {
-            return Err(JwtSvidError::NoJwtAuthority(
+            return Err(jwt_svid_status(JwtSvidError::NoJwtAuthority(
                 "the active identity backend publishes no JWT authority for this trust domain",
-            ));
+            )));
         }
-        jwt_svid::validate_published_authorities(trust_domain, &local)?;
+        jwt_svid::validate_published_authorities(trust_domain, &local).map_err(jwt_svid_status)?;
         bundles.insert(trust_domain.clone(), local);
 
         // Bounded by the ITERATION, not by how many bundles came back: counting
@@ -519,16 +577,20 @@ impl WorkloadApiService {
             }
             match ca.jwt_authorities(federated).await {
                 Ok(authorities) if !authorities.is_empty() => {
-                    jwt_svid::validate_published_authorities(federated, &authorities)?;
+                    jwt_svid::validate_published_authorities(federated, &authorities)
+                        .map_err(jwt_svid_status)?;
                     bundles.insert(federated.clone(), authorities);
                 }
                 // No authorities published for this federation peer — publish
                 // nothing for it rather than an empty (misleading) entry.
                 Ok(_) => {}
                 Err(e) => {
+                    // Federation is best-effort: omit the peer rather than
+                    // failing the local bundle. Log only the fixed error class
+                    // — never the raw CaError payload (and never echo the
+                    // rejected trust-domain value from the error itself).
                     debug!(
-                        trust_domain = %federated,
-                        error = %e,
+                        error_class = ca_error_class(&e),
                         "federated JWT authorities unavailable; omitting from JWT bundles"
                     );
                 }
@@ -544,20 +606,20 @@ impl WorkloadApiService {
         ca: &Arc<dyn CertificateAuthority>,
         trust_domain: &TrustDomain,
         federated_trust_domains: &[TrustDomain],
-    ) -> Result<JwtBundlesResponse, JwtSvidError> {
+    ) -> Result<JwtBundlesResponse, Status> {
         let authorities =
             Self::collect_jwt_authorities(ca, trust_domain, federated_trust_domains).await?;
         let mut bundles = HashMap::with_capacity(authorities.len());
         for (domain, published) in &authorities {
             // A malformed authority is refused before publication rather than
             // shipped to workloads as trust material.
-            let jwks = jwt_svid::jwks_document(published)?;
+            let jwks = jwt_svid::jwks_document(published).map_err(jwt_svid_status)?;
             bundles.insert(domain.to_string(), jwks);
         }
         if bundles.is_empty() {
-            return Err(JwtSvidError::NoJwtAuthority(
+            return Err(jwt_svid_status(JwtSvidError::NoJwtAuthority(
                 "no JWT bundle could be published for this trust domain",
-            ));
+            )));
         }
         Ok(JwtBundlesResponse { bundles })
     }
@@ -720,6 +782,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
                     Err(e) => {
                         // Transient CA failures are not entitlement denials;
                         // keep the stream open and retry on the next epoch.
+                        // `e` is already a redacted Status from `ca_status`.
                         warn!(error = %e, "rotation push failed for FetchX509SVID stream");
                     }
                 }
@@ -748,7 +811,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
             &self.federated_trust_domains,
         )
         .await
-        .map_err(|e| Status::internal(format!("CA bundle fetch failed: {e}")))?;
+        .map_err(|e| ca_status("trust_bundle", &e))?;
 
         let ca = Arc::clone(&self.ca);
         let td = self.trust_domain.clone();
@@ -779,7 +842,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
                         }
                     }
                     Err(e) => {
-                        warn!(error = %e, "rotation push failed for FetchX509Bundles stream");
+                        warn_ca_rotation_failure("FetchX509Bundles", &e);
                     }
                 }
             }
@@ -865,8 +928,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
             &self.trust_domain,
             &self.federated_trust_domains,
         )
-        .await
-        .map_err(jwt_svid_status)?;
+        .await?;
         let mut last_published = Self::jwt_bundles_fingerprint(&initial);
 
         let ca = Arc::clone(&self.ca);
@@ -911,6 +973,8 @@ impl SpiffeWorkloadApi for WorkloadApiService {
                         // and tearing the stream down would strand the
                         // workload without bundles it already validated
                         // against. Never publish a partial or empty map.
+                        // `e` is already a redacted Status (ca_status /
+                        // jwt_svid_status).
                         warn!(error = %e, "rotation push failed for FetchJWTBundles stream");
                     }
                 }
@@ -935,8 +999,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
             &self.trust_domain,
             &self.federated_trust_domains,
         )
-        .await
-        .map_err(jwt_svid_status)?;
+        .await?;
 
         let validated =
             jwt_svid::validate_jwt_svid(&req.svid, &req.audience, &bundles).map_err(|e| {

@@ -462,7 +462,7 @@ fn invalid_listener_does_not_block_valid_sibling_listener() {
         .iter()
         .map(|service| service.name.as_str())
         .collect();
-    assert_eq!(service_names, vec!["edge-public"]);
+    assert_eq!(service_names, vec!["gateway-4-edge-public"]);
 
     let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
     let status = &updates

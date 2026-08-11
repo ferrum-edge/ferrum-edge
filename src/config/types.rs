@@ -483,6 +483,18 @@ pub struct SubsetTrafficPolicy {
     /// sibling subsets cannot consume one another's allowance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http1_max_pending_requests: Option<u32>,
+    /// Subset-scoped HTTP idle timeout (ms), mapped from DestinationRule
+    /// `subsets[].trafficPolicy.connectionPool.http.idleTimeout`. Overlaid onto
+    /// the selected proxy's inherited dispatch fallback and projected onto
+    /// `Proxy.pool_idle_timeout_seconds` like the top-level/per-port form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_idle_timeout_ms: Option<u64>,
+    /// Subset-scoped HTTP/2 concurrent-streams cap, mapped from DestinationRule
+    /// `subsets[].trafficPolicy.connectionPool.http.http2MaxRequests`. Overlaid
+    /// onto the selected proxy's inherited dispatch fallback and projected onto
+    /// `Proxy.pool_http2_max_concurrent_streams` like the top-level/per-port form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2_max_concurrent_streams: Option<u32>,
     /// Per-subset passive health (Istio `subsets[].trafficPolicy.outlierDetection`),
     /// already resolved from the Istio outlier shape. The ejection *thresholds*
     /// (consecutive errors, interval, base-ejection time, min-health) are
@@ -645,9 +657,9 @@ pub struct UpstreamPortOverride {
     /// On the reqwest pool this value is part of the client-behavior (`rcfg`)
     /// pool-key segment, so divergent per-port idle timeouts isolate distinct
     /// shared clients rather than first-creator-wins leaking. Direct-H2 / gRPC
-    /// pool keys still exclude several builder-only knobs (see those pools'
-    /// first-materializer notes). Request-only connect timeouts remain
-    /// per-request and do not fragment any pool.
+    /// pool keys carry the selected subset and the effective H2 stream cap;
+    /// request-only connect timeouts remain per-request and do not fragment
+    /// any pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_idle_timeout_ms: Option<u64>,
     /// Per-port HTTP/2 concurrent-streams cap mapped from DestinationRule
@@ -656,8 +668,11 @@ pub struct UpstreamPortOverride {
     /// into the H2/gRPC backend builders via
     /// `http2::Builder::max_concurrent_streams` (peer SETTINGS) and
     /// `initial_max_send_streams` (local outbound-stream initial cap).
-    /// Applies to direct-H2 and gRPC pool entries; reqwest's H2 path does
-    /// not expose the same builder knob today.
+    /// Applies to direct-H2 and gRPC pool entries; those pools include the
+    /// effective value in their base keys (`none` when unset) so update/delete
+    /// cannot reuse a connection built under a prior limit. Reqwest's H2 path
+    /// does not expose the same builder knob today and therefore does not
+    /// key on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub h2_max_concurrent_streams: Option<u32>,
     /// Per-port backend TLS posture, mapped from DestinationRule
@@ -873,6 +888,12 @@ impl ResolvedPortOverride {
         if let Some(pending) = subset.http1_max_pending_requests {
             self.http1_max_pending_requests = Some(pending);
         }
+        if let Some(idle_ms) = subset.http_idle_timeout_ms {
+            self.http_idle_timeout_ms = Some(idle_ms);
+        }
+        if let Some(max_streams) = subset.h2_max_concurrent_streams {
+            self.h2_max_concurrent_streams = Some(max_streams);
+        }
     }
 }
 
@@ -928,7 +949,9 @@ pub(crate) fn dispatch_port_override_fallback_for_selected_subset(
     if let Some(subset_policy) = subset_policy
         && (subset_policy.h2_upgrade_policy.is_some()
             || subset_policy.max_retries.is_some()
-            || subset_policy.http1_max_pending_requests.is_some())
+            || subset_policy.http1_max_pending_requests.is_some()
+            || subset_policy.http_idle_timeout_ms.is_some()
+            || subset_policy.h2_max_concurrent_streams.is_some())
     {
         inherited
             .get_or_insert_with(ResolvedPortOverride::default)
@@ -989,6 +1012,10 @@ pub struct ResolvedSubsetTrafficPolicy {
     pub max_retries: Option<u32>,
     /// Subset-scoped concurrent in-flight HTTP/1.1 cap.
     pub http1_max_pending_requests: Option<u32>,
+    /// Subset-scoped HTTP idle timeout (milliseconds).
+    pub http_idle_timeout_ms: Option<u64>,
+    /// Subset-scoped HTTP/2 concurrent-streams cap.
+    pub h2_max_concurrent_streams: Option<u32>,
 }
 
 impl ResolvedSubsetTrafficPolicy {
@@ -1000,6 +1027,8 @@ impl ResolvedSubsetTrafficPolicy {
         h2_upgrade_policy: Option<H2UpgradePolicy>,
         max_retries: Option<u32>,
         http1_max_pending_requests: Option<u32>,
+        http_idle_timeout_ms: Option<u64>,
+        h2_max_concurrent_streams: Option<u32>,
     ) -> Option<Self> {
         let resolved = Self {
             tls,
@@ -1007,6 +1036,8 @@ impl ResolvedSubsetTrafficPolicy {
             h2_upgrade_policy,
             max_retries,
             http1_max_pending_requests,
+            http_idle_timeout_ms,
+            h2_max_concurrent_streams,
         };
         (!resolved.is_empty()).then_some(resolved)
     }
@@ -1017,6 +1048,8 @@ impl ResolvedSubsetTrafficPolicy {
             && self.h2_upgrade_policy.is_none()
             && self.max_retries.is_none()
             && self.http1_max_pending_requests.is_none()
+            && self.http_idle_timeout_ms.is_none()
+            && self.h2_max_concurrent_streams.is_none()
     }
 }
 
@@ -1719,10 +1752,11 @@ pub struct Upstream {
     /// Inherited (non-`portLevelSettings`) DestinationRule
     /// `connectionPool.http` overlay.
     ///
-    /// This carries the top-level block for service-discovery upstreams and the
-    /// three subset-inheritable fields (`h2UpgradePolicy`, `maxRetries`, and
-    /// `http1MaxPendingRequests`) for every upstream. During proxy projection a
-    /// selected subset overlays those three fields onto this base. Dispatch
+    /// This carries the top-level `connectionPool.http` block for every
+    /// upstream (including the five subset-inheritable fields:
+    /// `h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`,
+    /// `idleTimeout`, and `http2MaxRequests`). During proxy projection a
+    /// selected subset overlays those fields onto this base. Dispatch
     /// merges an explicit per-port entry first, then this inherited fallback,
     /// giving exact `port-level > subset-level > top-level` field precedence.
     /// Not serialized — derived from the matching DestinationRule.
@@ -2370,8 +2404,10 @@ pub struct Proxy {
     /// `GatewayConfig::resolve_dispatch_port_overrides()`.
     ///
     /// Service-discovery upstreams use this because target ports resolve at
-    /// runtime. All upstreams also use it for the subset-inheritable fields,
-    /// after the selected subset has overlaid the top-level values. The
+    /// runtime. All upstreams also use it for the subset-inheritable HTTP
+    /// fields (`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`,
+    /// `idleTimeout`, `http2MaxRequests`), after the selected subset has
+    /// overlaid the top-level values. The
     /// HTTP-family dispatch resolvers
     /// (`resolve_effective_proxy_for_target` / `cap_proxy_retry_for_target`)
     /// fall back to this overlay when the LB-selected target port has no
@@ -3017,7 +3053,8 @@ impl FrontendTlsCertificateSource {
     }
 }
 
-/// Upper bound on Gateway-delivered frontend TLS certificates in one snapshot.
+/// Upper bound on Gateway-delivered frontend TLS certificates per serving
+/// namespace in one snapshot.
 ///
 /// The data plane materializes every entry into a resident rustls
 /// `CertifiedKey` and an SNI index, so the set has to be bounded by config
@@ -3884,10 +3921,10 @@ impl GatewayConfig {
             .filter(|(_, m)| !m.is_empty())
             .collect();
 
-        // Inherited top-level `connectionPool.http` fallback. The three fields
-        // supported at subset scope are overlaid per proxy via the shared
-        // selected-subset helper so admission and runtime stay aligned. The
-        // per-port map stays separate and is consulted first at dispatch,
+        // Inherited top-level `connectionPool.http` fallback. All five applied
+        // HTTP fields supported at subset scope are overlaid per proxy via the
+        // shared selected-subset helper so admission and runtime stay aligned.
+        // The per-port map stays separate and is consulted first at dispatch,
         // preserving port > subset > top-level.
         let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
             .upstreams
@@ -8804,6 +8841,14 @@ impl Upstream {
                         "http1_max_pending_requests",
                         policy.http1_max_pending_requests.is_some(),
                     ),
+                    (
+                        "http_idle_timeout_ms",
+                        policy.http_idle_timeout_ms.is_some(),
+                    ),
+                    (
+                        "h2_max_concurrent_streams",
+                        policy.h2_max_concurrent_streams.is_some(),
+                    ),
                 ] {
                     if configured {
                         errors.push(format!(
@@ -9539,11 +9584,18 @@ impl GatewayConfig {
     ) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        if self.frontend_tls_certificate_sources.len() > MAX_FRONTEND_TLS_CERTIFICATE_SOURCES {
-            errors.push(format!(
-                "Gateway frontend TLS certificate source set exceeds the {} source admission limit; refusing the snapshot rather than serving a partial listener set",
-                MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
-            ));
+        let mut frontend_tls_sources_by_namespace = std::collections::HashMap::new();
+        for source in &self.frontend_tls_certificate_sources {
+            let count = frontend_tls_sources_by_namespace
+                .entry(source.namespace.as_str())
+                .or_insert(0usize);
+            *count += 1;
+            if *count == MAX_FRONTEND_TLS_CERTIFICATE_SOURCES + 1 {
+                errors.push(format!(
+                    "Gateway frontend TLS certificate source set for namespace '{}' exceeds the {} source admission limit; refusing the snapshot rather than serving a partial listener set",
+                    source.namespace, MAX_FRONTEND_TLS_CERTIFICATE_SOURCES
+                ));
+            }
         }
 
         // Shared cache: when multiple proxies reference the same TLS file path,

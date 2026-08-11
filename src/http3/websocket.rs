@@ -788,9 +788,13 @@ pub(crate) async fn handle_h3_websocket(
     // setup failures when `retry_on_connect_failure` is enabled, and rotate
     // upstream targets through the same load-balancer cache. Backend-side
     // upgrade rejections are post-wire and must not be replayed.
+    // Same admission point as H1/H2: a skipped size-limit instance must not
+    // constrain either framer (issue #3734). Memoized on the upgrade context.
+    let ws_size_limit_plugins =
+        crate::proxy::collect_websocket_size_limit_plugins(&plugins, &mut ctx);
     let ws_size_limits = crate::proxy::EffectiveWsSizeLimits::from_plugins(
         state.max_websocket_frame_size_bytes,
-        &plugins,
+        &ws_size_limit_plugins,
     );
     let mut current_backend_url = backend_url;
     // The target selection bound this request to, retained across the retry
@@ -1538,13 +1542,15 @@ pub(crate) async fn handle_h3_websocket(
     }));
 
     // ── Collect parsed-relay and disconnect plugin lists ────────────
-    let (ws_framing_plugins, ws_frame_plugins) =
-        crate::proxy::collect_websocket_relay_plugins(&plugins, requires_websocket_framing, &ctx);
-    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> = plugins
-        .iter()
-        .filter(|p| p.requires_ws_disconnect_hooks())
-        .cloned()
-        .collect();
+    let (ws_framing_plugins, ws_frame_plugins) = crate::proxy::collect_websocket_relay_plugins(
+        &plugins,
+        requires_websocket_framing,
+        &mut ctx,
+    );
+    // Same per-instance admission decision as the frame path, so an instance
+    // skipped for frames is skipped for disconnect on H3 Extended CONNECT too.
+    let ws_disconnect_plugins: Vec<Arc<dyn Plugin>> =
+        crate::proxy::collect_websocket_disconnect_plugins(&plugins, &mut ctx);
 
     let proxy_id_for_relay = proxy.id.clone();
     // Allocate before building session_meta so framed disconnect hooks receive

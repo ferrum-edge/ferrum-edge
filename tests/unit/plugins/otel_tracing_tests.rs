@@ -36,6 +36,9 @@ fn make_ctx() -> RequestContext {
 
 fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
     TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         timestamp_received: "2026-03-23T12:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),
@@ -173,6 +176,9 @@ fn otlp_resource_string_attr<'a>(payload: &'a Value, key: &str) -> Option<&'a st
 
 fn make_rich_summary(metadata: HashMap<String, String>) -> TransactionSummary {
     TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".to_string(),
         timestamp_received: "2026-03-23T12:00:00Z".to_string(),
         client_ip: "10.0.0.1".to_string(),

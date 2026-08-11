@@ -2026,8 +2026,19 @@ async fn handle_admin_request_inner(
             .serving_degraded
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Acquire));
-        let ready = startup_ready && !serving_degraded;
+        // Active remote JWKS trust aggregate (issue #3739). O(1) ArcSwap load
+        // with monotonic deadline comparison — never scans stores or URLs on
+        // the probe path. Expired active remotes fail readiness; grace keeps
+        // ready but marks degraded. Inline JWKS never participates.
+        let jwks_trust = crate::plugins::utils::jwks_cache::trust_health_snapshot();
+        let jwks_now = tokio::time::Instant::now();
+        let jwks_ready = jwks_trust.ready(jwks_now);
+        let jwks_degraded = jwks_trust.degraded(jwks_now);
+        let ready = startup_ready && !serving_degraded && jwks_ready;
         health_status["ready"] = json!(ready);
+        if jwks_degraded && jwks_ready {
+            health_status["status"] = json!("degraded");
+        }
 
         if let Some(failures) = state.serving_listener_failures.as_ref() {
             let snapshot = failures.snapshot();
@@ -2198,6 +2209,18 @@ async fn handle_admin_request_inner(
             health_status["ai_transcript_audit"] =
                 serde_json::to_value(crate::plugins::ai_transcript_audit::snapshots())
                     .unwrap_or_default();
+            // Fixed-cardinality active-remote JWKS trust health only — never
+            // URLs, kids, tokens, claims, or key material (issue #3739).
+            health_status["jwks_trust"] = json!({
+                "fresh": jwks_trust.fresh,
+                "grace": jwks_trust.grace,
+                "expired": jwks_trust.expired,
+                "max_age_seconds": {
+                    "fresh": jwks_trust.max_age_seconds_fresh,
+                    "grace": jwks_trust.max_age_seconds_grace,
+                    "expired": jwks_trust.max_age_seconds_expired,
+                },
+            });
         }
 
         let response_code = if !ready {
@@ -2207,7 +2230,9 @@ async fn handle_admin_request_inner(
             // sets it true AND best-effort clears `startup_ready`, so keying the
             // status off `!startup_ready` would mislabel a post-start
             // degradation as "starting". Use the sticky flag instead.
-            health_status["status"] = json!(if serving_degraded {
+            // Expired active JWKS trust is also an operator-visible outage of a
+            // previously-ready dependency, so it shares `unavailable`.
+            health_status["status"] = json!(if serving_degraded || !jwks_ready {
                 "unavailable"
             } else {
                 "starting"
@@ -2311,6 +2336,7 @@ async fn handle_admin_request_inner(
             }
         }
         let mut metrics_output = registry.render();
+        metrics_output.push_str(&crate::plugins::utils::jwks_cache::render_prometheus());
         metrics_output.push_str(&crate::logging::render_prometheus());
         metrics_output.push_str(&crate::observability_delivery::render_prometheus());
         metrics_output.push_str(&crate::notifications::render_delivery_prometheus());

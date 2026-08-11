@@ -16,6 +16,10 @@ Ferrum Edge enforces configurable size limits on request headers, request bodies
 | `FERRUM_MAX_GRPC_RECV_SIZE_BYTES` | `usize` | `4194304` (4MB) | Maximum total received gRPC payload size in bytes. For unary RPCs this is effectively a per-message limit. For streaming RPCs it caps the cumulative body size. Set to `0` for unlimited. |
 | `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` | `usize` | `16777216` (16MB) | Maximum WebSocket frame size in bytes. Also sets max message size to 4x frame size. |
 | `FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE` | `usize` | `131072` (128KB) | WebSocket write buffer size. Data is buffered up to this size before flushing to the transport. Default (128 KB) is optimal for 10KB-100KB payloads. Increase to `4194304` (4 MB) for workloads with large WS frames (1 MB+). Only applies when frame-level plugins are active; without plugins, the gateway uses zero-overhead raw TCP tunneling. |
+| `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES` | `usize` | `4194304` (4MB) | Maximum bytes admitted from any TLS material source before whole-value buffering. Default and hard maximum are both 4 MiB; `0` is rejected (not unlimited). See [TLS Material Source Ceiling](#tls-material-source-ceiling). |
+| `FERRUM_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES` | `usize` | `4194304` (4MB) | Per-response Kubernetes/Consul discovery success-body ceiling. Hard maximum 16 MiB; `0` is rejected (not unlimited). See [Service Discovery Response Body Ceilings](#service-discovery-response-body-ceilings). |
+| `FERRUM_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES` | `usize` | `4096` (4KB) | Independent discovery error-body ceiling. Hard maximum 64 KiB; must be `<=` the success ceiling; `0` is rejected. |
+| `FERRUM_SERVICE_DISCOVERY_BODY_BUDGET_BYTES` | `usize` | `33554432` (32MB) | Concurrent discovery-body budget across pollers. Hard maximum 256 MiB; must be `>=` the success ceiling; `0` is rejected. |
 
 ## Enforcement Layers
 
@@ -100,6 +104,47 @@ The same size-limit knobs apply to HTTP/3, but client-visible outcomes are **not
 ## Admin API Body Limit
 
 The Admin API enforces a **1 MiB** (1,048,576 bytes) request body size limit on all endpoints. This is a fixed limit independent of the proxy size limits above. Requests exceeding this limit receive a `413 Payload Too Large` response.
+
+## TLS Material Source Ceiling
+
+Proxy request/response size limits do **not** cover TLS control-plane material. Ferrum enforces one authoritative ceiling on every certificate, private-key, CA bundle, CRL, OCSP, and JWKS material source before whole-value buffering:
+
+| Variable | Type | Default | Hard maximum | Description |
+|----------|------|---------|--------------|-------------|
+| `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES` | `usize` | `4194304` (4 MiB) | `4194304` (4 MiB) | Applies to local files, inline PEM, compiled external-secret provider values (`vault://` / `aws://` / `azure://` / `gcp://`), Kubernetes Secret bytes, managed-store records, and ACME-store records. |
+
+Enforcement rules:
+
+- **Before or during allocation.** Provider strings and Kubernetes `ByteString` values are length-checked before `into_bytes()` / clone. Inline PEM is checked before copying. Managed and ACME material are validated at persistence/admission and again at the common loader boundary so corrupted existing state cannot bypass the ceiling.
+- **Files.** Metadata size is only an optimization. Reads always use a bounded reader through `limit + 1`, so growth after metadata inspection, non-regular files, and TOCTOU races cannot force an unbounded buffer. There is no unbounded fallback read.
+- **Finite only.** `0` is rejected (not unlimited). Values above `4194304` clamp down. A malformed value fails closed. Explicit helper/store ceilings go through the same validation before any read, conversion, clone, or store, so `usize::MAX` cannot make the bounded reader practically unbounded.
+- **Diagnostics.** Oversized input returns a stable, source-redacted `MaterialError::Oversized` classification. Public diagnostics never include filesystem paths, provider IDs, secret names/values, PEM fragments, or credentials.
+- **Live rotation.** An oversized watched source records a bounded `load_error`, retains the last-known-good TLS generation, and continues the existing watcher retry policy.
+- **One runtime policy.** `EnvConfig` validates and installs the ceiling for the process/config generation. Identical reinstall is accepted; a mismatching repeated install fails closed so the configured field cannot diverge from what production loaders enforce. Loaders and free helpers consume that snapshot (or the same pure parser).
+
+See also [configuration.md](configuration.md) and [frontend_tls.md](frontend_tls.md).
+
+## Service Discovery Response Body Ceilings
+
+Kubernetes EndpointSlice and Consul health discovery responses are control-plane snapshots buffered before JSON parse. Proxy request/response size limits do **not** cover these registry polls. Ferrum enforces:
+
+| Variable | Type | Default | Hard maximum | Description |
+|----------|------|---------|--------------|-------------|
+| `FERRUM_SERVICE_DISCOVERY_MAX_RESPONSE_BODY_BYTES` | `usize` | `4194304` (4 MiB) | `16777216` (16 MiB) | Per-response success-body ceiling for Kubernetes and Consul. |
+| `FERRUM_SERVICE_DISCOVERY_MAX_ERROR_BODY_BYTES` | `usize` | `4096` (4 KiB) | `65536` (64 KiB) | Independent error-body ceiling; must be `<=` the success ceiling. |
+| `FERRUM_SERVICE_DISCOVERY_BODY_BUDGET_BYTES` | `usize` | `33554432` (32 MiB) | `268435456` (256 MiB) | Concurrent retained-body budget across all discovery pollers; must be `>=` the success ceiling. |
+
+Enforcement rules:
+
+- **Content-Length fast path.** Every present `Content-Length` field line (and every comma-folded member) must parse and agree. An exact agreed length above the role ceiling is refused before any chunk is retained. Ambiguous or disagreeing framing fails closed (never treated as unknown length).
+- **Streaming.** Chunked / missing-length bodies are counted chunk-by-chunk and abort before retaining `limit + 1` bytes. Collectors never call unbounded `Response::{text,json,bytes}` first.
+- **Shared budget.** Each retained byte range charges a cancellation-safe permit **before** append; permits release on every error and drop path. Small bodies charge only their actual size. The collector does **not** pre-allocate from an untrusted `Content-Length` outside this budget.
+- **Error bodies.** Non-success responses are drained under the tighter error ceiling and discarded. Fixed provider/status diagnostics are emitted; body bytes, URLs, tokens, and headers are never logged.
+- **Finite only.** `0` is rejected (not unlimited). Values above each hard maximum clamp down. A malformed value fails closed.
+- **Parse vs publish.** `EnvConfig` parsing validates these ceilings without installing process-global state. Production startup publishes the accepted snapshot once before any discovery poller runs (identical reinstall accepted; mismatch fails closed).
+- **Fail closed.** Oversized, budget-exhausted, and malformed Kubernetes envelopes retain the last admitted `LoadBalancerCache` targets and any pending Consul `X-Consul-Index` cursor.
+
+See also [configuration.md](configuration.md#service-discovery).
 
 ## Error Responses
 

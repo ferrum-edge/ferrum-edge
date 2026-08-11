@@ -30,6 +30,9 @@ use ferrum_edge::retry::ErrorClass;
 /// serialized output.
 fn fully_populated_http() -> TransactionSummary {
     TransactionSummary {
+        // Terminal-log trigger carrier: stamped centrally by
+        // `log_with_mirror` from the authoritative RequestContext.
+        plugin_trigger_decisions: Default::default(),
         namespace: "ferrum".into(),
         timestamp_received: "2026-05-11T12:00:00Z".into(),
         client_ip: "10.0.0.1".into(),

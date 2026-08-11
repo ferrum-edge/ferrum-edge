@@ -11,7 +11,7 @@
 //!     [`ferrum_edge::service_discovery::consul::ConsulDiscoverer::discover`]
 //!     against live Consul health-API output (Service-vs-Node address
 //!     fallback, weights, tags, the `passing=true` filter, blocking-query
-//!     index tracking). Only `build_url` was previously covered.
+//!     cursor commit after snapshot admission). Only `build_url` was previously covered.
 //!   - **ldap** — OpenLDAP seeded via a controlled LDIF. Drives the real
 //!     `ldap_auth` plugin through `create_plugin` → `authenticate`, covering
 //!     direct bind, search-then-bind, and group-membership — the `ldap3`

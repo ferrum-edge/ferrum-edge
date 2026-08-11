@@ -95,10 +95,13 @@ fn scope_for_mesh_uses_mesh_frontend_but_skips_dtls() {
 #[test]
 fn scope_for_node_agent_is_admin_only() {
     let scope = StartupSecurityScope::for_mode(&OperatingMode::NodeAgent);
-    assert!(!scope.tls_policy_and_crls);
+    // TLS policy/CRL/admin TLS are in scope for validate/run parity, but
+    // load_startup_security_with_scope gates them on an active/explicit HTTPS
+    // admin surface so HTTP-only installs stay unaffected.
+    assert!(scope.tls_policy_and_crls);
     assert!(scope.admin_cidrs_and_metrics);
     assert!(!scope.frontend_tls);
-    assert!(!scope.admin_tls);
+    assert!(scope.admin_tls);
     assert!(!scope.dtls);
 }
 
@@ -568,6 +571,8 @@ fn node_agent_admin_gate_matches_serving_listener_boundary() {
         admin_http_port: 9000,
         admin_allowed_cidrs: "not-a-cidr".to_string(),
         metrics_allowed_cidrs: "also-not-a-cidr".to_string(),
+        // Unrelated TLS policy/CRL must not fail a disabled admin surface.
+        tls_crl_file_path: Some("/nonexistent/unrelated.crl".to_string()),
         ..EnvConfig::default()
     };
     load_startup_security(&disabled)
@@ -576,14 +581,71 @@ fn node_agent_admin_gate_matches_serving_listener_boundary() {
     let port_disabled = EnvConfig {
         node_agent_admin_enabled: true,
         admin_http_port: 0,
+        admin_https_port: 0,
         ..disabled.clone()
     };
     load_startup_security(&port_disabled)
         .expect("port-zero node-agent admin must not parse admin security policy");
 
+    let http_only_unrelated_crl = EnvConfig {
+        node_agent_admin_enabled: true,
+        admin_http_port: 9000,
+        admin_https_port: 0,
+        admin_allowed_cidrs: String::new(),
+        metrics_allowed_cidrs: String::new(),
+        tls_crl_file_path: Some("/nonexistent/unrelated.crl".to_string()),
+        ..EnvConfig {
+            mode: OperatingMode::NodeAgent,
+            ..EnvConfig::default()
+        }
+    };
+    load_startup_security(&http_only_unrelated_crl)
+        .expect("HTTP-only node-agent must not fail on unrelated CRL settings");
+
+    let https_only_malformed = EnvConfig {
+        node_agent_admin_enabled: true,
+        admin_http_port: 0,
+        admin_https_port: 19443,
+        admin_https_port_configured: true,
+        admin_tls_cert_path: Some("/tmp/tls.crt".to_string()),
+        admin_tls_key_path: Some("/tmp/tls.key".to_string()),
+        tls_crl_file_path: None,
+        ..disabled.clone()
+    };
+    let err = load_startup_security(&https_only_malformed)
+        .err()
+        .expect("HTTPS-only node-agent admin must still parse CIDRs or fail closed on TLS");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("FERRUM_ADMIN_ALLOWED_CIDRS")
+            || msg.contains("Invalid node_agent admin TLS configuration"),
+        "unexpected error: {msg}"
+    );
+
+    let explicit_https_missing_tls = EnvConfig {
+        node_agent_admin_enabled: true,
+        admin_http_port: 0,
+        admin_https_port: 19443,
+        admin_https_port_configured: true,
+        admin_allowed_cidrs: String::new(),
+        metrics_allowed_cidrs: String::new(),
+        ..EnvConfig {
+            mode: OperatingMode::NodeAgent,
+            ..EnvConfig::default()
+        }
+    };
+    let err = load_startup_security(&explicit_https_missing_tls)
+        .err()
+        .expect("explicit HTTPS without TLS must fail closed at validate");
+    assert!(
+        format!("{err:#}").contains("Invalid node_agent admin TLS configuration"),
+        "unexpected error: {err:#}"
+    );
+
     let active = EnvConfig {
         node_agent_admin_enabled: true,
         admin_http_port: 9000,
+        admin_https_port: 0,
         ..disabled
     };
     let err = load_startup_security(&active)

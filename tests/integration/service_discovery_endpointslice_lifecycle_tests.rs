@@ -77,14 +77,15 @@ async fn publish_discovered(
         .discover()
         .await
         .expect("kubernetes discovery must succeed");
+    let targets = discovered.targets().to_vec();
     cache.update_targets(
         "ferrum",
         upstream_id,
-        discovered.clone(),
+        targets.clone(),
         LoadBalancerAlgorithm::RoundRobin,
         None,
     );
-    discovered
+    targets
 }
 
 #[tokio::test]
