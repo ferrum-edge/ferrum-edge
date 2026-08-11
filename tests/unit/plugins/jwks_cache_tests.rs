@@ -628,7 +628,11 @@ async fn shared_cache_trust_publish_stays_outside_dashmap_guards() {
         .await;
     let after_tighten = trust_health_snapshot();
     assert_eq!(
-        (after_tighten.fresh, after_tighten.grace, after_tighten.expired),
+        (
+            after_tighten.fresh,
+            after_tighten.grace,
+            after_tighten.expired
+        ),
         (0, 1, 0),
         "failed forced refresh must publish grace without a test-side republish"
     );
