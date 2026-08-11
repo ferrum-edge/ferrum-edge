@@ -1389,9 +1389,7 @@ impl http_body::Body for ProxyBody {
                 Poll::Ready(Some(Ok(_))) => http_body::Body::is_end_stream(&*this),
                 Poll::Ready(Some(Err(_))) | Poll::Pending => false,
             };
-        if clean_backend_end
-            && let Some(lease) = this.pooled_backend_lease.take()
-        {
+        if clean_backend_end && let Some(lease) = this.pooled_backend_lease.take() {
             lease.release_on_clean_eof();
         }
 
@@ -4603,8 +4601,8 @@ mod tests {
             None,
         );
         let lease = MockPooledBackendLease::new(Arc::clone(&released), Arc::clone(&retired));
-        let mut body = ProxyBody::streaming(Box::pin(inner))
-            .with_pooled_backend_lease(Box::new(lease));
+        let mut body =
+            ProxyBody::streaming(Box::pin(inner)).with_pooled_backend_lease(Box::new(lease));
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -4638,8 +4636,8 @@ mod tests {
             None,
         );
         let lease = MockPooledBackendLease::new(Arc::clone(&released), Arc::clone(&retired));
-        let mut body = ProxyBody::streaming(Box::pin(inner))
-            .with_pooled_backend_lease(Box::new(lease));
+        let mut body =
+            ProxyBody::streaming(Box::pin(inner)).with_pooled_backend_lease(Box::new(lease));
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
