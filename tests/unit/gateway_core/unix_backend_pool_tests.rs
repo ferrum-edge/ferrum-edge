@@ -2296,17 +2296,21 @@ async fn the_websocket_dial_returns_the_remainder_of_one_budget() {
     let root = root_dir(&temp);
     let socket = root.join("app.sock");
     let _peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-websocket-one-budget");
 
     let budget = std::time::Duration::from_millis(750);
     let before = tokio::time::Instant::now();
-    let dial = UnixBackendConnectionPool::dial_websocket_stream(
-        socket.to_str().expect("utf-8"),
-        750,
-        &roots(&root),
-        &[],
-    )
-    .await
-    .expect("an admitted websocket carrier");
+    let dial = pool
+        .dial_websocket_stream(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            750,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("an admitted websocket carrier");
 
     let after = tokio::time::Instant::now();
     let deadline = dial.deadline;
@@ -2338,6 +2342,74 @@ async fn the_websocket_dial_returns_the_remainder_of_one_budget() {
         remaining <= budget,
         "the upgrade exchange may never receive more than the ONE original budget, \
          got {remaining:?} of {budget:?}"
+    );
+}
+
+/// A dedicated WebSocket bypasses only the idle carrier maps. It must consume
+/// the same per-target PHYSICAL connection lane as cold H1/h2c connections,
+/// and its lease must keep that lane charged through the whole session.
+#[tokio::test]
+async fn dedicated_websocket_holds_the_per_target_physical_connection_lane() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = HoldingPeer::bind(&socket);
+    let pool = Arc::new(UnixBackendConnectionPool::new(
+        PoolConfig::default(),
+        8,
+        1,
+    ));
+    let proxy = test_proxy("unix-websocket-bound");
+
+    let first = pool
+        .dial_websocket_stream(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("first websocket dial");
+    assert_eq!(
+        pool.open_connections_for_target(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            &first.admitted,
+            UnixWireProtocol::Http1,
+        ),
+        1,
+        "the dedicated websocket must hold the target's only lane"
+    );
+    assert_eq!(pool.stats().open_physical_connections, 1);
+
+    let second = pool
+        .dial_websocket_stream(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(
+            second,
+            Err(UnixBackendError::BackendConnectionLimit(_))
+        ),
+        "a second dedicated websocket must be refused before connect"
+    );
+
+    drop(first);
+    assert_eq!(
+        pool.stats().open_physical_connections,
+        0,
+        "dropping the websocket releases its physical-connection gauge"
+    );
+    assert_eq!(
+        pool.resident_connection_lanes(),
+        0,
+        "the last websocket lease must remove its empty target lane"
     );
 }
 

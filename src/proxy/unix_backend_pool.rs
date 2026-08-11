@@ -335,10 +335,16 @@
 //!
 //! An RFC 6455 upgrade consumes its HTTP/1.1 carrier for the whole session, so
 //! [`UnixBackendConnectionPool::dial_websocket_stream`] performs a dedicated
-//! admitted dial that never enters the idle set (issue #3732).
+//! admitted dial that never enters the idle set (issue #3732). The dedicated
+//! carrier still reserves the same per-target physical-connection lane and is
+//! counted in the fixed-cardinality open-connections gauge. Its session-owned
+//! lease releases both when the WebSocket relay ends, and shutdown closes its
+//! registration gate before publishing the pool latch and then waits a bounded
+//! interval for existing relays to release their carriers.
 
 /// Default `FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS`: the most concurrently
-/// open PHYSICAL connections the pool holds per admitted Unix ingress target.
+/// open PHYSICAL connections the Unix backend manager holds per admitted
+/// ingress target, including dedicated WebSockets.
 ///
 /// Matches the pool's own `max_idle_per_host` default, so the bound and the
 /// idle ceiling agree: every admitted carrier can be pooled, and a target
@@ -366,7 +372,7 @@ mod imp {
     use dashmap::DashMap;
     use hyper::client::conn::http1;
     use hyper_util::rt::TokioIo;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
     use tracing::debug;
 
     use crate::backend_conn_limit::BackendConnectionLimitExceeded;
@@ -376,7 +382,7 @@ mod imp {
     use crate::proxy::hbone_pool::{entry_idle_expired, unix_secs};
     use crate::proxy::mesh_mtls_pool::MeshMtlsSender;
     use crate::proxy::unix_backend::{
-        UnixBackendError, UnixConnectionDriver, admit_and_connect, connect_admitted,
+        UnixBackendError, UnixConnectionDriver, connect_admitted,
         connect_deadline, handshake_unix_h2c_sender,
     };
     use crate::runtime_metrics::PoolKind;
@@ -1198,6 +1204,32 @@ mod imp {
         /// The effective millisecond value behind `deadline`, so a timeout can
         /// be reported with the same number the rest of the transport uses.
         pub timeout_ms: u64,
+        /// Per-target physical-connection admission and fixed-cardinality
+        /// accounting for this dedicated carrier. The caller must retain this
+        /// for the complete WebSocket session; dropping it releases the lane.
+        pub(crate) conn_lease: UnixWebSocketConnLease,
+    }
+
+    /// Lifetime guard for one dedicated Unix WebSocket carrier.
+    ///
+    /// WebSockets do not have a hyper connection-driver task for
+    /// [`UnixDriverTracker`] to own: the session relay owns the `UnixStream`
+    /// directly. This guard supplies the equivalent lifetime accounting. It is
+    /// moved beside that relay and dropped only after the relay ends (or on any
+    /// pre-session handshake failure), so the per-target slot and the exported
+    /// open-physical-connections gauge describe the real socket lifetime.
+    pub(crate) struct UnixWebSocketConnLease {
+        _conn_slot: Option<TargetConnSlot>,
+        live: Arc<AtomicU64>,
+        drained: Arc<Notify>,
+    }
+
+    impl Drop for UnixWebSocketConnLease {
+        fn drop(&mut self) {
+            drop(self._conn_slot.take());
+            UnixBackendConnectionPool::note_pooled_removed(&self.live, 1);
+            self.drained.notify_waiters();
+        }
     }
 
     /// Bounded, lock-free-on-hit Unix backend connection manager.
@@ -1256,6 +1288,14 @@ mod imp {
         /// capacity toward the co-located app — deliberately NOT a
         /// `DestinationRule`, which is outbound client-side policy.
         conn_bound: UnixConnBound,
+        /// Dedicated Unix WebSocket carriers have no separately spawned hyper
+        /// driver, so their session-owned leases maintain this share of the
+        /// open-physical-connections gauge.
+        live_websocket_connections: Arc<AtomicU64>,
+        /// Linearizes dedicated WebSocket publication against shutdown. The
+        /// gate is taken once per new WebSocket, never per frame.
+        websocket_registration_closed: std::sync::Mutex<bool>,
+        websocket_drained: Arc<Notify>,
         hits: AtomicU64,
         misses: AtomicU64,
         physical_connects: AtomicU64,
@@ -1282,8 +1322,9 @@ mod imp {
     ///
     /// Every field is an O(1) atomic read. The counters are monotonic; the
     /// three connection fields are gauges maintained at each insert/removal
-    /// (idle/active carriers) and at each driver spawn/completion (physical
-    /// connections), so no map is ever scanned to produce this.
+    /// (idle/active carriers), at each driver spawn/completion, and at each
+    /// dedicated WebSocket lease acquire/release, so no map is ever scanned to
+    /// produce this.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
     pub struct UnixPoolStats {
         /// Checkouts served by an already-admitted pooled carrier.
@@ -1309,9 +1350,9 @@ mod imp {
         pub idle_h1_connections: u64,
         /// Shared h2c carriers currently resident in the pool.
         pub active_h2c_connections: u64,
-        /// Physical connections currently open — one per live connection
-        /// driver, including a carrier checked out into an in-flight exchange
-        /// (which is deliberately absent from the idle maps).
+        /// Physical connections currently open — pooled carrier drivers plus
+        /// dedicated WebSocket session leases. This includes a carrier checked
+        /// out into an in-flight exchange (which is absent from the idle maps).
         pub open_physical_connections: u64,
         /// Carriers the withdrawal fence refused to (re)pool because their
         /// lease was bound to an older publication generation — counted both
@@ -1347,6 +1388,9 @@ mod imp {
                 last_prune_unix_secs: AtomicU64::new(0),
                 drivers: Arc::new(UnixDriverTracker::new()),
                 conn_bound: UnixConnBound::new(max_connections_per_target, shards),
+                live_websocket_connections: Arc::new(AtomicU64::new(0)),
+                websocket_registration_closed: std::sync::Mutex::new(false),
+                websocket_drained: Arc::new(Notify::new()),
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
                 physical_connects: AtomicU64::new(0),
@@ -1437,7 +1481,10 @@ mod imp {
                 checkout_failures: self.checkout_failures.load(Ordering::Relaxed),
                 idle_h1_connections: self.idle_h1_gauge.load(Ordering::Relaxed),
                 active_h2c_connections: self.h2c_carrier_gauge.load(Ordering::Relaxed),
-                open_physical_connections: self.drivers.live(),
+                open_physical_connections: self
+                    .drivers
+                    .live()
+                    .saturating_add(self.live_websocket_connections.load(Ordering::Relaxed)),
                 withdrawal_fenced_checkins: fenced,
             }
         }
@@ -1631,11 +1678,11 @@ mod imp {
             .await;
         }
 
-        /// Set both shutdown latches in the ONE order that is safe: the driver
-        /// tracker's registration latch FIRST, under the tracker's map lock, and
-        /// only THEN the pool's own `shutting_down` Release store.
+        /// Set the shutdown latches in the ONE order that is safe: close both
+        /// physical-connection registration gates FIRST, under their locks, and
+        /// only THEN publish the pool's own `shutting_down` Release store.
         ///
-        /// The two are independent pieces of state and cannot land atomically.
+        /// These are independent pieces of state and cannot land atomically.
         /// What the boundary needs is not simultaneity but a direction: from the
         /// instant ANY thread can observe the pool latched closed, driver
         /// registration must ALREADY be closed. Storing the pool flag last is
@@ -1664,6 +1711,10 @@ mod imp {
             BFut: std::future::Future<Output = ()>,
         {
             self.drivers.close();
+            *self
+                .websocket_registration_closed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
             between_latches().await;
             self.shutting_down.store(true, Ordering::Release);
         }
@@ -1699,6 +1750,7 @@ mod imp {
             after_latch().await;
             self.force_drain_all();
             self.drivers.drain(driver_budget, reap_budget).await;
+            self.drain_websocket_connections(driver_budget).await;
         }
 
         #[inline]
@@ -1751,6 +1803,61 @@ mod imp {
             self.physical_connects.fetch_add(1, Ordering::Relaxed);
             crate::runtime_metrics::global_ref().record_pool_handshake(PoolKind::UnixBackend);
             Ok(())
+        }
+
+        /// Publish one dedicated WebSocket connection, atomically with respect
+        /// to the shutdown registration gate.
+        fn register_websocket_connection(
+            &self,
+            conn_slot: Option<TargetConnSlot>,
+        ) -> Result<UnixWebSocketConnLease, UnixBackendError> {
+            let closed = self
+                .websocket_registration_closed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *closed {
+                drop(closed);
+                drop(conn_slot);
+                self.record_checkout_failure();
+                return Err(UnixBackendError::PoolShuttingDown);
+            }
+            self.live_websocket_connections
+                .fetch_add(1, Ordering::Relaxed);
+            let lease = UnixWebSocketConnLease {
+                _conn_slot: conn_slot,
+                live: Arc::clone(&self.live_websocket_connections),
+                drained: Arc::clone(&self.websocket_drained),
+            };
+            drop(closed);
+            self.physical_connects.fetch_add(1, Ordering::Relaxed);
+            crate::runtime_metrics::global_ref().record_pool_handshake(PoolKind::UnixBackend);
+            Ok(lease)
+        }
+
+        /// Wait for session-owned Unix WebSocket carriers after the gateway's
+        /// WebSocket shutdown signal has asked their relays to finish. The
+        /// caller supplies the same bounded graceful budget used for drivers;
+        /// unlike a hyper driver there is no task handle for this pool to abort.
+        async fn drain_websocket_connections(&self, budget: std::time::Duration) {
+            let Some(deadline) = tokio::time::Instant::now().checked_add(budget) else {
+                return;
+            };
+            loop {
+                if self.live_websocket_connections.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                let notified = self.websocket_drained.notified();
+                if self.live_websocket_connections.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    debug!(
+                        live = self.live_websocket_connections.load(Ordering::Relaxed),
+                        "unix_backend_pool: shutdown left WebSocket carriers open after the drain budget"
+                    );
+                    return;
+                }
+            }
         }
 
         /// Retire every pooled carrier whose config-declared identity is not in
@@ -2895,7 +3002,10 @@ mod imp {
         /// (issue #3732).
         ///
         /// NEVER pooled and never returned to the idle set: the upgrade consumes
-        /// the connection for the whole session. Admission, containment,
+        /// the connection for the whole session. It still reserves the same
+        /// per-target physical-connection lane as every cold H1 connection,
+        /// and the returned lease must be held for the full session. Admission,
+        /// containment,
         /// owner/mode/type, inode identity, and peer-UID verification all
         /// complete inside the single establishment deadline and BEFORE the
         /// caller writes the first upgrade byte.
@@ -2906,28 +3016,44 @@ mod imp {
         /// upgrade is one establishment, so it gets one `connect_timeout_ms`
         /// budget in total, not one per stage.
         pub async fn dial_websocket_stream(
+            &self,
+            proxy: &Proxy,
             socket_path: &str,
             connect_timeout_ms: u64,
             allowed_roots: &[String],
             allowed_uids: &[u32],
         ) -> Result<UnixWebSocketDial, UnixBackendError> {
+            // Dedicated WebSockets bypass the reusable carrier maps, not the
+            // pool's shutdown gate or its per-target physical-connection
+            // ceiling. Refuse and reserve before `connect(2)`, exactly like a
+            // cold H1 checkout.
+            self.refuse_if_shutting_down()?;
             let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
-            let connect = admit_and_connect(
-                socket_path,
-                deadline,
-                timeout_ms,
-                allowed_roots,
-                allowed_uids,
-            );
-            let (admitted, stream) = match tokio::time::timeout_at(deadline, connect).await {
-                Ok(result) => result?,
-                Err(_) => return Err(UnixBackendError::ConnectTimeout { timeout_ms }),
+            self.maybe_prune_idle();
+            let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
+            let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
+            let conn_slot = self.acquire_conn_slot(&key)?;
+            let connect = connect_admitted(&admitted, deadline, timeout_ms);
+            let stream = match tokio::time::timeout_at(deadline, connect).await {
+                Ok(result) => result.inspect_err(|_| self.record_setup_failure())?,
+                Err(_) => {
+                    self.record_setup_failure();
+                    return Err(UnixBackendError::ConnectTimeout { timeout_ms });
+                }
             };
+
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            // A WebSocket has no separately spawned hyper driver. Register its
+            // directly owned stream under the dedicated gate instead; this is
+            // the linearization point against shutdown, and the returned lease
+            // carries both the target slot and fixed-cardinality gauge.
+            let conn_lease = self.register_websocket_connection(conn_slot)?;
             Ok(UnixWebSocketDial {
                 admitted,
                 stream,
                 deadline,
                 timeout_ms,
+                conn_lease,
             })
         }
     }

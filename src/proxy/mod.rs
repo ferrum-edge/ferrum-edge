@@ -12304,6 +12304,7 @@ async fn handle_websocket_request_authenticated(
                     // whole-gateway stack budget, not a WS-path cost.
                     #[cfg(unix)]
                     Ok(socket_path) => Box::pin(connect_unix_websocket_backend(
+                        &state.unix_backend_pool,
                         ws_dial_proxy,
                         &env_config,
                         socket_path,
@@ -13205,7 +13206,7 @@ async fn handle_websocket_request_authenticated(
                     #[cfg(unix)]
                     WsBackendHandshake::Unix(handshake) => {
                         let handshake = *handshake;
-                        Box::pin(run_websocket_proxy(
+                        let relay_result = Box::pin(run_websocket_proxy(
                             client_io,
                             handshake.stream,
                             &proxy_id,
@@ -13227,7 +13228,13 @@ async fn handle_websocket_request_authenticated(
                             ws_fragment_policy,
                             &adaptive_buf,
                         ))
-                        .await
+                        .await;
+                        // This is the Unix pool's per-target PHYSICAL
+                        // connection lease. Hold it until the relay has ended;
+                        // releasing it before the stream is consumed would let
+                        // a later WebSocket dial exceed the configured lane.
+                        drop(handshake.conn_lease);
+                        relay_result
                     }
                 };
                 if let Err(e) = relay_result {
@@ -14071,6 +14078,7 @@ type UnixBackendWsStream = WebSocketStream<WsActivityIo<tokio::net::UnixStream>>
 pub(crate) struct UnixBackendWsHandshake {
     pub stream: UnixBackendWsStream,
     pub negotiated_subprotocol: Option<hyper::header::HeaderValue>,
+    conn_lease: unix_backend_pool::UnixWebSocketConnLease,
 }
 
 /// Unified backend WebSocket handshake: a direct TCP/TLS upgrade (the pre-mesh /
@@ -14329,7 +14337,10 @@ pub(crate) async fn connect_websocket_backend(
 ///
 /// The connection is dedicated and non-reusable: an RFC 6455 upgrade consumes
 /// its HTTP/1.1 carrier for the session, so this dial deliberately bypasses the
-/// #3731 idle pool rather than leasing from it.
+/// #3731 idle carrier maps rather than leasing from them. It does NOT bypass
+/// `FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS`: the pool returns a dedicated
+/// physical-connection lease that this handshake retains through the complete
+/// session relay.
 ///
 /// ## Policy parity with the TCP path
 ///
@@ -14348,6 +14359,7 @@ pub(crate) async fn connect_websocket_backend(
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 async fn connect_unix_websocket_backend(
+    unix_pool: &unix_backend_pool::UnixBackendConnectionPool,
     proxy: &Proxy,
     env_config: &crate::config::EnvConfig,
     socket_path: &str,
@@ -14399,14 +14411,17 @@ async fn connect_unix_websocket_backend(
         stream,
         deadline,
         timeout_ms,
-    } = unix_backend_pool::UnixBackendConnectionPool::dial_websocket_stream(
-        socket_path,
-        proxy.backend_connect_timeout_ms,
-        &env_config.mesh_unix_socket_allowed_roots,
-        &env_config.mesh_unix_socket_allowed_uids,
-    )
-    .await
-    .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
+        conn_lease,
+    } = unix_pool
+        .dial_websocket_stream(
+            proxy,
+            socket_path,
+            proxy.backend_connect_timeout_ms,
+            &env_config.mesh_unix_socket_allowed_roots,
+            &env_config.mesh_unix_socket_allowed_uids,
+        )
+        .await
+        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
 
     // Bound the upgrade exchange by what REMAINS of the same per-proxy connect
     // budget the admission and connect above already drew on — not by a second
@@ -14440,6 +14455,7 @@ async fn connect_unix_websocket_backend(
     Ok(UnixBackendWsHandshake {
         stream,
         negotiated_subprotocol,
+        conn_lease,
     })
 }
 
