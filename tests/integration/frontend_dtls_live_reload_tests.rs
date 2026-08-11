@@ -23,8 +23,8 @@ use ferrum_edge::tls::source::subscription::{
 };
 use ferrum_edge::tls::source::{CertSource, MaterialKind};
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer,
-    KeyPair, KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
+    BasicConstraints, CertificateParams, CertificateRevocationListParams, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, RevocationReason, RevokedCertParams, SerialNumber,
 };
 use rustls::pki_types::CertificateRevocationListDer;
 use tokio::net::UdpSocket;
@@ -34,7 +34,10 @@ fn ensure_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-fn write_ecdsa_material(dir: &std::path::Path, san: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+fn write_ecdsa_material(
+    dir: &std::path::Path,
+    san: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
     ensure_crypto_provider();
     let key_pair =
         rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
@@ -79,10 +82,7 @@ async fn dtls_material_watcher_rotates_on_file_change_and_exits_on_shutdown() {
             sources: vec![
                 WatchedMaterialSource::new(
                     "dtls_cert",
-                    CertSource::parse(
-                        cert_path.to_string_lossy().into_owned(),
-                        MaterialKind::Cert,
-                    ),
+                    CertSource::parse(cert_path.to_string_lossy().into_owned(), MaterialKind::Cert),
                     MaterialKind::Cert,
                 ),
                 WatchedMaterialSource::new(
@@ -149,10 +149,7 @@ async fn dtls_material_watcher_keeps_prior_state_and_retries_same_failed_candida
             sources: vec![
                 WatchedMaterialSource::new(
                     "dtls_cert",
-                    CertSource::parse(
-                        cert_path.to_string_lossy().into_owned(),
-                        MaterialKind::Cert,
-                    ),
+                    CertSource::parse(cert_path.to_string_lossy().into_owned(), MaterialKind::Cert),
                     MaterialKind::Cert,
                 ),
                 WatchedMaterialSource::new(
@@ -180,7 +177,9 @@ async fn dtls_material_watcher_keeps_prior_state_and_retries_same_failed_candida
     );
 
     std::fs::write(&cert_path, b"not-a-certificate").expect("corrupt cert");
-    assert!(request_material_set_reload("test_frontend_dtls_reload_fail"));
+    assert!(request_material_set_reload(
+        "test_frontend_dtls_reload_fail"
+    ));
     tokio::time::timeout(Duration::from_secs(2), async {
         while attempts.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;
@@ -329,10 +328,7 @@ fn generate_signed_material(
     }
 }
 
-fn build_crl(
-    ca: &TestCa,
-    revoked: &[SerialNumber],
-) -> Vec<CertificateRevocationListDer<'static>> {
+fn build_crl(ca: &TestCa, revoked: &[SerialNumber]) -> Vec<CertificateRevocationListDer<'static>> {
     let now = time::OffsetDateTime::now_utc();
     let revoked_certs = revoked
         .iter()
@@ -437,7 +433,11 @@ async fn connect_dtls_client(
         (None, None)
     };
     let params = BackendDtlsParams {
-        config: Arc::new(dimpl::Config::builder().build().expect("client dimpl config")),
+        config: Arc::new(
+            dimpl::Config::builder()
+                .build()
+                .expect("client dimpl config"),
+        ),
         certificate,
         server_name,
         server_cert_verifier,
@@ -452,7 +452,10 @@ async fn echo_round_trip(conn: &DtlsConnection, payload: &[u8]) {
         .await
         .expect("echo recv timeout")
         .expect("echo recv");
-    assert_eq!(reply, payload, "established DTLS session must remain usable");
+    assert_eq!(
+        reply, payload,
+        "established DTLS session must remain usable"
+    );
 }
 
 async fn assert_udp_socket_still_owns(addr: SocketAddr) {
@@ -535,8 +538,7 @@ async fn dtls_server_live_swap_client_ca_replacement_rejects_old_ca_clients() {
         33,
     );
 
-    let server =
-        spawn_echo_dtls_server(frontend_config(&server_id, Some(&client_ca_a), &[])).await;
+    let server = spawn_echo_dtls_server(frontend_config(&server_id, Some(&client_ca_a), &[])).await;
     let addr = server.local_addr();
 
     let ok_a = connect_dtls_client(addr, &client_a, Some(&server_ca), 10_000)
@@ -618,10 +620,20 @@ async fn dtls_server_multi_listener_live_swap_converges_on_same_generation() {
         generate_signed_material(dir.path(), &root_a, "multi-server-v1", &["localhost"], 51);
     let server_v2 =
         generate_signed_material(dir.path(), &root_b, "multi-server-v2", &["localhost"], 52);
-    let client_a =
-        generate_signed_material(dir.path(), &root_a, "multi-client-a", &["client.example"], 53);
-    let client_b =
-        generate_signed_material(dir.path(), &root_b, "multi-client-b", &["client.example"], 54);
+    let client_a = generate_signed_material(
+        dir.path(),
+        &root_a,
+        "multi-client-a",
+        &["client.example"],
+        53,
+    );
+    let client_b = generate_signed_material(
+        dir.path(),
+        &root_b,
+        "multi-client-b",
+        &["client.example"],
+        54,
+    );
 
     let left = spawn_echo_dtls_server(frontend_config(&server_v1, None, &[])).await;
     let right = spawn_echo_dtls_server(frontend_config(&server_v1, None, &[])).await;

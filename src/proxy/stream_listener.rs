@@ -1457,22 +1457,20 @@ impl StreamListenerManager {
             .frontend_dtls_generation_counter
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
-        let accepted = Arc::new(crate::dtls::FrontendDtlsGeneration {
-            generation,
-            config,
-        });
+        let accepted = Arc::new(crate::dtls::FrontendDtlsGeneration { generation, config });
         self.frontend_dtls_generation
             .store(Arc::new(Some(Arc::clone(&accepted))));
         let swapped = self
             .swap_active_dtls_frontend_config(&accepted.config)
             .await;
-        self.frontend_dtls_reload_status.store(Arc::new(FrontendDtlsReloadStatus {
-            generation,
-            last_swapped_listeners: swapped as u64,
-            last_success_unix: unix_now_secs(),
-            last_failure_unix: self.frontend_dtls_reload_status.load().last_failure_unix,
-            last_outcome: "accepted",
-        }));
+        self.frontend_dtls_reload_status
+            .store(Arc::new(FrontendDtlsReloadStatus {
+                generation,
+                last_swapped_listeners: swapped as u64,
+                last_success_unix: unix_now_secs(),
+                last_failure_unix: self.frontend_dtls_reload_status.load().last_failure_unix,
+                last_outcome: "accepted",
+            }));
         info!(
             dtls_generation = generation,
             swapped_dtls_listeners = swapped,
