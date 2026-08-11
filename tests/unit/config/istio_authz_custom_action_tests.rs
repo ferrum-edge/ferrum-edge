@@ -86,7 +86,7 @@ extensionProviders:
     includeRequestHeadersInCheck:
     - x-request-id
     includeAdditionalHeadersInCheck:
-      x-ferrum-check: "1"
+      x-ext-authz-caller: "ferrum-mesh"
 "#,
     )
 }
@@ -746,4 +746,426 @@ fn a_structurally_invalid_provider_fails_validation_at_the_native_boundary() {
         mesh.validate().iter().any(|error| error.contains("https")),
         "a plaintext off-box provider must be refused on every source"
     );
+}
+
+// ── L4: HTTP-only fields are "always matched" for CUSTOM, as for DENY ──────
+//
+// Istio documents HTTP-only fields on a TCP port as always matched for DENY
+// AND CUSTOM. Treating CUSTOM like ALLOW there would make a CUSTOM rule that
+// carries `paths` / `methods` / `headers` / `when: request.auth.*` silently
+// INERT on an L4 session — a fail-open hole, because the whole point of the
+// unexecutable-delegation wrapper is that such a session is closed.
+
+fn l4_request() -> MeshAuthzRequest {
+    MeshAuthzRequest {
+        port: Some(9000),
+        protocol: ferrum_edge::modes::mesh::policy::MeshAuthzProtocol::L4,
+        ..MeshAuthzRequest::default()
+    }
+}
+
+fn custom_rule_policy(name: &str, rule: MeshRule) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: "default".to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![rule],
+    }
+}
+
+fn custom_action() -> PolicyAction {
+    PolicyAction::Custom {
+        provider: "p".to_string(),
+    }
+}
+
+#[test]
+fn an_l4_custom_rule_with_http_request_match_fields_still_denies() {
+    for request_match in [
+        RequestMatch {
+            paths: vec!["/admin/*".to_string()],
+            ..RequestMatch::default()
+        },
+        RequestMatch {
+            methods: vec!["POST".to_string()],
+            ..RequestMatch::default()
+        },
+        RequestMatch {
+            hosts: vec!["api.example.com".to_string()],
+            ..RequestMatch::default()
+        },
+        RequestMatch {
+            headers: HashMap::from([("x-token".to_string(), "*".to_string())]),
+            ..RequestMatch::default()
+        },
+    ] {
+        let policies = vec![custom_rule_policy(
+            "delegate",
+            MeshRule {
+                action: custom_action(),
+                to: vec![request_match.clone()],
+                ..MeshRule::default()
+            },
+        )];
+        assert_eq!(
+            evaluate_mesh_authorization_policies(policies.iter(), &l4_request()),
+            MeshAuthzDecision::Deny {
+                policy: "custom:delegate".to_string()
+            },
+            "an unsourceable HTTP field must not disarm an L4 CUSTOM delegation: {request_match:?}"
+        );
+    }
+}
+
+#[test]
+fn an_l4_custom_rule_with_http_only_when_conditions_still_denies() {
+    use ferrum_edge::modes::mesh::config::ConditionMatch;
+
+    for key in [
+        "request.headers[x-token]",
+        "request.auth.claims[groups]",
+        "request.auth.principal",
+        "request.auth.audiences",
+    ] {
+        let policies = vec![custom_rule_policy(
+            "delegate",
+            MeshRule {
+                action: custom_action(),
+                when: vec![ConditionMatch {
+                    key: key.to_string(),
+                    values: vec!["anything".to_string()],
+                    ..ConditionMatch::default()
+                }],
+                ..MeshRule::default()
+            },
+        )];
+        assert_eq!(
+            evaluate_mesh_authorization_policies(policies.iter(), &l4_request()),
+            MeshAuthzDecision::Deny {
+                policy: "custom:delegate".to_string()
+            },
+            "an HTTP-only `when` key must not disarm an L4 CUSTOM delegation: {key}"
+        );
+    }
+}
+
+// ── At most one extension provider per request ────────────────────────────
+
+#[test]
+fn several_custom_policies_naming_the_same_provider_coalesce_into_one_check() {
+    let policies = vec![
+        policy_with("delegate-a", custom_action(), &["/admin/*"]),
+        policy_with("delegate-b", custom_action(), &["/admin/*"]),
+    ];
+    let evaluation = evaluate_mesh_authorization_full(policies.iter(), &http_request("/admin/x"));
+    assert!(!evaluation.custom_provider_conflict);
+    assert_eq!(
+        evaluation.custom.as_ref().map(|c| c.provider.as_str()),
+        Some("p"),
+        "same-provider CUSTOM policies are one delegation, not a conflict"
+    );
+}
+
+#[test]
+fn two_distinct_applicable_providers_are_refused_rather_than_ordered() {
+    let policies = vec![
+        policy_with("delegate-a", custom_action(), &["/admin/*"]),
+        policy_with(
+            "delegate-b",
+            PolicyAction::Custom {
+                provider: "other".to_string(),
+            },
+            &["/admin/*"],
+        ),
+    ];
+    let evaluation = evaluate_mesh_authorization_full(policies.iter(), &http_request("/admin/x"));
+    assert!(
+        evaluation.custom_provider_conflict,
+        "Istio permits at most one extension provider per workload"
+    );
+    assert!(
+        evaluation.custom.is_none(),
+        "there is no single delegation to run, so none is reported"
+    );
+    assert_eq!(
+        evaluate_mesh_authorization_policies(policies.iter(), &http_request("/admin/x")),
+        MeshAuthzDecision::Deny {
+            policy: "custom:provider-conflict".to_string()
+        },
+        "the refusal carries a stable, bounded reason — never a provider name"
+    );
+}
+
+#[test]
+fn distinct_providers_on_disjoint_request_scopes_are_not_a_conflict() {
+    let policies = vec![
+        policy_with("delegate-admin", custom_action(), &["/admin/*"]),
+        policy_with(
+            "delegate-reports",
+            PolicyAction::Custom {
+                provider: "other".to_string(),
+            },
+            &["/reports/*"],
+        ),
+    ];
+    let evaluation = evaluate_mesh_authorization_full(policies.iter(), &http_request("/admin/x"));
+    assert!(!evaluation.custom_provider_conflict);
+    assert_eq!(
+        evaluation.custom.as_ref().map(|c| c.provider.as_str()),
+        Some("p"),
+        "only the providers a REQUEST can see participate in the conflict test"
+    );
+}
+
+// ── statusOnError is an HTTP status STRING upstream ───────────────────────
+
+fn config_map_with(status_on_error: &str) -> K8sObject {
+    mesh_config_map(
+        ROOT_NS,
+        &format!(
+            r#"
+extensionProviders:
+- name: sample-ext-authz
+  envoyExtAuthzHttp:
+    service: ext-authz.istio-system.svc.cluster.local
+    port: 8000
+    scheme: https
+    statusOnError: {status_on_error}
+"#
+        ),
+    )
+}
+
+#[test]
+fn status_on_error_accepts_the_upstream_decimal_string_form() {
+    let mesh = translate(&[
+        config_map_with("\"503\""),
+        custom_policy(json!({ "name": "sample-ext-authz" })),
+    ])
+    .expect("a decimal status string is the documented Istio input shape");
+    assert_eq!(mesh.ext_authz_providers[0].status_on_error, 503);
+}
+
+#[test]
+fn status_on_error_accepts_the_integer_compatibility_form() {
+    let mesh = translate(&[
+        config_map_with("503"),
+        custom_policy(json!({ "name": "sample-ext-authz" })),
+    ])
+    .expect("a hand-authored integer stays accepted");
+    assert_eq!(mesh.ext_authz_providers[0].status_on_error, 503);
+}
+
+#[test]
+fn status_on_error_outside_4xx_5xx_or_non_numeric_is_refused() {
+    for value in ["\"200\"", "200", "\"Forbidden\"", "\"40x\"", "403.5", "\"\""] {
+        let error = translate(&[
+            config_map_with(value),
+            custom_policy(json!({ "name": "sample-ext-authz" })),
+        ])
+        .expect_err("a defaulted statusOnError would change what a denial looks like");
+        assert!(
+            error.contains("statusOnError"),
+            "the diagnostic must name the field for {value}: {error}"
+        );
+    }
+}
+
+// ── Provider URL admission ────────────────────────────────────────────────
+
+fn provider_with_service(service: &str) -> MeshExtAuthzProvider {
+    let mut provider = provider("p");
+    provider.service = service.to_string();
+    provider.tls = true;
+    provider
+}
+
+#[test]
+fn hostile_provider_service_values_are_refused_at_admission() {
+    // Every one of these changes which URL component the remainder lands in
+    // when concatenated, so deferring the failure to a per-request parse would
+    // turn a typo into either a total outage or (with failOpen) a silent
+    // allow-all.
+    for service in [
+        "user:pass@authz.example.com",
+        "authz.example.com:8443",
+        "authz.example.com/check",
+        "authz.example.com?x=1",
+        "authz.example.com#frag",
+        "authz.example.com\\evil.example.com",
+        "[::1",
+        "::1]",
+        "%61uthz.example.com",
+        "authz..example.com",
+        "-authz.example.com",
+        "authz.example.com-",
+        "",
+        " authz.example.com",
+        "istio-system/authz.example.com",
+    ] {
+        assert!(
+            provider_with_service(service).validate().is_err(),
+            "a malformed provider host must be refused at admission: {service:?}"
+        );
+    }
+}
+
+#[test]
+fn the_namespace_qualified_istio_service_syntax_is_refused_by_name() {
+    let error = provider_with_service("istio-system/ext-authz.example.com")
+        .validate()
+        .expect_err("Ferrum dials the provider directly, so the qualifier has no meaning");
+    assert!(
+        error.contains("namespace-qualified"),
+        "the narrowing must be stated, never misparsed: {error}"
+    );
+}
+
+#[test]
+fn well_formed_provider_service_values_are_admitted() {
+    for service in [
+        "ext-authz.istio-system.svc.cluster.local",
+        "ext-authz.istio-system.svc.cluster.local.",
+        "10.0.0.7",
+        "[2001:db8::1]",
+        "2001:db8::1",
+    ] {
+        assert!(
+            provider_with_service(service).validate().is_ok(),
+            "a real bare host must stay admissible: {service:?}"
+        );
+    }
+}
+
+#[test]
+fn hostile_provider_path_prefixes_are_refused_at_admission() {
+    for prefix in [
+        "check",
+        "//evil.example.com/check",
+        "/check?x=1",
+        "/check#frag",
+        "/check\\evil",
+        "/check/../../root",
+        "/check\u{7f}",
+    ] {
+        let mut provider = provider("p");
+        provider.path_prefix = Some(prefix.to_string());
+        assert!(
+            provider.validate().is_err(),
+            "a pathPrefix that re-targets the check must be refused: {prefix:?}"
+        );
+    }
+    let mut provider = provider("p");
+    provider.path_prefix = Some("/check/v1".to_string());
+    assert!(provider.validate().is_ok(), "an ordinary path prefix is fine");
+}
+
+// ── Fixed check headers are authoritative ─────────────────────────────────
+
+#[test]
+fn case_variant_duplicate_fixed_check_headers_are_refused() {
+    use ferrum_edge::modes::mesh::config::MeshExtAuthzHeader;
+
+    let mut provider = provider("p");
+    provider.include_additional_headers_in_check = vec![
+        MeshExtAuthzHeader {
+            name: "x-caller".to_string(),
+            value: "a".to_string(),
+        },
+        MeshExtAuthzHeader {
+            name: "X-Caller".to_string(),
+            value: "b".to_string(),
+        },
+    ];
+    let error = provider
+        .validate()
+        .expect_err("which fixed value wins must never depend on iteration order");
+    assert!(error.contains("more than once"), "got: {error}");
+}
+
+#[test]
+fn duplicate_forwarded_check_header_names_are_refused() {
+    let mut provider = provider("p");
+    provider.include_request_headers_in_check =
+        vec!["x-request-id".to_string(), "X-Request-Id".to_string()];
+    assert!(
+        provider.validate().is_err(),
+        "case-variant duplicates make the forwarded set ambiguous"
+    );
+}
+
+// ── allowPartialMessage is refused, not accepted-and-ignored ──────────────
+
+#[test]
+fn allow_partial_message_is_refused_at_the_kubernetes_boundary() {
+    let config_map = mesh_config_map(
+        ROOT_NS,
+        r#"
+extensionProviders:
+- name: sample-ext-authz
+  envoyExtAuthzHttp:
+    service: ext-authz.istio-system.svc.cluster.local
+    port: 8000
+    scheme: https
+    includeRequestBodyInCheck:
+      maxRequestBytes: 4096
+      allowPartialMessage: true
+"#,
+    );
+    let error = translate(&[
+        config_map,
+        custom_policy(json!({ "name": "sample-ext-authz" })),
+    ])
+    .expect_err("an accepted-but-unreachable flag is worse than a visible refusal");
+    assert!(error.contains("allowPartialMessage"), "got: {error}");
+}
+
+#[test]
+fn allow_partial_message_is_refused_at_the_native_boundary() {
+    use ferrum_edge::modes::mesh::config::MeshExtAuthzBodyCheck;
+
+    let mut bad = provider("p");
+    bad.include_request_body_in_check = Some(MeshExtAuthzBodyCheck {
+        max_request_bytes: 4096,
+        allow_partial_message: true,
+    });
+    let mesh = MeshConfig {
+        ext_authz_providers: vec![bad],
+        ..MeshConfig::default()
+    };
+    assert!(
+        mesh.validate()
+            .iter()
+            .any(|error| error.contains("allowPartialMessage")),
+        "every admission boundary refuses it: {:?}",
+        mesh.validate()
+    );
+}
+
+#[test]
+fn a_bounded_body_check_without_partial_messages_stays_supported() {
+    let config_map = mesh_config_map(
+        ROOT_NS,
+        r#"
+extensionProviders:
+- name: sample-ext-authz
+  envoyExtAuthzHttp:
+    service: ext-authz.istio-system.svc.cluster.local
+    port: 8000
+    scheme: https
+    includeRequestBodyInCheck:
+      maxRequestBytes: 4096
+"#,
+    );
+    let mesh = translate(&[
+        config_map,
+        custom_policy(json!({ "name": "sample-ext-authz" })),
+    ])
+    .expect("the supported body contract is unchanged");
+    let body = mesh.ext_authz_providers[0]
+        .include_request_body_in_check
+        .as_ref()
+        .expect("body check translated");
+    assert_eq!(body.max_request_bytes, 4096);
+    assert!(!body.allow_partial_message);
 }

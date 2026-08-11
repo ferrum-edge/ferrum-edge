@@ -692,6 +692,144 @@ pub fn sanitize_mesh_ext_authz_diagnostic(value: &str) -> String {
     out
 }
 
+/// Validate an `extensionProviders[].service` value as a REAL bare URL host.
+///
+/// The value is concatenated into a URL authority at config publication, so
+/// anything that can change which URL component the remainder lands in has to
+/// be refused HERE, at generation admission — not deferred to a per-request
+/// parse failure that would turn every delegated decision into a fail-closed
+/// denial (or, with `failOpen`, into a silent allow).
+///
+/// Accepted shapes are exactly: a DNS name (RFC 1123 labels, optional trailing
+/// dot), an IPv4 literal, or an IPv6 literal (bracketed or bare). Everything
+/// else — userinfo (`@`), an embedded port (`:` outside an IPv6 literal), a
+/// path/query/fragment (`/`, `?`, `#`), a backslash, percent-encoding, a
+/// bracket imbalance, or the namespace-qualified Istio `namespace/hostname`
+/// syntax — is rejected with a field-shaped diagnostic.
+///
+/// Namespace-qualified `[namespace/]hostname` is DELIBERATELY unsupported:
+/// Ferrum dials the provider directly rather than resolving it through the
+/// mesh's own service registry, so the namespace qualifier has no meaning here
+/// and silently dropping it would dial a different service than the operator
+/// named. Declare the fully qualified host instead.
+pub fn validate_mesh_ext_authz_service_host(service: &str) -> Result<(), String> {
+    if service.is_empty() || service.len() > MAX_MESH_EXT_AUTHZ_NAME_LEN {
+        return Err(format!(
+            "service must be non-empty and at most {MAX_MESH_EXT_AUTHZ_NAME_LEN} bytes"
+        ));
+    }
+    if service.trim() != service {
+        return Err("service must not have surrounding whitespace".to_string());
+    }
+    if service.contains('/') {
+        return Err(
+            "service must be a bare host; namespace-qualified '<namespace>/<hostname>' syntax is \
+             not supported (declare the fully qualified hostname instead)"
+                .to_string(),
+        );
+    }
+    if service.bytes().any(|byte| {
+        byte.is_ascii_whitespace()
+            || byte.is_ascii_control()
+            || !byte.is_ascii()
+            || matches!(byte, b'@' | b'?' | b'#' | b'\\' | b'%' | b'"' | b'\'' | b'<' | b'>')
+    }) {
+        return Err(
+            "service must be a bare host with no userinfo, query, fragment, escape, or path \
+             component"
+                .to_string(),
+        );
+    }
+    // IPv6 literal, bracketed or bare.
+    if let Some(inner) = service.strip_prefix('[') {
+        let Some(inner) = inner.strip_suffix(']') else {
+            return Err("service IPv6 literal must be fully bracketed".to_string());
+        };
+        return match inner.parse::<std::net::Ipv6Addr>() {
+            Ok(_) => Ok(()),
+            Err(_) => Err("service IPv6 literal is not a valid address".to_string()),
+        };
+    }
+    if service.contains(']') {
+        return Err("service must not contain an unmatched ']'".to_string());
+    }
+    if service.contains(':') {
+        return match service.parse::<std::net::Ipv6Addr>() {
+            Ok(_) => Ok(()),
+            Err(_) => Err(
+                "service must not carry a port or ':' separator; declare the port in \
+                 extensionProviders[].port"
+                    .to_string(),
+            ),
+        };
+    }
+    if service.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Ok(());
+    }
+    // DNS name: RFC 1123 labels, one optional trailing dot.
+    let name = service.strip_suffix('.').unwrap_or(service);
+    if name.is_empty() {
+        return Err("service must be a valid DNS name".to_string());
+    }
+    for label in name.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err("service DNS labels must be 1-63 characters".to_string());
+        }
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(
+                "service DNS labels may contain only letters, digits, and hyphens".to_string(),
+            );
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("service DNS labels must not start or end with '-'".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Validate an `extensionProviders[].pathPrefix` as a REAL URL path prefix.
+///
+/// The prefix is concatenated ahead of the request path, so a value carrying
+/// `?`, `#`, `\`, or a leading `//` would move the remainder into the query,
+/// the fragment, or an entirely different authority — silently sending the
+/// check somewhere the operator did not name.
+pub fn validate_mesh_ext_authz_path_prefix(prefix: &str) -> Result<(), String> {
+    if !prefix.starts_with('/') {
+        return Err("pathPrefix must start with '/'".to_string());
+    }
+    if prefix.len() > MAX_MESH_EXT_AUTHZ_PATH_PREFIX_LEN {
+        return Err(format!(
+            "pathPrefix must be at most {MAX_MESH_EXT_AUTHZ_PATH_PREFIX_LEN} bytes"
+        ));
+    }
+    if prefix.starts_with("//") {
+        return Err(
+            "pathPrefix must not start with '//': a protocol-relative prefix re-targets the \
+             check at a different authority"
+                .to_string(),
+        );
+    }
+    if prefix.bytes().any(|byte| {
+        byte.is_ascii_control()
+            || byte.is_ascii_whitespace()
+            || !byte.is_ascii()
+            || matches!(byte, b'?' | b'#' | b'\\')
+    }) {
+        return Err(
+            "pathPrefix must be printable ASCII with no '?', '#', or '\\' (those change which \
+             URL component the request path lands in)"
+                .to_string(),
+        );
+    }
+    if prefix.split('/').any(|segment| segment == "..") {
+        return Err("pathPrefix must not contain a '..' segment".to_string());
+    }
+    Ok(())
+}
+
 /// Whether a host is a loopback literal, for which plaintext provider
 /// transport is permitted.
 pub fn mesh_ext_authz_host_is_loopback(host: &str) -> bool {
@@ -722,22 +860,12 @@ impl MeshExtAuthzProvider {
         if self.name.trim() != self.name {
             return Err("extensionProviders[].name must not have surrounding whitespace".into());
         }
-        if self.service.trim().is_empty() || self.service.len() > MAX_MESH_EXT_AUTHZ_NAME_LEN {
-            return Err(format!(
-                "extensionProviders '{}' service must be non-empty and at most {MAX_MESH_EXT_AUTHZ_NAME_LEN} bytes",
+        validate_mesh_ext_authz_service_host(&self.service).map_err(|error| {
+            format!(
+                "extensionProviders '{}' {error}",
                 sanitize_mesh_ext_authz_diagnostic(&self.name)
-            ));
-        }
-        if self
-            .service
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || byte == b'/')
-        {
-            return Err(format!(
-                "extensionProviders '{}' service must be a bare host, not a URL",
-                sanitize_mesh_ext_authz_diagnostic(&self.name)
-            ));
-        }
+            )
+        })?;
         if self.port == 0 {
             return Err(format!(
                 "extensionProviders '{}' port must be between 1 and 65535",
@@ -763,17 +891,12 @@ impl MeshExtAuthzProvider {
             ));
         }
         if let Some(prefix) = self.path_prefix.as_deref() {
-            if !prefix.starts_with('/')
-                || prefix.len() > MAX_MESH_EXT_AUTHZ_PATH_PREFIX_LEN
-                || prefix
-                    .bytes()
-                    .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-            {
-                return Err(format!(
-                    "extensionProviders '{}' pathPrefix must start with '/', be control-character free, and be at most {MAX_MESH_EXT_AUTHZ_PATH_PREFIX_LEN} bytes",
+            validate_mesh_ext_authz_path_prefix(prefix).map_err(|error| {
+                format!(
+                    "extensionProviders '{}' {error}",
                     sanitize_mesh_ext_authz_diagnostic(&self.name)
-                ));
-            }
+                )
+            })?;
         }
         Self::validate_header_list(
             &self.name,
@@ -818,13 +941,32 @@ impl MeshExtAuthzProvider {
                 sanitize_mesh_ext_authz_diagnostic(&self.name)
             ));
         }
+        // Fixed operator headers OVERRIDE both a same-named client header and a
+        // same-named `includeRequestHeadersInCheck` value, so exactly one value
+        // per name must be admitted. Two entries differing only in case would
+        // otherwise make the override winner depend on iteration order, which
+        // an attacker-supplied client header could then sit beside.
+        let mut fixed_names: BTreeSet<String> = BTreeSet::new();
         for header in &self.include_additional_headers_in_check {
-            validate_mesh_ext_authz_forwarded_header(&header.name).map_err(|error| {
-                format!(
-                    "extensionProviders '{}' includeAdditionalHeadersInCheck {error}",
+            let normalized =
+                validate_mesh_ext_authz_forwarded_header(&header.name).map_err(|error| {
+                    format!(
+                        "extensionProviders '{}' includeAdditionalHeadersInCheck {error}",
+                        sanitize_mesh_ext_authz_diagnostic(&self.name)
+                    )
+                })?;
+            if !fixed_names.insert(normalized.clone()) {
+                return Err(format!(
+                    "extensionProviders '{}' includeAdditionalHeadersInCheck declares '{normalized}' more than once (header names are case-insensitive)",
                     sanitize_mesh_ext_authz_diagnostic(&self.name)
-                )
-            })?;
+                ));
+            }
+            if header.name != normalized {
+                return Err(format!(
+                    "extensionProviders '{}' includeAdditionalHeadersInCheck names must be normalized to lowercase ('{normalized}')",
+                    sanitize_mesh_ext_authz_diagnostic(&self.name)
+                ));
+            }
             if header.value.len() > MAX_MESH_EXT_AUTHZ_HEADER_VALUE_LEN
                 || header
                     .value
@@ -847,6 +989,23 @@ impl MeshExtAuthzProvider {
                     sanitize_mesh_ext_authz_diagnostic(&self.name)
                 ));
             }
+            // `allowPartialMessage: true` is REFUSED, not approximated.
+            //
+            // Envoy's partial-message mode checks a bounded PREFIX and still
+            // forwards the complete original body upstream. Ferrum's
+            // authorize-phase body is the single pre-`before_proxy` buffer the
+            // proxy will also forward, so honouring the flag would mean either
+            // truncating the backend-visible request (changing what the client
+            // sent) or retaining an unbounded body behind a cap the operator
+            // asked for. Neither is acceptable, and an accepted-but-unreachable
+            // flag is worse than a visible refusal: an operator would believe
+            // large bodies are being checked when the request is really 413ed.
+            if body.allow_partial_message {
+                return Err(format!(
+                    "extensionProviders '{}' includeRequestBodyInCheck.allowPartialMessage is not supported: Ferrum checks the complete buffered body and returns 413 at maxRequestBytes instead of checking a truncated prefix",
+                    sanitize_mesh_ext_authz_diagnostic(&self.name)
+                ));
+            }
         }
         Ok(())
     }
@@ -863,13 +1022,26 @@ impl MeshExtAuthzProvider {
                 sanitize_mesh_ext_authz_diagnostic(provider)
             ));
         }
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         for name in names {
-            validator(name).map_err(|error| {
+            let normalized = validator(name).map_err(|error| {
                 format!(
                     "extensionProviders '{}' {field} {error}",
                     sanitize_mesh_ext_authz_diagnostic(provider)
                 )
             })?;
+            if !seen.insert(normalized.clone()) {
+                return Err(format!(
+                    "extensionProviders '{}' {field} declares '{normalized}' more than once (header names are case-insensitive)",
+                    sanitize_mesh_ext_authz_diagnostic(provider)
+                ));
+            }
+            if *name != normalized {
+                return Err(format!(
+                    "extensionProviders '{}' {field} names must be normalized to lowercase ('{normalized}')",
+                    sanitize_mesh_ext_authz_diagnostic(provider)
+                ));
+            }
         }
         Ok(())
     }

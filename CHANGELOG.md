@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Istio `AuthorizationPolicy` `action: CUSTOM` external authorization (issue
+  #3235). A matching policy delegates the decision to a root-namespace
+  `meshConfig.extensionProviders` `envoyExtAuthzHttp` provider, evaluated in
+  Istio's action order (CUSTOM → DENY → ALLOW) inside the `mesh_authz`
+  `authorize` phase, so every HTTP-family ingress path — HTTP/1.1, HTTP/2,
+  native gRPC, HTTP/3, and HTTP relayed inside a mesh/HBONE CONNECT — is
+  covered by one implementation. Providers ride the mesh slice and a new
+  `ExtAuthzProvidersCarrier` ECDS carrier; the DP proves the complete
+  policy↔provider binding after xDS recovery, so an incoherent generation
+  NACKs and the last-good slice keeps serving. Outcome classification follows
+  the Istio/Envoy HTTP ext-auth protocol exactly: HTTP `200` allows, HTTP `5xx`
+  and communication failures are failed checks subject to `failOpen` (resolving
+  to `statusOnError` when fail-closed), and every other status is an explicit
+  denial carrying the provider's own status. The check is dispatched through a
+  single-attempt seam on the shared plugin HTTP client, so an authorization
+  decision is never replayed by `FERRUM_PLUGIN_HTTP_MAX_RETRIES`. It carries the
+  protocol's automatic fields (original method, prefixed path, original `Host`
+  authority as a header only — the dial destination is always the provider's own
+  configured `service`/`port` — and `Content-Length`), and
+  `includeAdditionalHeadersInCheck` values are authoritative over a same-named
+  client or `includeRequestHeadersInCheck` value. At most one extension provider
+  may apply to a request: same-provider policies coalesce, a workload-scoped
+  conflict is refused at plugin construction, and a request that can see two
+  distinct providers is denied with the stable reason
+  `custom:provider-conflict`. On a non-HTTP port, HTTP-only fields are treated
+  as always matched for CUSTOM exactly as for DENY, so an L4 CUSTOM rule closes
+  the connection instead of becoming inert. Fixed-cardinality
+  `ferrum_mesh_ext_authz_checks_total{outcome}` /
+  `ferrum_mesh_ext_authz_check_failures_total{disposition}` series count every
+  matched delegation exactly once, including the outcomes decided without
+  contacting a provider. Deliberate narrowings, all rejected at admission with
+  field-shaped diagnostics rather than silently dropped: `envoyExtAuthzGrpc`,
+  unmodelled provider fields, `packAsBytes`, wildcard header entries,
+  `headersToUpstreamOnAllow` / `headersToDownstreamOnAllow`, plaintext transport
+  to a non-loopback provider, namespace-qualified `[<namespace>/]<hostname>`
+  service syntax, and `includeRequestBodyInCheck.allowPartialMessage: true`
+  (`maxRequestBytes` is enforced as a `413` before the check runs, which takes
+  precedence over `failOpen`, matching Envoy without partial messages; that
+  ceiling applies only to requests a body-inspecting CUSTOM rule could reach).
+  See `docs/mesh.md` → "AuthorizationPolicy `action: CUSTOM`".
+
 - Port-aware Gateway API HTTP-family route representation and real listener
   binding (issue #3612). Materialized proxies carry the admitting listener's
   `listen_port` plus a namespace-qualified TLS class, and a new

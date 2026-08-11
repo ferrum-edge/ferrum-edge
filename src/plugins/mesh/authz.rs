@@ -88,6 +88,14 @@ pub struct MeshAuthz {
     /// construction). A `None` executor never fails open: a matched CUSTOM
     /// delegation with no executor denies, exactly like the L4 path.
     ext_authz: Option<Arc<MeshExtAuthzExecutor>>,
+    /// The CUSTOM rules whose bound provider declares
+    /// `includeRequestBodyInCheck`, precomputed at construction.
+    ///
+    /// Drives the per-request buffering predicate: only a request one of these
+    /// rules could reach is buffered before `authorize` and held to that
+    /// provider's `maxRequestBytes`. Empty whenever no provider inspects
+    /// bodies, so an ordinary mesh pays nothing.
+    body_inspecting_custom_rules: Vec<crate::modes::mesh::config::MeshRule>,
     /// Unfiltered policy superset used for Ambient UDP CONNECTs carrying
     /// validated per-pod evidence and for ServiceWaypoint inbound relays whose
     /// destination workload differs from the waypoint identity. Ordinary
@@ -871,6 +879,7 @@ fn evaluate_destination_policy_scopes(
 ) -> MeshAuthzEvaluation {
     let mut audit_policy = None;
     let mut custom: Option<MeshAuthzCustomDelegation> = None;
+    let mut custom_provider_conflict = false;
     for scope in scopes {
         let evaluation = evaluate_mesh_authorization_full(
             policies
@@ -878,11 +887,27 @@ fn evaluate_destination_policy_scopes(
                 .filter(|policy| scope.policy_applies_for_destination(policy, waypoint)),
             request,
         );
-        // The FIRST matching delegation across every destination scope wins,
-        // matching the single-pass evaluator: one request delegates to at most
-        // one provider.
-        if custom.is_none() {
-            custom = evaluation.custom;
+        // Istio permits at most ONE extension provider per workload, and a
+        // relay evaluates several destination scopes for the same request, so
+        // the conflict test spans them. Different destination scopes may each
+        // carry their own provider legitimately, but a single request that can
+        // see two DIFFERENT ones has no correct winner — refuse rather than let
+        // scope iteration order pick the enforcing authorizer. Same-provider
+        // delegations across scopes coalesce into one check.
+        custom_provider_conflict |= evaluation.custom_provider_conflict;
+        if let Some(delegation) = evaluation.custom {
+            // `take` ends the borrow of `custom` before the arms assign to it.
+            match custom.take() {
+                Some(existing) if existing.provider == delegation.provider => {
+                    custom = Some(existing)
+                }
+                Some(_) => custom_provider_conflict = true,
+                None if custom_provider_conflict => {}
+                None => custom = Some(delegation),
+            }
+        }
+        if custom_provider_conflict {
+            custom = None;
         }
         match evaluation.decision {
             MeshAuthzDecision::Deny { policy } => {
@@ -891,6 +916,7 @@ fn evaluate_destination_policy_scopes(
                 // CUSTOM check rather than concluding none applied.
                 return MeshAuthzEvaluation {
                     custom,
+                    custom_provider_conflict,
                     decision: MeshAuthzDecision::Deny { policy },
                 };
             }
@@ -905,7 +931,11 @@ fn evaluate_destination_policy_scopes(
     } else {
         MeshAuthzDecision::Allow
     };
-    MeshAuthzEvaluation { custom, decision }
+    MeshAuthzEvaluation {
+        custom,
+        custom_provider_conflict,
+        decision,
+    }
 }
 
 /// Resolve a `request.headers[<name>]` value. Reads the already-lowercased
@@ -1412,12 +1442,40 @@ impl MeshAuthz {
         // `mesh_policies` array has no provider source, so its CUSTOM rules
         // (if any) deny — which is the correct reading of "delegate this
         // decision to a provider that is not configured here".
-        let ext_authz = if slice
+        // At most ONE extension provider may apply to a workload (Istio). The
+        // slice's own `mesh_policies` are ALREADY narrowed to this workload, so
+        // two distinct providers there can never be a legitimate
+        // disjoint-workload configuration — it is an unresolvable delegation
+        // and is refused at this cold boundary, which keeps the previous valid
+        // generation serving instead of publishing one whose enforcing
+        // authorizer depends on policy iteration order.
+        //
+        // `relay_policy_superset` is deliberately EXCLUDED: it is the
+        // un-narrowed superset a waypoint/relay evaluates per destination, so
+        // two providers there are the legitimate disjoint-destination case.
+        // That path is resolved per request instead, and a request that can
+        // genuinely see both is refused there (`custom_provider_conflict`).
+        let mut workload_providers: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
+        for provider in slice
             .mesh_policies
             .iter()
-            .chain(relay_policy_superset.iter())
             .flat_map(|policy| policy.rules.iter())
-            .any(|rule| rule.action.custom_provider().is_some())
+            .filter_map(|rule| rule.action.custom_provider())
+        {
+            workload_providers.insert(provider);
+        }
+        if workload_providers.len() > 1 {
+            return Err(
+                "mesh_authz: this workload is selected by CUSTOM AuthorizationPolicies naming                  more than one meshConfig.extensionProviders entry; Istio permits at most one                  external authorization provider per workload"
+                    .to_string(),
+            );
+        }
+        let ext_authz = if !workload_providers.is_empty()
+            || relay_policy_superset
+                .iter()
+                .flat_map(|policy| policy.rules.iter())
+                .any(|rule| rule.action.custom_provider().is_some())
         {
             match http_client {
                 Some(client) => {
@@ -1430,10 +1488,32 @@ impl MeshAuthz {
         } else {
             None
         };
+        // Rules whose CUSTOM provider inspects the request body. Precomputed
+        // here so the per-request buffering predicate is a bounded scan of the
+        // (usually empty) body-inspecting subset rather than a scan of every
+        // policy.
+        let body_inspecting_custom_rules: Vec<crate::modes::mesh::config::MeshRule> = match ext_authz
+            .as_ref()
+        {
+            Some(executor) if executor.requires_request_body() => slice
+                .mesh_policies
+                .iter()
+                .chain(relay_policy_superset.iter())
+                .flat_map(|policy| policy.rules.iter())
+                .filter(|rule| {
+                    rule.action
+                        .custom_provider()
+                        .is_some_and(|provider| executor.provider_requires_request_body(provider))
+                })
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        };
 
         Ok(Self {
             slice,
             ext_authz,
+            body_inspecting_custom_rules,
             relay_policy_superset,
             ambient_udp_source_scopes,
             ambient_udp_source_scoping,
@@ -1896,11 +1976,24 @@ impl MeshAuthz {
         &self,
         ctx: &mut RequestContext,
         delegation: &MeshAuthzCustomDelegation,
+        authority: Option<String>,
     ) -> Option<PluginResult> {
         let Some(executor) = self.ext_authz.as_ref() else {
+            // An executor-unavailable denial is a MATCHED delegation that was
+            // refused, so it participates in the same fixed-cardinality
+            // counters as every other outcome — exactly once, and never
+            // labelled by provider, policy, or request input. Leaving it
+            // uncounted would make a whole generation's worth of denials
+            // invisible on `/metrics`.
+            crate::plugins::mesh::ext_authz::record(
+                crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderUnbound,
+                false,
+            );
             ctx.metadata.insert(
                 "mesh_authz.ext_authz_outcome".to_string(),
-                "executor_unavailable".to_string(),
+                crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderUnbound
+                    .as_str()
+                    .to_string(),
             );
             return Some(PluginResult::Reject {
                 status_code: 403,
@@ -1921,6 +2014,11 @@ impl MeshAuthz {
         }
         let path = mesh_authz_authorization_path(&ctx.path);
         let body = ctx.request_body_bytes.clone();
+        // The ext-auth protocol carries the ORIGINAL request authority. This is
+        // the same validated `Host` / `:authority` the policy matcher used, and
+        // it becomes a header on the check request only — the dial destination
+        // stays the provider's configured service/port, so it cannot route the
+        // provider connection.
         let outcome = executor
             .check(
                 &delegation.provider,
@@ -1928,6 +2026,7 @@ impl MeshAuthz {
                     method: &ctx.method,
                     path: &path,
                     headers: &check_headers,
+                    authority: authority.as_deref(),
                     body: body.as_deref(),
                     body_proven_empty: ctx.replay_request_body_empty_proven(),
                 },
@@ -2694,10 +2793,46 @@ impl Plugin for MeshAuthz {
         // granted. An ALLOW verdict from the provider does NOT end the
         // evaluation: the DENY/ALLOW tiers still apply below, so a DENY policy
         // can still refuse a request the provider was willing to admit.
+        //
+        // Two DIFFERENT applicable providers is a refusal, not a precedence
+        // question: Istio permits at most one extension provider per workload,
+        // so picking one by iteration order would let policy ordering choose
+        // which operator's authorizer enforces. The refusal carries a stable,
+        // bounded reason and is counted once.
+        if evaluation.custom_provider_conflict {
+            crate::plugins::mesh::ext_authz::record(
+                crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderConflict,
+                false,
+            );
+            ctx.metadata.insert(
+                "mesh_authz.ext_authz_outcome".to_string(),
+                crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderConflict
+                    .as_str()
+                    .to_string(),
+            );
+            ctx.metadata.insert(
+                "mesh_authz.deny_policy".to_string(),
+                crate::modes::mesh::policy::MESH_AUTHZ_CUSTOM_PROVIDER_CONFLICT.to_string(),
+            );
+            self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+            if self.per_pod_policy_scoping && !asserted_identity_rejected {
+                crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+                    crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
+                );
+            }
+            return PluginResult::Reject {
+                status_code: 403,
+                body: r#"{"error":"Mesh authorization denied"}"#.into(),
+                headers: HashMap::new(),
+            };
+        }
         let decision = match evaluation.custom {
             None => evaluation.decision,
             Some(delegation) => {
-                match self.run_custom_delegation(ctx, &delegation).await {
+                match self
+                    .run_custom_delegation(ctx, &delegation, request.host.clone())
+                    .await
+                {
                     None => evaluation.decision,
                     Some(reject) => {
                         ctx.metadata.insert(
@@ -2819,9 +2954,45 @@ impl Plugin for MeshAuthz {
         self.requires_request_body_before_authorize()
     }
 
+    /// A body-inspecting CUSTOM provider must not make EVERY request on the
+    /// workload buffer its body and inherit that provider's `maxRequestBytes`
+    /// ceiling — the ceiling is enforced as a `413` before the check runs, so a
+    /// blanket declaration would shrink the accepted body size of requests no
+    /// CUSTOM rule can reach.
+    ///
+    /// The predicate is precise on the attributes this point can read (method,
+    /// path, host) and deliberately permissive on everything else, so it has no
+    /// false negatives for a rule that will later match — see
+    /// [`crate::modes::mesh::policy::mesh_rule_request_scope_may_apply`].
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        if self.body_inspecting_custom_rules.is_empty() {
+            return false;
+        }
+        let host = ctx
+            .raw_header_get("host")
+            .or_else(|| ctx.raw_header_get(":authority"))
+            .map(str::to_string)
+            .or_else(|| ctx.headers.get("host").cloned());
+        let path = mesh_authz_authorization_path(&ctx.path);
+        self.body_inspecting_custom_rules.iter().any(|rule| {
+            crate::modes::mesh::policy::mesh_rule_request_scope_may_apply(
+                rule,
+                &ctx.method,
+                &path,
+                host.as_deref(),
+            )
+        })
+    }
+
     /// Bound the buffer at the largest `maxRequestBytes` any provider declared,
     /// so a body-inspecting policy cannot make the gateway retain more than the
     /// operator asked a provider to see.
+    ///
+    /// This ceiling is what the proxy converts into a `413` at the
+    /// pre-`authorize` buffering step, BEFORE any check is dispatched — so the
+    /// refusal takes precedence over `failOpen`, which is Envoy's behavior with
+    /// partial messages disabled. `allowPartialMessage` is refused at
+    /// admission, so there is no truncated-prefix mode to reconcile with it.
     fn request_body_buffer_limit(&self) -> Option<usize> {
         self.ext_authz
             .as_ref()
@@ -2935,6 +3106,24 @@ impl Plugin for MeshAuthz {
         } else {
             evaluate_mesh_authorization_policies(self.slice.mesh_policies.iter(), &request)
         };
+        // An L4 CUSTOM refusal is a matched delegation, so it participates in
+        // the same fixed-cardinality counters as an executed check — exactly
+        // once, and never labelled by provider, policy, or connection input.
+        // The wrapper stamps a stable reason name, so the class is recoverable
+        // without introducing a second decision surface.
+        if let MeshAuthzDecision::Deny { policy } = &decision {
+            if policy == crate::modes::mesh::policy::MESH_AUTHZ_CUSTOM_PROVIDER_CONFLICT {
+                crate::plugins::mesh::ext_authz::record(
+                    crate::plugins::mesh::ext_authz::MeshExtAuthzReason::ProviderConflict,
+                    false,
+                );
+            } else if policy.starts_with("custom:") {
+                crate::plugins::mesh::ext_authz::record(
+                    crate::plugins::mesh::ext_authz::MeshExtAuthzReason::Unexecutable,
+                    false,
+                );
+            }
+        }
         let result = self.decision_to_result(decision, &mut metadata);
         if matches!(
             result,

@@ -442,10 +442,7 @@ fn envoy_ext_authz_http_provider(
         None => None,
     };
     let fail_open = optional_bool(config, "failOpen")?.unwrap_or(false);
-    let status_on_error = match optional_u16(config, "statusOnError")? {
-        Some(status) => status,
-        None => 403,
-    };
+    let status_on_error = parse_ext_authz_status_on_error(&display, config)?;
 
     let include_request_headers_in_check = ext_authz_header_list(
         &display,
@@ -517,6 +514,39 @@ fn reject_unknown_provider_keys(
         }
     }
     Ok(())
+}
+
+/// Parse `envoyExtAuthzHttp.statusOnError`.
+///
+/// Upstream Istio's `EnvoyExternalAuthorizationHttpProvider` documents this as
+/// an HTTP status STRING (it is an `envoy.type.v3.StatusCode` enum name in
+/// Envoy, surfaced by Istio as the decimal status text), so a decimal string is
+/// the real operator input shape. A JSON integer is accepted too because it is
+/// the shape a hand-authored Ferrum mesh document naturally carries, and the
+/// internal representation stays numeric either way. Anything else — an enum
+/// NAME, a float, a non-numeric string, or a status outside 4xx/5xx — is
+/// refused with a field-shaped diagnostic rather than defaulted, because a
+/// silently defaulted `statusOnError` changes what a fail-closed denial looks
+/// like to the client.
+fn parse_ext_authz_status_on_error(display: &str, config: &Value) -> Result<u16, String> {
+    let invalid = || {
+        format!(
+            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp statusOnError must be a 4xx or 5xx HTTP status, written as a decimal string such as \"403\" (an integer is also accepted)"
+        )
+    };
+    let status = match config.get("statusOnError") {
+        None | Some(Value::Null) => return Ok(403),
+        Some(Value::String(raw)) => raw.trim().parse::<u16>().map_err(|_| invalid())?,
+        Some(Value::Number(raw)) => {
+            let value = raw.as_u64().ok_or_else(invalid)?;
+            u16::try_from(value).map_err(|_| invalid())?
+        }
+        Some(_) => return Err(invalid()),
+    };
+    if !(400..=599).contains(&status) {
+        return Err(invalid());
+    }
+    Ok(status)
 }
 
 /// Parse a protobuf-Duration-shaped ext-auth timeout (`"0.25s"`, `"2s"`,
@@ -659,9 +689,19 @@ fn ext_authz_body_check(
             "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp includeRequestBodyInCheck.maxRequestBytes must be between 1 and {MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES}"
         ));
     }
+    // Deliberate, documented narrowing (see `MeshExtAuthzProvider::validate`):
+    // Envoy's partial-message mode checks a bounded prefix and still forwards
+    // the complete body upstream. Ferrum's authorize-phase body IS the buffer
+    // the proxy forwards, so it returns 413 at `maxRequestBytes` instead. An
+    // accepted-but-unreachable flag would be worse than this refusal.
+    if optional_bool(value, "allowPartialMessage")?.unwrap_or(false) {
+        return Err(format!(
+            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp includeRequestBodyInCheck.allowPartialMessage is not supported: Ferrum checks the complete buffered body and returns 413 at maxRequestBytes instead of checking a truncated prefix"
+        ));
+    }
     Ok(Some(MeshExtAuthzBodyCheck {
         max_request_bytes: max_request_bytes as usize,
-        allow_partial_message: optional_bool(value, "allowPartialMessage")?.unwrap_or(false),
+        allow_partial_message: false,
     }))
 }
 

@@ -32,14 +32,40 @@
 //!   [`crate::modes::mesh::config::MESH_EXT_AUTHZ_MAX_TIMEOUT_MS`])
 //! * concurrency ceiling reached (refused immediately; never queued)
 //! * response larger than the fixed read bound
-//! * a request body that exceeds `maxRequestBytes` without
-//!   `allowPartialMessage`
+//! * an HTTP `5xx` from the provider (it could not decide)
 //! * a body that could not be materialized for a provider that requires one
 //! * task cancellation (the future is dropped without producing an allow)
 //!
-//! A `2xx` provider status allows; any other status denies with that status.
-//! Nothing is retried: a check request may carry a partially sent body, and
-//! replaying an authorization decision is never safe.
+//! Outcome classification follows the Istio/Envoy HTTP ext-auth protocol
+//! exactly: HTTP `200` — and only `200` — allows; `5xx` (like a transport
+//! failure) is a FAILED CHECK subject to `failOpen`, resolving to
+//! `statusOnError` when fail-closed; every other status (3xx / 4xx, and any
+//! non-`200` 2xx) is an explicit provider denial carrying the provider's own
+//! status.
+//!
+//! Two refusals are decided WITHOUT contacting a provider and are therefore
+//! NOT subject to `failOpen`: a request to which two DIFFERENT extension
+//! providers would apply (Istio permits at most one per workload), and a
+//! matched delegation on a path with no HTTP request to check.
+//!
+//! Nothing is retried. The shared plugin HTTP client's transport-retry policy
+//! is explicitly suppressed through a single-attempt seam: an ext-authz check
+//! is usually a `GET`, so inheriting the shared policy would turn one client
+//! request into several authorization decisions.
+//!
+//! ## Request-body contract
+//!
+//! `includeRequestBodyInCheck.maxRequestBytes` is folded into the proxy's
+//! pre-`authorize` body ceiling, so a request over the cap is refused with
+//! `413` BEFORE any check is dispatched — which also means the refusal takes
+//! precedence over `failOpen`, matching Envoy without partial messages.
+//! `allowPartialMessage: true` is REFUSED at every admission boundary rather
+//! than accepted-and-ignored; see `MeshExtAuthzProvider::validate`.
+//!
+//! That ceiling applies only to requests a body-inspecting CUSTOM rule could
+//! actually reach: `MeshAuthz::should_buffer_request_body` gates it, so an
+//! unrelated request on the same workload keeps its ordinary accepted body
+//! size.
 //!
 //! ## What never leaves the process
 //!
@@ -70,6 +96,17 @@ pub enum MeshExtAuthzReason {
     Allowed,
     DeniedByProvider,
     ProviderUnbound,
+    /// The provider answered, but with an HTTP 5xx. Istio/Envoy treat this as
+    /// a failed check (subject to `failOpen`), NOT as a provider denial.
+    ProviderError,
+    /// Two DIFFERENT extension providers were applicable to one request.
+    /// Istio permits at most one per workload, so this is refused rather than
+    /// resolved by iteration order.
+    ProviderConflict,
+    /// A matched CUSTOM delegation on a path that has no HTTP request to
+    /// check (an L4 TCP/TLS/UDP session), or in a generation with no
+    /// executor. Always a denial.
+    Unexecutable,
     Timeout,
     TransportError,
     ResponseTooLarge,
@@ -86,6 +123,9 @@ impl MeshExtAuthzReason {
             MeshExtAuthzReason::Allowed => "allowed",
             MeshExtAuthzReason::DeniedByProvider => "denied_by_provider",
             MeshExtAuthzReason::ProviderUnbound => "provider_unbound",
+            MeshExtAuthzReason::ProviderError => "provider_error",
+            MeshExtAuthzReason::ProviderConflict => "provider_conflict",
+            MeshExtAuthzReason::Unexecutable => "unexecutable",
             MeshExtAuthzReason::Timeout => "timeout",
             MeshExtAuthzReason::TransportError => "transport_error",
             MeshExtAuthzReason::ResponseTooLarge => "response_too_large",
@@ -100,10 +140,18 @@ impl MeshExtAuthzReason {
     /// Whether the outcome represents a failed check (as opposed to a clean
     /// allow or an explicit provider denial). Only these are subject to
     /// `failOpen`.
+    ///
+    /// `ProviderConflict` and `Unexecutable` are deliberately excluded: they
+    /// are configuration/topology refusals decided WITHOUT contacting a
+    /// provider, so no provider's `failOpen` opinion applies to them. They are
+    /// still counted, once, in the check-outcome series.
     fn is_check_failure(self) -> bool {
         !matches!(
             self,
-            MeshExtAuthzReason::Allowed | MeshExtAuthzReason::DeniedByProvider
+            MeshExtAuthzReason::Allowed
+                | MeshExtAuthzReason::DeniedByProvider
+                | MeshExtAuthzReason::ProviderConflict
+                | MeshExtAuthzReason::Unexecutable
         )
     }
 }
@@ -130,13 +178,24 @@ static CHECKS_DENIED_BY_PROVIDER: AtomicU64 = AtomicU64::new(0);
 static CHECKS_FAILED_CLOSED: AtomicU64 = AtomicU64::new(0);
 static CHECKS_FAILED_OPEN: AtomicU64 = AtomicU64::new(0);
 static CHECKS_UNBOUND_PROVIDER: AtomicU64 = AtomicU64::new(0);
+static CHECKS_PROVIDER_ERROR: AtomicU64 = AtomicU64::new(0);
+static CHECKS_PROVIDER_CONFLICT: AtomicU64 = AtomicU64::new(0);
+static CHECKS_UNEXECUTABLE: AtomicU64 = AtomicU64::new(0);
 static CHECKS_TIMEOUT: AtomicU64 = AtomicU64::new(0);
 static CHECKS_TRANSPORT_ERROR: AtomicU64 = AtomicU64::new(0);
 static CHECKS_RESPONSE_REFUSED: AtomicU64 = AtomicU64::new(0);
 static CHECKS_BODY_REFUSED: AtomicU64 = AtomicU64::new(0);
 static CHECKS_CONCURRENCY_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 
-fn record(reason: MeshExtAuthzReason, failed_open: bool) {
+/// Record exactly one outcome for one matched CUSTOM delegation.
+///
+/// Every terminal path — including the ones decided WITHOUT contacting a
+/// provider (unbound name, no executor, an L4 session, two applicable
+/// providers) — funnels through here, so a matched delegation is never
+/// invisible in the metrics and never counted twice. Labels stay a closed
+/// enum: never a provider name, policy name, namespace, route, host, or
+/// principal.
+pub(crate) fn record(reason: MeshExtAuthzReason, failed_open: bool) {
     match reason {
         MeshExtAuthzReason::Allowed => CHECKS_ALLOWED.fetch_add(1, Ordering::Relaxed),
         MeshExtAuthzReason::DeniedByProvider => {
@@ -145,6 +204,11 @@ fn record(reason: MeshExtAuthzReason, failed_open: bool) {
         MeshExtAuthzReason::ProviderUnbound => {
             CHECKS_UNBOUND_PROVIDER.fetch_add(1, Ordering::Relaxed)
         }
+        MeshExtAuthzReason::ProviderError => CHECKS_PROVIDER_ERROR.fetch_add(1, Ordering::Relaxed),
+        MeshExtAuthzReason::ProviderConflict => {
+            CHECKS_PROVIDER_CONFLICT.fetch_add(1, Ordering::Relaxed)
+        }
+        MeshExtAuthzReason::Unexecutable => CHECKS_UNEXECUTABLE.fetch_add(1, Ordering::Relaxed),
         MeshExtAuthzReason::Timeout => CHECKS_TIMEOUT.fetch_add(1, Ordering::Relaxed),
         MeshExtAuthzReason::TransportError | MeshExtAuthzReason::RequestBuildFailed => {
             CHECKS_TRANSPORT_ERROR.fetch_add(1, Ordering::Relaxed)
@@ -176,6 +240,9 @@ pub struct MeshExtAuthzMetricsSnapshot {
     pub failed_closed: u64,
     pub failed_open: u64,
     pub provider_unbound: u64,
+    pub provider_error: u64,
+    pub provider_conflict: u64,
+    pub unexecutable: u64,
     pub timeout: u64,
     pub transport_error: u64,
     pub response_refused: u64,
@@ -190,6 +257,9 @@ pub fn snapshot() -> MeshExtAuthzMetricsSnapshot {
         failed_closed: CHECKS_FAILED_CLOSED.load(Ordering::Relaxed),
         failed_open: CHECKS_FAILED_OPEN.load(Ordering::Relaxed),
         provider_unbound: CHECKS_UNBOUND_PROVIDER.load(Ordering::Relaxed),
+        provider_error: CHECKS_PROVIDER_ERROR.load(Ordering::Relaxed),
+        provider_conflict: CHECKS_PROVIDER_CONFLICT.load(Ordering::Relaxed),
+        unexecutable: CHECKS_UNEXECUTABLE.load(Ordering::Relaxed),
         timeout: CHECKS_TIMEOUT.load(Ordering::Relaxed),
         transport_error: CHECKS_TRANSPORT_ERROR.load(Ordering::Relaxed),
         response_refused: CHECKS_RESPONSE_REFUSED.load(Ordering::Relaxed),
@@ -218,6 +288,9 @@ pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
         ("allowed", snap.allowed),
         ("denied_by_provider", snap.denied_by_provider),
         ("provider_unbound", snap.provider_unbound),
+        ("provider_error", snap.provider_error),
+        ("provider_conflict", snap.provider_conflict),
+        ("unexecutable", snap.unexecutable),
         ("timeout", snap.timeout),
         ("transport_error", snap.transport_error),
         ("response_refused", snap.response_refused),
@@ -277,6 +350,26 @@ impl PreparedProvider {
         let mut check_url_base = format!("{scheme}://{host}:{}", provider.port);
         if let Some(prefix) = provider.path_prefix.as_deref() {
             check_url_base.push_str(prefix.trim_end_matches('/'));
+        }
+        // Prove the composed base URL is what the operator's fields say it is.
+        // `validate()` already refuses every value shape that could move the
+        // remainder into another URL component; this is the independent proof
+        // that the composition itself did not, so a mis-parse can never be
+        // discovered per request (where it would deny every delegated decision
+        // — or, under `failOpen`, allow one).
+        let parsed = url::Url::parse(&check_url_base)
+            .map_err(|_| "external authorization check URL does not parse".to_string())?;
+        if parsed.scheme() != scheme
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.port_or_known_default() != Some(provider.port)
+        {
+            return Err(
+                "external authorization check URL must carry only scheme, host, port, and path"
+                    .to_string(),
+            );
         }
         // The redacted rendering is what reaches every log line the shared
         // plugin HTTP client emits. It carries scheme/host/port only: a
@@ -348,6 +441,15 @@ pub struct MeshExtAuthzCheckRequest<'a> {
     pub path: &'a str,
     /// Lowercased client request headers.
     pub headers: &'a HashMap<String, String>,
+    /// The ORIGINAL request authority (`Host` / `:authority`) as the proxy
+    /// validated it, when one is present.
+    ///
+    /// The HTTP ext-auth protocol carries the original `Host` to the provider
+    /// so a policy can be written against the service the client addressed.
+    /// It is a HEADER only: the dial destination stays the provider's own
+    /// configured `service`/`port`, so a client-controlled authority can never
+    /// re-target the provider connection.
+    pub authority: Option<&'a str>,
     /// Buffered request body, when the proxy retained one.
     pub body: Option<&'a [u8]>,
     /// Whether the transport PROVED the request body is empty. Distinguishes
@@ -496,33 +598,64 @@ impl MeshExtAuthzExecutor {
             return provider.failure(MeshExtAuthzReason::RequestBuildFailed);
         };
         let url = build_check_url(&provider.check_url_base, request.path);
-        let mut builder = self
-            .http_client
-            .get()
-            .request(method, url.as_str())
-            .timeout(provider.timeout);
+        // Header assembly is ONE map with insert (replace) semantics, not a
+        // chain of appends. `includeAdditionalHeadersInCheck` is the operator's
+        // FIXED value and must WIN over both a same-named client header and a
+        // same-named `includeRequestHeadersInCheck` entry — appending would let
+        // an attacker-controlled value ride to the provider beside the fixed
+        // one, where which value the provider reads is its own parser's choice.
+        // `HeaderName` comparison is already case-insensitive, and admission
+        // refuses case-variant duplicates, so the winner is deterministic.
+        let mut check_headers = http::HeaderMap::with_capacity(
+            provider.include_request_headers.len() + provider.additional_headers.len() + 1,
+        );
         for name in &provider.include_request_headers {
             if let Some(value) = request.headers.get(name.as_str())
                 && let Ok(header_value) = HeaderValue::from_str(value)
             {
-                builder = builder.header(name.clone(), header_value);
+                check_headers.insert(name.clone(), header_value);
             }
         }
         for (name, value) in &provider.additional_headers {
-            builder = builder.header(name.clone(), value.clone());
+            check_headers.insert(name.clone(), value.clone());
         }
+        // The HTTP ext-auth protocol carries the ORIGINAL request authority.
+        // Setting `Host` changes only what the provider is told the client
+        // addressed; the connection is still dialed at `check_url_base`, so
+        // this cannot route the provider connection anywhere. A malformed or
+        // unrepresentable authority is dropped rather than forwarded.
+        if let Some(authority) = request.authority
+            && let Ok(authority) = authority.parse::<http::uri::Authority>()
+            && let Ok(value) = HeaderValue::from_str(authority.as_str())
+        {
+            check_headers.insert(http::header::HOST, value);
+        }
+        let mut builder = self
+            .http_client
+            .get()
+            .request(method, url.as_str())
+            .timeout(provider.timeout)
+            .headers(check_headers);
+        // `Content-Length` is set by reqwest from the body, matching the
+        // protocol's automatic fields (Host, Method, Path, Content-Length).
         if let Some(body) = body {
             builder = builder.body(body);
         }
 
-        // `execute_redacted_tracked_classified` returns a TYPED failure class
-        // and logs only `redacted_url`, so the resolved provider URL (which may
-        // embed a shared secret in its path prefix) can never reach a log line.
-        // The classification is mapped onto this module's closed reason enum —
-        // the `reqwest::Error` itself is never rendered.
+        // `execute_redacted_tracked_classified_single_attempt` returns a TYPED
+        // failure class and logs only `redacted_url`, so the resolved provider
+        // URL (which may embed a shared secret in its path prefix) can never
+        // reach a log line. The classification is mapped onto this module's
+        // closed reason enum — the `reqwest::Error` itself is never rendered.
+        //
+        // SINGLE ATTEMPT, deliberately: a check is a decision, not a report.
+        // The shared client's transport-retry policy replays GET/HEAD/OPTIONS
+        // when `FERRUM_PLUGIN_HTTP_MAX_RETRIES` is set, and an ext-authz check
+        // is usually a GET, so the ordinary seam would silently turn one
+        // client request into several authorization decisions.
         let response = match self
             .http_client
-            .execute_redacted_tracked_classified(
+            .execute_redacted_tracked_classified_single_attempt(
                 builder,
                 "mesh_authz_ext_authz",
                 &provider.redacted_url,
@@ -548,7 +681,25 @@ impl MeshExtAuthzExecutor {
         {
             return provider.failure(MeshExtAuthzReason::ResponseTooLarge);
         }
-        let allowed = status.is_success();
+        // Istio/Envoy HTTP ext-auth outcome classification:
+        //
+        // * EXACTLY `200` allows. No other 2xx does — a `204` (or any other
+        //   success code) is not the protocol's allow signal, and reading one
+        //   as an allow would let a misconfigured or partially deployed
+        //   authorizer admit traffic it never authorized.
+        // * `5xx` is a FAILED CHECK, not a denial: the provider could not
+        //   decide, so it follows `failOpen` and, when fail-closed, uses
+        //   `statusOnError` — never the provider's own 5xx.
+        // * Everything else (3xx / 4xx) is an EXPLICIT provider denial and
+        //   keeps the provider's own status.
+        let outcome_class = classify_provider_status(status.as_u16());
+        if outcome_class == ProviderStatusClass::Error {
+            // Drain the connection under the fixed bound before failing, so a
+            // 5xx-emitting provider does not strand pooled connections.
+            let _ = read_response_body_bounded(response, MESH_EXT_AUTHZ_MAX_RESPONSE_BYTES).await;
+            return provider.failure(MeshExtAuthzReason::ProviderError);
+        }
+        let allowed = outcome_class == ProviderStatusClass::Allow;
         let deny_headers = if allowed {
             Vec::new()
         } else {
@@ -587,6 +738,25 @@ impl MeshExtAuthzExecutor {
     }
 }
 
+/// How one provider HTTP status resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderStatusClass {
+    /// Exactly `200`.
+    Allow,
+    /// `5xx`: the provider could not decide. Subject to `failOpen`.
+    Error,
+    /// Anything else: an explicit denial carrying the provider's own status.
+    Denied,
+}
+
+fn classify_provider_status(status: u16) -> ProviderStatusClass {
+    match status {
+        200 => ProviderStatusClass::Allow,
+        500..=599 => ProviderStatusClass::Error,
+        _ => ProviderStatusClass::Denied,
+    }
+}
+
 fn build_check_url(base: &str, path: &str) -> String {
     let mut url = String::with_capacity(base.len() + path.len() + 1);
     url.push_str(base);
@@ -619,12 +789,15 @@ fn resolve_check_body(
     };
     match request.body {
         Some(body) if body.len() <= policy.max_request_bytes => Ok(Some(body.to_vec())),
-        Some(body) if policy.allow_partial_message => {
-            Ok(Some(body[..policy.max_request_bytes].to_vec()))
-        }
-        // Istio/Envoy refuse an oversize body when partial messages are not
-        // allowed. Refusing here (rather than truncating anyway) is what keeps
+        // Defence in depth. In the live datapath an oversize body is already a
+        // `413` returned by the proxy's pre-`authorize` buffering step (which
+        // folds `maxRequestBytes` into the effective ceiling), BEFORE any check
+        // is dispatched and therefore before `failOpen` can be consulted —
+        // which is exactly Envoy's ordering without partial messages. Reaching
+        // here means the body was materialized some other way; refusing keeps
         // the provider's decision a decision about the real request.
+        // `allowPartialMessage` is refused at admission, so there is no
+        // truncating branch to fall into.
         Some(_) => Err(MeshExtAuthzReason::BodyTooLarge),
         // The transport proved there is no body at all: an empty check body is
         // the faithful representation, not a missing one.
@@ -636,6 +809,12 @@ fn resolve_check_body(
 
 #[cfg(test)]
 mod tests {
+    //! Inline coverage is deliberately limited to genuinely PRIVATE helpers
+    //! (`PreparedProvider`, `build_check_url`, `classify_provider_status`,
+    //! `resolve_check_body`). Everything reachable through a public seam —
+    //! `MeshAuthz::authorize`, the plugin body-phase declarations, and the
+    //! provider wire contract — is covered externally in
+    //! `tests/integration/mesh_ext_authz_custom_tests.rs`.
     use super::*;
 
     fn provider(name: &str) -> MeshExtAuthzProvider {
@@ -654,6 +833,21 @@ mod tests {
             headers_to_upstream_on_allow: Vec::new(),
             headers_to_downstream_on_deny: Vec::new(),
             headers_to_downstream_on_allow: Vec::new(),
+        }
+    }
+
+    fn body_request<'a>(
+        headers: &'a HashMap<String, String>,
+        body: Option<&'a [u8]>,
+        body_proven_empty: bool,
+    ) -> MeshExtAuthzCheckRequest<'a> {
+        MeshExtAuthzCheckRequest {
+            method: "POST",
+            path: "/",
+            headers,
+            authority: None,
+            body,
+            body_proven_empty,
         }
     }
 
@@ -678,7 +872,28 @@ mod tests {
     }
 
     #[test]
-    fn oversize_body_without_partial_messages_fails_closed() {
+    fn only_two_hundred_allows_and_five_hundreds_are_errors_not_denials() {
+        assert_eq!(classify_provider_status(200), ProviderStatusClass::Allow);
+        // A non-200 success is NOT the protocol's allow signal.
+        assert_eq!(classify_provider_status(204), ProviderStatusClass::Denied);
+        assert_eq!(classify_provider_status(302), ProviderStatusClass::Denied);
+        assert_eq!(classify_provider_status(403), ProviderStatusClass::Denied);
+        assert_eq!(classify_provider_status(500), ProviderStatusClass::Error);
+        assert_eq!(classify_provider_status(503), ProviderStatusClass::Error);
+    }
+
+    #[test]
+    fn a_five_hundred_is_a_check_failure_and_a_denial_is_not() {
+        assert!(MeshExtAuthzReason::ProviderError.is_check_failure());
+        assert!(!MeshExtAuthzReason::DeniedByProvider.is_check_failure());
+        assert!(!MeshExtAuthzReason::Allowed.is_check_failure());
+        // Decided without contacting a provider, so no failOpen applies.
+        assert!(!MeshExtAuthzReason::ProviderConflict.is_check_failure());
+        assert!(!MeshExtAuthzReason::Unexecutable.is_check_failure());
+    }
+
+    #[test]
+    fn oversize_body_fails_closed_and_there_is_no_truncating_branch() {
         let mut source = provider("p");
         source.include_request_body_in_check = Some(MeshExtAuthzBodyCheck {
             max_request_bytes: 4,
@@ -686,38 +901,24 @@ mod tests {
         });
         let prepared = PreparedProvider::build(&source).expect("provider prepares");
         let headers = HashMap::new();
-        let request = MeshExtAuthzCheckRequest {
-            method: "POST",
-            path: "/",
-            headers: &headers,
-            body: Some(b"0123456789"),
-            body_proven_empty: false,
-        };
         assert_eq!(
-            resolve_check_body(&prepared, &request),
+            resolve_check_body(&prepared, &body_request(&headers, Some(b"0123456789"), false)),
             Err(MeshExtAuthzReason::BodyTooLarge)
         );
     }
 
     #[test]
-    fn oversize_body_with_partial_messages_truncates_to_the_declared_bound() {
+    fn a_partial_message_provider_is_refused_at_preparation() {
         let mut source = provider("p");
         source.include_request_body_in_check = Some(MeshExtAuthzBodyCheck {
             max_request_bytes: 4,
             allow_partial_message: true,
         });
-        let prepared = PreparedProvider::build(&source).expect("provider prepares");
-        let headers = HashMap::new();
-        let request = MeshExtAuthzCheckRequest {
-            method: "POST",
-            path: "/",
-            headers: &headers,
-            body: Some(b"0123456789"),
-            body_proven_empty: false,
-        };
-        assert_eq!(
-            resolve_check_body(&prepared, &request),
-            Ok(Some(b"0123".to_vec()))
+        let error = PreparedProvider::build(&source)
+            .expect_err("allowPartialMessage is not a supported contract");
+        assert!(
+            error.contains("allowPartialMessage"),
+            "the refusal must name the field, got: {error}"
         );
     }
 
@@ -726,19 +927,12 @@ mod tests {
         let mut source = provider("p");
         source.include_request_body_in_check = Some(MeshExtAuthzBodyCheck {
             max_request_bytes: 16,
-            allow_partial_message: true,
+            allow_partial_message: false,
         });
         let prepared = PreparedProvider::build(&source).expect("provider prepares");
         let headers = HashMap::new();
-        let request = MeshExtAuthzCheckRequest {
-            method: "POST",
-            path: "/",
-            headers: &headers,
-            body: None,
-            body_proven_empty: false,
-        };
         assert_eq!(
-            resolve_check_body(&prepared, &request),
+            resolve_check_body(&prepared, &body_request(&headers, None, false)),
             Err(MeshExtAuthzReason::BodyUnavailable)
         );
     }
@@ -752,13 +946,9 @@ mod tests {
         });
         let prepared = PreparedProvider::build(&source).expect("provider prepares");
         let headers = HashMap::new();
-        let request = MeshExtAuthzCheckRequest {
-            method: "GET",
-            path: "/",
-            headers: &headers,
-            body: None,
-            body_proven_empty: true,
-        };
-        assert_eq!(resolve_check_body(&prepared, &request), Ok(Some(Vec::new())));
+        assert_eq!(
+            resolve_check_body(&prepared, &body_request(&headers, None, true)),
+            Ok(Some(Vec::new()))
+        );
     }
 }

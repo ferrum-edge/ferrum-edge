@@ -1152,11 +1152,11 @@ data:
         timeout: 0.5s
         pathPrefix: /check
         failOpen: false
-        statusOnError: 403
+        statusOnError: "403"
         includeRequestHeadersInCheck:
         - x-request-id
         includeAdditionalHeadersInCheck:
-          x-ferrum-mesh: "1"
+          x-ext-authz-caller: "ferrum-mesh"
         headersToDownstreamOnDeny:
         - www-authenticate
 ---
@@ -1210,20 +1210,103 @@ unencrypted off-box check (which may carry a forwarded credential) is refused
 at admission. Loopback providers (`127.0.0.1`, `::1`, `localhost`) may use
 plaintext.
 
+**`service` must be a real bare URL host** — a DNS name, an IPv4 literal, or an
+IPv6 literal (bracketed or bare). Userinfo (`@`), an embedded port, a path,
+query, fragment, backslash, percent-encoding, or a bracket imbalance is
+rejected at admission rather than deferred to a per-request URL parse.
+`pathPrefix` is validated as a real path: it must start with a single `/` and
+may not carry `?`, `#`, `\`, a `..` segment, or a leading `//` — each of those
+would move the request path into a different URL component. The composed base
+URL is re-parsed at config publication and must still carry only scheme, host,
+port, and path.
+
+> **Deliberate narrowing:** Istio's namespace-qualified
+> `[<namespace>/]<hostname>` service syntax is **not supported** and is
+> rejected with a diagnostic naming it. Ferrum dials the provider directly
+> rather than resolving it through the mesh service registry, so the namespace
+> qualifier has no meaning here — and silently dropping it would dial a
+> different service than the operator named. Declare the fully qualified
+> hostname instead.
+
+**`statusOnError` is an HTTP status.** Upstream Istio documents it as a status
+**string**, so `statusOnError: "403"` is the real operator input shape; a JSON
+integer (`403`) is also accepted for hand-authored Ferrum mesh documents. The
+internal representation is numeric. A value outside 4xx/5xx, an Envoy enum
+*name*, a float, or a non-numeric string is rejected rather than defaulted.
+
+**At most ONE extension provider may apply to a request.** Istio permits one
+extension provider per workload. Several CUSTOM policies naming the **same**
+provider coalesce into one check. Two CUSTOM policies naming **different**
+providers are refused: a workload-scoped conflict is rejected at plugin
+construction (the previous valid generation keeps serving), and a request that
+can see two distinct applicable providers across relay/waypoint destination
+scopes is denied with the stable reason `custom:provider-conflict`. Ferrum
+never picks the first match — that would let policy iteration order choose
+which operator's authorizer enforces. Different providers on **disjoint**
+workloads or destination scopes remain fully supported.
+
 **Bounds.** `timeout` is capped at 30s (default 1s), `includeRequestBodyInCheck.maxRequestBytes`
 at 1 MiB, provider response reads at 64 KiB, each header list at 32 exact
-entries, and the admitted provider set at 16 per mesh generation. In-flight
-checks are capped process-wide and are **refused immediately** at the ceiling
-rather than queued, so provider slowness cannot become unbounded gateway
-latency or memory growth. Nothing is retried: a check request may carry a
-partially sent body, and replaying an authorization decision is never safe.
+entries (case-insensitively unique), and the admitted provider set at 16 per
+mesh generation. In-flight checks are capped process-wide and are **refused
+immediately** at the ceiling rather than queued, so provider slowness cannot
+become unbounded gateway latency or memory growth.
 
-**Fail-closed outcomes.** A `2xx` provider status allows; any other status
-denies with that status. A timeout, transport error, oversize or unreadable
-response, an unavailable request body for a body-inspecting provider, a
-concurrency refusal, task cancellation, or a provider name this generation does
-not carry all **deny** with the provider's `statusOnError` — unless the provider
-explicitly sets `failOpen: true`.
+**Nothing is retried.** The check is dispatched through a dedicated
+single-attempt seam on the shared plugin HTTP client, so it keeps that client's
+no-proxy, redirect-disabled, DNS/egress-policy, TLS posture, redacted logging,
+latency accounting, and typed failure classification while performing **exactly
+one attempt** — `FERRUM_PLUGIN_HTTP_MAX_RETRIES` does not apply. A check is a
+decision, not a report: replaying it would turn one client request into several
+authorization decisions and amplify load onto a struggling authorizer.
+
+**What the check carries.** The HTTP ext-auth protocol's automatic fields are
+all present: the original request **method**, the (prefixed) **path**, the
+original **Host** authority, and **Content-Length** when a body is sent.
+Carrying the original authority is a header only — the connection is always
+dialled at the provider's own configured `service`/`port`, so a client-supplied
+authority can never route the provider connection. The query string is **not**
+forwarded (a credential in it must not reach the provider).
+`includeAdditionalHeadersInCheck` values are **authoritative**: a fixed
+operator header replaces any same-named client header or
+`includeRequestHeadersInCheck` value rather than being appended beside it, and
+case-variant duplicate fixed names are rejected at admission so the winner is
+never iteration-order dependent.
+
+**Outcome classification** follows the Istio/Envoy HTTP ext-auth protocol
+exactly:
+
+| Provider response | Outcome |
+| --- | --- |
+| HTTP `200` | **allow** |
+| HTTP `5xx` | **failed check** — follows `failOpen`; `statusOnError` when fail-closed |
+| communication failure (connect / TLS / timeout / unreadable or oversize response) | **failed check** — follows `failOpen`; `statusOnError` when fail-closed |
+| any other status (3xx, 4xx, and any non-`200` 2xx such as `204`) | **explicit denial**, carrying the provider's own status |
+
+A provider name this generation does not carry, a generation with no executor,
+an unavailable request body for a body-inspecting provider, a concurrency
+refusal, and task cancellation are all failed checks and therefore also honour
+`failOpen`. Two refusals are decided **without** contacting a provider and are
+therefore **not** subject to `failOpen`: a provider conflict (above), and a
+matched delegation on a connection with no HTTP request to check.
+
+**Request body.** `includeRequestBodyInCheck.maxRequestBytes` is folded into
+the proxy's pre-`authorize` body ceiling, so a request over the cap is refused
+with **413 before the check is dispatched** — which means the refusal takes
+precedence over `failOpen`, matching Envoy with partial messages disabled. That
+ceiling and the buffering it implies apply **only** to requests a
+body-inspecting CUSTOM rule could actually reach: the per-request predicate is
+precise on method, path, and host, so an unrelated request on the same workload
+keeps its ordinary accepted body size.
+
+> **Deliberate narrowing:** `includeRequestBodyInCheck.allowPartialMessage:
+> true` is **rejected at every admission boundary** (Kubernetes translation,
+> the native/file mesh document, and the xDS carrier). Envoy's partial-message
+> mode checks a bounded prefix and still forwards the complete original body
+> upstream; Ferrum's authorize-phase buffer *is* the body the proxy forwards, so
+> honouring the flag would mean either truncating the backend-visible request or
+> retaining an unbounded body behind a cap the operator asked for. An
+> accepted-but-unreachable flag would be worse than a visible refusal.
 
 **Mutation is deliberately narrow.** `headersToDownstreamOnDeny` is honoured:
 those headers land on the gateway-authored denial this plugin itself produces.
@@ -1244,8 +1327,12 @@ identically — HTTP/1.1, HTTP/2, native gRPC, HTTP/3, and HTTP relayed inside a
 mesh/HBONE CONNECT — because they share one `authorize` ladder. Layer-4
 sessions (raw TCP, TLS passthrough, UDP, DTLS) carry no HTTP request and cannot
 be checked: a CUSTOM rule that **matches** an L4 connection **denies** it rather
-than serving it unchecked. Scope a CUSTOM policy with `to.operation.ports` when
-the selected workload also serves non-HTTP ports.
+than serving it unchecked. Following Istio, HTTP-only fields are treated as
+**always matched** on a non-HTTP port for `DENY` **and `CUSTOM`** alike, so a
+CUSTOM rule carrying `paths` / `methods` / `headers` / `when: request.auth.*`
+still matches an L4 connection and still closes it — it does not quietly become
+inert. Scope a CUSTOM policy with `to.operation.ports` when the selected
+workload also serves non-HTTP ports.
 
 **Reload and withdrawal.** Providers ride the mesh slice (and their own
 `ExtAuthzProvidersCarrier` ECDS carrier over xDS, re-validated at the ACK
@@ -1260,9 +1347,15 @@ generation, so the previous valid one keeps serving.
 `ferrum_mesh_ext_authz_check_failures_total{disposition}` are fixed-cardinality:
 the labels are closed enums plus the gateway namespace, never a provider,
 policy, route, host, principal, or status string. `mesh_authz.ext_authz_outcome`
-request metadata carries the same closed reason token. No request body,
-credential header value, provider secret, or resolved provider URL is ever
-logged.
+request metadata carries the same closed reason token. Every matched
+delegation is counted **exactly once**, including the outcomes decided without
+contacting a provider (`provider_unbound` when no executor or no binding,
+`provider_conflict`, `unexecutable` for an L4 session), so a fail-closed
+denial is never invisible. `outcome` values are `allowed`, `denied_by_provider`,
+`provider_unbound`, `provider_error`, `provider_conflict`, `unexecutable`,
+`timeout`, `transport_error`, `response_refused`, `body_refused`, and
+`concurrency_exhausted`. No request body, credential header value, provider
+secret, or resolved provider URL is ever logged.
 
 ### Rule Matching
 

@@ -74,6 +74,34 @@ pub struct PluginHttpFailure {
     pub request_reached_wire: bool,
 }
 
+/// Whether one execution may use the shared `FERRUM_PLUGIN_HTTP_MAX_RETRIES`
+/// transport-retry policy, or must perform exactly one attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDisposition {
+    /// The default: safe/idempotent methods may be replayed on a transport
+    /// failure, as configured.
+    SharedPolicy,
+    /// Exactly one attempt. For callers whose request IS a decision (external
+    /// authorization) rather than a report, where a replay is a second
+    /// decision rather than a recovered delivery.
+    SingleAttempt,
+}
+
+fn classify_plugin_http_failure(error: &reqwest::Error) -> PluginHttpFailure {
+    let error_class = classify_reqwest_error(error);
+    PluginHttpFailure {
+        error_class,
+        // `DispatchPolicyRejected` is intentionally treated as a post-wire
+        // class by the backend retry machinery so a terminal route policy
+        // rejection is never amplified. Here the caller needs the literal
+        // provider-I/O boundary: a DnsCacheResolver egress denial happens
+        // before any dial, so a non-idempotent provider request remains safe
+        // to send to a configured fallback.
+        request_reached_wire: error_class != ErrorClass::DispatchPolicyRejected
+            && crate::retry::request_reached_wire(error_class),
+    }
+}
+
 /// Shared, pooled HTTP client for plugin outbound calls.
 ///
 /// Wraps a `reqwest::Client` configured with the gateway's connection pool
@@ -994,6 +1022,7 @@ impl PluginHttpClient {
             label,
             None,
             Some(redacted_url),
+            RetryDisposition::SharedPolicy,
         )
         .await
         .map_err(|e| {
@@ -1074,22 +1103,60 @@ impl PluginHttpClient {
         }
         self.execute_request(request, label, Some(accumulator), Some(redacted_url))
             .await
-            .map_err(|error| {
-                let error_class = classify_reqwest_error(&error);
-                PluginHttpFailure {
-                    error_class,
-                    // `DispatchPolicyRejected` is intentionally treated as a
-                    // post-wire class by the backend retry machinery so a
-                    // terminal route policy rejection is never amplified.
-                    // Here the caller needs the literal provider-I/O boundary:
-                    // a DnsCacheResolver egress denial happens before any dial,
-                    // so a non-idempotent provider request remains safe to send
-                    // to a configured fallback.
-                    request_reached_wire: error_class
-                        != crate::retry::ErrorClass::DispatchPolicyRejected
-                        && crate::retry::request_reached_wire(error_class),
-                }
-            })
+            .map_err(|error| classify_plugin_http_failure(&error))
+    }
+
+    /// Send a redacted, latency-tracked, typed-failure request that performs
+    /// EXACTLY ONE attempt, regardless of `FERRUM_PLUGIN_HTTP_MAX_RETRIES`.
+    ///
+    /// Identical to [`execute_redacted_tracked_classified`] in every other
+    /// respect — same shared client, so the no-proxy / redirect-disabled /
+    /// DNS-and-egress-policy / TLS posture / redacted logging / latency
+    /// accounting / typed classification invariants are the same object, not a
+    /// re-implementation.
+    ///
+    /// The distinction matters for callers whose request is an AUTHORIZATION
+    /// DECISION rather than telemetry. The shared retry loop replays
+    /// `GET`/`HEAD`/`OPTIONS` on transport failure; an external authorization
+    /// check is a `GET` far more often than not, so it would silently inherit
+    /// replays — turning one client request into several decisions, doubling
+    /// the check load a stalled authorizer sees, and re-sending a partially
+    /// transmitted check body. The correct fix is a seam that suppresses the
+    /// retry, never rewriting the check's method to dodge the predicate (that
+    /// would change what the provider is asked to authorize).
+    pub async fn execute_redacted_tracked_classified_single_attempt(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+        redacted_url: &str,
+        accumulator: &AtomicU64,
+    ) -> Result<reqwest::Response, PluginHttpFailure> {
+        let request = request.build().map_err(|error| PluginHttpFailure {
+            error_class: classify_reqwest_error(&error),
+            request_reached_wire: false,
+        })?;
+        if let Some(reason) = self.denied_literal_ip_reason(&request) {
+            tracing::warn!(
+                plugin = label,
+                url = %redacted_url,
+                reason,
+                "Plugin egress policy denied literal-IP endpoint; not dialing"
+            );
+            return Err(PluginHttpFailure {
+                error_class: crate::retry::ErrorClass::DispatchPolicyRejected,
+                request_reached_wire: false,
+            });
+        }
+        self.execute_request_with_client(
+            &self.client,
+            request,
+            label,
+            Some(accumulator),
+            Some(redacted_url),
+            RetryDisposition::SingleAttempt,
+        )
+        .await
+        .map_err(|error| classify_plugin_http_failure(&error))
     }
 
     async fn execute_request(
@@ -1105,6 +1172,7 @@ impl PluginHttpClient {
             label,
             accumulator,
             log_url_override,
+            RetryDisposition::SharedPolicy,
         )
         .await
     }
@@ -1116,6 +1184,7 @@ impl PluginHttpClient {
         label: &str,
         accumulator: Option<&AtomicU64>,
         log_url_override: Option<&str>,
+        retry_disposition: RetryDisposition,
     ) -> Result<reqwest::Response, reqwest::Error> {
         let url = request.url().to_string();
         let log_url = log_url_override.unwrap_or(&url).to_string();
@@ -1143,7 +1212,8 @@ impl PluginHttpClient {
 
         let total_start = std::time::Instant::now();
         let retry_template = request.try_clone();
-        let can_retry = self.max_retries > 0
+        let can_retry = retry_disposition == RetryDisposition::SharedPolicy
+            && self.max_retries > 0
             && matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS")
             && retry_template.is_some();
 
