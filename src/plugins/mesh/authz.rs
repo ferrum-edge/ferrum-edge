@@ -3032,7 +3032,8 @@ mod tests {
         mesh_ingress_authz_port_missing,
     };
     use crate::modes::mesh::{
-        MESH_INBOUND_PROXY_ID_PREFIX, MESH_INGRESS_PROXY_ID_PREFIX, MeshTrafficDirection,
+        MESH_INBOUND_PROXY_ID_PREFIX, MESH_INGRESS_BIND_PROXY_ID_PREFIX,
+        MESH_INGRESS_PROXY_ID_PREFIX, MeshTrafficDirection,
     };
 
     #[test]
@@ -3171,6 +3172,25 @@ mod tests {
             Some(id.as_str()),
             Some(8443),
         ));
+
+        // Dedicated-bind ids are an ingress sub-family. They must retain the
+        // same fail-closed requirement rather than authorizing on their local
+        // application backend when the direct listener loses its port stamp.
+        let dedicated_id =
+            format!("{MESH_INGRESS_BIND_PROXY_ID_PREFIX}default-reviews-8443");
+        assert!(mesh_ingress_authz_port_missing(
+            Some(MeshTrafficDirection::Inbound),
+            Some(dedicated_id.as_str()),
+            None,
+        ));
+        assert_eq!(
+            mesh_inbound_app_port(
+                Some(MeshTrafficDirection::Inbound),
+                Some((dedicated_id.as_str(), 8080)),
+                Some(8443),
+            ),
+            Some(8443),
+        );
     }
 
     #[test]

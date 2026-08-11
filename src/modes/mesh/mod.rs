@@ -3604,6 +3604,12 @@ pub(crate) const MESH_INBOUND_PROXY_ID_PREFIX: &str = "__mesh-inbound-";
 /// [`is_mesh_inbound_route_id`] / [`mesh_route_direction`].
 pub(crate) const MESH_INGRESS_PROXY_ID_PREFIX: &str = "__mesh-ingress-";
 
+/// Reserved sub-prefix for dedicated Sidecar ingress `bind` socket routes
+/// (issue #3266). These remain ingress routes, but are served by a listener
+/// whose accepted port already identifies the one declared listener rather
+/// than by the shared `:15006` capture listener's sibling selector.
+pub(crate) const MESH_INGRESS_BIND_PROXY_ID_PREFIX: &str = "__mesh-ingress-bind-";
+
 /// Whether a proxy id names a materialized sidecar inbound route — either a
 /// service-port default inbound route or a Sidecar `ingress[]` custom listener
 /// route. Both are inbound-direction (served only on the inbound listener) and
@@ -3616,6 +3622,12 @@ pub(crate) fn is_mesh_inbound_route_id(id: &str) -> bool {
 /// specifically (a subset of [`is_mesh_inbound_route_id`]).
 pub(crate) fn is_mesh_ingress_route_id(id: &str) -> bool {
     id.starts_with(MESH_INGRESS_PROXY_ID_PREFIX)
+}
+
+/// Whether a proxy id names the direct OS-listener route for a dedicated
+/// Sidecar ingress `bind`.
+pub(crate) fn is_mesh_ingress_bind_route_id(id: &str) -> bool {
+    id.starts_with(MESH_INGRESS_BIND_PROXY_ID_PREFIX)
 }
 
 /// LATENT-COLLISION HAZARD (shared by this whole `mesh_*_id` family —
@@ -5106,12 +5118,6 @@ fn materialize_sidecar_ingress_listener_proxies(
         now,
     );
 }
-
-/// Reserved id prefix for dedicated Sidecar ingress `bind` socket proxies
-/// (issue #3266). Distinct from the capture-path `__mesh-ingress-*` routes so
-/// Gateway/stream ownership can bind `bind:port` without making the `:15006`
-/// capture route listen-port-scoped.
-pub(crate) const MESH_INGRESS_BIND_PROXY_ID_PREFIX: &str = "__mesh-ingress-bind-";
 
 fn mesh_ingress_bind_proxy_id(namespace: &str, name: &str, port: u16) -> String {
     format!("{MESH_INGRESS_BIND_PROXY_ID_PREFIX}{namespace}-{name}-{port}").replace(['/', '.'], "-")

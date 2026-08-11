@@ -25577,11 +25577,29 @@ async fn handle_proxy_request_inner(
                 && crate::modes::mesh::is_mesh_inbound_route_id(&rm.proxy.id) =>
         {
             let representative_id = Arc::clone(&rm.proxy);
-            match epoch.route_table.select_mesh_inbound_port_route(
-                rm,
-                ctx.orig_dst.map(|addr| addr.port()),
-                authority_port,
-            ) {
+            // A dedicated Sidecar ingress bind has its own OS listener, so the
+            // accepted frontend port is already the authoritative declared
+            // listener port. Its route intentionally has a distinct id from the
+            // shared-:15006 capture sibling and therefore does not participate
+            // in the capture listener's per-service sibling group. Validate the
+            // explicit route/listener identity and stamp that port directly for
+            // mesh authorization. Every shared-capture ingress route continues
+            // through the existing orig-dst/authority selector below.
+            let selected = if crate::modes::mesh::is_mesh_ingress_bind_route_id(&rm.proxy.id) {
+                match (rm.proxy.listen_port, ctx.frontend_listen_port) {
+                    (Some(route_port), Some(frontend_port)) if route_port == frontend_port => {
+                        Ok((rm, Some(route_port)))
+                    }
+                    _ => Err(crate::router_cache::MeshInboundPortSelectError::PortNotMaterialized),
+                }
+            } else {
+                epoch.route_table.select_mesh_inbound_port_route(
+                    rm,
+                    ctx.orig_dst.map(|addr| addr.port()),
+                    authority_port,
+                )
+            };
+            match selected {
                 Ok((rm, ingress_authz_port)) => {
                     // F6 §6.2 (security): for a Sidecar `ingress[]` route, stamp
                     // the DECLARED listener port so `mesh_authz` authorizes on it

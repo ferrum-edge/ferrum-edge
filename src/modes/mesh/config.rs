@@ -2602,8 +2602,9 @@ pub enum IngressListenerUnsupported {
     /// listeners; Ferrum fails closed with the same field-specific reason
     /// rather than accepting inert metadata (issue #3266).
     UnixBindUnsupported,
-    /// `bind` was not a bare IPv4/IPv6 address (hostname, `ip:port`, empty
-    /// after trim of a present field, or otherwise unparseable).
+    /// A non-empty `bind` was not a bare IPv4/IPv6 address (hostname,
+    /// `ip:port`, or otherwise unparseable). Empty/whitespace-only values use
+    /// the shared-capture contract.
     UnparseableBind,
     /// `bind` named an IP Ferrum cannot represent as a dedicated socket at
     /// resolve time (not loopback and not the unspecified wildcard that maps

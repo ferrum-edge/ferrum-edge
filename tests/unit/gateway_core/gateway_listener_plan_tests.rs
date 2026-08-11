@@ -292,6 +292,7 @@ fn dedicated_sidecar_bind_is_carried_in_desired_identity() {
         Some(&DesiredGatewayListener {
             class: GatewayListenerClass::Plaintext,
             bind_addr: loopback,
+            mesh_direction: Some(ferrum_edge::modes::mesh::MeshTrafficDirection::Inbound),
         })
     );
 }

@@ -19,11 +19,12 @@
 //!   the supervisor consumes that same receiver. A publication that lands
 //!   between the readiness reconcile and [`GatewayListenerManager::run`] is
 //!   therefore still delivered — it cannot be swallowed as "already seen".
-//! - **Update.** A port whose TLS class or bind address changed is closed,
-//!   **awaited**, and only then rebound: with `FERRUM_ACCEPT_THREADS > 1` both
-//!   generations bind the same port through `SO_REUSEPORT`, so an overlap would
-//!   let the kernel hand new connections to the retiring plaintext/TLS accept
-//!   loop or leave a wildcard socket claiming a more-specific replacement.
+//! - **Update.** A port whose TLS class, bind address, or mesh direction changed
+//!   is closed, **awaited**, and only then rebound: with
+//!   `FERRUM_ACCEPT_THREADS > 1` both generations bind the same port through
+//!   `SO_REUSEPORT`, so an overlap would let the kernel hand new connections to
+//!   a retiring generation with obsolete protocol/direction state or leave a
+//!   wildcard socket claiming a more-specific replacement.
 //!   Awaiting the accept-loop task closes every accept socket first; already
 //!   accepted connections keep draining in their own tasks through the cloned
 //!   shutdown receivers they hold.
@@ -122,6 +123,10 @@ impl GatewayListenerClass {
 pub struct DesiredGatewayListener {
     pub class: GatewayListenerClass,
     pub bind_addr: IpAddr,
+    /// Dedicated Sidecar ingress binds are real inbound mesh listeners, not
+    /// ordinary process-global frontends. Stamping the direction is required
+    /// both for route isolation and for mesh authorization.
+    pub mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
 }
 
 /// The set of Gateway API listener ports a config wants bound.
@@ -213,6 +218,18 @@ impl GatewayListenerPlan {
             };
             let bind_addr = desired_gateway_bind(config, port, default_bind_addr);
             let dedicated_bind = sidecar_ingress_bind_for_port(config, port).is_some();
+            let mesh_direction = dedicated_bind
+                .then_some(crate::modes::mesh::MeshTrafficDirection::Inbound);
+            if dedicated_bind && class == GatewayListenerClass::Tls {
+                refused.entry(port).or_insert_with(|| {
+                    format!(
+                        "port {port} has a dedicated Sidecar ingress bind but is marked as a \
+                         frontend-TLS listener; Sidecar bind materialization supports plaintext \
+                         HTTP-family listeners only"
+                    )
+                });
+                continue;
+            }
             if let Some(existing) = existing_frontends.get(&port) {
                 if dedicated_bind {
                     // A dedicated Sidecar ingress bind claims exclusive OS
@@ -276,7 +293,14 @@ impl GatewayListenerPlan {
                 });
                 continue;
             }
-            if let Some(existing) = ports.insert(port, DesiredGatewayListener { class, bind_addr })
+            if let Some(existing) = ports.insert(
+                port,
+                DesiredGatewayListener {
+                    class,
+                    bind_addr,
+                    mesh_direction,
+                },
+            )
                 && existing.class != class
             {
                 // One socket cannot be both plaintext and TLS. The Gateway API
@@ -323,6 +347,9 @@ struct LiveListener {
     /// restart identity so a dedicated Sidecar ingress bind change (for
     /// example `127.0.0.1` → `::1`) retires the old socket.
     bind_addr: IpAddr,
+    /// Direction stamped on every accepted connection. Dedicated Sidecar
+    /// ingress binds use `Inbound`; ordinary Gateway listeners use `None`.
+    mesh_direction: Option<crate::modes::mesh::MeshTrafficDirection>,
     shutdown_tx: watch::Sender<bool>,
     /// The TCP accept-loop task. Returns once every accept socket is closed;
     /// accepted connections drain in their own tasks.
@@ -612,13 +639,15 @@ impl GatewayListenerManager {
         }
 
         // Close listeners whose port left the config, and rebind ports whose
-        // TLS class or bind address changed — a live socket is one class on
-        // one address, never both/ambiguous.
+        // TLS class, bind address, or mesh direction changed — a live socket
+        // is one class on one address with one direction, never ambiguous.
         let stale: Vec<u16> = live
             .iter()
             .filter_map(|(port, listener)| {
                 let drifted = !plan.ports.get(port).is_some_and(|desired| {
-                    desired.class == listener.class && desired.bind_addr == listener.bind_addr
+                    desired.class == listener.class
+                        && desired.bind_addr == listener.bind_addr
+                        && desired.mesh_direction == listener.mesh_direction
                 });
                 drifted.then_some(*port)
             })
@@ -752,10 +781,7 @@ impl GatewayListenerManager {
                 refused_route_ports.insert(*port);
                 continue;
             }
-            match self
-                .spawn_listener(*port, desired.class, desired.bind_addr)
-                .await
-            {
+            match self.spawn_listener(*port, *desired).await {
                 Ok(mut listener) => {
                     if let Some(error) = self.ensure_quic(*port, &mut listener).await {
                         failures.push(GatewayListenerBindFailure { port: *port, error });
@@ -913,25 +939,39 @@ impl GatewayListenerManager {
     async fn spawn_listener(
         &self,
         port: u16,
-        class: GatewayListenerClass,
-        bind_addr: IpAddr,
+        desired: DesiredGatewayListener,
     ) -> Result<LiveListener, String> {
-        let addr = SocketAddr::new(bind_addr, port);
+        let addr = SocketAddr::new(desired.bind_addr, port);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (started_tx, started_rx) = oneshot::channel();
         let state = self.state.clone();
         let tls = self.tls.clone();
         let task = tokio::spawn(async move {
-            match class {
+            match desired.class {
                 GatewayListenerClass::Plaintext => {
-                    crate::proxy::start_proxy_listener_with_tls_and_signal(
-                        addr,
-                        state,
-                        shutdown_rx,
-                        None,
-                        Some(started_tx),
-                    )
-                    .await
+                    match desired.mesh_direction {
+                        Some(mesh_direction) => {
+                            crate::proxy::start_mesh_plaintext_listener_with_signal(
+                                addr,
+                                state,
+                                shutdown_rx,
+                                None,
+                                Some(mesh_direction),
+                                Some(started_tx),
+                            )
+                            .await
+                        }
+                        None => {
+                            crate::proxy::start_proxy_listener_with_tls_and_signal(
+                                addr,
+                                state,
+                                shutdown_rx,
+                                None,
+                                Some(started_tx),
+                            )
+                            .await
+                        }
+                    }
                 }
                 GatewayListenerClass::Tls => {
                     if let Some(slot) = tls.reload_slot {
@@ -965,11 +1005,12 @@ impl GatewayListenerManager {
                 info!(
                     port,
                     "Gateway API {} listener started on {addr}",
-                    class.label()
+                    desired.class.label()
                 );
                 Ok(LiveListener {
-                    class,
-                    bind_addr,
+                    class: desired.class,
+                    bind_addr: desired.bind_addr,
+                    mesh_direction: desired.mesh_direction,
                     shutdown_tx,
                     tcp: task,
                     quic: None,
@@ -1277,6 +1318,22 @@ mod tests {
         config
     }
 
+    fn routable_dedicated_bind_config(
+        frontend_port: u16,
+        backend_port: u16,
+        bind: IpAddr,
+    ) -> GatewayConfig {
+        let mut config = config_with_dedicated_bind(frontend_port, bind);
+        let proxy = config.proxies.first_mut().expect("proxy");
+        proxy.id = format!(
+            "{}default-app-{frontend_port}",
+            crate::modes::mesh::MESH_INGRESS_BIND_PROXY_ID_PREFIX
+        );
+        proxy.listen_path = Some("/".to_string());
+        proxy.backend_port = backend_port;
+        config
+    }
+
     /// A dedicated Sidecar ingress bind address change must retire the old
     /// socket and rebind — port/class alone are not enough restart identity.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1302,6 +1359,85 @@ mod tests {
             vec![(port, second)],
             "bind-address drift must rebind the live Gateway listener"
         );
+        manager.shutdown_all().await;
+    }
+
+    /// The dedicated HTTP bind is an inbound mesh listener, not merely a
+    /// loopback socket. A live request must survive direction-scoped routing
+    /// and reach the configured local application backend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dedicated_sidecar_http_bind_serves_live_inbound_route() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind backend");
+        let backend_port = backend.local_addr().expect("backend addr").port();
+        let backend_task = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                backend.accept(),
+            )
+            .await
+            .expect("backend accept timeout")
+            .expect("backend accept");
+            let mut request = [0u8; 4096];
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.read(&mut request),
+            )
+            .await
+            .expect("backend read timeout")
+            .expect("backend read");
+            assert!(
+                String::from_utf8_lossy(&request[..read]).contains("GET / HTTP/1.1"),
+                "dedicated bind must forward the HTTP request"
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\ndedicated-ok",
+                )
+                .await
+                .expect("backend response");
+        });
+
+        let frontend_port = free_port().await;
+        let bind = IpAddr::from([127, 0, 0, 1]);
+        let manager = GatewayListenerManager::new(
+            test_state(routable_dedicated_bind_config(
+                frontend_port,
+                backend_port,
+                bind,
+            )),
+            IpAddr::from([0, 0, 0, 0]),
+            GatewayListenerTls::default(),
+        );
+        assert!(manager.reconcile().await.is_empty());
+
+        let mut client = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect((bind, frontend_port)),
+        )
+        .await
+        .expect("dedicated bind connect timeout")
+        .expect("connect dedicated bind");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: app.example.com\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("dedicated bind response timeout")
+        .expect("read response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("dedicated-ok"), "{response}");
+
+        backend_task.await.expect("backend task");
         manager.shutdown_all().await;
     }
 
