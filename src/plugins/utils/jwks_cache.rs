@@ -200,7 +200,8 @@ fn discovered_jwks_uris() -> &'static DashMap<String, String> {
 }
 
 fn committed_requirements_slot() -> &'static arc_swap::ArcSwap<JwksRequirementMap> {
-    COMMITTED_REQUIREMENTS.get_or_init(|| arc_swap::ArcSwap::from_pointee(JwksRequirementMap::new()))
+    COMMITTED_REQUIREMENTS
+        .get_or_init(|| arc_swap::ArcSwap::from_pointee(JwksRequirementMap::new()))
 }
 
 fn late_active_requirements() -> &'static DashMap<u64, (String, JwksRefreshRequirement)> {

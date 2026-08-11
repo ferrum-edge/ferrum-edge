@@ -1126,7 +1126,11 @@ impl super::Plugin for JwksAuth {
                 continue;
             }
             let guard = provider.jwks_store.load();
-            let Some(store) = guard.as_ref().as_ref().filter(|store| store.is_refreshable()) else {
+            let Some(store) = guard
+                .as_ref()
+                .as_ref()
+                .filter(|store| store.is_refreshable())
+            else {
                 continue;
             };
             publish_late_active_requirement(

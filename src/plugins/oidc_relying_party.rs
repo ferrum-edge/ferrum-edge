@@ -2,8 +2,8 @@ use crate::fips::approved::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::fips::backend::rand::{SecureRandom, SystemRandom};
@@ -806,7 +806,8 @@ impl OidcRelyingParty {
         let jwks_store = Arc::new(ArcSwap::from_pointee(initial_jwks_store));
         let jwks_committed = Arc::new(AtomicBool::new(false));
         let jwks_owner_live = Arc::new(AtomicBool::new(true));
-        let jwks_late_active: Arc<Mutex<Option<LateActiveRequirement>>> = Arc::new(Mutex::new(None));
+        let jwks_late_active: Arc<Mutex<Option<LateActiveRequirement>>> =
+            Arc::new(Mutex::new(None));
         let jwks_publication_gate = Arc::new(Mutex::new(()));
         let discovery_task = if start_background_tasks {
             discovery_url.clone().map(|url| {
@@ -2054,7 +2055,11 @@ impl super::Plugin for OidcRelyingParty {
         // the slot, so register its contribution here instead of waiting for
         // another reload.
         let guard = self.provider.jwks_store.load();
-        if let Some(store) = guard.as_ref().as_ref().filter(|store| store.is_refreshable()) {
+        if let Some(store) = guard
+            .as_ref()
+            .as_ref()
+            .filter(|store| store.is_refreshable())
+        {
             publish_late_active_requirement(
                 &self.jwks_late_active,
                 store.jwks_uri(),

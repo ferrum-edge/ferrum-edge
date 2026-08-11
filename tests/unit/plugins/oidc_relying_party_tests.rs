@@ -2347,9 +2347,9 @@ async fn oidc_discovered_jwks_store_joins_active_trust_health_after_commit() {
     let jwks_uri = format!("{}/oidc-trust/jwks.json", server.uri());
     Mock::given(method("GET"))
         .and(path("/oidc-trust/jwks.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(build_rsa_jwks_from_pem(
-            public_key_pem,
-        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -2423,9 +2423,9 @@ async fn oidc_staged_discovery_store_is_not_exposed_before_commit() {
     let jwks_uri = format!("{}/oidc-staged/jwks.json", server.uri());
     Mock::given(method("GET"))
         .and(path("/oidc-staged/jwks.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(build_rsa_jwks_from_pem(
-            public_key_pem,
-        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
