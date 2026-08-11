@@ -382,6 +382,12 @@ async fn test_http3_proxy_state_creation() {
                 64,
             ),
         ),
+        unix_backend_pool: Arc::new(
+            ferrum_edge::proxy::unix_backend_pool::UnixBackendConnectionPool::new(
+                ferrum_edge::config::PoolConfig::default(),
+                64,
+            ),
+        ),
         h3_pool: Arc::new(ferrum_edge::http3::client::Http3ConnectionPool::new(
             Arc::new(ferrum_edge::config::EnvConfig::default()),
             ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
@@ -683,6 +689,12 @@ async fn test_http3_full_integration() {
                 ferrum_edge::config::PoolConfig::default(),
                 ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default()),
                 Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+                64,
+            ),
+        ),
+        unix_backend_pool: Arc::new(
+            ferrum_edge::proxy::unix_backend_pool::UnixBackendConnectionPool::new(
+                ferrum_edge::config::PoolConfig::default(),
                 64,
             ),
         ),
