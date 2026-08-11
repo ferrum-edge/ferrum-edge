@@ -219,6 +219,7 @@ extensionProviders:
   envoyExtAuthzHttp:
     service: authz.default.svc.cluster.local
     port: 9000
+    scheme: https
 "#,
         ),
         telemetry(json!({

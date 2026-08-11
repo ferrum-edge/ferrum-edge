@@ -560,7 +560,9 @@ fn parse_ext_authz_timeout_ms(display: &str, value: &Value) -> Result<u64, Strin
         )
     };
     if let Some(seconds) = value.as_f64() {
-        if !seconds.is_finite() || seconds < 0.0 || seconds > 3600.0 {
+        // Reject non-finite first; RangeInclusive::contains is only for the
+        // closed [0, 3600] seconds contract once the value is known finite.
+        if !seconds.is_finite() || !(0.0..=3600.0).contains(&seconds) {
             return Err(invalid());
         }
         return Ok((seconds * 1000.0).round() as u64);

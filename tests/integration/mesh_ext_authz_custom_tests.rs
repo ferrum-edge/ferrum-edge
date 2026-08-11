@@ -835,6 +835,7 @@ mod live_datapath {
         json!({
             "node_id": "node-a",
             "namespace": "default",
+            "version": "test",
             "mesh_policies": [{
                 "name": "delegate-admin",
                 "namespace": "default",
@@ -989,6 +990,7 @@ mod live_datapath {
         json!({
             "node_id": "node-a",
             "namespace": "default",
+            "version": "test",
             "mesh_policies": [{
                 "name": "delegate-admin",
                 "namespace": "default",
@@ -1048,6 +1050,7 @@ mod live_datapath {
         let plugin = plugin(json!({
             "node_id": "node-a",
             "namespace": "default",
+            "version": "test",
             "mesh_policies": [{
                 "name": "delegate-all",
                 "namespace": "default",
