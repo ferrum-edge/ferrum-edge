@@ -16,6 +16,7 @@
 //! failures retain the previously committed cursor.
 
 use crate::config::types::UpstreamTarget;
+use crate::plugins::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,6 +64,9 @@ const QUERY_VALUE_ENCODE: &AsciiSet = &CONTROLS
 
 /// Maximum accepted `X-Consul-Index` header value length (decimal digits of u64).
 const MAX_CONSUL_INDEX_HEADER_LEN: usize = 20;
+
+/// Maximum Consul health API response body accepted by discovery.
+const MAX_CONSUL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Consul service discoverer.
 ///
@@ -200,14 +204,27 @@ impl super::ServiceDiscoverer for ConsulDiscoverer {
             anyhow::bail!("Consul API returned status {status}");
         }
 
-        // Distinguish transport/read failures from malformed JSON without
-        // logging body bytes, URLs, tokens, or unredacted error strings.
-        // Body byte caps for Consul / Kubernetes discovery are owned by
-        // issue #3720 — do not absorb that work here.
-        let body_bytes = response
-            .bytes()
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_CONSUL_RESPONSE_BYTES as u64)
+        {
+            anyhow::bail!("Consul API response body exceeds size limit");
+        }
+
+        // Enforce the limit while streaming as Content-Length can be absent,
+        // incorrect, or describe compressed rather than decoded bytes. Do not
+        // include body bytes or transport details in errors because they may
+        // contain secrets or other sensitive service metadata.
+        let body_bytes = read_response_body_bounded(response, MAX_CONSUL_RESPONSE_BYTES)
             .await
-            .map_err(|_| anyhow::anyhow!("Consul API response body read failed"))?;
+            .map_err(|error| match error {
+                BoundedReadError::LimitExceeded { .. } => {
+                    anyhow::anyhow!("Consul API response body exceeds size limit")
+                }
+                BoundedReadError::Stream(_) => {
+                    anyhow::anyhow!("Consul API response body read failed")
+                }
+            })?;
         let body: Vec<serde_json::Value> = serde_json::from_slice(&body_bytes)
             .map_err(|_| anyhow::anyhow!("Consul API returned malformed JSON"))?;
         let provider_item_count = body.len();

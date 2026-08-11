@@ -744,6 +744,41 @@ async fn test_consul_discover_error_response() {
     assert!(result.unwrap_err().to_string().contains("500"));
 }
 
+#[tokio::test]
+async fn test_consul_discover_rejects_oversized_response_body() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let oversized_body = vec![b' '; 16 * 1024 * 1024 + 1];
+
+    Mock::given(method("GET"))
+        .and(path("/v1/health/service/oversized-api"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized_body))
+        .mount(&mock_server)
+        .await;
+
+    let discoverer = ConsulDiscoverer::new(
+        reqwest::Client::new(),
+        mock_server.uri(),
+        "oversized-api".to_string(),
+        None,
+        None,
+        false,
+        None,
+        1,
+    );
+
+    let error = discoverer
+        .discover()
+        .await
+        .expect_err("oversized Consul response must be rejected");
+    assert_eq!(
+        error.to_string(),
+        "Consul API response body exceeds size limit"
+    );
+}
+
 // ── Kubernetes EndpointSlice parsing ──────────────────────────────────
 
 #[tokio::test]
