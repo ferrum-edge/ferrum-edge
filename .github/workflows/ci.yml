@@ -860,6 +860,7 @@ jobs:
               integration::service_discovery_endpointslice_lifecycle_tests
               integration::dtls_integration_tests
               integration::dtls_accept_isolation_tests
+              integration::frontend_dtls_live_reload_tests
               integration::backend_mtls_tests
               integration::backend_tls_san_allow_list_tests
               integration::frontend_tls_live_reload_tests
