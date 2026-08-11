@@ -41368,7 +41368,10 @@ pub fn collect_live_unix_target_identities(
     let mut upstreams_by_key: HashMap<(&str, &str), &crate::config::types::Upstream> =
         HashMap::with_capacity(config.upstreams.len());
     for upstream in &config.upstreams {
-        upstreams_by_key.insert((upstream.namespace.as_str(), upstream.id.as_str()), upstream);
+        upstreams_by_key.insert(
+            (upstream.namespace.as_str(), upstream.id.as_str()),
+            upstream,
+        );
     }
 
     let mut live = std::collections::HashSet::new();

@@ -1041,7 +1041,10 @@ async fn a_current_generation_checkin_is_still_pooled_and_reused() {
         )
         .await
         .expect("checkout");
-    assert!(reused.reused(), "the pooled carrier must be handed back out");
+    assert!(
+        reused.reused(),
+        "the pooled carrier must be handed back out"
+    );
     expect_accepts(&peer, 1, "reuse must not open a second physical connection").await;
 }
 
@@ -1211,7 +1214,12 @@ async fn a_checkout_in_the_post_insert_window_refuses_the_stale_carrier() {
         pool.stats().withdrawal_fenced_checkins >= 1,
         "the refusal must be attributed to the fence"
     );
-    expect_accepts(&peer, 2, "the racing request had to dial its own connection").await;
+    expect_accepts(
+        &peer,
+        2,
+        "the racing request had to dial its own connection",
+    )
+    .await;
 }
 
 /// The exact-entry removal id still matters: the losing side of the fence must

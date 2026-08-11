@@ -524,7 +524,10 @@ mod imp {
             slot.entries.retain(|entry| {
                 !entry.is_closed()
                     && !entry_idle_expired(entry.last_used_at(), idle_timeout, now)
-                    && entry.admitted().still_names_checked_object().unwrap_or(false)
+                    && entry
+                        .admitted()
+                        .still_names_checked_object()
+                        .unwrap_or(false)
             });
             evicted = evicted.saturating_add(before.saturating_sub(slot.entries.len()) as u64);
             if !slot.entries.is_empty() {
@@ -854,10 +857,7 @@ mod imp {
             self.retain_live_targets_inner(live);
         }
 
-        fn retain_live_targets_inner(
-            &self,
-            live: &std::collections::HashSet<UnixTargetIdentity>,
-        ) {
+        fn retain_live_targets_inner(&self, live: &std::collections::HashSet<UnixTargetIdentity>) {
             let generation = self.advance_publication_generation();
             // Install the liveness verdict before walking existing slots. A
             // stale-epoch dial that starts after the bump is therefore refused

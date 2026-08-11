@@ -434,7 +434,9 @@ async fn a_rejected_candidate_neither_advances_the_generation_nor_retires() {
     // Two host-less proxies on one listen path is a validation conflict.
     let later = stamp + Duration::seconds(1);
     let mut invalid = config_with(socket.to_str().expect("utf-8"), false, later);
-    invalid.proxies.push(unix_proxy("duplicate-listen-path", "/", later));
+    invalid
+        .proxies
+        .push(unix_proxy("duplicate-listen-path", "/", later));
     assert!(matches!(
         state.update_config(invalid),
         ConfigApplyOutcome::Rejected { .. }
