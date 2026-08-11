@@ -2034,8 +2034,24 @@ async fn handle_admin_request_inner(
         let jwks_now = tokio::time::Instant::now();
         let jwks_ready = jwks_trust.ready(jwks_now);
         let jwks_degraded = jwks_trust.degraded(jwks_now);
-        let ready = startup_ready && !serving_degraded && jwks_ready;
+        // Bounded last-known-good DP configuration age (issue #3726). `None`
+        // outside DP mode, so no other mode's readiness changes. Evaluating
+        // here (rather than reading a cached bit) keeps the probe exact at the
+        // boundary; it is a handful of relaxed atomic loads with no allocation,
+        // no lock, and no I/O, so an unauthenticated probe flood cannot drive
+        // work. The projection below is authenticated-detail only.
+        let dp_config_freshness = crate::dp_config_freshness::snapshot();
+        let dp_config_stale = dp_config_freshness
+            .as_ref()
+            .is_some_and(|freshness| freshness.stale);
+        let ready = startup_ready && !serving_degraded && jwks_ready && !dp_config_stale;
         health_status["ready"] = json!(ready);
+        if detailed && let Some(freshness) = dp_config_freshness.as_ref() {
+            // Fixed-cardinality only: booleans, seconds, counters, and
+            // closed-set reason/action labels. Never a CP URL, token,
+            // namespace, node id, or config content.
+            health_status["dp_config"] = serde_json::to_value(freshness).unwrap_or_default();
+        }
         if jwks_degraded && jwks_ready {
             health_status["status"] = json!("degraded");
         }
@@ -2231,12 +2247,15 @@ async fn handle_admin_request_inner(
             // status off `!startup_ready` would mislabel a post-start
             // degradation as "starting". Use the sticky flag instead.
             // Expired active JWKS trust is also an operator-visible outage of a
-            // previously-ready dependency, so it shares `unavailable`.
-            health_status["status"] = json!(if serving_degraded || !jwks_ready {
-                "unavailable"
-            } else {
-                "starting"
-            });
+            // previously-ready dependency, so it shares `unavailable`. So does
+            // a DP whose applied configuration aged past its bound (#3726): it
+            // started ready and lost its authority, which is not "starting".
+            health_status["status"] =
+                json!(if serving_degraded || !jwks_ready || dp_config_stale {
+                    "unavailable"
+                } else {
+                    "starting"
+                });
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::OK

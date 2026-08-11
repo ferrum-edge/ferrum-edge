@@ -34,6 +34,7 @@ mod compression_tests;
 mod correlation_id_tests;
 mod cors_tests;
 mod custom_plugin_guide_tests;
+mod dp_config_metrics_tests;
 mod dpop_tests;
 mod example_audit_plugin_tests;
 mod example_plugin_tests;

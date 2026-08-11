@@ -4,6 +4,7 @@
 //! We use `serial_test` via a simple mutex to enforce this.
 
 use ferrum_edge::config::{DbTlsMode, EnvConfig, OperatingMode};
+use ferrum_edge::dp_config_freshness::StaleAction;
 use ferrum_edge::ebpf::NodeAgentProxyMode;
 
 // Shared process-wide env lock: serializes against the identity guardrail
@@ -349,6 +350,104 @@ fn test_env_config_dp_mode_missing_grpc_url() {
             let result = EnvConfig::from_env();
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("FERRUM_DP_CP_GRPC_URLS"));
+        },
+    );
+}
+
+/// Issue #3726: the bounded last-known-good config age is nonzero by default,
+/// so an operator who never touches it still gets the safety boundary.
+#[test]
+fn test_env_config_dp_config_max_stale_defaults_to_one_hour_fail_closed() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_DP_CONFIG_MAX_STALE_SECONDS");
+            remove_var("FERRUM_DP_CONFIG_STALE_ACTION");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dp_config_max_stale_seconds, 3600);
+            assert_eq!(
+                config.dp_config_max_stale(),
+                std::time::Duration::from_secs(3600)
+            );
+            assert_eq!(
+                config.dp_config_stale_action_parsed().unwrap(),
+                StaleAction::FailClosed
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dp_config_max_stale_zero_is_the_unbounded_opt_in() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_DP_CONFIG_MAX_STALE_SECONDS", "0"),
+            ("FERRUM_DP_CONFIG_STALE_ACTION", "readiness_only"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dp_config_max_stale_seconds, 0);
+            assert!(config.dp_config_max_stale().is_zero());
+            assert_eq!(
+                config.dp_config_stale_action_parsed().unwrap(),
+                StaleAction::ReadinessOnly
+            );
+        },
+    );
+}
+
+/// The documented accepted values are exactly `fail_closed` and
+/// `readiness_only`; a case or dash variant is not an alias.
+#[test]
+fn test_env_config_dp_config_stale_action_rejects_case_and_dash_variants() {
+    for rejected in ["FAIL_CLOSED", "fail-closed", "Readiness-Only"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "dp"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_DP_CONFIG_STALE_ACTION", rejected),
+            ],
+            || {
+                let err = EnvConfig::from_env()
+                    .expect_err("only the exact documented spellings are accepted");
+                assert!(err.contains("FERRUM_DP_CONFIG_STALE_ACTION"));
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_dp_config_stale_action_rejects_unknown_values() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_DP_CONFIG_STALE_ACTION", "allow-everything"),
+        ],
+        || {
+            let err = EnvConfig::from_env().expect_err("unknown stale action must fail closed");
+            assert!(err.contains("FERRUM_DP_CONFIG_STALE_ACTION"));
         },
     );
 }

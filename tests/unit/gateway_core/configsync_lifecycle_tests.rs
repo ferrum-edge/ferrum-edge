@@ -40,6 +40,8 @@ use ferrum_edge::identity::{TrustBundle, TrustBundleSet as RuntimeTrustBundleSet
 use ferrum_edge::util::backoff::BACKOFF_INITIAL_SECS;
 use tonic::transport::Channel;
 
+const DP_CLIENT_SOURCE: &str = include_str!("../../../src/grpc/dp_client.rs");
+
 #[test]
 fn configsync_keepalive_constants_are_bounded_and_ordered() {
     assert_eq!(CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS, 30);
@@ -940,6 +942,23 @@ fn mid_stream_unusable_snapshot_and_delta_rejection_force_resync() {
     ));
     assert_eq!(state.current_cp_index, 1, "resync retries the same CP");
     assert_eq!(state.backoff_secs, BACKOFF_INITIAL_SECS);
+}
+
+#[test]
+fn rejected_resync_payload_marks_cp_authority_lost() {
+    // Issue #3726: a CP that repeatedly sends unusable payloads after an
+    // accepted base must not keep an arbitrarily old LKG in `Reconnecting`.
+    // The refusal boundary is authority loss; a later successfully applied
+    // snapshot is the only event that can recover a latched stale state.
+    let arm = DP_CLIENT_SOURCE
+        .split("Ok(DpStreamEnd::ResyncAfterAcceptedConfig) => {")
+        .nth(1)
+        .and_then(|tail| tail.split("Ok(DpStreamEnd::TransportFailure").next())
+        .expect("ResyncAfterAcceptedConfig outer-loop arm");
+    assert!(
+        arm.contains("update_state_disconnected(&connection_state, cp_url, is_primary, false);"),
+        "a refused mid-stream resync payload must mark CP authority lost"
+    );
 }
 
 #[test]

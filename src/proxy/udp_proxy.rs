@@ -854,6 +854,29 @@ fn udp_active_session_cap_reached(metrics: &UdpProxyMetrics, max_sessions: usize
     metrics.active_sessions.load(Ordering::Relaxed) >= max_sessions as u64
 }
 
+/// Whether a datagram from a source with no established session must be
+/// dropped.
+///
+/// Two independent process-level reasons, both a single relaxed atomic load and
+/// neither allocating or locking:
+///
+/// * critical overload shedding, and
+/// * the bounded last-known-good configuration fence (issue #3726) — a data
+///   plane whose applied CP snapshot aged past
+///   `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` with no authoritative CP can no longer
+///   be told that this listener, its backends, or its policy were revoked.
+///
+/// UDP has no handshake, but it does have a real new-session boundary: the
+/// caller pairs this with `!sessions.contains_key(..)`, so established sessions
+/// keep draining while no new source can start one under revoked policy. The
+/// same predicate gates the DTLS pre-allocation and post-accept admission
+/// checks, so no association path admits new work behind a stale configuration.
+#[inline]
+fn refuse_new_udp_source(overload: &crate::overload::OverloadState) -> bool {
+    overload.reject_new_connections.load(Ordering::Relaxed)
+        || crate::dp_config_freshness::new_traffic_blocked()
+}
+
 /// Atomically either remove the pending gate (when its queue is observed
 /// empty) or take the queued datagrams for draining. Both the empty-check +
 /// removal and the take happen under the same DashMap shard lock the recv
@@ -1904,8 +1927,12 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     let mut batch_dgrams_out: u64 = 0;
                     let mut batch_bytes_out: u64 = 0;
                     let batch_limit = adaptive_buffer.get_batch_limit(&proxy_namespace, &proxy_id);
-
                     use std::os::fd::AsRawFd;
+                    // One admission decision per batch: overload shedding and
+                    // the #3726 stale-configuration fence are both process-level
+                    // relaxed atomics, so reading them once here keeps the
+                    // per-datagram cost at zero extra loads.
+                    let refuse_new_udp_sources = refuse_new_udp_source(&overload);
                     let fd = frontend_socket.as_raw_fd();
                     let mut total_drained: usize = 0;
                     'drain: while total_drained < batch_limit {
@@ -1918,11 +1945,17 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                 for i in 0..n {
                                     let (data, addr2) = recv_batch.datagram(i);
 
-                                    // Reject datagrams from new clients under critical overload.
-                                    // Existing sessions continue to be served.
-                                    if overload.reject_new_connections.load(Ordering::Relaxed)
-                                        && !sessions.contains_key(&addr2)
-                                    {
+                                    // Reject datagrams from new clients under
+                                    // critical overload, or while the DP's
+                                    // applied CP configuration is stale beyond
+                                    // its bound (issue #3726). Existing
+                                    // sessions continue to be served, so
+                                    // established flows drain while no new
+                                    // source can start one under revoked
+                                    // policy. `refuse_new_udp_sources` is
+                                    // hoisted out of the batch: two relaxed
+                                    // loads per batch, none per datagram.
+                                    if refuse_new_udp_sources && !sessions.contains_key(&addr2) {
                                         continue;
                                     }
 
@@ -2049,12 +2082,12 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     }
                 };
 
-                // Reject datagrams from new clients under critical overload.
-                // Existing sessions continue to be served (UDP is sessionless at the
-                // wire level, so we only block session creation, not in-flight traffic).
-                if overload.reject_new_connections.load(Ordering::Relaxed)
-                    && !sessions.contains_key(&client_addr)
-                {
+                // Reject datagrams from new clients under critical overload, or
+                // while the DP's applied CP configuration is stale beyond its
+                // bound (issue #3726). Existing sessions continue to be served
+                // (UDP is sessionless at the wire level, so we only block
+                // session creation, not in-flight traffic).
+                if refuse_new_udp_source(&overload) && !sessions.contains_key(&client_addr) {
                     continue;
                 }
 
@@ -2120,6 +2153,11 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 #[cfg(target_os = "linux")]
                 {
                     use std::os::fd::AsRawFd;
+                    // One admission decision per batch: overload shedding and
+                    // the #3726 stale-configuration fence are both process-level
+                    // relaxed atomics, so reading them once here keeps the
+                    // per-datagram cost at zero extra loads.
+                    let refuse_new_udp_sources = refuse_new_udp_source(&overload);
                     let fd = frontend_socket.as_raw_fd();
                     let mut total_drained: usize = 0;
                     'drain: while total_drained < batch_limit {
@@ -2137,11 +2175,17 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         None
                                     };
 
-                                    // Reject datagrams from new clients under critical overload.
-                                    // Existing sessions continue to be served.
-                                    if overload.reject_new_connections.load(Ordering::Relaxed)
-                                        && !sessions.contains_key(&addr2)
-                                    {
+                                    // Reject datagrams from new clients under
+                                    // critical overload, or while the DP's
+                                    // applied CP configuration is stale beyond
+                                    // its bound (issue #3726). Existing
+                                    // sessions continue to be served, so
+                                    // established flows drain while no new
+                                    // source can start one under revoked
+                                    // policy. `refuse_new_udp_sources` is
+                                    // hoisted out of the batch: two relaxed
+                                    // loads per batch, none per datagram.
+                                    if refuse_new_udp_sources && !sessions.contains_key(&addr2) {
                                         continue;
                                     }
 
@@ -2247,14 +2291,20 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
 
                 #[cfg(not(target_os = "linux"))]
                 {
+                    // One admission decision per batch: overload shedding and
+                    // the #3726 stale-configuration fence are both process-level
+                    // relaxed atomics, so reading them once here keeps the
+                    // per-datagram cost at zero extra loads.
+                    let refuse_new_udp_sources = refuse_new_udp_source(&overload);
+
                     for _ in 0..batch_limit {
                         match frontend_socket.try_recv_from(&mut buf) {
                             Ok((len2, addr2)) => {
-                                // Reject datagrams from new clients under critical overload.
-                                // Existing sessions continue to be served.
-                                if overload.reject_new_connections.load(Ordering::Relaxed)
-                                    && !sessions.contains_key(&addr2)
-                                {
+                                // Reject datagrams from new clients under
+                                // critical overload, or while the applied CP
+                                // configuration is stale beyond its bound
+                                // (issue #3726). Existing sessions drain.
+                                if refuse_new_udp_sources && !sessions.contains_key(&addr2) {
                                     continue;
                                 }
 
@@ -3059,10 +3109,13 @@ async fn start_dtls_frontend_listener(
         max_sessions: Some(max_sessions),
         handshake_timeout: (frontend_tls_handshake_timeout_seconds > 0)
             .then_some(Duration::from_secs(frontend_tls_handshake_timeout_seconds)),
+        // Pre-allocation admission: refused before the server allocates any
+        // association state. Covers critical overload AND the #3726 stale
+        // last-known-good configuration fence, so a DP that can no longer be
+        // told this listener or its policy was revoked stops admitting new
+        // DTLS associations while established sessions drain.
         allow_new_session: Some(Arc::new(move || {
-            !admission_overload
-                .reject_new_connections
-                .load(Ordering::Relaxed)
+            !refuse_new_udp_source(&admission_overload)
         })),
         active_session_mirror: Some(metrics.dtls_demux_sessions.clone()),
     };
@@ -3105,8 +3158,12 @@ async fn start_dtls_frontend_listener(
                     }
                 };
 
-                // Reject new DTLS connections under critical overload.
-                if overload.reject_new_connections.load(Ordering::Relaxed) {
+                // Post-accept admission: `allow_new_session` is a soft
+                // pre-allocation gate, so re-check the same predicate here —
+                // critical overload or a stale applied configuration (#3726) —
+                // and close any association that raced past it. Neither race
+                // path may admit new work behind revoked policy.
+                if refuse_new_udp_source(&overload) {
                     client_conn.close().await;
                     continue;
                 }
