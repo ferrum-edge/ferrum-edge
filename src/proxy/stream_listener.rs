@@ -1949,8 +1949,14 @@ impl StreamListenerManager {
             // Pre-check port availability before spawning the listener task.
             // This catches EADDRINUSE early with a clear error rather than having
             // the spawned task fail silently in the background.
-            let bind_addr = self.bind_addr;
             let port_val = *port;
+            let bind_addr = self
+                .config
+                .load()
+                .mesh
+                .as_ref()
+                .and_then(|mesh| mesh.sidecar_ingress_bind_override(port_val))
+                .unwrap_or(self.bind_addr);
             let probe_addr = std::net::SocketAddr::new(bind_addr, port_val);
             let probe_result = if scheme.is_udp() {
                 tokio::net::UdpSocket::bind(probe_addr).await.map(drop)

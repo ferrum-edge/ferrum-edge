@@ -5218,6 +5218,7 @@ mod tests {
                 endpoint_unix_h2c: false,
                 owner_namespace: "default".to_string(),
                 owner_service: "api".to_string(),
+                bind: None,
             }],
             sidecar_ingress_declared: true,
             // F6 §6.2 (codex round-4 P2): the DECLARED HTTP-family ingress port

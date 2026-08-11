@@ -5839,6 +5839,7 @@ mod tests {
                         endpoint_unix_h2c: false,
                         owner_namespace: "default".to_string(),
                         owner_service: "reviews".to_string(),
+                        bind: None,
                     },
                     ResolvedIngressListener {
                         port: 8443,
@@ -5849,6 +5850,7 @@ mod tests {
                         endpoint_unix_h2c: false,
                         owner_namespace: "default".to_string(),
                         owner_service: "reviews".to_string(),
+                        bind: None,
                     },
                 ],
                 ..MeshConfig::default()
@@ -5919,6 +5921,7 @@ mod tests {
                     endpoint_unix_h2c: false,
                     owner_namespace: "default".to_string(),
                     owner_service: "reviews".to_string(),
+                    bind: None,
                 }],
                 ..MeshConfig::default()
             })),
@@ -6018,6 +6021,7 @@ mod tests {
                     endpoint_unix_h2c: false,
                     owner_namespace: "default".to_string(),
                     owner_service: "reviews".to_string(),
+                    bind: None,
                 }],
                 // Operator declared TWO HTTP-family ingress ports; only one
                 // resolved. The declared count must drive the router.

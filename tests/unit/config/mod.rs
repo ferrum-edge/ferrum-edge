@@ -49,6 +49,7 @@ mod plugin_migration_tests;
 mod plugin_trigger_tests;
 mod pool_config_tests;
 mod separate_listeners_tests;
+mod sidecar_ingress_bind_tests;
 mod sidecar_ingress_stream_tests;
 mod sidecar_outbound_policy_tests;
 mod sql_dialect_tests;

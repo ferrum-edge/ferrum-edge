@@ -1975,6 +1975,7 @@ fn ingress_resolved_listener_endpoint_revalidation() {
         endpoint_unix_h2c: false,
         owner_namespace: "default".to_string(),
         owner_service: "reviews".to_string(),
+        bind: None,
     };
     // An EMPTY containment allowlist is the shipped default. A loopback-TCP
     // listener must be completely unaffected by it — containment governs unix
@@ -2121,6 +2122,7 @@ fn ingress_carrier_rejects_an_h2c_marker_on_a_tcp_listener() {
         endpoint_unix_h2c: true,
         owner_namespace: "default".to_string(),
         owner_service: "reviews".to_string(),
+        bind: None,
     };
     assert!(!hostile.endpoint_is_valid(NO_ROOTS));
     assert!(!hostile.endpoint_shape_is_valid());
@@ -2175,6 +2177,7 @@ fn ingress_carrier_revalidates_unix_socket_shape() {
         endpoint_unix_h2c: false,
         owner_namespace: "default".to_string(),
         owner_service: "reviews".to_string(),
+        bind: None,
     };
     assert!(
         base.endpoint_is_valid(&unix_roots),
@@ -2262,6 +2265,7 @@ fn ingress_resolved_listener_rejects_unknown_protocol_on_revalidation() {
         endpoint_unix_h2c: false,
         owner_namespace: "default".to_string(),
         owner_service: "reviews".to_string(),
+        bind: None,
     };
     assert!(
         !hostile.endpoint_is_valid(NO_ROOTS),

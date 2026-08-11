@@ -774,7 +774,15 @@ impl GatewayListenerManager {
                  served on this Gateway listener port"
             ));
         };
-        let addr = SocketAddr::new(self.bind_addr, port);
+        let bind_addr = self
+            .state
+            .config
+            .load()
+            .mesh
+            .as_ref()
+            .and_then(|mesh| mesh.sidecar_ingress_bind_override(port))
+            .unwrap_or(self.bind_addr);
+        let addr = SocketAddr::new(bind_addr, port);
         let (started_tx, started_rx) = oneshot::channel();
         let state = self.state.clone();
         let shutdown_rx = listener.shutdown_tx.subscribe();
@@ -821,7 +829,15 @@ impl GatewayListenerManager {
         port: u16,
         class: GatewayListenerClass,
     ) -> Result<LiveListener, String> {
-        let addr = SocketAddr::new(self.bind_addr, port);
+        let bind_addr = self
+            .state
+            .config
+            .load()
+            .mesh
+            .as_ref()
+            .and_then(|mesh| mesh.sidecar_ingress_bind_override(port))
+            .unwrap_or(self.bind_addr);
+        let addr = SocketAddr::new(bind_addr, port);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (started_tx, started_rx) = oneshot::channel();
         let state = self.state.clone();

@@ -9997,6 +9997,7 @@ fn sidecar_ingress_stream_slice(
             endpoint_unix_h2c: false,
             owner_namespace: "ferrum".to_string(),
             owner_service: "echo".to_string(),
+            bind: None,
         }],
         sidecar_ingress_declared: true,
         peer_authentications: vec![PeerAuthentication {

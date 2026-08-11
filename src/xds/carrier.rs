@@ -1077,6 +1077,7 @@ mod tests {
                 endpoint_unix_h2c: false,
                 owner_namespace: "default".to_string(),
                 owner_service: "reviews".to_string(),
+                bind: None,
             }]),
             MeshSliceCarrier::SidecarIngressDeclared(true),
             MeshSliceCarrier::SidecarIngressDeclaredPorts(2),
