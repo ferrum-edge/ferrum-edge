@@ -134,12 +134,13 @@ pub struct ProxyBody {
     ///
     /// Set only by the sidecar-ingress Unix HTTP/1.1 dispatch, which leases a
     /// physical connection exclusively for one request/response exchange. The
-    /// lease may be returned only after a clean end-of-stream — `poll_frame`
-    /// releases it in the `Ready(None)` arm and NOWHERE else. Every other
-    /// terminal (body error, client disconnect, early drop, timeout, abort,
-    /// deadline expiry, shutdown) leaves it in place, so the field's own `Drop`
-    /// retires the physical connection. Fail-closed by construction: forgetting
-    /// to release costs one reused connection, never a mid-body handoff.
+    /// lease may be returned only after a clean end-of-stream — either
+    /// `Ready(None)` or a successful terminal frame after the inner body has
+    /// already consumed backend EOF. Every other terminal (body error, client
+    /// disconnect, early drop, timeout, abort, deadline expiry, shutdown)
+    /// leaves it in place, so the field's own `Drop` retires the physical
+    /// connection. Fail-closed by construction: forgetting to release costs one
+    /// reused connection, never a mid-body handoff.
     ///
     /// `None` on every other dispatch path, so this is one pointer-sized
     /// `Option` on the ordinary response envelope.
@@ -152,13 +153,14 @@ pub struct ProxyBody {
 /// Implemented by [`crate::proxy::unix_backend_pool`]'s HTTP/1.1 lease guard.
 /// The contract has exactly two outcomes:
 ///
-/// * [`Self::release_on_clean_eof`] — the body yielded `Ready(None)`, so the
-///   entire response body was read and the carrier may re-enter the idle pool
-///   (after the implementation confirms the wire dispatcher re-armed).
+/// * [`Self::release_on_clean_eof`] — the body yielded `Ready(None)`, or yielded
+///   a successful final frame while `Body::is_end_stream()` proved that the
+///   backend EOF had already been consumed. The carrier may re-enter the idle
+///   pool after the implementation confirms the wire dispatcher re-armed.
 /// * `Drop` without that call — anything else. The implementation MUST retire
 ///   the connection rather than pool it.
 pub trait PooledBackendLease: Send + 'static {
-    /// Clean end-of-stream observed on the client-visible body. Consumes the
+    /// Clean end-of-stream observed on the backend-owning body. Consumes the
     /// lease; the implementation decides whether the carrier is still healthy
     /// enough to pool.
     fn release_on_clean_eof(self: Box<Self>);
@@ -758,8 +760,9 @@ impl ProxyBody {
     /// into a separate task and feeds the client from a channel (the response
     /// inspector) is NOT — its channel closes on policy cuts and task
     /// cancellation too, neither of which is a backend EOF. The lease is
-    /// returned to its pool only from the `Ready(None)` arm of
-    /// [`ProxyBody::poll_frame`]; every other exit drops it, which retires the
+    /// returned only after [`ProxyBody::poll_frame`] proves a clean backend end:
+    /// either `Ready(None)` or a successful terminal frame whose inner body now
+    /// reports `is_end_stream()`. Every other exit drops it, which retires the
     /// physical connection.
     pub fn with_pooled_backend_lease(mut self, lease: Box<dyn PooledBackendLease>) -> Self {
         self.pooled_backend_lease = Some(lease);
@@ -1363,19 +1366,33 @@ impl http_body::Body for ProxyBody {
                 let terminal_class = client_deadline_fired.then_some(ErrorClass::ClientDisconnect);
                 this.record_deferred_backend_admission(terminal_class, client_deadline_fired);
                 this.record_deferred_backend_dispatch(terminal_class, client_deadline_fired);
-                // THE one place a pooled backend lease may be returned: the
-                // client-visible body reached clean end-of-stream, which can
-                // only happen after the inner backend body yielded its own
-                // `Ready(None)`. A synthesized client-deadline terminal is NOT
-                // a backend EOF — the backend stream was abandoned mid-body —
-                // so that case falls through to the drop-retires path.
-                if let Some(lease) = this.pooled_backend_lease.take()
-                    && !client_deadline_fired
-                {
-                    lease.release_on_clean_eof();
-                }
             }
             Poll::Pending => {}
+        }
+
+        // Return a Unix H1 carrier only after this backend-owning body proves a
+        // clean message end. `Ready(None)` is the ordinary proof. The second
+        // proof matters for coalesced bodies: the coalescer may consume the
+        // backend's `Ready(None)`, mark itself done, and yield its final buffered
+        // DATA frame. Hyper is then permitted to observe `is_end_stream()` and
+        // drop the body without one redundant EOF poll. Requiring that extra
+        // poll would retire a fully drained carrier nondeterministically.
+        //
+        // This remains fail-closed: non-terminal frames report false, errors and
+        // Pending never enter this branch, inspector termination drops the
+        // backend-owning body before it reaches either proof, and a synthesized
+        // client-deadline terminal is explicitly excluded even if its wrapper
+        // reports end-of-stream.
+        let clean_backend_end = !client_deadline_fired
+            && match &result {
+                Poll::Ready(None) => true,
+                Poll::Ready(Some(Ok(_))) => http_body::Body::is_end_stream(&*this),
+                Poll::Ready(Some(Err(_))) | Poll::Pending => false,
+            };
+        if clean_backend_end
+            && let Some(lease) = this.pooled_backend_lease.take()
+        {
+            lease.release_on_clean_eof();
         }
 
         result
@@ -1401,10 +1418,11 @@ impl http_body::Body for ProxyBody {
 impl Drop for ProxyBody {
     /// Note on `pooled_backend_lease` (issue #3731): this `Drop` deliberately
     /// does NOT release it. If the field is still populated here, the body
-    /// never reached a clean `Ready(None)` — client disconnect, hyper
-    /// abandoning the stream, a shutdown cancel, or a response hyper chose not
-    /// to poll at all — so the exclusive HTTP/1.1 carrier is in an unknown
-    /// framing state. Letting the field drop with the struct retires it.
+    /// never reached a proven clean end (`Ready(None)` or a successful terminal
+    /// frame after backend EOF) — client disconnect, hyper abandoning the
+    /// stream, a shutdown cancel, or a response hyper chose not to poll at all
+    /// — so the exclusive HTTP/1.1 carrier is in an unknown framing state.
+    /// Letting the field drop with the struct retires it.
     fn drop(&mut self) {
         let mut deferred_admission_error_class = None;
         let mut deferred_admission_client_disconnected = false;
@@ -4231,6 +4249,37 @@ mod tests {
         steps: VecDeque<MockStep>,
     }
 
+    struct MockPooledBackendLease {
+        released: Arc<AtomicBool>,
+        retired: Arc<AtomicBool>,
+        armed: bool,
+    }
+
+    impl MockPooledBackendLease {
+        fn new(released: Arc<AtomicBool>, retired: Arc<AtomicBool>) -> Self {
+            Self {
+                released,
+                retired,
+                armed: true,
+            }
+        }
+    }
+
+    impl PooledBackendLease for MockPooledBackendLease {
+        fn release_on_clean_eof(mut self: Box<Self>) {
+            self.released.store(true, Ordering::Release);
+            self.armed = false;
+        }
+    }
+
+    impl Drop for MockPooledBackendLease {
+        fn drop(&mut self) {
+            if self.armed {
+                self.retired.store(true, Ordering::Release);
+            }
+        }
+    }
+
     impl MockSource {
         fn new(steps: Vec<MockStep>) -> Self {
             Self {
@@ -4539,6 +4588,70 @@ mod tests {
             frames[0].as_ref().unwrap().data_ref().unwrap().as_ref(),
             b"partial"
         );
+    }
+
+    #[test]
+    fn pooled_backend_lease_releases_on_terminal_coalesced_frame_without_extra_eof_poll() {
+        let released = Arc::new(AtomicBool::new(false));
+        let retired = Arc::new(AtomicBool::new(false));
+        let inner = Coalescing::new(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from_static(b"tail")))),
+                MockStep::End,
+            ]),
+            1_000,
+            None,
+        );
+        let lease = MockPooledBackendLease::new(Arc::clone(&released), Arc::clone(&retired));
+        let mut body = ProxyBody::streaming(Box::pin(inner))
+            .with_pooled_backend_lease(Box::new(lease));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        match Pin::new(&mut body).poll_frame(&mut cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                assert_eq!(frame.data_ref().unwrap().as_ref(), b"tail");
+            }
+            other => panic!("expected terminal buffered frame, got {other:?}"),
+        }
+
+        assert!(body.is_end_stream());
+        assert!(released.load(Ordering::Acquire));
+        assert!(!retired.load(Ordering::Acquire));
+
+        // Deliberately do not poll `Ready(None)`: this is the exact hyper
+        // behavior that previously retired a fully drained Unix H1 carrier.
+        drop(body);
+        assert!(!retired.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pooled_backend_lease_retires_when_dropped_after_non_terminal_frame() {
+        let released = Arc::new(AtomicBool::new(false));
+        let retired = Arc::new(AtomicBool::new(false));
+        let inner = Coalescing::new(
+            MockSource::new(vec![
+                MockStep::Frame(Ok(Frame::data(Bytes::from_static(b"chunk")))),
+                MockStep::End,
+            ]),
+            1,
+            None,
+        );
+        let lease = MockPooledBackendLease::new(Arc::clone(&released), Arc::clone(&retired));
+        let mut body = ProxyBody::streaming(Box::pin(inner))
+            .with_pooled_backend_lease(Box::new(lease));
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(Some(Ok(_)))
+        ));
+        assert!(!body.is_end_stream());
+        assert!(!released.load(Ordering::Acquire));
+
+        drop(body);
+        assert!(retired.load(Ordering::Acquire));
     }
 
     #[tokio::test]

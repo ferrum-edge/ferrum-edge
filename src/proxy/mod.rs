@@ -34497,7 +34497,8 @@ async fn handle_proxy_request_inner(
             // the lease there would return an exclusive H1 carrier to the idle
             // set mid-response. Held by the backend-facing body instead, the
             // release stays exactly where the contract puts it: that body's own
-            // clean EOF, with every abandonment retiring the carrier via `Drop`.
+            // proven clean end (`Ready(None)`, or a terminal frame after backend
+            // EOF), with every abandonment retiring the carrier via `Drop`.
             let body = match pooled_backend_lease {
                 Some(lease) => body.with_pooled_backend_lease(lease),
                 None => body,
@@ -42172,8 +42173,8 @@ async fn proxy_to_backend_unix(
         &resp_headers,
     );
     // Mesh ingress defaults to `ResponseBodyMode::Stream`. A Content-Length
-    // response would otherwise ride the EOF-anchored streaming lease, returned
-    // only from `ProxyBody`'s clean `Ready(None)`. An HTTP/1.1 frontend that
+    // response would otherwise ride the EOF-anchored streaming lease. An
+    // HTTP/1.1 frontend that
     // closes after writing the response (client `Connection: close` — ordinary
     // for functional tests and many production clients) can drop that body
     // without the terminal poll, which retires the exclusive carrier and forces
@@ -42220,10 +42221,11 @@ async fn proxy_to_backend_unix(
         // 2. Otherwise the lease is wrapped as a `PooledBackendLease` and
         //    carried in the response's extensions to the streaming-body builder,
         //    which anchors it to the `ProxyBody` that OWNS the backend
-        //    `Incoming`. That body returns it from exactly one place — clean
-        //    `Poll::Ready(None)`, i.e. a real backend end-of-stream — and drops
-        //    it (retiring the connection) on a body error, a client disconnect,
-        //    an early drop, a fired deadline, or shutdown.
+        //    `Incoming`. That body returns it only after a proven clean backend
+        //    end — `Poll::Ready(None)`, or a successful terminal frame after
+        //    backend EOF — and drops it (retiring the connection) on a body
+        //    error, a client disconnect, an early drop, a fired deadline, or
+        //    shutdown.
         //
         // If the response never reaches the body builder (an `after_proxy`
         // reject replaces it, say), the extension drops with the response and

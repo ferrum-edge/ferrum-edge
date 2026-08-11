@@ -293,10 +293,11 @@
 //!   path cannot: the body leaves the dispatch function. It therefore hands the
 //!   lease to the `ProxyBody` that OWNS the backend `hyper::body::Incoming`, as
 //!   a [`crate::proxy::body::PooledBackendLease`] (see
-//!   [`UnixBackendConnectionPool::streaming_lease`]), which returns it from
-//!   exactly one place — the `Poll::Ready(None)` arm of `ProxyBody::poll_frame`,
-//!   i.e. that body's own clean end-of-stream, reachable only after the
-//!   `Incoming` beneath it yielded its own `Ready(None)`. The anchor is
+//!   [`UnixBackendConnectionPool::streaming_lease`]), which returns it only
+//!   after `ProxyBody::poll_frame` proves a clean end: either its own
+//!   `Poll::Ready(None)`, or a successful terminal frame after the `Incoming`
+//!   beneath it has already yielded EOF and `Body::is_end_stream()` reflects
+//!   that fact. The anchor is
 //!   deliberately the backend-facing body rather than whatever the client ends
 //!   up polling: the response-inspector bridge replaces the client-visible body
 //!   with a channel-fed one whose EOF also fires on a policy `Terminate` and on
@@ -571,7 +572,8 @@ mod imp {
     /// Constructed by [`UnixBackendConnectionPool::streaming_lease`] and stored
     /// on the `ProxyBody` that owns the backend stream. Two exits, and only two:
     ///
-    /// * `release_on_clean_eof` — the body yielded `Ready(None)`, so the whole
+    /// * `release_on_clean_eof` — the body yielded `Ready(None)`, or a successful
+    ///   terminal frame after `Body::is_end_stream()` proved that the whole
     ///   `hyper::body::Incoming` was consumed. Hand the carrier to
     ///   `checkin_h1_when_idle`, which additionally waits for hyper's h1
     ///   dispatcher to re-arm and re-checks liveness and socket identity.
@@ -2629,8 +2631,9 @@ mod imp {
         ///
         /// This is the EOF-anchored handoff. The returned guard owns the lease
         /// for as long as the `ProxyBody` holding the backend stream lives; that
-        /// body releases it from exactly one place, its `Poll::Ready(None)` arm,
-        /// and drops it on every other terminal. Because the guard owns the only
+        /// body releases it only after a proven clean end (`Poll::Ready(None)`,
+        /// or a successful terminal frame after backend EOF), and drops it on
+        /// every other terminal. Because the guard owns the only
         /// `UnixH1Checkout`, the connection cannot be handed to another request
         /// while the body is still streaming — the sender is not in `h1_idle`
         /// and there is no second reference to it.
