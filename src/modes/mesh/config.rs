@@ -2301,9 +2301,8 @@ pub struct MeshSidecarIngress {
     ///
     /// **Issue #3266:** omitted / empty / unspecified (`0.0.0.0` / `::`) keep
     /// the shared capture-listener contract (`:15006`). A supported dedicated
-    /// bind (loopback, or a local workload address known at materialization)
-    /// is conflict-checked and materialized as a real OS listener through the
-    /// Gateway/stream ownership path. Unsupported or unrepresentable values
+    /// loopback bind is conflict-checked and materialized as a real OS listener
+    /// through the Gateway/stream ownership path. Unsupported or unrepresentable values
     /// fail closed at [`Self::resolve`] with a field-specific reason rather
     /// than being accepted as inert metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2419,9 +2418,8 @@ pub struct ResolvedIngressListener {
     ///
     /// `None` means the shared capture contract (`:15006` / orig-dst). `Some`
     /// is a conflict-checked dedicated bind that Gateway/stream listener
-    /// ownership must honor; an untrusted carrier that forges a non-loopback
-    /// address is re-validated at materialization against local workload
-    /// addresses before any socket is claimed.
+    /// ownership must honor. An untrusted carrier that forges a non-loopback
+    /// address is rejected again at materialization before any socket is claimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind: Option<std::net::IpAddr>,
 }
@@ -2609,9 +2607,8 @@ pub enum IngressListenerUnsupported {
     UnparseableBind,
     /// `bind` named an IP Ferrum cannot represent as a dedicated socket at
     /// resolve time (not loopback and not the unspecified wildcard that maps
-    /// to shared capture). Non-local addresses may still be admitted later
-    /// only when materialization proves they match a local workload address;
-    /// resolve itself never silently accepts an arbitrary remote IP.
+    /// to shared capture). Such addresses are rejected rather than deferred to
+    /// a later locality guess; resolve never silently accepts an arbitrary IP.
     BindNotRepresentable,
 }
 
@@ -2624,8 +2621,7 @@ pub enum IngressBind {
     /// Omitted, empty, or unspecified (`0.0.0.0` / `::`) — traffic stays on
     /// the shared capture / `:15006` listener keyed by declared port.
     SharedCapture,
-    /// Dedicated IP the runtime must bind (loopback at resolve; local
-    /// workload addresses may be confirmed at materialization).
+    /// Dedicated loopback IP the runtime must bind.
     Dedicated(std::net::IpAddr),
 }
 
