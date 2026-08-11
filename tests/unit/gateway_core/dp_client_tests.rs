@@ -25,9 +25,7 @@ fn grpc_jwt_secret_stores_and_retrieves() {
     let key = jsonwebtoken::DecodingKey::from_secret(b"my-secret-key");
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     validation.validate_exp = true;
-    assert!(
-        jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation).is_ok()
-    );
+    assert!(jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation).is_ok());
 }
 
 #[test]
@@ -38,9 +36,7 @@ fn grpc_jwt_secret_clone() {
     let key = jsonwebtoken::DecodingKey::from_secret(b"test");
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     validation.validate_exp = true;
-    assert!(
-        jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation).is_ok()
-    );
+    assert!(jsonwebtoken::decode::<serde_json::Value>(&token, &key, &validation).is_ok());
 }
 
 #[test]
