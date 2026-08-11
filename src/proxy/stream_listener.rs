@@ -70,6 +70,20 @@ fn unix_now_secs() -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
+/// Run one collector-side observation while generation publication is fenced.
+/// The consumer must both apply the snapshot and expose its listener handle
+/// inside this call so no newer publisher can miss the handle and then be
+/// overwritten by the stale snapshot.
+async fn with_current_frontend_dtls_generation<T>(
+    publish_lock: &Arc<tokio::sync::Mutex<()>>,
+    generation_slot: &Arc<arc_swap::ArcSwap<Option<Arc<crate::dtls::FrontendDtlsGeneration>>>>,
+    consume: impl FnOnce(Option<&Arc<crate::dtls::FrontendDtlsGeneration>>) -> T,
+) -> T {
+    let _publish_guard = publish_lock.lock().await;
+    let generation = generation_slot.load_full();
+    consume(generation.as_ref())
+}
+
 /// Handle for a running stream listener — keeps the shutdown channel and task handle.
 struct ListenerHandle {
     shutdown_tx: watch::Sender<bool>,
@@ -842,7 +856,7 @@ pub struct StreamListenerManager {
     /// Serializes the complete generation publish and active-listener swap so
     /// concurrent frontend and mesh PeerAuth rotations cannot publish an older
     /// generation after a newer one.
-    frontend_dtls_publish: tokio::sync::Mutex<()>,
+    frontend_dtls_publish: Arc<tokio::sync::Mutex<()>>,
     /// Redacted reload status for admin/metrics (no PEM, keys, or secret URIs).
     frontend_dtls_reload_status: arc_swap::ArcSwap<FrontendDtlsReloadStatus>,
     /// Global override to disable backend TLS certificate verification.
@@ -1175,7 +1189,7 @@ impl StreamListenerManager {
             frontend_dtls_material: arc_swap::ArcSwap::new(Arc::new(None)),
             frontend_dtls_generation: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
             frontend_dtls_generation_counter: AtomicU64::new(0),
-            frontend_dtls_publish: tokio::sync::Mutex::new(()),
+            frontend_dtls_publish: Arc::new(tokio::sync::Mutex::new(())),
             frontend_dtls_reload_status: arc_swap::ArcSwap::new(Arc::new(
                 FrontendDtlsReloadStatus::default(),
             )),
@@ -1419,6 +1433,26 @@ impl StreamListenerManager {
         &self,
     ) -> Option<Arc<crate::dtls::FrontendDtlsGeneration>> {
         self.frontend_dtls_generation.load_full().as_ref().clone()
+    }
+
+    /// Test seam for deterministically fencing a collector against a concurrent
+    /// generation publish. Production collectors use the same lock through
+    /// [`with_current_frontend_dtls_generation`].
+    #[doc(hidden)]
+    pub fn frontend_dtls_publish_lock_for_test(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.frontend_dtls_publish)
+    }
+
+    /// Test seam that observes the generation exactly as a newly collected
+    /// DTLS server does, under the shared publication fence.
+    #[doc(hidden)]
+    pub async fn collected_frontend_dtls_generation_for_test(&self) -> Option<u64> {
+        with_current_frontend_dtls_generation(
+            &self.frontend_dtls_publish,
+            &self.frontend_dtls_generation,
+            |generation| generation.map(|generation| generation.generation),
+        )
+        .await
     }
 
     /// Bounded redacted DTLS live-reload status (no secrets or source paths).
@@ -2303,16 +2337,26 @@ impl StreamListenerManager {
                     Arc::new(arc_swap::ArcSwap::from_pointee(None));
                 let dtls_server_slot_for_collector = Arc::clone(&dtls_server_slot);
                 let generation_slot_for_collector = self.frontend_dtls_generation.clone();
+                let publish_lock_for_collector = Arc::clone(&self.frontend_dtls_publish);
                 tokio::spawn(async move {
                     if let Ok(server) = dtls_server_rx.await {
-                        // Converge a server that bound during a publish race:
-                        // apply the current accepted generation (if any) before
-                        // exposing the handle for subsequent live swaps.
-                        if let Some(generation) = generation_slot_for_collector.load_full().as_ref()
-                        {
-                            server.swap_frontend_config(generation.config.clone());
-                        }
-                        dtls_server_slot_for_collector.store(Arc::new(Some(server)));
+                        // Converge a server that bound during a publish race and
+                        // expose its handle in the same publication critical
+                        // section. Without this fence a collector could snapshot
+                        // generation A, a publisher could install B while the
+                        // handle was still absent, and the collector could then
+                        // expose the server after restoring stale A.
+                        with_current_frontend_dtls_generation(
+                            &publish_lock_for_collector,
+                            &generation_slot_for_collector,
+                            |generation| {
+                                if let Some(generation) = generation {
+                                    server.swap_frontend_config(generation.config.clone());
+                                }
+                                dtls_server_slot_for_collector.store(Arc::new(Some(server)));
+                            },
+                        )
+                        .await;
                     }
                 });
                 (

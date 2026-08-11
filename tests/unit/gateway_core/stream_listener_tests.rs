@@ -2069,6 +2069,52 @@ async fn concurrent_dtls_publishers_cannot_regress_the_accepted_generation() {
 }
 
 #[tokio::test]
+async fn collected_dtls_server_cannot_publish_an_older_generation_after_rotation() {
+    let manager = Arc::new(create_manager(empty_config()));
+    manager
+        .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+        .await;
+
+    // Hold the shared fence, queue generation 2 first, then queue the collector
+    // observation. Tokio's mutex is FIFO, so after release the publisher must
+    // complete before the collector can apply and expose its server. A collector
+    // that loaded the generation outside this fence would observe 1 here and
+    // could restore it after the generation-2 publisher missed its empty slot.
+    let publish_lock = manager.frontend_dtls_publish_lock_for_test();
+    let guard = publish_lock.lock().await;
+
+    let (publisher_started_tx, publisher_started_rx) = tokio::sync::oneshot::channel();
+    let publisher_manager = Arc::clone(&manager);
+    let publisher = tokio::spawn(async move {
+        let _ = publisher_started_tx.send(());
+        publisher_manager
+            .publish_frontend_dtls_generation(ephemeral_frontend_dtls_config())
+            .await
+            .0
+            .generation
+    });
+    publisher_started_rx.await.expect("publisher started");
+
+    let (collector_started_tx, collector_started_rx) = tokio::sync::oneshot::channel();
+    let collector_manager = Arc::clone(&manager);
+    let collector = tokio::spawn(async move {
+        let _ = collector_started_tx.send(());
+        collector_manager
+            .collected_frontend_dtls_generation_for_test()
+            .await
+    });
+    collector_started_rx.await.expect("collector started");
+    drop(guard);
+
+    assert_eq!(publisher.await.expect("publisher task"), 2);
+    assert_eq!(
+        collector.await.expect("collector task"),
+        Some(2),
+        "collector must apply the generation that won the shared publication fence"
+    );
+}
+
+#[tokio::test]
 async fn rejected_dtls_candidate_retains_previous_generation() {
     let manager = create_manager(empty_config());
     let (_gen, swapped) = manager

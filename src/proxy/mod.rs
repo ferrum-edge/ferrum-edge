@@ -6999,7 +6999,16 @@ impl ProxyState {
         // Validate the complete candidate (cert/key/optional client-CA/CRLs)
         // as one generation BEFORE publishing anything. A failure keeps the
         // last accepted generation on every listener.
-        let active_crls = crate::tls::load_crls(self.env_config.tls_crl_file_path.as_deref())?;
+        let active_crls = match crate::tls::load_crls(
+            self.env_config.tls_crl_file_path.as_deref(),
+        ) {
+            Ok(crls) => crls,
+            Err(err) => {
+                self.stream_listener_manager
+                    .record_frontend_dtls_candidate_failure();
+                return Err(err);
+            }
+        };
         let config = match crate::dtls::build_frontend_dtls_config(
             &cert_path,
             &key_path,
