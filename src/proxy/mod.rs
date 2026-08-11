@@ -6710,6 +6710,29 @@ impl ProxyState {
         }
     }
 
+    /// Reconcile the sidecar-ingress Unix backend pool against a request epoch
+    /// that HAS JUST BECOME CURRENT (issues #3731/#3764).
+    ///
+    /// Must be called from every successful publication, on both swap paths,
+    /// and BEFORE any early return — a withdrawal, a re-pointed socket path, an
+    /// `http` ⇄ `http2` flip, and a deleted proxy/upstream can all arrive
+    /// through `apply_incremental` or through a `update_config` generation that
+    /// carries no `ConfigDelta`, and each of those must retire the carriers the
+    /// published config no longer declares.
+    ///
+    /// `published` is the config the epoch swap actually made current, not the
+    /// local candidate: under a concurrent publication the swap can adopt a
+    /// different generation, and reconciling against the candidate would both
+    /// retire live carriers and retain withdrawn ones.
+    ///
+    /// A rejected candidate and a swap that reported no change never become
+    /// current, so neither reconciles nor advances the pool's publication
+    /// generation.
+    fn reconcile_unix_backend_pool(&self, published: &GatewayConfig) {
+        self.unix_backend_pool
+            .retain_live_targets(&collect_live_unix_target_identities(published));
+    }
+
     /// Terminal drain of transport pools that own kernel objects the graceful
     /// shutdown must release deterministically (issue #3731).
     ///
@@ -10336,6 +10359,10 @@ impl ProxyState {
                 &published.plugin_cache,
                 &published.config,
             );
+            // Initial full build: nothing should be pooled yet, but this epoch
+            // is now current, so it owns the generation advance like any other
+            // publication (issue #3764).
+            self.reconcile_unix_backend_pool(&published.config);
 
             // DNS warmup for all hostnames in the new config
             let mut hostnames: Vec<(String, Option<String>, Option<u64>)> = new_config
@@ -10576,6 +10603,26 @@ impl ProxyState {
             &published.config,
         );
 
+        // --- UnixBackendConnectionPool: retire withdrawn/changed Unix targets ---
+        //
+        // `ProxyState` (and therefore this pool) outlives a config swap, so a
+        // withdrawn `mesh.unix_socket` target would otherwise leave reusable
+        // carriers behind. This runs on EVERY published epoch — including the
+        // mesh-only / MMDB-only / projected-route republication that returns
+        // early below with no `ConfigDelta` — because a mesh slice apply is
+        // precisely how a Sidecar ingress listener is withdrawn or re-pointed.
+        // Exact tuple equality on `(namespace, proxy id, upstream id,
+        // configured path, wire protocol)` — never substring or prefix
+        // matching, which on a security-sensitive retirement both under- and
+        // over-retires. One pass per publication, never per request.
+        //
+        // The pass also advances the pool's publication generation, which is
+        // what reaches the carriers it CANNOT see: an HTTP/1.1 lease that is
+        // checked out for an in-flight exchange is deliberately absent from the
+        // idle map, and its check-in is fenced against the generation it was
+        // leased under (issue #3764).
+        self.reconcile_unix_backend_pool(&published.config);
+
         // Wake external config watchers (Gateway API listener lifecycle) on the
         // incremental path too — an add/update/delete of a port-scoped route
         // arrives here, not through the full-rebuild branch.
@@ -10591,25 +10638,6 @@ impl ProxyState {
             return ConfigApplyOutcome::Applied;
         };
         let proxy_plugin_rebuild_count = proxy_plugin_rebuild_count.get();
-
-        // --- UnixBackendConnectionPool: retire withdrawn/changed Unix targets ---
-        //
-        // `ProxyState` (and therefore this pool) outlives a config swap, so a
-        // withdrawn `mesh.unix_socket` target would otherwise leave reusable
-        // carriers behind. Rebuild the exact set of identities the NEWLY
-        // PUBLISHED config declares and retire everything else. Exact tuple
-        // equality on `(namespace, proxy id, upstream id, configured path, wire
-        // protocol)` — never substring or prefix matching, which on a
-        // security-sensitive retirement both under- and over-retires. One pass
-        // per publication, never per request.
-        //
-        // The pass also advances the pool's publication generation, which is
-        // what reaches the carriers it CANNOT see: an HTTP/1.1 lease that is
-        // checked out for an in-flight exchange is deliberately absent from the
-        // idle map, and its check-in is fenced against the generation it was
-        // leased under (issue #3764).
-        self.unix_backend_pool
-            .retain_live_targets(&collect_live_unix_target_identities(&new_config));
 
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
@@ -11136,9 +11164,16 @@ impl ProxyState {
         );
 
         // `apply_incremental` is a distinct publication path used by database
-        // and CP/DP deltas. Wake socket reconciliation here as well as in the
-        // full-snapshot path; otherwise a newly added/removed listener waits for
-        // the slow supervision tick despite its config already being live.
+        // and CP/DP deltas, so it needs the Unix pool reconciliation explicitly
+        // — a target withdrawn by a delta must not leave a reusable carrier
+        // behind just because it never travelled through `update_config`
+        // (issue #3764). Before the no-delta early return below, for the same
+        // reason as on the full path.
+        self.reconcile_unix_backend_pool(&published.config);
+
+        // Wake socket reconciliation here as well as in the full-snapshot path;
+        // otherwise a newly added/removed listener waits for the slow
+        // supervision tick despite its config already being live.
         self.bump_config_revision();
 
         let Some(delta) = applied_delta else {

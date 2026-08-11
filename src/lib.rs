@@ -2522,7 +2522,68 @@ pub mod _test_support {
         checkout: crate::proxy::unix_backend_pool::UnixH1Checkout,
         between_fence_reads: impl FnOnce(),
     ) {
-        pool.checkin_h1_fenced(checkout, between_fence_reads);
+        pool.checkin_h1_fenced(checkout, between_fence_reads, || {});
+    }
+
+    /// Drive the same production check-in with a hook that runs AFTER the
+    /// insert and after its shard guard is released, but BEFORE the fence's
+    /// post-insert cleanup (issue #3764).
+    ///
+    /// That is the visibility window a two-read fence cannot close on its own:
+    /// the entry is in the idle map, still stamped with the superseded
+    /// generation, and a concurrent checkout could otherwise pop it and adopt
+    /// it under the caller's own generation.
+    #[cfg(unix)]
+    pub fn checkin_unix_h1_with_checkout_after_insert(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        checkout: crate::proxy::unix_backend_pool::UnixH1Checkout,
+        between_fence_reads: impl FnOnce(),
+        after_insert: impl FnOnce(),
+    ) {
+        pool.checkin_h1_fenced(checkout, between_fence_reads, after_insert);
+    }
+
+    /// Drive the production h2c checkout with hooks around the point where the
+    /// shared carrier enters the map: `before_publish` can land a publication
+    /// during the dial, and `after_publish` observes the resulting window in
+    /// which a superseded carrier is visible but must not be handed out — the
+    /// h2c half of the H1 fence regression (issue #3764).
+    #[cfg(unix)]
+    pub async fn checkout_unix_h2c_with_publication_hooks(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        socket_path: &str,
+        connect_timeout_ms: u64,
+        allowed_roots: &[String],
+        allowed_uids: &[u32],
+        publish_seams: (impl FnOnce(), impl FnOnce()),
+    ) -> Result<
+        crate::proxy::mesh_mtls_pool::MeshMtlsSender,
+        crate::proxy::unix_backend::UnixBackendError,
+    > {
+        pool.checkout_h2c_fenced(
+            proxy,
+            socket_path,
+            connect_timeout_ms,
+            allowed_roots,
+            allowed_uids,
+            publish_seams,
+        )
+        .await
+    }
+
+    /// Ask the PRODUCTION shared-h2c selector whether it would hand a pooled
+    /// carrier to a request for this identity right now. Read-only; never
+    /// dials.
+    #[cfg(unix)]
+    pub fn unix_pool_shared_h2c_selector_yields_carrier(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        socket_path: &str,
+        allowed_roots: &[String],
+        allowed_uids: &[u32],
+    ) -> bool {
+        pool.shared_h2c_selector_yields_carrier(proxy, socket_path, allowed_roots, allowed_uids)
     }
 
     pub use crate::proxy::tcp_proxy::{

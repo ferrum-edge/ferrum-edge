@@ -1110,6 +1110,414 @@ async fn a_checkin_that_inserts_after_the_retirement_pass_withdraws_its_own_entr
     expect_accepts(&peer, 2, "the next request dials fresh").await;
 }
 
+/// Build the live-target set for `proxy` over `socket` as an h2c declaration.
+fn live_h2c_set(
+    proxy: &Proxy,
+    socket: &Path,
+) -> std::collections::HashSet<ferrum_edge::proxy::unix_backend_pool::UnixTargetIdentity> {
+    use ferrum_edge::proxy::unix_backend_pool::{UnixTargetIdentity, UnixWireProtocol};
+
+    let mut live = std::collections::HashSet::new();
+    live.insert(UnixTargetIdentity {
+        namespace: proxy.namespace.clone(),
+        proxy_id: proxy.id.clone(),
+        upstream_id: proxy.upstream_id.clone(),
+        configured_path: socket.to_str().expect("utf-8").to_string(),
+        protocol: UnixWireProtocol::H2c,
+    });
+    live
+}
+
+/// THE #3764 round-3 blocker. A two-read check-in fence still makes the
+/// old-generation entry VISIBLE between its insert and its own cleanup. A
+/// checkout that lands in exactly that window used to pop it and hand it out
+/// under the caller's generation — laundering a carrier out of a superseded
+/// incarnation into a new request.
+///
+/// Driven through the production check-in's own seams: the publication lands in
+/// the pre-insert window, and the checkout runs after the insert (with the
+/// shard guard already released) and before the fence's cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkout_in_the_post_insert_window_refuses_the_stale_carrier() {
+    use ferrum_edge::_test_support::checkin_unix_h1_with_checkout_after_insert;
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-visibility-window");
+
+    let inflight = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+
+    let publishing = Arc::clone(&pool);
+    let publish_proxy = proxy.clone();
+    let publish_socket = socket.clone();
+    let racing = Arc::clone(&pool);
+    let race_proxy = proxy.clone();
+    let race_socket = socket.clone();
+    let race_roots = roots(&root);
+    let observed_reuse = Arc::new(AtomicUsize::new(usize::MAX));
+    let observed_in_hook = Arc::clone(&observed_reuse);
+
+    checkin_unix_h1_with_checkout_after_insert(
+        &pool,
+        inflight,
+        move || {
+            // A publication lands in the pre-insert window. The identity STAYS
+            // declared, so the pass neither removes this key nor tombstones it:
+            // the only thing standing between the racing checkout and a
+            // superseded carrier is the entry's own publication token.
+            publishing.retain_live_targets(&live_http1_set(&publish_proxy, &publish_socket));
+        },
+        move || {
+            // The entry is in the idle map right now, still stamped with the
+            // superseded generation, and the fence's cleanup has not run.
+            let taken = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(racing.checkout_h1(
+                    &race_proxy,
+                    race_socket.to_str().expect("utf-8"),
+                    race_proxy.backend_connect_timeout_ms,
+                    &race_roots,
+                    &[],
+                ))
+            })
+            .expect("a checkout in the visibility window still succeeds, by dialing");
+            observed_in_hook.store(usize::from(taken.reused()), Ordering::SeqCst);
+        },
+    );
+
+    assert_eq!(
+        observed_reuse.load(Ordering::SeqCst),
+        0,
+        "a checkout inside the after-insert/before-cleanup window must refuse the \
+         superseded carrier instead of adopting it under its own generation"
+    );
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "nothing from the superseded generation may be left pooled"
+    );
+    assert!(
+        pool.stats().withdrawal_fenced_checkins >= 1,
+        "the refusal must be attributed to the fence"
+    );
+    expect_accepts(&peer, 2, "the racing request had to dial its own connection").await;
+}
+
+/// The exact-entry removal id still matters: the losing side of the fence must
+/// withdraw ITS entry and never a newer sibling pooled for the same key while
+/// it was racing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_losing_cleanup_withdraws_only_its_own_entry() {
+    use ferrum_edge::_test_support::checkin_unix_h1_with_checkout_after_insert;
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-sibling-entry");
+
+    let inflight = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+
+    let publishing = Arc::clone(&pool);
+    let publish_proxy = proxy.clone();
+    let publish_socket = socket.clone();
+    let sibling_pool = Arc::clone(&pool);
+    let sibling_proxy = proxy.clone();
+    let sibling_socket = socket.clone();
+    let sibling_roots = roots(&root);
+
+    checkin_unix_h1_with_checkout_after_insert(
+        &pool,
+        inflight,
+        move || {
+            publishing.retain_live_targets(&live_http1_set(&publish_proxy, &publish_socket));
+        },
+        move || {
+            // A sibling carrier for the SAME key, dialed and pooled under the
+            // CURRENT generation while the fenced entry is still visible.
+            // `checkout_fresh_h1` bypasses the idle set, so this does not
+            // consume the entry the cleanup is about to look for.
+            let fresh = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(sibling_pool.checkout_fresh_h1(
+                    &sibling_proxy,
+                    sibling_socket.to_str().expect("utf-8"),
+                    sibling_proxy.backend_connect_timeout_ms,
+                    &sibling_roots,
+                    &[],
+                ))
+            })
+            .expect("a fresh dial for the same key");
+            sibling_pool.checkin_h1(fresh);
+        },
+    );
+
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        1,
+        "the fence must withdraw exactly its own entry, leaving the newer sibling"
+    );
+    let reused = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    assert!(
+        reused.reused(),
+        "the sibling carrier was pooled under the current generation and stays reusable"
+    );
+    expect_accepts(&peer, 2, "only the fenced entry's dial and the sibling's").await;
+}
+
+/// A publication that does NOT withdraw an identity must leave its idle
+/// carriers reusable — the entry token is advanced by the pass, not discarded.
+/// Without that, every unrelated reload would empty the whole pool.
+#[tokio::test]
+async fn a_publication_that_keeps_an_identity_preserves_its_idle_carrier() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-retained-carrier");
+
+    let lease = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    pool.checkin_h1(lease);
+
+    // Three unrelated publications, each declaring this identity.
+    for _ in 0..3 {
+        pool.retain_live_targets(&live_http1_set(&proxy, &socket));
+    }
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        1,
+        "a continuously-live identity keeps its idle carrier across publications"
+    );
+
+    let reused = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    assert!(
+        reused.reused(),
+        "the retained carrier must still be handed out after the publications"
+    );
+    expect_accepts(&peer, 1, "no publication may force a redial here").await;
+}
+
+/// A request routed by a SUPERSEDED request epoch can still dial a withdrawn
+/// target, and its lease is bound to the CURRENT generation — so neither half
+/// of the generation fence sees anything wrong with it. The withdrawal
+/// tombstone is what refuses it.
+#[tokio::test]
+async fn a_checkin_for_a_withdrawn_identity_is_refused_after_the_withdrawal() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-tombstone");
+
+    // Something is pooled for this identity when the withdrawal lands, so the
+    // retirement pass can see the key and mark it.
+    let lease = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    pool.checkin_h1(lease);
+    pool.retain_live_targets(&std::collections::HashSet::new());
+    assert_eq!(pool.stats().idle_h1_connections, 0);
+
+    // A late request from the superseded epoch: dialed AFTER the withdrawal, so
+    // its lease carries the current generation.
+    let late = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("a superseded-epoch request may still dial");
+    assert_eq!(
+        late.generation(),
+        pool.publication_generation(),
+        "this lease is NOT fenced by generation — the tombstone is the only guard"
+    );
+    pool.checkin_h1(late);
+
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "an identity the published config no longer declares must retain no \
+         reusable carrier, even from a dial that started after the withdrawal"
+    );
+    expect_accepts(&peer, 2, "two dials, neither of them pooled").await;
+}
+
+/// The h2c half of the same tombstone rule: a shared carrier established for a
+/// withdrawn identity serves the RPC it was dialed for and nothing after it.
+#[tokio::test]
+async fn an_h2c_carrier_dialed_for_a_withdrawn_identity_is_not_published() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = SettingsThenClosePeer::bind(&socket, std::time::Duration::from_secs(30));
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-h2c-tombstone");
+
+    let sender = pool
+        .checkout_h2c(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("h2c checkout");
+    drop(sender);
+    assert_eq!(pool.stats().active_h2c_connections, 1);
+
+    pool.retain_live_targets(&std::collections::HashSet::new());
+    assert_eq!(pool.stats().active_h2c_connections, 0);
+
+    let late = pool
+        .checkout_h2c(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("a superseded-epoch RPC may still dial");
+    drop(late);
+    assert_eq!(
+        pool.stats().active_h2c_connections,
+        0,
+        "a withdrawn h2c identity must retain nothing multiplexable"
+    );
+}
+
+/// The h2c equivalent of the H1 visibility window: a publication lands during
+/// the dial, the carrier is published carrying the superseded token, and the
+/// PRODUCTION selector must refuse it while it is still visible.
+#[tokio::test]
+async fn the_h2c_selector_refuses_a_carrier_published_under_a_superseded_generation() {
+    use ferrum_edge::_test_support::{
+        checkout_unix_h2c_with_publication_hooks, unix_pool_shared_h2c_selector_yields_carrier,
+    };
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = SettingsThenClosePeer::bind(&socket, std::time::Duration::from_secs(30));
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-h2c-visibility-window");
+
+    let publishing = Arc::clone(&pool);
+    let publish_proxy = proxy.clone();
+    let publish_socket = socket.clone();
+    let observing = Arc::clone(&pool);
+    let observe_proxy = proxy.clone();
+    let observe_socket = socket.clone();
+    let observe_roots = roots(&root);
+    let visible_but_refused = Arc::new(AtomicUsize::new(usize::MAX));
+    let observed_in_hook = Arc::clone(&visible_but_refused);
+
+    let sender = checkout_unix_h2c_with_publication_hooks(
+        &pool,
+        &proxy,
+        socket.to_str().expect("utf-8"),
+        proxy.backend_connect_timeout_ms,
+        &roots(&root),
+        &[],
+        (
+            move || {
+                // A publication lands during the dial. The identity stays
+                // declared, so nothing is tombstoned and — because nothing is
+                // pooled for this key yet — there is no entry to re-stamp.
+                publishing.retain_live_targets(&live_h2c_set(&publish_proxy, &publish_socket));
+            },
+            move || {
+                // The carrier IS in the shared map at this instant.
+                let visible = observing.stats().active_h2c_connections;
+                let yielded = unix_pool_shared_h2c_selector_yields_carrier(
+                    &observing,
+                    &observe_proxy,
+                    observe_socket.to_str().expect("utf-8"),
+                    &observe_roots,
+                    &[],
+                );
+                observed_in_hook.store(usize::from(visible == 1 && !yielded), Ordering::SeqCst);
+            },
+        ),
+    )
+    .await
+    .expect("h2c checkout still returns the sender it dialed");
+    drop(sender);
+
+    assert_eq!(
+        visible_but_refused.load(Ordering::SeqCst),
+        1,
+        "the carrier is visible in the shared map but the production selector must \
+         refuse to multiplex a new RPC onto a superseded-generation carrier"
+    );
+    assert_eq!(
+        pool.stats().active_h2c_connections,
+        0,
+        "and the fence's cleanup removes it"
+    );
+}
+
 /// A protocol flip on the SAME path is a different identity, so the previous
 /// carrier must be retired by publication rather than silently kept alive.
 #[tokio::test]

@@ -22,10 +22,21 @@
 //!
 //! The pool is owned by `ProxyState`, which SURVIVES a config reload (the
 //! config itself is swapped through an `ArcSwap`), so publication has to retire
-//! withdrawn carriers explicitly. `ProxyState::update_config` calls
-//! [`UnixBackendConnectionPool::retain_live_targets`] with the exact set of
-//! `mesh.unix_socket` target identities the newly published config declares:
-//! every pooled carrier whose
+//! withdrawn carriers explicitly.
+//!
+//! EVERY successfully published request epoch reconciles the pool through
+//! [`UnixBackendConnectionPool::retain_live_targets`], with the exact set of
+//! `mesh.unix_socket` target identities THE CONFIG THAT WAS ACTUALLY PUBLISHED
+//! declares. That is all three publication paths — `ProxyState::update_config`'s
+//! initial full rebuild, its incremental delta branch, and
+//! `ProxyState::apply_incremental`'s separate database/CP-DP path — and the
+//! call happens immediately after the epoch swap, BEFORE any early return for a
+//! delta-free (mesh-only / MMDB-only / projected-route-only) republication. A
+//! candidate that was REJECTED, and one the epoch swap reported as genuinely
+//! unchanged (`Ok(None)`, which never becomes current), do not reconcile and do
+//! not advance the generation.
+//!
+//! Every pooled carrier whose
 //! `(namespace, proxy id, upstream id, configured path, wire protocol)` tuple is
 //! not in that set is retired before it can serve another request. The
 //! comparison is exact tuple equality — there is no substring, prefix, or
@@ -50,38 +61,99 @@
 //! the same inode would stop that late check-in from repopulating the idle set
 //! under a config-declared identity that no longer exists.
 //!
-//! Every retirement therefore also bumps a monotonic PUBLICATION GENERATION
-//! (`retain_live_targets`, `force_drain_all`, and hence `shutdown_drain`), and
-//! every lease records the generation that was current when it was checked out.
-//! A check-in is admitted only if the generation is UNCHANGED, which is
-//! strictly stronger than a membership test — it needs no live-set lookup, no
-//! per-request identity construction, and no allocation, just one atomic load —
-//! and it closes the same-key ABA hole a membership test leaves open: a target
-//! that is withdrawn and re-added under the exact same
-//! `(namespace, proxy id, upstream id, configured path, protocol)` tuple is a
-//! NEW incarnation, and a lease from the previous one must not re-enter it. The
-//! cost is that a lease outstanding across an unrelated publication is retired
-//! rather than reused — one connection per in-flight exchange per publication,
-//! paid off the hot path.
+//! Every retirement bumps a monotonic PUBLICATION GENERATION
+//! (`retain_live_targets`, `force_drain_all`, and hence `shutdown_drain`)
+//! BEFORE its retirement pass runs. Three rules hang off that one counter, and
+//! together they make a carrier NON-LAUNDERABLE: there is no instant, however
+//! brief, at which a request can be handed a carrier that a publication has
+//! already superseded.
 //!
-//! A generation test evaluated once would still be racy: a check-in can read a
-//! current generation immediately BEFORE publication bumps it and insert
-//! immediately AFTER the retirement pass has already scanned that shard. The
-//! fence is therefore evaluated TWICE, around the insert, and publication
-//! orders its own two steps to match:
+//! 1. **The lease token.** Every lease records the generation current when it
+//!    was acquired, and a check-in is refused unless that is still the current
+//!    generation. This is strictly stronger than re-testing set membership — it
+//!    needs no live-set lookup, no per-request identity construction and no
+//!    allocation, just one atomic load — and it closes same-key ABA: a target
+//!    withdrawn and re-added under the exact same tuple is a NEW incarnation,
+//!    and a lease from the previous one must not re-enter it. The cost is that
+//!    a lease outstanding across ANY publication is conservatively retired
+//!    rather than reused — one connection per in-flight exchange per
+//!    publication, paid off the hot path.
+//! 2. **The entry token.** Every idle H1 entry and every shared h2c carrier
+//!    also carries the generation it was PUBLISHED INTO THE MAP under, and a
+//!    checkout refuses any entry whose token is not the current generation,
+//!    reading both under the same shard guard. A two-read check-in fence alone
+//!    was NOT enough: it makes an old-generation entry briefly VISIBLE between
+//!    its insert and its withdrawal, and a concurrent checkout could pop it in
+//!    that window and re-stamp it with the caller's own generation — laundering
+//!    a carrier out of a withdrawn incarnation into a new request. With the
+//!    token on the entry, that pop refuses instead.
 //!
-//! 1. publication bumps the generation, THEN retires;
-//! 2. a check-in reads the generation, inserts a UNIQUELY IDENTIFIED entry,
-//!    releases the shard, and re-reads the generation. On a change it withdraws
-//!    exactly the entry it inserted.
+//!    So that an unrelated publication does not throw away every idle carrier
+//!    in the pool, `retain_live_targets` ADVANCES the token of each retained
+//!    entry to the new generation while it holds that entry's shard: an entry
+//!    the pass itself observed under a still-declared identity is, by
+//!    construction, a continuously-live carrier. A token can never run ahead of
+//!    the counter, so a lost update between two concurrent passes only ever
+//!    refuses reuse.
+//! 3. **The withdrawal tombstone.** A key the pass finds ABSENT from the live
+//!    set keeps its (now emptied) slot, marked withdrawn, and a check-in into a
+//!    withdrawn slot is refused. This is what stops a request still routed by a
+//!    SUPERSEDED request epoch — which can legitimately dial a withdrawn target
+//!    long after the epoch swap, and therefore holds a lease bound to the
+//!    CURRENT generation — from pooling a reusable carrier under an identity
+//!    the published config no longer declares. It is read through the same
+//!    single per-key map access the insert already performs, so it adds no
+//!    lookup, no allocation and no lock to the hot path. A later publication
+//!    that declares the identity again clears the mark, leaving the slot empty:
+//!    the re-added incarnation starts from a freshly admitted dial.
 //!
-//! Either the insert is visible to the retirement pass (which removes it), or
-//! the retirement pass released that shard's lock before the insert acquired
-//! it — and that release/acquire pair orders the generation bump before the
-//! re-read, so the check-in withdraws its own entry. There is no interleaving
-//! in which a carrier survives under a retired identity. The same two-step
-//! fence guards the h2c publish at the end of `checkout_h2c`, which likewise
-//! inserts into a shared map after a dial that can straddle a publication.
+//! ### The interleavings
+//!
+//! Publication is ordered "bump, THEN retire"; a check-in reads the generation,
+//! inserts a UNIQUELY IDENTIFIED entry, releases the shard, and re-reads.
+//!
+//! * *Publication sees the insert.* The retirement pass finds the entry: it
+//!   removes it (withdrawn identity) or advances its token (live identity).
+//! * *Publication completes before the insert.* The check-in's post-insert
+//!   re-read observes the bump — the shard release/acquire pair orders it — and
+//!   withdraws exactly the entry it inserted, by id, so a losing cleanup can
+//!   never delete a newer sibling carrier for the same key.
+//! * *A checkout races that window.* The entry is visible but still carries the
+//!   OLD token, and the checkout compares the token against the generation it
+//!   reads under the same shard guard. It refuses and drops it; it cannot be
+//!   re-stamped into a new request.
+//! * *Same-key withdraw/re-add ABA.* Rule 1 keeps the outstanding lease out
+//!   (its token is two generations stale). Rule 3 keeps a stale-epoch dial's
+//!   late check-in out for as long as the identity is withdrawn, and the
+//!   re-add clears an EMPTY slot, so the new incarnation cannot inherit a
+//!   carrier from the old one.
+//! * *Late h2c publish.* `checkout_h2c` publishes its carrier into a shared map
+//!   after a dial that can straddle a publication, so it runs the identical
+//!   sequence: tombstone check, insert with a token, post-insert re-read,
+//!   exact-id withdrawal. `take_shared_h2c` refuses non-current tokens.
+//! * *Shutdown.* `shutdown_drain` latches the pool closed AND bumps the
+//!   generation, so a check-in that read the latch unset a moment earlier is
+//!   still refused by rule 1.
+//!
+//! ### The one residual, stated exactly
+//!
+//! The retirement pass can only tombstone keys it can SEE. If an identity is
+//! withdrawn at an instant when nothing at all is pooled for it, there is no
+//! slot to mark, and a request still routed by a superseded epoch can then dial
+//! it and pool the result under the current generation. Closing that would take
+//! a live-set membership test on the check-in path, which means constructing a
+//! `UnixTargetIdentity` (four owned strings) per exchange — a per-request
+//! allocation and lookup this pool deliberately does not pay.
+//!
+//! What that carrier is, precisely: a connection dialed AFTER the withdrawal,
+//! through the complete admission gate, against the same
+//! `(dev, ino, owner_uid)` object — re-verified on every subsequent checkout and
+//! check-in — and reachable only by a request whose key matches, i.e. by
+//! another superseded-epoch request, or by a later publication that re-declares
+//! the identical tuple over the identical socket object. It is never a carrier
+//! from the incarnation that was withdrawn: rule 1 retires every lease that
+//! spans the withdrawal, and rule 3 covers every identity that had a pooled
+//! carrier when it was withdrawn.
 //!
 //! [`UnixBackendConnectionPool::force_drain_all`] retires everything but leaves
 //! the pool usable; [`UnixBackendConnectionPool::shutdown_drain`] additionally
@@ -341,6 +413,10 @@ mod imp {
         /// withdraw EXACTLY the entry it inserted and no other — including a
         /// concurrently pooled carrier for the same key.
         id: u64,
+        /// Publication generation this entry is REUSABLE under (fence rule 2).
+        /// Set to the inserting lease's generation, and advanced by a
+        /// retirement pass that observes the entry under a still-live identity.
+        generation: AtomicU64,
         sender: UnixH1Sender,
         admitted: AdmittedUnixSocket,
         last_used_at: AtomicU64,
@@ -349,9 +425,174 @@ mod imp {
     struct SharedH2c {
         /// See [`IdleH1::id`].
         id: u64,
+        /// See [`IdleH1::generation`].
+        generation: AtomicU64,
         sender: MeshMtlsSender,
         admitted: AdmittedUnixSocket,
         last_used_at: AtomicU64,
+    }
+
+    /// The parts of a pooled entry the shared slot maintenance needs, so the
+    /// H1 and h2c maps cannot drift in how they are retired, pruned, fenced,
+    /// or withdrawn.
+    trait PooledEntry {
+        fn id(&self) -> u64;
+        fn generation(&self) -> &AtomicU64;
+        fn admitted(&self) -> &AdmittedUnixSocket;
+        fn last_used_at(&self) -> u64;
+        fn is_closed(&self) -> bool;
+    }
+
+    impl PooledEntry for IdleH1 {
+        fn id(&self) -> u64 {
+            self.id
+        }
+        fn generation(&self) -> &AtomicU64 {
+            &self.generation
+        }
+        fn admitted(&self) -> &AdmittedUnixSocket {
+            &self.admitted
+        }
+        fn last_used_at(&self) -> u64 {
+            self.last_used_at.load(Ordering::Relaxed)
+        }
+        fn is_closed(&self) -> bool {
+            self.sender.is_closed()
+        }
+    }
+
+    impl PooledEntry for SharedH2c {
+        fn id(&self) -> u64 {
+            self.id
+        }
+        fn generation(&self) -> &AtomicU64 {
+            &self.generation
+        }
+        fn admitted(&self) -> &AdmittedUnixSocket {
+            &self.admitted
+        }
+        fn last_used_at(&self) -> u64 {
+            self.last_used_at.load(Ordering::Relaxed)
+        }
+        fn is_closed(&self) -> bool {
+            self.sender.is_closed()
+        }
+    }
+
+    /// Everything one pool key owns: its carriers, plus the config-liveness
+    /// record the retirement pass leaves behind (fence rule 3).
+    struct KeySlot<T> {
+        /// Set when a publication found this key's identity ABSENT from the
+        /// live set. A withdrawn slot holds no carriers and refuses every
+        /// insert, so a request still routed by a superseded request epoch
+        /// cannot establish a reusable carrier under an identity the published
+        /// config no longer declares. Cleared by a publication that declares
+        /// the identity again — which leaves the slot EMPTY, so the re-added
+        /// incarnation starts from a freshly admitted dial.
+        withdrawn: bool,
+        entries: Vec<T>,
+    }
+
+    impl<T> Default for KeySlot<T> {
+        fn default() -> Self {
+            Self {
+                withdrawn: false,
+                entries: Vec::new(),
+            }
+        }
+    }
+
+    /// Retire, tombstone, or re-stamp every slot of one map against the newly
+    /// published live set. Returns how many carriers were retired.
+    ///
+    /// `generation` is the value the publication just bumped to. Advancing a
+    /// retained entry's token happens under the shard guard `retain` holds, so
+    /// a concurrent checkout either sees the old token (and refuses) or the new
+    /// one (and the entry really was observed live by this pass).
+    fn retain_live_slots<T: PooledEntry>(
+        map: &DashMap<UnixPoolKey, KeySlot<T>>,
+        live: &std::collections::HashSet<UnixTargetIdentity>,
+        generation: u64,
+    ) -> u64 {
+        let mut retired = 0u64;
+        map.retain(|key, slot| {
+            if live.contains(&key.target_identity()) {
+                slot.withdrawn = false;
+                for entry in &slot.entries {
+                    entry.generation().store(generation, Ordering::Release);
+                }
+            } else {
+                retired = retired.saturating_add(slot.entries.len() as u64);
+                slot.entries.clear();
+                slot.withdrawn = true;
+            }
+            true
+        });
+        retired
+    }
+
+    /// Amortized sweep of one map: drop closed, expired, and
+    /// identity-changed carriers, then reclaim slots that can no longer be
+    /// reached. Returns how many carriers were evicted.
+    ///
+    /// A slot is kept when it still holds a carrier, and a WITHDRAWN slot is
+    /// kept for as long as a check-in could still reach it (see
+    /// [`tombstone_still_reachable`]) — that mark is a security decision, not a
+    /// cache entry, so it is not dropped merely because the slot is empty.
+    fn prune_slots<T: PooledEntry>(
+        map: &DashMap<UnixPoolKey, KeySlot<T>>,
+        idle_timeout: u64,
+        now: u64,
+    ) -> u64 {
+        let mut evicted = 0u64;
+        map.retain(|key, slot| {
+            let before = slot.entries.len();
+            slot.entries.retain(|entry| {
+                !entry.is_closed()
+                    && !entry_idle_expired(entry.last_used_at(), idle_timeout, now)
+                    && entry.admitted().still_names_checked_object().unwrap_or(false)
+            });
+            evicted = evicted.saturating_add(before.saturating_sub(slot.entries.len()) as u64);
+            if !slot.entries.is_empty() {
+                return true;
+            }
+            slot.withdrawn && tombstone_still_reachable(key)
+        });
+        evicted
+    }
+
+    /// Remove EXACTLY entry `entry_id` under `key`, if it is still there.
+    ///
+    /// Used only by the losing side of the check-in fence, so it may find
+    /// nothing (the retirement pass already emptied the slot). Matching on the
+    /// process-unique id is what keeps a losing cleanup from deleting a NEWER
+    /// sibling carrier pooled under the same key.
+    fn withdraw_slot_entry<T: PooledEntry>(
+        map: &DashMap<UnixPoolKey, KeySlot<T>>,
+        key: &UnixPoolKey,
+        entry_id: u64,
+    ) -> bool {
+        let Some(mut slot) = map.get_mut(key) else {
+            return false;
+        };
+        let before = slot.entries.len();
+        slot.entries.retain(|entry| entry.id() != entry_id);
+        slot.entries.len() != before
+    }
+
+    /// Whether a withdrawn (tombstoned) slot can still be reached by any future
+    /// check-in, and therefore has to be kept.
+    ///
+    /// A pool key pins `(dev, ino)`, and a check-in re-verifies exactly that
+    /// through `still_names_checked_object` before inserting. Once the path no
+    /// longer names the admitted object, no lease can ever insert under this
+    /// key again, so the tombstone is dead weight and the periodic sweep drops
+    /// it. This is what bounds tombstone growth against socket churn.
+    fn tombstone_still_reachable(key: &UnixPoolKey) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        std::fs::metadata(key.path())
+            .is_ok_and(|meta| meta.dev() == key.dev && meta.ino() == key.ino)
     }
 
     /// Bounded, lock-free-on-hit Unix backend connection manager.
@@ -359,9 +600,9 @@ mod imp {
         pool_config: PoolConfig,
         /// Idle HTTP/1.1 senders per identity. A checked-out sender is NOT in
         /// this map, which is what makes the H1 lease exclusive.
-        h1_idle: DashMap<UnixPoolKey, Vec<IdleH1>>,
+        h1_idle: DashMap<UnixPoolKey, KeySlot<IdleH1>>,
         /// Shared multiplexable h2c carriers per identity.
-        h2c_carriers: DashMap<UnixPoolKey, Vec<SharedH2c>>,
+        h2c_carriers: DashMap<UnixPoolKey, KeySlot<SharedH2c>>,
         /// Coalesces concurrent h2c misses for one identity.
         h2c_creation_locks: DashMap<UnixPoolKey, Arc<Mutex<()>>>,
         /// Last admitted `(dev, ino, owner_uid)` observed for a canonical path.
@@ -448,12 +689,12 @@ mod imp {
                 idle_h1_connections: self
                     .h1_idle
                     .iter()
-                    .map(|entry| entry.value().len() as u64)
+                    .map(|entry| entry.value().entries.len() as u64)
                     .sum(),
                 active_h2c_connections: self
                     .h2c_carriers
                     .iter()
-                    .map(|entry| entry.value().len() as u64)
+                    .map(|entry| entry.value().entries.len() as u64)
                     .sum(),
                 withdrawal_fenced_checkins: fenced,
             }
@@ -467,18 +708,35 @@ mod imp {
             self.publication_generation.load(Ordering::Acquire)
         }
 
-        /// Invalidate every OUTSTANDING lease by advancing the publication
-        /// generation. Called BEFORE each retirement pass, never on the
-        /// request path.
+        /// Invalidate every OUTSTANDING lease and every pooled entry token by
+        /// advancing the publication generation. Called BEFORE each retirement
+        /// pass, never on the request path. Returns the new generation, which
+        /// is the value the pass re-stamps retained live entries with.
         #[inline]
-        fn advance_publication_generation(&self) {
-            self.publication_generation.fetch_add(1, Ordering::AcqRel);
+        fn advance_publication_generation(&self) -> u64 {
+            self.publication_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1)
         }
 
         #[inline]
         fn record_withdrawal_fenced_checkin(&self) {
             self.withdrawal_fenced_checkins
                 .fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Attribute `count` carriers the fence refused to reuse or retain.
+        /// Fixed cardinality: one counter and one pool-kind eviction metric,
+        /// never a per-target label.
+        #[inline]
+        fn record_fenced_carriers(&self, count: u64) {
+            if count == 0 {
+                return;
+            }
+            self.withdrawal_fenced_checkins
+                .fetch_add(count, Ordering::Relaxed);
+            crate::runtime_metrics::global_ref()
+                .record_pool_evictions(PoolKind::UnixBackend, count);
         }
 
         /// Drop every pooled connection, leaving the pool usable.
@@ -493,6 +751,12 @@ mod imp {
         /// FIRST, so every lease outstanding right now is already bound to a
         /// superseded generation and its check-in is fenced out, whether it
         /// lands before or after the clear.
+        ///
+        /// This also drops the withdrawal tombstones, which is why the only
+        /// production caller is `shutdown_drain`: it latches the pool closed in
+        /// the same breath, so nothing can be pooled afterwards at all. A
+        /// config publication must use `retain_live_targets`, which preserves
+        /// them.
         pub fn force_drain_all(&self) {
             self.advance_publication_generation();
             self.h1_idle.clear();
@@ -524,48 +788,49 @@ mod imp {
         /// Retire every pooled carrier whose config-declared identity is not in
         /// `live`.
         ///
-        /// Called from `ProxyState::update_config` on every publication that
-        /// carries a resource delta. `live` is built from the NEWLY PUBLISHED
-        /// config, so a withdrawn target, a deleted proxy or upstream, a
-        /// re-bound namespace/upstream, a changed `mesh.unix_socket` path, and
-        /// an `http` ⇄ `http2` protocol flip all fall out of the set and are
-        /// retired here — before the next request can be handed a carrier that
-        /// belongs to configuration that no longer exists.
+        /// Called from EVERY successful publication on both of `ProxyState`'s
+        /// swap paths (`update_config`'s full and incremental branches, and
+        /// `apply_incremental`), against the config that publication actually
+        /// made current. `live` is built from that config, so a withdrawn
+        /// target, a deleted proxy or upstream, a re-bound namespace/upstream,
+        /// a changed `mesh.unix_socket` path, and an `http` ⇄ `http2` protocol
+        /// flip all fall out of the set and are retired here — before the next
+        /// request can be handed a carrier that belongs to configuration that
+        /// no longer exists.
         ///
         /// Exact tuple equality on [`UnixTargetIdentity`]; never a substring or
         /// prefix test. One pass over the idle maps per publication, not per
         /// request.
         ///
-        /// The idle maps are only HALF the retirement. A checked-out HTTP/1.1
-        /// lease is deliberately absent from `h1_idle`, so this pass cannot see
-        /// it and a comment claiming such an exchange "fails its own check-in
-        /// revalidation" would be false — nothing about a still-open socket
-        /// that still names the same inode expresses a config withdrawal. The
-        /// generation bump below is the other half: it fences every lease that
-        /// was outstanding at this instant out of the pool for good, including
-        /// one whose exact identity is withdrawn and then re-added. It happens
-        /// BEFORE the retirement pass so that a check-in racing this call
-        /// either has its entry removed by the pass or observes the new
-        /// generation on its post-insert re-read and withdraws its own entry.
+        /// The idle maps are only PART of the retirement. A checked-out
+        /// HTTP/1.1 lease is deliberately absent from `h1_idle`, so this pass
+        /// cannot see it and a comment claiming such an exchange "fails its own
+        /// check-in revalidation" would be false — nothing about a still-open
+        /// socket that still names the same inode expresses a config
+        /// withdrawal. The generation bump below is what reaches it, and it
+        /// happens BEFORE the pass so that a check-in racing this call either
+        /// has its entry removed by the pass or observes the new generation on
+        /// its post-insert re-read and withdraws exactly its own entry.
+        ///
+        /// What the pass does per key is therefore three-way, not two-way:
+        ///
+        /// * identity still live → keep the slot and ADVANCE each retained
+        ///   entry's token to the new generation under the shard guard. These
+        ///   are continuously-live idle carriers, observed by this very pass,
+        ///   and they stay reusable — an unrelated publication must not empty
+        ///   the pool.
+        /// * identity withdrawn → drop the carriers and mark the slot
+        ///   withdrawn. The mark survives, because a request routed by a
+        ///   superseded epoch can still dial this target afterwards and would
+        ///   otherwise pool a reusable carrier under an identity the published
+        ///   config does not declare.
+        /// * either way the slot itself is retained here; the periodic sweep
+        ///   reclaims empty live slots and tombstones whose socket object no
+        ///   longer exists.
         pub fn retain_live_targets(&self, live: &std::collections::HashSet<UnixTargetIdentity>) {
-            self.advance_publication_generation();
-            let mut retired = 0u64;
-            self.h1_idle.retain(|key, entries| {
-                if live.contains(&key.target_identity()) {
-                    true
-                } else {
-                    retired = retired.saturating_add(entries.len() as u64);
-                    false
-                }
-            });
-            self.h2c_carriers.retain(|key, entries| {
-                if live.contains(&key.target_identity()) {
-                    true
-                } else {
-                    retired = retired.saturating_add(entries.len() as u64);
-                    false
-                }
-            });
+            let generation = self.advance_publication_generation();
+            let retired = retain_live_slots(&self.h1_idle, live, generation)
+                .saturating_add(retain_live_slots(&self.h2c_carriers, live, generation));
             self.h2c_creation_locks
                 .retain(|key, _| live.contains(&key.target_identity()));
             // `path_identities` is the replacement memo, not a connection
@@ -577,10 +842,14 @@ mod imp {
             let mut retained_paths: std::collections::HashSet<PathBuf> =
                 std::collections::HashSet::new();
             for entry in self.h1_idle.iter() {
-                retained_paths.insert(entry.key().path().to_path_buf());
+                if !entry.value().entries.is_empty() {
+                    retained_paths.insert(entry.key().path().to_path_buf());
+                }
             }
             for entry in self.h2c_carriers.iter() {
-                retained_paths.insert(entry.key().path().to_path_buf());
+                if !entry.value().entries.is_empty() {
+                    retained_paths.insert(entry.key().path().to_path_buf());
+                }
             }
             self.path_identities
                 .retain(|path, _| retained_paths.contains(path));
@@ -604,20 +873,27 @@ mod imp {
         /// outstanding lease admitted against the replaced object fails its own
         /// `still_names_checked_object` re-check at check-in, which is a real
         /// filesystem observation rather than a claim about config.
+        ///
+        /// It drops the carriers but PRESERVES a withdrawal tombstone: this is
+        /// a statement about the filesystem, not about config, and discarding
+        /// the config verdict here would let a stale-epoch check-in re-create a
+        /// reusable slot under a withdrawn identity.
         pub fn retire_socket_path(&self, path: &Path) {
             let mut retired = 0u64;
-            self.h1_idle.retain(|key, entries| {
+            self.h1_idle.retain(|key, slot| {
                 if key.path() == path {
-                    retired = retired.saturating_add(entries.len() as u64);
-                    false
+                    retired = retired.saturating_add(slot.entries.len() as u64);
+                    slot.entries.clear();
+                    slot.withdrawn
                 } else {
                     true
                 }
             });
-            self.h2c_carriers.retain(|key, entries| {
+            self.h2c_carriers.retain(|key, slot| {
                 if key.path() == path {
-                    retired = retired.saturating_add(entries.len() as u64);
-                    false
+                    retired = retired.saturating_add(slot.entries.len() as u64);
+                    slot.entries.clear();
+                    slot.withdrawn
                 } else {
                     true
                 }
@@ -685,43 +961,22 @@ mod imp {
             }
 
             let idle_timeout = self.pool_config.idle_timeout_seconds;
-            let mut evicted = 0u64;
-            self.h1_idle.retain(|_, entries| {
-                let before = entries.len();
-                entries.retain(|entry| {
-                    !entry.sender.is_closed()
-                        && !entry_idle_expired(
-                            entry.last_used_at.load(Ordering::Relaxed),
-                            idle_timeout,
-                            now,
-                        )
-                        && entry.admitted.still_names_checked_object().unwrap_or(false)
-                });
-                evicted = evicted.saturating_add(before.saturating_sub(entries.len()) as u64);
-                !entries.is_empty()
-            });
-            self.h2c_carriers.retain(|_, entries| {
-                let before = entries.len();
-                entries.retain(|entry| {
-                    !entry.sender.is_closed()
-                        && !entry_idle_expired(
-                            entry.last_used_at.load(Ordering::Relaxed),
-                            idle_timeout,
-                            now,
-                        )
-                        && entry.admitted.still_names_checked_object().unwrap_or(false)
-                });
-                evicted = evicted.saturating_add(before.saturating_sub(entries.len()) as u64);
-                !entries.is_empty()
-            });
+            let evicted = prune_slots(&self.h1_idle, idle_timeout, now)
+                .saturating_add(prune_slots(&self.h2c_carriers, idle_timeout, now));
             if evicted > 0 {
                 crate::runtime_metrics::global_ref()
                     .record_pool_evictions(PoolKind::UnixBackend, evicted);
             }
             // Only retain locks that are still contended or still name a live
-            // carrier, so the lock map cannot grow without bound.
+            // carrier, so the lock map cannot grow without bound. A withdrawn
+            // key's slot survives as a tombstone, so ask for a CARRIER rather
+            // than for the key's presence.
             self.h2c_creation_locks.retain(|key, lock| {
-                Arc::strong_count(lock) > 1 || self.h2c_carriers.contains_key(key)
+                Arc::strong_count(lock) > 1
+                    || self
+                        .h2c_carriers
+                        .get(key)
+                        .is_some_and(|slot| !slot.entries.is_empty())
             });
         }
 
@@ -782,7 +1037,7 @@ mod imp {
             let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
             let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
 
-            if let Some(checkout) = self.take_idle_h1(&key, &admitted, proxy, generation) {
+            if let Some(checkout) = self.take_idle_h1(&key, &admitted, proxy) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(checkout);
             }
@@ -865,52 +1120,80 @@ mod imp {
             })
         }
 
+        /// Pop a reusable idle HTTP/1.1 carrier, or nothing.
+        ///
+        /// The publication generation is read HERE, under the shard guard, and
+        /// compared against each candidate entry's own token (fence rule 2).
+        /// That ordering is what makes the fence non-launderable: a publication
+        /// that has already bumped the generation is visible to this read, and
+        /// one that has not yet bumped cannot have started its retirement pass,
+        /// so an entry whose token equals the value read here was current at
+        /// the instant it was handed out. An entry from a superseded generation
+        /// is dropped rather than re-stamped with the caller's generation.
         fn take_idle_h1(
             &self,
             key: &UnixPoolKey,
             expected: &AdmittedUnixSocket,
             proxy: &Proxy,
-            generation: u64,
         ) -> Option<UnixH1Checkout> {
             let idle_timeout = self.idle_timeout_seconds(proxy);
             let now = unix_secs();
-            let mut entries = self.h1_idle.get_mut(key)?;
-            while let Some(entry) = entries.pop() {
-                if !Self::identity_intact(&entry.admitted, expected) {
-                    // The path no longer names the admitted object. Drop this
-                    // guard first, then retire everything for the path — no
-                    // request byte has been written on any of them.
-                    drop(entries);
-                    let path = expected.resolved_path().to_path_buf();
-                    self.retire_socket_path(&path);
-                    return None;
+            let mut fenced = 0u64;
+            let mut taken = None;
+            {
+                let mut slot = self.h1_idle.get_mut(key)?;
+                let generation = self.publication_generation.load(Ordering::Acquire);
+                while let Some(entry) = slot.entries.pop() {
+                    if !Self::identity_intact(&entry.admitted, expected) {
+                        // The path no longer names the admitted object. Drop
+                        // this guard first, then retire everything for the
+                        // path — no request byte has been written on any of
+                        // them.
+                        drop(slot);
+                        let path = expected.resolved_path().to_path_buf();
+                        self.retire_socket_path(&path);
+                        self.record_fenced_carriers(fenced);
+                        return None;
+                    }
+                    if entry.generation.load(Ordering::Acquire) != generation {
+                        // Published under an incarnation this pool has already
+                        // superseded — including one still sitting in the
+                        // window between a fenced check-in's insert and its own
+                        // cleanup. Never hand it out, and never launder it by
+                        // adopting the caller's generation.
+                        fenced = fenced.saturating_add(1);
+                        continue;
+                    }
+                    // `is_closed()` (not `is_ready()`) is the reuse gate.
+                    // hyper's `is_ready()` reports "the dispatcher has already
+                    // asked for the next request", which is a scheduling
+                    // artifact, not a liveness fact — a perfectly good
+                    // connection reads as not-ready until its driver task next
+                    // polls. The genuine idle keep-alive race (the peer reaped
+                    // the socket after check-in) is caught by the dispatch
+                    // path's `try_send_request` replay, which recovers the
+                    // unsent request and redials.
+                    if entry.sender.is_closed()
+                        || entry_idle_expired(
+                            entry.last_used_at.load(Ordering::Relaxed),
+                            idle_timeout,
+                            now,
+                        )
+                    {
+                        continue;
+                    }
+                    taken = Some(UnixH1Checkout {
+                        key: key.clone(),
+                        admitted: entry.admitted,
+                        reused: true,
+                        generation,
+                        sender: entry.sender,
+                    });
+                    break;
                 }
-                // `is_closed()` (not `is_ready()`) is the reuse gate. hyper's
-                // `is_ready()` reports "the dispatcher has already asked for the
-                // next request", which is a scheduling artifact, not a liveness
-                // fact — a perfectly good connection reads as not-ready until its
-                // driver task next polls. The genuine idle keep-alive race (the
-                // peer reaped the socket after check-in) is caught by the
-                // dispatch path's `try_send_request` replay, which recovers the
-                // unsent request and redials.
-                if entry.sender.is_closed()
-                    || entry_idle_expired(
-                        entry.last_used_at.load(Ordering::Relaxed),
-                        idle_timeout,
-                        now,
-                    )
-                {
-                    continue;
-                }
-                return Some(UnixH1Checkout {
-                    key: key.clone(),
-                    admitted: entry.admitted,
-                    reused: true,
-                    generation,
-                    sender: entry.sender,
-                });
             }
-            None
+            self.record_fenced_carriers(fenced);
+            taken
         }
 
         /// Return an HTTP/1.1 lease to the idle set.
@@ -925,20 +1208,25 @@ mod imp {
         /// lease is bound to a superseded publication generation is dropped
         /// instead of pooled.
         pub fn checkin_h1(&self, checkout: UnixH1Checkout) {
-            self.checkin_h1_fenced(checkout, || {});
+            self.checkin_h1_fenced(checkout, || {}, || {});
         }
 
-        /// The check-in body, with a seam for the fence's regression tests.
-        ///
-        /// `between_fence_reads` runs after the pre-insert generation check and
-        /// before the insert, which is exactly the window a publication has to
-        /// win for the post-insert half of the fence to be the thing that saves
-        /// us. Production passes an empty closure, so this monomorphizes to the
+        /// The check-in body, with the two seams the fence's regression tests
+        /// need. Production passes empty closures, so this monomorphizes to the
         /// same code with no branch and no allocation.
+        ///
+        /// * `between_fence_reads` runs after the pre-insert generation check
+        ///   and before the insert — the window a publication has to win for
+        ///   the post-insert half of the fence to be the thing that saves us.
+        /// * `after_insert` runs after the insert and after the shard guard is
+        ///   released, but before the post-insert cleanup — the window in which
+        ///   an old-generation entry is VISIBLE, and in which a concurrent
+        ///   checkout must refuse it rather than launder it.
         pub(crate) fn checkin_h1_fenced(
             &self,
             checkout: UnixH1Checkout,
             between_fence_reads: impl FnOnce(),
+            after_insert: impl FnOnce(),
         ) {
             let UnixH1Checkout {
                 key,
@@ -967,48 +1255,53 @@ mod imp {
             between_fence_reads();
             let entry_id = self.next_entry_id.fetch_add(1, Ordering::Relaxed);
             let max_idle = self.max_idle_per_key();
+            let mut refused_by_tombstone = false;
             {
-                let mut entries = self.h1_idle.entry(key.clone()).or_default();
-                if entries.len() >= max_idle {
-                    // Bound the idle set: drop the OLDEST idle connection, which
-                    // is the one most likely to have been reaped by the peer.
-                    entries.remove(0);
-                    crate::runtime_metrics::global_ref()
-                        .record_pool_eviction(PoolKind::UnixBackend);
+                let mut slot = self.h1_idle.entry(key.clone()).or_default();
+                if slot.withdrawn {
+                    // Fence rule 3. The last publication did not declare this
+                    // identity, and this lease can only exist because the
+                    // request was routed by a superseded request epoch. The
+                    // carrier is fine for the exchange it already served; it
+                    // must not become reusable.
+                    refused_by_tombstone = true;
+                } else {
+                    if slot.entries.len() >= max_idle {
+                        // Bound the idle set: drop the OLDEST idle connection,
+                        // which is the one most likely to have been reaped by
+                        // the peer.
+                        slot.entries.remove(0);
+                        crate::runtime_metrics::global_ref()
+                            .record_pool_eviction(PoolKind::UnixBackend);
+                    }
+                    slot.entries.push(IdleH1 {
+                        id: entry_id,
+                        generation: AtomicU64::new(generation),
+                        sender,
+                        admitted,
+                        last_used_at: AtomicU64::new(unix_secs()),
+                    });
                 }
-                entries.push(IdleH1 {
-                    id: entry_id,
-                    sender,
-                    admitted,
-                    last_used_at: AtomicU64::new(unix_secs()),
-                });
                 // The shard guard is released HERE, before the second fence
                 // read: the release/acquire pair on that shard is what orders a
                 // concurrent publication's generation bump ahead of the read
                 // when the retirement pass ran before this insert.
             }
+            if refused_by_tombstone {
+                self.record_withdrawal_fenced_checkin();
+                return;
+            }
+            after_insert();
             // Fence, second read. Either the publication's retirement pass saw
             // this entry and removed it, or it did not — in which case it
             // released the shard before we took it and the bump is visible now.
-            if self.publication_generation.load(Ordering::Acquire) != generation {
-                self.withdraw_idle_h1_entry(&key, entry_id);
-            }
-        }
-
-        /// Remove EXACTLY the idle entry `entry_id` under `key`, if it is still
-        /// there. Used only by the losing side of the check-in fence, so it may
-        /// find nothing (the retirement pass already removed the whole key).
-        fn withdraw_idle_h1_entry(&self, key: &UnixPoolKey, entry_id: u64) {
-            let mut withdrawn = false;
-            if let Some(mut entries) = self.h1_idle.get_mut(key) {
-                let before = entries.len();
-                entries.retain(|entry| entry.id != entry_id);
-                withdrawn = entries.len() != before;
-            }
-            self.h1_idle.remove_if(key, |_, entries| entries.is_empty());
-            if withdrawn {
-                self.record_withdrawal_fenced_checkin();
-                crate::runtime_metrics::global_ref().record_pool_eviction(PoolKind::UnixBackend);
+            // In the gap between the insert and this cleanup the entry is
+            // visible but still carries the OLD token, so a concurrent checkout
+            // refuses it (fence rule 2) rather than laundering it.
+            if self.publication_generation.load(Ordering::Acquire) != generation
+                && withdraw_slot_entry(&self.h1_idle, &key, entry_id)
+            {
+                self.record_fenced_carriers(1);
             }
         }
 
@@ -1093,6 +1386,33 @@ mod imp {
             allowed_roots: &[String],
             allowed_uids: &[u32],
         ) -> Result<MeshMtlsSender, UnixBackendError> {
+            self.checkout_h2c_fenced(
+                proxy,
+                socket_path,
+                connect_timeout_ms,
+                allowed_roots,
+                allowed_uids,
+                (|| {}, || {}),
+            )
+            .await
+        }
+
+        /// The h2c checkout body, with the same two seams
+        /// [`Self::checkin_h1_fenced`] exposes, as one `(before, after)` pair:
+        /// `before` runs after the dial and before the carrier enters the
+        /// shared map, and `after` runs once it is in the map and before the
+        /// fence's cleanup — the window in which a superseded carrier is
+        /// visible. Production passes empty closures.
+        pub(crate) async fn checkout_h2c_fenced(
+            &self,
+            proxy: &Proxy,
+            socket_path: &str,
+            connect_timeout_ms: u64,
+            allowed_roots: &[String],
+            allowed_uids: &[u32],
+            publish_seams: (impl FnOnce(), impl FnOnce()),
+        ) -> Result<MeshMtlsSender, UnixBackendError> {
+            let (before_publish, after_publish) = publish_seams;
             self.maybe_prune_idle();
             // Same fence as the H1 lease: a dial can straddle a publication, so
             // the generation is captured before admission and re-checked after
@@ -1144,19 +1464,29 @@ mod imp {
 
             let max_idle = self.max_idle_per_key();
             let entry_id = self.next_entry_id.fetch_add(1, Ordering::Relaxed);
+            let mut refused_by_tombstone = false;
+            before_publish();
             {
-                let mut entries = self.h2c_carriers.entry(key.clone()).or_default();
-                while entries.len() >= max_idle {
-                    entries.remove(0);
-                    crate::runtime_metrics::global_ref()
-                        .record_pool_eviction(PoolKind::UnixBackend);
+                let mut slot = self.h2c_carriers.entry(key.clone()).or_default();
+                if slot.withdrawn {
+                    // Fence rule 3, exactly as on the H1 check-in: this dial
+                    // can only have come from a superseded request epoch, so
+                    // its carrier serves this RPC and nothing after it.
+                    refused_by_tombstone = true;
+                } else {
+                    while slot.entries.len() >= max_idle {
+                        slot.entries.remove(0);
+                        crate::runtime_metrics::global_ref()
+                            .record_pool_eviction(PoolKind::UnixBackend);
+                    }
+                    slot.entries.push(SharedH2c {
+                        id: entry_id,
+                        generation: AtomicU64::new(generation),
+                        sender: sender.clone(),
+                        admitted,
+                        last_used_at: AtomicU64::new(unix_secs()),
+                    });
                 }
-                entries.push(SharedH2c {
-                    id: entry_id,
-                    sender: sender.clone(),
-                    admitted,
-                    last_used_at: AtomicU64::new(unix_secs()),
-                });
                 // Shard guard released before the second fence read, as in
                 // `checkin_h1_fenced`.
             }
@@ -1164,29 +1494,52 @@ mod imp {
             // authorized to make; the fence only decides whether the carrier
             // stays REUSABLE. A publication that landed during the dial retires
             // it immediately.
-            if self.publication_generation.load(Ordering::Acquire) != generation {
-                self.withdraw_h2c_entry(&key, entry_id);
+            if refused_by_tombstone {
+                self.record_withdrawal_fenced_checkin();
+                return Ok(sender);
+            }
+            after_publish();
+            if self.publication_generation.load(Ordering::Acquire) != generation
+                && withdraw_slot_entry(&self.h2c_carriers, &key, entry_id)
+            {
+                self.record_fenced_carriers(1);
             }
             Ok(sender)
         }
 
-        /// Remove EXACTLY the shared h2c carrier `entry_id` under `key`. See
-        /// [`Self::withdraw_idle_h1_entry`].
-        fn withdraw_h2c_entry(&self, key: &UnixPoolKey, entry_id: u64) {
-            let mut withdrawn = false;
-            if let Some(mut entries) = self.h2c_carriers.get_mut(key) {
-                let before = entries.len();
-                entries.retain(|entry| entry.id != entry_id);
-                withdrawn = entries.len() != before;
-            }
-            self.h2c_carriers
-                .remove_if(key, |_, entries| entries.is_empty());
-            if withdrawn {
-                self.record_withdrawal_fenced_checkin();
-                crate::runtime_metrics::global_ref().record_pool_eviction(PoolKind::UnixBackend);
-            }
+        /// Whether the PRODUCTION shared-h2c selector would hand a pooled
+        /// carrier to a request for this identity right now.
+        ///
+        /// A read-only observation of `take_shared_h2c`, the exact hot-path
+        /// predicate, so a test can inspect the after-publish window without
+        /// re-entering `checkout_h2c` (which would block on the creation lock
+        /// its caller still holds). It re-admits the path exactly as a checkout
+        /// does and never dials.
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests reach it there.
+        pub(crate) fn shared_h2c_selector_yields_carrier(
+            &self,
+            proxy: &Proxy,
+            socket_path: &str,
+            allowed_roots: &[String],
+            allowed_uids: &[u32],
+        ) -> bool {
+            let Ok(admitted) = crate::util::unix_socket::admit_socket_for_connect(
+                socket_path,
+                allowed_roots,
+                allowed_uids,
+            ) else {
+                return false;
+            };
+            let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::H2c);
+            self.take_shared_h2c(&key, &admitted, proxy).is_some()
         }
 
+        /// Pick a live shared h2c carrier for `key`, or nothing.
+        ///
+        /// Carries the same entry-token rule as [`Self::take_idle_h1`]: the
+        /// generation is read under the map guard and a carrier published under
+        /// a superseded generation is never multiplexed onto, even in the
+        /// window between a fenced publish and its own cleanup.
         fn take_shared_h2c(
             &self,
             key: &UnixPoolKey,
@@ -1198,13 +1551,15 @@ mod imp {
             let mut retire = false;
             let mut selected = None;
             {
-                let entries = self.h2c_carriers.get(key)?;
-                for entry in entries.iter() {
+                let slot = self.h2c_carriers.get(key)?;
+                let generation = self.publication_generation.load(Ordering::Acquire);
+                for entry in slot.entries.iter() {
                     if !Self::identity_intact(&entry.admitted, expected) {
                         retire = true;
                         break;
                     }
-                    if entry.sender.is_closed()
+                    if entry.generation.load(Ordering::Acquire) != generation
+                        || entry.sender.is_closed()
                         || entry_idle_expired(
                             entry.last_used_at.load(Ordering::Relaxed),
                             idle_timeout,
