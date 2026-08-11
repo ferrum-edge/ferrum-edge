@@ -394,6 +394,11 @@ pub struct AsyncMaterialSetReloadConfig {
     pub revision_tx: watch::Sender<u64>,
     pub rebuild: MaterialSetAsyncRebuildFn,
     pub max_material_bytes: usize,
+    /// Optional oneshot fired after the initial fingerprint baseline is
+    /// established (and before the loop begins accepting force/tick polls).
+    /// Tests use this as a deterministic readiness barrier; production callers
+    /// leave it `None`.
+    pub ready_tx: Option<oneshot::Sender<()>>,
 }
 
 pub type MaterialSetSourceCollectorFn =
@@ -807,6 +812,7 @@ async fn run_async_material_set_reload_loop(
         revision_tx,
         rebuild,
         max_material_bytes,
+        ready_tx,
     } = config;
 
     if sources.is_empty() {
@@ -814,6 +820,9 @@ async fn run_async_material_set_reload_loop(
             surface,
             "TLS material reload watcher has no sources; exiting"
         );
+        if let Some(ready_tx) = ready_tx {
+            let _ = ready_tx.send(());
+        }
         force_reload_registry().remove(surface);
         return;
     }
@@ -840,6 +849,13 @@ async fn run_async_material_set_reload_loop(
     };
     let mut last_load_failed = last_fingerprint.is_none();
     let mut last_rebuild_failure: Option<MaterialSetFingerprint> = None;
+
+    // Deterministic readiness: force/tick handling starts only after the
+    // initial fingerprint baseline is established, so callers cannot race the
+    // baseline onto a rewritten candidate.
+    if let Some(ready_tx) = ready_tx {
+        let _ = ready_tx.send(());
+    }
 
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1510,6 +1526,7 @@ mod tests {
                 revision_tx,
                 rebuild,
                 max_material_bytes: crate::config::env_config::DEFAULT_TLS_MAX_MATERIAL_SIZE_BYTES,
+                ready_tx: None,
             },
             Some(shutdown_rx),
         );

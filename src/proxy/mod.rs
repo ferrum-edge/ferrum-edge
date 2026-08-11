@@ -7061,6 +7061,7 @@ impl ProxyState {
                     interval,
                     revision_tx,
                     max_material_bytes: self.env_config.tls_max_material_size_bytes,
+                    ready_tx: None,
                     rebuild: Box::new(move || {
                         let state = state.clone();
                         Box::pin(async move { state.reload_frontend_dtls_material().await })

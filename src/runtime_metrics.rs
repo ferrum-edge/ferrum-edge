@@ -927,6 +927,8 @@ fn build_overload_snapshot(proxy_state: Option<&crate::proxy::ProxyState>) -> Va
             json!({
                 "dtls_demux_sessions_total": 0,
                 "dtls_demux_sessions": [],
+                "frontend_dtls_reload":
+                    crate::proxy::stream_listener::FrontendDtlsReloadStatus::default(),
                 "bind_failures_total": 0,
                 "bind_failures": []
             })

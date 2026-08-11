@@ -28,7 +28,7 @@ use rcgen::{
 };
 use rustls::pki_types::CertificateRevocationListDer;
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 fn ensure_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -76,6 +76,7 @@ async fn dtls_material_watcher_rotates_on_file_change_and_exits_on_shutdown() {
 
     let (revision_tx, mut revision_rx) = watch::channel(0u64);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = oneshot::channel();
     let task = spawn_async_material_set_reload_task(
         AsyncMaterialSetReloadConfig {
             surface: "test_frontend_dtls_reload",
@@ -94,6 +95,7 @@ async fn dtls_material_watcher_rotates_on_file_change_and_exits_on_shutdown() {
             interval: Duration::from_secs(3600),
             revision_tx,
             max_material_bytes: EnvConfig::default().tls_max_material_size_bytes,
+            ready_tx: Some(ready_tx),
             rebuild: Box::new(move || {
                 let rebuilds_for_task = rebuilds_for_task.clone();
                 let cert_for_rebuild = cert_for_rebuild.clone();
@@ -109,6 +111,7 @@ async fn dtls_material_watcher_rotates_on_file_change_and_exits_on_shutdown() {
         },
         Some(shutdown_rx),
     );
+    ready_rx.await.expect("watcher fingerprint baseline");
 
     // Rotate cert+key content under the same source paths (file:// contract).
     let key_pair =
@@ -143,6 +146,7 @@ async fn dtls_material_watcher_keeps_prior_state_and_retries_same_failed_candida
     let attempts_for_task = attempts.clone();
     let (revision_tx, mut revision_rx) = watch::channel(0u64);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = oneshot::channel();
     let task = spawn_async_material_set_reload_task(
         AsyncMaterialSetReloadConfig {
             surface: "test_frontend_dtls_reload_fail",
@@ -161,6 +165,7 @@ async fn dtls_material_watcher_keeps_prior_state_and_retries_same_failed_candida
             interval: Duration::from_secs(3600),
             revision_tx,
             max_material_bytes: EnvConfig::default().tls_max_material_size_bytes,
+            ready_tx: Some(ready_tx),
             rebuild: Box::new(move || {
                 let attempts_for_task = attempts_for_task.clone();
                 Box::pin(async move {
@@ -175,6 +180,7 @@ async fn dtls_material_watcher_keeps_prior_state_and_retries_same_failed_candida
         },
         Some(shutdown_rx),
     );
+    ready_rx.await.expect("watcher fingerprint baseline");
 
     std::fs::write(&cert_path, b"not-a-certificate").expect("corrupt cert");
     assert!(request_material_set_reload(
@@ -458,6 +464,21 @@ async fn echo_round_trip(conn: &DtlsConnection, payload: &[u8]) {
     );
 }
 
+async fn assert_new_dtls_session_rejected(
+    connection: Result<DtlsConnection, anyhow::Error>,
+    reason: &str,
+) {
+    let Ok(conn) = connection else {
+        return;
+    };
+    if conn.send(b"must-not-echo").await.is_ok()
+        && let Ok(Ok(reply)) = tokio::time::timeout(Duration::from_secs(2), conn.recv()).await
+    {
+        panic!("{reason}; rejected session unexpectedly echoed {reply:?}");
+    }
+    conn.close().await;
+}
+
 async fn assert_udp_socket_still_owns(addr: SocketAddr) {
     let conflict = UdpSocket::bind(addr).await;
     assert!(
@@ -552,11 +573,11 @@ async fn dtls_server_live_swap_client_ca_replacement_rejects_old_ca_clients() {
     assert_udp_socket_still_owns(addr).await;
     echo_round_trip(&ok_a, b"ca-a-session-retained").await;
 
-    let rejected = connect_dtls_client(addr, &client_a, Some(&server_ca), 2_000).await;
-    assert!(
-        rejected.is_err(),
-        "clients trusted only by the removed CA-A must fail after client-CA replacement"
-    );
+    assert_new_dtls_session_rejected(
+        connect_dtls_client(addr, &client_a, Some(&server_ca), 2_000).await,
+        "clients trusted only by the removed CA-A must fail after client-CA replacement",
+    )
+    .await;
 
     let ok_b = connect_dtls_client(addr, &client_b, Some(&server_ca), 10_000)
         .await
@@ -600,11 +621,11 @@ async fn dtls_server_live_swap_crl_only_rejects_newly_revoked_client() {
     assert_udp_socket_still_owns(addr).await;
     echo_round_trip(&established, b"post-crl-established").await;
 
-    let revoked = connect_dtls_client(addr, &client, Some(&server_ca), 2_000).await;
-    assert!(
-        revoked.is_err(),
-        "CRL-only generation must reject a newly revoked client on the next handshake"
-    );
+    assert_new_dtls_session_rejected(
+        connect_dtls_client(addr, &client, Some(&server_ca), 2_000).await,
+        "CRL-only generation must reject a newly revoked client on the next handshake",
+    )
+    .await;
 
     established.close().await;
     server.close().await;

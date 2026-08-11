@@ -76,6 +76,7 @@ pub fn start_db_tls_reload_task(
             interval,
             revision_tx,
             max_material_bytes: env_config.tls_max_material_size_bytes,
+            ready_tx: None,
             rebuild: Box::new(move || {
                 let env_for_reload = env_for_reload.clone();
                 let db_for_reload = db_for_reload.clone();
