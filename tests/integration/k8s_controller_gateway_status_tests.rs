@@ -2197,7 +2197,9 @@ fn different_certificate_sets_across_namespaces_refuse_every_effective_claim() {
         );
         assert!(
             !conflict.message.contains(&key.to_string())
-                && !conflict.message.contains(&format!("{}.example.com", key.gateway))
+                && !conflict
+                    .message
+                    .contains(&format!("{}.example.com", key.gateway))
                 && !conflict.message.contains("cert-a")
                 && !conflict.message.contains("cert-b")
                 && !conflict.message.contains("k8s://")
