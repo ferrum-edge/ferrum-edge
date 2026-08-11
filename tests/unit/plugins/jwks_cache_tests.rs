@@ -215,6 +215,10 @@ async fn policy_reconfiguration_forces_refresh_without_resetting_retained_key_ag
         uri.clone(),
         JwksRefreshRequirement::new(Duration::from_secs(900), Duration::from_secs(900)),
     )]));
+    // Keep the virtual 899-second key age, but let the replacement worker's
+    // real HTTP request run on a live clock. Driving reqwest and WireMock while
+    // Tokio time is paused can turn a valid response into a transport timeout.
+    tokio::time::resume();
     let (interval_after_change, generation_after_policy_change) =
         cached_refresh_state(&uri).expect("shared store remains cached");
     assert_eq!(interval_after_change, Duration::from_secs(900));
@@ -224,9 +228,9 @@ async fn policy_reconfiguration_forces_refresh_without_resetting_retained_key_ag
         "a changed effective policy must replace the shared refresh worker"
     );
 
-    // The replacement worker must contact the endpoint without advancing the
-    // paused clock. Wait on the store's completion notify rather than a
-    // wall-clock scheduling bound so the full/coverage matrix cannot flake.
+    // The replacement worker must contact the endpoint immediately, without
+    // waiting for the new interval. Wait on the store's completion notify
+    // rather than a wall-clock scheduling bound.
     store
         .wait_for_refresh_completion_after(completions_before)
         .await;
@@ -255,6 +259,7 @@ async fn policy_reconfiguration_forces_refresh_without_resetting_retained_key_ag
         "restarting the worker must not reset the retained snapshot's key age"
     );
 
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_eq!(store.health_snapshot().trust_state, JwksTrustState::Expired);
 
@@ -531,7 +536,9 @@ async fn active_remote_trust_health_transitions_and_excludes_inactive() {
     assert_eq!((expired.fresh, expired.grace, expired.expired), (0, 0, 1));
     assert!(!expired.ready(tokio::time::Instant::now()));
 
-    // Recovery after a later validated non-empty refresh.
+    // Recovery after a later validated non-empty refresh. Preserve the
+    // virtually advanced key age, but run real HTTP traffic on a live clock.
+    tokio::time::resume();
     server.reset().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200).set_body_json(
@@ -561,7 +568,6 @@ async fn active_remote_trust_health_transitions_and_excludes_inactive() {
     assert_eq!((removed.fresh, removed.grace, removed.expired), (0, 0, 0));
     assert!(removed.ready(tokio::time::Instant::now()));
 
-    tokio::time::resume();
     clear_jwks_cache();
 }
 
