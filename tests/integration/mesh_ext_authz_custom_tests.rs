@@ -984,6 +984,158 @@ mod live_datapath {
         );
     }
 
+    /// Two providers declared once, reused by both multi-scope fixtures below.
+    fn two_providers_json() -> serde_json::Value {
+        json!([
+            {
+                "name": "provider-a",
+                "service": "127.0.0.1",
+                "port": 9000,
+                "timeout_ms": 500,
+                "status_on_error": 403,
+            },
+            {
+                "name": "provider-b",
+                "service": "127.0.0.1",
+                "port": 9001,
+                "timeout_ms": 500,
+                "status_on_error": 403,
+            },
+        ])
+    }
+
+    /// A NodeWaypoint slice: two pods enrolled on ONE node, each selected by its
+    /// own CUSTOM policy naming its own provider.
+    fn node_waypoint_slice_json() -> serde_json::Value {
+        json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [
+                {
+                    "name": "delegate-api",
+                    "namespace": "default",
+                    "scope": {
+                        "kind": "workload_selector",
+                        "selector": {
+                            "namespace": "default",
+                            "labels": { "app": "api" },
+                        },
+                    },
+                    "rules": [{
+                        "to": [{ "paths": ["/admin/*"] }],
+                        "action": { "custom": { "provider": "provider-a" } },
+                    }],
+                },
+                {
+                    "name": "delegate-batch",
+                    "namespace": "default",
+                    "scope": {
+                        "kind": "workload_selector",
+                        "selector": {
+                            "namespace": "default",
+                            "labels": { "app": "batch" },
+                        },
+                    },
+                    "rules": [{
+                        "to": [{ "paths": ["/admin/*"] }],
+                        "action": { "custom": { "provider": "provider-b" } },
+                    }],
+                },
+            ],
+            "ext_authz_providers": two_providers_json(),
+        })
+    }
+
+    /// A waypoint slice fronting TWO Services, each with its own
+    /// `targetRefs`-attached CUSTOM policy naming its own provider.
+    fn waypoint_slice_json() -> serde_json::Value {
+        json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "waypoint_name": "shared-waypoint",
+            "services": [
+                { "name": "reviews", "namespace": "default" },
+                { "name": "ratings", "namespace": "default" },
+            ],
+            "mesh_policies": [
+                {
+                    "name": "delegate-reviews",
+                    "namespace": "default",
+                    "scope": {
+                        "kind": "target_refs",
+                        "attachments": [{
+                            "kind": "service",
+                            "namespace": "default",
+                            "name": "reviews",
+                        }],
+                    },
+                    "rules": [{
+                        "to": [{ "paths": ["/admin/*"] }],
+                        "action": { "custom": { "provider": "provider-a" } },
+                    }],
+                },
+                {
+                    "name": "delegate-ratings",
+                    "namespace": "default",
+                    "scope": {
+                        "kind": "target_refs",
+                        "attachments": [{
+                            "kind": "service",
+                            "namespace": "default",
+                            "name": "ratings",
+                        }],
+                    },
+                    "rules": [{
+                        "to": [{ "paths": ["/admin/*"] }],
+                        "action": { "custom": { "provider": "provider-b" } },
+                    }],
+                },
+            ],
+            "ext_authz_providers": two_providers_json(),
+        })
+    }
+
+    /// A NodeWaypoint serves EVERY enrolled pod on the node from one listener,
+    /// so `per_pod_policy_scoping` deliberately SKIPS the workload retain and
+    /// `mesh_policies` is the node's superset, not one workload's set. Two pods
+    /// each naming their own provider is a legitimate Istio configuration
+    /// ("at most one per workload" is satisfied), and refusing the generation
+    /// would stall config for every pod on the node — not just the two. The
+    /// per-request, pod-filtered evaluation is what refuses a request that can
+    /// genuinely see two providers (`custom:provider-conflict`).
+    #[test]
+    fn a_node_waypoint_generation_may_carry_one_provider_per_enrolled_pod() {
+        let config = json!({
+            "mesh_slice": node_waypoint_slice_json(),
+            "per_pod_policy_scoping": true,
+        });
+        // Match rather than `expect`: MeshAuthz intentionally omits Debug.
+        match MeshAuthz::new_with_http_client(&config, Some(PluginHttpClient::default())) {
+            Ok(_) => {}
+            Err(error) => panic!(
+                "a node waypoint's un-narrowed policy superset is not one workload naming two \
+                 providers: {error}"
+            ),
+        }
+    }
+
+    /// The same holds for a waypoint: its retain admits `targetRefs` policies
+    /// for every fronted Service, so one provider per destination Service is the
+    /// disjoint-destination-scope configuration the per-request
+    /// destination-scope evaluation already resolves.
+    #[test]
+    fn a_waypoint_generation_may_carry_one_provider_per_fronted_service() {
+        let config = json!({ "mesh_slice": waypoint_slice_json() });
+        match MeshAuthz::new_with_http_client(&config, Some(PluginHttpClient::default())) {
+            Ok(_) => {}
+            Err(error) => panic!(
+                "a waypoint fronting two Services may bind one provider per destination: {error}"
+            ),
+        }
+    }
+
     // ── Request-body phase seams ──────────────────────────────────────────
 
     fn body_slice_json(port: u16, paths: &[&str]) -> serde_json::Value {

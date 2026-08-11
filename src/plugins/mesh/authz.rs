@@ -1461,19 +1461,33 @@ impl MeshAuthz {
         // `mesh_policies` array has no provider source, so its CUSTOM rules
         // (if any) deny — which is the correct reading of "delegate this
         // decision to a provider that is not configured here".
-        // At most ONE extension provider may apply to a workload (Istio). The
-        // slice's own `mesh_policies` are ALREADY narrowed to this workload, so
-        // two distinct providers there can never be a legitimate
+        // At most ONE extension provider may apply to a workload (Istio). When
+        // the retain above ran, `slice.mesh_policies` IS one workload's policy
+        // set, so two distinct providers there can never be a legitimate
         // disjoint-workload configuration — it is an unresolvable delegation
         // and is refused at this cold boundary, which keeps the previous valid
         // generation serving instead of publishing one whose enforcing
         // authorizer depends on policy iteration order.
         //
-        // `relay_policy_superset` is deliberately EXCLUDED: it is the
-        // un-narrowed superset a waypoint/relay evaluates per destination, so
-        // two providers there are the legitimate disjoint-destination case.
-        // That path is resolved per request instead, and a request that can
-        // genuinely see both is refused there (`custom_provider_conflict`).
+        // That refusal is sound ONLY for a genuinely single-workload set. Two
+        // topologies deliberately retain a WIDER one, and in both of them two
+        // distinct providers are the legitimate disjoint-scope configuration:
+        //
+        //   * `per_pod_policy_scoping` (NodeWaypoint) SKIPS the retain entirely
+        //     — one listener serves every enrolled pod on the node, so two pods
+        //     may each name their own provider. Refusing here would reject the
+        //     whole plugin generation and stall config for every pod on the
+        //     node, not just the two that disagree.
+        //   * A waypoint's retain additionally admits `targetRefs` policies for
+        //     EVERY fronted Service, so one waypoint legitimately carries a
+        //     provider per destination.
+        //
+        // Both are resolved PER REQUEST instead, by the same mechanism that
+        // already covers `relay_policy_superset` (deliberately excluded here
+        // for exactly this reason): the pod-/destination-filtered evaluation
+        // reports `custom_provider_conflict`, and only a request that can
+        // genuinely see two providers is refused.
+        let policy_set_is_one_workload = !per_pod_policy_scoping && slice.waypoint_name.is_none();
         let mut workload_providers: std::collections::BTreeSet<&str> =
             std::collections::BTreeSet::new();
         for provider in slice
@@ -1484,9 +1498,11 @@ impl MeshAuthz {
         {
             workload_providers.insert(provider);
         }
-        if workload_providers.len() > 1 {
+        if policy_set_is_one_workload && workload_providers.len() > 1 {
             return Err(
-                "mesh_authz: this workload is selected by CUSTOM AuthorizationPolicies naming                  more than one meshConfig.extensionProviders entry; Istio permits at most one                  external authorization provider per workload"
+                "mesh_authz: this workload is selected by CUSTOM AuthorizationPolicies naming \
+                 more than one meshConfig.extensionProviders entry; Istio permits at most one \
+                 external authorization provider per workload"
                     .to_string(),
             );
         }

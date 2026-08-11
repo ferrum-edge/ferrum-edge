@@ -1249,7 +1249,12 @@ can see two distinct applicable providers across relay/waypoint destination
 scopes is denied with the stable reason `custom:provider-conflict`. Ferrum
 never picks the first match — that would let policy iteration order choose
 which operator's authorizer enforces. Different providers on **disjoint**
-workloads or destination scopes remain fully supported.
+workloads or destination scopes remain fully supported: the construction-time
+refusal applies only where the generation's policy set really is one workload's,
+so a node-waypoint generation (which serves every enrolled pod on the node from
+one listener) and a waypoint generation (whose `targetRefs` retention spans
+every fronted Service) may each carry one provider per pod / per destination,
+and only a request that can genuinely see two is refused.
 
 **CUSTOM runs before DENY across destination scopes too.** A request that spans
 several destination scopes (a node-waypoint relay serving many backends)
