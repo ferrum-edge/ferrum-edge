@@ -839,6 +839,7 @@ async fn run_async_material_set_reload_loop(
         }
     };
     let mut last_load_failed = last_fingerprint.is_none();
+    let mut last_rebuild_failure: Option<MaterialSetFingerprint> = None;
 
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -914,6 +915,7 @@ async fn run_async_material_set_reload_loop(
                 let event_entries = next_fingerprint.entries.clone();
                 record_refresh_for_entries(surface, &next_fingerprint.entries, "rotated");
                 last_fingerprint = Some(next_fingerprint);
+                last_rebuild_failure = None;
                 revision_tx.send_modify(|r| *r = r.saturating_add(1));
                 let revision = *revision_tx.borrow();
                 crate::tls::events::record_rotation_success(surface, &event_entries, revision);
@@ -925,17 +927,19 @@ async fn run_async_material_set_reload_loop(
             }
             Err(error) => {
                 record_refresh_for_entries(surface, &next_fingerprint.entries, "rebuild_error");
-                crate::tls::events::record_rebuild_error(
-                    surface,
-                    &next_fingerprint.entries,
-                    &error,
-                );
-                last_fingerprint = Some(next_fingerprint);
-                warn!(
-                    surface,
-                    error = %error,
-                    "TLS material sources changed but rebuild failed; keeping previous material"
-                );
+                if last_rebuild_failure.as_ref() != Some(&next_fingerprint) {
+                    crate::tls::events::record_rebuild_error(
+                        surface,
+                        &next_fingerprint.entries,
+                        &error,
+                    );
+                    warn!(
+                        surface,
+                        error = %error,
+                        "TLS material sources changed but rebuild failed; keeping previous material and retrying at the bounded watcher cadence"
+                    );
+                    last_rebuild_failure = Some(next_fingerprint);
+                }
             }
         }
     }

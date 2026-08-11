@@ -12565,7 +12565,7 @@ components:
           description: |
             Stream-listener (TCP/UDP/DTLS) diagnostics. Present only when the
             gateway has a proxy state (absent in control-plane mode).
-          required: [dtls_demux_sessions_total, dtls_demux_sessions, bind_failures_total, bind_failures]
+          required: [dtls_demux_sessions_total, dtls_demux_sessions, frontend_dtls_reload, bind_failures_total, bind_failures]
           properties:
             dtls_demux_sessions_total:
               type: integer
@@ -12586,6 +12586,28 @@ components:
                   sessions:
                     type: integer
                     format: uint64
+            frontend_dtls_reload:
+              type: object
+              description: Bounded, redacted frontend-DTLS material rotation and listener convergence status.
+              required: [generation, last_swapped_listeners, last_success_unix, last_failure_unix, last_outcome]
+              properties:
+                generation:
+                  type: integer
+                  format: uint64
+                  description: Last accepted immutable material generation; 0 means none has been published.
+                last_swapped_listeners:
+                  type: integer
+                  format: uint64
+                  description: Active DTLS listeners live-swapped during the last accepted publish.
+                last_success_unix:
+                  type: [integer, "null"]
+                  format: uint64
+                last_failure_unix:
+                  type: [integer, "null"]
+                  format: uint64
+                last_outcome:
+                  type: string
+                  enum: [none, accepted, rejected]
             bind_failures_total:
               type: integer
               description: |

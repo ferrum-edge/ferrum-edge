@@ -2041,6 +2041,31 @@ async fn swap_active_dtls_frontend_configs_publishes_generation_without_listener
     let status = manager.frontend_dtls_reload_status();
     assert_eq!(status.last_outcome, "accepted");
     assert_eq!(status.generation, 1);
+    let overload = manager.overload_snapshot();
+    assert_eq!(overload.frontend_dtls_reload.generation, 1);
+    assert_eq!(overload.frontend_dtls_reload.last_outcome, "accepted");
+}
+
+#[tokio::test]
+async fn concurrent_dtls_publishers_cannot_regress_the_accepted_generation() {
+    let manager = create_manager(empty_config());
+    let first_config = ephemeral_frontend_dtls_config();
+    let second_config = ephemeral_frontend_dtls_config();
+
+    let (first, second) = tokio::join!(
+        manager.publish_frontend_dtls_generation(first_config),
+        manager.publish_frontend_dtls_generation(second_config)
+    );
+    let mut published = [first.0.generation, second.0.generation];
+    published.sort_unstable();
+    assert_eq!(published, [1, 2]);
+    assert_eq!(
+        manager
+            .snapshot_frontend_dtls_generation()
+            .expect("accepted generation")
+            .generation,
+        2
+    );
 }
 
 #[tokio::test]

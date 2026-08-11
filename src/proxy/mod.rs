@@ -7014,13 +7014,6 @@ impl ProxyState {
             }
         };
 
-        // Publish CRLs used by the accepted generation so path-fallback builds
-        // (and TCP+TLS reload keys that fold CRL content) observe the same
-        // revocation snapshot. Only store after the DTLS candidate validated.
-        self.shared_crls.store(active_crls);
-        self.stream_listener_manager
-            .set_crls(self.shared_crls.load_full());
-
         let (published, swapped) = self
             .stream_listener_manager
             .publish_frontend_dtls_generation(config)

@@ -290,10 +290,7 @@ pub fn build_frontend_dtls_config(
         let verifier = verifier_builder
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build DTLS client verifier: {}", e))?;
-        debug!(
-            ca_path = %ca_path,
-            "Frontend DTLS mTLS enabled: requiring and verifying client certificates"
-        );
+        debug!("Frontend DTLS mTLS enabled: requiring and verifying client certificates");
         (true, Some(verifier))
     } else {
         (false, None)
@@ -1717,6 +1714,13 @@ pub(crate) fn load_dtls_certificate_with_key_drop_hook(
             e
         )
     })?;
+
+    crate::tls::check_cert_expiry_from_pem_bytes(
+        cert_material.bytes.expose_secret(),
+        "DTLS certificate",
+        &cert_material.display_source_id,
+        0,
+    )?;
 
     // Parse every declared certificate and exactly one key through the shared
     // bounded, fail-closed PEM admission path. The patched dimpl stack presents

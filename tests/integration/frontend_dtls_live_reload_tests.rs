@@ -119,7 +119,7 @@ async fn dtls_material_watcher_rotates_on_file_change_and_exits_on_shutdown() {
 }
 
 #[tokio::test]
-async fn dtls_material_watcher_keeps_prior_state_when_rebuild_fails() {
+async fn dtls_material_watcher_keeps_prior_state_and_retries_same_failed_candidate() {
     ensure_crypto_provider();
     let dir = tempfile::tempdir().expect("tempdir");
     let (cert_path, key_path) = write_ecdsa_material(dir.path(), "fail");
@@ -152,8 +152,12 @@ async fn dtls_material_watcher_keeps_prior_state_when_rebuild_fails() {
             rebuild: Box::new(move || {
                 let attempts_for_task = attempts_for_task.clone();
                 Box::pin(async move {
-                    attempts_for_task.fetch_add(1, Ordering::SeqCst);
-                    Err(anyhow::anyhow!("simulated malformed DTLS candidate"))
+                    let attempt = attempts_for_task.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Err(anyhow::anyhow!("simulated transient rebuild failure"))
+                    } else {
+                        Ok(())
+                    }
                 })
             }),
         },
@@ -162,19 +166,79 @@ async fn dtls_material_watcher_keeps_prior_state_when_rebuild_fails() {
 
     std::fs::write(&cert_path, b"not-a-certificate").expect("corrupt cert");
     assert!(request_material_set_reload("test_frontend_dtls_reload_fail"));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while attempts.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first failed rebuild attempt");
     assert_eq!(
         *revision_rx.borrow(),
         0,
         "failed rebuild must not bump the accepted revision"
     );
-    assert!(attempts.load(Ordering::SeqCst) >= 1);
+
+    assert!(request_material_set_reload(
+        "test_frontend_dtls_reload_fail"
+    ));
+    tokio::time::timeout(Duration::from_secs(2), revision_rx.changed())
+        .await
+        .expect("stable failed candidate should be retried")
+        .expect("watcher alive");
+    assert_eq!(*revision_rx.borrow(), 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 
     shutdown_tx.send_replace(true);
     tokio::time::timeout(Duration::from_secs(2), task)
         .await
         .expect("watcher should exit on shutdown")
         .expect("watcher join");
+}
+
+#[test]
+fn frontend_dtls_builder_rejects_expired_and_not_yet_valid_certificates() {
+    ensure_crypto_provider();
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    for (name, not_before, not_after, expected) in [
+        (
+            "expired",
+            time::OffsetDateTime::now_utc() - time::Duration::days(2),
+            time::OffsetDateTime::now_utc() - time::Duration::days(1),
+            "expired",
+        ),
+        (
+            "future",
+            time::OffsetDateTime::now_utc() + time::Duration::days(1),
+            time::OffsetDateTime::now_utc() + time::Duration::days(2),
+            "not yet valid",
+        ),
+    ] {
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate key");
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).expect("params");
+        params.not_before = not_before;
+        params.not_after = not_after;
+        let cert = params.self_signed(&key_pair).expect("self-sign");
+        let cert_path = dir.path().join(format!("{name}-cert.pem"));
+        let key_path = dir.path().join(format!("{name}-key.pem"));
+        std::fs::write(&cert_path, cert.pem()).expect("write cert");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write key");
+
+        let error = ferrum_edge::dtls::build_frontend_dtls_config(
+            cert_path.to_str().expect("cert utf8"),
+            key_path.to_str().expect("key utf8"),
+            None,
+            &[],
+        )
+        .err()
+        .expect("invalid certificate lifetime must be refused");
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected {name} error: {error}"
+        );
+    }
 }
 
 #[test]

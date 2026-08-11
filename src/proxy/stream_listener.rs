@@ -37,7 +37,7 @@ const STREAM_LISTENER_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 ///
 /// Exposes generation/convergence counters only — never PEM, key bytes, secret
 /// URIs, or source path material.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct FrontendDtlsReloadStatus {
     /// Last accepted generation id (`0` means none published yet).
     pub generation: u64,
@@ -63,11 +63,11 @@ impl Default for FrontendDtlsReloadStatus {
     }
 }
 
-fn unix_now_secs() -> u64 {
+fn unix_now_secs() -> Option<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 /// Handle for a running stream listener — keeps the shutdown channel and task handle.
@@ -345,6 +345,8 @@ impl BackendTlsMaterialReloadKey {
 pub struct StreamListenerOverloadSnapshot {
     pub dtls_demux_sessions_total: u64,
     pub dtls_demux_sessions: Vec<DtlsDemuxSessionSnapshot>,
+    /// Bounded frontend-DTLS material generation and convergence status.
+    pub frontend_dtls_reload: FrontendDtlsReloadStatus,
     /// Number of configured stream-listener resources that are not serving
     /// after the most recent `reconcile()` — hard bind failures PLUS listeners
     /// deferred/degraded for a config reason (e.g. waiting on frontend TLS
@@ -834,9 +836,13 @@ pub struct StreamListenerManager {
     /// every active `DtlsServer` and every listener created afterwards observe
     /// the same generation. A rejected candidate never replaces this slot.
     frontend_dtls_generation:
-        arc_swap::ArcSwap<Option<Arc<crate::dtls::FrontendDtlsGeneration>>>,
+        Arc<arc_swap::ArcSwap<Option<Arc<crate::dtls::FrontendDtlsGeneration>>>>,
     /// Monotonic counter backing [`crate::dtls::FrontendDtlsGeneration::generation`].
     frontend_dtls_generation_counter: AtomicU64,
+    /// Serializes the complete generation publish and active-listener swap so
+    /// concurrent frontend and mesh PeerAuth rotations cannot publish an older
+    /// generation after a newer one.
+    frontend_dtls_publish: tokio::sync::Mutex<()>,
     /// Redacted reload status for admin/metrics (no PEM, keys, or secret URIs).
     frontend_dtls_reload_status: arc_swap::ArcSwap<FrontendDtlsReloadStatus>,
     /// Global override to disable backend TLS certificate verification.
@@ -1167,8 +1173,9 @@ impl StreamListenerManager {
             health_checker,
             frontend_tls_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(frontend_tls_config))),
             frontend_dtls_material: arc_swap::ArcSwap::new(Arc::new(None)),
-            frontend_dtls_generation: arc_swap::ArcSwap::new(Arc::new(None)),
+            frontend_dtls_generation: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
             frontend_dtls_generation_counter: AtomicU64::new(0),
+            frontend_dtls_publish: tokio::sync::Mutex::new(()),
             frontend_dtls_reload_status: arc_swap::ArcSwap::new(Arc::new(
                 FrontendDtlsReloadStatus::default(),
             )),
@@ -1425,7 +1432,7 @@ impl StreamListenerManager {
                 generation: current.generation,
                 last_swapped_listeners: current.last_swapped_listeners,
                 last_success_unix: current.last_success_unix,
-                last_failure_unix: Some(unix_now_secs()),
+                last_failure_unix: unix_now_secs(),
                 last_outcome: "rejected",
             })
         });
@@ -1445,6 +1452,7 @@ impl StreamListenerManager {
         &self,
         config: crate::dtls::FrontendDtlsConfig,
     ) -> (crate::dtls::FrontendDtlsGeneration, usize) {
+        let _publish_guard = self.frontend_dtls_publish.lock().await;
         let generation = self
             .frontend_dtls_generation_counter
             .fetch_add(1, Ordering::AcqRel)
@@ -1461,7 +1469,7 @@ impl StreamListenerManager {
         self.frontend_dtls_reload_status.store(Arc::new(FrontendDtlsReloadStatus {
             generation,
             last_swapped_listeners: swapped as u64,
-            last_success_unix: Some(unix_now_secs()),
+            last_success_unix: unix_now_secs(),
             last_failure_unix: self.frontend_dtls_reload_status.load().last_failure_unix,
             last_outcome: "accepted",
         }));
@@ -2598,6 +2606,7 @@ impl StreamListenerManager {
         StreamListenerOverloadSnapshot {
             dtls_demux_sessions_total,
             dtls_demux_sessions,
+            frontend_dtls_reload: self.frontend_dtls_reload_status(),
             bind_failures_total: bind_failures.len(),
             bind_failures: bind_failures.as_ref().clone(),
         }
