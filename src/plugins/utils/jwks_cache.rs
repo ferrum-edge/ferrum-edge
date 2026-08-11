@@ -188,8 +188,10 @@ pub fn trust_health_snapshot() -> JwksTrustHealthAggregate {
 pub fn republish_trust_health() {
     ensure_trust_health_hook();
     let now = Instant::now();
-    let mut aggregate = JwksTrustHealthAggregate::default();
-    aggregate.age_observed_at = Some(now);
+    let mut aggregate = JwksTrustHealthAggregate {
+        age_observed_at: Some(now),
+        ..JwksTrustHealthAggregate::default()
+    };
     let mut next_watch: Option<Instant> = None;
 
     if let Some(cache) = JWKS_CACHE.get() {
