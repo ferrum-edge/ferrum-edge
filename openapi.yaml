@@ -12676,6 +12676,23 @@ components:
         pool_handshakes_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
         pool_evictions_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
         pool_failures_total: { type: object, additionalProperties: { type: integer, format: uint64 } }
+        unix_backend_pool:
+          type: object
+          description: >-
+            Sidecar-ingress Unix-domain backend connection pool accounting. Fixed
+            cardinality: one object for the whole pool, never per target. Counters
+            are monotonic; the three connection fields are gauges.
+          properties:
+            hits: { type: integer, format: uint64, description: "Checkouts served by an already-admitted pooled carrier" }
+            misses: { type: integer, format: uint64, description: "Checkouts that had to establish a new physical connection" }
+            physical_connects: { type: integer, format: uint64, description: "Physical connections established" }
+            identity_retirements: { type: integer, format: uint64, description: "Carriers retired by socket replacement or config withdrawal" }
+            setup_failures: { type: integer, format: uint64, description: "Connect or protocol-handshake failures" }
+            checkout_failures: { type: integer, format: uint64, description: "Pre-dial refusals: path admission and the maxConnections cap" }
+            idle_h1_connections: { type: integer, format: uint64, description: "Idle HTTP/1.1 carriers currently pooled" }
+            active_h2c_connections: { type: integer, format: uint64, description: "Shared h2c carriers currently pooled" }
+            open_physical_connections: { type: integer, format: uint64, description: "Physical connections currently open, including checked-out carriers" }
+            withdrawal_fenced_checkins: { type: integer, format: uint64, description: "Carriers the publication fence refused to re-pool" }
         tcp_rst_observed:
           type: object
           properties:

@@ -126,6 +126,15 @@ pub enum UnixBackendError {
     /// ended it on the very poll that validated that preface. Either way no
     /// request could be issued on it and none was.
     H2ConnectionClosed,
+    /// The destination is already at its DestinationRule
+    /// `connectionPool.tcp.maxConnections` ceiling and this request would have
+    /// required a NEW physical connection (issue #3764).
+    ///
+    /// Decided BEFORE `connect(2)`, so no socket is opened and no application
+    /// byte is written. Reuse of an already-admitted pooled carrier never
+    /// reaches this refusal, so a saturated destination still serves every
+    /// request that can ride an existing connection.
+    BackendConnectionLimit(crate::backend_conn_limit::BackendConnectionLimitExceeded),
     /// The socket accepted the connection but the h2c connection did not become
     /// usable inside the effective connect budget — hyper's client handshake and
     /// the peer's own initial SETTINGS frame (RFC 9113 §3.4) must BOTH land
@@ -182,6 +191,9 @@ impl std::fmt::Display for UnixBackendError {
                 f,
                 "unix backend h2c handshake timed out after {timeout_ms}ms"
             ),
+            Self::BackendConnectionLimit(limit) => {
+                write!(f, "unix backend connection limit reached: {limit}")
+            }
             Self::PlatformUnsupported => {
                 write!(f, "unix backends are not supported on this platform")
             }
@@ -194,6 +206,10 @@ impl std::error::Error for UnixBackendError {
         match self {
             Self::Connect(err) | Self::PeerCredentialsUnavailable(err) => Some(err),
             Self::Http1Handshake(err) | Self::H2Handshake(err) => Some(err),
+            // Keep the typed over-cap marker reachable through the source chain
+            // so `is_backend_connection_limit_error` recognizes it structurally
+            // wherever this error is boxed.
+            Self::BackendConnectionLimit(limit) => Some(limit),
             _ => None,
         }
     }
@@ -219,9 +235,16 @@ impl UnixBackendError {
     /// * a failed or timed-out connect — or an h2c connection that errored,
     ///   hung up, or never became usable inside the budget — IS evidence the
     ///   local app is down, wedged, or not speaking its declared protocol, so
-    ///   those keep the ordinary connect-phase classes.
+    ///   those keep the ordinary connect-phase classes;
+    /// * an over-cap refusal is the operator's own gateway-side ceiling, decided
+    ///   before `connect(2)`. It gets the shared typed
+    ///   [`crate::retry::ErrorClass::BackendConnectionLimit`] class every other
+    ///   transport uses: pre-wire, health-neutral (no breaker, passive-health,
+    ///   or LB penalty for a healthy destination that is merely saturated), and
+    ///   retryable onto another load-balanced target with its own lane.
     pub fn error_class(&self) -> crate::retry::ErrorClass {
         match self {
+            Self::BackendConnectionLimit(_) => crate::retry::ErrorClass::BackendConnectionLimit,
             Self::InadmissiblePath(_)
             | Self::PlatformUnsupported
             | Self::PeerCredentialsUnavailable(_)
@@ -318,6 +341,20 @@ pub fn effective_connect_timeout_ms(proxy_connect_timeout_ms: u64) -> u64 {
 /// fail closed rather than silently becoming an unbounded wait. Returning the
 /// effective millisecond value keeps the timeout response aligned with the
 /// default applied when the proxy-level value is zero.
+///
+/// This is the ONE budget for a Unix transport establishment. It is created
+/// once, at the OUTERMOST point of an establishment — before admission, before
+/// any pool creation-lock wait, before `connect(2)`, before the protocol
+/// handshake, and (for WebSocket) before the RFC 6455 upgrade exchange — and
+/// then threaded through every stage as an absolute `Instant`. No stage may
+/// derive a fresh budget from `connect_timeout_ms` again: two nested full
+/// timeouts would let a single establishment consume twice the configured
+/// setup budget (issue #3764).
+///
+/// A synchronous filesystem admission check cannot be preempted while it runs,
+/// but the time it spends is charged against this deadline all the same,
+/// because every later stage is awaited through `timeout_at(deadline, ..)` —
+/// which resolves `Err` immediately when the deadline has already passed.
 pub(crate) fn connect_deadline(
     proxy_connect_timeout_ms: u64,
 ) -> Result<(u64, tokio::time::Instant), UnixBackendError> {
@@ -327,6 +364,18 @@ pub(crate) fn connect_deadline(
         .ok_or(UnixBackendError::ConnectTimeout { timeout_ms })?;
     Ok((timeout_ms, deadline))
 }
+
+/// The connection-driver future of one physical Unix backend connection.
+///
+/// Returned to the caller rather than spawned internally so the pool can take
+/// STRUCTURED OWNERSHIP of every driver it creates (issue #3764): a detached
+/// `tokio::spawn` is unreachable at shutdown, and "the sender map was dropped"
+/// is not the bounded close/await contract issue #3731 asks for. Boxed because
+/// hyper's concrete `Connection` type is not nameable at this boundary; one
+/// allocation per PHYSICAL connection, never per request.
+#[cfg(unix)]
+pub type UnixConnectionDriver =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
 
 /// HTTP/2 client-connection bounds for an h2c Unix backend.
 ///
@@ -437,12 +486,17 @@ fn connected_peer_uid(stream: &tokio::net::UnixStream) -> Result<u32, UnixBacken
 /// Either failure — and an unavailable credential, which is identity ambiguity
 /// and therefore also a failure — drops the stream unused. There is no fallback
 /// to TCP, to the placeholder `host:port`, or to a weaker check.
+///
+/// `deadline` / `timeout_ms` are the caller's ONE establishment budget (see
+/// [`connect_deadline`]); this function never derives its own, so admission
+/// time already spent is charged here rather than granted a second full
+/// timeout.
 #[cfg(unix)]
 pub async fn connect_admitted(
     admitted: &AdmittedUnixSocket,
-    connect_timeout_ms: u64,
+    deadline: tokio::time::Instant,
+    timeout_ms: u64,
 ) -> Result<tokio::net::UnixStream, UnixBackendError> {
-    let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
     let stream = match tokio::time::timeout_at(
         deadline,
         tokio::net::UnixStream::connect(admitted.resolved_path()),
@@ -486,14 +540,15 @@ pub async fn connect_admitted(
 #[cfg(unix)]
 pub async fn admit_and_connect(
     path: &str,
-    connect_timeout_ms: u64,
+    deadline: tokio::time::Instant,
+    timeout_ms: u64,
     allowed_roots: &[String],
     allowed_uids: &[u32],
 ) -> Result<(AdmittedUnixSocket, tokio::net::UnixStream), UnixBackendError> {
     let admitted =
         crate::util::unix_socket::admit_socket_for_connect(path, allowed_roots, allowed_uids)
             .map_err(UnixBackendError::InadmissiblePath)?;
-    let stream = connect_admitted(&admitted, connect_timeout_ms).await?;
+    let stream = connect_admitted(&admitted, deadline, timeout_ms).await?;
     Ok((admitted, stream))
 }
 
@@ -505,12 +560,17 @@ pub async fn admit_and_connect(
 /// the pooled entry can retain the admitted `(dev, ino, owner)` identity; the
 /// 1:1 [`dial_unix_h2c_sender`] helper composes admission + this handshake for
 /// focused external tests.
+///
+/// Returns the driver as a [`UnixConnectionDriver`] instead of spawning it: the
+/// caller owns it, so the pool can track, close, and reap every physical
+/// connection under a bounded shutdown deadline (issue #3764).
 #[cfg(unix)]
 pub async fn handshake_unix_h2c_sender(
     stream: tokio::net::UnixStream,
     deadline: tokio::time::Instant,
     timeout_ms: u64,
-) -> Result<crate::proxy::mesh_mtls_pool::MeshMtlsSender, UnixBackendError> {
+) -> Result<(crate::proxy::mesh_mtls_pool::MeshMtlsSender, UnixConnectionDriver), UnixBackendError>
+{
     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 
     let settings_received = Arc::new(AtomicBool::new(false));
@@ -545,12 +605,12 @@ pub async fn handshake_unix_h2c_sender(
         });
     }
 
-    tokio::spawn(async move {
+    let driver: UnixConnectionDriver = Box::pin(async move {
         if let Err(e) = connection.await {
             tracing::debug!("unix_backend: h2c connection closed: {}", e);
         }
     });
-    Ok(sender)
+    Ok((sender, driver))
 }
 
 /// Dial a co-located Unix-domain STREAM socket and complete an **h2c
@@ -580,12 +640,18 @@ pub async fn dial_unix_h2c_sender(
 ) -> Result<crate::proxy::mesh_mtls_pool::MeshMtlsSender, UnixBackendError> {
     let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
 
-    let connect = admit_and_connect(path, connect_timeout_ms, allowed_roots, allowed_uids);
+    let connect = admit_and_connect(path, deadline, timeout_ms, allowed_roots, allowed_uids);
     let (_admitted, stream) = match tokio::time::timeout_at(deadline, connect).await {
         Ok(result) => result?,
         Err(_) => return Err(UnixBackendError::ConnectTimeout { timeout_ms }),
     };
-    handshake_unix_h2c_sender(stream, deadline, timeout_ms).await
+    // Unpooled compatibility helper: nothing here owns a driver registry, so
+    // the driver is tied to the returned sender's lifetime exactly as it was
+    // before the pool existed. Production dispatch goes through the pool, which
+    // takes structured ownership instead.
+    let (sender, driver) = handshake_unix_h2c_sender(stream, deadline, timeout_ms).await?;
+    tokio::spawn(driver);
+    Ok(sender)
 }
 
 /// Non-Unix build: there is no Unix-domain socket to dial, so the shared

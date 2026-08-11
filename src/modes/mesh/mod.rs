@@ -17441,7 +17441,7 @@ async fn shutdown_and_join_mesh(
     // On a sidecar this is the pool of admitted connections to the co-located
     // application's Unix ingress sockets; leaving one idle keeps the app's
     // listener busy after the data plane has stopped serving.
-    proxy_state.drain_transport_pools_for_shutdown();
+    proxy_state.drain_transport_pools_for_shutdown().await;
 
     if let Some(handle) = tasks.dns_retry_handle {
         tasks.handles.push(handle);

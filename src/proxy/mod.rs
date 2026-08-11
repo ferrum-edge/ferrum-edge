@@ -6751,8 +6751,15 @@ impl ProxyState {
     /// gateway believes it has stopped. `shutdown_drain` also latches the pool
     /// closed, so a streaming response that reaches EOF in the last moments of
     /// the drain retires its carrier instead of re-pooling it.
-    pub fn drain_transport_pools_for_shutdown(&self) {
-        self.unix_backend_pool.shutdown_drain();
+    ///
+    /// Async because the drain does not merely drop carriers: it AWAITS every
+    /// physical connection driver the pool owns, under the pool's own bounded
+    /// budget, and aborts whatever has not ended (issue #3764). Callers already
+    /// run inside the mode's async shutdown sequence, after the operator's
+    /// `FERRUM_SHUTDOWN_DRAIN_SECONDS` wait, so this adds a bounded tail rather
+    /// than lengthening the configured drain.
+    pub async fn drain_transport_pools_for_shutdown(&self) {
+        self.unix_backend_pool.shutdown_drain().await;
     }
 
     /// Install CP-delivered trust bundles for gateway-to-mesh TLS.
@@ -7469,6 +7476,10 @@ impl ProxyState {
         hbone_pool.attach_backend_conn_limit(backend_conn_limit.clone());
         mesh_mtls_pool.attach_backend_conn_limit(backend_conn_limit.clone());
         h3_pool.attach_backend_conn_limit(backend_conn_limit.clone());
+        // Sidecar-ingress Unix carriers are physical backend connections Ferrum
+        // owns, so they are admitted against the SAME per-destination
+        // DestinationRule ceiling as every other transport (issue #3764).
+        unix_backend_pool.attach_backend_conn_limit(backend_conn_limit.clone());
         let backend_capabilities = Arc::new(BackendCapabilityRegistry::with_shard_amount(
             pool_shard_amount,
         ));
@@ -14235,6 +14246,11 @@ pub(crate) async fn connect_websocket_backend(
 /// upgrade request. A replaced socket, wrong owner, wrong file type, or peer-UID
 /// mismatch therefore sends ZERO application bytes.
 ///
+/// That deadline is ABSOLUTE and shared: the RFC 6455 upgrade exchange is
+/// bounded by what remains of it, not by a fresh `backend_connect_timeout_ms`
+/// timer. Admission + connect + upgrade is one establishment and gets one setup
+/// budget in total (issue #3764).
+///
 /// ## Lease
 ///
 /// The connection is dedicated and non-reusable: an RFC 6455 upgrade consumes
@@ -14304,7 +14320,12 @@ async fn connect_unix_websocket_backend(
     // WS failure handler classifies it through the same `error_class()` the
     // HTTP/gRPC Unix dispatch uses (pre-wire connect classes stay retryable and
     // are charged as setup failures, not as backend request failures).
-    let (_admitted, stream) = unix_backend_pool::UnixBackendConnectionPool::dial_websocket_stream(
+    let unix_backend_pool::UnixWebSocketDial {
+        admitted: _admitted,
+        stream,
+        deadline,
+        timeout_ms,
+    } = unix_backend_pool::UnixBackendConnectionPool::dial_websocket_stream(
         socket_path,
         proxy.backend_connect_timeout_ms,
         &env_config.mesh_unix_socket_allowed_roots,
@@ -14313,15 +14334,14 @@ async fn connect_unix_websocket_backend(
     .await
     .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { Box::new(err) })?;
 
-    // Bound the upgrade exchange itself by the same per-proxy connect budget: an
-    // app that accepts the socket but never answers the upgrade must not pin the
-    // request task. A timeout here is pre-wire from the client's perspective —
-    // no 101 was ever sent downstream.
-    let connect_timeout = Duration::from_millis(unix_backend::effective_connect_timeout_ms(
-        proxy.backend_connect_timeout_ms,
-    ));
-    let (stream, response) = match tokio::time::timeout(
-        connect_timeout,
+    // Bound the upgrade exchange by what REMAINS of the same per-proxy connect
+    // budget the admission and connect above already drew on — not by a second
+    // full timeout, which would let one establishment consume roughly twice the
+    // configured setup budget (issue #3764). An app that accepts the socket but
+    // never answers the upgrade must not pin the request task. A timeout here is
+    // pre-wire from the client's perspective — no 101 was ever sent downstream.
+    let (stream, response) = match tokio::time::timeout_at(
+        deadline,
         client_async_with_config(
             ws_request,
             WsActivityIo::new(stream, idle_tracker),
@@ -14333,9 +14353,7 @@ async fn connect_unix_websocket_backend(
         Ok(result) => result?,
         Err(_) => {
             return Err(Box::new(unix_backend::UnixBackendError::ConnectTimeout {
-                timeout_ms: unix_backend::effective_connect_timeout_ms(
-                    proxy.backend_connect_timeout_ms,
-                ),
+                timeout_ms,
             }));
         }
     };
@@ -37048,6 +37066,7 @@ async fn proxy_to_backend(
             proxy_to_backend_unix(
                 state,
                 proxy,
+                upstream_target,
                 socket_path,
                 backend_url,
                 method,
@@ -41323,13 +41342,13 @@ fn unix_backend_error_response(
         error = %err,
         "Unix-socket backend dispatch failed"
     );
-    let status_code = if matches!(
-        error_class,
-        retry::ErrorClass::ConnectionTimeout | retry::ErrorClass::ReadWriteTimeout
-    ) {
-        504
-    } else {
-        502
+    let status_code = match error_class {
+        retry::ErrorClass::ConnectionTimeout | retry::ErrorClass::ReadWriteTimeout => 504,
+        // A gateway-side ceiling, not a backend fault: answer 503 like every
+        // other transport's over-cap refusal (the raw-TCP path included) rather
+        // than a 502 that reads as "the application failed".
+        retry::ErrorClass::BackendConnectionLimit => 503,
+        _ => 502,
     };
     retry::BackendResponse {
         status_code,
@@ -41441,6 +41460,7 @@ pub fn collect_live_unix_target_identities(
 async fn proxy_to_backend_unix(
     state: &ProxyState,
     proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
     socket_path: &str,
     backend_url: &str,
     method: &str,
@@ -41462,10 +41482,22 @@ async fn proxy_to_backend_unix(
     Option<Bytes>,
     Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
+    // The pool resolves the DestinationRule `maxConnections` lane from the
+    // proxy it is handed, so it must be the TARGET-EFFECTIVE clone — the same
+    // convention the direct-H2 and gRPC pools follow. That clone carries the
+    // LB-selected target's dial host/port and, under a `targetPort` remap,
+    // mirrors the service-port policy onto the dial port with `policy_port`
+    // stamped, so the Unix carrier lands on the destination's one shared lane
+    // instead of a second ceiling of its own (issue #3764). Everything else on
+    // this path deliberately keeps using `proxy`: only pool identity and
+    // connection admission are target-effective here.
+    let unix_conn_effective_proxy =
+        resolve_backend_connection_proxy_for_target(proxy, upstream_target);
+    let conn_proxy = unix_conn_effective_proxy.as_ref();
     let mut checkout = match state
         .unix_backend_pool
         .checkout_h1(
-            proxy,
+            conn_proxy,
             socket_path,
             proxy.backend_connect_timeout_ms,
             &state.env_config.mesh_unix_socket_allowed_roots,
@@ -41745,7 +41777,7 @@ async fn proxy_to_backend_unix(
                     checkout = match state
                         .unix_backend_pool
                         .checkout_fresh_h1(
-                            proxy,
+                            conn_proxy,
                             socket_path,
                             proxy.backend_connect_timeout_ms,
                             &state.env_config.mesh_unix_socket_allowed_roots,
@@ -41954,6 +41986,7 @@ async fn proxy_to_backend_unix(
 async fn proxy_to_backend_unix(
     _state: &ProxyState,
     proxy: &Proxy,
+    _upstream_target: Option<&UpstreamTarget>,
     _socket_path: &str,
     _backend_url: &str,
     _method: &str,
@@ -42423,8 +42456,13 @@ async fn proxy_to_backend_mesh_mtls(
     // Concurrent RPCs share one connection's streams, and a closed/GOAWAY
     // carrier is replaced rather than reused.
     let sender_result = if let Some(socket_path) = unix_socket_path {
+        // Target-effective proxy for pool identity and `maxConnections`
+        // admission only — see `proxy_to_backend_unix` (issue #3764). The rest
+        // of this dispatch keeps using `proxy`, so the shared mesh-mTLS body is
+        // unchanged for non-Unix targets.
+        let unix_conn_proxy = resolve_backend_connection_proxy_for_target(proxy, Some(target));
         let dial = state.unix_backend_pool.checkout_h2c(
-            proxy,
+            unix_conn_proxy.as_ref(),
             socket_path,
             proxy.backend_connect_timeout_ms,
             &state.env_config.mesh_unix_socket_allowed_roots,

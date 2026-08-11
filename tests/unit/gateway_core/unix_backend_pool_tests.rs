@@ -23,10 +23,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::Utc;
+use ferrum_edge::backend_conn_limit::{BackendConnectionLimitExceeded, BackendConnectionLimiter};
 use ferrum_edge::config::PoolConfig;
-use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
+use ferrum_edge::config::types::{
+    AuthMode, BackendScheme, DispatchKind, Proxy, ResolvedPortOverride,
+};
 use ferrum_edge::proxy::unix_backend::UnixBackendError;
 use ferrum_edge::proxy::unix_backend_pool::UnixBackendConnectionPool;
+use ferrum_edge::retry::ErrorClass;
 
 /// Accepts every connection and holds it open, counting acceptances so a test
 /// can tell "reused a pooled connection" from "dialed a new one".
@@ -762,15 +766,26 @@ async fn shutdown_drain_latches_the_pool_closed_against_a_late_checkin() {
         .expect("checkout");
     let lease = UnixBackendConnectionPool::streaming_lease(&pool, inflight);
 
-    pool.shutdown_drain();
-    lease.release_on_clean_eof();
+    // Race the late check-in against the drain. `join!` polls the drain first,
+    // so the latch and the carrier retirement are already done when the lease
+    // is released — the exact interleaving the latch exists for. Releasing it
+    // inside the join (rather than after) also lets the checked-out carrier's
+    // driver end, so the drain's bounded reap resolves promptly instead of
+    // spending its whole budget on a connection the test is still holding.
+    tokio::join!(pool.shutdown_drain(), async {
+        lease.release_on_clean_eof();
+    });
 
     // Give a would-be check-in every chance to land before asserting it did not.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let stats = pool.stats();
     assert_eq!(
-        pool.stats().idle_h1_connections,
-        0,
+        stats.idle_h1_connections, 0,
         "a check-in racing the shutdown drain must not repopulate the pool"
+    );
+    assert_eq!(
+        stats.open_physical_connections, 0,
+        "the bounded drain must reap every physical connection driver it owns"
     );
 }
 
@@ -1769,5 +1784,458 @@ async fn a_withdrawn_h2c_target_retains_no_shared_carrier() {
         pool.stats().active_h2c_connections,
         0,
         "a withdrawn h2c identity must retain no shared carrier for the next RPC"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #3764: the DestinationRule ceiling, driver ownership, the single
+// establishment deadline, and the exported metric surface.
+// ---------------------------------------------------------------------------
+
+/// Build a proxy whose destination declares `connectionPool.tcp.maxConnections`
+/// on its dial port, exactly as the target-effective clone that production
+/// dispatch hands the pool would.
+fn capped_proxy(id: &str, cap: u32) -> Proxy {
+    let mut proxy = test_proxy(id);
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        proxy.backend_port,
+        ResolvedPortOverride {
+            max_connections: Some(cap),
+            ..Default::default()
+        },
+    );
+    proxy.dispatch_port_overrides = Some(overrides);
+    proxy
+}
+
+/// A `targetPort`-remapped destination: policy lives on the SERVICE port and is
+/// mirrored onto the dial port with `policy_port` stamped, which is what
+/// `resolve_backend_connection_proxy_for_target` produces. The counter lane must
+/// key on the service port so a Unix carrier shares the destination's one
+/// ceiling instead of opening a second lane on the workload port.
+fn remapped_capped_proxy(id: &str, service_port: u16, cap: u32) -> Proxy {
+    let mut proxy = test_proxy(id);
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        proxy.backend_port,
+        ResolvedPortOverride {
+            max_connections: Some(cap),
+            policy_port: Some(service_port),
+            ..Default::default()
+        },
+    );
+    proxy.dispatch_port_overrides = Some(overrides);
+    proxy
+}
+
+fn capped_pool(limiter: &Arc<BackendConnectionLimiter>) -> Arc<UnixBackendConnectionPool> {
+    let pool = default_pool();
+    pool.attach_backend_conn_limit(Arc::clone(limiter));
+    pool
+}
+
+/// A physical connection is admitted against the destination ceiling, and the
+/// refusal is decided BEFORE `connect(2)` — the backend never accepts a socket
+/// for the request that was refused.
+#[tokio::test]
+async fn a_new_physical_connection_is_refused_at_the_destination_cap() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    let pool = capped_pool(&limiter);
+    let proxy = capped_proxy("unix-pool-cap", 1);
+
+    let held = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("the first physical connection is under the cap");
+    expect_accepts(&peer, 1, "one physical connection so far").await;
+    assert_eq!(
+        limiter.current(&proxy.backend_host, proxy.backend_port),
+        1,
+        "the pooled carrier must hold exactly one destination slot"
+    );
+
+    // The lease is exclusive, so a concurrent checkout is a MISS and needs a
+    // second physical connection — which the cap must refuse.
+    let refused = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await;
+    match refused {
+        Err(UnixBackendError::BackendConnectionLimit(limit)) => {
+            assert_eq!(limit.cap, 1);
+            assert_eq!(limit.current, 1);
+        }
+        other => panic!(
+            "an over-cap dial must be refused with the typed limit error, got {other:?}"
+        ),
+    }
+    let typed = UnixBackendError::BackendConnectionLimit(BackendConnectionLimitExceeded {
+        current: 1,
+        cap: 1,
+    });
+    assert_eq!(
+        typed.error_class(),
+        ErrorClass::BackendConnectionLimit,
+        "an over-cap refusal stays pre-wire and health-neutral"
+    );
+    // Refused BEFORE connect: the peer never saw a second acceptance.
+    expect_accepts(&peer, 1, "an over-cap refusal must not open a socket").await;
+    assert!(
+        pool.stats().checkout_failures >= 1,
+        "a pre-dial refusal is a checkout failure, not a setup failure"
+    );
+
+    drop(held);
+}
+
+/// Reuse of an already-admitted carrier takes NO second slot, so a destination
+/// pinned at `maxConnections: 1` still serves an unbounded number of sequential
+/// requests.
+#[tokio::test]
+async fn reusing_a_pooled_carrier_takes_no_second_connection_slot() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    let pool = capped_pool(&limiter);
+    let proxy = capped_proxy("unix-pool-cap-reuse", 1);
+
+    for _ in 0..3 {
+        let checkout = pool
+            .checkout_h1(
+                &proxy,
+                socket.to_str().expect("utf-8"),
+                proxy.backend_connect_timeout_ms,
+                &roots(&root),
+                &[],
+            )
+            .await
+            .expect("a reused carrier is never re-admitted against the cap");
+        assert_eq!(
+            limiter.current(&proxy.backend_host, proxy.backend_port),
+            1,
+            "reuse must never grow the destination's open-connection count"
+        );
+        pool.checkin_h1(checkout);
+    }
+
+    expect_accepts(&peer, 1, "three sequential requests share one admitted socket").await;
+    let stats = pool.stats();
+    assert_eq!(stats.physical_connects, 1);
+    assert_eq!(stats.hits, 2);
+    assert_eq!(stats.misses, 1);
+}
+
+/// Retiring a carrier releases its slot, and the destination can immediately be
+/// re-dialed. The slot is owned by the CONNECTION's driver, not by the request,
+/// so this also proves the driver ends when the last sender is dropped.
+#[tokio::test]
+async fn retiring_a_carrier_releases_its_slot_for_a_later_dial() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    let pool = capped_pool(&limiter);
+    let proxy = capped_proxy("unix-pool-cap-release", 1);
+
+    let checkout = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("first dial");
+    // Dropping the lease without checking it in retires the connection.
+    drop(checkout);
+
+    // The driver observes the closed connection asynchronously, so wait for the
+    // slot rather than sampling once.
+    for _ in 0..200 {
+        if limiter.current(&proxy.backend_host, proxy.backend_port) == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        limiter.current(&proxy.backend_host, proxy.backend_port),
+        0,
+        "a retired connection must release its destination slot"
+    );
+    assert_eq!(
+        pool.stats().open_physical_connections,
+        0,
+        "the physical-connection gauge must follow the driver's lifetime"
+    );
+
+    pool.checkout_h1(
+        &proxy,
+        socket.to_str().expect("utf-8"),
+        proxy.backend_connect_timeout_ms,
+        &roots(&root),
+        &[],
+    )
+    .await
+    .expect("the freed slot must admit a replacement connection");
+    expect_accepts(&peer, 2, "the replacement is a second physical connection").await;
+}
+
+/// A `targetPort` remap must not split the destination's ceiling: the lane is
+/// keyed by the DestinationRule policy port, so a Unix carrier and any other
+/// transport to the same destination share one counter.
+#[tokio::test]
+async fn a_target_port_remap_admits_on_the_service_policy_port() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = HoldingPeer::bind(&socket);
+    let limiter = Arc::new(BackendConnectionLimiter::new());
+    let pool = capped_pool(&limiter);
+    let service_port = 80u16;
+    let proxy = remapped_capped_proxy("unix-pool-remap", service_port, 2);
+    assert_ne!(
+        proxy.backend_port, service_port,
+        "the fixture must actually exercise a remap"
+    );
+
+    let _held = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("under the cap");
+
+    assert_eq!(
+        limiter.current(&proxy.backend_host, service_port),
+        1,
+        "the slot must be counted on the SERVICE policy port"
+    );
+    assert_eq!(
+        limiter.current(&proxy.backend_host, proxy.backend_port),
+        0,
+        "counting on the workload dial port would give the destination two lanes"
+    );
+}
+
+/// `pool_enable_http_keep_alive = false` is honored literally on HTTP/1.1:
+/// nothing is pooled and nothing is reused, so every request is its own
+/// admitted connection.
+#[tokio::test]
+async fn disabling_keep_alive_stops_http1_connection_reuse() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let mut proxy = test_proxy("unix-pool-no-keepalive");
+    proxy.pool_enable_http_keep_alive = Some(false);
+
+    for _ in 0..2 {
+        let checkout = pool
+            .checkout_h1(
+                &proxy,
+                socket.to_str().expect("utf-8"),
+                proxy.backend_connect_timeout_ms,
+                &roots(&root),
+                &[],
+            )
+            .await
+            .expect("checkout");
+        assert!(
+            !checkout.reused(),
+            "with keep-alive disabled no checkout may come from the idle set"
+        );
+        pool.checkin_h1(checkout);
+        assert_eq!(
+            pool.stats().idle_h1_connections,
+            0,
+            "a check-in must not pool a carrier when keep-alive is disabled"
+        );
+    }
+
+    expect_accepts(&peer, 2, "each request gets its own admitted connection").await;
+    assert_eq!(pool.stats().hits, 0);
+}
+
+/// The default (`None` on the proxy, `true` globally) still reuses, so the flag
+/// is a real switch rather than a permanent downgrade.
+#[tokio::test]
+async fn keep_alive_enabled_by_default_still_reuses() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-default-keepalive");
+    assert!(proxy.pool_enable_http_keep_alive.is_none());
+
+    let first = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("first checkout");
+    pool.checkin_h1(first);
+    let second = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("second checkout");
+    assert!(second.reused());
+    expect_accepts(&peer, 1, "the default posture keeps reusing").await;
+}
+
+/// The exported gauges track the maps they describe across check-out, check-in,
+/// and a config withdrawal — without scanning anything.
+#[tokio::test]
+async fn the_exported_gauges_follow_checkout_checkin_and_withdrawal() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-gauges");
+
+    let checkout = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    let checked_out = pool.stats();
+    assert_eq!(
+        checked_out.idle_h1_connections, 0,
+        "a checked-out carrier is deliberately absent from the idle set"
+    );
+    assert_eq!(
+        checked_out.open_physical_connections, 1,
+        "but it is still an OPEN physical connection"
+    );
+
+    pool.checkin_h1(checkout);
+    let pooled = pool.stats();
+    assert_eq!(pooled.idle_h1_connections, 1);
+    assert_eq!(pooled.open_physical_connections, 1);
+
+    // Withdraw the identity entirely: the idle gauge must return to zero.
+    pool.retain_live_targets(&std::collections::HashSet::new());
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "a withdrawn identity retains no idle carrier, and the gauge must say so"
+    );
+}
+
+/// Admission, connect, protocol handshake, and the peer's SETTINGS preface all
+/// draw on ONE `backend_connect_timeout_ms` budget. A peer that accepts and then
+/// goes silent must therefore fail inside roughly one budget, not two or three.
+#[tokio::test]
+async fn h2c_establishment_spends_one_budget_end_to_end() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    // Accepts and holds the connection without ever speaking h2c.
+    let _peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let mut proxy = test_proxy("unix-pool-one-budget");
+    let budget_ms = 400u64;
+    proxy.backend_connect_timeout_ms = budget_ms;
+
+    let started = std::time::Instant::now();
+    let outcome = pool
+        .checkout_h2c(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(outcome, Err(UnixBackendError::H2HandshakeTimeout { .. })),
+        "a peer that never sends SETTINGS must time out, got {outcome:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(budget_ms * 2),
+        "admission + connect + handshake + preface must share ONE budget; \
+         {elapsed:?} exceeds two budgets of {budget_ms}ms"
+    );
+    assert!(
+        pool.stats().setup_failures >= 1,
+        "a failed establishment is a setup failure"
+    );
+}
+
+/// The WebSocket dial hands back what REMAINS of the one establishment budget,
+/// so the upgrade exchange cannot start a second full timer.
+#[tokio::test]
+async fn the_websocket_dial_returns_the_remainder_of_one_budget() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = HoldingPeer::bind(&socket);
+
+    let budget = std::time::Duration::from_millis(750);
+    let before = tokio::time::Instant::now();
+    let dial = UnixBackendConnectionPool::dial_websocket_stream(
+        socket.to_str().expect("utf-8"),
+        750,
+        &roots(&root),
+        &[],
+    )
+    .await
+    .expect("an admitted websocket carrier");
+
+    assert_eq!(dial.timeout_ms, 750);
+    assert!(
+        dial.deadline <= before + budget,
+        "the returned deadline must be the ORIGINAL budget's end, not a fresh one"
+    );
+    let remaining = dial
+        .deadline
+        .saturating_duration_since(tokio::time::Instant::now());
+    assert!(
+        remaining < budget,
+        "admission and connect already spent part of the budget, so the upgrade \
+         must get strictly less than a full {budget:?}, got {remaining:?}"
     );
 }

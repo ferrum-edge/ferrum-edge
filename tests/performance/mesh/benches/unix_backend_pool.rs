@@ -267,8 +267,12 @@ mod unix_bench {
             pooled_peer.accepts()
         );
 
-        dial_pool.shutdown_drain();
-        pooled_pool.shutdown_drain();
+        // The drain is async: it does not merely drop carriers, it awaits the
+        // physical connection drivers it owns under a bounded budget.
+        runtime.block_on(async {
+            dial_pool.shutdown_drain().await;
+            pooled_pool.shutdown_drain().await;
+        });
     }
 }
 

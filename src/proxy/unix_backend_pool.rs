@@ -8,6 +8,64 @@
 //! establishment deadline. Pooling only removes the repeated `connect(2)` +
 //! protocol handshake, never a check.
 //!
+//! ## One establishment deadline, opened before admission
+//!
+//! `connect_deadline` is called at the TOP of every checkout — before
+//! `admit_and_reconcile`, before the h2c creation-lock wait, before
+//! `connect(2)`, before the protocol handshake and the peer's SETTINGS preface,
+//! and (for WebSocket) before the RFC 6455 upgrade exchange the caller drives.
+//! Every one of those stages is awaited through `timeout_at` on that SAME
+//! absolute `Instant`. No stage derives a second budget from
+//! `backend_connect_timeout_ms`, so an establishment can never consume two (or
+//! three) full setup budgets. A synchronous admission `stat` cannot be
+//! preempted while it executes, but the time it costs is charged all the same:
+//! the next `timeout_at` resolves `Err` immediately once the deadline has
+//! passed. An operator duration the platform clock cannot represent still fails
+//! closed in `connect_deadline` rather than becoming an unbounded wait.
+//!
+//! ## The DestinationRule ceiling
+//!
+//! Issue #3731's pooling must not become a way around
+//! `connectionPool.tcp.maxConnections`. The pool holds the gateway-wide
+//! [`crate::backend_conn_limit::BackendConnectionLimiter`] (installed once by
+//! `ProxyState`) and acquires a slot at the ONE point a new physical connection
+//! is about to be constructed — never on a pool hit, and never per multiplexed
+//! h2c stream. The lane is resolved from the TARGET-EFFECTIVE proxy, so it is
+//! keyed by the LB-selected target's dial host and its exact DestinationRule
+//! POLICY port (including a `targetPort` remap), and a Unix carrier therefore
+//! shares one ceiling with the same destination's WebSocket, raw-TCP, reqwest,
+//! and pooled-H2 connections rather than getting a second one. The guard is
+//! moved into the connection's own driver task, so the slot is held for exactly
+//! the physical connection's lifetime — idle residence included — and released
+//! on handshake failure, close, eviction, withdrawal, drain, and shutdown. An
+//! over-cap refusal is the typed
+//! [`crate::proxy::unix_backend::UnixBackendError::BackendConnectionLimit`]:
+//! decided before `connect(2)`, so no socket is opened and no application byte
+//! is written, and classified pre-wire and health-neutral.
+//!
+//! ## Driver ownership
+//!
+//! Every physical connection's driver future is REGISTERED with the pool
+//! (`UnixDriverTracker`) instead of being detached with a bare
+//! `tokio::spawn`. Dropping the sender maps is not equivalent to the bounded
+//! close/await contract: a carrier checked out into an in-flight exchange, or
+//! cloned into a multiplexed h2c request, is deliberately absent from those
+//! maps and keeps its connection open. `shutdown_drain` therefore latches the
+//! pool closed, drops every pooled carrier, awaits the remaining drivers under
+//! one bounded budget, and aborts whatever is left — no driver task survives
+//! the drain, and the wait cannot be unbounded.
+//!
+//! ## Metrics
+//!
+//! [`UnixBackendConnectionPool::stats`] is the pool's bounded, fixed-cardinality
+//! export: hits, misses, physical connects, identity retirements, setup
+//! failures, pre-dial checkout failures, and the idle / shared-carrier / open
+//! physical-connection gauges. There are no per-target labels, and every field
+//! is one atomic load — the gauges are maintained at each insert/removal and at
+//! each driver spawn/completion, so producing the snapshot never scans a map.
+//! The runtime metrics endpoint publishes it under
+//! `connections.unix_backend_pool`.
+//!
 //! ## Identity is the key
 //!
 //! [`UnixPoolKey`] is a STRUCTURED key, not a formatted string: namespace,
@@ -175,10 +233,22 @@
 //!   `SendRequest::try_send_request` does not wait for readiness, so a sender
 //!   pooled before its dispatcher re-arms would bounce the next request.
 //! * **h2c / native gRPC** — the multiplexable [`MeshMtlsSender`] is cloned per
-//!   request and shared. A closed/GOAWAY carrier fails `is_closed()` /
-//!   `is_ready()` and is replaced on the next checkout; concurrent misses for
-//!   one key are coalesced behind a creation lock bounded by the same
-//!   establishment deadline, so one burst opens one connection rather than N.
+//!   request and shared. A closed or GOAWAY-drained carrier fails `is_closed()`
+//!   and is EVICTED (not merely skipped) on the next checkout, then replaced;
+//!   `is_ready()` is deliberately not consulted, because on an h2 sender it also
+//!   reports transient `MAX_CONCURRENT_STREAMS` backpressure and would discard a
+//!   healthy busy carrier. Concurrent misses for one key are coalesced behind a
+//!   creation lock whose wait draws on the same establishment deadline, so one
+//!   burst opens one connection rather than N.
+//!
+//! ## Keep-alive
+//!
+//! `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` / `Proxy.pool_enable_http_keep_alive` is
+//! honored literally for HTTP/1.1: with it off, a carrier is neither taken from
+//! nor returned to the idle set, so every request gets a freshly admitted
+//! connection. h2c is unaffected — HTTP/2 has no keep-alive negotiation and
+//! stream multiplexing is the transport's defining behavior. See
+//! `UnixBackendConnectionPool::keep_alive_enabled`.
 //!
 //! ## Not pooled: WebSocket
 //!
@@ -188,9 +258,10 @@
 
 #[cfg(unix)]
 mod imp {
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, OnceLock};
 
     use arc_swap::ArcSwapOption;
     use dashmap::DashMap;
@@ -199,17 +270,33 @@ mod imp {
     use tokio::sync::Mutex;
     use tracing::debug;
 
+    use crate::backend_conn_limit::{
+        PooledConnectionAdmission, SharedBackendConnectionGuard, SharedBackendConnectionLimiter,
+    };
     use crate::config::PoolConfig;
     use crate::config::types::Proxy;
     use crate::proxy::body::{ReplayableRequestBody, SizeLimitedIncoming};
     use crate::proxy::hbone_pool::{entry_idle_expired, unix_secs};
     use crate::proxy::mesh_mtls_pool::MeshMtlsSender;
     use crate::proxy::unix_backend::{
-        UnixBackendError, admit_and_connect, connect_admitted, connect_deadline,
-        handshake_unix_h2c_sender,
+        UnixBackendError, UnixConnectionDriver, admit_and_connect, connect_admitted,
+        connect_deadline, handshake_unix_h2c_sender,
     };
     use crate::runtime_metrics::PoolKind;
     use crate::util::unix_socket::AdmittedUnixSocket;
+
+    /// Bounded budget the graceful shutdown gives Unix connection drivers to
+    /// finish after the pool has been latched closed and every pooled carrier
+    /// dropped.
+    ///
+    /// Reached only by a driver whose sender is still held by in-flight work
+    /// that outlived the gateway's own `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget;
+    /// the ordinary case resolves immediately because dropping the last sender
+    /// closes the connection. Anything still running when the budget expires is
+    /// ABORTED, so no driver task is ever leaked past the drain. Deliberately
+    /// not an operator knob: it runs strictly after the operator-configured
+    /// drain and is a backstop, not a policy.
+    const DRIVER_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Request body carried by the pooled HTTP/1.1 Unix sender.
     ///
@@ -333,6 +420,10 @@ mod imp {
         /// stops an exchange that outlived a withdrawal — or a withdrawal
         /// followed by a same-identity re-add — from repopulating the pool.
         generation: u64,
+        /// The effective `pool_enable_http_keep_alive` for the dispatch that
+        /// took this lease, captured at checkout so the check-in (which has no
+        /// `Proxy`) applies the same decision the checkout did.
+        keep_alive: bool,
         pub sender: UnixH1Sender,
     }
 
@@ -340,6 +431,14 @@ mod imp {
         #[inline]
         pub fn reused(&self) -> bool {
             self.reused
+        }
+
+        /// Whether this lease may re-enter the idle set at all. `false` when
+        /// the effective `pool_enable_http_keep_alive` is off.
+        #[inline]
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests read it there.
+        pub fn keep_alive(&self) -> bool {
+            self.keep_alive
         }
 
         /// The publication generation this lease is bound to.
@@ -567,6 +666,166 @@ mod imp {
             .is_ok_and(|meta| meta.dev() == key.dev && meta.ino() == key.ino)
     }
 
+    /// What the tracker holds for one physical connection.
+    enum DriverSlot {
+        /// The driver is running; the handle is what shutdown awaits/aborts.
+        Running(tokio::task::JoinHandle<()>),
+        /// The driver finished before its handle could be registered — the
+        /// spawn/registration race. Consumed by the registration, which then
+        /// stores nothing, so this can never accumulate.
+        FinishedBeforeRegister,
+    }
+
+    /// Structured ownership of every physical Unix backend connection driver
+    /// (issue #3764).
+    ///
+    /// A detached `tokio::spawn` is unreachable: shutdown cannot close it,
+    /// cannot await it, and cannot prove it ended. Dropping the sender maps is
+    /// not equivalent either, because a carrier CHECKED OUT into an in-flight
+    /// exchange — or cloned into a multiplexed h2c request — is deliberately
+    /// absent from those maps and keeps its connection open.
+    ///
+    /// Every driver is therefore registered here at spawn and removed when it
+    /// completes, so [`UnixBackendConnectionPool::shutdown_drain`] can await
+    /// them all under one bounded deadline and abort whatever is left.
+    ///
+    /// The lock is a plain `std::sync::Mutex` held only for map mutation, and
+    /// it is taken exactly twice per PHYSICAL connection (register, finish) —
+    /// never per request. `live` is the O(1) "physical connections currently
+    /// open" gauge, so the metrics surface never scans a map.
+    struct UnixDriverTracker {
+        next_id: AtomicU64,
+        drivers: std::sync::Mutex<HashMap<u64, DriverSlot>>,
+        live: AtomicU64,
+    }
+
+    impl UnixDriverTracker {
+        fn new() -> Self {
+            Self {
+                next_id: AtomicU64::new(0),
+                drivers: std::sync::Mutex::new(HashMap::new()),
+                live: AtomicU64::new(0),
+            }
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, DriverSlot>> {
+            // No panic is reachable inside the critical section (map insert and
+            // remove on integer keys), but the production rule forbids
+            // `unwrap()`, and recovering the map is the correct behavior even if
+            // a future edit did panic: the tracker keeps reaping.
+            self.drivers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        fn live(&self) -> u64 {
+            self.live.load(Ordering::Relaxed)
+        }
+
+        /// Spawn `driver` under tracking. `driver` already owns whatever the
+        /// connection's lifetime must hold (notably the DestinationRule
+        /// `maxConnections` slot), so the slot is released exactly when the
+        /// physical connection ends — handshake failure, close, eviction,
+        /// withdrawal, drain, or shutdown.
+        ///
+        /// An associated function rather than a method because `&Arc<Self>` is
+        /// not a permitted method receiver on stable Rust.
+        fn spawn(tracker: &Arc<Self>, driver: UnixConnectionDriver) {
+            let id = tracker.next_id.fetch_add(1, Ordering::Relaxed);
+            tracker.live.fetch_add(1, Ordering::Relaxed);
+            let owner = Arc::clone(tracker);
+            let handle = tokio::spawn(async move {
+                driver.await;
+                owner.finish(id);
+            });
+            // Registration can lose the race against a driver that finished
+            // immediately, so `finish` leaves a sentinel and this consumes it.
+            let mut drivers = tracker.lock();
+            if drivers.remove(&id).is_some() {
+                return;
+            }
+            drivers.insert(id, DriverSlot::Running(handle));
+        }
+
+        fn finish(&self, id: u64) {
+            self.live.fetch_sub(1, Ordering::Relaxed);
+            let mut drivers = self.lock();
+            if drivers.remove(&id).is_none() {
+                drivers.insert(id, DriverSlot::FinishedBeforeRegister);
+            }
+        }
+
+        fn take_next_running(&self) -> Option<tokio::task::JoinHandle<()>> {
+            let mut drivers = self.lock();
+            let id = drivers.iter().find_map(|(id, slot)| match slot {
+                DriverSlot::Running(_) => Some(*id),
+                DriverSlot::FinishedBeforeRegister => None,
+            })?;
+            match drivers.remove(&id) {
+                Some(DriverSlot::Running(handle)) => Some(handle),
+                other => {
+                    // Cannot happen: the id was just observed as `Running`
+                    // under this same guard. Put anything else back rather than
+                    // dropping it, and report "nothing to await" instead of
+                    // panicking on the shutdown path.
+                    if let Some(slot) = other {
+                        drivers.insert(id, slot);
+                    }
+                    None
+                }
+            }
+        }
+
+        fn abort_all(&self) {
+            let mut drivers = self.lock();
+            for (_, slot) in drivers.drain() {
+                if let DriverSlot::Running(handle) = slot {
+                    handle.abort();
+                }
+            }
+        }
+
+        /// Await every tracked driver, bounded by `budget`; abort the remainder.
+        ///
+        /// Never panics and never waits unbounded: a `JoinError` (including a
+        /// panicked driver) is ignored, and an unrepresentable deadline degrades
+        /// to an immediate abort rather than to an infinite wait.
+        async fn drain(&self, budget: std::time::Duration) {
+            let Some(deadline) = tokio::time::Instant::now().checked_add(budget) else {
+                self.abort_all();
+                return;
+            };
+            while let Some(handle) = self.take_next_running() {
+                let abort = handle.abort_handle();
+                if tokio::time::timeout_at(deadline, handle).await.is_err() {
+                    // The budget is spent. `timeout_at` dropped the handle,
+                    // which only DETACHES the task, so abort it explicitly and
+                    // abort everything still tracked.
+                    abort.abort();
+                    self.abort_all();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// An admitted, connected WebSocket carrier plus the REMAINING share of the
+    /// one establishment budget its upgrade handshake must complete inside.
+    pub struct UnixWebSocketDial {
+        /// The admitted socket identity the connection is bound to. Held by the
+        /// caller for the session; a WebSocket carrier is never pooled.
+        #[allow(dead_code)] // Identity is proven at dial; retained for caller diagnostics/parity.
+        pub admitted: AdmittedUnixSocket,
+        pub stream: tokio::net::UnixStream,
+        /// Absolute end of the ONE `backend_connect_timeout_ms` establishment
+        /// budget. The upgrade exchange must be bounded by this, not by a fresh
+        /// full timeout.
+        pub deadline: tokio::time::Instant,
+        /// The effective millisecond value behind `deadline`, so a timeout can
+        /// be reported with the same number the rest of the transport uses.
+        pub timeout_ms: u64,
+    }
+
     /// Bounded, lock-free-on-hit Unix backend connection manager.
     pub struct UnixBackendConnectionPool {
         pool_config: PoolConfig,
@@ -616,31 +875,66 @@ mod imp {
         /// Allocator for [`IdleH1::id`] / [`SharedH2c::id`].
         next_entry_id: AtomicU64,
         last_prune_unix_secs: AtomicU64,
+        /// Owns every physical connection driver this pool spawned.
+        drivers: Arc<UnixDriverTracker>,
+        /// Shared gateway-wide DestinationRule
+        /// `connectionPool.tcp.maxConnections` counter, installed once by
+        /// `ProxyState`. Unset for focused tests and standalone callers, in
+        /// which case no cap is enforced.
+        backend_conn_limit: OnceLock<SharedBackendConnectionLimiter>,
         hits: AtomicU64,
         misses: AtomicU64,
         physical_connects: AtomicU64,
         identity_retirements: AtomicU64,
         setup_failures: AtomicU64,
+        checkout_failures: AtomicU64,
         withdrawal_fenced_checkins: AtomicU64,
+        /// O(1) gauge of idle HTTP/1.1 carriers resident in [`Self::h1_idle`].
+        /// Maintained at every insert/removal so the metrics surface never
+        /// scans the map. See `Self::note_pooled_removed`.
+        idle_h1_gauge: AtomicU64,
+        /// O(1) gauge of shared h2c carriers resident in
+        /// [`Self::h2c_carriers`].
+        h2c_carrier_gauge: AtomicU64,
     }
 
-    /// Bounded counters for tests and diagnostics. No per-target labels are
-    /// exported, so the metric cardinality of this pool is constant.
+    /// The pool's complete, bounded, FIXED-CARDINALITY accounting surface.
     ///
-    /// Production hot paths publish through `runtime_metrics`; this snapshot is
-    /// the external unit/bench compatibility surface that proves hit/miss,
-    /// identity retirement, and withdrawal-fence accounting without expanding
-    /// Prometheus cardinality.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    #[allow(dead_code)] // Constructed by `stats()` for external unit/bench callers; unused in the binary tree.
+    /// This is what the runtime metrics endpoint exports (issue #3731's
+    /// "export bounded metrics" requirement) and what the external unit and
+    /// bench suites assert. There are deliberately NO per-target labels: one
+    /// snapshot describes the whole pool, so socket churn, pod-IP churn, and
+    /// wildcard routing cannot grow the metric surface.
+    ///
+    /// Every field is an O(1) atomic read. The counters are monotonic; the
+    /// three connection fields are gauges maintained at each insert/removal
+    /// (idle/active carriers) and at each driver spawn/completion (physical
+    /// connections), so no map is ever scanned to produce this.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
     pub struct UnixPoolStats {
+        /// Checkouts served by an already-admitted pooled carrier.
         pub hits: u64,
+        /// Checkouts that had to establish a new physical connection.
         pub misses: u64,
+        /// Physical connections established (admitted, connected, handshaken).
         pub physical_connects: u64,
+        /// Carriers retired because their identity no longer exists: a replaced
+        /// socket object, or a config withdrawal.
         pub identity_retirements: u64,
+        /// Establishment failures: connect, protocol handshake, or the
+        /// establishment deadline expiring.
         pub setup_failures: u64,
+        /// Checkout failures decided BEFORE any dial: path admission refusal
+        /// and `maxConnections` over-cap refusal.
+        pub checkout_failures: u64,
+        /// Idle HTTP/1.1 carriers currently resident in the pool.
         pub idle_h1_connections: u64,
+        /// Shared h2c carriers currently resident in the pool.
         pub active_h2c_connections: u64,
+        /// Physical connections currently open — one per live connection
+        /// driver, including a carrier checked out into an in-flight exchange
+        /// (which is deliberately absent from the idle maps).
+        pub open_physical_connections: u64,
         /// Carriers the withdrawal fence refused to (re)pool because their
         /// lease was bound to an older publication generation — counted both
         /// for a refusal before the insert and for an entry withdrawn after it.
@@ -662,16 +956,76 @@ mod imp {
                 last_config_reconcile_generation: std::sync::Mutex::new(0),
                 next_entry_id: AtomicU64::new(0),
                 last_prune_unix_secs: AtomicU64::new(0),
+                drivers: Arc::new(UnixDriverTracker::new()),
+                backend_conn_limit: OnceLock::new(),
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
                 physical_connects: AtomicU64::new(0),
                 identity_retirements: AtomicU64::new(0),
                 setup_failures: AtomicU64::new(0),
+                checkout_failures: AtomicU64::new(0),
                 withdrawal_fenced_checkins: AtomicU64::new(0),
+                idle_h1_gauge: AtomicU64::new(0),
+                h2c_carrier_gauge: AtomicU64::new(0),
             }
         }
 
-        #[allow(dead_code)] // External unit/bench tests assert pool accounting; binary uses runtime_metrics.
+        /// Install the gateway-wide `connectionPool.tcp.maxConnections` counter
+        /// so a NEW physical Unix connection is admitted against the same
+        /// per-destination ceiling as every other transport Ferrum owns.
+        /// Idempotent; later calls are ignored.
+        pub fn attach_backend_conn_limit(&self, limiter: SharedBackendConnectionLimiter) {
+            let _ = self.backend_conn_limit.set(limiter);
+        }
+
+        /// Resolve the `maxConnections` admission lane for a Unix dial.
+        ///
+        /// `proxy` MUST be the TARGET-EFFECTIVE proxy that
+        /// `resolve_backend_connection_proxy_for_target` produced for the
+        /// LB-selected target — exactly the convention the direct-H2 and gRPC
+        /// pools follow. That clone carries the target's own
+        /// `backend_host`/`backend_port` and, under a `targetPort` remap,
+        /// mirrors the SERVICE-port policy onto the dial port with
+        /// `ResolvedPortOverride::policy_port` stamped. So the lane resolved
+        /// here is keyed by the destination's dial host and its exact
+        /// DestinationRule POLICY port, and a Unix carrier shares one ceiling
+        /// with the same destination's WebSocket, raw-TCP, reqwest, and pooled
+        /// H2 connections instead of getting a lane of its own.
+        ///
+        /// `None` means nothing is capped for this destination: a single
+        /// `Option` check, no map touch, no allocation.
+        fn conn_admission<'a>(&'a self, proxy: &'a Proxy) -> Option<PooledConnectionAdmission<'a>> {
+            PooledConnectionAdmission::resolve(
+                self.backend_conn_limit.get().map(|limiter| &**limiter),
+                proxy,
+                &proxy.backend_host,
+                proxy.backend_port,
+            )
+        }
+
+        /// Reserve one physical-connection slot, or refuse pre-wire.
+        ///
+        /// Called at the ONE point a new physical connection is about to be
+        /// constructed, so reuse of a pooled carrier — an idle H1 hit or another
+        /// stream on a shared h2c carrier — never consumes a slot.
+        fn acquire_conn_slot(
+            &self,
+            proxy: &Proxy,
+        ) -> Result<Option<SharedBackendConnectionGuard>, UnixBackendError> {
+            let Some(admission) = self.conn_admission(proxy) else {
+                return Ok(None);
+            };
+            match admission.acquire() {
+                Ok(guard) => Ok(Some(guard)),
+                Err(limit) => {
+                    self.record_checkout_failure();
+                    Err(UnixBackendError::BackendConnectionLimit(limit))
+                }
+            }
+        }
+
+        /// The exported metric snapshot. O(1): every field is one atomic load,
+        /// so the metrics endpoint never walks the pool's maps.
         pub fn stats(&self) -> UnixPoolStats {
             let fenced = self.withdrawal_fenced_checkins.load(Ordering::Relaxed);
             UnixPoolStats {
@@ -680,18 +1034,35 @@ mod imp {
                 physical_connects: self.physical_connects.load(Ordering::Relaxed),
                 identity_retirements: self.identity_retirements.load(Ordering::Relaxed),
                 setup_failures: self.setup_failures.load(Ordering::Relaxed),
-                idle_h1_connections: self
-                    .h1_idle
-                    .iter()
-                    .map(|entry| entry.value().entries.len() as u64)
-                    .sum(),
-                active_h2c_connections: self
-                    .h2c_carriers
-                    .iter()
-                    .map(|entry| entry.value().entries.len() as u64)
-                    .sum(),
+                checkout_failures: self.checkout_failures.load(Ordering::Relaxed),
+                idle_h1_connections: self.idle_h1_gauge.load(Ordering::Relaxed),
+                active_h2c_connections: self.h2c_carrier_gauge.load(Ordering::Relaxed),
+                open_physical_connections: self.drivers.live(),
                 withdrawal_fenced_checkins: fenced,
             }
+        }
+
+        /// Account for `count` carriers leaving one of the resident maps.
+        ///
+        /// Every removal path funnels through here — checkout pop, idle-ceiling
+        /// eviction, periodic sweep, socket-replacement retirement, config
+        /// withdrawal, fence cleanup — so a gauge cannot drift from the map it
+        /// describes. `saturating_sub` rather than `fetch_sub`: a gauge is a
+        /// diagnostic, and an accounting slip must not underflow into a
+        /// nonsensical `u64::MAX` on an operator's dashboard.
+        #[inline]
+        fn note_pooled_removed(gauge: &AtomicU64, count: u64) {
+            if count == 0 {
+                return;
+            }
+            let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(count))
+            });
+        }
+
+        #[inline]
+        fn note_pooled_added(gauge: &AtomicU64) {
+            gauge.fetch_add(1, Ordering::Relaxed);
         }
 
         /// The current publication generation. Exposed for diagnostics and for
@@ -752,8 +1123,10 @@ mod imp {
         /// Drop every pooled connection, leaving the pool usable.
         ///
         /// A dropped sender ends its driver task once the connection closes, so
-        /// this is a complete retirement of the idle set without a task
-        /// registry.
+        /// this retires the whole idle set. It does NOT wait for those drivers:
+        /// they stay tracked (see `UnixDriverTracker`) and only
+        /// [`Self::shutdown_drain`] awaits and reaps them, under a bounded
+        /// deadline.
         ///
         /// In-flight exchanges are NOT in these maps — an HTTP/1.1 lease is
         /// checked out precisely so that it is not — so clearing the maps
@@ -773,21 +1146,38 @@ mod imp {
             self.h2c_carriers.clear();
             self.h2c_creation_locks.clear();
             self.path_identities.clear();
+            // Both maps are now empty, so the gauges are exactly zero. Storing
+            // rather than decrementing is what keeps them exact across a
+            // wholesale `clear()`, which cannot report how much it removed.
+            self.idle_h1_gauge.store(0, Ordering::Relaxed);
+            self.h2c_carrier_gauge.store(0, Ordering::Relaxed);
         }
 
-        /// Graceful-shutdown drain: retire everything AND latch the pool closed.
+        /// Graceful-shutdown drain: retire everything, latch the pool closed,
+        /// and REAP every physical connection driver under a bounded deadline.
         ///
         /// Called from the bounded shutdown drain of every serving mode, after
         /// accept loops have stopped and in-flight requests have been given
-        /// their `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget. The latch is what makes
-        /// the drain terminal: a streaming response that reaches EOF during the
-        /// final moments of the drain would otherwise check its carrier back
-        /// into a pool nobody will ever drain again. `force_drain_all`'s
-        /// generation bump closes the interleaving the latch alone cannot — a
-        /// check-in that read the latch unset a moment before it was set.
-        pub fn shutdown_drain(&self) {
+        /// their `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget. Three things happen, in
+        /// this order, and all three are load-bearing:
+        ///
+        /// 1. The latch makes the drain terminal: a streaming response that
+        ///    reaches EOF during the final moments of the drain would otherwise
+        ///    check its carrier back into a pool nobody will ever drain again.
+        ///    `force_drain_all`'s generation bump closes the interleaving the
+        ///    latch alone cannot — a check-in that read the latch unset a moment
+        ///    before it was set.
+        /// 2. `force_drain_all` drops every pooled carrier, which closes each
+        ///    connection whose only remaining sender was the pooled one.
+        /// 3. The tracker awaits every driver task that is still running —
+        ///    which, after (2), is exactly the set whose carriers are still held
+        ///    by in-flight work — and ABORTS whatever has not ended when
+        ///    `DRIVER_DRAIN_BUDGET` expires. No driver survives the drain, and
+        ///    the wait is bounded by construction (issue #3764).
+        pub async fn shutdown_drain(&self) {
             self.shutting_down.store(true, Ordering::Release);
             self.force_drain_all();
+            self.drivers.drain(DRIVER_DRAIN_BUDGET).await;
         }
 
         #[inline]
@@ -873,8 +1263,11 @@ mod imp {
             // If a check-in races the tiny bump/store window, the slot walk
             // that follows observes and removes its insertion.
             self.live_targets.store(Some(Arc::new(live.clone())));
-            let retired = retain_live_slots(&self.h1_idle, live, generation)
-                .saturating_add(retain_live_slots(&self.h2c_carriers, live, generation));
+            let retired_h1 = retain_live_slots(&self.h1_idle, live, generation);
+            Self::note_pooled_removed(&self.idle_h1_gauge, retired_h1);
+            let retired_h2c = retain_live_slots(&self.h2c_carriers, live, generation);
+            Self::note_pooled_removed(&self.h2c_carrier_gauge, retired_h2c);
+            let retired = retired_h1.saturating_add(retired_h2c);
             self.h2c_creation_locks
                 .retain(|key, _| live.contains(key.target_identity()));
             // `path_identities` is the replacement memo, not a connection
@@ -923,10 +1316,11 @@ mod imp {
         /// the config verdict here would let a stale-epoch check-in re-create a
         /// reusable slot under a withdrawn identity.
         pub fn retire_socket_path(&self, path: &Path) {
-            let mut retired = 0u64;
+            let mut retired_h1 = 0u64;
+            let mut retired_h2c = 0u64;
             self.h1_idle.retain(|key, slot| {
                 if key.path() == path {
-                    retired = retired.saturating_add(slot.entries.len() as u64);
+                    retired_h1 = retired_h1.saturating_add(slot.entries.len() as u64);
                     slot.entries.clear();
                     slot.withdrawn
                 } else {
@@ -935,15 +1329,18 @@ mod imp {
             });
             self.h2c_carriers.retain(|key, slot| {
                 if key.path() == path {
-                    retired = retired.saturating_add(slot.entries.len() as u64);
+                    retired_h2c = retired_h2c.saturating_add(slot.entries.len() as u64);
                     slot.entries.clear();
                     slot.withdrawn
                 } else {
                     true
                 }
             });
+            Self::note_pooled_removed(&self.idle_h1_gauge, retired_h1);
+            Self::note_pooled_removed(&self.h2c_carrier_gauge, retired_h2c);
             self.h2c_creation_locks.retain(|key, _| key.path() != path);
             self.path_identities.remove(path);
+            let retired = retired_h1.saturating_add(retired_h2c);
             if retired > 0 {
                 self.identity_retirements
                     .fetch_add(retired, Ordering::Relaxed);
@@ -957,6 +1354,33 @@ mod imp {
             proxy
                 .pool_idle_timeout_seconds
                 .unwrap_or(self.pool_config.idle_timeout_seconds)
+        }
+
+        /// Whether HTTP/1.1 connection reuse is enabled for this dispatch.
+        ///
+        /// `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` (globally) and
+        /// `Proxy.pool_enable_http_keep_alive` (per proxy, taking precedence —
+        /// the same precedence `idle_timeout_seconds` uses) are documented as
+        /// "enable HTTP keep-alive for backend connection reuse". On this
+        /// transport that is applied literally: with keep-alive OFF an HTTP/1.1
+        /// carrier is never taken from the idle set and never returned to it, so
+        /// every request gets a freshly admitted connection that is closed when
+        /// its exchange ends.
+        ///
+        /// Scope is HTTP/1.1 only, deliberately. "Keep-alive" is an HTTP/1.1
+        /// concept: on the reqwest transport this same flag installs a TCP
+        /// keepalive socket option and never disables reuse, and a Unix-domain
+        /// socket has no TCP keepalive to configure — so honoring the documented
+        /// reuse meaning is the only reading that gives the flag any effect
+        /// here. h2c is NOT affected: HTTP/2 has no keep-alive/close negotiation
+        /// and multiplexing an RPC onto an existing connection is the
+        /// transport's defining behavior, not a keep-alive optimization. See
+        /// `docs/configuration.md`.
+        #[inline]
+        fn keep_alive_enabled(&self, proxy: &Proxy) -> bool {
+            proxy
+                .pool_enable_http_keep_alive
+                .unwrap_or(self.pool_config.enable_http_keep_alive)
         }
 
         /// Idle-connection ceiling per identity. Concurrency is bounded
@@ -1005,8 +1429,11 @@ mod imp {
             }
 
             let idle_timeout = self.pool_config.idle_timeout_seconds;
-            let evicted = prune_slots(&self.h1_idle, idle_timeout, now)
-                .saturating_add(prune_slots(&self.h2c_carriers, idle_timeout, now));
+            let evicted_h1 = prune_slots(&self.h1_idle, idle_timeout, now);
+            Self::note_pooled_removed(&self.idle_h1_gauge, evicted_h1);
+            let evicted_h2c = prune_slots(&self.h2c_carriers, idle_timeout, now);
+            Self::note_pooled_removed(&self.h2c_carrier_gauge, evicted_h2c);
+            let evicted = evicted_h1.saturating_add(evicted_h2c);
             if evicted > 0 {
                 crate::runtime_metrics::global_ref()
                     .record_pool_evictions(PoolKind::UnixBackend, evicted);
@@ -1038,6 +1465,7 @@ mod imp {
                 allowed_roots,
                 allowed_uids,
             )
+            .inspect_err(|_| self.record_checkout_failure())
             .map_err(UnixBackendError::InadmissiblePath)?;
             let live = (admitted.device_id(), admitted.inode(), admitted.owner_uid());
             let path = admitted.resolved_path();
@@ -1064,7 +1492,15 @@ mod imp {
         ///
         /// Cancellation-safe: there is no queueing wait. A hit returns
         /// immediately; a miss dials and handshakes inside ONE establishment
-        /// deadline shared with the admission that preceded it.
+        /// deadline that is created BEFORE admission, so path admission,
+        /// connect, and the client handshake all draw on the same budget rather
+        /// than admission being free (issue #3764).
+        ///
+        /// `proxy` must be the target-effective proxy — see
+        /// `Self::conn_admission`. A MISS additionally admits against the
+        /// destination's DestinationRule `maxConnections` ceiling; a hit never
+        /// does, so a saturated destination still serves every request that can
+        /// ride an already-admitted connection.
         pub async fn checkout_h1(
             &self,
             proxy: &Proxy,
@@ -1074,20 +1510,39 @@ mod imp {
             allowed_uids: &[u32],
         ) -> Result<UnixH1Checkout, UnixBackendError> {
             self.maybe_prune_idle();
+            // ONE budget for the whole establishment, opened before the
+            // synchronous admission `stat`s: a slow filesystem cannot be
+            // preempted mid-syscall, but the time it costs is charged here and
+            // every later await is bounded by this same absolute deadline.
+            let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
             // Read the generation BEFORE admission and the dial, so a
             // publication that lands anywhere between here and the check-in
             // fences this lease out of the pool.
             let generation = self.publication_generation.load(Ordering::Acquire);
+            let keep_alive = self.keep_alive_enabled(proxy);
             let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
             let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
 
-            if let Some(checkout) = self.take_idle_h1(&key, &admitted, proxy) {
+            // With keep-alive disabled there is nothing to reuse by contract,
+            // so do not even look: the idle set is empty for this identity
+            // because no lease of it is ever checked back in.
+            if keep_alive
+                && let Some(checkout) = self.take_idle_h1(&key, &admitted, proxy, keep_alive)
+            {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(checkout);
             }
             self.misses.fetch_add(1, Ordering::Relaxed);
-            self.dial_h1(key, admitted, connect_timeout_ms, generation)
-                .await
+            self.dial_h1(
+                proxy,
+                key,
+                admitted,
+                deadline,
+                timeout_ms,
+                generation,
+                keep_alive,
+            )
+            .await
         }
 
         /// Force a fresh physical HTTP/1.1 connection, bypassing the idle set.
@@ -1095,7 +1550,8 @@ mod imp {
         /// Used for exactly one replay when a REUSED lease failed pre-wire — the
         /// classic idle keep-alive race, where the backend closed the connection
         /// between check-in and the next request. The admission gate runs again
-        /// in full.
+        /// in full, inside its own single establishment deadline, and the new
+        /// physical connection takes its own `maxConnections` slot.
         pub async fn checkout_fresh_h1(
             &self,
             proxy: &Proxy,
@@ -1104,23 +1560,41 @@ mod imp {
             allowed_roots: &[String],
             allowed_uids: &[u32],
         ) -> Result<UnixH1Checkout, UnixBackendError> {
+            let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
             let generation = self.publication_generation.load(Ordering::Acquire);
+            let keep_alive = self.keep_alive_enabled(proxy);
             let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
             let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
             self.misses.fetch_add(1, Ordering::Relaxed);
-            self.dial_h1(key, admitted, connect_timeout_ms, generation)
-                .await
+            self.dial_h1(
+                proxy,
+                key,
+                admitted,
+                deadline,
+                timeout_ms,
+                generation,
+                keep_alive,
+            )
+            .await
         }
 
+        #[allow(clippy::too_many_arguments)]
         async fn dial_h1(
             &self,
+            proxy: &Proxy,
             key: UnixPoolKey,
             admitted: AdmittedUnixSocket,
-            connect_timeout_ms: u64,
+            deadline: tokio::time::Instant,
+            timeout_ms: u64,
             generation: u64,
+            keep_alive: bool,
         ) -> Result<UnixH1Checkout, UnixBackendError> {
-            let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
-            let connect = connect_admitted(&admitted, connect_timeout_ms);
+            // The DestinationRule ceiling is decided BEFORE `connect(2)`: an
+            // over-cap refusal opens no socket and writes no application byte,
+            // and it is typed so the dispatch path answers with a pre-wire,
+            // health-neutral refusal rather than charging the app.
+            let conn_slot = self.acquire_conn_slot(proxy)?;
+            let connect = connect_admitted(&admitted, deadline, timeout_ms);
             let stream = match tokio::time::timeout_at(deadline, connect).await {
                 Ok(result) => result.inspect_err(|_| self.record_setup_failure())?,
                 Err(_) => {
@@ -1142,16 +1616,25 @@ mod imp {
                     return Err(UnixBackendError::ConnectTimeout { timeout_ms });
                 }
             };
-            // The driver is owned by the sender's lifetime: it resolves when the
-            // connection closes, which happens as soon as the last sender for it
-            // is dropped. Pool drain / `ProxyState` replacement therefore ends
-            // these tasks deterministically without a detached generation
-            // registry.
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    debug!("unix_backend_pool: h1 connection closed: {}", e);
-                }
-            });
+            // The driver task OWNS the connection's whole lifetime, and with it
+            // the `maxConnections` slot: the guard moves in here and is released
+            // exactly when the physical connection ends — idle residence,
+            // in-flight use, close, eviction, withdrawal, drain, and shutdown
+            // all included. Every failure arm above returns with `conn_slot`
+            // still on the stack, so a handshake failure releases it too.
+            //
+            // The driver is registered with the pool's tracker rather than
+            // detached, so shutdown can close and reap it under a bounded
+            // deadline (issue #3764).
+            UnixDriverTracker::spawn(
+                &self.drivers,
+                Box::pin(async move {
+                    let _conn_slot = conn_slot;
+                    if let Err(e) = connection.await {
+                        debug!("unix_backend_pool: h1 connection closed: {}", e);
+                    }
+                }),
+            );
             self.physical_connects.fetch_add(1, Ordering::Relaxed);
             crate::runtime_metrics::global_ref().record_pool_handshake(PoolKind::UnixBackend);
 
@@ -1160,6 +1643,7 @@ mod imp {
                 admitted,
                 reused: false,
                 generation,
+                keep_alive,
                 sender,
             })
         }
@@ -1179,6 +1663,7 @@ mod imp {
             key: &UnixPoolKey,
             expected: &AdmittedUnixSocket,
             proxy: &Proxy,
+            keep_alive: bool,
         ) -> Option<UnixH1Checkout> {
             let idle_timeout = self.idle_timeout_seconds(proxy);
             let now = unix_secs();
@@ -1188,6 +1673,9 @@ mod imp {
                 let mut slot = self.h1_idle.get_mut(key)?;
                 let generation = self.publication_generation.load(Ordering::Acquire);
                 while let Some(entry) = slot.entries.pop() {
+                    // Every `pop` removes a resident carrier, whether it is
+                    // taken, fenced out, or dropped as unusable.
+                    Self::note_pooled_removed(&self.idle_h1_gauge, 1);
                     if !Self::identity_intact(&entry.admitted, expected) {
                         // The path no longer names the admitted object. Drop
                         // this guard first, then retire everything for the
@@ -1231,6 +1719,7 @@ mod imp {
                         admitted: entry.admitted,
                         reused: true,
                         generation,
+                        keep_alive,
                         sender: entry.sender,
                     });
                     break;
@@ -1277,9 +1766,13 @@ mod imp {
                 admitted,
                 reused: _,
                 generation,
+                keep_alive,
                 sender,
             } = checkout;
-            if sender.is_closed() || self.is_shutting_down() {
+            // Keep-alive off: the carrier served its one exchange and is
+            // retired here. Dropping the sender closes the connection, which
+            // ends its driver and releases its `maxConnections` slot.
+            if !keep_alive || sender.is_closed() || self.is_shutting_down() {
                 return;
             }
             // Fence, first read. A publication that already completed retired
@@ -1320,9 +1813,11 @@ mod imp {
                         // which is the one most likely to have been reaped by
                         // the peer.
                         slot.entries.remove(0);
+                        Self::note_pooled_removed(&self.idle_h1_gauge, 1);
                         crate::runtime_metrics::global_ref()
                             .record_pool_eviction(PoolKind::UnixBackend);
                     }
+                    Self::note_pooled_added(&self.idle_h1_gauge);
                     slot.entries.push(IdleH1 {
                         id: entry_id,
                         generation: AtomicU64::new(generation),
@@ -1350,6 +1845,7 @@ mod imp {
             if self.publication_generation.load(Ordering::Acquire) != generation
                 && withdraw_slot_entry(&self.h1_idle, &key, entry_id)
             {
+                Self::note_pooled_removed(&self.idle_h1_gauge, 1);
                 self.record_fenced_carriers(1);
             }
         }
@@ -1376,7 +1872,9 @@ mod imp {
         /// An associated function rather than a method because `&Arc<Self>` is
         /// not a permitted method receiver on stable Rust.
         pub fn checkin_h1_when_idle(pool: &Arc<Self>, mut checkout: UnixH1Checkout) {
-            if checkout.sender.is_closed() || pool.is_shutting_down() {
+            // Keep-alive off retires the carrier here rather than parking a
+            // waiter task for a connection that may never be pooled.
+            if !checkout.keep_alive || checkout.sender.is_closed() || pool.is_shutting_down() {
                 return;
             }
             // Fence early so a lease whose incarnation is already retired is
@@ -1463,6 +1961,10 @@ mod imp {
         ) -> Result<MeshMtlsSender, UnixBackendError> {
             let (before_publish, after_publish) = publish_seams;
             self.maybe_prune_idle();
+            // ONE budget, opened before admission — and therefore before the
+            // creation-lock wait too, so a queue behind a wedged app cannot
+            // start its own fresh timer (issue #3764).
+            let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
             // Same fence as the H1 lease: a dial can straddle a publication, so
             // the generation is captured before admission and re-checked after
             // the carrier is published into the shared map.
@@ -1475,7 +1977,6 @@ mod imp {
                 return Ok(sender);
             }
 
-            let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
             let lock = self
                 .h2c_creation_locks
                 .entry(key.clone())
@@ -1497,7 +1998,11 @@ mod imp {
             }
             self.misses.fetch_add(1, Ordering::Relaxed);
 
-            let connect = connect_admitted(&admitted, connect_timeout_ms);
+            // Pre-`connect(2)` ceiling, exactly as on the H1 cold path. Reuse of
+            // a shared carrier returned above without reaching this line, so an
+            // arbitrary number of multiplexed RPCs still ride one admitted slot.
+            let conn_slot = self.acquire_conn_slot(proxy)?;
+            let connect = connect_admitted(&admitted, deadline, timeout_ms);
             let stream = match tokio::time::timeout_at(deadline, connect).await {
                 Ok(result) => result.inspect_err(|_| self.record_setup_failure())?,
                 Err(_) => {
@@ -1505,9 +2010,18 @@ mod imp {
                     return Err(UnixBackendError::ConnectTimeout { timeout_ms });
                 }
             };
-            let sender = handshake_unix_h2c_sender(stream, deadline, timeout_ms)
+            let (sender, driver) = handshake_unix_h2c_sender(stream, deadline, timeout_ms)
                 .await
                 .inspect_err(|_| self.record_setup_failure())?;
+            // Structured ownership of the h2c driver, and with it the
+            // `maxConnections` slot, for the physical connection's whole life.
+            UnixDriverTracker::spawn(
+                &self.drivers,
+                Box::pin(async move {
+                    let _conn_slot = conn_slot;
+                    driver.await;
+                }),
+            );
             self.physical_connects.fetch_add(1, Ordering::Relaxed);
             crate::runtime_metrics::global_ref().record_pool_handshake(PoolKind::UnixBackend);
 
@@ -1529,9 +2043,11 @@ mod imp {
                 } else {
                     while slot.entries.len() >= max_idle {
                         slot.entries.remove(0);
+                        Self::note_pooled_removed(&self.h2c_carrier_gauge, 1);
                         crate::runtime_metrics::global_ref()
                             .record_pool_eviction(PoolKind::UnixBackend);
                     }
+                    Self::note_pooled_added(&self.h2c_carrier_gauge);
                     slot.entries.push(SharedH2c {
                         id: entry_id,
                         generation: AtomicU64::new(generation),
@@ -1555,6 +2071,7 @@ mod imp {
             if self.publication_generation.load(Ordering::Acquire) != generation
                 && withdraw_slot_entry(&self.h2c_carriers, &key, entry_id)
             {
+                Self::note_pooled_removed(&self.h2c_carrier_gauge, 1);
                 self.record_fenced_carriers(1);
             }
             Ok(sender)
@@ -1593,6 +2110,23 @@ mod imp {
         /// generation is read under the map guard and a carrier published under
         /// a superseded generation is never multiplexed onto, even in the
         /// window between a fenced publish and its own cleanup.
+        ///
+        /// ## GOAWAY and closed carriers
+        ///
+        /// `is_closed()` is the liveness gate — `is_ready()` is deliberately NOT
+        /// consulted, because on an HTTP/2 sender it also reports transient
+        /// `MAX_CONCURRENT_STREAMS` backpressure, so a healthy but busy carrier
+        /// would be discarded and replaced with a second physical connection
+        /// under exactly the load the pool exists to serve. A GOAWAY does reach
+        /// `is_closed()`: hyper's client dispatcher stops accepting new requests
+        /// once the h2 connection refuses to open further streams, which closes
+        /// the dispatch channel the flag reads.
+        ///
+        /// A carrier observed closed is REMOVED here rather than merely skipped
+        /// (issue #3764). Skipping alone left the dead entry resident until the
+        /// next periodic sweep, so every checkout in between re-walked it and
+        /// the shared slot could stay permanently occupied by corpses while the
+        /// per-identity ceiling refused to admit a replacement.
         fn take_shared_h2c(
             &self,
             key: &UnixPoolKey,
@@ -1602,9 +2136,10 @@ mod imp {
             let idle_timeout = self.idle_timeout_seconds(proxy);
             let now = unix_secs();
             let mut retire = false;
+            let mut evicted = 0u64;
             let mut selected = None;
             {
-                let slot = self.h2c_carriers.get(key)?;
+                let mut slot = self.h2c_carriers.get_mut(key)?;
                 let generation = self.publication_generation.load(Ordering::Acquire);
                 for entry in slot.entries.iter() {
                     if !Self::identity_intact(&entry.admitted, expected) {
@@ -1625,6 +2160,27 @@ mod imp {
                     selected = Some(entry.sender.clone());
                     break;
                 }
+                if !retire {
+                    // Reclaim carriers that can never serve another RPC. A
+                    // superseded-generation entry is left alone: the withdrawal
+                    // fence owns that lifecycle and its own cleanup withdraws it
+                    // by id, so removing it here would race that.
+                    let before = slot.entries.len();
+                    slot.entries.retain(|entry| {
+                        !entry.sender.is_closed()
+                            && !entry_idle_expired(
+                                entry.last_used_at.load(Ordering::Relaxed),
+                                idle_timeout,
+                                now,
+                            )
+                    });
+                    evicted = before.saturating_sub(slot.entries.len()) as u64;
+                }
+            }
+            if evicted > 0 {
+                Self::note_pooled_removed(&self.h2c_carrier_gauge, evicted);
+                crate::runtime_metrics::global_ref()
+                    .record_pool_evictions(PoolKind::UnixBackend, evicted);
             }
             if retire {
                 let path = expected.resolved_path().to_path_buf();
@@ -1640,6 +2196,15 @@ mod imp {
             crate::runtime_metrics::global_ref().record_pool_failure(PoolKind::UnixBackend);
         }
 
+        /// A checkout refused BEFORE any dial: path admission, or the
+        /// destination's `maxConnections` ceiling. Distinct from a setup
+        /// failure, which is a connection that was attempted and failed.
+        #[inline]
+        fn record_checkout_failure(&self) {
+            self.checkout_failures.fetch_add(1, Ordering::Relaxed);
+            crate::runtime_metrics::global_ref().record_pool_failure(PoolKind::UnixBackend);
+        }
+
         /// Dedicated admitted dial for an RFC 6455 WebSocket upgrade
         /// (issue #3732).
         ///
@@ -1648,19 +2213,36 @@ mod imp {
         /// owner/mode/type, inode identity, and peer-UID verification all
         /// complete inside the single establishment deadline and BEFORE the
         /// caller writes the first upgrade byte.
+        ///
+        /// The REMAINDER of that one deadline is returned with the stream, and
+        /// the caller must bound the RFC 6455 upgrade exchange with it rather
+        /// than starting a second timer (issue #3764): admission + connect +
+        /// upgrade is one establishment, so it gets one `connect_timeout_ms`
+        /// budget in total, not one per stage.
         pub async fn dial_websocket_stream(
             socket_path: &str,
             connect_timeout_ms: u64,
             allowed_roots: &[String],
             allowed_uids: &[u32],
-        ) -> Result<(AdmittedUnixSocket, tokio::net::UnixStream), UnixBackendError> {
+        ) -> Result<UnixWebSocketDial, UnixBackendError> {
             let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
-            let connect =
-                admit_and_connect(socket_path, connect_timeout_ms, allowed_roots, allowed_uids);
-            match tokio::time::timeout_at(deadline, connect).await {
-                Ok(result) => result,
-                Err(_) => Err(UnixBackendError::ConnectTimeout { timeout_ms }),
-            }
+            let connect = admit_and_connect(
+                socket_path,
+                deadline,
+                timeout_ms,
+                allowed_roots,
+                allowed_uids,
+            );
+            let (admitted, stream) = match tokio::time::timeout_at(deadline, connect).await {
+                Ok(result) => result?,
+                Err(_) => return Err(UnixBackendError::ConnectTimeout { timeout_ms }),
+            };
+            Ok(UnixWebSocketDial {
+                admitted,
+                stream,
+                deadline,
+                timeout_ms,
+            })
         }
     }
 }
@@ -1697,15 +2279,17 @@ mod imp {
         pub protocol: UnixWireProtocol,
     }
 
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
     pub struct UnixPoolStats {
         pub hits: u64,
         pub misses: u64,
         pub physical_connects: u64,
         pub identity_retirements: u64,
         pub setup_failures: u64,
+        pub checkout_failures: u64,
         pub idle_h1_connections: u64,
         pub active_h2c_connections: u64,
+        pub open_physical_connections: u64,
         pub withdrawal_fenced_checkins: u64,
     }
 
@@ -1714,6 +2298,14 @@ mod imp {
     impl UnixBackendConnectionPool {
         pub fn new(_pool_config: PoolConfig, _shard_amount: usize) -> Self {
             Self
+        }
+
+        /// Parity with the Unix build. Nothing dials here, so no connection is
+        /// ever admitted against the shared ceiling.
+        pub fn attach_backend_conn_limit(
+            &self,
+            _limiter: crate::backend_conn_limit::SharedBackendConnectionLimiter,
+        ) {
         }
 
         /// Mirrors the Unix build's accessor. Nothing is ever pooled here, so
@@ -1725,7 +2317,9 @@ mod imp {
 
         pub fn force_drain_all(&self) {}
 
-        pub fn shutdown_drain(&self) {}
+        /// Parity with the Unix build's bounded driver reap. There are no
+        /// drivers on this platform, so it completes immediately.
+        pub async fn shutdown_drain(&self) {}
 
         pub fn retain_live_targets_for_publication(
             &self,
