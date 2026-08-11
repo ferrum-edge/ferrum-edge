@@ -581,6 +581,7 @@ impl MeshExtAuthzExecutor {
     }
 
     /// Whether this generation carries `provider_name` at all.
+    #[allow(dead_code)] // external integration-test seam; unused in the binary target
     pub fn binds(&self, provider_name: &str) -> bool {
         self.providers.contains_key(provider_name)
     }

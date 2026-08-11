@@ -971,8 +971,12 @@ mod live_datapath {
 
     #[test]
     fn a_workload_selected_by_two_distinct_providers_is_refused_at_construction() {
-        let error = plugin(slice_json(9000, Some("other-ext-authz"), false))
-            .expect_err("Istio permits at most one extension provider per workload");
+        // Match rather than `expect_err`: MeshAuthz intentionally omits Debug,
+        // and Result::expect_err requires Debug on the success type.
+        let error = match plugin(slice_json(9000, Some("other-ext-authz"), false)) {
+            Ok(_) => panic!("Istio permits at most one extension provider per workload"),
+            Err(error) => error,
+        };
         assert!(
             error.contains("more than one"),
             "the refusal must state the contract: {error}"

@@ -1278,6 +1278,7 @@ impl MeshAuthz {
     /// Used by direct-config / test construction. A generation built this way
     /// cannot execute an Istio `action: CUSTOM` delegation, so a matched CUSTOM
     /// rule DENIES rather than falling through — same contract as the L4 path.
+    #[allow(dead_code)] // external integration/unit-test construction seam; unused in the binary target
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::new_with_http_client(config, None)
     }

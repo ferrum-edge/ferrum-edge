@@ -19,10 +19,12 @@ pub(crate) struct MeshConfigProviderRegistry {
     tracing_providers: HashMap<String, TracingProvider>,
     /// extensionProvider names declared in meshConfig that Ferrum does not
     /// translate to a tracing provider — either non-tracing types
-    /// (`envoyExtAuthzHttp`, `prometheus`, future Istio additions) or a
-    /// recognised tracing key Ferrum can't yet emit. Tracked so Telemetry
-    /// resolution can distinguish "name not in meshConfig" from
-    /// "name in meshConfig but not a tracing type Ferrum supports".
+    /// (`prometheus`, `stackdriver`, future Istio additions), admitted
+    /// `envoyExtAuthzHttp` providers (which are tracked separately for CUSTOM
+    /// authz but are still "not tracing"), or a recognised tracing key Ferrum
+    /// can't yet emit. Tracked so Telemetry resolution can distinguish "name
+    /// not in meshConfig" from "name in meshConfig but not a tracing type
+    /// Ferrum supports".
     non_tracing_provider_names: HashSet<String>,
     default_tracing_provider_names: Vec<String>,
     /// Admitted `envoyExtAuthzHttp` providers, keyed by `name` (issue #3235).
@@ -262,11 +264,12 @@ fn collect_default_providers(value: &Value, parsed: &mut ParsedMeshConfig) -> Re
 
 /// Outcome of classifying a single `meshConfig.extensionProviders[]` entry.
 /// `Tracing` carries a translated provider; `NonTracing` means the entry has a
-/// recognisable shape (e.g., `envoyExtAuthzHttp`, `prometheus`, `stackdriver`,
-/// a future Istio tracing key Ferrum doesn't translate, or a typo'd block
-/// name) so the registry can still remember the *name* and let Telemetry
-/// resolution distinguish "name not declared" from "name declared but Ferrum
-/// can't translate it as tracing".
+/// recognisable non-tracing/non-ext-authz shape (e.g., `prometheus`,
+/// `stackdriver`, a future Istio tracing key Ferrum doesn't translate, or a
+/// typo'd block name) so the registry can still remember the *name* and let
+/// Telemetry resolution distinguish "name not declared" from "name declared
+/// but Ferrum can't translate it as tracing". `envoyExtAuthzHttp` is
+/// `ExtAuthz`, not `NonTracing`.
 enum ExtensionProviderKind {
     Tracing(TracingProvider),
     /// An admitted `envoyExtAuthzHttp` external authorization provider
@@ -852,13 +855,16 @@ extensionProviders:
 
     #[test]
     fn skips_non_tracing_extension_providers() {
+        // Use a genuinely non-tracing, non-ext-authz provider kind. An
+        // `envoyExtAuthzHttp` entry is no longer "skipped" — issue #3235
+        // admits it as CUSTOM authz config and fail-closes plaintext
+        // non-loopback HTTP — so this fixture must stay on an unrelated
+        // extensionProviders shape.
         let parsed = parse(
             r#"
 extensionProviders:
-- name: ext-authz
-  envoyExtAuthzHttp:
-    service: authz.default.svc.cluster.local
-    port: 9000
+- name: prometheus
+  prometheus: {}
 "#,
         );
 
@@ -867,7 +873,11 @@ extensionProviders:
             "non-tracing providers must not enter tracing registry"
         );
         assert!(
-            parsed.registry.is_known_non_tracing_provider("ext-authz"),
+            parsed.registry.ext_authz_providers.is_empty(),
+            "non-ext-authz providers must not enter the ext-authz registry"
+        );
+        assert!(
+            parsed.registry.is_known_non_tracing_provider("prometheus"),
             "non-tracing provider name must be remembered so Telemetry resolution \
              can distinguish 'name not declared' from 'declared but not tracing'"
         );
