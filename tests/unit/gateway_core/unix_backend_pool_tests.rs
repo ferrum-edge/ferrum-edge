@@ -252,7 +252,12 @@ async fn an_outstanding_http1_lease_is_exclusive() {
         !concurrent.reused(),
         "an outstanding lease must never be handed to a second caller"
     );
-    expect_accepts(&peer, 2, "an exclusive lease forces a second physical connection").await;
+    expect_accepts(
+        &peer,
+        2,
+        "an exclusive lease forces a second physical connection",
+    )
+    .await;
     drop(held);
     drop(concurrent);
 }
@@ -512,5 +517,467 @@ async fn h2c_checkout_fails_closed_when_the_peer_never_speaks_http2() {
     assert!(
         pool.stats().setup_failures >= 1,
         "a failed establishment must be counted as a pool setup failure"
+    );
+}
+
+/// Accepts every connection and immediately closes it, so the client side sees
+/// a peer hangup on a connection it believes is idle.
+struct ClosingPeer {
+    accepts: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ClosingPeer {
+    fn bind(path: &Path) -> Self {
+        let listener = tokio::net::UnixListener::bind(path).expect("bind unix socket");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_task = Arc::clone(&accepts);
+        let task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        accepts_task.fetch_add(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        Self { accepts, task }
+    }
+
+    fn accepts(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for ClosingPeer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Poll until `condition` holds or the bounded attempts run out.
+async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
+    for _ in 0..200 {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{what}");
+}
+
+/// A STREAMING response's carrier is returned to the idle pool when — and only
+/// when — its body reaches clean end-of-stream. This is the #3731 contract the
+/// `ProxyBody` terminal arm invokes.
+#[tokio::test]
+async fn a_streaming_lease_returns_the_carrier_on_clean_eof() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-streaming-eof");
+
+    let checkout = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    let lease = UnixBackendConnectionPool::streaming_lease(&pool, checkout);
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "a lease held by a streaming body must NOT be in the idle set"
+    );
+
+    lease.release_on_clean_eof();
+    wait_until(
+        || pool.stats().idle_h1_connections == 1,
+        "a clean end-of-stream must return the carrier to the idle pool",
+    )
+    .await;
+
+    let reused = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout after the streaming body completed");
+    assert!(
+        reused.reused(),
+        "the carrier returned at end-of-stream must be the one handed to the next request"
+    );
+    expect_accepts(
+        &peer,
+        1,
+        "streaming reuse must not open a second connection",
+    )
+    .await;
+}
+
+/// Every abnormal streaming terminal — body error, client disconnect, an early
+/// body drop, a fired deadline, shutdown — reaches the pool as a DROPPED lease.
+/// A dropped lease must retire its carrier, never pool it.
+#[tokio::test]
+async fn a_streaming_lease_dropped_before_eof_retires_the_carrier() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-streaming-abort");
+
+    let checkout = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    let lease = UnixBackendConnectionPool::streaming_lease(&pool, checkout);
+    drop(lease);
+
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "a lease dropped before end-of-stream must never enter the idle set"
+    );
+    let next = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout after the aborted stream");
+    assert!(
+        !next.reused(),
+        "an aborted streaming exchange must not leave a reusable connection behind"
+    );
+    expect_accepts(
+        &peer,
+        2,
+        "the aborted carrier is retired, so the next request dials",
+    )
+    .await;
+}
+
+/// A peer that hangs up on an idle pooled connection must never have that
+/// connection handed to a later request.
+#[tokio::test]
+async fn a_carrier_closed_by_the_peer_is_never_reused() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = ClosingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-peer-close");
+
+    let lease = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    pool.checkin_h1(lease);
+
+    // The hangup is observed by hyper's connection driver, not synchronously by
+    // the check-in, so converge on it: keep returning the lease to the pool
+    // until a checkout stops reporting reuse. Once the driver marks the sender
+    // closed, both `checkin_h1` and `take_idle_h1` drop it and the next checkout
+    // is a freshly admitted dial.
+    let mut observed_fresh_dial = false;
+    for _ in 0..200 {
+        let lease = pool
+            .checkout_h1(
+                &proxy,
+                socket.to_str().expect("utf-8"),
+                proxy.backend_connect_timeout_ms,
+                &roots(&root),
+                &[],
+            )
+            .await
+            .expect("checkout while the peer hangup propagates");
+        if !lease.reused() {
+            observed_fresh_dial = true;
+            break;
+        }
+        pool.checkin_h1(lease);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        observed_fresh_dial,
+        "a connection the peer closed must be evicted, not handed out"
+    );
+    wait_until(
+        || peer.accepts() >= 2,
+        "a closed carrier forces a freshly admitted dial",
+    )
+    .await;
+}
+
+/// Graceful shutdown is terminal: a response body that reaches end-of-stream
+/// during the drain must retire its carrier rather than repopulate a pool that
+/// nobody will drain again.
+#[tokio::test]
+async fn shutdown_drain_latches_the_pool_closed_against_a_late_checkin() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-shutdown");
+
+    let inflight = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    let lease = UnixBackendConnectionPool::streaming_lease(&pool, inflight);
+
+    pool.shutdown_drain();
+    lease.release_on_clean_eof();
+
+    // Give a would-be check-in every chance to land before asserting it did not.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "a check-in racing the shutdown drain must not repopulate the pool"
+    );
+}
+
+/// Config publication must retire carriers whose target no longer exists, and
+/// must leave live ones alone. Exact identity comparison, never substring.
+#[tokio::test]
+async fn retain_live_targets_retires_only_withdrawn_unix_targets() {
+    use ferrum_edge::proxy::unix_backend_pool::{UnixTargetIdentity, UnixWireProtocol};
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let kept_socket = root.join("kept.sock");
+    let withdrawn_socket = root.join("withdrawn.sock");
+    let _kept_peer = HoldingPeer::bind(&kept_socket);
+    let _withdrawn_peer = HoldingPeer::bind(&withdrawn_socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-reload");
+
+    for socket in [&kept_socket, &withdrawn_socket] {
+        let lease = pool
+            .checkout_h1(
+                &proxy,
+                socket.to_str().expect("utf-8"),
+                proxy.backend_connect_timeout_ms,
+                &roots(&root),
+                &[],
+            )
+            .await
+            .expect("checkout");
+        pool.checkin_h1(lease);
+    }
+    assert_eq!(pool.stats().idle_h1_connections, 2);
+
+    let mut live = std::collections::HashSet::new();
+    live.insert(UnixTargetIdentity {
+        namespace: proxy.namespace.clone(),
+        proxy_id: proxy.id.clone(),
+        upstream_id: proxy.upstream_id.clone(),
+        configured_path: kept_socket.to_str().expect("utf-8").to_string(),
+        protocol: UnixWireProtocol::Http1,
+    });
+    pool.retain_live_targets(&live);
+
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        1,
+        "publication must retire exactly the carrier whose target was withdrawn"
+    );
+    let kept = pool
+        .checkout_h1(
+            &proxy,
+            kept_socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout on the surviving target");
+    assert!(
+        kept.reused(),
+        "a target that is still published must keep its pooled carrier"
+    );
+    let withdrawn = pool
+        .checkout_h1(
+            &proxy,
+            withdrawn_socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout on the re-added target");
+    assert!(
+        !withdrawn.reused(),
+        "a withdrawn target must not leave a reusable carrier behind"
+    );
+}
+
+/// A protocol flip on the SAME path is a different identity, so the previous
+/// carrier must be retired by publication rather than silently kept alive.
+#[tokio::test]
+async fn retain_live_targets_retires_a_protocol_flip_on_the_same_path() {
+    use ferrum_edge::proxy::unix_backend_pool::{UnixTargetIdentity, UnixWireProtocol};
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-protocol-flip");
+
+    let lease = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("checkout");
+    pool.checkin_h1(lease);
+
+    // The same path, the same proxy — but the listener now declares h2c.
+    let mut live = std::collections::HashSet::new();
+    live.insert(UnixTargetIdentity {
+        namespace: proxy.namespace.clone(),
+        proxy_id: proxy.id.clone(),
+        upstream_id: proxy.upstream_id.clone(),
+        configured_path: socket.to_str().expect("utf-8").to_string(),
+        protocol: UnixWireProtocol::H2c,
+    });
+    pool.retain_live_targets(&live);
+
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "an http -> http2 flip must retire the HTTP/1.1 carrier admitted under the old protocol"
+    );
+}
+
+/// Accepts, completes the HTTP/2 connection preface with a well-formed empty
+/// `SETTINGS` frame, holds the connection briefly, then closes it — the shape a
+/// local app takes when it drains an h2c connection (GOAWAY / close) while the
+/// gateway still has the multiplexed carrier pooled.
+struct SettingsThenClosePeer {
+    accepts: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SettingsThenClosePeer {
+    fn bind(path: &Path, hold: std::time::Duration) -> Self {
+        let listener = tokio::net::UnixListener::bind(path).expect("bind unix socket");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_task = Arc::clone(&accepts);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                accepts_task.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+
+                    // RFC 9113 §6.5: length 0, type 0x4 (SETTINGS), no flags,
+                    // stream 0. Structurally valid and semantically empty.
+                    const EMPTY_SETTINGS: [u8; 9] = [0, 0, 0, 0x4, 0, 0, 0, 0, 0];
+                    if stream.write_all(&EMPTY_SETTINGS).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(hold).await;
+                    drop(stream);
+                });
+            }
+        });
+        Self { accepts, task }
+    }
+
+    fn accepts(&self) -> usize {
+        self.accepts.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SettingsThenClosePeer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// An h2c carrier that the application closed must be replaced on the next
+/// checkout rather than handed out again. The multiplexed sender is shared, so
+/// a dead one would otherwise fail every concurrent RPC riding it.
+#[tokio::test]
+async fn a_closed_h2c_carrier_is_replaced_on_the_next_checkout() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = SettingsThenClosePeer::bind(&socket, std::time::Duration::from_millis(400));
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-h2c-close");
+
+    // Converge rather than assume timing: keep checking out until the pool has
+    // had to establish a SECOND physical connection, which can only happen once
+    // the first carrier is observed closed. A checkout that fails because the
+    // peer closed mid-handshake is fine — the next accept opens a fresh window.
+    let mut replaced = false;
+    for _ in 0..300 {
+        let _ = pool
+            .checkout_h2c(
+                &proxy,
+                socket.to_str().expect("utf-8"),
+                proxy.backend_connect_timeout_ms,
+                &roots(&root),
+                &[],
+            )
+            .await;
+        if pool.stats().physical_connects >= 2 {
+            replaced = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        replaced,
+        "a closed h2c carrier must be evicted and re-established, not reused"
+    );
+    assert!(
+        peer.accepts() >= 2,
+        "the replacement must be a freshly admitted physical connection"
     );
 }

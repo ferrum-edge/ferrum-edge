@@ -17437,6 +17437,11 @@ async fn shutdown_and_join_mesh(
         crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
             .await;
     }
+    // Release backend transport pools that hold kernel objects (issue #3731).
+    // On a sidecar this is the pool of admitted connections to the co-located
+    // application's Unix ingress sockets; leaving one idle keeps the app's
+    // listener busy after the data plane has stopped serving.
+    proxy_state.drain_transport_pools_for_shutdown();
 
     if let Some(handle) = tasks.dns_retry_handle {
         tasks.handles.push(handle);

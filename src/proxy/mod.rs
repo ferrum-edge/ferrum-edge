@@ -6710,6 +6710,24 @@ impl ProxyState {
         }
     }
 
+    /// Terminal drain of transport pools that own kernel objects the graceful
+    /// shutdown must release deterministically (issue #3731).
+    ///
+    /// Called by every serving mode from inside the existing bounded shutdown
+    /// sequence — after accept loops stop and after in-flight requests have had
+    /// their `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget — so it never shortens the
+    /// drain and never races a request that is still being served.
+    ///
+    /// Only the sidecar-ingress Unix pool participates today: it is the one
+    /// pool holding file descriptors on co-located application sockets, where a
+    /// lingering idle connection keeps the app's listener busy after the
+    /// gateway believes it has stopped. `shutdown_drain` also latches the pool
+    /// closed, so a streaming response that reaches EOF in the last moments of
+    /// the drain retires its carrier instead of re-pooling it.
+    pub fn drain_transport_pools_for_shutdown(&self) {
+        self.unix_backend_pool.shutdown_drain();
+    }
+
     /// Install CP-delivered trust bundles for gateway-to-mesh TLS.
     ///
     /// If the gateway already has a source-loaded SVID, rebuild the SVID bundle
@@ -10574,6 +10592,19 @@ impl ProxyState {
         };
         let proxy_plugin_rebuild_count = proxy_plugin_rebuild_count.get();
 
+        // --- UnixBackendConnectionPool: retire withdrawn/changed Unix targets ---
+        //
+        // `ProxyState` (and therefore this pool) outlives a config swap, so a
+        // withdrawn `mesh.unix_socket` target would otherwise leave reusable
+        // carriers behind. Rebuild the exact set of identities the NEWLY
+        // PUBLISHED config declares and retire everything else. Exact tuple
+        // equality on `(namespace, proxy id, upstream id, configured path, wire
+        // protocol)` — never substring or prefix matching, which on a
+        // security-sensitive retirement both under- and over-retires. One pass
+        // per publication, never per request.
+        self.unix_backend_pool
+            .retain_live_targets(&collect_live_unix_target_identities(&new_config));
+
         // --- CircuitBreakerCache: prune breakers for deleted proxies ---
         if !delta.removed_proxy_ids.is_empty() {
             self.circuit_breaker_cache.prune(&delta.removed_proxy_ids);
@@ -14241,10 +14272,9 @@ async fn connect_unix_websocket_backend(
     // app that accepts the socket but never answers the upgrade must not pin the
     // request task. A timeout here is pre-wire from the client's perspective —
     // no 101 was ever sent downstream.
-    let connect_timeout =
-        Duration::from_millis(unix_backend::effective_connect_timeout_ms(
-            proxy.backend_connect_timeout_ms,
-        ));
+    let connect_timeout = Duration::from_millis(unix_backend::effective_connect_timeout_ms(
+        proxy.backend_connect_timeout_ms,
+    ));
     let (stream, response) = match tokio::time::timeout(
         connect_timeout,
         client_async_with_config(
@@ -34121,7 +34151,20 @@ async fn handle_proxy_request_inner(
                 }
             }
         }
-        ResponseBody::StreamingH2(resp) => {
+        ResponseBody::StreamingH2(mut resp) => {
+            // Issue #3731: a sidecar-ingress Unix HTTP/1.1 dispatch parks its
+            // exclusive connection lease in the response extensions. Take it
+            // BEFORE `resp.into_body()` (which drops the extension map) and
+            // re-attach it to the OUTERMOST client-visible body below, so the
+            // carrier is owned for the whole stream — through the coalescer,
+            // the size limiter, the inspector bridge, and any deadline wrapper
+            // — and is returned only on that body's clean end-of-stream. Every
+            // other dispatch path leaves this `None` and pays one `Option`
+            // check per streaming response.
+            let pooled_backend_lease = resp
+                .extensions_mut()
+                .remove::<crate::proxy::body::PooledBackendLeaseSlot>()
+                .and_then(|slot| slot.take());
             // `cl` is the gateway's internal size decision input (the
             // large-response coalescer bypass); `advertised_cl` is the only one
             // the body may expose as an exact size hint, which hyper would
@@ -34310,6 +34353,11 @@ async fn handle_proxy_request_inner(
                 if streaming_h2_native_grpc {
                     body = body.with_grpc_trailer_backend_dispatch_classification();
                 }
+            }
+            // Outermost, so the lease outlives every adapter above it and its
+            // release is anchored to the terminal frame the CLIENT sees.
+            if let Some(lease) = pooled_backend_lease {
+                body = body.with_pooled_backend_lease(lease);
             }
             body
         }
@@ -41250,6 +41298,67 @@ fn unix_backend_error_response(
     }
 }
 
+/// Every `mesh.unix_socket` target identity a published config declares.
+///
+/// The input to [`unix_backend_pool::UnixBackendConnectionPool::retain_live_targets`]
+/// (issue #3731). Anything pooled whose identity is absent from this set no
+/// longer exists in configuration and must not serve another request: a
+/// withdrawn target, a deleted proxy or upstream, a proxy re-bound to a
+/// different namespace or upstream, a changed `mesh.unix_socket` path, or an
+/// `http` ⇄ `http2` protocol flip.
+///
+/// A target whose wire-protocol carrier is missing or malformed is deliberately
+/// OMITTED rather than defaulted: `resolve_unix_socket_target` refuses such a
+/// target at dispatch, so it can never own a pooled carrier, and inventing a
+/// protocol for it here would be the silent downgrade the transport gate
+/// exists to prevent.
+///
+/// Runs once per config publication that carries a resource delta, never on the
+/// request path.
+pub fn collect_live_unix_target_identities(
+    config: &GatewayConfig,
+) -> std::collections::HashSet<unix_backend_pool::UnixTargetIdentity> {
+    use unix_backend_pool::{UnixTargetIdentity, UnixWireProtocol};
+
+    let mut upstreams_by_key: HashMap<(&str, &str), &crate::config::types::Upstream> =
+        HashMap::with_capacity(config.upstreams.len());
+    for upstream in &config.upstreams {
+        upstreams_by_key.insert((upstream.namespace.as_str(), upstream.id.as_str()), upstream);
+    }
+
+    let mut live = std::collections::HashSet::new();
+    for proxy in &config.proxies {
+        let Some(upstream_id) = proxy.upstream_id.as_deref() else {
+            continue;
+        };
+        let Some(upstream) = upstreams_by_key.get(&(proxy.namespace.as_str(), upstream_id)) else {
+            continue;
+        };
+        for target in &upstream.targets {
+            let Some(path) = target.tags.get(unix_backend::MESH_UNIX_SOCKET_TAG) else {
+                continue;
+            };
+            let protocol = match target
+                .tags
+                .get(unix_backend::MESH_UNIX_SOCKET_H2C_TAG)
+                .map(String::as_str)
+            {
+                Some("true") => UnixWireProtocol::H2c,
+                Some("false") => UnixWireProtocol::Http1,
+                _ => continue,
+            };
+            live.insert(UnixTargetIdentity {
+                namespace: proxy.namespace.clone(),
+                proxy_id: proxy.id.clone(),
+                upstream_id: proxy.upstream_id.clone(),
+                configured_path: path.clone(),
+                protocol,
+            });
+        }
+    }
+    live
+}
+
 /// HTTP-family dispatch to a co-located Unix-domain STREAM socket
 /// (Istio `Sidecar` `ingress[].defaultEndpoint: unix:///path`).
 ///
@@ -41260,9 +41369,13 @@ fn unix_backend_error_response(
 ///
 /// **Pooled.** Idle HTTP/1.1 senders are retained per admitted socket identity
 /// (canonical path + device/inode/owner + proxy identity). A socket replacement
-/// retires the pool key before any further request byte is written. Streaming
-/// responses keep the exclusive lease for the response lifetime (not returned);
-/// buffered responses return the sender for keep-alive reuse.
+/// retires the pool key before any further request byte is written.
+///
+/// Both response shapes return the carrier for keep-alive reuse, and both do so
+/// only after the ENTIRE response body has been read. A buffered response reads
+/// it here; a streaming response hands the lease to the client-visible
+/// `ProxyBody`, which returns it on clean end-of-stream and drops it (retiring
+/// the connection) on every other terminal.
 ///
 /// **HTTP/1.1 only.** This function serves an `http`-declared listener. An
 /// `http2` / `https` / `grpc`-declared listener carries the
@@ -41649,20 +41762,43 @@ async fn proxy_to_backend_unix(
 
     if stream_response {
         // A streaming response hands the body out of this function, so this
-        // function cannot observe when the last body byte is read — and hyper's
+        // function cannot itself observe the last body byte — and hyper's
         // HTTP/1.1 readiness signal is NOT that observation: `can_write_head()`
         // is already true while a response body is still being read, so awaiting
         // `SendRequest::ready()` here would re-pool the connection mid-body and
         // let the next request pipeline onto it. Checking in after headers but
         // before the body is exactly the H1 pooling bug this contract forbids.
         //
-        // So a streaming response keeps a DEDICATED connection: the lease is
-        // dropped, which tells hyper "no further requests" and closes the
-        // connection once this in-flight response finishes. Pooling for
-        // streaming H1 responses needs an EOF-anchored lease handoff through
-        // `ResponseBody`, which is a follow-up rather than something to
-        // approximate unsafely here.
-        drop(checkout);
+        // So the lease travels WITH the body (issue #3731). Two cases:
+        //
+        // 1. hyper already knows there is no body to read (`is_end_stream()` —
+        //    a 204/304, a `HEAD` response, a `Content-Length: 0`). The exchange
+        //    is complete right here, so check the carrier in directly.
+        // 2. Otherwise the lease is wrapped as a `PooledBackendLease` and
+        //    carried in the response's extensions to the streaming-body builder,
+        //    which anchors it to the client-visible `ProxyBody`. That body
+        //    returns it from exactly one place — clean `Poll::Ready(None)` —
+        //    and drops it (retiring the connection) on a body error, a client
+        //    disconnect, an early drop, a fired deadline, or shutdown.
+        //
+        // If the response never reaches the body builder (an `after_proxy`
+        // reject replaces it, say), the extension drops with the response and
+        // the connection is retired. Every failure direction is fail-closed.
+        let mut response = response;
+        if http_body::Body::is_end_stream(response.body()) {
+            unix_backend_pool::UnixBackendConnectionPool::checkin_h1_when_idle(
+                &state.unix_backend_pool,
+                checkout,
+            );
+        } else {
+            let lease = unix_backend_pool::UnixBackendConnectionPool::streaming_lease(
+                &state.unix_backend_pool,
+                checkout,
+            );
+            response
+                .extensions_mut()
+                .insert(body::PooledBackendLeaseSlot::new(lease));
+        }
         (
             retry::BackendResponse {
                 status_code: status,

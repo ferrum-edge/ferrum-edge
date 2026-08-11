@@ -642,8 +642,7 @@ pub const WS_BACKEND_TLS_SNI_UNSUPPORTED: &str = "WebSocket backend dial refused
 /// the wire protocol the listener declared is exactly the fail-open the Unix
 /// transport gate exists to prevent. Gateway-side and pre-dial, so it classifies
 /// as `DispatchPolicyRejected`: non-retryable and neutral to backend health.
-pub const WS_UNIX_H2C_EXTENDED_CONNECT_UNSUPPORTED: &str =
-    "WebSocket backend dial refused: RFC 8441 Extended CONNECT over an h2c unix-socket ingress \
+pub const WS_UNIX_H2C_EXTENDED_CONNECT_UNSUPPORTED: &str = "WebSocket backend dial refused: RFC 8441 Extended CONNECT over an h2c unix-socket ingress \
      carrier is not supported";
 
 /// Pre-dial refusal for a WebSocket upgrade to a `mesh.unix_socket` target whose

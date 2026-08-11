@@ -7,9 +7,14 @@ use ferrum_edge::_test_support::{
     DirectH2UploadGateForTest, UploadCancelSignalForTest, direct_h2_upload_gate_for_test,
     poll_upload_cancel_for_test, proxy_body_streaming_for_test, request_body_drop_outcome_for_test,
 };
-use ferrum_edge::proxy::body::{ProxyBody, RequestBodyOutcome, StreamingMetrics};
+use ferrum_edge::proxy::body::{
+    PooledBackendLease, ProxyBody, ProxyBodyError, RequestBodyOutcome, StreamingMetrics,
+};
 use http_body::{Body, Frame};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 // ── ProxyBody constructors ────────────────────────────────────────────────
@@ -569,4 +574,179 @@ async fn proxy_body_grpc_message_counter_ignores_hostile_declared_length() {
         .with_grpc_message_counter(Arc::clone(&counter));
     let _ = body.collect().await.expect("collect hostile body");
     assert_eq!(counter.load(Ordering::Acquire), 0);
+}
+
+// ── Pooled backend lease anchoring (issue #3731) ──────────────────────────
+//
+// A sidecar-ingress Unix HTTP/1.1 dispatch leases a physical connection
+// EXCLUSIVELY for one exchange and hands that lease to the streaming response
+// body. The body is the only thing that can observe the last backend byte, so
+// it owns the release decision: return the carrier on clean end-of-stream,
+// retire it (by dropping the lease) on anything else. These tests pin that
+// decision without needing a live Unix socket.
+
+/// Records which of the two lease exits fired.
+#[derive(Default)]
+struct LeaseOutcome {
+    released: AtomicUsize,
+    dropped: AtomicUsize,
+}
+
+impl LeaseOutcome {
+    fn released(&self) -> usize {
+        self.released.load(Ordering::SeqCst)
+    }
+
+    fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::SeqCst)
+    }
+}
+
+struct CountingLease(Arc<LeaseOutcome>);
+
+impl PooledBackendLease for CountingLease {
+    fn release_on_clean_eof(self: Box<Self>) {
+        self.0.released.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Drop for CountingLease {
+    fn drop(&mut self) {
+        self.0.dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Yields `remaining` DATA frames and then either ends cleanly or fails, so a
+/// test can drive each terminal the pool has to distinguish.
+struct ScriptedStream {
+    remaining: usize,
+    fail_at_end: bool,
+}
+
+impl Body for ScriptedStream {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.remaining > 0 {
+            this.remaining -= 1;
+            return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"chunk")))));
+        }
+        if this.fail_at_end {
+            return Poll::Ready(Some(Err("backend stream failed".into())));
+        }
+        Poll::Ready(None)
+    }
+}
+
+fn leased_scripted_body(
+    frames: usize,
+    fail_at_end: bool,
+    outcome: &Arc<LeaseOutcome>,
+) -> ProxyBody {
+    let stream = ScriptedStream {
+        remaining: frames,
+        fail_at_end,
+    };
+    let lease = Box::new(CountingLease(Arc::clone(outcome)));
+    proxy_body_streaming_for_test(Box::pin(stream)).with_pooled_backend_lease(lease)
+}
+
+async fn poll_once(body: &mut ProxyBody) -> Option<Result<Frame<Bytes>, ProxyBodyError>> {
+    std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await
+}
+
+#[tokio::test]
+async fn pooled_backend_lease_is_released_on_clean_end_of_stream() {
+    let outcome = Arc::new(LeaseOutcome::default());
+    let mut body = leased_scripted_body(3, false, &outcome);
+
+    while poll_once(&mut body).await.is_some() {}
+
+    assert_eq!(
+        outcome.released(),
+        1,
+        "a fully-read streaming body must return its pooled carrier exactly once"
+    );
+}
+
+#[tokio::test]
+async fn pooled_backend_lease_is_not_released_before_end_of_stream() {
+    let outcome = Arc::new(LeaseOutcome::default());
+    let mut body = leased_scripted_body(3, false, &outcome);
+
+    // Two DATA frames read; the body is not finished.
+    for _ in 0..2 {
+        assert!(
+            poll_once(&mut body).await.is_some(),
+            "the scripted body still has data"
+        );
+    }
+    assert_eq!(
+        outcome.released(),
+        0,
+        "the carrier must never be returned while the response body is still streaming"
+    );
+
+    // The client goes away mid-body.
+    drop(body);
+    assert_eq!(
+        outcome.released(),
+        0,
+        "a body abandoned mid-stream must not return its carrier"
+    );
+    assert_eq!(
+        outcome.dropped(),
+        1,
+        "the lease must drop instead, which retires the physical connection"
+    );
+}
+
+#[tokio::test]
+async fn pooled_backend_lease_is_retired_when_the_body_errors() {
+    let outcome = Arc::new(LeaseOutcome::default());
+    let mut body = leased_scripted_body(1, true, &outcome);
+
+    let mut saw_error = false;
+    for _ in 0..3 {
+        match poll_once(&mut body).await {
+            Some(Err(_)) => {
+                saw_error = true;
+                break;
+            }
+            Some(Ok(_)) => continue,
+            None => break,
+        }
+    }
+    assert!(saw_error, "the scripted body must surface its failure");
+    assert_eq!(
+        outcome.released(),
+        0,
+        "a body error leaves the carrier in an unknown framing state; it must not be pooled"
+    );
+    assert_eq!(
+        outcome.dropped(),
+        1,
+        "the errored exchange retires its carrier at the error, not at body drop"
+    );
+}
+
+#[tokio::test]
+async fn pooled_backend_lease_is_retired_when_the_body_is_never_polled() {
+    let outcome = Arc::new(LeaseOutcome::default());
+    let body = leased_scripted_body(3, false, &outcome);
+
+    // hyper decided not to stream this response at all. The backend body was
+    // never drained, so the carrier's framing state is unknown: fail closed.
+    drop(body);
+    assert_eq!(
+        outcome.released(),
+        0,
+        "a never-polled streaming body must not return its carrier"
+    );
+    assert_eq!(outcome.dropped(), 1);
 }

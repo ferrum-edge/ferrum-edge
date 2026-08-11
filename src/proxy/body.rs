@@ -129,6 +129,67 @@ pub struct ProxyBody {
     /// ordinary response body. `GrpcBody` contains an `Incoming` or mpsc
     /// receiver and must not inflate the proxy hot-path response envelope.
     _held_frontend_grpc_upload: Option<Box<crate::proxy::grpc_proxy::GrpcBody>>,
+    /// Exclusive backend-connection lease whose return to its idle pool is
+    /// anchored to THIS body's terminal frame (issue #3731).
+    ///
+    /// Set only by the sidecar-ingress Unix HTTP/1.1 dispatch, which leases a
+    /// physical connection exclusively for one request/response exchange. The
+    /// lease may be returned only after a clean end-of-stream — `poll_frame`
+    /// releases it in the `Ready(None)` arm and NOWHERE else. Every other
+    /// terminal (body error, client disconnect, early drop, timeout, abort,
+    /// deadline expiry, shutdown) leaves it in place, so the field's own `Drop`
+    /// retires the physical connection. Fail-closed by construction: forgetting
+    /// to release costs one reused connection, never a mid-body handoff.
+    ///
+    /// `None` on every other dispatch path, so this is one pointer-sized
+    /// `Option` on the ordinary response envelope.
+    pooled_backend_lease: Option<Box<dyn PooledBackendLease>>,
+}
+
+/// An exclusive backend-connection lease held by a streaming response body
+/// until the body reaches a terminal state (issue #3731).
+///
+/// Implemented by [`crate::proxy::unix_backend_pool`]'s HTTP/1.1 lease guard.
+/// The contract has exactly two outcomes:
+///
+/// * [`Self::release_on_clean_eof`] — the body yielded `Ready(None)`, so the
+///   entire response body was read and the carrier may re-enter the idle pool
+///   (after the implementation confirms the wire dispatcher re-armed).
+/// * `Drop` without that call — anything else. The implementation MUST retire
+///   the connection rather than pool it.
+pub trait PooledBackendLease: Send + 'static {
+    /// Clean end-of-stream observed on the client-visible body. Consumes the
+    /// lease; the implementation decides whether the carrier is still healthy
+    /// enough to pool.
+    fn release_on_clean_eof(self: Box<Self>);
+}
+
+/// Transport for a [`PooledBackendLease`] from a backend dispatch function to
+/// the response-body builder, carried in `http::Extensions` on the backend
+/// `hyper::Response`.
+///
+/// `Extensions::insert` requires `Clone + Send + Sync`, which a lease itself is
+/// not, so the lease lives behind an `Arc<Mutex<Option<..>>>`. Only one clone
+/// is ever created (the insert), and [`Self::take`] moves the lease out at the
+/// single consumption site. If the response is discarded before that site — an
+/// `after_proxy` plugin replacing the body, a reject, a panic — the last `Arc`
+/// drops the lease and the connection is retired, which is the fail-closed
+/// direction.
+#[derive(Clone)]
+pub struct PooledBackendLeaseSlot(Arc<std::sync::Mutex<Option<Box<dyn PooledBackendLease>>>>);
+
+impl PooledBackendLeaseSlot {
+    pub fn new(lease: Box<dyn PooledBackendLease>) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(lease))))
+    }
+
+    /// Move the lease out. Returns `None` if it was already taken.
+    pub fn take(&self) -> Option<Box<dyn PooledBackendLease>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
 }
 
 #[derive(Clone)]
@@ -551,6 +612,7 @@ impl ProxyBody {
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
             _held_frontend_grpc_upload: None,
+            pooled_backend_lease: None,
         }
     }
 
@@ -579,6 +641,7 @@ impl ProxyBody {
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
             _held_frontend_grpc_upload: None,
+            pooled_backend_lease: None,
         }
     }
 
@@ -682,6 +745,19 @@ impl ProxyBody {
         guard: super::LoadBalancerConnectionGuard,
     ) -> Self {
         self._lb_connection_guard = Some(guard);
+        self
+    }
+
+    /// Anchor an exclusive pooled backend-connection lease to this body's
+    /// terminal frame (issue #3731).
+    ///
+    /// Must be applied to the OUTERMOST client-visible body so the lease
+    /// outlives every inner adapter (coalescer, size limiter, inspector bridge,
+    /// deadline wrapper). The lease is returned to its pool only from the
+    /// `Ready(None)` arm of [`ProxyBody::poll_frame`]; every other exit drops
+    /// it, which retires the physical connection.
+    pub fn with_pooled_backend_lease(mut self, lease: Box<dyn PooledBackendLease>) -> Self {
+        self.pooled_backend_lease = Some(lease);
         self
     }
 
@@ -952,6 +1028,7 @@ impl ProxyBody {
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
             _held_frontend_grpc_upload: None,
+            pooled_backend_lease: None,
         }
     }
 
@@ -1268,6 +1345,10 @@ impl http_body::Body for ProxyBody {
                 }
                 this.record_deferred_backend_admission(Some(class), disconnected);
                 this.record_deferred_backend_dispatch(Some(class), disconnected);
+                // A body error leaves the backend carrier in an unknown framing
+                // state. Drop the lease so the connection is retired, never
+                // pooled (issue #3731).
+                this.pooled_backend_lease = None;
             }
             Poll::Ready(None) => {
                 if let Some(logger) = this.logger.take() {
@@ -1277,6 +1358,17 @@ impl http_body::Body for ProxyBody {
                 let terminal_class = client_deadline_fired.then_some(ErrorClass::ClientDisconnect);
                 this.record_deferred_backend_admission(terminal_class, client_deadline_fired);
                 this.record_deferred_backend_dispatch(terminal_class, client_deadline_fired);
+                // THE one place a pooled backend lease may be returned: the
+                // client-visible body reached clean end-of-stream, which can
+                // only happen after the inner backend body yielded its own
+                // `Ready(None)`. A synthesized client-deadline terminal is NOT
+                // a backend EOF — the backend stream was abandoned mid-body —
+                // so that case falls through to the drop-retires path.
+                if let Some(lease) = this.pooled_backend_lease.take()
+                    && !client_deadline_fired
+                {
+                    lease.release_on_clean_eof();
+                }
             }
             Poll::Pending => {}
         }
@@ -1302,6 +1394,12 @@ impl http_body::Body for ProxyBody {
 }
 
 impl Drop for ProxyBody {
+    /// Note on `pooled_backend_lease` (issue #3731): this `Drop` deliberately
+    /// does NOT release it. If the field is still populated here, the body
+    /// never reached a clean `Ready(None)` — client disconnect, hyper
+    /// abandoning the stream, a shutdown cancel, or a response hyper chose not
+    /// to poll at all — so the exclusive HTTP/1.1 carrier is in an unknown
+    /// framing state. Letting the field drop with the struct retires it.
     fn drop(&mut self) {
         let mut deferred_admission_error_class = None;
         let mut deferred_admission_client_disconnected = false;

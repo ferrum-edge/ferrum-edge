@@ -14556,11 +14556,27 @@ impl UnixHttp1Backend {
                             .map(|line| line["host:".len()..].trim().to_string())
                             .unwrap_or_default();
                         let body = format!("{name}|{request_line}|{host}");
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
+                        // A `/stream` request is answered with a CHUNKED
+                        // response and no `Content-Length`, which is what forces
+                        // the gateway down its STREAMING response path. That is
+                        // the path #3731 must pool through an EOF-anchored lease,
+                        // so `accepts()` on this fixture is the direct proof.
+                        let response = if request_line.contains("/stream") {
+                            // Two DATA chunks then the terminating zero chunk.
+                            let mut chunked = format!(
+                                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n{:x}\r\n{}\r\n",
+                                body.len(),
+                                body
+                            );
+                            chunked.push_str("7\r\n|chunk2\r\n0\r\n\r\n");
+                            chunked
+                        } else {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                        };
                         if stream.write_all(response.as_bytes()).await.is_err() {
                             return;
                         }
@@ -15232,16 +15248,17 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
 
         let ws_accepts_before = ws_backend.accepts();
         let ws_url = "ws://echo.ferrum.svc.cluster.local:6443/ws";
-        let mut ws_request = match tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
-            ws_url,
-        ) {
-            Ok(request) => request,
-            Err(e) => {
-                let output = captured_output(&temp);
-                kill_child(&mut child);
-                panic!("building the unix-backed WebSocket request failed: {e}\n{output}");
-            }
-        };
+        let mut ws_request =
+            match tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+                ws_url,
+            ) {
+                Ok(request) => request,
+                Err(e) => {
+                    let output = captured_output(&temp);
+                    kill_child(&mut child);
+                    panic!("building the unix-backed WebSocket request failed: {e}\n{output}");
+                }
+            };
         // The gateway routes on Host/`:authority`; the TCP dial is the local
         // inbound listener.
         ws_request.headers_mut().insert(
@@ -15256,25 +15273,27 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
                 panic!("connecting to the mesh inbound listener failed: {e}\n{output}");
             }
         };
-        let (mut ws, response) =
-            match tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::client_async(ws_request, tcp))
-                .await
-            {
-                Ok(Ok(established)) => established,
-                Ok(Err(e)) => {
-                    let output = captured_output(&temp);
-                    kill_child(&mut child);
-                    panic!(
-                        "a WebSocket upgrade to an http-declared unix ingress socket must \
+        let (mut ws, response) = match tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::client_async(ws_request, tcp),
+        )
+        .await
+        {
+            Ok(Ok(established)) => established,
+            Ok(Err(e)) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!(
+                    "a WebSocket upgrade to an http-declared unix ingress socket must \
                          complete; handshake failed: {e}\n{output}"
-                    );
-                }
-                Err(_) => {
-                    let output = captured_output(&temp);
-                    kill_child(&mut child);
-                    panic!("the unix-backed WebSocket handshake timed out\n{output}");
-                }
-            };
+                );
+            }
+            Err(_) => {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!("the unix-backed WebSocket handshake timed out\n{output}");
+            }
+        };
         assert_eq!(
             response.status().as_u16(),
             101,
@@ -15412,41 +15431,59 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
         }
     }
 
-    // ── (e4) HTTP/1.1 over the admitted socket never amplifies connections ──
-    // The H1 pool leases exclusively and re-pools only fully-read (buffered)
-    // responses, so the invariant a test can assert without depending on the
-    // per-route buffering decision is: every request is served correctly and no
-    // request ever costs more than one physical connection.
-    {
+    // ── (e4) HTTP/1.1 keep-alive reuse over the admitted socket (#3731) ──
+    // The point of the issue: many sequential live requests must be served by
+    // SUBSTANTIALLY fewer physical backend connections than requests. Both
+    // response shapes are exercised, because they take different pooling paths:
+    //
+    //   * `/` answers with `Content-Length`, so the gateway buffers and the
+    //     lease is checked in inside the dispatch function;
+    //   * `/stream` answers CHUNKED with no `Content-Length`, so the gateway
+    //     streams and the lease rides the response body, returning only on the
+    //     body's clean end-of-stream.
+    //
+    // The bound is `<= 2` rather than `== 1` for one honest reason: the backend
+    // may reap an idle keep-alive socket between two requests, which the pool
+    // recovers from with exactly one extra dial. It is nowhere near `== 12`,
+    // which is what an unpooled or check-in-less path would produce.
+    for (label, path) in [("buffered", "/"), ("streaming", "/stream")] {
         let accepts_before = http1_backend.accepts();
         let hits_before = http1_backend.hits();
         for index in 0..12 {
             let (status, body) =
-                match plaintext_inbound_http1(inbound_port, authority_8443, "/", &[]).await {
+                match plaintext_inbound_http1(inbound_port, authority_8443, path, &[]).await {
                     Ok(result) => result,
                     Err(e) => {
                         let output = captured_output(&temp);
                         kill_child(&mut child);
-                        panic!("pooled unix request {index} failed: {e}\n{output}");
+                        panic!("pooled unix {label} request {index} failed: {e}\n{output}");
                     }
                 };
             if status != 200 || !body.contains("unix-http1-a") {
                 let output = captured_output(&temp);
                 kill_child(&mut child);
                 panic!(
-                    "pooled unix request {index} must still be served correctly; got status \
-                     {status} body {body:?}\n{output}"
+                    "pooled unix {label} request {index} must still be served correctly; got \
+                     status {status} body {body:?}\n{output}"
+                );
+            }
+            if path == "/stream" && !body.contains("|chunk2") {
+                let output = captured_output(&temp);
+                kill_child(&mut child);
+                panic!(
+                    "the streaming unix response must be relayed to its last chunk; got \
+                     {body:?}\n{output}"
                 );
             }
         }
         let new_accepts = http1_backend.accepts() - accepts_before;
         let new_hits = http1_backend.hits() - hits_before;
-        if new_hits != 12 || new_accepts > new_hits {
+        if new_hits != 12 || new_accepts > 2 {
             let output = captured_output(&temp);
             kill_child(&mut child);
             panic!(
-                "admitted unix HTTP/1.1 dispatch must serve 12 requests over at most 12 \
-                 physical connections; got {new_hits} requests over {new_accepts} \
+                "12 sequential {label} unix requests must reuse one admitted HTTP/1.1 \
+                 connection; got {new_hits} requests over {new_accepts} physical \
                  connections\n{output}"
             );
         }

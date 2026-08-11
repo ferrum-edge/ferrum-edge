@@ -1,8 +1,8 @@
 #!/bin/bash
 # Mesh performance bench runner for Ferrum Edge.
 # Usage: ./run.sh [bench-name] [--skip-build] [--filter <criterion-filter>]
-#   bench-name: authz_match | slice_apply | xds_translation | ip_restriction | all
-#               (default: all)
+#   bench-name: authz_match | slice_apply | xds_translation | ip_restriction
+#               | unix_backend_pool | all   (default: all)
 
 set -euo pipefail
 
@@ -19,11 +19,11 @@ while [[ $# -gt 0 ]]; do
         --filter) FILTER="$2"; shift 2 ;;
         -h|--help)
             echo "Usage: $0 [bench-name] [--skip-build] [--filter <criterion-filter>]"
-            echo "  bench-name: authz_match | slice_apply | xds_translation | ip_restriction | all (default: all)"
+            echo "  bench-name: authz_match | slice_apply | xds_translation | ip_restriction | unix_backend_pool | all (default: all)"
             exit 0
             ;;
         *)
-            if [[ "$1" == "authz_match" || "$1" == "slice_apply" || "$1" == "xds_translation" || "$1" == "ip_restriction" || "$1" == "all" ]]; then
+            if [[ "$1" == "authz_match" || "$1" == "slice_apply" || "$1" == "xds_translation" || "$1" == "ip_restriction" || "$1" == "unix_backend_pool" || "$1" == "all" ]]; then
                 BENCH="$1"
             else
                 echo "Unknown argument: $1" >&2
@@ -55,6 +55,7 @@ if [[ "$BENCH" == "all" ]]; then
     run_one slice_apply
     run_one xds_translation
     run_one ip_restriction
+    run_one unix_backend_pool
 else
     run_one "$BENCH"
 fi

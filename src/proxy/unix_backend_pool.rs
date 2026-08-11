@@ -18,14 +18,33 @@
 //! security-sensitive retirement can both under-retire (a prefix that does not
 //! align on a path segment) and over-retire.
 //!
-//! Config/generation coverage: the pool is owned by `ProxyState`, which is
-//! rebuilt wholesale on config replacement, so a reload constructs a NEW pool
-//! and drops the old one — every idle sender is dropped and its driver task
-//! ends when its last sender drops. Within one generation, a changed socket
-//! path, UID expectation, or wire protocol yields a DIFFERENT key, so a
-//! connection admitted under the old identity is never handed out under the new
-//! one. [`UnixBackendConnectionPool::force_drain_all`] is the explicit
-//! shutdown/test hook.
+//! ## Config lifecycle
+//!
+//! The pool is owned by `ProxyState`, which SURVIVES a config reload (the
+//! config itself is swapped through an `ArcSwap`), so publication has to retire
+//! withdrawn carriers explicitly. `ProxyState::update_config` calls
+//! [`UnixBackendConnectionPool::retain_live_targets`] with the exact set of
+//! `mesh.unix_socket` target identities the newly published config declares:
+//! every pooled carrier whose
+//! `(namespace, proxy id, upstream id, configured path, wire protocol)` tuple is
+//! not in that set is retired before it can serve another request. The
+//! comparison is exact tuple equality — there is no substring, prefix, or
+//! path-containment rule anywhere in this module, because such a rule on a
+//! security-sensitive retirement both under-retires (a prefix that does not
+//! align on a path segment) and over-retires.
+//!
+//! That covers a withdrawn target, a deleted proxy or upstream, a namespace or
+//! upstream re-binding, a changed socket path, and an `http` ⇄ `http2`
+//! protocol flip. A change to the socket OBJECT (a replaced inode or a new
+//! owner uid) is caught on the checkout path instead, by `admit_and_reconcile`,
+//! because it is invisible to config. The containment allowlist and UID
+//! allowlist are process env (`FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` /
+//! `_ALLOWED_UIDS`) and cannot change without a restart.
+//!
+//! [`UnixBackendConnectionPool::force_drain_all`] retires everything but leaves
+//! the pool usable; [`UnixBackendConnectionPool::shutdown_drain`] additionally
+//! latches the pool closed so a late check-in racing graceful shutdown cannot
+//! repopulate it.
 //!
 //! ## Before every checkout
 //!
@@ -38,17 +57,30 @@
 //! ## Per-protocol lease semantics
 //!
 //! * **HTTP/1.1** — an EXCLUSIVE lease, returned to the idle set only after the
-//!   ENTIRE response body has been read. Concretely that is the BUFFERED
-//!   response path, via [`UnixBackendConnectionPool::checkin_h1_when_idle`].
-//!   A streaming, upgraded, errored, partial, or `Connection: close` response
-//!   never checks its lease back in — it is dropped, which closes the
-//!   connection. Receiving response headers is never sufficient, and neither is
-//!   hyper's own `SendRequest::ready()`: h1 `can_write_head()` is already true
-//!   while a response body is still being read, so readiness would re-pool a
-//!   connection mid-body and pipeline the next request onto it. Pooling
-//!   STREAMING h1 responses needs an EOF-anchored lease handoff through
-//!   `ResponseBody` and is a deliberate follow-up, not something approximated
-//!   unsafely here.
+//!   ENTIRE response body has been read, for BOTH the buffered and the
+//!   streaming response path.
+//!
+//!   The buffered path reads the body inside the dispatch function and calls
+//!   [`UnixBackendConnectionPool::checkin_h1_when_idle`] directly. The streaming
+//!   path cannot: the body leaves the dispatch function. It therefore hands the
+//!   lease to the client-visible `ProxyBody` as a
+//!   [`crate::proxy::body::PooledBackendLease`] (see
+//!   [`UnixBackendConnectionPool::streaming_lease`]), which returns it from
+//!   exactly one place — the `Poll::Ready(None)` arm of `ProxyBody::poll_frame`,
+//!   i.e. clean end-of-stream on the outermost body, which is reachable only
+//!   after the inner `hyper::body::Incoming` yielded its own `Ready(None)`.
+//!   Everything else (body error, backend close, client cancellation, an early
+//!   body drop, a read timeout, an aborted request, a fired client deadline,
+//!   shutdown) leaves the lease in place and its `Drop` retires the connection.
+//!
+//!   Receiving response headers is never sufficient, and neither is hyper's own
+//!   `SendRequest::ready()`: h1 `can_write_head()` is already true while a
+//!   response body is still being read, so readiness alone would re-pool a
+//!   connection mid-body and pipeline the next request onto it. Readiness is
+//!   used only as the SECOND half of the check-in, after the caller has already
+//!   proven the body is complete, to close the dispatcher re-arm gap —
+//!   `SendRequest::try_send_request` does not wait for readiness, so a sender
+//!   pooled before its dispatcher re-arms would bounce the next request.
 //! * **h2c / native gRPC** — the multiplexable [`MeshMtlsSender`] is cloned per
 //!   request and shared. A closed/GOAWAY carrier fails `is_closed()` /
 //!   `is_ready()` and is replaced on the next checkout; concurrent misses for
@@ -65,7 +97,7 @@
 mod imp {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use dashmap::DashMap;
     use hyper::client::conn::http1;
@@ -91,8 +123,7 @@ mod imp {
     /// concrete `SendRequest<B>` type is fixed without changing what the
     /// dispatch path builds: `Left` is the streaming, size-limited frontend
     /// body; `Right` is the retry-replayable buffered body.
-    pub type UnixH1RequestBody =
-        http_body_util::Either<SizeLimitedIncoming, ReplayableRequestBody>;
+    pub type UnixH1RequestBody = http_body_util::Either<SizeLimitedIncoming, ReplayableRequestBody>;
 
     /// Concrete pooled HTTP/1.1 sender type.
     pub type UnixH1Sender = http1::SendRequest<UnixH1RequestBody>;
@@ -106,10 +137,37 @@ mod imp {
         H2c,
     }
 
+    /// The CONFIG-declared identity of a Unix ingress target, independent of
+    /// any filesystem observation.
+    ///
+    /// This is the half of [`UnixPoolKey`] that a published `GatewayConfig` can
+    /// reproduce without touching the filesystem, and it is what
+    /// [`UnixBackendConnectionPool::retain_live_targets`] compares on reload.
+    /// Equality is exact on every field; nothing here is matched by substring
+    /// or prefix.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    pub struct UnixTargetIdentity {
+        pub namespace: String,
+        pub proxy_id: String,
+        pub upstream_id: Option<String>,
+        /// The socket path exactly as the `mesh.unix_socket` tag declares it,
+        /// BEFORE symlink resolution. Config can only reproduce this form.
+        pub configured_path: String,
+        pub protocol: UnixWireProtocol,
+    }
+
     /// Complete transport/security identity of a pooled Unix connection.
     ///
-    /// Included: namespace, proxy id, effective upstream id, canonical resolved
-    /// path, admitted device/inode/owner, wire protocol.
+    /// Included: namespace, proxy id, effective upstream id, the CONFIGURED
+    /// socket path, the canonical resolved path, admitted device/inode/owner,
+    /// and wire protocol.
+    ///
+    /// The configured path is carried in addition to the resolved one so config
+    /// publication can retire withdrawn targets by exact tuple equality without
+    /// re-resolving symlinks (see [`UnixTargetIdentity`]). Two configured paths
+    /// that resolve to the same object still key separately, which is the
+    /// conservative direction: it costs one extra connection and never shares
+    /// one across declarations.
     ///
     /// Deliberately EXCLUDED: `backend_connect_timeout_ms` and
     /// `backend_read_timeout_ms` are request-only policy applied per dispatch
@@ -122,6 +180,7 @@ mod imp {
         namespace: String,
         proxy_id: String,
         upstream_id: Option<String>,
+        configured_path: String,
         path: PathBuf,
         dev: u64,
         ino: u64,
@@ -130,11 +189,17 @@ mod imp {
     }
 
     impl UnixPoolKey {
-        fn new(proxy: &Proxy, admitted: &AdmittedUnixSocket, protocol: UnixWireProtocol) -> Self {
+        fn new(
+            proxy: &Proxy,
+            configured_path: &str,
+            admitted: &AdmittedUnixSocket,
+            protocol: UnixWireProtocol,
+        ) -> Self {
             Self {
                 namespace: proxy.namespace.clone(),
                 proxy_id: proxy.id.clone(),
                 upstream_id: proxy.upstream_id.clone(),
+                configured_path: configured_path.to_string(),
                 path: admitted.resolved_path().to_path_buf(),
                 dev: admitted.device_id(),
                 ino: admitted.inode(),
@@ -147,6 +212,17 @@ mod imp {
         /// compares this by exact path equality, never by substring.
         pub fn path(&self) -> &Path {
             &self.path
+        }
+
+        /// The config-reproducible identity of this key.
+        fn target_identity(&self) -> UnixTargetIdentity {
+            UnixTargetIdentity {
+                namespace: self.namespace.clone(),
+                proxy_id: self.proxy_id.clone(),
+                upstream_id: self.upstream_id.clone(),
+                configured_path: self.configured_path.clone(),
+                protocol: self.protocol,
+            }
         }
     }
 
@@ -175,6 +251,33 @@ mod imp {
         #[inline]
         pub fn key(&self) -> &UnixPoolKey {
             &self.key
+        }
+    }
+
+    /// EOF-anchored owner of an exclusive HTTP/1.1 lease for a STREAMING
+    /// response (issue #3731).
+    ///
+    /// Constructed by [`UnixBackendConnectionPool::streaming_lease`] and stored
+    /// on the client-visible `ProxyBody`. Two exits, and only two:
+    ///
+    /// * `release_on_clean_eof` — the body yielded `Ready(None)`, so the whole
+    ///   `hyper::body::Incoming` was consumed. Hand the carrier to
+    ///   `checkin_h1_when_idle`, which additionally waits for hyper's h1
+    ///   dispatcher to re-arm and re-checks liveness and socket identity.
+    /// * `Drop` with the lease still present — every abnormal terminal. The
+    ///   `UnixH1Checkout` drops, its `SendRequest` drops, and hyper closes the
+    ///   connection. Nothing is pooled, so it can never be reused.
+    struct UnixH1StreamingLease {
+        pool: Arc<UnixBackendConnectionPool>,
+        /// `Some` until one of the two exits fires.
+        checkout: Option<UnixH1Checkout>,
+    }
+
+    impl crate::proxy::body::PooledBackendLease for UnixH1StreamingLease {
+        fn release_on_clean_eof(mut self: Box<Self>) {
+            if let Some(checkout) = self.checkout.take() {
+                UnixBackendConnectionPool::checkin_h1_when_idle(&self.pool, checkout);
+            }
         }
     }
 
@@ -207,6 +310,10 @@ mod imp {
         /// though the swap also changes the pool KEY (which would otherwise
         /// simply miss and leave the old connections pooled and live).
         path_identities: DashMap<PathBuf, (u64, u64, u32)>,
+        /// Latched by [`UnixBackendConnectionPool::shutdown_drain`]. Once set,
+        /// no check-in may repopulate the pool, so the drain is terminal even
+        /// against a response body that reaches EOF while shutdown is running.
+        shutting_down: AtomicBool,
         last_prune_unix_secs: AtomicU64,
         hits: AtomicU64,
         misses: AtomicU64,
@@ -237,6 +344,7 @@ mod imp {
                 h2c_carriers: DashMap::with_shard_amount(shards),
                 h2c_creation_locks: DashMap::with_shard_amount(shards),
                 path_identities: DashMap::with_shard_amount(shards),
+                shutting_down: AtomicBool::new(false),
                 last_prune_unix_secs: AtomicU64::new(0),
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
@@ -266,13 +374,94 @@ mod imp {
             }
         }
 
-        /// Drop every pooled connection. Used at shutdown and by tests; a
-        /// dropped sender ends its driver task once the connection closes.
+        /// Drop every pooled connection, leaving the pool usable.
+        ///
+        /// A dropped sender ends its driver task once the connection closes, so
+        /// this is a complete retirement of the idle set without a task
+        /// registry. In-flight exchanges are unaffected: their leases are
+        /// checked out and therefore not in these maps, and each one will fail
+        /// its own check-in re-validation or simply be dropped.
         pub fn force_drain_all(&self) {
             self.h1_idle.clear();
             self.h2c_carriers.clear();
             self.h2c_creation_locks.clear();
             self.path_identities.clear();
+        }
+
+        /// Graceful-shutdown drain: retire everything AND latch the pool closed.
+        ///
+        /// Called from the bounded shutdown drain of every serving mode, after
+        /// accept loops have stopped and in-flight requests have been given
+        /// their `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget. The latch is what makes
+        /// the drain terminal: a streaming response that reaches EOF during the
+        /// final moments of the drain would otherwise check its carrier back
+        /// into a pool nobody will ever drain again.
+        pub fn shutdown_drain(&self) {
+            self.shutting_down.store(true, Ordering::Release);
+            self.force_drain_all();
+        }
+
+        #[inline]
+        fn is_shutting_down(&self) -> bool {
+            self.shutting_down.load(Ordering::Acquire)
+        }
+
+        /// Retire every pooled carrier whose config-declared identity is not in
+        /// `live`.
+        ///
+        /// Called from `ProxyState::update_config` on every publication that
+        /// carries a resource delta. `live` is built from the NEWLY PUBLISHED
+        /// config, so a withdrawn target, a deleted proxy or upstream, a
+        /// re-bound namespace/upstream, a changed `mesh.unix_socket` path, and
+        /// an `http` ⇄ `http2` protocol flip all fall out of the set and are
+        /// retired here — before the next request can be handed a carrier that
+        /// belongs to configuration that no longer exists.
+        ///
+        /// Exact tuple equality on [`UnixTargetIdentity`]; never a substring or
+        /// prefix test. One pass over the idle maps per publication, not per
+        /// request.
+        pub fn retain_live_targets(&self, live: &std::collections::HashSet<UnixTargetIdentity>) {
+            let mut retired = 0u64;
+            self.h1_idle.retain(|key, entries| {
+                if live.contains(&key.target_identity()) {
+                    true
+                } else {
+                    retired = retired.saturating_add(entries.len() as u64);
+                    false
+                }
+            });
+            self.h2c_carriers.retain(|key, entries| {
+                if live.contains(&key.target_identity()) {
+                    true
+                } else {
+                    retired = retired.saturating_add(entries.len() as u64);
+                    false
+                }
+            });
+            self.h2c_creation_locks
+                .retain(|key, _| live.contains(&key.target_identity()));
+            // `path_identities` is the replacement memo, not a connection
+            // holder. Keep it only for canonical paths that still have a pooled
+            // carrier to protect. Forgetting a path with nothing pooled is
+            // harmless — the next checkout re-admits from scratch and records a
+            // fresh first observation, and there is no stale carrier left for a
+            // swap detection to retire.
+            let mut retained_paths: std::collections::HashSet<PathBuf> =
+                std::collections::HashSet::new();
+            for entry in self.h1_idle.iter() {
+                retained_paths.insert(entry.key().path().to_path_buf());
+            }
+            for entry in self.h2c_carriers.iter() {
+                retained_paths.insert(entry.key().path().to_path_buf());
+            }
+            self.path_identities
+                .retain(|path, _| retained_paths.contains(path));
+            if retired > 0 {
+                self.identity_retirements
+                    .fetch_add(retired, Ordering::Relaxed);
+                crate::runtime_metrics::global_ref()
+                    .record_pool_evictions(PoolKind::UnixBackend, retired);
+            }
         }
 
         /// Retire every pooled connection admitted against `path`, across
@@ -373,10 +562,7 @@ mod imp {
                             idle_timeout,
                             now,
                         )
-                        && entry
-                            .admitted
-                            .still_names_checked_object()
-                            .unwrap_or(false)
+                        && entry.admitted.still_names_checked_object().unwrap_or(false)
                 });
                 evicted = evicted.saturating_add(before.saturating_sub(entries.len()) as u64);
                 !entries.is_empty()
@@ -390,10 +576,7 @@ mod imp {
                             idle_timeout,
                             now,
                         )
-                        && entry
-                            .admitted
-                            .still_names_checked_object()
-                            .unwrap_or(false)
+                        && entry.admitted.still_names_checked_object().unwrap_or(false)
                 });
                 evicted = evicted.saturating_add(before.saturating_sub(entries.len()) as u64);
                 !entries.is_empty()
@@ -404,8 +587,9 @@ mod imp {
             }
             // Only retain locks that are still contended or still name a live
             // carrier, so the lock map cannot grow without bound.
-            self.h2c_creation_locks
-                .retain(|key, lock| Arc::strong_count(lock) > 1 || self.h2c_carriers.contains_key(key));
+            self.h2c_creation_locks.retain(|key, lock| {
+                Arc::strong_count(lock) > 1 || self.h2c_carriers.contains_key(key)
+            });
         }
 
         /// Re-admit `socket_path` and, when the resulting identity differs from
@@ -423,16 +607,9 @@ mod imp {
                 allowed_uids,
             )
             .map_err(UnixBackendError::InadmissiblePath)?;
-            let live = (
-                admitted.device_id(),
-                admitted.inode(),
-                admitted.owner_uid(),
-            );
+            let live = (admitted.device_id(), admitted.inode(), admitted.owner_uid());
             let path = admitted.resolved_path();
-            let previous = self
-                .path_identities
-                .get(path)
-                .map(|entry| *entry.value());
+            let previous = self.path_identities.get(path).map(|entry| *entry.value());
             match previous {
                 Some(previous) if previous != live => {
                     // The filesystem object at this canonical path was replaced.
@@ -465,9 +642,8 @@ mod imp {
             allowed_uids: &[u32],
         ) -> Result<UnixH1Checkout, UnixBackendError> {
             self.maybe_prune_idle();
-            let admitted =
-                self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
-            let key = UnixPoolKey::new(proxy, &admitted, UnixWireProtocol::Http1);
+            let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
+            let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
 
             if let Some(checkout) = self.take_idle_h1(&key, &admitted, proxy) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
@@ -491,9 +667,8 @@ mod imp {
             allowed_roots: &[String],
             allowed_uids: &[u32],
         ) -> Result<UnixH1Checkout, UnixBackendError> {
-            let admitted =
-                self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
-            let key = UnixPoolKey::new(proxy, &admitted, UnixWireProtocol::Http1);
+            let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
+            let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
             self.misses.fetch_add(1, Ordering::Relaxed);
             self.dial_h1(key, admitted, connect_timeout_ms).await
         }
@@ -611,7 +786,7 @@ mod imp {
                 reused: _,
                 sender,
             } = checkout;
-            if sender.is_closed() {
+            if sender.is_closed() || self.is_shutting_down() {
                 return;
             }
             if !admitted.still_names_checked_object().unwrap_or(false) {
@@ -626,8 +801,7 @@ mod imp {
                 // Bound the idle set: drop the OLDEST idle connection, which is
                 // the one most likely to have been reaped by the peer.
                 entries.remove(0);
-                crate::runtime_metrics::global_ref()
-                    .record_pool_eviction(PoolKind::UnixBackend);
+                crate::runtime_metrics::global_ref().record_pool_eviction(PoolKind::UnixBackend);
             }
             entries.push(IdleH1 {
                 sender,
@@ -658,7 +832,7 @@ mod imp {
         /// An associated function rather than a method because `&Arc<Self>` is
         /// not a permitted method receiver on stable Rust.
         pub fn checkin_h1_when_idle(pool: &Arc<Self>, mut checkout: UnixH1Checkout) {
-            if checkout.sender.is_closed() {
+            if checkout.sender.is_closed() || pool.is_shutting_down() {
                 return;
             }
             if checkout.sender.is_ready() {
@@ -671,6 +845,29 @@ mod imp {
                     pool.checkin_h1(checkout);
                 }
             });
+        }
+
+        /// Wrap an exclusive HTTP/1.1 lease as a
+        /// [`crate::proxy::body::PooledBackendLease`] for a STREAMING response.
+        ///
+        /// This is the EOF-anchored handoff. The returned guard owns the lease
+        /// for as long as the client-visible `ProxyBody` lives; that body
+        /// releases it from exactly one place, its `Poll::Ready(None)` arm, and
+        /// drops it on every other terminal. Because the guard owns the only
+        /// `UnixH1Checkout`, the connection cannot be handed to another request
+        /// while the body is still streaming — the sender is not in `h1_idle`
+        /// and there is no second reference to it.
+        ///
+        /// The guard is not "detached": it has no task of its own and no pool
+        /// registry entry. Its lifetime is exactly the response body's.
+        pub fn streaming_lease(
+            pool: &Arc<Self>,
+            checkout: UnixH1Checkout,
+        ) -> Box<dyn crate::proxy::body::PooledBackendLease> {
+            Box::new(UnixH1StreamingLease {
+                pool: Arc::clone(pool),
+                checkout: Some(checkout),
+            })
         }
 
         /// Acquire a multiplexable h2c sender for `socket_path`.
@@ -688,9 +885,8 @@ mod imp {
             allowed_uids: &[u32],
         ) -> Result<MeshMtlsSender, UnixBackendError> {
             self.maybe_prune_idle();
-            let admitted =
-                self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
-            let key = UnixPoolKey::new(proxy, &admitted, UnixWireProtocol::H2c);
+            let admitted = self.admit_and_reconcile(socket_path, allowed_roots, allowed_uids)?;
+            let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::H2c);
 
             if let Some(sender) = self.take_shared_h2c(&key, &admitted, proxy) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
@@ -832,6 +1028,26 @@ mod imp {
 
     pub struct UnixH1Checkout;
 
+    /// Wire protocol a Unix ingress target declares. Mirrors the Unix build's
+    /// type so `ProxyState`'s reload reconciliation compiles everywhere.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum UnixWireProtocol {
+        Http1,
+        H2c,
+    }
+
+    /// Config-declared identity of a Unix ingress target. Never populated on a
+    /// platform without Unix-domain sockets, but the type must exist so the
+    /// shared reload path is not itself `cfg`-gated.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    pub struct UnixTargetIdentity {
+        pub namespace: String,
+        pub proxy_id: String,
+        pub upstream_id: Option<String>,
+        pub configured_path: String,
+        pub protocol: UnixWireProtocol,
+    }
+
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct UnixPoolStats {
         pub hits: u64,
@@ -851,6 +1067,10 @@ mod imp {
         }
 
         pub fn force_drain_all(&self) {}
+
+        pub fn shutdown_drain(&self) {}
+
+        pub fn retain_live_targets(&self, _live: &std::collections::HashSet<UnixTargetIdentity>) {}
 
         pub fn stats(&self) -> UnixPoolStats {
             UnixPoolStats::default()
@@ -880,11 +1100,7 @@ mod imp {
 
         pub fn checkin_h1(&self, _checkout: UnixH1Checkout) {}
 
-        pub fn checkin_h1_when_idle(
-            _pool: &std::sync::Arc<Self>,
-            _checkout: UnixH1Checkout,
-        ) {
-        }
+        pub fn checkin_h1_when_idle(_pool: &std::sync::Arc<Self>, _checkout: UnixH1Checkout) {}
 
         pub async fn checkout_h2c(
             &self,
