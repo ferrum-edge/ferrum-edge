@@ -73,16 +73,20 @@
 //! one bounded budget, then aborts AND JOINS whatever is left under a second
 //! bounded budget — no driver task survives the drain, the wait cannot be
 //! unbounded, and the drain does not return while a cancelled driver is still
-//! unreaped. The "physical connections open" gauge and the per-target
-//! connection slot are both released by a guard the driver FUTURE owns, so they
-//! are exact on the graceful path, on the forced-abort path (including a future
-//! aborted before its first poll), and on a driver panic alike.
+//! unreaped inside that budget (an expired reap budget is logged, not
+//! silently accepted). The "physical connections open" gauge and the
+//! per-target connection slot are both released by a guard the driver FUTURE
+//! owns, so they are exact on the graceful path, on the forced-abort path
+//! (including a future aborted before its first poll), and on a driver panic
+//! alike. Registration is also the shutdown boundary: after the latch, no
+//! further driver is created at all — see "The shutdown boundary is terminal
+//! in BOTH directions" below.
 //!
 //! ## Metrics
 //!
 //! [`UnixBackendConnectionPool::stats`] is the pool's bounded, fixed-cardinality
 //! export: hits, misses, physical connects, identity retirements, setup
-//! failures, pre-dial checkout failures, and the idle / shared-carrier / open
+//! failures, gateway-side checkout refusals, and the idle / shared-carrier / open
 //! physical-connection gauges. There are no per-target labels, and every field
 //! is one atomic load — the gauges are maintained at each insert/removal and at
 //! each driver spawn/completion, so producing the snapshot never scans a map.
@@ -219,6 +223,41 @@
 //! the pool usable; [`UnixBackendConnectionPool::shutdown_drain`] additionally
 //! latches the pool closed so a late check-in racing graceful shutdown cannot
 //! repopulate it.
+//!
+//! ## The shutdown boundary is terminal in BOTH directions
+//!
+//! The latch is not only a check-in fence; it is also a checkout refusal
+//! (issue #3764). Every checkout — `checkout_h1`, `checkout_fresh_h1`, and the
+//! h2c cold path — runs `refuse_if_shutting_down` as its FIRST act, before the
+//! establishment deadline, the idle sweep, path admission, and any
+//! `connect(2)`. A request that arrives after the drain therefore fails closed
+//! with `UnixBackendError::PoolShuttingDown` without opening a socket or
+//! reserving a slot on the target's bound, and that refusal is health-neutral:
+//! the application is not implicated by the gateway shutting down.
+//!
+//! A checkout that passed that gate while the pool was still open can still
+//! reach driver registration after the drain latches. `UnixDriverTracker`
+//! resolves that race atomically — it reads the latch, spawns, and inserts
+//! under ONE acquisition of its map lock — so the losing side spawns NOTHING:
+//! no task to abort, no detached handle, no gauge or connection slot charged
+//! and released later. The un-spawned driver future is dropped (which closes
+//! the freshly established socket), the target's slot is released, and the
+//! checkout returns the same `PoolShuttingDown` refusal rather than a sender
+//! backed by a connection nobody drives.
+//!
+//! What that does and does NOT guarantee, stated exactly:
+//!
+//! * when `shutdown_drain` returns, every driver it OWNED has ended and
+//!   released its gauge share and connection slot, or the bounded reap budget
+//!   expired — the budget bounds the wait, it cannot force a task that ignores
+//!   cancellation points to be dropped sooner, and an expired reap budget is
+//!   logged;
+//! * an establishment that was already in flight when the latch was set is not
+//!   owned by that drain and may still hold its target's connection slot for
+//!   the remainder of its own bounded establishment deadline. It settles
+//!   exactly — slot released, gauge untouched, socket closed — before its own
+//!   checkout call returns, and it can never publish a carrier or leave a task
+//!   behind.
 //!
 //! ## Before every checkout
 //!
@@ -840,7 +879,7 @@ mod imp {
     /// Everything ONE physical connection charges the pool for, owned by that
     /// connection's driver future.
     ///
-    /// Constructed by [`UnixDriverTracker::spawn`] and CAPTURED by the spawned
+    /// Constructed by [`UnixDriverTracker::register`] and CAPTURED by the spawned
     /// future rather than created inside it, which is what makes the accounting
     /// exact under cancellation: a future the runtime drops before its first
     /// poll still drops this, so an abort that wins the race with scheduling
@@ -859,15 +898,11 @@ mod imp {
         }
     }
 
-    /// What the tracker holds for one physical connection.
-    enum DriverSlot {
-        /// The driver is running; the handle is what shutdown awaits/aborts.
-        Running(tokio::task::JoinHandle<()>),
-        /// The driver finished before its handle could be registered — the
-        /// spawn/registration race. Consumed by the registration, which then
-        /// stores nothing, so this can never accumulate.
-        FinishedBeforeRegister,
-    }
+    /// The tracker refused to adopt a driver because shutdown has already
+    /// latched it closed. Nothing was spawned and nothing was charged: the
+    /// caller's `conn_slot` and the un-spawned driver future were released by
+    /// [`UnixDriverTracker::register`] before it returned.
+    struct DriverRegistrationClosed;
 
     /// Structured ownership of every physical Unix backend connection driver
     /// (issue #3764).
@@ -890,15 +925,30 @@ mod imp {
     /// by [`DriverLifetime`]'s `Drop`, i.e. by the driver future's own release,
     /// which is the only event that is common to a clean end, a panic, and a
     /// cancellation.
+    ///
+    /// ## Spawn and registration are ONE decision
+    ///
+    /// [`Self::register`] holds the map lock across the `tokio::spawn` AND the
+    /// insert, and it reads `closed` under that same lock. That is what makes
+    /// the shutdown boundary terminal rather than eventually-consistent:
+    ///
+    /// * a registration that acquires the lock before [`Self::drain`] latches
+    ///   is fully in the map when the drain reads it, so the drain owns it;
+    /// * a registration that acquires the lock after the latch spawns NOTHING —
+    ///   there is no task to abort, no handle to detach, and no gauge to
+    ///   release later. It refuses, and the caller fails its checkout closed.
+    ///
+    /// Because the insert cannot be preempted by the driver's own completion
+    /// (`finish` needs the same lock), there is no registration sentinel and no
+    /// state in which the map describes a driver that has already released its
+    /// accounting.
     struct UnixDriverTracker {
         next_id: AtomicU64,
-        drivers: std::sync::Mutex<HashMap<u64, DriverSlot>>,
+        drivers: std::sync::Mutex<HashMap<u64, tokio::task::JoinHandle<()>>>,
         live: AtomicU64,
         /// Latched by [`Self::drain`] UNDER the map lock. Once set, the drain
-        /// owns every handle: `finish` stops leaving registration sentinels
-        /// behind (the drain already removed the entry, so a sentinel would
-        /// survive the drain forever) and a registration that lost the race
-        /// cancels its task instead of re-populating the map.
+        /// owns every handle already in the map and [`Self::register`] refuses
+        /// to create any more.
         closed: AtomicBool,
     }
 
@@ -912,7 +962,7 @@ mod imp {
             }
         }
 
-        fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, DriverSlot>> {
+        fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, tokio::task::JoinHandle<()>>> {
             // No panic is reachable inside the critical section (map insert and
             // remove on integer keys), but the production rule forbids
             // `unwrap()`, and recovering the map is the correct behavior even if
@@ -926,22 +976,47 @@ mod imp {
             self.live.load(Ordering::Relaxed)
         }
 
-        /// Entries currently tracked (running drivers plus any registration
-        /// sentinel). Diagnostics/tests only; never on the request path.
+        /// Drivers currently tracked. Diagnostics/tests only; never on the
+        /// request path.
         fn entries(&self) -> usize {
             self.lock().len()
         }
 
         /// Spawn `driver` under tracking, holding `conn_slot` — the target's
-        /// physical-connection slot — for the connection's whole lifetime.
+        /// physical-connection slot — for the connection's whole lifetime, or
+        /// REFUSE because shutdown already latched the tracker closed.
+        ///
+        /// The `closed` read, the spawn, and the insert all happen under ONE
+        /// acquisition of the map lock, so there is no window in which a task
+        /// exists that the drain does not own. On the refusal side nothing is
+        /// spawned at all: the guard is released and then `conn_slot` and the
+        /// un-polled `driver` future are dropped on the way out, which releases
+        /// the target's physical-connection slot and closes the freshly
+        /// established socket before this returns. The gauge is incremented only
+        /// on the side that actually spawns, so a refusal cannot leave a
+        /// transient count behind for a later reader to observe.
+        ///
+        /// This is one cold-path lock acquisition per NEW physical connection —
+        /// the same registration boundary that already existed — not a
+        /// per-request one.
         ///
         /// An associated function rather than a method because `&Arc<Self>` is
         /// not a permitted method receiver on stable Rust.
-        fn spawn(
+        fn register(
             tracker: &Arc<Self>,
             driver: UnixConnectionDriver,
             conn_slot: Option<TargetConnSlot>,
-        ) {
+        ) -> Result<(), DriverRegistrationClosed> {
+            let mut drivers = tracker.lock();
+            if tracker.closed.load(Ordering::Acquire) {
+                // Release the map lock BEFORE dropping the slot: the slot's
+                // `Drop` takes a `DashMap` shard lock, and no path takes these
+                // two in the other order.
+                drop(drivers);
+                drop(conn_slot);
+                drop(driver);
+                return Err(DriverRegistrationClosed);
+            }
             let id = tracker.next_id.fetch_add(1, Ordering::Relaxed);
             tracker.live.fetch_add(1, Ordering::Relaxed);
             let lifetime = DriverLifetime {
@@ -955,23 +1030,12 @@ mod imp {
                 let _lifetime = lifetime;
                 driver.await;
             });
-            let mut drivers = tracker.lock();
-            if tracker.closed.load(Ordering::Acquire) {
-                // Shutdown latched while this connection was being established.
-                // The drain will never see this handle, so cancel it here rather
-                // than leaving an untracked task alive; its `DriverLifetime`
-                // still releases the gauge and the slot when the runtime drops
-                // it.
-                drop(drivers);
-                handle.abort();
-                return;
-            }
-            // Registration can lose the race against a driver that finished
-            // immediately, so `finish` leaves a sentinel and this consumes it.
-            if drivers.remove(&id).is_some() {
-                return;
-            }
-            drivers.insert(id, DriverSlot::Running(handle));
+            // The spawned task cannot have completed and called `finish` yet:
+            // `finish` needs this same lock, which is still held here. So the
+            // insert can never be undone by a completion that ran first, and no
+            // registration sentinel is needed.
+            drivers.insert(id, handle);
+            Ok(())
         }
 
         /// Release one driver's accounting. Called from [`DriverLifetime`], so
@@ -982,45 +1046,21 @@ mod imp {
             // is a diagnostic, and an accounting slip must not underflow into a
             // nonsensical `u64::MAX` on an operator's dashboard.
             UnixBackendConnectionPool::note_pooled_removed(&self.live, 1);
-            let mut drivers = self.lock();
-            if drivers.remove(&id).is_none() && !self.closed.load(Ordering::Acquire) {
-                drivers.insert(id, DriverSlot::FinishedBeforeRegister);
-            }
+            // A miss is the ordinary shutdown case: the drain already took this
+            // handle out of the map to await or cancel it.
+            self.lock().remove(&id);
         }
 
         fn take_next_running(&self) -> Option<tokio::task::JoinHandle<()>> {
             let mut drivers = self.lock();
-            let id = drivers.iter().find_map(|(id, slot)| match slot {
-                DriverSlot::Running(_) => Some(*id),
-                DriverSlot::FinishedBeforeRegister => None,
-            })?;
-            match drivers.remove(&id) {
-                Some(DriverSlot::Running(handle)) => Some(handle),
-                other => {
-                    // Cannot happen: the id was just observed as `Running`
-                    // under this same guard. Put anything else back rather than
-                    // dropping it, and report "nothing to await" instead of
-                    // panicking on the shutdown path.
-                    if let Some(slot) = other {
-                        drivers.insert(id, slot);
-                    }
-                    None
-                }
-            }
+            let id = *drivers.keys().next()?;
+            drivers.remove(&id)
         }
 
-        /// Empty the map, returning every still-running handle. Registration
-        /// sentinels are dropped: they describe drivers that have already
-        /// released their accounting.
+        /// Empty the map, returning every still-running handle.
         fn take_all_running(&self) -> Vec<tokio::task::JoinHandle<()>> {
             let mut drivers = self.lock();
-            drivers
-                .drain()
-                .filter_map(|(_, slot)| match slot {
-                    DriverSlot::Running(handle) => Some(handle),
-                    DriverSlot::FinishedBeforeRegister => None,
-                })
-                .collect()
+            drivers.drain().map(|(_, handle)| handle).collect()
         }
 
         /// Terminal, bounded shutdown of every tracked driver.
@@ -1041,7 +1081,7 @@ mod imp {
             {
                 // Latch UNDER the map lock so a concurrent registration either
                 // completes before the drain can miss it or observes the latch
-                // and cancels its own task.
+                // and never spawns at all.
                 let _guard = self.lock();
                 self.closed.store(true, Ordering::Release);
             }
@@ -1058,9 +1098,9 @@ mod imp {
                     }
                 }
             }
-            // Either every driver ended inside the budget (leaving at most
-            // registration sentinels, which this clears) or the deadline was
-            // unrepresentable and nothing was waited for at all.
+            // Either every driver ended inside the budget (leaving the map
+            // empty, which this observes) or the deadline was unrepresentable
+            // and nothing was waited for at all.
             self.cancel_and_reap(None, reap_budget).await;
         }
 
@@ -1210,9 +1250,12 @@ mod imp {
         /// Establishment failures: connect, protocol handshake, or the
         /// establishment deadline expiring.
         pub setup_failures: u64,
-        /// Checkout failures decided BEFORE any dial: path admission refusal
-        /// and the target's physical-connection bound refusing a new
-        /// connection.
+        /// Checkouts refused by GATEWAY-side policy rather than by the
+        /// application: path admission, the target's physical-connection bound,
+        /// and the shutdown latch. The first two are decided before any dial,
+        /// as is the shutdown latch at the checkout gate; only the shutdown
+        /// latch/registration race is counted after a connection was
+        /// established (and that connection is closed again, undriven).
         pub checkout_failures: u64,
         /// Idle HTTP/1.1 carriers currently resident in the pool.
         pub idle_h1_connections: u64,
@@ -1478,9 +1521,18 @@ mod imp {
         ///    accounting settled, under a wait that is bounded by construction
         ///    (issue #3764).
         ///
-        /// Terminal by design: after this returns the tracker refuses to adopt
-        /// new drivers, so a connection whose establishment raced the drain is
-        /// cancelled rather than left untracked.
+        /// Terminal by design, in both directions: after the latch is set, a
+        /// new checkout is refused before it can dial
+        /// ([`Self::refuse_if_shutting_down`]) and the tracker refuses to adopt
+        /// any further driver, so an establishment that raced the latch spawns
+        /// no task at all and fails its own checkout closed instead of handing
+        /// back an undriven carrier.
+        ///
+        /// The bound is honest about its limits: the reap budget bounds how long
+        /// this waits for CANCELLED drivers to be dropped, and an expired budget
+        /// is logged rather than papered over. It does not, and cannot, retract
+        /// a connection slot held by an establishment that is still inside its
+        /// own connect deadline elsewhere; that one settles when it returns.
         pub async fn shutdown_drain(&self) {
             self.shutting_down.store(true, Ordering::Release);
             self.force_drain_all();
@@ -1506,6 +1558,53 @@ mod imp {
         #[inline]
         fn is_shutting_down(&self) -> bool {
             self.shutting_down.load(Ordering::Acquire)
+        }
+
+        /// The one shutdown gate every checkout runs FIRST.
+        ///
+        /// A checkout that starts after [`Self::shutdown_drain`] latched the
+        /// pool is refused here — before the establishment deadline is opened,
+        /// before path admission, and therefore before any `connect(2)`. So a
+        /// post-drain request opens no socket, reserves no slot on the target's
+        /// bound, and cannot hand back a carrier the drain has no way to reap.
+        ///
+        /// Typed and health-neutral: shutdown is the gateway's own decision, so
+        /// the application must not be circuit-broken, passively ejected, or
+        /// LB-penalized for it (see `UnixBackendError::error_class`).
+        #[inline]
+        fn refuse_if_shutting_down(&self) -> Result<(), UnixBackendError> {
+            if self.is_shutting_down() {
+                self.record_checkout_failure();
+                return Err(UnixBackendError::PoolShuttingDown);
+            }
+            Ok(())
+        }
+
+        /// Hand one freshly established physical connection's driver to the
+        /// tracker, or fail the checkout closed.
+        ///
+        /// The SINGLE registration boundary for both wire protocols: the H1
+        /// dial and the h2c cold path both land here, so the shutdown race is
+        /// decided once, in one place, and the two paths cannot drift.
+        ///
+        /// A refusal means shutdown latched the tracker while this connection
+        /// was being established. `register` has already released the target's
+        /// physical-connection slot and dropped the un-spawned driver future
+        /// (closing the socket), so nothing is charged and nothing is left
+        /// running; the caller must NOT return its sender, because that sender
+        /// is backed by a connection with no driver.
+        fn register_driver(
+            &self,
+            driver: UnixConnectionDriver,
+            conn_slot: Option<TargetConnSlot>,
+        ) -> Result<(), UnixBackendError> {
+            if UnixDriverTracker::register(&self.drivers, driver, conn_slot).is_err() {
+                self.record_checkout_failure();
+                return Err(UnixBackendError::PoolShuttingDown);
+            }
+            self.physical_connects.fetch_add(1, Ordering::Relaxed);
+            crate::runtime_metrics::global_ref().record_pool_handshake(PoolKind::UnixBackend);
+            Ok(())
         }
 
         /// Retire every pooled carrier whose config-declared identity is not in
@@ -1824,6 +1923,10 @@ mod imp {
         /// bound (`FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS`); a hit never does,
         /// so a target at its bound still serves every request that can ride an
         /// already-admitted connection.
+        ///
+        /// Refused immediately, before any of that, once the pool is latched
+        /// closed by [`Self::shutdown_drain`] (see
+        /// [`Self::refuse_if_shutting_down`]).
         pub async fn checkout_h1(
             &self,
             proxy: &Proxy,
@@ -1832,6 +1935,43 @@ mod imp {
             allowed_roots: &[String],
             allowed_uids: &[u32],
         ) -> Result<UnixH1Checkout, UnixBackendError> {
+            self.checkout_h1_seamed(
+                proxy,
+                socket_path,
+                connect_timeout_ms,
+                allowed_roots,
+                allowed_uids,
+                || std::future::ready(()),
+            )
+            .await
+        }
+
+        /// The production HTTP/1.1 checkout body, with one test seam: an async
+        /// hook awaited after the client handshake and BEFORE the driver is
+        /// registered.
+        ///
+        /// That is the exact interleaving the shutdown boundary has to survive —
+        /// a checkout that passed the entry gate while the pool was open and
+        /// reaches registration after the drain latched — and it cannot be
+        /// produced by timing alone. Production passes a ready future, so a test
+        /// through here exercises the production path rather than a parallel
+        /// one.
+        pub(crate) async fn checkout_h1_seamed<F, Fut>(
+            &self,
+            proxy: &Proxy,
+            socket_path: &str,
+            connect_timeout_ms: u64,
+            allowed_roots: &[String],
+            allowed_uids: &[u32],
+            before_register: F,
+        ) -> Result<UnixH1Checkout, UnixBackendError>
+        where
+            F: FnOnce() -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
+            // Fail closed before the budget, the sweep, admission, and the dial:
+            // a checkout that starts after the drain opens no socket at all.
+            self.refuse_if_shutting_down()?;
             // ONE budget for the whole establishment, opened at the OUTERMOST
             // entry — before the amortized idle sweep, which scans the pool's
             // maps and `stat`s socket paths, and before the synchronous
@@ -1860,13 +2000,13 @@ mod imp {
             }
             self.misses.fetch_add(1, Ordering::Relaxed);
             self.dial_h1(
-                proxy,
                 key,
                 admitted,
                 deadline,
                 timeout_ms,
                 generation,
                 keep_alive,
+                before_register,
             )
             .await
         }
@@ -1886,6 +2026,7 @@ mod imp {
             allowed_roots: &[String],
             allowed_uids: &[u32],
         ) -> Result<UnixH1Checkout, UnixBackendError> {
+            self.refuse_if_shutting_down()?;
             let (timeout_ms, deadline) = connect_deadline(connect_timeout_ms)?;
             let generation = self.publication_generation.load(Ordering::Acquire);
             let keep_alive = self.keep_alive_enabled(proxy);
@@ -1893,28 +2034,32 @@ mod imp {
             let key = UnixPoolKey::new(proxy, socket_path, &admitted, UnixWireProtocol::Http1);
             self.misses.fetch_add(1, Ordering::Relaxed);
             self.dial_h1(
-                proxy,
                 key,
                 admitted,
                 deadline,
                 timeout_ms,
                 generation,
                 keep_alive,
+                || std::future::ready(()),
             )
             .await
         }
 
         #[allow(clippy::too_many_arguments)]
-        async fn dial_h1(
+        async fn dial_h1<F, Fut>(
             &self,
-            proxy: &Proxy,
             key: UnixPoolKey,
             admitted: AdmittedUnixSocket,
             deadline: tokio::time::Instant,
             timeout_ms: u64,
             generation: u64,
             keep_alive: bool,
-        ) -> Result<UnixH1Checkout, UnixBackendError> {
+            before_register: F,
+        ) -> Result<UnixH1Checkout, UnixBackendError>
+        where
+            F: FnOnce() -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
             // The per-target physical-connection bound is decided BEFORE
             // `connect(2)`: an over-bound refusal opens no socket and writes no
             // application byte, and it is typed so the dispatch path answers
@@ -1954,18 +2099,19 @@ mod imp {
             //
             // The driver is registered with the pool's tracker rather than
             // detached, so shutdown can close and reap it under a bounded
-            // deadline (issue #3764).
-            UnixDriverTracker::spawn(
-                &self.drivers,
+            // deadline (issue #3764). A registration REFUSED by an already
+            // latched tracker fails this checkout closed: `sender` is dropped
+            // here rather than handed back, because the connection behind it
+            // has no driver and never will.
+            before_register().await;
+            self.register_driver(
                 Box::pin(async move {
                     if let Err(e) = connection.await {
                         debug!("unix_backend_pool: h1 connection closed: {}", e);
                     }
                 }),
                 conn_slot,
-            );
-            self.physical_connects.fetch_add(1, Ordering::Relaxed);
-            crate::runtime_metrics::global_ref().record_pool_handshake(PoolKind::UnixBackend);
+            )?;
 
             Ok(UnixH1Checkout {
                 key,
@@ -2288,7 +2434,67 @@ mod imp {
             allowed_uids: &[u32],
             publish_seams: (impl FnOnce(), impl FnOnce()),
         ) -> Result<MeshMtlsSender, UnixBackendError> {
+            self.checkout_h2c_inner(
+                proxy,
+                socket_path,
+                connect_timeout_ms,
+                allowed_roots,
+                allowed_uids,
+                publish_seams,
+                || std::future::ready(()),
+            )
+            .await
+        }
+
+        /// The same production h2c checkout with the H1 path's registration
+        /// seam: an async hook awaited after the handshake and BEFORE the driver
+        /// is registered, so the shutdown latch/registration race is reproducible
+        /// on this wire protocol too (issue #3764).
+        #[allow(dead_code)] // Bin target omits lib::_test_support; external tests reach it there.
+        pub(crate) async fn checkout_h2c_with_registration_seam<F, Fut>(
+            &self,
+            proxy: &Proxy,
+            socket_path: &str,
+            connect_timeout_ms: u64,
+            allowed_roots: &[String],
+            allowed_uids: &[u32],
+            before_register: F,
+        ) -> Result<MeshMtlsSender, UnixBackendError>
+        where
+            F: FnOnce() -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
+            self.checkout_h2c_inner(
+                proxy,
+                socket_path,
+                connect_timeout_ms,
+                allowed_roots,
+                allowed_uids,
+                (|| {}, || {}),
+                before_register,
+            )
+            .await
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn checkout_h2c_inner<F, Fut>(
+            &self,
+            proxy: &Proxy,
+            socket_path: &str,
+            connect_timeout_ms: u64,
+            allowed_roots: &[String],
+            allowed_uids: &[u32],
+            publish_seams: (impl FnOnce(), impl FnOnce()),
+            before_register: F,
+        ) -> Result<MeshMtlsSender, UnixBackendError>
+        where
+            F: FnOnce() -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
             let (before_publish, after_publish) = publish_seams;
+            // Same fail-closed entry gate as the H1 checkout: after the drain
+            // latched the pool, no h2c checkout admits, dials, or handshakes.
+            self.refuse_if_shutting_down()?;
             // ONE budget, opened at the OUTERMOST entry — before the amortized
             // idle sweep, before admission, and therefore before the creation-
             // lock wait too, so neither pool maintenance nor a queue behind a
@@ -2346,10 +2552,11 @@ mod imp {
                 .inspect_err(|_| self.record_setup_failure())?;
             // Structured ownership of the h2c driver, and with it the target's
             // physical-connection slot, for the physical connection's whole
-            // life.
-            UnixDriverTracker::spawn(&self.drivers, driver, conn_slot);
-            self.physical_connects.fetch_add(1, Ordering::Relaxed);
-            crate::runtime_metrics::global_ref().record_pool_handshake(PoolKind::UnixBackend);
+            // life. A tracker latched closed by a concurrent drain refuses it,
+            // and this checkout then fails closed with `sender` dropped and
+            // never published — exactly as on the H1 path.
+            before_register().await;
+            self.register_driver(driver, conn_slot)?;
 
             let max_idle = self.max_idle_per_key();
             let entry_id = self.next_entry_id.fetch_add(1, Ordering::Relaxed);
@@ -2522,9 +2729,16 @@ mod imp {
             crate::runtime_metrics::global_ref().record_pool_failure(PoolKind::UnixBackend);
         }
 
-        /// A checkout refused BEFORE any dial: path admission, or the target's
-        /// physical-connection bound. Distinct from a setup failure, which is a
-        /// connection that was attempted and failed.
+        /// A checkout refused by GATEWAY-side policy rather than by the
+        /// application: path admission, the target's physical-connection bound,
+        /// or the shutdown latch. Distinct from a setup failure, which is a
+        /// connection that was attempted and failed on the app's side.
+        ///
+        /// The first two are decided before any dial. The shutdown latch is too
+        /// when it refuses at the checkout gate; the registration race is the
+        /// one case where a connection was established first, and it is counted
+        /// here rather than as a setup failure because nothing about the
+        /// application failed.
         #[inline]
         fn record_checkout_failure(&self) {
             self.checkout_failures.fetch_add(1, Ordering::Relaxed);

@@ -2572,6 +2572,75 @@ pub mod _test_support {
         .await
     }
 
+    /// Drive the production HTTP/1.1 checkout with a hook awaited AFTER the
+    /// client handshake and BEFORE the connection's driver is registered with
+    /// the pool's shutdown tracker (issue #3764).
+    ///
+    /// That is the one interleaving the shutdown boundary must survive: a
+    /// checkout that passed the pool's closed-latch gate while the pool was
+    /// still open, and reaches registration after a concurrent
+    /// `shutdown_drain` latched it. Production `checkout_h1` is this same
+    /// function with a ready future.
+    #[cfg(unix)]
+    pub async fn checkout_unix_h1_with_registration_seam<F, Fut>(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        socket_path: &str,
+        connect_timeout_ms: u64,
+        allowed_roots: &[String],
+        allowed_uids: &[u32],
+        before_register: F,
+    ) -> Result<
+        crate::proxy::unix_backend_pool::UnixH1Checkout,
+        crate::proxy::unix_backend::UnixBackendError,
+    >
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        pool.checkout_h1_seamed(
+            proxy,
+            socket_path,
+            connect_timeout_ms,
+            allowed_roots,
+            allowed_uids,
+            before_register,
+        )
+        .await
+    }
+
+    /// The h2c half of [`checkout_unix_h1_with_registration_seam`]: the same
+    /// pre-registration hook on the shared-carrier cold path, so both wire
+    /// protocols prove the shutdown latch/registration race rather than one
+    /// standing in for the other.
+    #[cfg(unix)]
+    pub async fn checkout_unix_h2c_with_registration_seam<F, Fut>(
+        pool: &crate::proxy::unix_backend_pool::UnixBackendConnectionPool,
+        proxy: &crate::config::types::Proxy,
+        socket_path: &str,
+        connect_timeout_ms: u64,
+        allowed_roots: &[String],
+        allowed_uids: &[u32],
+        before_register: F,
+    ) -> Result<
+        crate::proxy::mesh_mtls_pool::MeshMtlsSender,
+        crate::proxy::unix_backend::UnixBackendError,
+    >
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        pool.checkout_h2c_with_registration_seam(
+            proxy,
+            socket_path,
+            connect_timeout_ms,
+            allowed_roots,
+            allowed_uids,
+            before_register,
+        )
+        .await
+    }
+
     /// Ask the PRODUCTION shared-h2c selector whether it would hand a pooled
     /// carrier to a request for this identity right now. Read-only; never
     /// dials.

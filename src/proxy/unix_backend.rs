@@ -153,6 +153,24 @@ pub enum UnixBackendError {
     /// as the caller's own deadline allows — which is forever when the client
     /// supplied no gRPC deadline and no backend read timeout is configured.
     H2HandshakeTimeout { timeout_ms: u64 },
+    /// The pool has been latched closed by graceful shutdown
+    /// (`UnixBackendConnectionPool::shutdown_drain`), so this checkout may not
+    /// establish or hand out a Unix backend connection (issue #3764).
+    ///
+    /// Two arrivals produce it, and both are fail-closed:
+    ///
+    /// * a checkout that STARTS after the latch — refused before the
+    ///   establishment deadline, before path admission, and before `connect(2)`,
+    ///   so no socket is opened and no slot on the target's bound is reserved;
+    /// * a checkout that raced the latch and reached driver registration after
+    ///   the tracker closed — the driver is never spawned, the un-polled driver
+    ///   future is dropped (closing the socket just established), the target's
+    ///   connection slot is released, and the sender is dropped rather than
+    ///   returned, because nothing would drive its connection.
+    ///
+    /// Health-neutral by construction: the gateway is shutting down, which says
+    /// nothing about the co-located application.
+    PoolShuttingDown,
     /// The build target has no Unix-domain sockets (Windows). Sidecar mesh
     /// deployments are Linux-only, so this is unreachable in practice; it
     /// exists so the non-Unix build refuses the dispatch rather than silently
@@ -200,6 +218,10 @@ impl std::fmt::Display for UnixBackendError {
             Self::BackendConnectionLimit(limit) => {
                 write!(f, "unix ingress connection bound reached: {limit}")
             }
+            Self::PoolShuttingDown => write!(
+                f,
+                "unix backend pool is shutting down and cannot establish a connection"
+            ),
             Self::PlatformUnsupported => {
                 write!(f, "unix backends are not supported on this platform")
             }
@@ -248,11 +270,16 @@ impl UnixBackendError {
     ///   other transport uses: pre-wire, health-neutral (no breaker,
     ///   passive-health, or LB penalty for a healthy application that is merely
     ///   at its configured transport capacity), and retryable onto another
-    ///   load-balanced target with its own lane.
+    ///   load-balanced target with its own lane;
+    /// * a shutdown refusal is likewise gateway-side and health-neutral, and it
+    ///   is deliberately NOT retried: every Unix target in this process shares
+    ///   the one latched pool, so a replay could only repeat the same refusal
+    ///   while the process is trying to exit.
     pub fn error_class(&self) -> crate::retry::ErrorClass {
         match self {
             Self::BackendConnectionLimit(_) => crate::retry::ErrorClass::BackendConnectionLimit,
             Self::InadmissiblePath(_)
+            | Self::PoolShuttingDown
             | Self::PlatformUnsupported
             | Self::PeerCredentialsUnavailable(_)
             | Self::PeerUidMismatch { .. }

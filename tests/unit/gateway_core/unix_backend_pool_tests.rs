@@ -2416,23 +2416,32 @@ async fn a_graceful_drain_leaves_no_tracked_driver_behind() {
     assert_eq!(pool.resident_connection_lanes(), 0);
 }
 
-/// The registration/drain race: a connection whose establishment lands AFTER
-/// the tracker was latched closed is cancelled rather than left untracked, and
-/// its accounting still settles.
+/// `UnixH1Checkout` and the shared h2c sender are deliberately not `Debug`
+/// (they wrap live senders), so a refusal is asserted by consuming the `Ok`
+/// arm rather than through `expect_err`.
+fn expect_refusal<T>(result: Result<T, UnixBackendError>, what: &str) -> UnixBackendError {
+    match result {
+        Ok(_) => panic!("{what}"),
+        Err(err) => err,
+    }
+}
+
+/// An HTTP/1.1 checkout that STARTS after the drain is refused before it can
+/// dial: the socket is never connected, the target's lane is never reserved,
+/// and the caller gets the typed, health-neutral shutdown outcome.
 #[tokio::test]
-async fn a_driver_registered_after_the_drain_is_cancelled_not_leaked() {
+async fn a_post_drain_h1_checkout_is_refused_before_any_connect() {
     let temp = tempfile::TempDir::new().expect("temp dir");
     let root = root_dir(&temp);
     let socket = root.join("app.sock");
-    let _peer = HoldingPeer::bind(&socket);
+    let peer = HoldingPeer::bind(&socket);
     let pool = bounded_pool(4);
-    let proxy = test_proxy("unix-pool-late-driver");
+    let proxy = test_proxy("unix-pool-post-drain-h1");
 
     pool.shutdown_drain().await;
+    let before = pool.stats().checkout_failures;
 
-    // A dial that raced the drain: it still establishes, but its driver must not
-    // become an untracked task that outlives shutdown.
-    let late = pool
+    let result = pool
         .checkout_h1(
             &proxy,
             socket.to_str().expect("utf-8"),
@@ -2440,35 +2449,255 @@ async fn a_driver_registered_after_the_drain_is_cancelled_not_leaked() {
             &roots(&root),
             &[],
         )
-        .await
-        .expect("a dial racing the drain still completes");
-    drop(late);
+        .await;
+    let err = expect_refusal(result, "a checkout after the drain must fail closed");
 
-    for _ in 0..200 {
-        if pool.stats().open_physical_connections == 0 && pool.resident_connection_lanes() == 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    let stats = pool.stats();
+    assert!(
+        matches!(err, UnixBackendError::PoolShuttingDown),
+        "expected the typed shutdown refusal, got {err}"
+    );
     assert_eq!(
-        stats.open_physical_connections, 0,
-        "a driver spawned into a closed tracker must still release the gauge"
+        err.error_class(),
+        ErrorClass::DispatchPolicyRejected,
+        "the gateway shutting down is not evidence about the application, so the \
+         refusal must stay health-neutral and unretried"
+    );
+    assert_eq!(
+        peer.accepts(),
+        0,
+        "the refusal happens before connect(2), so the app never sees a connection"
     );
     assert_eq!(
         pool.resident_connection_lanes(),
         0,
-        "a driver spawned into a closed tracker must still release its slot"
+        "a refused checkout must not reserve a slot on the target's bound"
+    );
+    let stats = pool.stats();
+    assert_eq!(stats.open_physical_connections, 0);
+    assert_eq!(stats.physical_connects, 0, "nothing was established");
+    assert_eq!(
+        stats.checkout_failures,
+        before + 1,
+        "a shutdown refusal is a gateway-side checkout failure, not a setup failure"
+    );
+    assert_eq!(
+        stats.setup_failures, 0,
+        "no establishment was attempted, so the app is not charged a setup failure"
+    );
+    assert_eq!(pool.tracked_drivers(), 0);
+}
+
+/// The h2c half of the same gate: the shared-carrier cold path is refused at
+/// the same point, so neither wire protocol can dial after the drain.
+#[tokio::test]
+async fn a_post_drain_h2c_checkout_is_refused_before_any_connect() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = SettingsThenClosePeer::bind(&socket, std::time::Duration::from_secs(30));
+    let pool = bounded_pool(4);
+    let proxy = test_proxy("unix-pool-post-drain-h2c");
+
+    pool.shutdown_drain().await;
+
+    let result = pool
+        .checkout_h2c(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await;
+    let err = expect_refusal(result, "an h2c checkout after the drain must fail closed");
+
+    assert!(
+        matches!(err, UnixBackendError::PoolShuttingDown),
+        "expected the typed shutdown refusal, got {err}"
+    );
+    assert_eq!(err.error_class(), ErrorClass::DispatchPolicyRejected);
+    assert_eq!(
+        peer.accepts(),
+        0,
+        "the refusal happens before connect(2) on this path too"
+    );
+    assert_eq!(pool.resident_connection_lanes(), 0);
+    let stats = pool.stats();
+    assert_eq!(stats.active_h2c_connections, 0);
+    assert_eq!(stats.open_physical_connections, 0);
+    assert_eq!(stats.physical_connects, 0);
+    assert_eq!(pool.tracked_drivers(), 0);
+}
+
+/// The latch/registration race, driven deterministically rather than polled: a
+/// checkout that passed the shutdown gate while the pool was open is parked at
+/// the driver-registration boundary, the drain runs to completion, and only
+/// then is the checkout released.
+///
+/// It must refuse — no sender may be handed back for a connection the drain can
+/// no longer reap — and every piece of accounting it touched must already be
+/// zero when it returns. No sleeping, no retry loop: the assertions run on the
+/// instant the racing call returns.
+#[tokio::test]
+async fn an_h1_checkout_racing_the_shutdown_latch_refuses_and_settles_exactly() {
+    use ferrum_edge::_test_support::checkout_unix_h1_with_registration_seam;
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = HoldingPeer::bind(&socket);
+    let pool = bounded_pool(4);
+    let proxy = test_proxy("unix-pool-h1-latch-race");
+    // Bound, not a temporary: the checkout future below borrows it across the
+    // `join!`, so it must outlive the statement that creates the future.
+    let allowed_roots = roots(&root);
+
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let lanes_while_parked = AtomicUsize::new(usize::MAX);
+    let gauge_while_parked = AtomicUsize::new(usize::MAX);
+    let tracked_after_drain = AtomicUsize::new(usize::MAX);
+
+    let racing_checkout = checkout_unix_h1_with_registration_seam(
+        &pool,
+        &proxy,
+        socket.to_str().expect("utf-8"),
+        proxy.backend_connect_timeout_ms,
+        &allowed_roots,
+        &[],
+        || async move {
+            let _ = reached_tx.send(());
+            let _ = release_rx.await;
+        },
+    );
+    let shutdown = async {
+        reached_rx
+            .await
+            .expect("the racing checkout reaches the registration boundary");
+        // Parked AFTER the dial and BEFORE registration: the connection exists
+        // and its slot is reserved, but no driver is tracked or charged yet.
+        let gauge = pool.stats().open_physical_connections as usize;
+        lanes_while_parked.store(pool.resident_connection_lanes(), Ordering::SeqCst);
+        gauge_while_parked.store(gauge, Ordering::SeqCst);
+        pool.shutdown_drain().await;
+        tracked_after_drain.store(pool.tracked_drivers(), Ordering::SeqCst);
+        let _ = release_tx.send(());
+    };
+    let (result, ()) = tokio::join!(racing_checkout, shutdown);
+
+    assert_eq!(
+        lanes_while_parked.load(Ordering::SeqCst),
+        1,
+        "the racing establishment holds its target's connection slot while parked"
+    );
+    assert_eq!(
+        gauge_while_parked.load(Ordering::SeqCst),
+        0,
+        "registration is what charges the open-connection gauge, and it has not run"
+    );
+    assert_eq!(
+        tracked_after_drain.load(Ordering::SeqCst),
+        0,
+        "the drain owned no driver for the racing connection"
+    );
+
+    let err = expect_refusal(
+        result,
+        "a checkout that reaches registration after the tracker closed must not hand back a \
+         sender whose connection has no driver",
+    );
+    assert!(
+        matches!(err, UnixBackendError::PoolShuttingDown),
+        "expected the typed shutdown refusal, got {err}"
+    );
+    assert_eq!(err.error_class(), ErrorClass::DispatchPolicyRejected);
+
+    let stats = pool.stats();
+    assert_eq!(
+        stats.open_physical_connections, 0,
+        "the losing side never spawned a driver, so the gauge was never charged"
+    );
+    assert_eq!(
+        pool.resident_connection_lanes(),
+        0,
+        "the refusal releases the target's connection slot before it returns"
     );
     assert_eq!(
         pool.tracked_drivers(),
         0,
-        "a closed tracker must not adopt a late driver"
+        "a closed tracker adopts nothing, and leaves no sentinel or aborted handle"
+    );
+    assert_eq!(
+        stats.physical_connects, 0,
+        "an established-then-refused connection is not a completed establishment"
     );
     assert_eq!(
         stats.idle_h1_connections, 0,
         "the pool stays latched: nothing may be pooled after the drain"
     );
+}
+
+/// The h2c half of the same race, through the same single registration
+/// boundary: the carrier is never published and the sender is never returned.
+#[tokio::test]
+async fn an_h2c_checkout_racing_the_shutdown_latch_refuses_and_settles_exactly() {
+    use ferrum_edge::_test_support::checkout_unix_h2c_with_registration_seam;
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = SettingsThenClosePeer::bind(&socket, std::time::Duration::from_secs(30));
+    let pool = bounded_pool(4);
+    let proxy = test_proxy("unix-pool-h2c-latch-race");
+    let allowed_roots = roots(&root);
+
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let lanes_while_parked = AtomicUsize::new(usize::MAX);
+
+    let racing_checkout = checkout_unix_h2c_with_registration_seam(
+        &pool,
+        &proxy,
+        socket.to_str().expect("utf-8"),
+        proxy.backend_connect_timeout_ms,
+        &allowed_roots,
+        &[],
+        || async move {
+            let _ = reached_tx.send(());
+            let _ = release_rx.await;
+        },
+    );
+    let shutdown = async {
+        reached_rx
+            .await
+            .expect("the racing h2c checkout reaches the registration boundary");
+        lanes_while_parked.store(pool.resident_connection_lanes(), Ordering::SeqCst);
+        pool.shutdown_drain().await;
+        let _ = release_tx.send(());
+    };
+    let (result, ()) = tokio::join!(racing_checkout, shutdown);
+
+    assert_eq!(
+        lanes_while_parked.load(Ordering::SeqCst),
+        1,
+        "the racing h2c establishment holds its target's connection slot while parked"
+    );
+    let err = expect_refusal(result, "the h2c race must fail closed rather than return a carrier");
+    assert!(
+        matches!(err, UnixBackendError::PoolShuttingDown),
+        "expected the typed shutdown refusal, got {err}"
+    );
+    assert_eq!(err.error_class(), ErrorClass::DispatchPolicyRejected);
+
+    let stats = pool.stats();
+    assert_eq!(
+        stats.active_h2c_connections, 0,
+        "a refused registration must never publish a multiplexable carrier"
+    );
+    assert_eq!(stats.open_physical_connections, 0);
+    assert_eq!(stats.physical_connects, 0);
+    assert_eq!(pool.resident_connection_lanes(), 0);
+    assert_eq!(pool.tracked_drivers(), 0);
 }
 
 /// The one establishment budget is opened at the OUTERMOST checkout entry —

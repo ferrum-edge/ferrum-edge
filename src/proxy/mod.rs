@@ -41344,13 +41344,22 @@ fn unix_backend_error_response(
         error = %err,
         "Unix-socket backend dispatch failed"
     );
-    let status_code = match error_class {
-        retry::ErrorClass::ConnectionTimeout | retry::ErrorClass::ReadWriteTimeout => 504,
-        // A gateway-side ceiling, not a backend fault: answer 503 like every
-        // other transport's over-cap refusal (the raw-TCP path included) rather
-        // than a 502 that reads as "the application failed".
-        retry::ErrorClass::BackendConnectionLimit => 503,
-        _ => 502,
+    // The pool refuses because THIS gateway is shutting down, which says nothing
+    // about the application: 503 (with the drain's `Connection: close`) is the
+    // honest answer, not a 502 that reads as "the backend failed". Keyed on the
+    // variant because its health-neutral class is shared with policy refusals
+    // that really are terminal 502s.
+    let status_code = if matches!(err, unix_backend::UnixBackendError::PoolShuttingDown) {
+        503
+    } else {
+        match error_class {
+            retry::ErrorClass::ConnectionTimeout | retry::ErrorClass::ReadWriteTimeout => 504,
+            // A gateway-side ceiling, not a backend fault: answer 503 like every
+            // other transport's over-cap refusal (the raw-TCP path included)
+            // rather than a 502 that reads as "the application failed".
+            retry::ErrorClass::BackendConnectionLimit => 503,
+            _ => 502,
+        }
     };
     retry::BackendResponse {
         status_code,

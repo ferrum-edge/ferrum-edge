@@ -12688,7 +12688,7 @@ components:
             physical_connects: { type: integer, format: uint64, description: "Physical connections established" }
             identity_retirements: { type: integer, format: uint64, description: "Carriers retired by socket replacement or config withdrawal" }
             setup_failures: { type: integer, format: uint64, description: "Connect or protocol-handshake failures" }
-            checkout_failures: { type: integer, format: uint64, description: "Pre-dial refusals: path admission and the per-target Unix ingress connection bound" }
+            checkout_failures: { type: integer, format: uint64, description: "Gateway-side checkout refusals: path admission, the per-target Unix ingress connection bound, and the shutdown latch" }
             idle_h1_connections: { type: integer, format: uint64, description: "Idle HTTP/1.1 carriers currently pooled" }
             active_h2c_connections: { type: integer, format: uint64, description: "Shared h2c carriers currently pooled" }
             open_physical_connections: { type: integer, format: uint64, description: "Physical connections currently open, including checked-out carriers" }
