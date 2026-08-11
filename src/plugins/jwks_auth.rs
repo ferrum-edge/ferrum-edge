@@ -28,8 +28,10 @@ use super::utils::claim_resolver::{
 };
 use super::utils::dpop::{self, DpopJtiCache, DpopVerifyInput};
 use super::utils::jwks_cache::{
-    DiscoveryStoreCandidate, JwksRefreshRequirement, get_or_create_jwks_store,
-    last_discovered_jwks_uri, remember_discovered_jwks_uri, retire_jwks_store_if_unreferenced,
+    DiscoveryStoreCandidate, JwksRefreshRequirement, LateActiveRequirement,
+    clear_late_active_requirement, get_or_create_jwks_store, last_discovered_jwks_uri,
+    publish_late_active_requirement, remember_discovered_jwks_uri,
+    retire_jwks_store_if_unreferenced,
 };
 pub use super::utils::jwks_store::{DEFAULT_JWKS_MAX_STALE_SECONDS, MAX_JWKS_MAX_STALE_SECONDS};
 use super::utils::jwks_store::{JwksKeyStore, redacted_jwks_uri};
@@ -124,6 +126,9 @@ pub struct JwksAuth {
     refresh_interval: Duration,
     discovery_tasks: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
     discovery_owner_live: Arc<AtomicBool>,
+    /// Set by `commit_background_tasks` once this generation is published.
+    /// Only a committed generation may contribute to readiness and metrics.
+    discovery_owner_committed: Arc<AtomicBool>,
     discovery_publication_gate: Arc<Mutex<()>>,
 }
 
@@ -167,6 +172,11 @@ struct JwksProvider {
     jwks_store: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
     /// Maximum monotonic age of the last validated non-empty remote JWKS.
     max_stale: Duration,
+    /// This provider's contribution to the shared-cache active set when its
+    /// store is resolved asynchronously after publication. Shared with the
+    /// discovery task, but always cleared by [`JwksAuth::drop`] so an aborted
+    /// task cannot keep a retired generation's store visible.
+    late_active: Arc<Mutex<Option<LateActiveRequirement>>>,
     jwks_source: JwksSource,
     /// Outbound hosts used by direct JWKS or discovery URLs.
     warmup_hostnames: Vec<String>,
@@ -246,6 +256,11 @@ impl Drop for JwksAuth {
             if matches!(&provider.jwks_source, JwksSource::Inline) {
                 continue;
             }
+            // Drop this generation's active contribution before retiring. The
+            // discovery task holds an `Arc` to the same slot and `abort()` is
+            // not synchronous, so relying on the task's reference to go away
+            // would leave a retired generation visible in readiness/metrics.
+            clear_late_active_requirement(&provider.late_active);
             let current = provider.jwks_store.swap(Arc::new(None));
             let jwks_uri = current
                 .as_ref()
@@ -483,6 +498,7 @@ impl JwksAuth {
                 dpop_jti_cache,
                 jwks_store: jwks_store_slot,
                 max_stale: provider_max_stale,
+                late_active: Arc::new(Mutex::new(None)),
                 jwks_source,
                 warmup_hostnames,
             });
@@ -549,6 +565,7 @@ impl JwksAuth {
             refresh_interval,
             discovery_tasks: Mutex::new(None),
             discovery_owner_live: Arc::new(AtomicBool::new(true)),
+            discovery_owner_committed: Arc::new(AtomicBool::new(false)),
             discovery_publication_gate: Arc::new(Mutex::new(())),
         })
     }
@@ -1075,11 +1092,13 @@ impl super::Plugin for JwksAuth {
                     tasks.push(spawn_discovery_task(
                         &runtime,
                         Arc::clone(&provider.jwks_store),
+                        Arc::clone(&provider.late_active),
                         self.http_client.clone(),
                         discovery_url.clone(),
                         self.refresh_interval,
                         provider.max_stale,
                         Arc::clone(&self.discovery_owner_live),
+                        Arc::clone(&self.discovery_owner_committed),
                         Arc::clone(&self.discovery_publication_gate),
                     ));
                 }
@@ -1087,6 +1106,35 @@ impl super::Plugin for JwksAuth {
         }
         *task_slot = Some(tasks);
         Ok(())
+    }
+
+    fn commit_background_tasks(&self) {
+        // Serialize against a discovery task publishing concurrently so exactly
+        // one of the two registers this generation's contribution: whichever
+        // runs second observes the other's result under the same gate.
+        let _publication = match self.discovery_publication_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.discovery_owner_committed
+            .store(true, Ordering::Release);
+        for provider in &self.providers {
+            // Direct and inline sources are already in the slot when the
+            // publication reconciliation collects requirements; only an
+            // asynchronously resolved store can arrive too late for it.
+            if !matches!(&provider.jwks_source, JwksSource::Discovery(_)) {
+                continue;
+            }
+            let guard = provider.jwks_store.load();
+            let Some(store) = guard.as_ref().as_ref().filter(|store| store.is_refreshable()) else {
+                continue;
+            };
+            publish_late_active_requirement(
+                &provider.late_active,
+                store.jwks_uri(),
+                JwksRefreshRequirement::new(self.refresh_interval, provider.max_stale),
+            );
+        }
     }
 
     async fn authenticate(
@@ -1211,11 +1259,13 @@ impl super::Plugin for JwksAuth {
 fn spawn_discovery_task(
     runtime: &tokio::runtime::Handle,
     slot: Arc<ArcSwap<Option<Arc<JwksKeyStore>>>>,
+    late_active: Arc<Mutex<Option<LateActiveRequirement>>>,
     client: PluginHttpClient,
     discovery_url: String,
     refresh_interval: Duration,
     max_stale: Duration,
     owner_live: Arc<AtomicBool>,
+    owner_committed: Arc<AtomicBool>,
     publication_gate: Arc<Mutex<()>>,
 ) -> tokio::task::JoinHandle<()> {
     runtime.spawn(async move {
@@ -1268,6 +1318,13 @@ fn spawn_discovery_task(
                             return;
                         }
                         remember_discovered_jwks_uri(&discovery_url, &uri);
+                        if owner_committed.load(Ordering::Acquire) {
+                            publish_late_active_requirement(
+                                &late_active,
+                                &uri,
+                                JwksRefreshRequirement::new(refresh_interval, max_stale),
+                            );
+                        }
                         candidate.publish();
                         return;
                     }
@@ -1309,6 +1366,18 @@ fn spawn_discovery_task(
                         }
                         slot.store(Arc::new(Some(Arc::clone(&store))));
                         remember_discovered_jwks_uri(&discovery_url, &uri);
+                        // The store is now the authenticator's verification
+                        // source, so a committed generation must expose it —
+                        // and its exact max-stale deadline — immediately. A
+                        // replacement moves this provider's contribution off
+                        // the previous URI without touching a co-tenant.
+                        if owner_committed.load(Ordering::Acquire) {
+                            publish_late_active_requirement(
+                                &late_active,
+                                &uri,
+                                JwksRefreshRequirement::new(refresh_interval, max_stale),
+                            );
+                        }
                     }
 
                     if !previous_has_keys
@@ -1328,6 +1397,7 @@ fn spawn_discovery_task(
                         Err(poisoned) => poisoned.into_inner(),
                     };
                     if !owner_live.load(Ordering::Acquire) {
+                        clear_late_active_requirement(&late_active);
                         let discarded = slot.swap(Arc::new(None));
                         drop(discarded);
                         return;

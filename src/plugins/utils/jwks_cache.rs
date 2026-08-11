@@ -10,6 +10,21 @@
 //! On config reload, [`retain_active_uris`] removes entries for JWKS URIs
 //! that are no longer referenced by any active JWKS consumer, aborting their
 //! background refresh tasks after any retired in-flight consumers finish.
+//!
+//! The active set has two contributors, unioned by
+//! [`reconcile_active_requirements`]:
+//!
+//! * the exact requirement map of the last committed plugin generation
+//!   ([`retain_active_requirements`]), and
+//! * [`LateActiveRequirement`] registrations from committed consumers whose
+//!   store was resolved asynchronously *after* that publication already ran
+//!   (OIDC discovery). Without them a discovery-backed store an authenticator
+//!   really uses would age into grace/expired while `/health`, `/status`, and
+//!   the JWKS metrics still omitted it.
+//!
+//! Every mutation recomputes the whole union, so a publication, retirement,
+//! discovery-URI replacement, or rejected staged generation reconciles only its
+//! own contribution and can never deactivate a co-tenant of the same URI.
 
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
@@ -48,6 +63,9 @@ impl JwksRefreshRequirement {
         }
     }
 }
+
+/// Strictest active requirement per shared JWKS URI.
+type JwksRequirementMap = HashMap<String, JwksRefreshRequirement>;
 
 /// A cached JWKS entry: the key store plus its background refresh task handle.
 struct JwksCacheEntry {
@@ -148,6 +166,13 @@ static JWKS_CACHE: OnceLock<Arc<DashMap<String, JwksCacheEntry>>> = OnceLock::ne
 /// stores only URI strings; key material remains owned by `JWKS_CACHE` and its
 /// generation-aware reaper.
 static DISCOVERED_JWKS_URIS: OnceLock<DashMap<String, String>> = OnceLock::new();
+/// Exact requirement set of the last committed plugin generation.
+static COMMITTED_REQUIREMENTS: OnceLock<arc_swap::ArcSwap<JwksRequirementMap>> = OnceLock::new();
+/// Live [`LateActiveRequirement`] contributions from committed consumers whose
+/// store resolved after their generation was published.
+static LATE_ACTIVE_REQUIREMENTS: OnceLock<DashMap<u64, (String, JwksRefreshRequirement)>> =
+    OnceLock::new();
+static LATE_ACTIVE_REQUIREMENT_IDS: AtomicU64 = AtomicU64::new(0);
 /// Precomputed active-remote trust aggregate for O(1) `/health` and `/status`.
 static TRUST_HEALTH: OnceLock<arc_swap::ArcSwap<JwksTrustHealthAggregate>> = OnceLock::new();
 /// Generation for the deadline-watcher task; bumping cancels a stale sleeper.
@@ -172,6 +197,103 @@ fn global_cache() -> &'static Arc<DashMap<String, JwksCacheEntry>> {
 
 fn discovered_jwks_uris() -> &'static DashMap<String, String> {
     DISCOVERED_JWKS_URIS.get_or_init(DashMap::new)
+}
+
+fn committed_requirements_slot() -> &'static arc_swap::ArcSwap<JwksRequirementMap> {
+    COMMITTED_REQUIREMENTS.get_or_init(|| arc_swap::ArcSwap::from_pointee(JwksRequirementMap::new()))
+}
+
+fn late_active_requirements() -> &'static DashMap<u64, (String, JwksRefreshRequirement)> {
+    LATE_ACTIVE_REQUIREMENTS.get_or_init(DashMap::new)
+}
+
+/// One committed consumer's asynchronously discovered contribution to the
+/// active requirement set.
+///
+/// Registered only by a consumer whose owning plugin generation has already
+/// been committed, so a staged, rejected, canceled, or unpublished generation
+/// never reaches readiness or metrics. Dropping the guard removes exactly this
+/// contribution and reconciles, which is what retires the store when the owning
+/// generation goes away. The registry is keyed by a monotonic id, so an
+/// identical URI registered twice stays two independent contributions and the
+/// registry is bounded by the live discovery-backed consumers.
+#[derive(Debug)]
+pub struct LateActiveRequirement {
+    id: u64,
+}
+
+impl LateActiveRequirement {
+    /// Publish this consumer's requirement immediately, without waiting for
+    /// another configuration reload.
+    pub fn register(jwks_uri: &str, requirement: JwksRefreshRequirement) -> Self {
+        let id = LATE_ACTIVE_REQUIREMENT_IDS.fetch_add(1, Ordering::Relaxed);
+        late_active_requirements().insert(id, (jwks_uri.to_string(), requirement));
+        reconcile_active_requirements();
+        Self { id }
+    }
+
+    /// Re-point this contribution at a replacement discovery result. Only this
+    /// consumer moves; a co-tenant of either URI keeps its own contribution.
+    pub fn replace(&self, jwks_uri: &str, requirement: JwksRefreshRequirement) {
+        late_active_requirements().insert(self.id, (jwks_uri.to_string(), requirement));
+        reconcile_active_requirements();
+    }
+}
+
+impl Drop for LateActiveRequirement {
+    fn drop(&mut self) {
+        late_active_requirements().remove(&self.id);
+        reconcile_active_requirements();
+    }
+}
+
+/// Make one consumer's exact requirement active on the shared store now,
+/// without waiting for another configuration reload.
+///
+/// Re-pointing an existing contribution moves only this consumer, so a
+/// co-tenant of either the previous or the replacement URI keeps its own
+/// strictness. Callers own the slot for the lifetime of their plugin
+/// generation; a poisoned lock is recovered rather than panicking.
+pub fn publish_late_active_requirement(
+    slot: &std::sync::Mutex<Option<LateActiveRequirement>>,
+    jwks_uri: &str,
+    requirement: JwksRefreshRequirement,
+) {
+    let mut guard = match slot.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(existing) = guard.as_ref() {
+        existing.replace(jwks_uri, requirement);
+        return;
+    }
+    *guard = Some(LateActiveRequirement::register(jwks_uri, requirement));
+}
+
+/// Withdraw one consumer's contribution — plugin retirement, or a publication
+/// this generation discarded. Removes only this consumer's entry.
+pub fn clear_late_active_requirement(slot: &std::sync::Mutex<Option<LateActiveRequirement>>) {
+    let mut guard = match slot.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    drop(guard.take());
+}
+
+/// Spawn a cache-maintenance task when a Tokio runtime is available.
+///
+/// Reconciliation runs from plugin `Drop` as well as from the runtime, and a
+/// bare `tokio::spawn` panics off-runtime. Skipping the timer is safe for both
+/// callers: the trust aggregate carries monotonic deadlines that
+/// [`JwksTrustHealthAggregate::ready`] evaluates at read time, and a retired
+/// entry is reaped by the next reconciliation instead.
+fn spawn_cache_maintenance<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(future);
+    }
 }
 
 /// O(1) snapshot of active remote JWKS trust health for `/health` and `/status`.
@@ -279,7 +401,7 @@ fn schedule_trust_health_watch(next_watch: Option<Instant>) {
         return;
     };
     let generation = TRUST_HEALTH_WATCH_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-    tokio::spawn(async move {
+    spawn_cache_maintenance(async move {
         tokio::time::sleep_until(deadline).await;
         if TRUST_HEALTH_WATCH_GENERATION.load(Ordering::Acquire) != generation {
             return;
@@ -377,6 +499,16 @@ fn reconfigure_refresh_policy(
     if entry.requirement == requirement {
         return;
     }
+    if tokio::runtime::Handle::try_current().is_err() {
+        // Reconciliation also runs from plugin `Drop`, which may land on a
+        // non-runtime thread at teardown. Replacing the worker there would
+        // panic in `tokio::spawn`, and aborting it without a replacement would
+        // stop refreshes entirely, so keep the current policy and worker and
+        // let the next on-runtime reconciliation apply the change. Every
+        // consumer that could construct a store did so on a runtime, so this
+        // is a teardown path; active-flag reconciliation still proceeds.
+        return;
+    }
     let previous = entry.requirement;
     entry
         .store
@@ -397,15 +529,37 @@ fn reconfigure_refresh_policy(
     );
 }
 
-/// Reconcile the shared cache against the exact strictest requirement of the
-/// newly committed plugin generation, then retire unreferenced stores.
+/// Install the exact strictest requirement of the newly committed plugin
+/// generation, then reconcile the shared cache against the full active union.
 ///
 /// Trust-health republication runs only after `retain` returns so it never
 /// iterates the map under the retain shard guard.
 pub fn retain_active_requirements(active_requirements: &HashMap<String, JwksRefreshRequirement>) {
+    committed_requirements_slot().store(Arc::new(active_requirements.clone()));
+    reconcile_active_requirements();
+}
+
+/// Recompute the active set as `committed generation ∪ late contributions` and
+/// apply it to the shared cache.
+///
+/// Every mutation path funnels through here, so relaxation of a shared store
+/// happens only once *every* stricter committed consumer — published or
+/// asynchronously discovered — is gone.
+fn reconcile_active_requirements() {
+    let mut effective: JwksRequirementMap = (**committed_requirements_slot().load()).clone();
+    if let Some(late) = LATE_ACTIVE_REQUIREMENTS.get() {
+        for entry in late.iter() {
+            let (uri, requirement) = entry.value();
+            effective
+                .entry(uri.clone())
+                .and_modify(|current| *current = current.strictest(*requirement))
+                .or_insert(*requirement);
+        }
+    }
+
     let cache = global_cache();
     cache.retain(|uri, entry| {
-        if let Some(requirement) = active_requirements.get(uri) {
+        if let Some(requirement) = effective.get(uri) {
             entry.active.store(true, Ordering::Release);
             entry.retirement_epoch.fetch_add(1, Ordering::AcqRel);
             reconfigure_refresh_policy(uri, entry, *requirement);
@@ -419,6 +573,11 @@ pub fn retain_active_requirements(active_requirements: &HashMap<String, JwksRefr
 }
 
 /// Remove JWKS cache entries whose URIs are not in `active_uris`.
+///
+/// Lower-level test-only helper: it decides activity from a bare URI set and
+/// deliberately ignores both the committed requirement map and late
+/// contributions. Production reconciliation goes through
+/// [`retain_active_requirements`] / [`reconcile_active_requirements`].
 ///
 /// Aborts the background refresh task for each removed entry so leaked tokio
 /// tasks don't accumulate across config reloads. Stores still owned by a
@@ -472,7 +631,7 @@ fn schedule_retired_store_reaper(uri: String, entry: &JwksCacheEntry) {
     let store = Arc::downgrade(&entry.store);
     let cache = Arc::clone(global_cache());
 
-    tokio::spawn(async move {
+    spawn_cache_maintenance(async move {
         loop {
             tokio::time::sleep(RETIRED_STORE_REAP_INTERVAL).await;
             if retirement_epoch.load(Ordering::Acquire) != epoch {
@@ -717,5 +876,12 @@ pub fn clear_jwks_cache() {
     if let Some(discoveries) = DISCOVERED_JWKS_URIS.get() {
         discoveries.clear();
     }
+    // Drop both contributors so a later test starts from an empty active set.
+    // Outstanding `LateActiveRequirement` guards still remove their own id on
+    // drop; the removal is simply a no-op after this clear.
+    if let Some(late) = LATE_ACTIVE_REQUIREMENTS.get() {
+        late.clear();
+    }
+    committed_requirements_slot().store(Arc::new(JwksRequirementMap::new()));
     republish_trust_health();
 }

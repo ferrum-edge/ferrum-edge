@@ -674,3 +674,155 @@ async fn shared_cache_trust_publish_stays_outside_dashmap_guards() {
 
     clear_jwks_cache();
 }
+
+// ---------------------------------------------------------------------------
+// Asynchronously discovered stores (issue #3739 direct/discovery parity)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn late_registered_store_is_active_immediately_and_expires_without_another_reload() {
+    use ferrum_edge::plugins::utils::jwks_cache::{
+        LateActiveRequirement, republish_trust_health, trust_health_snapshot,
+    };
+
+    let (server, uri) = super::jwks_auth_tests::start_jwks_server(RSA_PUBLIC_PEM).await;
+    let _guard = cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    // A discovery worker resolves a store *after* its generation's publication
+    // reconciliation already ran, so the committed requirement map is empty.
+    let store = get_or_create_jwks_store_with_policy(
+        &uri,
+        &client(),
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+    );
+    super::jwks_auth_tests::wait_for_received_request_count(&server, 1).await;
+    let populated = std::time::Instant::now() + Duration::from_secs(2);
+    while !store.has_keys() {
+        assert!(
+            std::time::Instant::now() < populated,
+            "initial JWKS populate"
+        );
+        tokio::task::yield_now().await;
+    }
+    retain_active_requirements(&HashMap::new());
+    let before = trust_health_snapshot();
+    assert_eq!(
+        (before.fresh, before.grace, before.expired),
+        (0, 0, 0),
+        "a store no committed consumer has claimed must stay out of readiness"
+    );
+
+    // The committed owner publishes its contribution. No reload involved.
+    let contribution = LateActiveRequirement::register(
+        &uri,
+        JwksRefreshRequirement::new(Duration::from_secs(10), Duration::from_secs(30)),
+    );
+    let active = trust_health_snapshot();
+    assert_eq!(
+        (active.fresh, active.grace, active.expired),
+        (1, 0, 0),
+        "a committed discovery-backed store must be visible immediately"
+    );
+    assert_eq!(
+        cached_requirement(&uri).expect("cached entry").max_stale,
+        Duration::from_secs(30)
+    );
+
+    // Its readiness must transition at max-stale with no further publication.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [] })))
+        .mount(&server)
+        .await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let expired = trust_health_snapshot();
+    assert!(
+        !expired.ready(tokio::time::Instant::now()),
+        "a late-registered store must fail readiness at its own max-stale deadline"
+    );
+    republish_trust_health();
+    let expired = trust_health_snapshot();
+    assert_eq!((expired.fresh, expired.grace, expired.expired), (0, 0, 1));
+    tokio::time::resume();
+
+    // Retiring the owning generation withdraws exactly this contribution.
+    drop(contribution);
+    let retired = trust_health_snapshot();
+    assert_eq!((retired.fresh, retired.grace, retired.expired), (0, 0, 0));
+    assert!(retired.ready(tokio::time::Instant::now()));
+
+    drop(store);
+    clear_jwks_cache();
+}
+
+#[tokio::test]
+async fn shared_uri_strictest_arbitration_spans_committed_and_late_consumers() {
+    use ferrum_edge::plugins::utils::jwks_cache::LateActiveRequirement;
+
+    let server = wiremock::MockServer::start().await;
+    let uri = format!("{}/shared-late/jwks.json", server.uri());
+    let _guard = cache_test_lock().lock().await;
+    clear_jwks_cache();
+
+    let relaxed = JwksRefreshRequirement::new(Duration::from_secs(600), Duration::from_secs(3_600));
+    let strict = JwksRefreshRequirement::new(Duration::from_secs(60), Duration::from_secs(300));
+
+    let _store = get_or_create_jwks_store_with_policy(
+        &uri,
+        &client(),
+        relaxed.refresh_interval,
+        relaxed.max_stale,
+    );
+    retain_active_requirements(&HashMap::from([(uri.clone(), relaxed)]));
+    assert_eq!(cached_requirement(&uri), Some(relaxed));
+
+    // A late discovery-backed consumer of the same URI tightens both bounds.
+    let strict_contribution = LateActiveRequirement::register(&uri, strict);
+    assert_eq!(
+        cached_requirement(&uri),
+        Some(strict),
+        "the strictest active requirement must win across both contributors"
+    );
+
+    // A second committed publication that still carries only the relaxed
+    // consumer must not relax the store while the strict consumer is live.
+    retain_active_requirements(&HashMap::from([(uri.clone(), relaxed)]));
+    assert_eq!(cached_requirement(&uri), Some(strict));
+
+    // Relaxation happens only once the stricter consumer is gone.
+    drop(strict_contribution);
+    assert_eq!(cached_requirement(&uri), Some(relaxed));
+
+    // A late consumer alone keeps the store active after the committed
+    // generation drops it.
+    let strict_contribution = LateActiveRequirement::register(&uri, strict);
+    retain_active_requirements(&HashMap::new());
+    assert_eq!(
+        cached_requirement(&uri),
+        Some(strict),
+        "a publication must not deactivate another consumer of the same URI"
+    );
+
+    // Re-pointing that consumer at a replacement URI moves only its own
+    // contribution; the original URI has no owner left.
+    let replacement_uri = format!("{}/shared-late/rotated.json", server.uri());
+    let _replacement = get_or_create_jwks_store_with_policy(
+        &replacement_uri,
+        &client(),
+        relaxed.refresh_interval,
+        relaxed.max_stale,
+    );
+    assert_eq!(cached_requirement(&replacement_uri), Some(relaxed));
+    strict_contribution.replace(&replacement_uri, strict);
+    assert_eq!(
+        cached_requirement(&replacement_uri),
+        Some(strict),
+        "a replaced discovery URI must carry the consumer's exact requirement"
+    );
+
+    drop(strict_contribution);
+    clear_jwks_cache();
+}
