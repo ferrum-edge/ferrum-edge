@@ -371,8 +371,10 @@ fn validator_rejects_unbound_custom_policy_as_content_failure() {
 fn apply_update_keeps_last_good_on_invalid_ext_authz_content() {
     let state = MeshRuntimeState::new();
     let request = client_config(None, None).subscribe_request(ferrum_edge::FERRUM_VERSION);
-    let consumer =
-        NativeMeshConfigConsumer::new(state.clone(), MeshUpdateExpectation::from_subscribe_request(&request));
+    let consumer = NativeMeshConfigConsumer::new(
+        state.clone(),
+        MeshUpdateExpectation::from_subscribe_request(&request),
+    );
 
     let last_good = MeshSlice {
         version: "v-last-good".to_string(),

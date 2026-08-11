@@ -1108,8 +1108,7 @@ mod live_datapath {
     /// `failOpen` — admit on `BodyUnavailable`.
     #[test]
     fn a_body_inspecting_custom_rule_with_positive_port_scope_still_buffers() {
-        let plugin =
-            plugin(body_slice_with_ports(9000, &[8080], &[])).expect("generation builds");
+        let plugin = plugin(body_slice_with_ports(9000, &[8080], &[])).expect("generation builds");
         assert!(
             plugin.should_buffer_request_body(&ctx("/admin/reports")),
             "positive ports are unavailable at the prebuffer point and must be treated as satisfiable"
@@ -1122,8 +1121,7 @@ mod live_datapath {
 
     #[test]
     fn a_body_inspecting_custom_rule_with_negative_port_scope_still_buffers() {
-        let plugin =
-            plugin(body_slice_with_ports(9000, &[], &[9090])).expect("generation builds");
+        let plugin = plugin(body_slice_with_ports(9000, &[], &[9090])).expect("generation builds");
         assert!(
             plugin.should_buffer_request_body(&ctx("/admin/reports")),
             "notPorts is also unavailable pre-authorize and must not false-negative buffering"
