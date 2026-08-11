@@ -3176,8 +3176,7 @@ mod tests {
         // Dedicated-bind ids are an ingress sub-family. They must retain the
         // same fail-closed requirement rather than authorizing on their local
         // application backend when the direct listener loses its port stamp.
-        let dedicated_id =
-            format!("{MESH_INGRESS_BIND_PROXY_ID_PREFIX}default-reviews-8443");
+        let dedicated_id = format!("{MESH_INGRESS_BIND_PROXY_ID_PREFIX}default-reviews-8443");
         assert!(mesh_ingress_authz_port_missing(
             Some(MeshTrafficDirection::Inbound),
             Some(dedicated_id.as_str()),

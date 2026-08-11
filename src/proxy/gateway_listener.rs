@@ -218,8 +218,8 @@ impl GatewayListenerPlan {
             };
             let bind_addr = desired_gateway_bind(config, port, default_bind_addr);
             let dedicated_bind = sidecar_ingress_bind_for_port(config, port).is_some();
-            let mesh_direction = dedicated_bind
-                .then_some(crate::modes::mesh::MeshTrafficDirection::Inbound);
+            let mesh_direction =
+                dedicated_bind.then_some(crate::modes::mesh::MeshTrafficDirection::Inbound);
             if dedicated_bind && class == GatewayListenerClass::Tls {
                 refused.entry(port).or_insert_with(|| {
                     format!(
@@ -300,8 +300,7 @@ impl GatewayListenerPlan {
                     bind_addr,
                     mesh_direction,
                 },
-            )
-                && existing.class != class
+            ) && existing.class != class
             {
                 // One socket cannot be both plaintext and TLS. The Gateway API
                 // translator refuses this at admission, so reaching it means a
@@ -948,31 +947,29 @@ impl GatewayListenerManager {
         let tls = self.tls.clone();
         let task = tokio::spawn(async move {
             match desired.class {
-                GatewayListenerClass::Plaintext => {
-                    match desired.mesh_direction {
-                        Some(mesh_direction) => {
-                            crate::proxy::start_mesh_plaintext_listener_with_signal(
-                                addr,
-                                state,
-                                shutdown_rx,
-                                None,
-                                Some(mesh_direction),
-                                Some(started_tx),
-                            )
-                            .await
-                        }
-                        None => {
-                            crate::proxy::start_proxy_listener_with_tls_and_signal(
-                                addr,
-                                state,
-                                shutdown_rx,
-                                None,
-                                Some(started_tx),
-                            )
-                            .await
-                        }
+                GatewayListenerClass::Plaintext => match desired.mesh_direction {
+                    Some(mesh_direction) => {
+                        crate::proxy::start_mesh_plaintext_listener_with_signal(
+                            addr,
+                            state,
+                            shutdown_rx,
+                            None,
+                            Some(mesh_direction),
+                            Some(started_tx),
+                        )
+                        .await
                     }
-                }
+                    None => {
+                        crate::proxy::start_proxy_listener_with_tls_and_signal(
+                            addr,
+                            state,
+                            shutdown_rx,
+                            None,
+                            Some(started_tx),
+                        )
+                        .await
+                    }
+                },
                 GatewayListenerClass::Tls => {
                     if let Some(slot) = tls.reload_slot {
                         crate::proxy::start_proxy_listener_with_dynamic_tls_and_signal(
@@ -1374,21 +1371,17 @@ mod tests {
             .expect("bind backend");
         let backend_port = backend.local_addr().expect("backend addr").port();
         let backend_task = tokio::spawn(async move {
-            let (mut stream, _) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                backend.accept(),
-            )
-            .await
-            .expect("backend accept timeout")
-            .expect("backend accept");
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), backend.accept())
+                    .await
+                    .expect("backend accept timeout")
+                    .expect("backend accept");
             let mut request = [0u8; 4096];
-            let read = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                stream.read(&mut request),
-            )
-            .await
-            .expect("backend read timeout")
-            .expect("backend read");
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut request))
+                    .await
+                    .expect("backend read timeout")
+                    .expect("backend read");
             assert!(
                 String::from_utf8_lossy(&request[..read]).contains("GET / HTTP/1.1"),
                 "dedicated bind must forward the HTTP request"
