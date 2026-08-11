@@ -2226,35 +2226,62 @@ fn streaming_deadline_wraps_client_visible_body_after_inspection() {
             assert!(
                 body.contains("PooledBackendLeaseSlot")
                     && body.contains("with_pooled_backend_lease("),
-                "{arm} must re-attach any Unix pool lease outside the deadline wrapper"
+                "{arm} must re-attach any Unix pool lease to the backend-facing body"
             );
             let lease_attach = body
                 .find("with_pooled_backend_lease(")
                 .expect("lease attach");
+            // #3731: the lease anchors to the body that OWNS the backend
+            // `Incoming`, so its `Ready(None)` really is a backend EOF. The
+            // response inspector is the one adapter that does NOT preserve that
+            // — it moves the backend body into a detached task and feeds the
+            // client from a channel that also closes on a policy `Terminate`,
+            // an early return, and task cancellation. Attaching the lease after
+            // that split would re-pool an exclusive HTTP/1.1 carrier
+            // mid-response, so it must come BEFORE it (and therefore before the
+            // deadline wrapper, which decorates the same client-visible body).
             assert!(
-                deadline < lease_attach,
-                "{arm} must keep the Unix pool lease outermost around the deadline wrapper"
+                lease_attach < inspection,
+                "{arm} must anchor the Unix pool lease to the backend-facing body, before the \
+                 inspector bridge"
+            );
+            assert!(
+                lease_attach < deadline,
+                "{arm} must attach the Unix pool lease before the deadline wrapper"
             );
         }
     }
 }
 
 #[test]
-fn unix_h1_keep_alive_forces_in_dispatch_buffering_for_content_length() {
-    // #3731: mesh ingress streams by default; a Content-Length response must
-    // still check in inside proxy_to_backend_unix when keep-alive is on, so a
+fn unix_h1_keep_alive_buffers_only_within_the_eager_buffer_contract() {
+    // #3731: mesh ingress streams by default; a SMALL Content-Length response
+    // checks in inside proxy_to_backend_unix when keep-alive is on, so a
     // frontend Connection: close cannot retire a reusable carrier.
+    //
+    // The gate is the repo's existing eager-buffer contract, not "any declared
+    // length": buffering past `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` would make
+    // the retained size unbounded by that knob, fold an `unlimited` response
+    // ceiling down to the fail-closed per-response fallback (a `502` for a
+    // response that used to stream), and multiply resident bytes by concurrency
+    // against the shared response-buffer budget. SSE must stream regardless.
     let source = include_str!("../../../src/proxy/mod.rs");
-    let marker = "Known-length responses\n    // therefore buffer and check in inside this function whenever";
+    let dispatch = source
+        .split("async fn proxy_to_backend_unix(")
+        .nth(1)
+        .expect("unix dispatch");
     assert!(
-        source.contains(marker)
-            || source
-                .contains("therefore buffer and check in inside this function whenever keep-alive"),
-        "unix dispatch must document the Content-Length keep-alive buffering rule"
+        dispatch.contains("checkout.keep_alive()"),
+        "unix dispatch must gate in-dispatch buffering on the lease's keep-alive decision"
     );
     assert!(
-        source.contains("content_length.is_some() && checkout.keep_alive()"),
-        "unix dispatch must force stream_response=false for Content-Length + keep-alive"
+        dispatch.contains("state.response_buffer_cutoff_bytes > 0")
+            && dispatch.contains("len <= state.response_buffer_cutoff_bytes"),
+        "unix dispatch must bound in-dispatch buffering by the eager-buffer cutoff"
+    );
+    assert!(
+        dispatch.contains("!is_streaming_content_type(&resp_headers)"),
+        "unix dispatch must never eagerly buffer a stream-mandated content type"
     );
 }
 

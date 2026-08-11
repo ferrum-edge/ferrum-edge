@@ -34352,12 +34352,12 @@ async fn handle_proxy_request_inner(
             // Issue #3731: a sidecar-ingress Unix HTTP/1.1 dispatch parks its
             // exclusive connection lease in the response extensions. Take it
             // BEFORE `resp.into_body()` (which drops the extension map) and
-            // re-attach it to the OUTERMOST client-visible body below, so the
-            // carrier is owned for the whole stream — through the coalescer,
-            // the size limiter, the inspector bridge, and any deadline wrapper
-            // — and is returned only on that body's clean end-of-stream. Every
-            // other dispatch path leaves this `None` and pays one `Option`
-            // check per streaming response.
+            // re-attach it below to the body that OWNS the backend
+            // `hyper::body::Incoming` — through the coalescer, the size limiter
+            // and any deadline wrapper, all of which decorate that same
+            // `ProxyBody` — so it is returned only on a real backend
+            // end-of-stream. Every other dispatch path leaves this `None` and
+            // pays one `Option` check per streaming response.
             let pooled_backend_lease = resp
                 .extensions_mut()
                 .remove::<crate::proxy::body::PooledBackendLeaseSlot>()
@@ -34462,6 +34462,30 @@ async fn handle_proxy_request_inner(
                     streaming_trailer_governor.take(),
                 )
             };
+            // Anchor the sidecar-ingress Unix HTTP/1.1 lease to the
+            // BACKEND-FACING body (issue #3731) — the one that actually owns the
+            // `hyper::body::Incoming` this arm just wrapped.
+            //
+            // On every non-inspected path this is the same `ProxyBody` value the
+            // adapters below keep decorating: `with_lb_connection_guard`,
+            // `with_client_grpc_deadline`, and the deferred-outcome builders all
+            // consume and return `self`, so "innermost" and "outermost" are one
+            // struct and nothing moves.
+            //
+            // The response INSPECTOR is the single case where they differ: it
+            // moves this body into a detached task and hands the client a
+            // second, channel-fed `ProxyBody`. That outer body reaches
+            // `Ready(None)` whenever the inspection task's sender drops — a
+            // policy `Terminate`, an early return, a cancelled or panicking task
+            // — none of which imply the backend body was read to EOF. Releasing
+            // the lease there would return an exclusive H1 carrier to the idle
+            // set mid-response. Held by the backend-facing body instead, the
+            // release stays exactly where the contract puts it: that body's own
+            // clean EOF, with every abandonment retiring the carrier via `Drop`.
+            let body = match pooled_backend_lease {
+                Some(lease) => body.with_pooled_backend_lease(lease),
+                None => body,
+            };
             let mut body = if let Some(inspector) = response_inspector {
                 let (tx, rx) = tokio::sync::mpsc::channel(16);
                 tokio::spawn(crate::proxy::body::run_proxy_body_response_inspection(
@@ -34550,11 +34574,6 @@ async fn handle_proxy_request_inner(
                 if streaming_h2_native_grpc {
                     body = body.with_grpc_trailer_backend_dispatch_classification();
                 }
-            }
-            // Outermost, so the lease outlives every adapter above it and its
-            // release is anchored to the terminal frame the CLIENT sees.
-            if let Some(lease) = pooled_backend_lease {
-                body = body.with_pooled_backend_lease(lease);
             }
             body
         }
@@ -41772,15 +41791,22 @@ async fn proxy_to_backend_unix(
     Option<Bytes>,
     Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
-    // The pool resolves the DestinationRule `maxConnections` lane from the
-    // proxy it is handed, so it must be the TARGET-EFFECTIVE clone — the same
-    // convention the direct-H2 and gRPC pools follow. That clone carries the
-    // LB-selected target's dial host/port and, under a `targetPort` remap,
-    // mirrors the service-port policy onto the dial port with `policy_port`
-    // stamped, so the Unix carrier lands on the destination's one shared lane
-    // instead of a second ceiling of its own (issue #3764). Everything else on
-    // this path deliberately keeps using `proxy`: only pool identity and
-    // connection admission are target-effective here.
+    // The pool reads its per-dispatch policy (idle timeout, keep-alive reuse)
+    // off the proxy it is handed, so it must be the TARGET-EFFECTIVE clone —
+    // the same convention the direct-H2 and gRPC pools follow. That clone
+    // carries the LB-selected target's dial host/port and, under a `targetPort`
+    // remap, mirrors the service-port policy onto the dial port with
+    // `policy_port` stamped. Its `namespace` / `id` / `upstream_id` are
+    // untouched, which is what keeps the resulting `UnixPoolKey` identical to
+    // the identity config publication reconciles against.
+    //
+    // The pool's own physical-connection ceiling is
+    // `FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS`, NOT a DestinationRule
+    // `connectionPool.tcp.maxConnections` — that is outbound, client-side
+    // policy and deliberately does not govern sidecar ingress (see
+    // `unix_backend_pool`'s module docs). Everything else on this path
+    // deliberately keeps using `proxy`: only pool identity and connection
+    // admission are target-effective here.
     let unix_conn_effective_proxy =
         resolve_backend_connection_proxy_for_target(proxy, upstream_target);
     let conn_proxy = unix_conn_effective_proxy.as_ref();
@@ -42136,11 +42162,26 @@ async fn proxy_to_backend_unix(
     // for functional tests and many production clients) can drop that body
     // without the terminal poll, which retires the exclusive carrier and forces
     // one dial per request (#3731 hosted data-plane evidence: 12 sequential
-    // buffered requests over 12 physical connections). Known-length responses
-    // therefore buffer and check in inside this function whenever keep-alive
-    // reuse is enabled — the path the keep-alive assertion expects — while
-    // chunked / unknown-length bodies keep the streaming lease.
-    let stream_response = if content_length.is_some() && checkout.keep_alive() {
+    // buffered requests over 12 physical connections). A small known-length
+    // response therefore buffers and checks in inside this function whenever
+    // keep-alive reuse is enabled, while chunked / unknown-length bodies keep
+    // the streaming lease.
+    //
+    // The gate is the SAME eager-buffer contract every other transport applies
+    // (`FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES`, and never for a stream-mandated
+    // content type), not "any declared length": buffering a response the
+    // operator's cutoff excludes would make the retained size unbounded by that
+    // knob, fold an `unlimited` response ceiling down to the fail-closed
+    // per-response fallback (turning a previously streamable large response
+    // into a `502`), multiply resident bytes by concurrency against the shared
+    // response-buffer budget, and eagerly collect an SSE stream that declared a
+    // length. Reuse is a performance property; none of those are worth it.
+    let stream_response = if stream_response
+        && checkout.keep_alive()
+        && state.response_buffer_cutoff_bytes > 0
+        && content_length.is_some_and(|len| len <= state.response_buffer_cutoff_bytes)
+        && !is_streaming_content_type(&resp_headers)
+    {
         false
     } else {
         stream_response
@@ -42162,10 +42203,11 @@ async fn proxy_to_backend_unix(
         //    is complete right here, so check the carrier in directly.
         // 2. Otherwise the lease is wrapped as a `PooledBackendLease` and
         //    carried in the response's extensions to the streaming-body builder,
-        //    which anchors it to the client-visible `ProxyBody`. That body
-        //    returns it from exactly one place — clean `Poll::Ready(None)` —
-        //    and drops it (retiring the connection) on a body error, a client
-        //    disconnect, an early drop, a fired deadline, or shutdown.
+        //    which anchors it to the `ProxyBody` that OWNS the backend
+        //    `Incoming`. That body returns it from exactly one place — clean
+        //    `Poll::Ready(None)`, i.e. a real backend end-of-stream — and drops
+        //    it (retiring the connection) on a body error, a client disconnect,
+        //    an early drop, a fired deadline, or shutdown.
         //
         // If the response never reaches the body builder (an `after_proxy`
         // reject replaces it, say), the extension drops with the response and
@@ -42762,10 +42804,12 @@ async fn proxy_to_backend_mesh_mtls(
     // Concurrent RPCs share one connection's streams, and a closed/GOAWAY
     // carrier is replaced rather than reused.
     let sender_result = if let Some(socket_path) = unix_socket_path {
-        // Target-effective proxy for pool identity and `maxConnections`
-        // admission only — see `proxy_to_backend_unix` (issue #3764). The rest
-        // of this dispatch keeps using `proxy`, so the shared mesh-mTLS body is
-        // unchanged for non-Unix targets.
+        // Target-effective proxy for pool identity and per-dispatch pool policy
+        // only — see `proxy_to_backend_unix` (issue #3764), including why the
+        // Unix ceiling is `FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS` rather than
+        // an outbound DestinationRule. The rest of this dispatch keeps using
+        // `proxy`, so the shared mesh-mTLS body is unchanged for non-Unix
+        // targets.
         let unix_conn_proxy = resolve_backend_connection_proxy_for_target(proxy, Some(target));
         // Boxed for the same stack-budget reason as the Unix dispatch in
         // `proxy_to_backend` (issue #3764): `proxy_to_backend_mesh_mtls` is

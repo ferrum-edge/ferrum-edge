@@ -751,11 +751,16 @@ impl ProxyBody {
     /// Anchor an exclusive pooled backend-connection lease to this body's
     /// terminal frame (issue #3731).
     ///
-    /// Must be applied to the OUTERMOST client-visible body so the lease
-    /// outlives every inner adapter (coalescer, size limiter, inspector bridge,
-    /// deadline wrapper). The lease is returned to its pool only from the
-    /// `Ready(None)` arm of [`ProxyBody::poll_frame`]; every other exit drops
-    /// it, which retires the physical connection.
+    /// Must be applied to the body that OWNS the backend stream, so that this
+    /// body's `Ready(None)` really is the backend's end-of-stream. The
+    /// coalescer, size limiter and deadline wrapper all decorate that same
+    /// `ProxyBody`, so they are covered; a bridge that moves the backend body
+    /// into a separate task and feeds the client from a channel (the response
+    /// inspector) is NOT — its channel closes on policy cuts and task
+    /// cancellation too, neither of which is a backend EOF. The lease is
+    /// returned to its pool only from the `Ready(None)` arm of
+    /// [`ProxyBody::poll_frame`]; every other exit drops it, which retires the
+    /// physical connection.
     pub fn with_pooled_backend_lease(mut self, lease: Box<dyn PooledBackendLease>) -> Self {
         self.pooled_backend_lease = Some(lease);
         self
