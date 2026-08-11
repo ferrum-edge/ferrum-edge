@@ -619,6 +619,183 @@ async fn a_check_is_never_retried_even_when_shared_plugin_retries_are_configured
     );
 }
 
+// ── Per-provider request-body cap ─────────────────────────────────────────
+
+/// Run a check that carries a request body.
+async fn check_with_body(
+    executor: &MeshExtAuthzExecutor,
+    provider_name: &str,
+    body: &[u8],
+) -> MeshExtAuthzOutcome {
+    let accumulator = AtomicU64::new(0);
+    let headers = HashMap::new();
+    executor
+        .check(
+            provider_name,
+            MeshExtAuthzCheckRequest {
+                method: "POST",
+                path: "/admin/reports",
+                headers: &headers,
+                authority: Some("api.example.com"),
+                body: Some(body),
+                body_proven_empty: false,
+            },
+            &accumulator,
+        )
+        .await
+}
+
+fn body_provider(port: u16, name: &str, max_request_bytes: usize) -> MeshExtAuthzProvider {
+    use ferrum_edge::modes::mesh::config::MeshExtAuthzBodyCheck;
+
+    let mut source = provider(port);
+    source.name = name.to_string();
+    source.include_request_body_in_check = Some(MeshExtAuthzBodyCheck {
+        max_request_bytes,
+        allow_partial_message: false,
+    });
+    source
+}
+
+/// The proxy's pre-`authorize` prebuffer ceiling is the MAXIMUM
+/// `maxRequestBytes` across the generation's providers, so a body within that
+/// shared ceiling but over the SELECTED provider's own cap reaches the check.
+/// It must be refused unconditionally, with no provider I/O and no `failOpen`
+/// escape — otherwise an unrelated high-cap provider silently raises the cap a
+/// low-cap provider enforces.
+#[tokio::test]
+async fn a_high_cap_provider_cannot_raise_the_selected_providers_body_cap() {
+    let stub = start_status_stub(200).await;
+    // The low-cap provider is even configured failOpen: an over-cap body is
+    // not a FAILED CHECK, so failOpen must not apply to it.
+    let mut low = body_provider(stub.port, "low-cap", 8);
+    low.fail_open = true;
+    let high = body_provider(stub.port, "high-cap", 1024);
+    let executor = executor(vec![low, high]);
+    assert_eq!(
+        executor.max_request_body_bytes(),
+        Some(1024),
+        "one prebuffer serves whichever provider the matched rule selects, so the shared \
+         ceiling is the maximum — NOT the selected provider's own cap"
+    );
+
+    let body = [b'x'; 64];
+    match check_with_body(&executor, "low-cap", &body).await {
+        MeshExtAuthzOutcome::Deny { status, reason, .. } => {
+            assert_eq!(
+                status, 413,
+                "an over-cap body is a client-facing 413, not the provider's statusOnError"
+            );
+            assert_eq!(reason, MeshExtAuthzReason::BodyTooLarge);
+        }
+        other => panic!(
+            "failOpen must never admit a body over the selected provider's maxRequestBytes, \
+             got {other:?}"
+        ),
+    }
+    assert_eq!(
+        stub.calls.load(Ordering::SeqCst),
+        0,
+        "the refusal is decided before any provider I/O"
+    );
+
+    // The SAME body is within the other provider's declared cap, so selecting
+    // that provider still dispatches a real check: the refusal is per-provider,
+    // not a generation-wide ceiling.
+    assert!(
+        matches!(
+            check_with_body(&executor, "high-cap", &body).await,
+            MeshExtAuthzOutcome::Allow { .. }
+        ),
+        "a body within the selected provider's cap must still be checked"
+    );
+    assert_eq!(stub.calls.load(Ordering::SeqCst), 1);
+}
+
+/// A body that is MISSING (rather than too large) stays an ordinary failed
+/// check: the provider could not decide, so `failOpen` still governs it.
+#[tokio::test]
+async fn an_unavailable_body_remains_a_failed_check_distinct_from_an_oversize_one() {
+    let stub = start_status_stub(200).await;
+    let mut source = body_provider(stub.port, "sample-ext-authz", 64);
+    source.fail_open = true;
+    let executor = executor(vec![source]);
+    let accumulator = AtomicU64::new(0);
+    let headers = HashMap::new();
+    let outcome = executor
+        .check(
+            "sample-ext-authz",
+            MeshExtAuthzCheckRequest {
+                method: "POST",
+                path: "/admin/reports",
+                headers: &headers,
+                authority: Some("api.example.com"),
+                body: None,
+                body_proven_empty: false,
+            },
+            &accumulator,
+        )
+        .await;
+    match outcome {
+        MeshExtAuthzOutcome::Allow { reason } => {
+            assert_eq!(
+                reason,
+                MeshExtAuthzReason::BodyUnavailable,
+                "an unavailable body is a FAILED CHECK, which failOpen may admit"
+            );
+        }
+        other => panic!("expected the failOpen allow, got {other:?}"),
+    }
+    assert_eq!(
+        stub.calls.load(Ordering::SeqCst),
+        0,
+        "a provider that inspects bodies is not contacted without one"
+    );
+}
+
+/// Fail-closed is the default for both, and the two are still distinguishable.
+#[tokio::test]
+async fn an_oversize_body_and_a_missing_body_fail_closed_with_distinct_reasons() {
+    let stub = start_status_stub(200).await;
+    let executor = executor(vec![body_provider(stub.port, "sample-ext-authz", 8)]);
+
+    match check_with_body(&executor, "sample-ext-authz", &[b'x'; 64]).await {
+        MeshExtAuthzOutcome::Deny { status, reason, .. } => {
+            assert_eq!(status, 413);
+            assert_eq!(reason, MeshExtAuthzReason::BodyTooLarge);
+        }
+        other => panic!("expected the oversize refusal, got {other:?}"),
+    }
+
+    let accumulator = AtomicU64::new(0);
+    let headers = HashMap::new();
+    let outcome = executor
+        .check(
+            "sample-ext-authz",
+            MeshExtAuthzCheckRequest {
+                method: "POST",
+                path: "/admin/reports",
+                headers: &headers,
+                authority: None,
+                body: None,
+                body_proven_empty: false,
+            },
+            &accumulator,
+        )
+        .await;
+    match outcome {
+        MeshExtAuthzOutcome::Deny { status, reason, .. } => {
+            assert_eq!(
+                status, 403,
+                "a failed check resolves to the provider's statusOnError"
+            );
+            assert_eq!(reason, MeshExtAuthzReason::BodyUnavailable);
+        }
+        other => panic!("expected the fail-closed denial, got {other:?}"),
+    }
+    assert_eq!(stub.calls.load(Ordering::SeqCst), 0);
+}
+
 // ── Live datapath: through MeshAuthz::authorize ───────────────────────────
 
 mod live_datapath {
@@ -838,8 +1015,9 @@ mod live_datapath {
         assert_eq!(
             plugin.request_body_buffer_limit(),
             Some(64),
-            "maxRequestBytes is the pre-authorize ceiling, enforced as a 413 \
-             before the check — which is what makes it take precedence over failOpen"
+            "the pre-authorize prebuffer ceiling is the MAXIMUM maxRequestBytes across the \
+             generation's providers (one provider here), enforced as a 413; the selected \
+             provider's own cap is enforced again at check time and never honours failOpen"
         );
         assert!(
             plugin.should_buffer_request_body(&ctx("/admin/reports")),

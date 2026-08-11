@@ -33,7 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   may apply to a request: same-provider policies coalesce, a workload-scoped
   conflict is refused at plugin construction, and a request that can see two
   distinct providers is denied with the stable reason
-  `custom:provider-conflict`. On a non-HTTP port, HTTP-only fields are treated
+  `custom:provider-conflict`; a request spanning several destination scopes
+  evaluates every applicable scope before applying a decision, so a DENY in an
+  earlier scope no longer skips a later scope's CUSTOM delegation (Istio orders
+  CUSTOM before DENY) while the first DENY in scope order still refuses the
+  request. On a non-HTTP port, HTTP-only fields are treated
   as always matched for CUSTOM exactly as for DENY, so an L4 CUSTOM rule closes
   the connection instead of becoming inert. Fixed-cardinality
   `ferrum_mesh_ext_authz_checks_total{outcome}` /
@@ -44,10 +48,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unmodelled provider fields, `packAsBytes`, wildcard header entries,
   `headersToUpstreamOnAllow` / `headersToDownstreamOnAllow`, plaintext transport
   to a non-loopback provider, namespace-qualified `[<namespace>/]<hostname>`
-  service syntax, and `includeRequestBodyInCheck.allowPartialMessage: true`
-  (`maxRequestBytes` is enforced as a `413` before the check runs, which takes
-  precedence over `failOpen`, matching Envoy without partial messages; that
-  ceiling applies only to requests a body-inspecting CUSTOM rule could reach).
+  service syntax, and `includeRequestBodyInCheck.allowPartialMessage: true`.
+  `maxRequestBytes` is enforced as a `413` before the check runs, matching Envoy
+  without partial messages; the proxy's shared prebuffer ceiling is the maximum
+  cap across the generation's providers, so the SELECTED provider's own cap is
+  re-enforced at check time as an unconditional `413` — decided before any
+  provider I/O and never subject to `failOpen`, so a high-cap provider cannot
+  raise the cap a low-cap provider enforces. A missing (rather than oversize)
+  body remains a failed check that still honours `failOpen`, and the two have
+  distinct `body_unavailable` / `body_too_large` outcome series. That ceiling
+  applies only to requests a body-inspecting CUSTOM rule could reach.
   See `docs/mesh.md` → "AuthorizationPolicy `action: CUSTOM`".
 
 - Port-aware Gateway API HTTP-family route representation and real listener

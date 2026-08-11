@@ -43,10 +43,11 @@
 //! non-`200` 2xx) is an explicit provider denial carrying the provider's own
 //! status.
 //!
-//! Two refusals are decided WITHOUT contacting a provider and are therefore
+//! THREE refusals are decided WITHOUT contacting a provider and are therefore
 //! NOT subject to `failOpen`: a request to which two DIFFERENT extension
-//! providers would apply (Istio permits at most one per workload), and a
-//! matched delegation on a path with no HTTP request to check.
+//! providers would apply (Istio permits at most one per workload), a matched
+//! delegation on a path with no HTTP request to check, and a request body over
+//! the SELECTED provider's own `maxRequestBytes` (see below).
 //!
 //! Nothing is retried. The shared plugin HTTP client's transport-retry policy
 //! is explicitly suppressed through a single-attempt seam: an ext-authz check
@@ -56,11 +57,24 @@
 //! ## Request-body contract
 //!
 //! `includeRequestBodyInCheck.maxRequestBytes` is folded into the proxy's
-//! pre-`authorize` body ceiling, so a request over the cap is refused with
-//! `413` BEFORE any check is dispatched — which also means the refusal takes
-//! precedence over `failOpen`, matching Envoy without partial messages.
-//! `allowPartialMessage: true` is REFUSED at every admission boundary rather
-//! than accepted-and-ignored; see `MeshExtAuthzProvider::validate`.
+//! pre-`authorize` body ceiling, so an over-cap request is refused with `413`
+//! before a check is dispatched. That shared ceiling is the MAXIMUM
+//! `maxRequestBytes` across the generation's providers, because ONE prebuffer
+//! serves whichever provider the matched CUSTOM rule selects — it is NOT
+//! necessarily the selected provider's own cap. A generation carrying a
+//! higher-cap provider therefore lets a body over a LOWER-cap provider's
+//! `maxRequestBytes` reach [`MeshExtAuthzExecutor::check`].
+//!
+//! The per-provider cap is what actually decides the request, and it is
+//! enforced here as an UNCONDITIONAL client-facing `413` refusal, before any
+//! provider I/O and before a concurrency permit is taken. It is never subject
+//! to `failOpen`: `allowPartialMessage: true` is refused at every admission
+//! boundary (see `MeshExtAuthzProvider::validate`), so a strict provider must
+//! decide on the complete body or not decide at all — allowing an oversize
+//! request because the provider opted into `failOpen` for FAILED CHECKS would
+//! admit exactly the request the operator's cap excluded. A body that is
+//! missing (rather than too large) remains a failed check and keeps honouring
+//! `failOpen`, as do transport failures.
 //!
 //! That ceiling applies only to requests a body-inspecting CUSTOM rule could
 //! actually reach: `MeshAuthz::should_buffer_request_body` gates it, so an
@@ -111,7 +125,13 @@ pub enum MeshExtAuthzReason {
     TransportError,
     ResponseTooLarge,
     ResponseReadFailed,
+    /// A body-inspecting provider had no body to inspect. A FAILED CHECK: the
+    /// provider could not decide, so `failOpen` still applies.
     BodyUnavailable,
+    /// The request body exceeded the SELECTED provider's `maxRequestBytes`.
+    /// Decided without contacting the provider and never subject to
+    /// `failOpen` — `allowPartialMessage` is refused at admission, so there is
+    /// no truncated representation the provider could have decided on.
     BodyTooLarge,
     ConcurrencyExhausted,
     RequestBuildFailed,
@@ -141,10 +161,10 @@ impl MeshExtAuthzReason {
     /// allow or an explicit provider denial). Only these are subject to
     /// `failOpen`.
     ///
-    /// `ProviderConflict` and `Unexecutable` are deliberately excluded: they
-    /// are configuration/topology refusals decided WITHOUT contacting a
-    /// provider, so no provider's `failOpen` opinion applies to them. They are
-    /// still counted, once, in the check-outcome series.
+    /// `ProviderConflict`, `Unexecutable`, and `BodyTooLarge` are deliberately
+    /// excluded: they are configuration/contract refusals decided WITHOUT
+    /// contacting a provider, so no provider's `failOpen` opinion applies to
+    /// them. They are still counted, once, in the check-outcome series.
     fn is_check_failure(self) -> bool {
         !matches!(
             self,
@@ -152,6 +172,7 @@ impl MeshExtAuthzReason {
                 | MeshExtAuthzReason::DeniedByProvider
                 | MeshExtAuthzReason::ProviderConflict
                 | MeshExtAuthzReason::Unexecutable
+                | MeshExtAuthzReason::BodyTooLarge
         )
     }
 }
@@ -184,7 +205,8 @@ static CHECKS_UNEXECUTABLE: AtomicU64 = AtomicU64::new(0);
 static CHECKS_TIMEOUT: AtomicU64 = AtomicU64::new(0);
 static CHECKS_TRANSPORT_ERROR: AtomicU64 = AtomicU64::new(0);
 static CHECKS_RESPONSE_REFUSED: AtomicU64 = AtomicU64::new(0);
-static CHECKS_BODY_REFUSED: AtomicU64 = AtomicU64::new(0);
+static CHECKS_BODY_UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
+static CHECKS_BODY_TOO_LARGE: AtomicU64 = AtomicU64::new(0);
 static CHECKS_CONCURRENCY_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 
 /// Record exactly one outcome for one matched CUSTOM delegation.
@@ -216,9 +238,14 @@ pub(crate) fn record(reason: MeshExtAuthzReason, failed_open: bool) {
         MeshExtAuthzReason::ResponseTooLarge | MeshExtAuthzReason::ResponseReadFailed => {
             CHECKS_RESPONSE_REFUSED.fetch_add(1, Ordering::Relaxed)
         }
-        MeshExtAuthzReason::BodyUnavailable | MeshExtAuthzReason::BodyTooLarge => {
-            CHECKS_BODY_REFUSED.fetch_add(1, Ordering::Relaxed)
+        // Deliberately separate series: `body_unavailable` is a failed check
+        // that still honours `failOpen`, while `body_too_large` is the
+        // unconditional over-cap refusal. Folding them together would hide
+        // which of the two an operator is actually seeing.
+        MeshExtAuthzReason::BodyUnavailable => {
+            CHECKS_BODY_UNAVAILABLE.fetch_add(1, Ordering::Relaxed)
         }
+        MeshExtAuthzReason::BodyTooLarge => CHECKS_BODY_TOO_LARGE.fetch_add(1, Ordering::Relaxed),
         MeshExtAuthzReason::ConcurrencyExhausted => {
             CHECKS_CONCURRENCY_EXHAUSTED.fetch_add(1, Ordering::Relaxed)
         }
@@ -246,7 +273,8 @@ pub struct MeshExtAuthzMetricsSnapshot {
     pub timeout: u64,
     pub transport_error: u64,
     pub response_refused: u64,
-    pub body_refused: u64,
+    pub body_unavailable: u64,
+    pub body_too_large: u64,
     pub concurrency_exhausted: u64,
 }
 
@@ -263,7 +291,8 @@ pub fn snapshot() -> MeshExtAuthzMetricsSnapshot {
         timeout: CHECKS_TIMEOUT.load(Ordering::Relaxed),
         transport_error: CHECKS_TRANSPORT_ERROR.load(Ordering::Relaxed),
         response_refused: CHECKS_RESPONSE_REFUSED.load(Ordering::Relaxed),
-        body_refused: CHECKS_BODY_REFUSED.load(Ordering::Relaxed),
+        body_unavailable: CHECKS_BODY_UNAVAILABLE.load(Ordering::Relaxed),
+        body_too_large: CHECKS_BODY_TOO_LARGE.load(Ordering::Relaxed),
         concurrency_exhausted: CHECKS_CONCURRENCY_EXHAUSTED.load(Ordering::Relaxed),
     }
 }
@@ -294,7 +323,8 @@ pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
         ("timeout", snap.timeout),
         ("transport_error", snap.transport_error),
         ("response_refused", snap.response_refused),
-        ("body_refused", snap.body_refused),
+        ("body_unavailable", snap.body_unavailable),
+        ("body_too_large", snap.body_too_large),
         ("concurrency_exhausted", snap.concurrency_exhausted),
     ] {
         output.push_str(&format!(
@@ -403,6 +433,34 @@ impl PreparedProvider {
         })
     }
 
+    /// Refuse a request whose body exceeds THIS provider's `maxRequestBytes`.
+    ///
+    /// Unconditional and client-facing (`413`), decided before any provider
+    /// I/O: `failOpen` governs FAILED CHECKS — a provider that could not
+    /// decide — and this is not one. The strict `allowPartialMessage: false`
+    /// contract means there is no truncated body the provider could have
+    /// decided on, so honouring `failOpen` here would admit precisely the
+    /// oversize request the operator's cap excluded. `statusOnError` is
+    /// likewise not consulted: no error occurred, and `413` is the same
+    /// client-facing status the proxy's pre-`authorize` ceiling returns.
+    ///
+    /// Counted exactly once, in the same fixed-cardinality series as every
+    /// other outcome (`body_too_large`), and never as a `failOpen`/fail-closed
+    /// disposition.
+    fn body_too_large_refusal(&self) -> MeshExtAuthzOutcome {
+        record(MeshExtAuthzReason::BodyTooLarge, false);
+        tracing::warn!(
+            plugin = "mesh_authz",
+            reason = MeshExtAuthzReason::BodyTooLarge.as_str(),
+            "Mesh external authorization request body exceeds the selected provider's maxRequestBytes; refusing without dispatching a check"
+        );
+        MeshExtAuthzOutcome::Deny {
+            status: 413,
+            headers: Vec::new(),
+            reason: MeshExtAuthzReason::BodyTooLarge,
+        }
+    }
+
     fn failure(&self, reason: MeshExtAuthzReason) -> MeshExtAuthzOutcome {
         record(reason, self.fail_open);
         if self.fail_open {
@@ -503,7 +561,17 @@ impl MeshExtAuthzExecutor {
     }
 
     /// The largest `maxRequestBytes` any provider declares, used as the
-    /// plugin's request-body buffer ceiling.
+    /// plugin's SHARED request-body buffer ceiling.
+    ///
+    /// One prebuffer serves whichever provider the matched CUSTOM rule
+    /// selects, and which rule matches is not known when the ceiling is
+    /// declared, so this is the maximum rather than the selected provider's
+    /// own cap. It is therefore a PREBUFFER bound, not the authorization
+    /// contract: a generation carrying a higher-cap provider lets a body over
+    /// a lower-cap provider's `maxRequestBytes` through to
+    /// [`Self::check`], which refuses it unconditionally with `413` before any
+    /// provider I/O (never subject to `failOpen`). Raising this to the maximum
+    /// can only over-buffer, never under-enforce.
     pub fn max_request_body_bytes(&self) -> Option<usize> {
         self.providers
             .values()
@@ -583,8 +651,14 @@ impl MeshExtAuthzExecutor {
 
         // Resolve the check body BEFORE taking a permit so an oversize or
         // unavailable body cannot occupy concurrency capacity.
+        //
+        // The two failures are deliberately NOT the same: an over-cap body is
+        // an unconditional `413` refusal of the request (never `failOpen`),
+        // while a body that could not be materialized is an ordinary failed
+        // check the provider's `failOpen` still governs.
         let body = match resolve_check_body(provider, &request) {
             Ok(body) => body,
+            Err(MeshExtAuthzReason::BodyTooLarge) => return provider.body_too_large_refusal(),
             Err(reason) => return provider.failure(reason),
         };
 
@@ -791,15 +865,15 @@ fn resolve_check_body(
     };
     match request.body {
         Some(body) if body.len() <= policy.max_request_bytes => Ok(Some(body.to_vec())),
-        // Defence in depth. In the live datapath an oversize body is already a
-        // `413` returned by the proxy's pre-`authorize` buffering step (which
-        // folds `maxRequestBytes` into the effective ceiling), BEFORE any check
-        // is dispatched and therefore before `failOpen` can be consulted —
-        // which is exactly Envoy's ordering without partial messages. Reaching
-        // here means the body was materialized some other way; refusing keeps
-        // the provider's decision a decision about the real request.
-        // `allowPartialMessage` is refused at admission, so there is no
-        // truncating branch to fall into.
+        // The authoritative per-provider cap. The proxy's pre-`authorize`
+        // ceiling is the MAXIMUM `maxRequestBytes` across the generation's
+        // providers (one prebuffer, many possible providers), so a body within
+        // that shared ceiling but over THIS provider's cap arrives here
+        // routinely — it is not merely defence in depth. The caller turns this
+        // into an unconditional `413` before any provider I/O, so an unrelated
+        // high-cap provider can never raise the ceiling a low-cap provider
+        // enforces, and no `failOpen` opinion applies. `allowPartialMessage` is
+        // refused at admission, so there is no truncating branch to fall into.
         Some(_) => Err(MeshExtAuthzReason::BodyTooLarge),
         // The transport proved there is no body at all: an empty check body is
         // the faithful representation, not a missing one.
@@ -892,6 +966,10 @@ mod tests {
         // Decided without contacting a provider, so no failOpen applies.
         assert!(!MeshExtAuthzReason::ProviderConflict.is_check_failure());
         assert!(!MeshExtAuthzReason::Unexecutable.is_check_failure());
+        assert!(!MeshExtAuthzReason::BodyTooLarge.is_check_failure());
+        // A body that could not be materialized IS a failed check: the
+        // provider could not decide, so failOpen still governs it.
+        assert!(MeshExtAuthzReason::BodyUnavailable.is_check_failure());
     }
 
     #[test]

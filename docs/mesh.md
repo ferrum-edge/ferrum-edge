@@ -1245,6 +1245,16 @@ never picks the first match — that would let policy iteration order choose
 which operator's authorizer enforces. Different providers on **disjoint**
 workloads or destination scopes remain fully supported.
 
+**CUSTOM runs before DENY across destination scopes too.** A request that spans
+several destination scopes (a node-waypoint relay serving many backends)
+evaluates **every** applicable scope before applying a decision: a DENY in an
+earlier scope is recorded and the scan continues, so a delegation carried by a
+later scope is still executed and still counted. The first DENY in scope order
+remains the reported policy, and it still refuses the request once the check has
+run — stopping the scan at that DENY would have let scope order decide whether
+an operator's authorizer ever saw a request the scope it protects applied to
+(and would have hidden a two-provider conflict living in a later scope).
+
 **Bounds.** `timeout` is capped at 30s (default 1s), `includeRequestBodyInCheck.maxRequestBytes`
 at 1 MiB, provider response reads at 64 KiB, each header list at 32 exact
 entries (case-insensitively unique), and the admitted provider set at 16 per
@@ -1286,18 +1296,29 @@ exactly:
 A provider name this generation does not carry, a generation with no executor,
 an unavailable request body for a body-inspecting provider, a concurrency
 refusal, and task cancellation are all failed checks and therefore also honour
-`failOpen`. Two refusals are decided **without** contacting a provider and are
-therefore **not** subject to `failOpen`: a provider conflict (above), and a
-matched delegation on a connection with no HTTP request to check.
+`failOpen`. **Three** refusals are decided **without** contacting a provider and
+are therefore **not** subject to `failOpen`: a provider conflict (above), a
+matched delegation on a connection with no HTTP request to check, and a request
+body over the selected provider's `maxRequestBytes` (below).
 
 **Request body.** `includeRequestBodyInCheck.maxRequestBytes` is folded into
-the proxy's pre-`authorize` body ceiling, so a request over the cap is refused
-with **413 before the check is dispatched** — which means the refusal takes
-precedence over `failOpen`, matching Envoy with partial messages disabled. That
-ceiling and the buffering it implies apply **only** to requests a
-body-inspecting CUSTOM rule could actually reach: the per-request predicate is
-precise on method, path, and host, so an unrelated request on the same workload
-keeps its ordinary accepted body size.
+the proxy's pre-`authorize` body ceiling, so an over-cap request is refused with
+**413 before the check is dispatched**. That shared ceiling is the **maximum**
+`maxRequestBytes` across the generation's providers, because one prebuffer
+serves whichever provider the matched CUSTOM rule selects — it is **not**
+necessarily the selected provider's own cap, so a generation that also carries a
+higher-cap provider lets a body over a lower-cap provider's `maxRequestBytes`
+reach the check. The per-provider cap is re-enforced there as an
+**unconditional client-facing 413**, before any provider I/O and before a
+concurrency permit is taken, and it is **never** subject to `failOpen`: with
+`allowPartialMessage` refused at admission there is no truncated body a strict
+provider could have decided on, so an unrelated provider's larger cap can never
+admit a request the selected provider's cap excluded. (A body that is *missing*
+rather than too large stays an ordinary failed check and still honours
+`failOpen`.) That ceiling and the buffering it implies apply **only** to
+requests a body-inspecting CUSTOM rule could actually reach: the per-request
+predicate is precise on method, path, and host, so an unrelated request on the
+same workload keeps its ordinary accepted body size.
 
 > **Deliberate narrowing:** `includeRequestBodyInCheck.allowPartialMessage:
 > true` is **rejected at every admission boundary** (Kubernetes translation,
@@ -1353,9 +1374,11 @@ contacting a provider (`provider_unbound` when no executor or no binding,
 `provider_conflict`, `unexecutable` for an L4 session), so a fail-closed
 denial is never invisible. `outcome` values are `allowed`, `denied_by_provider`,
 `provider_unbound`, `provider_error`, `provider_conflict`, `unexecutable`,
-`timeout`, `transport_error`, `response_refused`, `body_refused`, and
-`concurrency_exhausted`. No request body, credential header value, provider
-secret, or resolved provider URL is ever logged.
+`timeout`, `transport_error`, `response_refused`, `body_unavailable`,
+`body_too_large`, and `concurrency_exhausted`. `body_unavailable` (a failed
+check `failOpen` may admit) and `body_too_large` (the unconditional over-cap
+refusal) are deliberately separate series. No request body, credential header
+value, provider secret, or resolved provider URL is ever logged.
 
 ### Rule Matching
 
