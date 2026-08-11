@@ -26,7 +26,7 @@ use chrono::Utc;
 use ferrum_edge::backend_conn_limit::BackendConnectionLimitExceeded;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, Proxy};
-use ferrum_edge::proxy::unix_backend::UnixBackendError;
+use ferrum_edge::proxy::unix_backend::{MAX_UNIX_CONNECT_TIMEOUT_MS, UnixBackendError};
 use ferrum_edge::proxy::unix_backend_pool::{UnixBackendConnectionPool, UnixWireProtocol};
 use ferrum_edge::retry::ErrorClass;
 use ferrum_edge::util::unix_socket::{AdmittedUnixSocket, admit_socket_for_connect};
@@ -2308,18 +2308,36 @@ async fn the_websocket_dial_returns_the_remainder_of_one_budget() {
     .await
     .expect("an admitted websocket carrier");
 
+    let after = tokio::time::Instant::now();
+    let deadline = dial.deadline;
+
     assert_eq!(dial.timeout_ms, 750);
+    // The deadline was opened at SOME instant inside this call — production
+    // necessarily reads the clock after `before` — so it lands in
+    // `[before + budget, after + budget]` and nowhere else. The upper bound is
+    // the load-bearing half: a second timer started once admission and connect
+    // had finished would push the deadline past `after + budget`. The lower
+    // bound proves the budget was not shortened. Both are exact orderings of
+    // monotonic instants, so neither depends on how much wall-clock time the
+    // dial actually spent.
     assert!(
-        dial.deadline <= before + budget,
-        "the returned deadline must be the ORIGINAL budget's end, not a fresh one"
+        deadline >= before + budget,
+        "the ONE budget may not be shortened: {deadline:?} precedes the earliest \
+         end the dial could have opened"
     );
-    let remaining = dial
-        .deadline
-        .saturating_duration_since(tokio::time::Instant::now());
     assert!(
-        remaining < budget,
-        "admission and connect already spent part of the budget, so the upgrade \
-         must get strictly less than a full {budget:?}, got {remaining:?}"
+        deadline <= after + budget,
+        "the returned deadline must be the end of the budget opened INSIDE the dial, \
+         not a fresh one started after admission and connect completed"
+    );
+    // Restated from the upgrade's point of view: what it inherits is the
+    // REMAINDER — one budget minus whatever the dial already spent — so it can
+    // never be handed more than `budget` no matter how fast the dial was.
+    let remaining = deadline.saturating_duration_since(after);
+    assert!(
+        remaining <= budget,
+        "the upgrade exchange may never receive more than the ONE original budget, \
+         got {remaining:?} of {budget:?}"
     );
 }
 
@@ -2987,10 +3005,10 @@ async fn registration_is_already_closed_before_the_pool_latch_is_published() {
 /// before the pool's amortized idle sweep, which scans the pool's maps and
 /// `stat`s socket paths (issue #3764).
 ///
-/// Proved by ordering rather than by timing: a `connect_timeout_ms` the
-/// platform clock cannot represent fails deadline creation closed, and the
-/// sweep — which would otherwise have evicted the closed idle carrier this test
-/// plants — must therefore not have run.
+/// Proved by ordering rather than by timing: a `connect_timeout_ms` beyond the
+/// defensive `MAX_UNIX_CONNECT_TIMEOUT_MS` ceiling fails deadline creation
+/// closed on every platform, and the sweep — which would otherwise have evicted
+/// the closed idle carrier this test plants — must therefore not have run.
 #[tokio::test]
 async fn the_establishment_budget_opens_before_the_idle_sweep() {
     let temp = tempfile::TempDir::new().expect("temp dir");
@@ -3026,14 +3044,18 @@ async fn the_establishment_budget_opens_before_the_idle_sweep() {
         .checkout_h1(
             &proxy,
             socket.to_str().expect("utf-8"),
-            u64::MAX,
+            MAX_UNIX_CONNECT_TIMEOUT_MS + 1,
             &roots(&root),
             &[],
         )
         .await;
+    let err = expect_refusal(
+        refused,
+        "an establishment budget past the defensive ceiling must fail closed",
+    );
     assert!(
-        matches!(refused, Err(UnixBackendError::ConnectTimeout { .. })),
-        "an unrepresentable establishment budget must fail closed"
+        matches!(err, UnixBackendError::ConnectTimeout { .. }),
+        "expected the typed connect-timeout refusal, got {err}"
     );
     assert_eq!(
         pool.stats().idle_h1_connections,

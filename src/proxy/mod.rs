@@ -36792,6 +36792,145 @@ fn oversized_request_body_dispatch_reject(
     None
 }
 
+/// What one backend dispatch hands back to [`proxy_to_backend`]: the backend
+/// response, an optionally retained request body, and the request-body-exceeded
+/// flag.
+type BackendDispatchOutcome = (
+    retry::BackendResponse,
+    Option<Bytes>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+);
+
+/// One backend dispatch future, heap-allocated so it is not a frame slot in the
+/// caller. See [`boxed_proxy_to_backend_unix`].
+type BoxedBackendDispatchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = BackendDispatchOutcome> + Send + 'a>>;
+
+/// The Unix-socket dispatch future, CONSTRUCTED OUT OF LINE and returned boxed.
+///
+/// This indirection is a stack-budget invariant, not a style choice (issue
+/// #3764). `proxy_to_backend` is awaited inline by `handle_proxy_request_inner`
+/// — THE generic request future every HTTP request the gateway serves is polled
+/// through — so `proxy_to_backend`'s poll frame is live on the worker stack
+/// underneath every backend dispatch, Unix or not.
+///
+/// A bare `Box::pin(proxy_to_backend_unix(..))` written at the call site is NOT
+/// enough: the callee's future is materialized into a temporary belonging to the
+/// caller's poll frame and only then moved into the box. In an unoptimized build
+/// (the coverage profile) that temporary is a fixed `alloca` in
+/// `proxy_to_backend`'s frame, charged to EVERY request even though only a
+/// `mesh.unix_socket` sidecar-ingress target ever executes the branch — which is
+/// how a plain non-mesh HTTP request overflowed a 2 MiB tokio worker stack. This
+/// PR's pooled dispatch (admission gate + `connect(2)` + hyper h1 handshake, a
+/// second FRESH checkout for the idle-race replay, the request/response parts,
+/// and the body plumbing) made that temporary large enough to matter.
+///
+/// Building the future in a separate, `#[inline(never)]` frame that RETURNS
+/// before anything is awaited keeps the large temporary off the deep poll stack
+/// entirely: `proxy_to_backend` stores only a pointer. The cost is one
+/// allocation, and only when the Unix branch is selected. Do not fold this back
+/// into the call site without re-measuring the generic future's stack frame.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_proxy_to_backend_unix<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    upstream_target: Option<&'a UpstreamTarget>,
+    socket_path: &'a str,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    plugins: &'a [Arc<dyn crate::plugins::Plugin>],
+    ctx: Option<&'a RequestContext>,
+    response_decision_ctx: Option<&'a RequestContext>,
+    stream_response: bool,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
+    effective_request_body_size_limit: usize,
+    effective_max_response_body_size_bytes: usize,
+) -> BoxedBackendDispatchFuture<'a> {
+    Box::pin(proxy_to_backend_unix(
+        state,
+        proxy,
+        upstream_target,
+        socket_path,
+        backend_url,
+        method,
+        headers,
+        client_request_body,
+        plugins,
+        ctx,
+        response_decision_ctx,
+        stream_response,
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        resolved_ip,
+        ctx_bytes_sent_observed,
+        effective_request_body_size_limit,
+        effective_max_response_body_size_bytes,
+    ))
+}
+
+/// The h2c Unix-socket dispatch future, constructed out of line and returned
+/// boxed, for exactly the reason documented on [`boxed_proxy_to_backend_unix`].
+///
+/// `proxy_to_backend_mesh_mtls` is called from three sites inside
+/// `proxy_to_backend`, and an unoptimized build gives each call site its own
+/// frame slot. This one — the `mesh.unix_socket_h2c` sidecar-ingress branch —
+/// is the cold, Unix-selected one, so it pays a heap allocation instead of a
+/// permanent slot in the frame every ordinary request walks over. The two
+/// non-Unix call sites are untouched.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn boxed_proxy_to_backend_unix_h2c<'a>(
+    state: &'a ProxyState,
+    proxy: &'a Proxy,
+    backend_url: &'a str,
+    method: &'a str,
+    headers: &'a HashMap<String, String>,
+    client_request_body: MeshClientRequestBody,
+    upstream_target: Option<&'a UpstreamTarget>,
+    plugins: &'a [Arc<dyn crate::plugins::Plugin>],
+    request_ctx: &'a RequestContext,
+    response_decision_ctx: Option<&'a RequestContext>,
+    stream_response: bool,
+    client_ip: &'a str,
+    xff_append_ip: &'a str,
+    request_is_secure: bool,
+    resolved_ip: Option<String>,
+    ctx_bytes_sent_observed: &'a Arc<std::sync::atomic::AtomicU64>,
+    route_request_body_limit: Option<usize>,
+    route_response_body_limit: Option<usize>,
+    unix_socket_path: Option<&'a str>,
+) -> BoxedBackendDispatchFuture<'a> {
+    Box::pin(proxy_to_backend_mesh_mtls(
+        state,
+        proxy,
+        backend_url,
+        method,
+        headers,
+        client_request_body,
+        upstream_target,
+        plugins,
+        request_ctx,
+        response_decision_ctx,
+        stream_response,
+        client_ip,
+        xff_append_ip,
+        request_is_secure,
+        resolved_ip,
+        ctx_bytes_sent_observed,
+        route_request_body_limit,
+        route_response_body_limit,
+        unix_socket_path,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend(
     state: &ProxyState,
@@ -37126,7 +37265,9 @@ async fn proxy_to_backend(
         };
         *backend_admission_started_at = Instant::now();
         let (backend_resp, body_bytes, request_body_exceeded) = if unix_h2c {
-            proxy_to_backend_mesh_mtls(
+            // Constructed out of line and boxed — see
+            // `boxed_proxy_to_backend_unix_h2c`.
+            boxed_proxy_to_backend_unix_h2c(
                 state,
                 proxy,
                 backend_url,
@@ -37149,26 +37290,12 @@ async fn proxy_to_backend(
             )
             .await
         } else {
-            // BOXED ON PURPOSE — this is a stack-budget invariant, not a style
-            // choice (issue #3764).
-            //
-            // `proxy_to_backend` is awaited inline by `handle_proxy_request_inner`,
-            // which is THE generic request future: every HTTP request the gateway
-            // serves is polled through it, and its size is the union of every
-            // dispatch branch reachable from it. A `mesh.unix_socket` sidecar
-            // ingress is a rare branch, but its dispatch future is large — it now
-            // stores a pooled checkout (admission gate + `connect(2)` + hyper h1
-            // handshake), a second FRESH checkout for the idle-race replay, the
-            // request/response parts, and the body plumbing. Left inline it
-            // enlarges the generic future for every request on every listener,
-            // and unoptimized builds (the coverage profile) materialize that
-            // future through stack temporaries — which is how a plain non-mesh
-            // request overflowed a tokio worker stack.
-            //
-            // One `Box::pin` per Unix-socket dispatch is charged to the branch
-            // that needs it, off the shared hot path. Do not unwrap it back
-            // inline without re-measuring the generic future's size.
-            Box::pin(proxy_to_backend_unix(
+            // BOXED OUT OF LINE ON PURPOSE — this is a stack-budget invariant,
+            // not a style choice (issue #3764). Boxing AT this call site would
+            // still leave the callee's future as a fixed frame slot in
+            // `proxy_to_backend`, which every request walks over; see
+            // `boxed_proxy_to_backend_unix` for the full rationale.
+            boxed_proxy_to_backend_unix(
                 state,
                 proxy,
                 upstream_target,
@@ -37188,7 +37315,7 @@ async fn proxy_to_backend(
                 ctx_bytes_sent_observed,
                 effective_max_request_body_size_bytes,
                 effective_max_response_body_size_bytes,
-            ))
+            )
             .await
         };
         return BackendDispatchResult::Response {

@@ -369,12 +369,26 @@ pub fn effective_connect_timeout_ms(proxy_connect_timeout_ms: u64) -> u64 {
     }
 }
 
+/// Defensive upper bound on ONE Unix establishment budget, in milliseconds.
+///
+/// Deliberately the same value config validation already enforces on every
+/// operator-facing timeout field ([`crate::config::types::MAX_TIMEOUT_MS`], 24
+/// hours), so no value an admitted configuration can produce is affected. It
+/// exists because this dial is reached from config that may have crossed the
+/// CP/DP, file, or xDS boundary: a `backend_connect_timeout_ms` that escaped
+/// validation must fail closed here rather than become an establishment budget
+/// no request would ever outlive. The check is not a substitute for the
+/// representability check below — it is the bound that does not depend on how
+/// wide the platform's `Instant` happens to be.
+pub const MAX_UNIX_CONNECT_TIMEOUT_MS: u64 = crate::config::types::MAX_TIMEOUT_MS;
+
 /// Absolute deadline for one Unix transport establishment budget.
 ///
-/// An operator-supplied duration that the platform clock cannot represent must
-/// fail closed rather than silently becoming an unbounded wait. Returning the
-/// effective millisecond value keeps the timeout response aligned with the
-/// default applied when the proxy-level value is zero.
+/// An unreasonable duration — one past [`MAX_UNIX_CONNECT_TIMEOUT_MS`], or one
+/// the platform clock cannot represent — must fail closed rather than silently
+/// becoming an effectively unbounded wait. Returning the effective millisecond
+/// value keeps the timeout response aligned with the default applied when the
+/// proxy-level value is zero.
 ///
 /// This is the ONE budget for a Unix transport establishment. It is created
 /// once, at the OUTERMOST point of an establishment — before admission, before
@@ -393,6 +407,12 @@ pub(crate) fn connect_deadline(
     proxy_connect_timeout_ms: u64,
 ) -> Result<(u64, tokio::time::Instant), UnixBackendError> {
     let timeout_ms = effective_connect_timeout_ms(proxy_connect_timeout_ms);
+    // Fail closed BEFORE any clock arithmetic: a budget larger than the one
+    // config validation admits is refused on every platform, whatever range
+    // that platform's `Instant` supports.
+    if timeout_ms > MAX_UNIX_CONNECT_TIMEOUT_MS {
+        return Err(UnixBackendError::ConnectTimeout { timeout_ms });
+    }
     let deadline = tokio::time::Instant::now()
         .checked_add(std::time::Duration::from_millis(timeout_ms))
         .ok_or(UnixBackendError::ConnectTimeout { timeout_ms })?;

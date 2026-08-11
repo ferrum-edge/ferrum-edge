@@ -21,8 +21,10 @@
 //! three) full setup budgets. A synchronous admission `stat` cannot be
 //! preempted while it executes, but the time it costs is charged all the same:
 //! the next `timeout_at` resolves `Err` immediately once the deadline has
-//! passed. An operator duration the platform clock cannot represent still fails
-//! closed in `connect_deadline` rather than becoming an unbounded wait.
+//! passed. An unreasonable operator duration — one past
+//! `MAX_UNIX_CONNECT_TIMEOUT_MS` (the same 24h ceiling config validation
+//! enforces), or one the platform clock cannot represent — still fails closed in
+//! `connect_deadline` rather than becoming an effectively unbounded wait.
 //!
 //! ## The per-target physical-connection bound
 //!
