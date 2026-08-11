@@ -832,6 +832,7 @@ jobs:
               integration::mesh_topology_hbone_tests
               integration::mesh_authz_e2e_tests
               integration::mesh_authz_negative_match_tests
+              integration::mesh_ext_authz_custom_tests
               integration::mesh_service_waypoint_tests
               integration::mesh_stock_xds_tests
               integration::mesh_ew_egress_e2e_tests

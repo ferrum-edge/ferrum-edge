@@ -3110,6 +3110,7 @@ paths:
                           - mesh_telemetry
                           - mesh_proxy_configs
                           - extension_configs
+                          - ext_authz_providers
                         properties:
                           workloads: { type: integer, minimum: 0 }
                           services: { type: integer, minimum: 0 }
@@ -3122,6 +3123,7 @@ paths:
                           mesh_telemetry: { type: integer, minimum: 0 }
                           mesh_proxy_configs: { type: integer, minimum: 0 }
                           extension_configs: { type: integer, minimum: 0 }
+                          ext_authz_providers: { type: integer, minimum: 0 }
                       fingerprint:
                         type: string
                         pattern: "^sha256-[0-9a-f]{64}$"
@@ -3389,6 +3391,7 @@ paths:
                         mesh_telemetry: 2
                         mesh_proxy_configs: 1
                         extension_configs: 0
+                        ext_authz_providers: 1
                       fingerprint: "sha256-9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
                       source_protocol: native
                       source_cp_url: "grpcs://cp-primary.mesh.svc.cluster.local:50051"
@@ -3442,6 +3445,7 @@ paths:
                         mesh_telemetry: 0
                         mesh_proxy_configs: 0
                         extension_configs: 0
+                        ext_authz_providers: 0
                       source_protocol: native
                       source_cp_url: "grpcs://cp-primary.mesh.svc.cluster.local:50051"
                     revision:

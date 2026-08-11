@@ -24,6 +24,7 @@ Concepts map directly to the Istio service mesh model: `Workload` corresponds to
   - [PolicyScope Filtering](#policyscope-filtering)
   - [AuthorizationPolicy targetRefs](#authorizationpolicy-targetrefs-issue-3226)
   - [Evaluation Semantics](#evaluation-semantics)
+  - [AuthorizationPolicy action: CUSTOM](#authorizationpolicy-action-custom-issue-3235)
   - [Rule Matching](#rule-matching)
   - [SPIFFE Identity](#spiffe-identity)
   - [HBONE Protocol](#hbone-protocol)
@@ -1117,14 +1118,151 @@ DP slices reconstruct `MeshConfig` without `waypoint_bindings`, so Gateway prese
 
 ### Evaluation Semantics
 
-`evaluate_mesh_authorization()` processes policies in order:
+`evaluate_mesh_authorization_full()` processes policies in Istio's action order:
 
-1. **DENY rules checked first** -- first match returns `Deny`.
-2. **ALLOW rules** -- if any ALLOW rule exists in the policy set but none matched, the result is **implicit deny** (Istio semantics).
-3. **AUDIT rules** -- matched audit policies are returned for logging.
-4. If no DENY or ALLOW rules exist, the result is `Allow`.
+1. **CUSTOM rules checked first** -- a matching CUSTOM rule delegates the decision to its `meshConfig.extensionProviders` external authorizer *before* any DENY or ALLOW tier can settle the request. See [AuthorizationPolicy `action: CUSTOM`](#authorizationpolicy-action-custom-issue-3235).
+2. **DENY rules** -- first match returns `Deny`. A DENY still refuses a request an external authorizer was willing to admit.
+3. **ALLOW rules** -- if any ALLOW rule exists in the policy set but none matched, the result is **implicit deny** (Istio semantics). A CUSTOM rule does **not** contribute to that implicit-deny floor: it delegates rather than grants.
+4. **AUDIT rules** -- matched audit policies are returned for logging.
+5. If no CUSTOM, DENY, or ALLOW rules exist, the result is `Allow`.
 
-**Istio empty-rule semantics**: `ALLOW` with no rules is allow-nothing (emits a `never_matches` rule so the implicit deny applies). `DENY`/`AUDIT` with no rules are no-ops.
+**Istio empty-rule semantics**: `ALLOW` with no rules is allow-nothing (emits a `never_matches` rule so the implicit deny applies). `DENY`/`AUDIT` with no rules are no-ops. `CUSTOM` with no rules is **rejected** at translation: a ruleless delegation has no matching surface, so admitting it would produce an accepted-but-inert policy.
+
+### AuthorizationPolicy `action: CUSTOM` (issue #3235)
+
+An `AuthorizationPolicy` with `action: CUSTOM` delegates matching requests to an
+external authorization service declared in the **root-namespace**
+`meshConfig.extensionProviders` list:
+
+```yaml
+# istio-system/istio ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: istio
+  namespace: istio-system
+data:
+  mesh: |
+    extensionProviders:
+    - name: sample-ext-authz
+      envoyExtAuthzHttp:
+        service: ext-authz.istio-system.svc.cluster.local
+        port: 8000
+        scheme: https           # Ferrum extension, see "Provider transport"
+        timeout: 0.5s
+        pathPrefix: /check
+        failOpen: false
+        statusOnError: 403
+        includeRequestHeadersInCheck:
+        - x-request-id
+        includeAdditionalHeadersInCheck:
+          x-ferrum-mesh: "1"
+        headersToDownstreamOnDeny:
+        - www-authenticate
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: delegate-admin
+  namespace: default
+spec:
+  action: CUSTOM
+  provider:
+    name: sample-ext-authz
+  selector:
+    matchLabels: { app: reviews }
+  rules:
+  - to:
+    - operation:
+        paths: ["/admin/*"]
+```
+
+**Provider resolution is root-namespace only.** `spec.provider.name` is resolved
+against `meshConfig.extensionProviders` in `FERRUM_K8S_ISTIO_ROOT_NAMESPACE`.
+A tenant namespace cannot introduce or shadow a provider, so cross-namespace
+provider resolution is structurally impossible rather than filtered. Each
+failure mode has its own field-shaped diagnostic and **rejects the resource**
+(it is never accepted-but-inert):
+
+| Condition | Outcome |
+| --- | --- |
+| `provider` absent / not an object / unknown field | rejected |
+| `provider.name` empty, non-string, or over 253 bytes | rejected |
+| name not declared in the root-namespace meshConfig | rejected, naming the root namespace |
+| name declared as a tracing (or other non-ext-auth) provider | rejected, "is not an external authorization provider" |
+| name declared as `envoyExtAuthzGrpc` | rejected, "a variant Ferrum does not implement" |
+| `action: CUSTOM` with no `rules` | rejected |
+| `provider` on a non-CUSTOM action | rejected |
+
+**Supported provider shape.** Only `envoyExtAuthzHttp` is implemented: the
+check is a bounded HTTP request. `envoyExtAuthzGrpc` is refused at admission
+rather than approximated — the Envoy gRPC check API carries attributes Ferrum
+does not model, and an approximation would silently change what a policy
+authorizes. The `envoyExtAuthzHttp` key set is **closed**: an unmodelled field
+(including the deprecated `includeHeadersInCheck`) is rejected rather than
+ignored, so an operator can never believe a field is in force when it is not.
+
+**Provider transport.** Istio derives the ext-auth transport from the
+destination's own mesh configuration; Ferrum's provider dial does not go
+through that path, so the operator states it with a `scheme: http|https` field
+on the provider block. A **non-loopback** provider must use `https`: an
+unencrypted off-box check (which may carry a forwarded credential) is refused
+at admission. Loopback providers (`127.0.0.1`, `::1`, `localhost`) may use
+plaintext.
+
+**Bounds.** `timeout` is capped at 30s (default 1s), `includeRequestBodyInCheck.maxRequestBytes`
+at 1 MiB, provider response reads at 64 KiB, each header list at 32 exact
+entries, and the admitted provider set at 16 per mesh generation. In-flight
+checks are capped process-wide and are **refused immediately** at the ceiling
+rather than queued, so provider slowness cannot become unbounded gateway
+latency or memory growth. Nothing is retried: a check request may carry a
+partially sent body, and replaying an authorization decision is never safe.
+
+**Fail-closed outcomes.** A `2xx` provider status allows; any other status
+denies with that status. A timeout, transport error, oversize or unreadable
+response, an unavailable request body for a body-inspecting provider, a
+concurrency refusal, task cancellation, or a provider name this generation does
+not carry all **deny** with the provider's `statusOnError` — unless the provider
+explicitly sets `failOpen: true`.
+
+**Mutation is deliberately narrow.** `headersToDownstreamOnDeny` is honoured:
+those headers land on the gateway-authored denial this plugin itself produces.
+`headersToUpstreamOnAllow` and `headersToDownstreamOnAllow` are **rejected at
+admission**. Ferrum runs the check in the `authorize` phase, before route
+dispatch and before every request/response transformer, so a header written
+there would order differently against operator-authored rules on each ingress
+path; a protocol-dependent mutation of an authenticated request is exactly the
+gap this feature must not introduce. Wildcard header entries are refused for
+the same reason a prefix rule cannot be shown to exclude hop-by-hop, routing,
+mesh-identity, or gateway-reserved names. The provider's own response **body**
+is never echoed to the client. Credentials (`authorization`, `cookie`) reach a
+provider only by being named explicitly in `includeRequestHeadersInCheck`; the
+full client header map and the request query string are never forwarded.
+
+**Protocol coverage.** The check runs on every HTTP-family ingress path
+identically — HTTP/1.1, HTTP/2, native gRPC, HTTP/3, and HTTP relayed inside a
+mesh/HBONE CONNECT — because they share one `authorize` ladder. Layer-4
+sessions (raw TCP, TLS passthrough, UDP, DTLS) carry no HTTP request and cannot
+be checked: a CUSTOM rule that **matches** an L4 connection **denies** it rather
+than serving it unchecked. Scope a CUSTOM policy with `to.operation.ports` when
+the selected workload also serves non-HTTP ports.
+
+**Reload and withdrawal.** Providers ride the mesh slice (and their own
+`ExtAuthzProvidersCarrier` ECDS carrier over xDS, re-validated at the ACK
+boundary), and `MeshSlice::content_eq` compares them, so editing only
+`meshConfig.extensionProviders` still republishes. Each slice carries only the
+providers its retained policies actually bind. Deleting a CUSTOM policy retires
+its executor with the generation — there is no background task or detached
+queue to leak. A provider that cannot be prepared rejects the whole plugin
+generation, so the previous valid one keeps serving.
+
+**Observability.** `ferrum_mesh_ext_authz_checks_total{outcome}` and
+`ferrum_mesh_ext_authz_check_failures_total{disposition}` are fixed-cardinality:
+the labels are closed enums plus the gateway namespace, never a provider,
+policy, route, host, principal, or status string. `mesh_authz.ext_authz_outcome`
+request metadata carries the same closed reason token. No request body,
+credential header value, provider secret, or resolved provider URL is ever
+logged.
 
 ### Rule Matching
 

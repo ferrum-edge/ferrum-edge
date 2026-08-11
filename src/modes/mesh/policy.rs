@@ -111,6 +111,37 @@ pub enum MeshAuthzDecision {
     Audit { policy: String },
 }
 
+/// A matched Istio `action: CUSTOM` delegation, pending an external
+/// authorization check.
+///
+/// Istio evaluates CUSTOM BEFORE DENY and ALLOW. The evaluator therefore
+/// cannot decide a request that matched a CUSTOM rule on its own: it returns
+/// the delegation alongside the decision the remaining (DENY/ALLOW/AUDIT)
+/// tiers would produce, and the caller runs the provider check first. Only an
+/// ALLOW verdict from the provider lets that decision take effect; a deny, an
+/// error, or an unavailable executor denies outright.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshAuthzCustomDelegation {
+    /// Name of the `AuthorizationPolicy` whose CUSTOM rule matched. Used for
+    /// deny metadata / the policy-deny drilldown; never for provider lookup.
+    pub policy: String,
+    /// `meshConfig.extensionProviders[].name` this delegation binds.
+    pub provider: String,
+}
+
+/// Full evaluation outcome: the CUSTOM delegation (if any) plus the decision
+/// the non-CUSTOM tiers reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshAuthzEvaluation {
+    /// `Some` when at least one CUSTOM rule matched. The FIRST match in policy
+    /// order wins, mirroring Istio, which permits only one CUSTOM provider to
+    /// apply to a given request.
+    pub custom: Option<MeshAuthzCustomDelegation>,
+    /// What DENY / ALLOW / AUDIT alone decided. Meaningful only after the
+    /// CUSTOM delegation (if present) has returned an allow verdict.
+    pub decision: MeshAuthzDecision,
+}
+
 pub fn evaluate_mesh_authorization(
     slice: &MeshSlice,
     request: &MeshAuthzRequest,
@@ -133,21 +164,72 @@ pub fn evaluate_mesh_authorization_policies<'a, I>(
 where
     I: IntoIterator<Item = &'a MeshPolicy>,
 {
+    let evaluation = evaluate_mesh_authorization_full(policies, request);
+    match evaluation.custom {
+        // A matched CUSTOM delegation that this caller cannot execute (it has
+        // no external-authorization executor — the L4 / stream path, or a
+        // generation whose provider set did not bind) MUST NOT fall through to
+        // the ALLOW/DENY tiers: Istio runs CUSTOM first, so skipping it would
+        // serve traffic the operator delegated away. Deny with a stable,
+        // fixed-cardinality rule name.
+        Some(delegation) => MeshAuthzDecision::Deny {
+            policy: format!("custom:{}", delegation.policy),
+        },
+        None => evaluation.decision,
+    }
+}
+
+/// Evaluate mesh authorization, surfacing a matched CUSTOM delegation instead
+/// of collapsing it into a denial.
+///
+/// Istio's action order is CUSTOM → DENY → ALLOW, with AUDIT non-enforcing.
+/// This function performs ONE pass and reports both halves:
+///
+/// * `custom` — the first matching CUSTOM rule, if any. The caller must run
+///   the external check before anything else takes effect.
+/// * `decision` — what the DENY/ALLOW/AUDIT tiers decided on their own,
+///   including the ALLOW implicit-deny floor.
+///
+/// A CUSTOM rule deliberately does NOT contribute to the ALLOW implicit-deny
+/// floor: in Istio a CUSTOM policy delegates rather than grants, so it must
+/// neither raise the floor for unrelated traffic nor satisfy an existing one.
+pub fn evaluate_mesh_authorization_full<'a, I>(
+    policies: I,
+    request: &MeshAuthzRequest,
+) -> MeshAuthzEvaluation
+where
+    I: IntoIterator<Item = &'a MeshPolicy>,
+{
     let mut saw_allow = false;
     let mut matched_allow = false;
     let mut matched_audit = None;
+    let mut matched_deny: Option<String> = None;
+    let mut custom: Option<MeshAuthzCustomDelegation> = None;
     let normalized_host = request.host.as_deref().and_then(normalize_match_host);
 
     for policy in policies {
         for rule in &policy.rules {
+            // Hot-path guard: once a DENY has matched, the decision half is
+            // settled and only an as-yet-unseen CUSTOM rule can still change
+            // what the caller must do. Skipping the (comparatively expensive)
+            // matcher for every other rule keeps the common deny path at the
+            // same cost it had before CUSTOM existed — the check below is a
+            // discriminant test, not a match evaluation.
+            if matched_deny.is_some()
+                && (custom.is_some() || !matches!(rule.action, PolicyAction::Custom { .. }))
+            {
+                continue;
+            }
             if !rule_matches(rule, request, normalized_host.as_ref(), &policy.namespace) {
                 continue;
             }
-            match rule.action {
+            match &rule.action {
                 PolicyAction::Deny => {
-                    return MeshAuthzDecision::Deny {
-                        policy: policy.name.clone(),
-                    };
+                    // Record rather than return: a CUSTOM rule in a later
+                    // policy still has to be reported so the caller cannot
+                    // conclude "no delegation applied" from a deny it might
+                    // later re-derive. The deny still wins the decision half.
+                    matched_deny.get_or_insert_with(|| policy.name.clone());
                 }
                 PolicyAction::Allow => {
                     saw_allow = true;
@@ -155,6 +237,12 @@ where
                 }
                 PolicyAction::Audit => {
                     matched_audit.get_or_insert_with(|| policy.name.clone());
+                }
+                PolicyAction::Custom { provider } => {
+                    custom.get_or_insert_with(|| MeshAuthzCustomDelegation {
+                        policy: policy.name.clone(),
+                        provider: provider.clone(),
+                    });
                 }
             }
         }
@@ -167,15 +255,18 @@ where
         }
     }
 
-    if saw_allow && !matched_allow {
-        return MeshAuthzDecision::Deny {
+    let decision = if let Some(policy) = matched_deny {
+        MeshAuthzDecision::Deny { policy }
+    } else if saw_allow && !matched_allow {
+        MeshAuthzDecision::Deny {
             policy: "implicit-deny".to_string(),
-        };
-    }
-    if let Some(policy) = matched_audit {
-        return MeshAuthzDecision::Audit { policy };
-    }
-    MeshAuthzDecision::Allow
+        }
+    } else if let Some(policy) = matched_audit {
+        MeshAuthzDecision::Audit { policy }
+    } else {
+        MeshAuthzDecision::Allow
+    };
+    MeshAuthzEvaluation { custom, decision }
 }
 
 /// `policy_namespace` is the namespace of the owning [`MeshPolicy`] (the
@@ -195,8 +286,8 @@ fn rule_matches(
         && matches_request_principals(&rule.request_principals, request)
         && matches_not_request_principals(&rule.not_request_principals, request)
         && matches_source_negation(&rule.source_negation, request)
-        && matches_requests(&rule.to, request, rule.action, normalized_host)
-        && matches_conditions(&rule.when, request, rule.action, policy_namespace)
+        && matches_requests(&rule.to, request, &rule.action, normalized_host)
+        && matches_conditions(&rule.when, request, &rule.action, policy_namespace)
 }
 
 /// Enforce the conjunctive source-negative / IP-block matchers for one rule.
@@ -363,7 +454,7 @@ fn source_principal_pattern_matches(pattern: &str, source: &SpiffeId) -> bool {
 fn matches_requests(
     matches: &[RequestMatch],
     request: &MeshAuthzRequest,
-    action: PolicyAction,
+    action: &PolicyAction,
     normalized_host: Option<&NormalizedHost>,
 ) -> bool {
     if matches.is_empty() {
@@ -377,7 +468,7 @@ fn matches_requests(
 fn request_match(
     match_: &RequestMatch,
     request: &MeshAuthzRequest,
-    action: PolicyAction,
+    action: &PolicyAction,
     normalized_host: Option<&NormalizedHost>,
 ) -> bool {
     if !match_.methods.is_empty() {
@@ -496,8 +587,15 @@ fn request_match(
     true
 }
 
-fn deny_missing_http_attribute_matches(action: PolicyAction) -> bool {
-    action == PolicyAction::Deny
+/// Istio treats an unobservable HTTP attribute differently per action.
+///
+/// `DENY` ignores the field (the rule still matches on its remaining
+/// constraints), so an unevaluable attribute can never disarm a deny.
+/// `ALLOW`, `AUDIT`, and `CUSTOM` can never match on it: access is never
+/// granted — nor delegated to an external authorizer as if the attribute had
+/// been observed — on something this path cannot read.
+fn deny_missing_http_attribute_matches(action: &PolicyAction) -> bool {
+    matches!(action, PolicyAction::Deny)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -631,7 +729,7 @@ struct ConditionMatchContext<'a> {
 fn matches_conditions(
     matches: &[ConditionMatch],
     request: &MeshAuthzRequest,
-    action: PolicyAction,
+    action: &PolicyAction,
     policy_namespace: &str,
 ) -> bool {
     matches.iter().all(|match_| {
@@ -647,7 +745,7 @@ fn matches_conditions(
         // live policy, so this is a defence-in-depth default, not a path
         // operators can reach.
         let Some(kind) = classify_mesh_condition_key(&match_.key) else {
-            return action == PolicyAction::Deny;
+            return matches!(action, PolicyAction::Deny);
         };
         // Istio semantics for an attribute this path can never observe (an
         // HTTP-only key on a TCP/UDP port, or a documented key Ferrum has no
@@ -662,7 +760,7 @@ fn matches_conditions(
         // not send), which follows the ordinary values / notValues rules
         // below exactly as Istio compiles them.
         if !condition_kind_is_sourceable(kind, request) {
-            return action == PolicyAction::Deny;
+            return matches!(action, PolicyAction::Deny);
         }
         let context = ConditionMatchContext {
             kind,

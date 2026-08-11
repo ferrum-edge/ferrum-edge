@@ -524,6 +524,40 @@ fn authorization_policy_status(
                     }
                 });
                 (true, "NoOp", message, Some(detail))
+            } else if action == "CUSTOM" {
+                // Issue #3235. A CUSTOM policy is only ever accepted with a
+                // bound provider (translation refuses it otherwise), so the
+                // status states which provider now decides matching requests
+                // and how a provider failure resolves — operators cannot see
+                // either from the resource alone.
+                let rule_count = object
+                    .spec
+                    .get("rules")
+                    .and_then(Value::as_array)
+                    .map(|rules| rules.len())
+                    .unwrap_or(0);
+                let provider = object
+                    .spec
+                    .get("provider")
+                    .and_then(|provider| provider.get("name"))
+                    .and_then(Value::as_str)
+                    .map(crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic)
+                    .unwrap_or_default();
+                let message = format!(
+                    "Ferrum accepted this CUSTOM AuthorizationPolicy ({rule_count} rule(s)); \
+                     matching HTTP requests are delegated to meshConfig.extensionProviders \
+                     '{provider}'. A provider timeout, transport error, or malformed response \
+                     denies unless the provider sets failOpen. Matching non-HTTP (TCP/UDP) \
+                     traffic is denied: an external check cannot be performed on it."
+                );
+                let detail = json!({
+                    "translation": {
+                        "action": action,
+                        "rules_translated": rule_count,
+                        "custom_provider": provider,
+                    }
+                });
+                (true, "Accepted", message, Some(detail))
             } else {
                 let rule_count = object
                     .spec

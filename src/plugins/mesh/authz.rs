@@ -49,23 +49,29 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::config::types::Proxy;
 use crate::identity::{SpiffeId, TrustDomain};
 use crate::modes::mesh::config::{
-    MAX_MESH_RULE_CONDITIONS, MeshPolicy, PolicyAction, PolicyScope, WaypointAttachment,
+    MAX_MESH_RULE_CONDITIONS, MeshPolicy, PolicyScope, WaypointAttachment,
     normalize_request_match_host_pattern, policy_scope_applies_to_workload,
     policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
     resolve_target_port, validate_mesh_condition, workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
-    MeshAuthzAttribute, MeshAuthzDecision, MeshAuthzProtocol, MeshAuthzRequest,
-    evaluate_mesh_authorization, evaluate_mesh_authorization_policies, istio_source_principal,
-    mesh_policies_have_header_rules, normalize_mesh_policy_header_names,
+    MeshAuthzAttribute, MeshAuthzCustomDelegation, MeshAuthzDecision, MeshAuthzEvaluation,
+    MeshAuthzProtocol, MeshAuthzRequest, evaluate_mesh_authorization_full,
+    evaluate_mesh_authorization_policies, istio_source_principal, mesh_policies_have_header_rules,
+    normalize_mesh_policy_header_names,
 };
 use crate::modes::mesh::policy_deny_log::{self, PolicyDenyEvent};
 use crate::modes::mesh::slice::MeshSlice;
+use crate::plugins::PluginHttpClient;
+use crate::plugins::mesh::ext_authz::{
+    MeshExtAuthzCheckRequest, MeshExtAuthzExecutor, MeshExtAuthzOutcome,
+};
 use crate::plugins::{
     ALL_PROTOCOLS, JwtAuthAttributeValue, Plugin, PluginResult, ProxyProtocol, RequestContext,
     StreamConnectionContext, priority,
@@ -75,6 +81,13 @@ pub(crate) const IGNORED_UDP_SOURCE_SCOPE_METADATA: &str = "mesh_authz.ignored_u
 
 pub struct MeshAuthz {
     slice: MeshSlice,
+    /// Istio `action: CUSTOM` external-authorization executor (issue #3235).
+    ///
+    /// `None` when this generation carries no CUSTOM policy, or when the
+    /// plugin was constructed without an HTTP client (direct-config / test
+    /// construction). A `None` executor never fails open: a matched CUSTOM
+    /// delegation with no executor denies, exactly like the L4 path.
+    ext_authz: Option<Arc<MeshExtAuthzExecutor>>,
     /// Unfiltered policy superset used for Ambient UDP CONNECTs carrying
     /// validated per-pod evidence and for ServiceWaypoint inbound relays whose
     /// destination workload differs from the waypoint identity. Ordinary
@@ -855,18 +868,31 @@ fn evaluate_destination_policy_scopes(
     scopes: &[crate::modes::mesh::runtime::PolicyScopeCache],
     waypoint: WaypointAttachment<'_>,
     request: &MeshAuthzRequest,
-) -> MeshAuthzDecision {
+) -> MeshAuthzEvaluation {
     let mut audit_policy = None;
+    let mut custom: Option<MeshAuthzCustomDelegation> = None;
     for scope in scopes {
-        let decision = evaluate_mesh_authorization_policies(
+        let evaluation = evaluate_mesh_authorization_full(
             policies
                 .iter()
                 .filter(|policy| scope.policy_applies_for_destination(policy, waypoint)),
             request,
         );
-        match decision {
+        // The FIRST matching delegation across every destination scope wins,
+        // matching the single-pass evaluator: one request delegates to at most
+        // one provider.
+        if custom.is_none() {
+            custom = evaluation.custom;
+        }
+        match evaluation.decision {
             MeshAuthzDecision::Deny { policy } => {
-                return MeshAuthzDecision::Deny { policy };
+                // A deny in ANY destination scope is final, but the delegation
+                // still has to be reported so the caller runs (and records) the
+                // CUSTOM check rather than concluding none applied.
+                return MeshAuthzEvaluation {
+                    custom,
+                    decision: MeshAuthzDecision::Deny { policy },
+                };
             }
             MeshAuthzDecision::Audit { policy } => {
                 audit_policy.get_or_insert(policy);
@@ -874,11 +900,12 @@ fn evaluate_destination_policy_scopes(
             MeshAuthzDecision::Allow => {}
         }
     }
-    if let Some(policy) = audit_policy {
+    let decision = if let Some(policy) = audit_policy {
         MeshAuthzDecision::Audit { policy }
     } else {
         MeshAuthzDecision::Allow
-    }
+    };
+    MeshAuthzEvaluation { custom, decision }
 }
 
 /// Resolve a `request.headers[<name>]` value. Reads the already-lowercased
@@ -1198,7 +1225,19 @@ fn normalize_authz_policies(policies: &mut [MeshPolicy]) {
 }
 
 impl MeshAuthz {
+    /// Construct without an outbound HTTP client.
+    ///
+    /// Used by direct-config / test construction. A generation built this way
+    /// cannot execute an Istio `action: CUSTOM` delegation, so a matched CUSTOM
+    /// rule DENIES rather than falling through — same contract as the L4 path.
     pub fn new(config: &Value) -> Result<Self, String> {
+        Self::new_with_http_client(config, None)
+    }
+
+    pub fn new_with_http_client(
+        config: &Value,
+        http_client: Option<PluginHttpClient>,
+    ) -> Result<Self, String> {
         // Whether the policies arrived via a `mesh_slice` (the slice-apply path
         // builds this — see `inject_mesh_authz_plugin`) vs. a flat
         // `mesh_policies` operator config with no slice context. This selects
@@ -1343,10 +1382,7 @@ impl MeshAuthz {
                 // empty-rule ALLOW (allow-nothing) is translated to a
                 // never-matching `Allow` rule, so it is still counted here.
                 !matches!(policy.scope, PolicyScope::MeshWide)
-                    && policy
-                        .rules
-                        .iter()
-                        .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
+                    && policy.rules.iter().any(|rule| rule.action.is_enforcing())
             });
         let service_waypoint_destination_scope_required =
             ambient_udp_source_scoping && slice.waypoint_name.is_some();
@@ -1366,8 +1402,38 @@ impl MeshAuthz {
             } else {
                 DestinationPolicyScopeIndex::default()
             };
+        // Build the CUSTOM external-authorization executor once per generation.
+        // Every per-request cost (URL, header names, timeout) is resolved here,
+        // on the cold path. A provider that cannot be prepared REJECTS the whole
+        // generation so the previous valid one keeps serving, rather than
+        // publishing a generation whose CUSTOM policies would all deny.
+        //
+        // The provider set is taken from the slice ONLY. A direct-config
+        // `mesh_policies` array has no provider source, so its CUSTOM rules
+        // (if any) deny — which is the correct reading of "delegate this
+        // decision to a provider that is not configured here".
+        let ext_authz = if slice
+            .mesh_policies
+            .iter()
+            .chain(relay_policy_superset.iter())
+            .flat_map(|policy| policy.rules.iter())
+            .any(|rule| rule.action.custom_provider().is_some())
+        {
+            match http_client {
+                Some(client) => {
+                    let executor = MeshExtAuthzExecutor::new(&slice.ext_authz_providers, client)
+                        .map_err(|error| format!("mesh_authz: {error}"))?;
+                    Some(Arc::new(executor))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             slice,
+            ext_authz,
             relay_policy_superset,
             ambient_udp_source_scopes,
             ambient_udp_source_scoping,
@@ -1815,6 +1881,89 @@ impl MeshAuthz {
         }
     }
 
+    /// Execute a matched Istio `action: CUSTOM` delegation.
+    ///
+    /// Returns `None` when the request may continue to the DENY/ALLOW tiers,
+    /// and `Some(reject)` when the request is refused. Every failure path is a
+    /// refusal unless the provider itself opted into `failOpen`; a generation
+    /// with no executor (no HTTP client, or a provider set that does not bind
+    /// this name) refuses too, so a CUSTOM policy can never be skipped.
+    ///
+    /// Nothing here logs a header value, a body byte, or the resolved provider
+    /// URL: the executor owns redaction, and this function contributes only the
+    /// fixed-cardinality outcome token.
+    async fn run_custom_delegation(
+        &self,
+        ctx: &mut RequestContext,
+        delegation: &MeshAuthzCustomDelegation,
+    ) -> Option<PluginResult> {
+        let Some(executor) = self.ext_authz.as_ref() else {
+            ctx.metadata.insert(
+                "mesh_authz.ext_authz_outcome".to_string(),
+                "executor_unavailable".to_string(),
+            );
+            return Some(PluginResult::Reject {
+                status_code: 403,
+                body: r#"{"error":"Mesh authorization denied"}"#.into(),
+                headers: HashMap::new(),
+            });
+        };
+
+        // Materialize ONLY the header values the provider asked for. The full
+        // client header map is never forwarded, so a credential header reaches
+        // the provider only because the operator named it in
+        // `includeRequestHeadersInCheck`.
+        let mut check_headers = HashMap::new();
+        for name in executor.required_header_names(&delegation.provider) {
+            if let Some(value) = http_header_attribute(ctx, &BTreeMap::new(), name.as_str()) {
+                check_headers.insert(name.as_str().to_string(), value);
+            }
+        }
+        let path = mesh_authz_authorization_path(&ctx.path);
+        let body = ctx.request_body_bytes.clone();
+        let outcome = executor
+            .check(
+                &delegation.provider,
+                MeshExtAuthzCheckRequest {
+                    method: &ctx.method,
+                    path: &path,
+                    headers: &check_headers,
+                    body: body.as_deref(),
+                    body_proven_empty: ctx.replay_request_body_empty_proven(),
+                },
+                &ctx.plugin_http_call_ns,
+            )
+            .await;
+
+        match outcome {
+            MeshExtAuthzOutcome::Allow { reason } => {
+                ctx.metadata.insert(
+                    "mesh_authz.ext_authz_outcome".to_string(),
+                    reason.as_str().to_string(),
+                );
+                None
+            }
+            MeshExtAuthzOutcome::Deny {
+                status,
+                headers,
+                reason,
+            } => {
+                ctx.metadata.insert(
+                    "mesh_authz.ext_authz_outcome".to_string(),
+                    reason.as_str().to_string(),
+                );
+                Some(PluginResult::Reject {
+                    status_code: status,
+                    // The provider's own response body is deliberately NOT
+                    // echoed: it is unvalidated third-party content that would
+                    // otherwise be rendered into a gateway-authored response.
+                    body: r#"{"error":"Mesh authorization denied"}"#.into(),
+                    headers: headers.into_iter().collect(),
+                })
+            }
+        }
+    }
+
     /// Push a deny record into the process-singleton policy-deny recorder
     /// consumed by `GET /mesh/policy-denies/recent`. Exception-path only —
     /// `mesh_authz` is called on every request, but this helper runs only
@@ -1860,10 +2009,7 @@ impl MeshAuthz {
 /// missing-scope check in `MeshAuthz::new` (`has_scoped_policies`) already does
 /// — an unscopable audit-only selector policy is skipped, not rejected.
 fn policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
-    policy
-        .rules
-        .iter()
-        .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny))
+    policy.rules.iter().any(|rule| rule.action.is_enforcing())
 }
 
 /// Refuse a waypoint slice that carries an ENFORCING GatewayClass-targeted
@@ -2329,7 +2475,7 @@ impl Plugin for MeshAuthz {
         // services, destination_rules, etc. the authz engine never reads).
         let mut scope_missing = false;
         let mut authorized_destination = None;
-        let decision = if relay_policy_superset_request {
+        let evaluation = if relay_policy_superset_request {
             // Destination-aware inbound relay. ServiceWaypoint byte-stream and
             // UDP CONNECTs both resolve the exact destination workload scope;
             // plain Ambient enters this branch only for UDP source scoping.
@@ -2404,7 +2550,7 @@ impl Plugin for MeshAuthz {
                     Some(destination_scope_match.authorized_destination.clone());
                 let destination_scopes = destination_scope_match.scopes;
                 let waypoint = self.waypoint_attachment();
-                evaluate_mesh_authorization_policies(
+                evaluate_mesh_authorization_full(
                     self.relay_policy_superset.iter().filter(|policy| {
                         let destination_applies = destination_scopes
                             .iter()
@@ -2418,7 +2564,7 @@ impl Plugin for MeshAuthz {
                     &request,
                 )
             } else {
-                evaluate_mesh_authorization_policies(
+                evaluate_mesh_authorization_full(
                     self.slice.mesh_policies.iter().chain(
                         self.relay_policy_superset.iter().filter(|policy| {
                             let source_applies = source_scope.map_or_else(
@@ -2538,10 +2684,36 @@ impl Plugin for MeshAuthz {
                     .mesh_policies
                     .iter()
                     .filter(|policy| Self::policy_applies_to_pod(policy, scope));
-                evaluate_mesh_authorization_policies(policies, &request)
+                evaluate_mesh_authorization_full(policies, &request)
             }
         } else {
-            evaluate_mesh_authorization(&self.slice, &request)
+            evaluate_mesh_authorization_full(self.slice.mesh_policies.iter(), &request)
+        };
+        // Istio evaluates CUSTOM BEFORE DENY and ALLOW, so a matched delegation
+        // runs here — ahead of anything `evaluation.decision` would have
+        // granted. An ALLOW verdict from the provider does NOT end the
+        // evaluation: the DENY/ALLOW tiers still apply below, so a DENY policy
+        // can still refuse a request the provider was willing to admit.
+        let decision = match evaluation.custom {
+            None => evaluation.decision,
+            Some(delegation) => {
+                match self.run_custom_delegation(ctx, &delegation).await {
+                    None => evaluation.decision,
+                    Some(reject) => {
+                        ctx.metadata.insert(
+                            "mesh_authz.deny_policy".to_string(),
+                            format!("custom:{}", delegation.policy),
+                        );
+                        self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
+                        if self.per_pod_policy_scoping && !asserted_identity_rejected {
+                            crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+                                crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
+                            );
+                        }
+                        return reject;
+                    }
+                }
+            }
         };
         // Remaining scope-missing cases reach here only when no scoped policies
         // are configured (the mesh is fully evaluable mesh-wide), so surface the
@@ -2627,6 +2799,40 @@ impl Plugin for MeshAuthz {
 
     fn is_authorize_plugin(&self) -> bool {
         true
+    }
+
+    /// A provider that declares `includeRequestBodyInCheck` needs the buffered
+    /// request body available AT the `authorize` phase — that is where the
+    /// CUSTOM check runs. Without this the body would be `None` and the check
+    /// would fail closed on every request instead of being decided.
+    fn requires_request_body_before_authorize(&self) -> bool {
+        self.ext_authz
+            .as_ref()
+            .is_some_and(|executor| executor.requires_request_body())
+    }
+
+    fn requires_request_body_buffering(&self) -> bool {
+        self.requires_request_body_before_authorize()
+    }
+
+    fn needs_request_body_bytes(&self) -> bool {
+        self.requires_request_body_before_authorize()
+    }
+
+    /// Bound the buffer at the largest `maxRequestBytes` any provider declared,
+    /// so a body-inspecting policy cannot make the gateway retain more than the
+    /// operator asked a provider to see.
+    fn request_body_buffer_limit(&self) -> Option<usize> {
+        self.ext_authz
+            .as_ref()
+            .and_then(|executor| executor.max_request_body_bytes())
+    }
+
+    fn warmup_hostnames(&self) -> Vec<String> {
+        self.ext_authz
+            .as_ref()
+            .map(|executor| executor.warmup_hostnames())
+            .unwrap_or_default()
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
@@ -2721,9 +2927,13 @@ impl Plugin for MeshAuthz {
                 .mesh_policies
                 .iter()
                 .filter(|policy| Self::policy_applies_to_pod(policy, scope));
+            // The stream (L4) path deliberately keeps the DENYING wrapper: a
+            // TCP/TLS/UDP session carries no HTTP request, so a matched CUSTOM
+            // delegation cannot be checked and must close the connection rather
+            // than fall through to the ALLOW/DENY tiers.
             evaluate_mesh_authorization_policies(policies, &request)
         } else {
-            evaluate_mesh_authorization(&self.slice, &request)
+            evaluate_mesh_authorization_policies(self.slice.mesh_policies.iter(), &request)
         };
         let result = self.decision_to_result(decision, &mut metadata);
         if matches!(

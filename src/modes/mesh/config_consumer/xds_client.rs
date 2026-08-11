@@ -15,7 +15,7 @@ use super::common::{
 };
 use crate::grpc::dp_client::{DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret};
 use crate::modes::mesh::config::{
-    AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, PolicyAction, PolicyScope,
+    AppProtocol, MeshDestinationRule, MeshRuntimeOverlay, MeshService, PolicyScope,
     PolicyTargetAttachment, ServicePort,
 };
 use crate::modes::mesh::revision::MeshRevisionRejection;
@@ -1531,6 +1531,12 @@ fn reverse_translate(
         // GAP-1a: authorization policies recovered from the MeshPolicies
         // carrier. Without this the xDS mesh had NO authz (implicit allow-all).
         mesh_policies: recovered.mesh_policies,
+        // Issue #3235: ext-authz providers recovered from the ExtAuthzProviders
+        // carrier, already re-validated at the ACK boundary. Without this an
+        // xDS-built slice would carry CUSTOM policies with no provider to bind,
+        // which the runtime denies — the carrier is what keeps xDS and native
+        // materialization at parity.
+        ext_authz_providers: recovered.ext_authz_providers,
         // Gate the CORS carrier exactly like the legacy DR carrier above is
         // gated to the workload namespace: an ECDS carrier is raw producer
         // input that never passed this DP's slice admission, so the
@@ -1736,7 +1742,7 @@ fn validate_waypoint_gateway_class_carrier(
         let enforces = policy
             .rules
             .iter()
-            .any(|rule| matches!(rule.action, PolicyAction::Allow | PolicyAction::Deny));
+            .any(|rule| rule.action.is_enforcing());
         targets_gateway_class && enforces
     });
 
@@ -1896,6 +1902,22 @@ fn validate_recognized_mesh_slice_carrier(
                 namespace,
                 &mut errors,
             );
+        }
+        // Issue #3235: an ext-authz provider names where an authorization
+        // decision is delegated to, including the transport it is dialed over.
+        // A carrier is raw producer input that never passed this DP's
+        // admission, so the full fail-closed structural contract
+        // (bounded cardinality, unique names, TLS-or-loopback transport,
+        // bounded timeout/status/headers/body) is re-checked here rather than
+        // trusted. The diagnostic is provider-name-shaped and bounded by
+        // `sanitize_mesh_ext_authz_diagnostic`; it never echoes a header value
+        // or an unbounded endpoint string.
+        MeshSliceCarrier::ExtAuthzProviders(providers) => {
+            if let Err(error) =
+                crate::modes::mesh::config::validate_mesh_ext_authz_providers(providers)
+            {
+                errors.push(format!("xDS ext-authz provider carrier: {error}"));
+            }
         }
         _ => return Ok(()),
     }
