@@ -1178,7 +1178,8 @@ mod imp {
     pub struct UnixWebSocketDial {
         /// The admitted socket identity the connection is bound to. Held by the
         /// caller for the session; a WebSocket carrier is never pooled.
-        #[allow(dead_code)] // Identity is proven at dial; retained for caller diagnostics/parity.
+        #[allow(dead_code)]
+        // Identity is proven at dial; retained for caller diagnostics/parity.
         pub admitted: AdmittedUnixSocket,
         pub stream: tokio::net::UnixStream,
         /// Absolute end of the ONE `backend_connect_timeout_ms` establishment

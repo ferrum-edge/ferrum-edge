@@ -6830,7 +6830,10 @@ fn unix_ingress_max_connections_rejects_an_unreachable_ceiling() {
         &[
             ("FERRUM_MODE", "file"),
             ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
-            ("FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS", &over.to_string()),
+            (
+                "FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS",
+                &over.to_string(),
+            ),
         ],
         || {
             let result = EnvConfig::from_env();

@@ -603,8 +603,13 @@ pub async fn handshake_unix_h2c_sender(
     stream: tokio::net::UnixStream,
     deadline: tokio::time::Instant,
     timeout_ms: u64,
-) -> Result<(crate::proxy::mesh_mtls_pool::MeshMtlsSender, UnixConnectionDriver), UnixBackendError>
-{
+) -> Result<
+    (
+        crate::proxy::mesh_mtls_pool::MeshMtlsSender,
+        UnixConnectionDriver,
+    ),
+    UnixBackendError,
+> {
     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 
     let settings_received = Arc::new(AtomicBool::new(false));

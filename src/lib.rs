@@ -2902,12 +2902,9 @@ pub mod _test_support {
         B: FnOnce() -> BFut,
         BFut: std::future::Future<Output = ()>,
     {
-        pool.shutdown_drain_seamed(
-            driver_budget,
-            reap_budget,
-            between_latches,
-            || std::future::ready(()),
-        )
+        pool.shutdown_drain_seamed(driver_budget, reap_budget, between_latches, || {
+            std::future::ready(())
+        })
         .await;
     }
 

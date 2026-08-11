@@ -1858,9 +1858,9 @@ async fn a_new_physical_connection_is_refused_at_the_target_bound() {
             assert_eq!(limit.cap, 1);
             assert_eq!(limit.current, 1);
         }
-        other => panic!(
-            "an over-bound dial must be refused with the typed limit error, got {other:?}"
-        ),
+        other => {
+            panic!("an over-bound dial must be refused with the typed limit error, got {other:?}")
+        }
     }
     let typed = UnixBackendError::BackendConnectionLimit(BackendConnectionLimitExceeded {
         current: 1,
@@ -1952,7 +1952,12 @@ async fn reusing_a_pooled_carrier_takes_no_second_connection_slot() {
         pool.checkin_h1(checkout);
     }
 
-    expect_accepts(&peer, 1, "three sequential requests share one admitted socket").await;
+    expect_accepts(
+        &peer,
+        1,
+        "three sequential requests share one admitted socket",
+    )
+    .await;
     let stats = pool.stats();
     assert_eq!(stats.physical_connects, 1);
     assert_eq!(stats.hits, 2);
@@ -2682,7 +2687,10 @@ async fn an_h2c_checkout_racing_the_shutdown_latch_refuses_and_settles_exactly()
         1,
         "the racing h2c establishment holds its target's connection slot while parked"
     );
-    let err = expect_refusal(result, "the h2c race must fail closed rather than return a carrier");
+    let err = expect_refusal(
+        result,
+        "the h2c race must fail closed rather than return a carrier",
+    );
     assert!(
         matches!(err, UnixBackendError::PoolShuttingDown),
         "expected the typed shutdown refusal, got {err}"
@@ -2896,14 +2904,18 @@ async fn registration_is_already_closed_before_the_pool_latch_is_published() {
             std::time::Duration::from_secs(5),
             || async {
                 // The tracker is closed; the pool flag is NOT stored yet.
-                latch_published_on_entry
-                    .store(usize::from(pool.shutdown_latch_published()), Ordering::SeqCst);
+                latch_published_on_entry.store(
+                    usize::from(pool.shutdown_latch_published()),
+                    Ordering::SeqCst,
+                );
                 let _ = release_tx.send(());
                 let _ = settled_rx.await;
                 // Still inside the interval: whatever refused the checkout was
                 // the tracker's latch, because this one is still unpublished.
-                latch_published_after_settle
-                    .store(usize::from(pool.shutdown_latch_published()), Ordering::SeqCst);
+                latch_published_after_settle.store(
+                    usize::from(pool.shutdown_latch_published()),
+                    Ordering::SeqCst,
+                );
                 let stats = pool.stats();
                 tracked_between.store(pool.tracked_drivers(), Ordering::SeqCst);
                 gauge_between.store(stats.open_physical_connections as usize, Ordering::SeqCst);
@@ -3041,5 +3053,10 @@ async fn the_establishment_budget_opens_before_the_idle_sweep() {
         )
         .await
         .expect("checkout");
-    expect_accepts(&peer, 2, "the expired idle carrier must not have been reused").await;
+    expect_accepts(
+        &peer,
+        2,
+        "the expired idle carrier must not have been reused",
+    )
+    .await;
 }
