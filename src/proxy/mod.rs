@@ -12246,8 +12246,16 @@ async fn handle_websocket_request_authenticated(
         let ws_dial_result: Result<WsBackendHandshake, Box<dyn std::error::Error + Send + Sync>> =
             if let Some(unix_dispatch) = ws_unix_dispatch {
                 match unix_dispatch {
+                    // Boxed: this dial future (admission gate + hyper/tungstenite
+                    // H1 upgrade + framer construction) would otherwise be stored
+                    // INLINE in this function's state machine, which is itself a
+                    // field of the single generic `handle_proxy_request_inner`
+                    // future every request — WebSocket or not — is polled through.
+                    // See the boxing note on the Unix dispatch in
+                    // `proxy_to_backend`: the generic future's size is a
+                    // whole-gateway stack budget, not a WS-path cost.
                     #[cfg(unix)]
-                    Ok(socket_path) => connect_unix_websocket_backend(
+                    Ok(socket_path) => Box::pin(connect_unix_websocket_backend(
                         ws_dial_proxy,
                         &env_config,
                         socket_path,
@@ -12258,7 +12266,7 @@ async fn handle_websocket_request_authenticated(
                         ws_size_limits.max_message_bytes,
                         state.websocket_write_buffer_size,
                         ws_idle_tracker.clone(),
-                    )
+                    ))
                     .await
                     .map(|handshake| WsBackendHandshake::Unix(Box::new(handshake))),
                     // Non-Unix builds never produce `Ok` above.
@@ -13140,10 +13148,16 @@ async fn handle_websocket_request_authenticated(
                     // backend byte transport is an admitted `UnixStream`. The
                     // dedicated connection is owned by this session and closes
                     // with it; it is never returned to the #3731 idle pool.
+                    //
+                    // Boxed so this third `run_websocket_proxy` monomorphization
+                    // is not a third inline copy of the relay's state machine in
+                    // the spawned session future (which is built on the caller's
+                    // stack before `tokio::spawn` moves it to the heap). One
+                    // allocation per WebSocket SESSION, not per frame.
                     #[cfg(unix)]
                     WsBackendHandshake::Unix(handshake) => {
                         let handshake = *handshake;
-                        run_websocket_proxy(
+                        Box::pin(run_websocket_proxy(
                             client_io,
                             handshake.stream,
                             &proxy_id,
@@ -13164,7 +13178,7 @@ async fn handle_websocket_request_authenticated(
                             Arc::clone(&state.overload),
                             ws_fragment_policy,
                             &adaptive_buf,
-                        )
+                        ))
                         .await
                     }
                 };
@@ -37135,7 +37149,26 @@ async fn proxy_to_backend(
             )
             .await
         } else {
-            proxy_to_backend_unix(
+            // BOXED ON PURPOSE — this is a stack-budget invariant, not a style
+            // choice (issue #3764).
+            //
+            // `proxy_to_backend` is awaited inline by `handle_proxy_request_inner`,
+            // which is THE generic request future: every HTTP request the gateway
+            // serves is polled through it, and its size is the union of every
+            // dispatch branch reachable from it. A `mesh.unix_socket` sidecar
+            // ingress is a rare branch, but its dispatch future is large — it now
+            // stores a pooled checkout (admission gate + `connect(2)` + hyper h1
+            // handshake), a second FRESH checkout for the idle-race replay, the
+            // request/response parts, and the body plumbing. Left inline it
+            // enlarges the generic future for every request on every listener,
+            // and unoptimized builds (the coverage profile) materialize that
+            // future through stack temporaries — which is how a plain non-mesh
+            // request overflowed a tokio worker stack.
+            //
+            // One `Box::pin` per Unix-socket dispatch is charged to the branch
+            // that needs it, off the shared hot path. Do not unwrap it back
+            // inline without re-measuring the generic future's size.
+            Box::pin(proxy_to_backend_unix(
                 state,
                 proxy,
                 upstream_target,
@@ -37155,7 +37188,7 @@ async fn proxy_to_backend(
                 ctx_bytes_sent_observed,
                 effective_max_request_body_size_bytes,
                 effective_max_response_body_size_bytes,
-            )
+            ))
             .await
         };
         return BackendDispatchResult::Response {
@@ -42542,13 +42575,20 @@ async fn proxy_to_backend_mesh_mtls(
         // of this dispatch keeps using `proxy`, so the shared mesh-mTLS body is
         // unchanged for non-Unix targets.
         let unix_conn_proxy = resolve_backend_connection_proxy_for_target(proxy, Some(target));
-        let dial = state.unix_backend_pool.checkout_h2c(
+        // Boxed for the same stack-budget reason as the Unix dispatch in
+        // `proxy_to_backend` (issue #3764): `proxy_to_backend_mesh_mtls` is
+        // awaited inline from THREE sites reachable from the generic
+        // `handle_proxy_request_inner` future, so this pooled checkout (creation
+        // lock + admission gate + `connect(2)` + h2c handshake) would be stored
+        // inline three times over in the future every request is polled through.
+        // One allocation, only on the Unix h2c branch.
+        let dial = Box::pin(state.unix_backend_pool.checkout_h2c(
             unix_conn_proxy.as_ref(),
             socket_path,
             proxy.backend_connect_timeout_ms,
             &state.env_config.mesh_unix_socket_allowed_roots,
             &state.env_config.mesh_unix_socket_allowed_uids,
-        );
+        ));
         // The client's end-to-end RPC deadline caps the dial exactly as it caps
         // the pooled sender acquisition below: a wedged local app must not
         // outlive the deadline the caller already committed to.
