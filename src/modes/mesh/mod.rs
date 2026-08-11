@@ -57,8 +57,8 @@ use crate::modes::mesh::config::{
     MeshEgressUdpDestination, MeshEgressUdpDialEndpoint, MeshExternalUdpEgressRoute,
     MeshInboundTcpRoute, MeshJwtRule, MeshLoadBalancer, MeshLocalityLbSetting,
     MeshOutlierDetection, MeshPolicy, MeshRequestAuthentication, MeshSimpleLb, MeshTelemetryConfig,
-    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope, Resolution,
-    ServiceEntry, ServiceEntryLocation, ServiceTargetPort, destination_rule_exported_to_namespace,
+    MeshTrafficPolicy, MeshTrafficPolicyTls, MtlsMode, PolicyScope, Resolution, ServiceEntry,
+    ServiceEntryLocation, ServiceTargetPort, destination_rule_exported_to_namespace,
     destination_rule_lookup_tier, resolve_target_port, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::native_client::NativeMeshClientConfig;

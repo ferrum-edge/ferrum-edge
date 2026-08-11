@@ -5,9 +5,8 @@ use serde_json::Value;
 use crate::modes::mesh::config::{
     MAX_MESH_EXT_AUTHZ_PROVIDERS, MESH_EXT_AUTHZ_DEFAULT_TIMEOUT_MS,
     MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES, MESH_EXT_AUTHZ_MAX_TIMEOUT_MS, MeshExtAuthzBodyCheck,
-    MeshExtAuthzHeader, MeshExtAuthzProvider, TracingProvider,
-    sanitize_mesh_ext_authz_diagnostic, validate_mesh_ext_authz_forwarded_header,
-    validate_mesh_ext_authz_mutable_header,
+    MeshExtAuthzHeader, MeshExtAuthzProvider, TracingProvider, sanitize_mesh_ext_authz_diagnostic,
+    validate_mesh_ext_authz_forwarded_header, validate_mesh_ext_authz_mutable_header,
 };
 
 use super::{
@@ -592,7 +591,9 @@ fn ext_authz_header_list(
         return Ok(Vec::new());
     };
     let entries = value.as_array().ok_or_else(|| {
-        format!("meshConfig.extensionProviders '{display}' envoyExtAuthzHttp {field} must be an array")
+        format!(
+            "meshConfig.extensionProviders '{display}' envoyExtAuthzHttp {field} must be an array"
+        )
     })?;
     let mut names = Vec::with_capacity(entries.len());
     for entry in entries {

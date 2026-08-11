@@ -1616,7 +1616,9 @@ fn reverse_translate(
 /// Diagnostics are field/name-shaped and bounded by
 /// `sanitize_mesh_ext_authz_diagnostic`; a carrier-supplied value is never
 /// echoed unbounded.
-fn validate_recovered_ext_authz_binding(slice: &crate::modes::mesh::slice::MeshSlice) -> Result<(), String> {
+fn validate_recovered_ext_authz_binding(
+    slice: &crate::modes::mesh::slice::MeshSlice,
+) -> Result<(), String> {
     use crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic;
 
     for policy in &slice.mesh_policies {
@@ -1782,10 +1784,7 @@ fn validate_waypoint_gateway_class_carrier(
                         matches!(attachment, PolicyTargetAttachment::GatewayClass { .. })
                     })
         );
-        let enforces = policy
-            .rules
-            .iter()
-            .any(|rule| rule.action.is_enforcing());
+        let enforces = policy.rules.iter().any(|rule| rule.action.is_enforcing());
         targets_gateway_class && enforces
     });
 
@@ -5004,8 +5003,7 @@ mod tests {
             .try_build_mesh_slice(&test_config())
             .expect_err("an incoherent recovery must NACK and retain last-good");
         assert!(
-            error.contains("sample-ext-authz")
-                && error.contains("does not declare"),
+            error.contains("sample-ext-authz") && error.contains("does not declare"),
             "the diagnostic must name the unbound provider: {error}"
         );
     }

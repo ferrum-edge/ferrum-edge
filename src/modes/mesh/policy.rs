@@ -268,9 +268,7 @@ where
                     // assign to it.
                     match custom.take() {
                         // Same provider: Istio coalesces these into ONE check.
-                        Some(existing) if existing.provider == *provider => {
-                            custom = Some(existing)
-                        }
+                        Some(existing) if existing.provider == *provider => custom = Some(existing),
                         // A second, DIFFERENT provider. Istio permits at most
                         // one extension provider per workload, so there is no
                         // correct winner — refuse rather than let iteration

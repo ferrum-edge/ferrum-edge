@@ -382,7 +382,9 @@ impl PreparedProvider {
             timeout: Duration::from_millis(provider.timeout_ms),
             fail_open: provider.fail_open,
             status_on_error: provider.status_on_error,
-            include_request_headers: parse_header_names(&provider.include_request_headers_in_check)?,
+            include_request_headers: parse_header_names(
+                &provider.include_request_headers_in_check,
+            )?,
             additional_headers: provider
                 .include_additional_headers_in_check
                 .iter()
@@ -902,7 +904,10 @@ mod tests {
         let prepared = PreparedProvider::build(&source).expect("provider prepares");
         let headers = HashMap::new();
         assert_eq!(
-            resolve_check_body(&prepared, &body_request(&headers, Some(b"0123456789"), false)),
+            resolve_check_body(
+                &prepared,
+                &body_request(&headers, Some(b"0123456789"), false)
+            ),
             Err(MeshExtAuthzReason::BodyTooLarge)
         );
     }

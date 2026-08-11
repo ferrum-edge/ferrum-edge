@@ -286,7 +286,10 @@ fn resolve_custom_action_provider(
     }
     let display = sanitize_mesh_ext_authz_diagnostic(name);
     let root_namespace = &acc.options.istio_root_namespace;
-    if acc.mesh_config_registry.is_unsupported_ext_authz_provider(name) {
+    if acc
+        .mesh_config_registry
+        .is_unsupported_ext_authz_provider(name)
+    {
         return Err(invalid_resource(
             object,
             format!(

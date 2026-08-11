@@ -732,7 +732,10 @@ pub fn validate_mesh_ext_authz_service_host(service: &str) -> Result<(), String>
         byte.is_ascii_whitespace()
             || byte.is_ascii_control()
             || !byte.is_ascii()
-            || matches!(byte, b'@' | b'?' | b'#' | b'\\' | b'%' | b'"' | b'\'' | b'<' | b'>')
+            || matches!(
+                byte,
+                b'@' | b'?' | b'#' | b'\\' | b'%' | b'"' | b'\'' | b'<' | b'>'
+            )
     }) {
         return Err(
             "service must be a bare host with no userinfo, query, fragment, escape, or path \
@@ -4872,7 +4875,11 @@ impl MeshConfig {
             &mut errors,
         );
         validate_virtual_service_cors_policies(&self.virtual_service_cors_policies, &mut errors);
-        validate_mesh_ext_authz_binding(&self.mesh_policies, &self.ext_authz_providers, &mut errors);
+        validate_mesh_ext_authz_binding(
+            &self.mesh_policies,
+            &self.ext_authz_providers,
+            &mut errors,
+        );
         errors
     }
 

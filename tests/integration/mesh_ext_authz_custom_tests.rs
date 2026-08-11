@@ -425,8 +425,9 @@ async fn start_status_stub(status: u16) -> Stub {
                 if let Ok(mut slot) = request.lock() {
                     *slot = String::from_utf8_lossy(&buffer[..read]).to_string();
                 }
-                let response =
-                    format!("HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
             });
@@ -458,7 +459,10 @@ async fn a_two_hundred_and_four_is_a_denial_not_an_allow() {
     let executor = executor(vec![provider(stub.port)]);
     match check(&executor, "sample-ext-authz", &request_headers()).await {
         MeshExtAuthzOutcome::Deny { status, reason, .. } => {
-            assert_eq!(status, 204, "an explicit denial keeps the provider's status");
+            assert_eq!(
+                status, 204,
+                "an explicit denial keeps the provider's status"
+            );
             assert_eq!(reason, MeshExtAuthzReason::DeniedByProvider);
         }
         other => panic!("a non-200 success must never be read as an allow, got {other:?}"),
@@ -477,7 +481,9 @@ async fn a_four_hundred_and_three_is_an_explicit_denial_not_a_failed_check() {
             assert_eq!(status, 403);
             assert_eq!(reason, MeshExtAuthzReason::DeniedByProvider);
         }
-        other => panic!("failOpen must not convert an explicit 4xx denial into an allow: {other:?}"),
+        other => {
+            panic!("failOpen must not convert an explicit 4xx denial into an allow: {other:?}")
+        }
     }
 }
 
@@ -546,9 +552,7 @@ async fn a_fixed_check_header_overrides_a_same_named_client_header() {
         "an attacker-controlled value must not survive beside the fixed one: {seen}"
     );
     assert_eq!(
-        seen.to_ascii_lowercase()
-            .matches("x-request-id:")
-            .count(),
+        seen.to_ascii_lowercase().matches("x-request-id:").count(),
         1,
         "exactly one value is sent for the name: {seen}"
     );
@@ -691,7 +695,9 @@ mod live_datapath {
             PluginResult::Continue
         ));
         assert_eq!(
-            ctx.metadata.get("mesh_authz.ext_authz_outcome").map(String::as_str),
+            ctx.metadata
+                .get("mesh_authz.ext_authz_outcome")
+                .map(String::as_str),
             Some("allowed")
         );
         assert_eq!(stub.calls.load(Ordering::SeqCst), 1);
@@ -703,7 +709,9 @@ mod live_datapath {
         let plugin = plugin(slice_json(stub.port, None, false)).expect("generation builds");
         let mut ctx = ctx("/admin/reports");
         match plugin.authorize(&mut ctx).await {
-            PluginResult::Reject { status_code, body, .. } => {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
                 assert_eq!(status_code, 401, "the provider's own status is preserved");
                 assert!(
                     !body.contains("denied!"),
@@ -713,7 +721,9 @@ mod live_datapath {
             other => panic!("expected a rejection, got {other:?}"),
         }
         assert_eq!(
-            ctx.metadata.get("mesh_authz.deny_policy").map(String::as_str),
+            ctx.metadata
+                .get("mesh_authz.deny_policy")
+                .map(String::as_str),
             Some("custom:delegate-admin")
         );
     }
@@ -744,7 +754,9 @@ mod live_datapath {
             "a 5xx is a failed check and failOpen is the operator's opt-in"
         );
         assert_eq!(
-            ctx.metadata.get("mesh_authz.ext_authz_outcome").map(String::as_str),
+            ctx.metadata
+                .get("mesh_authz.ext_authz_outcome")
+                .map(String::as_str),
             Some("provider_error")
         );
     }
@@ -772,7 +784,9 @@ mod live_datapath {
             other => panic!("an unexecutable delegation must deny, got {other:?}"),
         }
         assert_eq!(
-            ctx.metadata.get("mesh_authz.ext_authz_outcome").map(String::as_str),
+            ctx.metadata
+                .get("mesh_authz.ext_authz_outcome")
+                .map(String::as_str),
             Some("provider_unbound"),
             "the refusal participates in the fixed-cardinality outcome set"
         );

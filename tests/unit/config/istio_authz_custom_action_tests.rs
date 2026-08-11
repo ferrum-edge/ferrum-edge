@@ -189,8 +189,11 @@ extensionProviders:
     scheme: https
 "#,
     );
-    let mesh = translate(&[config_map, custom_policy(json!({ "name": "sample-ext-authz" }))])
-        .expect("translation succeeds");
+    let mesh = translate(&[
+        config_map,
+        custom_policy(json!({ "name": "sample-ext-authz" })),
+    ])
+    .expect("translation succeeds");
 
     assert_eq!(
         mesh.ext_authz_providers.len(),
@@ -275,8 +278,11 @@ extensionProviders:
     port: 9000
 "#,
     );
-    let error = translate(&[config_map, custom_policy(json!({ "name": "grpc-ext-authz" }))])
-        .expect_err("the gRPC check API is not implementable here and must fail closed");
+    let error = translate(&[
+        config_map,
+        custom_policy(json!({ "name": "grpc-ext-authz" })),
+    ])
+    .expect_err("the gRPC check API is not implementable here and must fail closed");
     assert!(
         error.contains("does not implement"),
         "an unsupported provider VARIANT must be reported as such, not as 'not declared', \
@@ -325,10 +331,7 @@ fn custom_action_without_rules_is_refused() {
     );
     let error = translate(&[ext_authz_config_map(), policy])
         .expect_err("a CUSTOM policy with no rules has no matching surface");
-    assert!(
-        error.contains("requires at least one rule"),
-        "got: {error}"
-    );
+    assert!(error.contains("requires at least one rule"), "got: {error}");
 }
 
 #[test]
@@ -344,10 +347,12 @@ fn a_provider_block_on_a_non_custom_action_is_refused() {
             "rules": [{}],
         }),
     );
-    let error = translate(&[ext_authz_config_map(), policy]).expect_err(
-        "a provider on an ALLOW policy would read as a delegation that never happens",
+    let error = translate(&[ext_authz_config_map(), policy])
+        .expect_err("a provider on an ALLOW policy would read as a delegation that never happens");
+    assert!(
+        error.contains("only valid with action CUSTOM"),
+        "got: {error}"
     );
-    assert!(error.contains("only valid with action CUSTOM"), "got: {error}");
 }
 
 // ── Provider admission: unrepresentable options fail closed ───────────────
@@ -406,10 +411,7 @@ extensionProviders:
 "#,
     )
     .expect_err("a field Ferrum does not model changes what the check authorizes");
-    assert!(
-        error.contains("does not support field"),
-        "got: {error}"
-    );
+    assert!(error.contains("does not support field"), "got: {error}");
 }
 
 #[test]
@@ -659,7 +661,10 @@ fn a_custom_rule_does_not_raise_the_allow_implicit_deny_floor() {
         &["/admin/*"],
     )];
     let evaluation = evaluate_mesh_authorization_full(policies.iter(), &http_request("/public"));
-    assert!(evaluation.custom.is_none(), "the rule does not match /public");
+    assert!(
+        evaluation.custom.is_none(),
+        "the rule does not match /public"
+    );
     assert_eq!(
         evaluation.decision,
         MeshAuthzDecision::Allow,
@@ -958,7 +963,14 @@ fn status_on_error_accepts_the_integer_compatibility_form() {
 
 #[test]
 fn status_on_error_outside_4xx_5xx_or_non_numeric_is_refused() {
-    for value in ["\"200\"", "200", "\"Forbidden\"", "\"40x\"", "403.5", "\"\""] {
+    for value in [
+        "\"200\"",
+        "200",
+        "\"Forbidden\"",
+        "\"40x\"",
+        "403.5",
+        "\"\"",
+    ] {
         let error = translate(&[
             config_map_with(value),
             custom_policy(json!({ "name": "sample-ext-authz" })),
@@ -1057,7 +1069,10 @@ fn hostile_provider_path_prefixes_are_refused_at_admission() {
     }
     let mut provider = provider("p");
     provider.path_prefix = Some("/check/v1".to_string());
-    assert!(provider.validate().is_ok(), "an ordinary path prefix is fine");
+    assert!(
+        provider.validate().is_ok(),
+        "an ordinary path prefix is fine"
+    );
 }
 
 // ── Fixed check headers are authoritative ─────────────────────────────────

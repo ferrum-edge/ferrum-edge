@@ -1492,23 +1492,22 @@ impl MeshAuthz {
         // here so the per-request buffering predicate is a bounded scan of the
         // (usually empty) body-inspecting subset rather than a scan of every
         // policy.
-        let body_inspecting_custom_rules: Vec<crate::modes::mesh::config::MeshRule> = match ext_authz
-            .as_ref()
-        {
-            Some(executor) if executor.requires_request_body() => slice
-                .mesh_policies
-                .iter()
-                .chain(relay_policy_superset.iter())
-                .flat_map(|policy| policy.rules.iter())
-                .filter(|rule| {
-                    rule.action
-                        .custom_provider()
-                        .is_some_and(|provider| executor.provider_requires_request_body(provider))
-                })
-                .cloned()
-                .collect(),
-            _ => Vec::new(),
-        };
+        let body_inspecting_custom_rules: Vec<crate::modes::mesh::config::MeshRule> =
+            match ext_authz.as_ref() {
+                Some(executor) if executor.requires_request_body() => slice
+                    .mesh_policies
+                    .iter()
+                    .chain(relay_policy_superset.iter())
+                    .flat_map(|policy| policy.rules.iter())
+                    .filter(|rule| {
+                        rule.action.custom_provider().is_some_and(|provider| {
+                            executor.provider_requires_request_body(provider)
+                        })
+                    })
+                    .cloned()
+                    .collect(),
+                _ => Vec::new(),
+            };
 
         Ok(Self {
             slice,
