@@ -2240,6 +2240,49 @@ fn streaming_deadline_wraps_client_visible_body_after_inspection() {
 }
 
 #[test]
+fn unix_h1_keep_alive_forces_in_dispatch_buffering_for_content_length() {
+    // #3731: mesh ingress streams by default; a Content-Length response must
+    // still check in inside proxy_to_backend_unix when keep-alive is on, so a
+    // frontend Connection: close cannot retire a reusable carrier.
+    let source = include_str!("../../../src/proxy/mod.rs");
+    let marker = "Known-length responses\n    // therefore buffer and check in inside this function whenever";
+    assert!(
+        source.contains(marker)
+            || source.contains(
+                "therefore buffer and check in inside this function whenever keep-alive"
+            ),
+        "unix dispatch must document the Content-Length keep-alive buffering rule"
+    );
+    assert!(
+        source.contains("content_length.is_some() && checkout.keep_alive()"),
+        "unix dispatch must force stream_response=false for Content-Length + keep-alive"
+    );
+}
+
+#[test]
+fn direct_h2_body_size_hint_does_not_leak_incoming_exact_length() {
+    // Streaming framing strips Content-Length and passes content_length=None
+    // into DirectH2Body. Falling through to Incoming's exact hint would let
+    // hyper reconstruct Content-Length and finish without Ready(None).
+    let source = include_str!("../../../src/proxy/body.rs");
+    let arm = source
+        .split("struct DirectH2Body {")
+        .nth(1)
+        .expect("DirectH2Body")
+        .split("/// Wraps a streaming HTTP/2 response body with a per-frame idle read deadline.")
+        .next()
+        .expect("DirectH2Body impl bound");
+    assert!(
+        arm.contains("content_length_hint(self.content_length)"),
+        "DirectH2Body::size_hint must use content_length_hint only"
+    );
+    assert!(
+        !arm.contains("self.inner.size_hint()"),
+        "DirectH2Body::size_hint must not fall through to Incoming's exact hint"
+    );
+}
+
+#[test]
 fn generic_retry_backoff_uses_request_aware_grpc_deadline_response() {
     let source = include_str!("../../../src/proxy/mod.rs");
     let retry_loop = source

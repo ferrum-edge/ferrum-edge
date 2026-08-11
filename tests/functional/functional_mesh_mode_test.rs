@@ -15440,8 +15440,11 @@ async fn functional_mesh_sidecar_ingress_unix_socket_serves_live_traffic() {
     // SUBSTANTIALLY fewer physical backend connections than requests. Both
     // response shapes are exercised, because they take different pooling paths:
     //
-    //   * `/` answers with `Content-Length`, so the gateway buffers and the
-    //     lease is checked in inside the dispatch function;
+    //   * `/` answers with `Content-Length`. Mesh ingress streams by default,
+    //     so the Unix dispatch forces in-dispatch buffering for known-length
+    //     keep-alive responses and checks the lease in before returning to the
+    //     client-facing writer (a frontend `Connection: close` must not retire
+    //     a still-reusable carrier);
     //   * `/stream` answers CHUNKED with no `Content-Length`, so the gateway
     //     streams and the lease rides the response body, returning only on the
     //     body's clean end-of-stream.

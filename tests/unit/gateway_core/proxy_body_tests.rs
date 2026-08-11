@@ -5,7 +5,9 @@
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     DirectH2UploadGateForTest, UploadCancelSignalForTest, direct_h2_upload_gate_for_test,
-    poll_upload_cancel_for_test, proxy_body_streaming_for_test, request_body_drop_outcome_for_test,
+    poll_upload_cancel_for_test, proxy_body_streaming_for_test,
+    proxy_body_with_success_on_drop_after_response_bytes_for_test,
+    request_body_drop_outcome_for_test,
 };
 use ferrum_edge::proxy::body::{
     PooledBackendLease, ProxyBody, ProxyBodyError, RequestBodyOutcome, StreamingMetrics,
@@ -749,4 +751,32 @@ async fn pooled_backend_lease_is_retired_when_the_body_is_never_polled() {
         "a never-polled streaming body must not return its carrier"
     );
     assert_eq!(outcome.dropped(), 1);
+}
+
+#[tokio::test]
+async fn pooled_backend_lease_is_released_on_drop_after_declared_bytes() {
+    // Hyper can finish a known-length H1 write without polling Ready(None).
+    // When the streamed byte count matches the declared length, Drop must
+    // still return the Unix pool carrier rather than retiring it (#3731).
+    let outcome = Arc::new(LeaseOutcome::default());
+    let mut body = proxy_body_with_success_on_drop_after_response_bytes_for_test(
+        leased_scripted_body(2, false, &outcome),
+        Some(10),
+    );
+
+    for _ in 0..2 {
+        let frame = poll_once(&mut body)
+            .await
+            .expect("scripted body still has data")
+            .expect("scripted body must not error");
+        assert!(frame.data_ref().is_some());
+    }
+    assert_eq!(outcome.released(), 0, "lease stays held until Drop");
+
+    drop(body);
+    assert_eq!(
+        outcome.released(),
+        1,
+        "a drop after the declared byte count must return the carrier"
+    );
 }

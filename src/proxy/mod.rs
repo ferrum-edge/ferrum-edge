@@ -42080,6 +42080,22 @@ async fn proxy_to_backend_unix(
         status,
         &resp_headers,
     );
+    // Mesh ingress defaults to `ResponseBodyMode::Stream`. A Content-Length
+    // response would otherwise ride the EOF-anchored streaming lease, returned
+    // only from `ProxyBody`'s clean `Ready(None)`. An HTTP/1.1 frontend that
+    // closes after writing the response (client `Connection: close` — ordinary
+    // for functional tests and many production clients) can drop that body
+    // without the terminal poll, which retires the exclusive carrier and forces
+    // one dial per request (#3731 hosted data-plane evidence: 12 sequential
+    // buffered requests over 12 physical connections). Known-length responses
+    // therefore buffer and check in inside this function whenever keep-alive
+    // reuse is enabled — the path the keep-alive assertion expects — while
+    // chunked / unknown-length bodies keep the streaming lease.
+    let stream_response = if content_length.is_some() && checkout.keep_alive() {
+        false
+    } else {
+        stream_response
+    };
 
     if stream_response {
         // A streaming response hands the body out of this function, so this

@@ -1394,12 +1394,14 @@ impl http_body::Body for ProxyBody {
 }
 
 impl Drop for ProxyBody {
-    /// Note on `pooled_backend_lease` (issue #3731): this `Drop` deliberately
-    /// does NOT release it. If the field is still populated here, the body
-    /// never reached a clean `Ready(None)` — client disconnect, hyper
-    /// abandoning the stream, a shutdown cancel, or a response hyper chose not
-    /// to poll at all — so the exclusive HTTP/1.1 carrier is in an unknown
-    /// framing state. Letting the field drop with the struct retires it.
+    /// Note on `pooled_backend_lease` (issue #3731): a mid-stream abandon leaves
+    /// the exclusive HTTP/1.1 carrier in an unknown framing state, so the
+    /// default is to drop the lease and retire the connection. Two proven
+    /// completions are safe to return even when hyper never polled
+    /// `Ready(None)`: a declared-length body whose streamed byte count matches
+    /// (`success_on_drop_after_bytes`), and an inner body that already reports
+    /// `is_end_stream()` after at least one poll (hyper finished a known-length
+    /// write without the terminal frame).
     fn drop(&mut self) {
         let mut deferred_admission_error_class = None;
         let mut deferred_admission_client_disconnected = false;
@@ -1520,6 +1522,20 @@ impl Drop for ProxyBody {
             deferred_admission_error_class,
             deferred_admission_client_disconnected,
         );
+        if let Some(lease) = self.pooled_backend_lease.take() {
+            let bytes = self.bytes_streamed.load(Ordering::Relaxed);
+            let completed_declared_bytes = self
+                .success_on_drop_after_bytes
+                .is_some_and(|expected| bytes == expected);
+            // Safe completions without `Ready(None)`: declared-length match, or
+            // an already-ended inner body after hyper started polling it.
+            let backend_complete = !client_deadline_fired
+                && (completed_declared_bytes
+                    || (self.polled.load(Ordering::Relaxed) && self.is_end_stream()));
+            if backend_complete {
+                lease.release_on_clean_eof();
+            }
+        }
     }
 }
 
@@ -3026,9 +3042,12 @@ impl http_body::Body for DirectH2Body {
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
-        self.content_length
-            .map(http_body::SizeHint::with_exact)
-            .unwrap_or_else(|| self.inner.size_hint())
+        // Honor only the gateway's advertised length. Falling through to
+        // `Incoming`'s exact hint when `content_length` is `None` would re-arm
+        // a wire `Content-Length` after Streaming framing stripped it, and let
+        // hyper finish an H1 response without polling `Ready(None)` — the
+        // terminal the Unix pool lease is returned from (#3731).
+        content_length_hint(self.content_length)
     }
 }
 
