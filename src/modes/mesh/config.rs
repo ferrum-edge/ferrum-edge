@@ -3742,12 +3742,14 @@ pub struct MeshConfig {
     /// outbound registry / egress scope must not widen to the local service).
     #[serde(skip)]
     pub local_inbound_services: Option<Vec<MeshService>>,
-    /// Runtime-only back-projection of the slice's resolved Sidecar `ingress[]`
-    /// custom inbound listeners (`MeshSlice.local_ingress_listeners`), set by
-    /// mesh preparation. The router's INBOUND per-port sibling grouping and the
-    /// listen-path uniqueness exemption read this (via
-    /// `mesh_ingress_listener_groups`) so they see the same listeners
-    /// `materialize_sidecar_inbound_proxies` materialized. `serde(skip)`: never
+    /// Runtime-only projection of the slice's resolved Sidecar `ingress[]`
+    /// custom inbound listeners after cold-path admission
+    /// (`admit_sidecar_ingress_listeners` via `materialize_sidecar_ingress_listener_proxies`).
+    /// The router's INBOUND per-port sibling grouping, listen-path uniqueness
+    /// exemption, and authenticated CONNECT remap all read this so they see
+    /// the same surviving set the materializer emitted — including dedicated-bind
+    /// conflict rejection (issue #3266), which removes the whole entry rather
+    /// than silently degrading to shared capture / CONNECT. `serde(skip)`: never
     /// operator-settable, never serialized.
     #[serde(skip)]
     pub local_ingress_listeners: Vec<ResolvedIngressListener>,
@@ -3938,8 +3940,8 @@ impl MeshConfig {
     ///    is not permission to remap a sibling replica's (or a bare loopback)
     ///    destination onto our application.
     /// 4. Malformed endpoint / unmodeled protocol / zero port, or a missing
-    ///    owner stamp ⇒ `Deny` (same pair of guards the back-projection
-    ///    chokepoint and the materializer apply).
+    ///    owner stamp ⇒ `Deny` (same admission guards the materializer applies
+    ///    before writing this prepared `local_ingress_listeners` set).
     /// 5. Not stream-family ⇒ `Deny`. An HTTP-family listener is served by its
     ///    materialized `__mesh-ingress-*` HTTP route; a bare byte-stream CONNECT
     ///    naming it is outside the declared contract and is refused rather than
