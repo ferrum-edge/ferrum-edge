@@ -153,6 +153,17 @@ pub enum UnixBackendError {
     /// as the caller's own deadline allows — which is forever when the client
     /// supplied no gRPC deadline and no backend read timeout is configured.
     H2HandshakeTimeout { timeout_ms: u64 },
+    /// The RFC 6455 upgrade exchange timed out after the admitted Unix connect
+    /// succeeded and `client_async_with_config` had already written and flushed
+    /// the backend upgrade request (issue #3764).
+    ///
+    /// Post-wire by construction: the application may have received the upgrade.
+    /// Must NOT be classified as [`Self::ConnectTimeout`] — that class is
+    /// pre-wire / replay-safe under `retry_on_connect_failure`, and replaying
+    /// an upgrade the peer may already have seen violates the same conservative
+    /// reached-wire boundary used for direct tungstenite IO failures and
+    /// non-101 handshake responses.
+    WebSocketHandshakeTimeout { timeout_ms: u64 },
     /// The pool has been latched closed by graceful shutdown
     /// (`UnixBackendConnectionPool::shutdown_drain`), so this checkout may not
     /// establish or hand out a Unix backend connection (issue #3764).
@@ -215,6 +226,10 @@ impl std::fmt::Display for UnixBackendError {
                 f,
                 "unix backend h2c handshake timed out after {timeout_ms}ms"
             ),
+            Self::WebSocketHandshakeTimeout { timeout_ms } => write!(
+                f,
+                "unix backend websocket upgrade timed out after {timeout_ms}ms"
+            ),
             Self::BackendConnectionLimit(limit) => {
                 write!(f, "unix ingress connection bound reached: {limit}")
             }
@@ -246,9 +261,13 @@ impl std::error::Error for UnixBackendError {
 impl UnixBackendError {
     /// Retry/circuit-breaker classification.
     ///
-    /// Every variant happens strictly BEFORE any request byte reaches the app,
-    /// so `request_reached_wire` is false for all of them and a replay is safe.
-    /// They differ in whether they are EVIDENCE about the backend:
+    /// Most variants happen strictly BEFORE any application request byte is
+    /// written, so `request_reached_wire` is false and a connect-failure replay
+    /// is safe. The exception is [`Self::WebSocketHandshakeTimeout`]: the RFC
+    /// 6455 upgrade request is flushed before the 101 wait, so a timeout there
+    /// is post-wire and must not satisfy `retry_on_connect_failure`.
+    ///
+    /// Pre-wire variants differ in whether they are EVIDENCE about the backend:
     ///
     /// * an inadmissible path (or a platform with no Unix sockets) is a
     ///   terminal gateway-side policy decision — replaying it anywhere would
@@ -274,7 +293,11 @@ impl UnixBackendError {
     /// * a shutdown refusal is likewise gateway-side and health-neutral, and it
     ///   is deliberately NOT retried: every Unix target in this process shares
     ///   the one latched pool, so a replay could only repeat the same refusal
-    ///   while the process is trying to exit.
+    ///   while the process is trying to exit;
+    /// * a WebSocket upgrade-response timeout is POST-wire
+    ///   ([`crate::retry::ErrorClass::ReadWriteTimeout`]): the upgrade request
+    ///   may already have reached the application, matching the conservative
+    ///   boundary used for tungstenite IO and non-101 handshake responses.
     pub fn error_class(&self) -> crate::retry::ErrorClass {
         match self {
             Self::BackendConnectionLimit(_) => crate::retry::ErrorClass::BackendConnectionLimit,
@@ -295,6 +318,8 @@ impl UnixBackendError {
                 crate::retry::ErrorClass::ConnectionPoolError
             }
             Self::H2HandshakeTimeout { .. } => crate::retry::ErrorClass::ConnectionTimeout,
+            // Upgrade request already flushed — reached-wire; not connect-retryable.
+            Self::WebSocketHandshakeTimeout { .. } => crate::retry::ErrorClass::ReadWriteTimeout,
         }
     }
 }

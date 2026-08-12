@@ -486,3 +486,123 @@ async fn an_unchanged_candidate_does_not_advance_the_generation() {
         "a quiet poll must leave the pool alone"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Effective keep-alive / reuse is part of the reusable live-identity set.
+// ---------------------------------------------------------------------------
+
+fn config_with_keep_alive(
+    socket_path: &str,
+    h2c: bool,
+    stamp: DateTime<Utc>,
+    pool_enable_http_keep_alive: Option<bool>,
+) -> GatewayConfig {
+    let mut config = config_with(socket_path, h2c, stamp);
+    config.proxies[0].pool_enable_http_keep_alive = pool_enable_http_keep_alive;
+    config
+}
+
+fn config_with_h1_and_h2c(
+    h1_path: &str,
+    h2c_path: &str,
+    stamp: DateTime<Utc>,
+    pool_enable_http_keep_alive: Option<bool>,
+) -> GatewayConfig {
+    let mut config = config_with(h1_path, false, stamp);
+    config.proxies[0].pool_enable_http_keep_alive = pool_enable_http_keep_alive;
+    config.upstreams[0]
+        .targets
+        .push(unix_target(h2c_path, true));
+    config.normalize_fields();
+    config
+}
+
+/// `collect_live_unix_target_identities` omits H1 when effective reuse is off,
+/// honors per-proxy override over the process-lifetime default, and always
+/// retains declared h2c identities across an H1-only reuse flip.
+#[test]
+fn collect_live_omits_h1_when_effective_keep_alive_is_false() {
+    use ferrum_edge::proxy::collect_live_unix_target_identities;
+    use ferrum_edge::proxy::unix_backend_pool::UnixWireProtocol;
+
+    let stamp = ts(1_700_000_000);
+    let h1 = "/tmp/ferrum-unix-h1.sock";
+    let h2c = "/tmp/ferrum-unix-h2c.sock";
+
+    // Global default false, no per-proxy override → H1 omitted.
+    let from_global = collect_live_unix_target_identities(
+        &config_with_h1_and_h2c(h1, h2c, stamp, None),
+        false,
+    );
+    assert!(
+        from_global
+            .iter()
+            .all(|id| id.protocol == UnixWireProtocol::H2c),
+        "global keep-alive=false must omit H1 from the reusable live set"
+    );
+    assert_eq!(from_global.len(), 1);
+
+    // Global default true, per-proxy false → per-proxy wins, H1 omitted.
+    let from_proxy = collect_live_unix_target_identities(
+        &config_with_h1_and_h2c(h1, h2c, stamp, Some(false)),
+        true,
+    );
+    assert!(
+        from_proxy
+            .iter()
+            .all(|id| id.protocol == UnixWireProtocol::H2c),
+        "per-proxy keep-alive=false must override a true global default"
+    );
+    assert_eq!(from_proxy.len(), 1);
+
+    // Global default false, per-proxy true → H1 retained.
+    let override_on = collect_live_unix_target_identities(
+        &config_with(h1, false, stamp),
+        false,
+    );
+    // The plain helper leaves pool_enable_http_keep_alive = None, so global
+    // false still omits; prove the Some(true) override restores H1.
+    let restored = collect_live_unix_target_identities(
+        &config_with_keep_alive(h1, false, stamp, Some(true)),
+        false,
+    );
+    assert_eq!(
+        override_on.len(),
+        0,
+        "None + global false must omit the H1 identity"
+    );
+    assert_eq!(
+        restored.len(),
+        1,
+        "per-proxy keep-alive=true must restore H1 against a false global default"
+    );
+    assert!(
+        restored.iter().all(|id| id.protocol == UnixWireProtocol::Http1)
+    );
+}
+
+/// Publishing a config that flips the proxy to keep-alive=false retires the
+/// pooled H1 carrier through the production `ProxyState` swap path.
+#[tokio::test]
+async fn update_config_keep_alive_false_retires_pooled_h1_carriers() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let _peer = HoldingPeer::bind(&socket);
+    let stamp = ts(1_700_000_000);
+    let path = socket.to_str().expect("utf-8");
+
+    let state = state_from(config_with(path, false, stamp)).await;
+    pool_one_carrier(&state, &socket, &root).await;
+
+    let later = stamp + Duration::seconds(1);
+    assert_eq!(
+        state.update_config(config_with_keep_alive(path, false, later, Some(false))),
+        ConfigApplyOutcome::Applied
+    );
+    assert_eq!(
+        state.unix_backend_pool.stats().idle_h1_connections,
+        0,
+        "publication must retire idle H1 carriers when effective reuse flips off"
+    );
+}

@@ -6724,10 +6724,11 @@ impl ProxyState {
     ///
     /// Must be called from every successful publication, on both swap paths,
     /// and BEFORE any early return — a withdrawal, a re-pointed socket path, an
-    /// `http` ⇄ `http2` flip, and a deleted proxy/upstream can all arrive
-    /// through `apply_incremental` or through a `update_config` generation that
-    /// carries no `ConfigDelta`, and each of those must retire the carriers the
-    /// published config no longer declares.
+    /// `http` ⇄ `http2` flip, an H1 keep-alive/reuse disable, and a deleted
+    /// proxy/upstream can all arrive through `apply_incremental` or through a
+    /// `update_config` generation that carries no `ConfigDelta`, and each of
+    /// those must retire the carriers the published config no longer declares
+    /// as reusable.
     ///
     /// `published` is the exact request epoch that just became current. The
     /// epoch, not the local candidate, is authoritative: under a concurrent
@@ -6742,7 +6743,10 @@ impl ProxyState {
     fn reconcile_unix_backend_pool(&self, published: &RequestEpoch) {
         self.unix_backend_pool.retain_live_targets_for_publication(
             published.config_generation,
-            &collect_live_unix_target_identities(&published.config),
+            &collect_live_unix_target_identities(
+                &published.config,
+                self.unix_backend_pool.default_http_keep_alive(),
+            ),
         );
     }
 
@@ -14436,8 +14440,15 @@ async fn connect_unix_websocket_backend(
     // budget the admission and connect above already drew on — not by a second
     // full timeout, which would let one establishment consume roughly twice the
     // configured setup budget (issue #3764). An app that accepts the socket but
-    // never answers the upgrade must not pin the request task. A timeout here is
-    // pre-wire from the client's perspective — no 101 was ever sent downstream.
+    // never answers the upgrade must not pin the request task.
+    //
+    // `client_async_with_config` writes and flushes the RFC 6455 upgrade request
+    // BEFORE waiting for the 101 response, so a timeout here is POST-wire: the
+    // application may already have the request. Map it to the dedicated
+    // `WebSocketHandshakeTimeout` class (reached-wire / non-connect-retryable),
+    // never `ConnectTimeout`, which would incorrectly satisfy
+    // `retry_on_connect_failure`. Admission/connect failures above remain
+    // pre-wire; a non-101 handshake response stays post-wire via tungstenite.
     let (stream, response) = match tokio::time::timeout_at(
         deadline,
         client_async_with_config(
@@ -14450,9 +14461,9 @@ async fn connect_unix_websocket_backend(
     {
         Ok(result) => result?,
         Err(_) => {
-            return Err(Box::new(unix_backend::UnixBackendError::ConnectTimeout {
-                timeout_ms,
-            }));
+            return Err(Box::new(
+                unix_backend::UnixBackendError::WebSocketHandshakeTimeout { timeout_ms },
+            ));
         }
     };
 
@@ -41938,14 +41949,25 @@ fn unix_backend_error_response(
     }
 }
 
-/// Every `mesh.unix_socket` target identity a published config declares.
+/// Every `mesh.unix_socket` target identity a published config still declares
+/// as reusable.
 ///
 /// The input to [`unix_backend_pool::UnixBackendConnectionPool::retain_live_targets`]
-/// (issue #3731). Anything pooled whose identity is absent from this set no
-/// longer exists in configuration and must not serve another request: a
-/// withdrawn target, a deleted proxy or upstream, a proxy re-bound to a
-/// different namespace or upstream, a changed `mesh.unix_socket` path, or an
-/// `http` ⇄ `http2` protocol flip.
+/// (issue #3731). Anything pooled whose identity is absent from this set must
+/// not remain reusable: a withdrawn target, a deleted proxy or upstream, a
+/// proxy re-bound to a different namespace or upstream, a changed
+/// `mesh.unix_socket` path, an `http` ⇄ `http2` protocol flip, or an HTTP/1.1
+/// target whose effective keep-alive/reuse setting is now off.
+///
+/// `default_enable_http_keep_alive` is the process-lifetime pool/global default
+/// (`FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE`). Per-proxy
+/// `pool_enable_http_keep_alive` overrides it with the same precedence
+/// checkout/check-in use. An H1 identity whose effective value is false is
+/// omitted so publication synchronously retires resident idle H1 carriers
+/// before reconciliation returns; fresh H1 dials under that policy remain
+/// admitted and are never repooled. h2c identities are always retained when
+/// still declared — an H1-only reuse flip must not retire a healthy h2c
+/// carrier.
 ///
 /// A target whose wire-protocol carrier is missing or malformed is deliberately
 /// OMITTED rather than defaulted: `resolve_unix_socket_target` refuses such a
@@ -41958,6 +41980,7 @@ fn unix_backend_error_response(
 /// request path.
 pub fn collect_live_unix_target_identities(
     config: &GatewayConfig,
+    default_enable_http_keep_alive: bool,
 ) -> std::collections::HashSet<unix_backend_pool::UnixTargetIdentity> {
     use unix_backend_pool::{UnixTargetIdentity, UnixWireProtocol};
 
@@ -41978,6 +42001,11 @@ pub fn collect_live_unix_target_identities(
         let Some(upstream) = upstreams_by_key.get(&(proxy.namespace.as_str(), upstream_id)) else {
             continue;
         };
+        // Same precedence checkout/check-in use: per-proxy override wins over
+        // the process-lifetime pool default.
+        let h1_reuse = proxy
+            .pool_enable_http_keep_alive
+            .unwrap_or(default_enable_http_keep_alive);
         for target in &upstream.targets {
             let Some(path) = target.tags.get(unix_backend::MESH_UNIX_SOCKET_TAG) else {
                 continue;
@@ -41991,6 +42019,12 @@ pub fn collect_live_unix_target_identities(
                 Some("false") => UnixWireProtocol::Http1,
                 _ => continue,
             };
+            // H1 with reuse disabled is still a valid dispatch target, but it
+            // is not a reusable live identity: omit it so publication retires
+            // idle H1 carriers. h2c is unaffected by the keep-alive flag.
+            if protocol == UnixWireProtocol::Http1 && !h1_reuse {
+                continue;
+            }
             live.insert(UnixTargetIdentity {
                 namespace: proxy.namespace.clone(),
                 proxy_id: proxy.id.clone(),

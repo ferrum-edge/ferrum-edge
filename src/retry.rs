@@ -474,15 +474,17 @@ fn classify_typed_chain(
             return Some(dial_err.error_class());
         }
         // `UnixBackendError` is the sidecar-ingress Unix dial/admission error the
-        // WebSocket egress path boxes (issue #3732). Every variant is PRE-WIRE by
-        // construction — admission, connect, and handshake all complete before an
-        // upgrade byte is written — and `error_class()` already encodes which of
-        // them are health-neutral gateway policy rejects (inadmissible path, peer
-        // UID mismatch, socket identity change) versus real evidence about the
-        // app. Match it BEFORE the source walk so a boxed `Connect(io)` is not
-        // re-derived from its io source and a source-less policy reject does not
-        // fall through to the post-wire `RequestError` default and get charged to
-        // backend health. Mirrors the `HbonePoolError` / `MeshMtlsDialError` arms.
+        // WebSocket egress path boxes (issue #3732 / #3764). Most variants are
+        // PRE-WIRE (admission, connect, and protocol setup before an upgrade /
+        // request byte). `WebSocketHandshakeTimeout` is the deliberate exception:
+        // the RFC 6455 upgrade request is flushed before the 101 wait, so
+        // `error_class()` maps it to post-wire `ReadWriteTimeout` and
+        // `retry_on_connect_failure` must not replay it. Match BEFORE the source
+        // walk so a boxed `Connect(io)` is not re-derived from its io source, a
+        // source-less policy reject does not fall through to the post-wire
+        // `RequestError` default, and the upgrade-timeout class is not collapsed
+        // into the substring `"timed out"` → `ConnectionTimeout` fallback.
+        // Mirrors the `HbonePoolError` / `MeshMtlsDialError` arms.
         if let Some(unix_err) = err.downcast_ref::<crate::proxy::unix_backend::UnixBackendError>() {
             return Some(unix_err.error_class());
         }

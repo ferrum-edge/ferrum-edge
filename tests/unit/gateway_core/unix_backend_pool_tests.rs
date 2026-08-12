@@ -3449,3 +3449,166 @@ async fn the_establishment_budget_opens_before_the_idle_sweep() {
     )
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #3764: publication must retire idle H1 carriers when effective
+// keep-alive/reuse flips off, so a full idle set cannot pin the physical cap.
+// ---------------------------------------------------------------------------
+
+/// Wait until retired idle carriers have released their physical-connection
+/// slots (driver futures complete after their senders are dropped).
+async fn wait_for_open_physical(pool: &UnixBackendConnectionPool, expected: u64) {
+    for _ in 0..200 {
+        if pool.stats().open_physical_connections == expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        pool.stats().open_physical_connections,
+        expected,
+        "retired carriers must release their physical-connection slots"
+    );
+}
+
+/// A pool filled to the physical cap under keep-alive=true must retire those
+/// idle H1 carriers when publication omits the identity (effective reuse off).
+/// The next fresh H1 checkout under reuse-disabled policy is admitted rather
+/// than `BackendConnectionLimit`.
+#[tokio::test]
+async fn publishing_keep_alive_false_retires_a_full_idle_set_and_admits_a_fresh_dial() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let cap = 2u32;
+    let pool = bounded_pool(cap);
+    let mut proxy = test_proxy("unix-pool-ka-retire-cap");
+    // Fill under reuse-enabled (default).
+    assert!(proxy.pool_enable_http_keep_alive.is_none());
+
+    for _ in 0..cap {
+        let lease = pool
+            .checkout_h1(
+                &proxy,
+                socket.to_str().expect("utf-8"),
+                proxy.backend_connect_timeout_ms,
+                &roots(&root),
+                &[],
+            )
+            .await
+            .expect("fill under the physical cap");
+        assert!(!lease.reused());
+        pool.checkin_h1(lease);
+    }
+    assert_eq!(pool.stats().idle_h1_connections, cap as u64);
+    assert_eq!(pool.stats().open_physical_connections, cap as u64);
+
+    // Control: with carriers still live, a reuse-disabled miss needs a fresh
+    // dial and must hit the bound.
+    proxy.pool_enable_http_keep_alive = Some(false);
+    let refused = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(UnixBackendError::BackendConnectionLimit(_))),
+        "without publication retirement a full idle set pins every slot"
+    );
+
+    // Publication omits the H1 identity (effective keep-alive/reuse off) —
+    // the shape `collect_live_unix_target_identities` produces.
+    pool.retain_live_targets_for_publication(1, &std::collections::HashSet::new());
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "publication must synchronously retire resident idle H1 carriers"
+    );
+    wait_for_open_physical(&pool, 0).await;
+
+    let admitted = pool
+        .checkout_h1(
+            &proxy,
+            socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("fresh H1 dial under reuse-disabled must be admitted after retirement");
+    assert!(
+        !admitted.reused(),
+        "reuse-disabled checkout must never come from the idle set"
+    );
+    assert!(!admitted.keep_alive());
+    pool.checkin_h1(admitted);
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "reuse-disabled check-in must never repool the carrier"
+    );
+    expect_accepts(
+        &peer,
+        (cap as usize) + 1,
+        "fill dials plus the post-retirement fresh dial",
+    )
+    .await;
+}
+
+/// An H1-only reuse disable must not retire a healthy h2c carrier on a sibling
+/// identity: protocol is part of the live-identity tuple.
+#[tokio::test]
+async fn an_h1_reuse_disable_publication_leaves_a_live_h2c_carrier() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let h1_socket = root.join("h1.sock");
+    let h2c_socket = root.join("h2c.sock");
+    let _h1_peer = HoldingPeer::bind(&h1_socket);
+    let _h2c_peer = SettingsThenClosePeer::bind(&h2c_socket, std::time::Duration::from_secs(30));
+    let pool = default_pool();
+    let proxy = test_proxy("unix-pool-ka-h2c-preserved");
+
+    let h1 = pool
+        .checkout_h1(
+            &proxy,
+            h1_socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("h1 checkout");
+    pool.checkin_h1(h1);
+    let h2c = pool
+        .checkout_h2c(
+            &proxy,
+            h2c_socket.to_str().expect("utf-8"),
+            proxy.backend_connect_timeout_ms,
+            &roots(&root),
+            &[],
+        )
+        .await
+        .expect("h2c checkout");
+    drop(h2c);
+    assert_eq!(pool.stats().idle_h1_connections, 1);
+    assert_eq!(pool.stats().active_h2c_connections, 1);
+
+    // Only the h2c identity remains reusable — H1 keep-alive/reuse off.
+    pool.retain_live_targets(&live_h2c_set(&proxy, &h2c_socket));
+    assert_eq!(
+        pool.stats().idle_h1_connections,
+        0,
+        "H1 must be retired when omitted from the reusable live set"
+    );
+    assert_eq!(
+        pool.stats().active_h2c_connections,
+        1,
+        "an H1-only reuse flip must not retire a continuously-live h2c carrier"
+    );
+}

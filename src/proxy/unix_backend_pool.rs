@@ -113,8 +113,8 @@
 //!
 //! EVERY successfully published request epoch reconciles the pool through
 //! [`UnixBackendConnectionPool::retain_live_targets_for_publication`], with the
-//! exact set of `mesh.unix_socket` target identities THE CONFIG THAT WAS
-//! ACTUALLY PUBLISHED declares. That is all three publication paths —
+//! exact set of reusable `mesh.unix_socket` target identities THE CONFIG THAT
+//! WAS ACTUALLY PUBLISHED declares. That is all three publication paths —
 //! `ProxyState::update_config`'s
 //! initial full rebuild, its incremental delta branch, and
 //! `ProxyState::apply_incremental`'s separate database/CP-DP path — and the
@@ -133,12 +133,15 @@
 //! align on a path segment) and over-retires.
 //!
 //! That covers a withdrawn target, a deleted proxy or upstream, a namespace or
-//! upstream re-binding, a changed socket path, and an `http` ⇄ `http2`
-//! protocol flip. A change to the socket OBJECT (a replaced inode or a new
-//! owner uid) is caught on the checkout path instead, by `admit_and_reconcile`,
-//! because it is invisible to config. The containment allowlist and UID
-//! allowlist are process env (`FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` /
-//! `_ALLOWED_UIDS`) and cannot change without a restart.
+//! upstream re-binding, a changed socket path, an `http` ⇄ `http2`
+//! protocol flip, and an HTTP/1.1 target whose effective keep-alive/reuse
+//! setting flipped off (so idle H1 carriers cannot pin the physical-connection
+//! cap while new traffic must dial fresh). A change to the socket OBJECT (a
+//! replaced inode or a new owner uid) is caught on the checkout path instead,
+//! by `admit_and_reconcile`, because it is invisible to config. The containment
+//! allowlist and UID allowlist are process env
+//! (`FERRUM_MESH_UNIX_SOCKET_ALLOWED_ROOTS` / `_ALLOWED_UIDS`) and cannot change
+//! without a restart.
 //!
 //! ## The withdrawal fence
 //!
@@ -343,9 +346,15 @@
 //! `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` / `Proxy.pool_enable_http_keep_alive` is
 //! honored literally for HTTP/1.1: with it off, a carrier is neither taken from
 //! nor returned to the idle set, so every request gets a freshly admitted
-//! connection. h2c is unaffected — HTTP/2 has no keep-alive negotiation and
-//! stream multiplexing is the transport's defining behavior. See
-//! `UnixBackendConnectionPool::keep_alive_enabled`.
+//! connection. Publication treats the same effective setting as part of the
+//! reusable live-identity set: an H1 target whose keep-alive/reuse is off is
+//! omitted from the published live set so resident idle H1 carriers are
+//! retired synchronously before reconciliation returns — otherwise a full idle
+//! set (defaults: physical cap 64 and idle cap 64) would keep every physical
+//! slot occupied while new traffic must dial fresh and could receive
+//! `BackendConnectionLimit` until idle expiry. h2c is unaffected — HTTP/2 has
+//! no keep-alive negotiation and stream multiplexing is the transport's
+//! defining behavior. See `UnixBackendConnectionPool::keep_alive_enabled`.
 //!
 //! ## Not pooled: WebSocket
 //!
@@ -1909,10 +1918,11 @@ mod imp {
         /// `apply_incremental`), against the config that publication actually
         /// made current. `live` is built from that config, so a withdrawn
         /// target, a deleted proxy or upstream, a re-bound namespace/upstream,
-        /// a changed `mesh.unix_socket` path, and an `http` ⇄ `http2` protocol
-        /// flip all fall out of the set and are retired here — before the next
+        /// a changed `mesh.unix_socket` path, an `http` ⇄ `http2` protocol
+        /// flip, and an HTTP/1.1 target whose effective keep-alive/reuse is now
+        /// off all fall out of the set and are retired here — before the next
         /// request can be handed a carrier that belongs to configuration that
-        /// no longer exists.
+        /// no longer exists as reusable.
         ///
         /// Exact tuple equality on [`UnixTargetIdentity`]; never a substring or
         /// prefix test. One pass over the idle maps per publication, not per
@@ -2088,6 +2098,19 @@ mod imp {
                 crate::runtime_metrics::global_ref()
                     .record_pool_evictions(PoolKind::UnixBackend, retired);
             }
+        }
+
+        /// Process-lifetime HTTP keep-alive / H1 reuse default
+        /// (`FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE`).
+        ///
+        /// Publication collection passes this into
+        /// `collect_live_unix_target_identities` so per-proxy
+        /// `pool_enable_http_keep_alive` can override it with the same
+        /// precedence checkout uses. The global value itself does not change
+        /// across reloads.
+        #[inline]
+        pub fn default_http_keep_alive(&self) -> bool {
+            self.pool_config.enable_http_keep_alive
         }
 
         #[inline]
@@ -3149,15 +3172,24 @@ mod imp {
         pub withdrawal_fenced_checkins: u64,
     }
 
-    pub struct UnixBackendConnectionPool;
+    pub struct UnixBackendConnectionPool {
+        pool_config: PoolConfig,
+    }
 
     impl UnixBackendConnectionPool {
         pub fn new(
-            _pool_config: PoolConfig,
+            pool_config: PoolConfig,
             _shard_amount: usize,
             _max_connections_per_target: u32,
         ) -> Self {
-            Self
+            Self { pool_config }
+        }
+
+        /// Parity with the Unix build: process-lifetime keep-alive / H1 reuse
+        /// default used by publication collection.
+        #[inline]
+        pub fn default_http_keep_alive(&self) -> bool {
+            self.pool_config.enable_http_keep_alive
         }
 
         /// Parity with the Unix build. Nothing is ever dialed here, so no
