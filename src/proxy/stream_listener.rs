@@ -1439,6 +1439,7 @@ impl StreamListenerManager {
     /// generation publish. Production collectors use the same lock through
     /// [`with_current_frontend_dtls_generation`].
     #[doc(hidden)]
+    #[allow(dead_code)] // External integration-test seam is unused by the bin test target.
     pub fn frontend_dtls_publish_lock_for_test(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.frontend_dtls_publish)
     }
@@ -1446,6 +1447,7 @@ impl StreamListenerManager {
     /// Test seam that observes the generation exactly as a newly collected
     /// DTLS server does, under the shared publication fence.
     #[doc(hidden)]
+    #[allow(dead_code)] // External integration-test seam is unused by the bin test target.
     pub async fn collected_frontend_dtls_generation_for_test(&self) -> Option<u64> {
         with_current_frontend_dtls_generation(
             &self.frontend_dtls_publish,
