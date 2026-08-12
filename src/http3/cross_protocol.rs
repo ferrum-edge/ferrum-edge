@@ -1423,10 +1423,14 @@ where
     // Cap lookup AND lane key use the DR policy port (`dispatch_policy_port`),
     // never the dial port — same identity `proxy_to_backend` /
     // `proxy_to_backend_retry` derive via `dispatch_policy_port_for_target`. A
-    // `targetPort`-remapped Service (80 → 8080) otherwise gives the H3 bridge
-    // its own `host|8080|subset` lane while H1/H2 counts in `host|80|subset`,
-    // so a cap of N admits 2N combined, and an explicit
+    // `targetPort`-remapped Service (80 → 8080) otherwise gives the H3→plain
+    // bridge its own dial-port-keyed lane while the H1/reqwest path counts on
+    // the policy port, so a cap of N admits 2N combined, and an explicit
     // `portLevelSettings[{port: 80}]` cap would be invisible here.
+    //
+    // The lane itself is the precomputed logical destination scope (issue
+    // #3778), not the selected endpoint host — matching the H1/reqwest
+    // `http1MaxPendingRequests` gate. Direct H2 does not consume this gate.
     let pending_cap = crate::proxy::resolve_backend_http1_max_pending_requests(
         dispatch_proxy,
         dispatch_policy_port,
@@ -1434,57 +1438,66 @@ where
     .filter(|_| {
         crate::proxy::reqwest_dispatch_is_http1_only(state, dispatch_proxy, current_target)
     });
-    match state.backend_pending_limit.try_acquire_for_subset(
-        effective_host,
-        dispatch_policy_port,
-        dispatch_proxy.upstream_subset.as_deref(),
-        pending_cap,
-    ) {
-        Ok(pending_slot) => Ok(Ok(PlainAttemptDispatch {
-            pending_slot,
-            sni_dial,
-        })),
-        Err(limit) => {
-            warn!(
-                proxy_id = %dispatch_proxy.id,
-                backend_host = %effective_host,
-                backend_port = dispatch_dial_port,
-                in_flight_requests = limit.current,
-                max_in_flight_requests = limit.cap,
-                "Shedding cross-protocol H3→HTTP request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
-            );
-            record_backend_outcome_no_conn_end(
-                state,
-                dispatch_proxy,
-                &epoch.load_balancer,
-                upstream_balancer,
-                current_target,
-                current_cb_target_key,
-                503,
-                false,
-                Some(ErrorClass::DispatchPolicyRejected),
-                cb_is_half_open_probe,
-                false,
-                backend_start.elapsed(),
-            );
-            if halt_request_body_before_reject {
-                crate::http3::stream_util::halt_request_body(stream);
+    let pending_slot = if let Some(cap) = pending_cap {
+        // Direct-backend route overrides clear both their inherited cap and
+        // scope. Do not rebuild a fallback scope on that uncapped hot path.
+        let pending_scope = crate::proxy::pending_limit_scope_for_proxy(dispatch_proxy);
+        match state.backend_pending_limit.try_acquire(
+            pending_scope.as_ref(),
+            dispatch_policy_port,
+            Some(cap),
+        ) {
+            Ok(pending_slot) => pending_slot,
+            Err(limit) => {
+                warn!(
+                    proxy_id = %dispatch_proxy.id,
+                    backend_host = %effective_host,
+                    backend_port = dispatch_dial_port,
+                    pending_policy_port = dispatch_policy_port,
+                    pending_scope_digest = pending_scope.digest(),
+                    in_flight_requests = limit.current,
+                    max_in_flight_requests = limit.cap,
+                    "Shedding cross-protocol H3→HTTP request: DestinationRule http1MaxPendingRequests reached for backend (upstream overflow)"
+                );
+                record_backend_outcome_no_conn_end(
+                    state,
+                    dispatch_proxy,
+                    &epoch.load_balancer,
+                    upstream_balancer,
+                    current_target,
+                    current_cb_target_key,
+                    503,
+                    false,
+                    Some(ErrorClass::DispatchPolicyRejected),
+                    cb_is_half_open_probe,
+                    false,
+                    backend_start.elapsed(),
+                );
+                if halt_request_body_before_reject {
+                    crate::http3::stream_util::halt_request_body(stream);
+                }
+                let mut outcome = write_plain_gateway_error(
+                    stream,
+                    ctx,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"error":"HTTP/1.1 in-flight request limit reached"}"#,
+                    None,
+                    backend_start,
+                    bytes_sent,
+                )
+                .await?;
+                outcome.backend_target = Some(strip_query_from_backend_url(current_url));
+                outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
+                return Ok(Err(outcome));
             }
-            let mut outcome = write_plain_gateway_error(
-                stream,
-                ctx,
-                StatusCode::SERVICE_UNAVAILABLE,
-                r#"{"error":"HTTP/1.1 in-flight request limit reached"}"#,
-                None,
-                backend_start,
-                bytes_sent,
-            )
-            .await?;
-            outcome.backend_target = Some(strip_query_from_backend_url(current_url));
-            outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
-            Ok(Err(outcome))
         }
-    }
+    } else {
+        None
+    };
+    Ok(Ok(PlainAttemptDispatch {
+        pending_slot,
+        sni_dial,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2333,9 +2346,10 @@ where
                     .as_deref()
                     .map(|t| t.port)
                     .unwrap_or(dispatch_proxy.backend_port);
-                // Same DR policy-port identity the H1/H2 path uses, so the
-                // streaming bridge shares one H1 admission lane per destination
-                // instead of opening a dial-port-keyed second one.
+                // Same DR policy-port identity the H1/reqwest path uses, so the
+                // streaming H3→plain bridge shares one H1 admission lane per
+                // destination instead of opening a dial-port-keyed second one.
+                // Direct H2 does not consume this gate.
                 let dispatch_policy_port = crate::proxy::dispatch_policy_port_for_target(
                     dispatch_proxy,
                     current_target.as_deref(),

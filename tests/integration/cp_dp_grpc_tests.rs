@@ -120,6 +120,7 @@ fn create_test_proxy(id: &str, listen_path: &str) -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -213,6 +214,7 @@ fn create_test_mesh_config() -> GatewayConfig {
             }],
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
+            uid: None,
         }],
         ..MeshConfig::default()
     }));
@@ -932,6 +934,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
             },
             MeshService {
                 cluster_ips: Vec::new(),
@@ -945,6 +948,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
                 }],
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
+                uid: None,
             },
         ],
         waypoint_bindings: vec![MeshWaypointBinding {
@@ -3259,6 +3263,8 @@ fn create_test_upstream(id: &str, hosts: &[(&str, u16)]) -> Upstream {
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 

@@ -4895,10 +4895,11 @@ impl RequestContext {
     /// `route_override_upstream_id` changes the effective upstream.
     ///
     /// Use this variant for dispatch paths that might honor upstream-id
-    /// overrides. It preserves the upstream-id / TLS / per-port-policy
-    /// portion of the effective routing target. Pool-backed transports that
-    /// read `proxy.backend_host` / `proxy.backend_port` directly must still
-    /// rebase those fields after load-balancer target selection.
+    /// overrides. It preserves the upstream-id / TLS / per-port-policy /
+    /// pending-admission-scope portion of the effective routing target.
+    /// Pool-backed transports that read `proxy.backend_host` /
+    /// `proxy.backend_port` directly must still rebase those fields after
+    /// load-balancer target selection.
     pub fn apply_route_overrides_with_upstreams(
         &self,
         proxy: Arc<Proxy>,
@@ -4992,6 +4993,12 @@ impl RequestContext {
         // this, a route from an SD upstream LEAKS its top-level/subset fallback
         // onto a different destination, and a route TO an SD upstream LOSES that
         // destination's fallback (see #1806 codex r1).
+        //
+        // The same rebind applies to `pending_limit_scope` (issue #3778): an
+        // upstream-id override Arc-clones the destination Upstream's
+        // precomputed top-level scope (subset cleared with the upstream
+        // change); a direct-backend override clears any stale capped upstream
+        // lane so a reachable cap path cannot consult the prior Service.
         let dispatch_port_override_fallback_override = if upstream_id_changed {
             if direct_backend_override {
                 Some(None)
@@ -5017,6 +5024,20 @@ impl RequestContext {
         let dispatch_port_override_fallback_changed = dispatch_port_override_fallback_override
             .as_ref()
             .is_some_and(|fallback| *fallback != proxy.dispatch_port_override_fallback);
+        let pending_limit_scope_override = if upstream_id_changed {
+            if direct_backend_override {
+                Some(None)
+            } else {
+                Some(
+                    self.route_override_upstream_id
+                        .as_deref()
+                        .and_then(|id| upstreams.and_then(|map| map.get(id)))
+                        .and_then(|upstream| upstream.pending_limit_scope.clone()),
+                )
+            }
+        } else {
+            None
+        };
         let backend_read_timeout_changed = self
             .route_override_backend_read_timeout_ms
             .is_some_and(|timeout| timeout != proxy.backend_read_timeout_ms);
@@ -5089,6 +5110,9 @@ impl RequestContext {
         }
         if let Some(dispatch_port_override_fallback) = dispatch_port_override_fallback_override {
             overridden.dispatch_port_override_fallback = dispatch_port_override_fallback;
+        }
+        if let Some(pending_limit_scope) = pending_limit_scope_override {
+            overridden.pending_limit_scope = pending_limit_scope;
         }
         if let Some(timeout) = self.route_override_backend_read_timeout_ms {
             overridden.backend_read_timeout_ms = timeout;

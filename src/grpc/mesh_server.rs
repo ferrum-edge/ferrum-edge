@@ -1077,6 +1077,7 @@ mod tests {
                     }],
                     workloads: Vec::new(),
                     protocol_overrides: std::collections::HashMap::new(),
+                    uid: None,
                 }],
                 ..MeshConfig::default()
             })),
@@ -1390,6 +1391,7 @@ mod tests {
                     }],
                     workloads: Vec::new(),
                     protocol_overrides: std::collections::HashMap::new(),
+                    uid: None,
                 },
                 MeshService {
                     cluster_ips: Vec::new(),
@@ -1403,6 +1405,7 @@ mod tests {
                     }],
                     workloads: Vec::new(),
                     protocol_overrides: std::collections::HashMap::new(),
+                    uid: None,
                 },
             ],
             ..MeshConfig::default()

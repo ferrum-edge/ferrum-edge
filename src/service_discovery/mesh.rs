@@ -954,6 +954,7 @@ mod tests {
                 })
                 .collect(),
             protocol_overrides: HashMap::new(),
+            uid: None,
         }
     }
 
@@ -1510,6 +1511,7 @@ mod tests {
                 }],
                 protocol_overrides: HashMap::new(),
                 cluster_ips: Vec::new(),
+                uid: None,
             }],
             workloads: vec![vm],
             ..MeshConfig::default()
@@ -1550,6 +1552,7 @@ mod tests {
                 workloads: Vec::new(),
                 protocol_overrides: HashMap::new(),
                 cluster_ips: Vec::new(),
+                uid: None,
             }],
             workloads: vec![vm],
             ..MeshConfig::default()

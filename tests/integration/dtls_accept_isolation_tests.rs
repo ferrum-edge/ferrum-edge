@@ -163,6 +163,7 @@ fn dtls_proxy(listen_port: u16, backend_port: u16) -> Proxy {
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
