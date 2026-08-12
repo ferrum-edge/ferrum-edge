@@ -71,6 +71,7 @@ fn make_proxy(id: &str, listen_path: &str, updated_at: DateTime<Utc>) -> Proxy {
         compiled_stream_match: None,
         created_at: updated_at,
         updated_at,
+        pending_limit_scope: None,
     }
 }
 
@@ -102,6 +103,8 @@ fn make_upstream(id: &str, targets: Vec<UpstreamTarget>, updated_at: DateTime<Ut
         api_spec_id: None,
         created_at: updated_at,
         updated_at,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 

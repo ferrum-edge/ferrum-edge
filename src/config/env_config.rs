@@ -1808,6 +1808,11 @@ pub struct EnvConfig {
     /// a larger per-IP cap can never fire and is refused at startup rather than
     /// silently ignored.
     pub cp_grpc_max_connections_per_ip: usize,
+    /// Independent finite lifetime for every bearer-authenticated ConfigSync,
+    /// MeshSubscribe, and ADS stream admitted by a control plane. This never
+    /// extends token expiry; the earlier deadline wins. Default 3600 seconds;
+    /// validated to 60..=86400 and cannot be disabled.
+    pub cp_grpc_max_stream_lifetime_seconds: u64,
     /// Capacity of the tokio broadcast channel used to fan out config deltas
     /// to subscribed Data Planes. When a DP lags behind by more than this many
     /// updates, it receives a full config snapshot instead of the missed deltas.
@@ -3360,6 +3365,8 @@ impl Default for EnvConfig {
             cp_grpc_tls_client_ca_path: None,
             cp_grpc_max_connections: 1024,
             cp_grpc_max_connections_per_ip: 64,
+            cp_grpc_max_stream_lifetime_seconds:
+                crate::grpc::auth::DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS,
             cp_broadcast_channel_capacity: 128,
             cp_namespaces: Vec::new(),
             cp_require_namespace_claim: false,
@@ -3925,6 +3932,7 @@ impl EnvConfig {
             cp_grpc_tls_client_ca_path: Option<String> = "FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH";
             cp_grpc_max_connections: usize = "FERRUM_CP_GRPC_MAX_CONNECTIONS" => 1024usize;
             cp_grpc_max_connections_per_ip: usize = "FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP" => 64usize;
+            cp_grpc_max_stream_lifetime_seconds: u64 = "FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS" => crate::grpc::auth::DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS;
             cp_broadcast_channel_capacity: usize = "FERRUM_CP_BROADCAST_CHANNEL_CAPACITY" => 128usize;
             cp_namespaces: Vec<String> = "FERRUM_CP_NAMESPACES" => Vec::new();
             cp_require_namespace_claim: bool = "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM" => false;
@@ -4727,6 +4735,7 @@ impl EnvConfig {
             cp_grpc_tls_client_ca_path,
             cp_grpc_max_connections,
             cp_grpc_max_connections_per_ip,
+            cp_grpc_max_stream_lifetime_seconds,
             cp_broadcast_channel_capacity,
             cp_namespaces,
             cp_require_namespace_claim,
@@ -5954,6 +5963,17 @@ impl EnvConfig {
                     ));
                 }
             }
+        }
+
+        if !(crate::grpc::auth::MIN_GRPC_MAX_STREAM_LIFETIME_SECONDS
+            ..=crate::grpc::auth::MAX_GRPC_MAX_STREAM_LIFETIME_SECONDS)
+            .contains(&self.cp_grpc_max_stream_lifetime_seconds)
+        {
+            return Err(format!(
+                "FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS must be between {} and {} seconds; 0/unbounded is not permitted",
+                crate::grpc::auth::MIN_GRPC_MAX_STREAM_LIFETIME_SECONDS,
+                crate::grpc::auth::MAX_GRPC_MAX_STREAM_LIFETIME_SECONDS,
+            ));
         }
 
         // CP/DP gRPC credential presence (advisory GHSA-3f2j-wwqw-grmg).

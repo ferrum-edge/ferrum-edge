@@ -69,6 +69,7 @@ fn mesh_service(namespace: &str, name: &str, workload_spiffe: Option<&str>) -> M
             .unwrap_or_default(),
         protocol_overrides: HashMap::new(),
         cluster_ips: Vec::new(),
+        uid: None,
     }
 }
 

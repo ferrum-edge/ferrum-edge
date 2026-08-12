@@ -179,6 +179,18 @@ producer does not start in that release. `finalize` is admitted only after the
 node-local durable proof exists, and only then does the chart remove the setns
 privilege set. See the [Ambient UDP migration procedure](mesh.md#ambient-udp-placement-migration-enforced-hard-upgrade-guard).
 
+Once that migration has completed, a node with no node-local durable record —
+one that joined the cluster afterwards, or whose registry directory was
+recreated by a reboot — adopts the placement from the chart-rendered
+`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED` attestation, which the chart
+derives only from the already-installed placement ConfigMap. That widens no
+privilege: such a node still renders the narrowed host-placement capability set,
+and the attestation is consulted only when the durable record is absent, so it
+can never authorize an in-place flip on a running node. A
+`.udp-placement-quarantined` tombstone in the registry directory refuses every
+absent-state bootstrap outright, which is what makes the corrupt-ownership
+repair procedure machine-enforced rather than advisory.
+
 What it does NOT reduce is `CAP_NET_ADMIN`: the path still writes `mangle` chains,
 an `ip rule`, and an `ip route` in the host namespace, and still binds
 `IP_TRANSPARENT` sockets. The chart also retains the ambient container's existing

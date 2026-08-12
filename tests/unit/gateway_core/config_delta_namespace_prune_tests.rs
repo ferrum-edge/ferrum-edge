@@ -87,6 +87,7 @@ fn make_proxy(namespace: &str, id: &str, listen_path: &str) -> Proxy {
         compiled_stream_match: None,
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -127,6 +128,8 @@ fn make_upstream(namespace: &str, id: &str, host: &str) -> Upstream {
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 

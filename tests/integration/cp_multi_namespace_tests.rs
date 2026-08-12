@@ -135,6 +135,7 @@ fn proxy_in(id: &str, namespace: &str) -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -158,6 +159,7 @@ fn mesh_service(name: &str, namespace: &str) -> MeshService {
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
         cluster_ips: Vec::new(),
+        uid: None,
     }
 }
 

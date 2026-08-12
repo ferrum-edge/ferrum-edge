@@ -239,6 +239,8 @@ fn make_upstream(subsets: Option<Vec<SubsetDefinition>>) -> Upstream {
         api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
