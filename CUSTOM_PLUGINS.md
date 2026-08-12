@@ -1095,7 +1095,7 @@ pub struct RequestContext {
 - `backend_consumer_username()` — returns the identity for the `X-Consumer-Username` backend header
 - `backend_consumer_custom_id()` — returns the Consumer custom ID, if a gateway Consumer was resolved
 - `apply_route_overrides(proxy)` — returns an `Arc<Proxy>` with direct route overrides applied. This helper cannot re-resolve upstream TLS for `route_override_upstream_id`.
-- `apply_route_overrides_with_upstreams(proxy, upstreams)` — use this in custom dispatch paths that honor `route_override_upstream_id`; it re-resolves `resolved_tls` from the effective upstream snapshot.
+- `apply_route_overrides_with_upstreams(proxy, upstreams)` — use this in custom dispatch paths that honor `route_override_upstream_id`; it re-resolves `resolved_tls` from the effective upstream snapshot and rebinds the precomputed H1 `pending_limit_scope` (clearing it on a direct-backend override).
 
 ### Inter-Plugin Communication
 

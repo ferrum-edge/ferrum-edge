@@ -428,6 +428,7 @@ fn https_proxy_referencing_ca(id: &str, ca_id: &str) -> Proxy {
         compiled_stream_match: None,
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 

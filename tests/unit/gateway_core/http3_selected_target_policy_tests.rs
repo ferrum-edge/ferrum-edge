@@ -1153,24 +1153,29 @@ fn h3_flavor_aware_reject_metrics_match_the_http_wire_status() {
 }
 
 #[test]
-fn h3_cross_protocol_http1_admission_uses_selected_subset_lane() {
+fn h3_cross_protocol_http1_admission_uses_logical_scope_lane() {
     let source = include_str!("../../../src/http3/cross_protocol.rs");
     let pending_gate = source
         .find("let pending_cap =")
         .expect("H3-to-plain pending gate");
     let gate_tail = &source[pending_gate..];
     let acquisition = gate_tail
-        .find(".try_acquire_for_subset(")
-        .expect("subset-keyed H1 admission");
+        .find(".try_acquire(")
+        .expect("scope-keyed H1 admission");
     let acquisition_tail = &gate_tail[acquisition..];
     let acquisition_end = acquisition_tail
-        .find("pending_cap,")
+        .find("Some(cap),")
         .expect("pending cap argument");
     let acquisition_call = &acquisition_tail[..acquisition_end];
 
     assert!(
-        acquisition_call.contains("dispatch_proxy.upstream_subset.as_deref()"),
-        "the H3-to-plain bridge must not collapse selected subsets into the unmatched H1 admission lane"
+        acquisition_call.contains("pending_scope.as_ref()")
+            || acquisition_call.contains("pending_limit_scope_for_proxy"),
+        "the H3-to-plain bridge must acquire against the precomputed logical scope"
+    );
+    assert!(
+        !acquisition_call.contains("effective_host"),
+        "selected endpoint host must not key the H1 pending lane"
     );
 }
 
@@ -1178,10 +1183,9 @@ fn h3_cross_protocol_http1_admission_uses_selected_subset_lane() {
 /// `UpstreamTarget::dispatch_policy_port()`, the declared Service port under
 /// `targetPort` remapping — exactly like `proxy_to_backend` /
 /// `proxy_to_backend_retry`. Keying the bridge by the DIAL port instead splits
-/// one destination's in-flight budget across two lanes (`host|80|s…` for
-/// H1/H2, `host|8080|s…` for H3), so a cap of N admits 2N combined, and it
-/// makes an explicit `portLevelSettings[{port: 80}]` cap invisible to the
-/// bridge.
+/// one destination's in-flight budget across two lanes for H1/H2 vs H3, so a
+/// cap of N admits 2N combined, and it makes an explicit
+/// `portLevelSettings[{port: 80}]` cap invisible to the bridge.
 #[test]
 fn h3_cross_protocol_http1_admission_keys_the_policy_port_not_the_dial_port() {
     let source = include_str!("../../../src/http3/cross_protocol.rs");
@@ -1190,12 +1194,12 @@ fn h3_cross_protocol_http1_admission_keys_the_policy_port_not_the_dial_port() {
         .expect("H3-to-plain pending gate");
     let gate_tail = &source[pending_gate..];
     let acquisition = gate_tail
-        .find(".try_acquire_for_subset(")
-        .expect("subset-keyed H1 admission");
+        .find(".try_acquire(")
+        .expect("scope-keyed H1 admission");
     let cap_lookup = &gate_tail[..acquisition];
     let acquisition_tail = &gate_tail[acquisition..];
     let acquisition_end = acquisition_tail
-        .find("pending_cap,")
+        .find("Some(cap),")
         .expect("pending cap argument");
     let acquisition_call = &acquisition_tail[..acquisition_end];
 
@@ -1214,6 +1218,10 @@ fn h3_cross_protocol_http1_admission_keys_the_policy_port_not_the_dial_port() {
     assert!(
         !acquisition_call.contains("dispatch_dial_port"),
         "the H3 bridge must not open a dial-port-keyed second admission lane"
+    );
+    assert!(
+        !acquisition_call.contains("effective_host"),
+        "logical scope identity replaces the selected-host key (issue #3778)"
     );
 
     // Both bridge dispatch sites (buffered retry loop and streaming dispatch)

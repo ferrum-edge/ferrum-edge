@@ -75,15 +75,10 @@
 //! control-plane input, and killing the process over one unbindable port would
 //! take down every healthy listener with it.
 //!
-//! Routing fail-closed is scoped to **admission refusals** (reserved /
-//! stream / TLS-class collisions, missing TLS material, deferred class flips),
-//! which are published in the exact request epoch so a refused listener cannot
+//! Routing fails closed for both admission refusals and OS bind failures. They
+//! are published in the exact request epoch so an unavailable listener cannot
 //! become reachable through the process-global proxy or the single-listener
-//! Service remap. Ordinary OS bind failures (for example
-//! privileged `:80` without `CAP_NET_BIND_SERVICE`) stay telemetry-only: the
-//! Service-fronted topology still remaps that listener port through
-//! `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT` when the table has
-//! exactly one listen port of that protocol class.
+//! Service remap.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -646,9 +641,7 @@ impl GatewayListenerManager {
         // the current plan. A request already accepted by that old listener
         // must not be remapped to the sole surviving listener. Extend this set
         // for other reconcile-time decisions that likewise must not leak onto
-        // the process-global proxy. Ordinary `spawn_listener` OS errors are
-        // intentionally omitted so Service-fronted `:80`/`:443` remapping
-        // survives privileged-port bind failures.
+        // the process-global proxy.
         let mut refused_route_ports: BTreeSet<u16> = plan.refused.keys().copied().collect();
         refused_route_ports.extend(stale_route_ports);
         refused_route_ports.extend(retiring_ports.iter().copied());
@@ -696,6 +689,7 @@ impl GatewayListenerManager {
                 Err(error) => {
                     error!(port = *port, "Gateway API listener bind failed: {error}");
                     failures.push(GatewayListenerBindFailure { port: *port, error });
+                    refused_route_ports.insert(*port);
                 }
             }
         }
@@ -949,8 +943,8 @@ impl GatewayListenerManager {
     /// container may lack `CAP_NET_BIND_SERVICE` for), so killing the gateway
     /// would take down every healthy listener over one unbindable port. The
     /// failure is loud, surfaced on [`Self::bind_failures`], and retried.
-    /// Admission refusals stay unreachable; ordinary OS bind failures remain
-    /// eligible for the intentional single-listener Service remap.
+    /// Admission refusals and ordinary OS bind failures stay unreachable
+    /// through the intentional single-listener Service remap.
     pub async fn run(
         self: Arc<Self>,
         mut shutdown: watch::Receiver<bool>,

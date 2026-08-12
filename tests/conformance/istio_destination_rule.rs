@@ -349,8 +349,9 @@ fn dr_connection_pool_http_max_retries() {
 
 /// `trafficPolicy.connectionPool.http.http1MaxPendingRequests` (F5.1 final knob):
 /// projected onto the HTTP overlay and honestly reinterpreted at runtime as a
-/// per-`(host, policy port, selected subset)` concurrent in-flight HTTP/1.1 gate
-/// (503 "upstream overflow" when full). No longer deferred at top-level /
+/// per-logical-destination `(namespace, upstream/Service identity, policy port,
+/// selected subset)` concurrent in-flight HTTP/1.1 gate (503 "upstream
+/// overflow" when full). No longer deferred at top-level /
 /// `portLevelSettings`.
 #[test]
 fn dr_connection_pool_http_http1_max_pending_requests_supported() {
@@ -358,7 +359,7 @@ fn dr_connection_pool_http_http1_max_pending_requests_supported() {
         category = CATEGORY,
         feature = "trafficPolicy.connectionPool.http.http1MaxPendingRequests",
         status = Status::Supported,
-        notes = "Projected onto port_overrides[port].http1_max_pending_requests → Proxy.pool_http1_max_pending_requests; honestly reinterpreted as a 503-on-overflow concurrent in-flight-request gate on the reqwest/HTTP-1.1 dispatch path (src/backend_pending_limit.rs).",
+        notes = "Projected onto port_overrides[port].http1_max_pending_requests → Proxy.pool_http1_max_pending_requests; honestly reinterpreted as a 503-on-overflow concurrent in-flight-request gate on the reqwest/HTTP-1.1 dispatch path (and H3→plain bridge), keyed by logical destination (namespace, stable logical upstream/Service identity, optional K8s Service UID when stamped, policy port, selected subset) rather than selected endpoint host; mesh VIP/service-host and direct-pod routes converge on the Service FQDN while native upstreams retain their resource ids (src/backend_pending_limit.rs, issue #3778).",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
@@ -385,7 +386,7 @@ fn dr_subset_connection_pool_http_combined() {
         category = CATEGORY,
         feature = "subsets[].trafficPolicy.connectionPool.http.{h2UpgradePolicy,maxRetries,http1MaxPendingRequests,idleTimeout,http2MaxRequests}",
         status = Status::Supported,
-        notes = "Preserved per subset; runtime precedence is explicit port-level > selected subset > top-level. H1 admission is keyed by subset; retry caps never synthesize retry policy; idleTimeout projects onto pool_idle_timeout_seconds (reqwest rcfg identity); http2MaxRequests projects onto direct-H2/native-gRPC builders (reqwest H2 has no equivalent builder knob). Shared-client keys already carry upstream_subset so sibling subsets cannot first-materialize each other.",
+        notes = "Preserved per subset; runtime precedence is explicit port-level > selected subset > top-level. H1 admission is keyed by logical destination identity including the selected subset; retry caps never synthesize retry policy; idleTimeout projects onto pool_idle_timeout_seconds (reqwest rcfg identity); http2MaxRequests projects onto direct-H2/native-gRPC builders (reqwest H2 has no equivalent builder knob — distinct from #3775's future active-request breaker). Shared-client keys already carry upstream_subset so sibling subsets cannot first-materialize each other.",
     );
     let dr = translated(json!({
         "host": "echo.default.svc.cluster.local",
@@ -943,6 +944,7 @@ fn admitted_names_with_entries(
             }],
             workloads: Vec::new(),
             protocol_overrides: std::collections::HashMap::new(),
+            uid: None,
         }],
         sidecars: vec![MeshSidecar {
             name: "default-sc".to_string(),

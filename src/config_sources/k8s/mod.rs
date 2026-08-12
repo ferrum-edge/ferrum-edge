@@ -2503,6 +2503,7 @@ pub(crate) fn proxy_for_route(spec: RouteProxySpec) -> Proxy {
         allowed_ws_origins: Vec::new(),
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 
@@ -3780,6 +3781,8 @@ pub(crate) fn upstream_for_route_with_session(
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     };
     if let Some(session) = session {
         apply_session_persistence_to_upstream(&mut upstream, session);

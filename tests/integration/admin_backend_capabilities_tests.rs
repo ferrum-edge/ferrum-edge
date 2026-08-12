@@ -214,6 +214,7 @@ fn make_minimal_proxy(id: &str) -> ferrum_edge::config::types::Proxy {
         compiled_stream_match: None,
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 

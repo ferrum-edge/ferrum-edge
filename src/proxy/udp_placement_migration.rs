@@ -17,6 +17,12 @@ use serde::{Deserialize, Serialize};
 use crate::config::conf_file::resolve_ferrum_var;
 
 const STATE_FILE: &str = ".udp-placement-state-v1.json";
+/// Operator-written tombstone recording that node-local ownership was
+/// quarantined as corrupt/unknown. Its presence means "absent state is NOT
+/// evidence of a fresh node", so it refuses every stable bootstrap from absent
+/// state — including a release-attested adoption — until an explicit
+/// cleanup/finalize pair has proven predecessor state retired.
+const QUARANTINE_FILE: &str = ".udp-placement-quarantined";
 const REGISTRY_SYNC_FILE: &str = ".udp-registry-synced";
 const MAX_STATE_BYTES: u64 = 4096;
 const MAX_GENERATION_BYTES: usize = 64;
@@ -89,6 +95,17 @@ pub struct UdpPlacementRequest {
     pub generation: Option<String>,
     pub from: Option<UdpPlacement>,
     pub to: Option<UdpPlacement>,
+    /// Release-level attestation that this placement was already established by
+    /// a COMPLETED earlier migration release, so a node carrying no durable
+    /// record of its own has no predecessor state to retire.
+    ///
+    /// The chart derives it from the INSTALLED placement ConfigMap and renders
+    /// it only when the previously installed contract already recorded this
+    /// exact target in a `stable`/`finalize` phase — never during the release
+    /// that performs the change. It is consulted ONLY when the node-local
+    /// durable record is absent; a present record that disagrees with the
+    /// requested placement is still a hard rejection.
+    pub established: Option<UdpPlacement>,
 }
 
 impl UdpPlacementRequest {
@@ -115,6 +132,15 @@ impl UdpPlacementRequest {
         let to = resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO")
             .filter(|value| !value.trim().is_empty())
             .map(|value| UdpPlacement::parse(&value, "FERRUM_MESH_CAPTURE_UDP_MIGRATION_TO"))
+            .transpose()?;
+        // Parsed (and therefore validated) in every phase so a typo is a startup
+        // error rather than a silently inert attestation, but only CONSULTED by
+        // the stable arm below: cleanup/finalize decide from durable ownership.
+        let established = resolve_ferrum_var("FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED")
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                UdpPlacement::parse(&value, "FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED")
+            })
             .transpose()?;
 
         if phase == UdpMigrationPhase::Stable {
@@ -161,6 +187,7 @@ impl UdpPlacementRequest {
             generation,
             from,
             to,
+            established,
         })
     }
 
@@ -439,14 +466,60 @@ pub fn prepare_placement(
     match request.phase {
         UdpMigrationPhase::Stable => {
             if state.is_none() {
-                if request.target == UdpPlacement::HostNetns {
+                // A node with no durable record is either genuinely new to this
+                // placement (fresh node, or a registry directory recreated by a
+                // node reboot) or a pre-contract node whose predecessor rules
+                // may still be live inside running pods. The node cannot tell
+                // those apart by inspection: under the host placement it has
+                // deliberately dropped the setns privileges needed to look
+                // inside a pod netns, and marker absence is not proof.
+                //
+                // The RELEASE can tell them apart, because a completed earlier
+                // migration release is exactly the event that retired every
+                // then-existing node's predecessor state. Adopt the requested
+                // host placement only when the deployment attests that this
+                // placement was already established before this release; a
+                // present-but-different durable record is never overridden.
+                //
+                // An operator who quarantined unreadable/unknown ownership asked
+                // for cleanup to re-establish it. Refuse every stable bootstrap
+                // from absent state until a finalize proof clears the tombstone,
+                // so a restart between the quarantine and the cleanup release
+                // cannot silently adopt any placement instead.
+                match ownership_is_quarantined(registry_dir) {
+                    Ok(true) => {
+                        set_failure(UdpMigrationFailureReason::MigrationRequired);
+                        return Err(
+                            "Ambient UDP ownership is quarantined on this node and no durable record remains; run an explicit cleanup migration (the quarantine tombstone is cleared only by a finalize that proves predecessor state retired)"
+                                .to_string(),
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        set_failure(UdpMigrationFailureReason::DurableStateRejected);
+                        return Err(format!(
+                            "could not safely inspect the Ambient UDP ownership quarantine marker: {error}"
+                        ));
+                    }
+                }
+                let host_target = request.target == UdpPlacement::HostNetns;
+                let adopted_from_established_release =
+                    host_target && request.established == Some(request.target);
+                if host_target && !adopted_from_established_release {
                     set_failure(UdpMigrationFailureReason::MigrationRequired);
                     return Err(
-                        "host-netns Ambient UDP capture has no durable predecessor proof; run an explicit cleanup migration before selecting host-netns"
+                        "host-netns Ambient UDP capture has no durable predecessor proof and this release does not attest an already-established host-netns placement; run an explicit cleanup migration before selecting host-netns"
                             .to_string(),
                     );
                 }
                 write_state(registry_dir, &DurablePlacementState::new(request.target))?;
+                if adopted_from_established_release {
+                    record_established_adoption();
+                    tracing::info!(
+                        placement = request.target.as_str(),
+                        "Ambient UDP placement adopted from the release-attested established placement; this node carried no durable record (fresh node or recreated registry directory) and no predecessor cleanup is owed"
+                    );
+                }
                 state = read_state(registry_dir)?;
             }
             let state = state.ok_or_else(|| {
@@ -535,6 +608,10 @@ pub fn prepare_placement(
                 && state.pending.is_none()
                 && state.completed.as_ref() == Some(&transition)
             {
+                // Finalize is idempotent, including its quarantine cleanup. A
+                // crash or transient filesystem error after the durable state
+                // write must not make a later retry skip the tombstone removal.
+                clear_ownership_quarantine(registry_dir);
                 set_phase(UdpMigrationStatusPhase::Stable, 0);
                 clear_failure();
                 return Ok(UdpPlacementDecision::RunStable);
@@ -561,6 +638,11 @@ pub fn prepare_placement(
             state.pending = None;
             state.completed = Some(transition);
             write_state(registry_dir, &state)?;
+            // A completed cleanup/finalize pair is exactly the proof the
+            // quarantine tombstone was waiting for. Clearing it fails soft: the
+            // durable record is now present, so a stale tombstone only refuses a
+            // future ABSENT-state adoption, which is the safe direction.
+            clear_ownership_quarantine(registry_dir);
             set_phase(UdpMigrationStatusPhase::Stable, 0);
             clear_failure();
             Ok(UdpPlacementDecision::RunStable)
@@ -570,6 +652,44 @@ pub fn prepare_placement(
 
 fn state_path(registry_dir: &Path) -> PathBuf {
     registry_dir.join(STATE_FILE)
+}
+
+/// Any entry at the tombstone path counts, including a symlink or a directory:
+/// this is a fail-closed presence check, never a content read.
+fn ownership_is_quarantined(registry_dir: &Path) -> Result<bool, std::io::Error> {
+    match std::fs::symlink_metadata(registry_dir.join(QUARANTINE_FILE)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn clear_ownership_quarantine(registry_dir: &Path) {
+    let path = registry_dir.join(QUARANTINE_FILE);
+    let removal = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir(&path),
+        Ok(_) => std::fs::remove_file(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => Err(error),
+    };
+    match removal {
+        Ok(()) => {
+            if let Err(error) = sync_directory(registry_dir) {
+                tracing::warn!(
+                    %error,
+                    "could not sync Ambient UDP ownership quarantine removal; a surviving tombstone only refuses a future absent-state adoption"
+                );
+            }
+        }
+        // A concurrent operator cleanup already achieved the desired state.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "could not clear the Ambient UDP ownership quarantine tombstone; remove it manually before relying on release-attested adoption"
+            );
+        }
+    }
 }
 
 fn read_state(registry_dir: &Path) -> Result<Option<DurablePlacementState>, String> {
@@ -1008,6 +1128,7 @@ static STATUS_PHASE: AtomicU8 = AtomicU8::new(0);
 static OUTSTANDING: AtomicU64 = AtomicU64::new(0);
 static FAILURE_REASON: AtomicU8 = AtomicU8::new(0);
 static FAILURES_TOTAL: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+static ESTABLISHED_ADOPTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UdpMigrationStatusSnapshot {
@@ -1015,6 +1136,14 @@ pub struct UdpMigrationStatusSnapshot {
     pub phase: UdpMigrationStatusPhase,
     pub outstanding: u64,
     pub failure_reason: UdpMigrationFailureReason,
+    /// True when this process started its placement from the release-attested
+    /// established placement instead of a node-local durable record.
+    pub established_adoption: bool,
+}
+
+fn record_established_adoption() {
+    ENABLED.store(true, Ordering::Relaxed);
+    ESTABLISHED_ADOPTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn set_phase(phase: UdpMigrationStatusPhase, outstanding: usize) {
@@ -1041,6 +1170,7 @@ pub fn snapshot() -> UdpMigrationStatusSnapshot {
         failure_reason: UdpMigrationFailureReason::from_code(
             FAILURE_REASON.load(Ordering::Relaxed),
         ),
+        established_adoption: ESTABLISHED_ADOPTIONS_TOTAL.load(Ordering::Relaxed) > 0,
     }
 }
 
@@ -1079,6 +1209,18 @@ pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
         output,
         "ferrum_mesh_udp_placement_migration_outstanding",
         snapshot.outstanding,
+        gateway_ns_label,
+    );
+    output.push_str(
+        "# HELP ferrum_mesh_udp_placement_migration_established_adoptions_total Ambient UDP placements adopted from the release-attested established placement without a node-local durable record.\n",
+    );
+    output.push_str(
+        "# TYPE ferrum_mesh_udp_placement_migration_established_adoptions_total counter\n",
+    );
+    render_value(
+        output,
+        "ferrum_mesh_udp_placement_migration_established_adoptions_total",
+        ESTABLISHED_ADOPTIONS_TOTAL.load(Ordering::Relaxed),
         gateway_ns_label,
     );
     output.push_str(
