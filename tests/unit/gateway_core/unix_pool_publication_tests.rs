@@ -530,10 +530,8 @@ fn collect_live_omits_h1_when_effective_keep_alive_is_false() {
     let h2c = "/tmp/ferrum-unix-h2c.sock";
 
     // Global default false, no per-proxy override → H1 omitted.
-    let from_global = collect_live_unix_target_identities(
-        &config_with_h1_and_h2c(h1, h2c, stamp, None),
-        false,
-    );
+    let from_global =
+        collect_live_unix_target_identities(&config_with_h1_and_h2c(h1, h2c, stamp, None), false);
     assert!(
         from_global
             .iter()
@@ -556,10 +554,7 @@ fn collect_live_omits_h1_when_effective_keep_alive_is_false() {
     assert_eq!(from_proxy.len(), 1);
 
     // Global default false, per-proxy true → H1 retained.
-    let override_on = collect_live_unix_target_identities(
-        &config_with(h1, false, stamp),
-        false,
-    );
+    let override_on = collect_live_unix_target_identities(&config_with(h1, false, stamp), false);
     // The plain helper leaves pool_enable_http_keep_alive = None, so global
     // false still omits; prove the Some(true) override restores H1.
     let restored = collect_live_unix_target_identities(
@@ -577,7 +572,9 @@ fn collect_live_omits_h1_when_effective_keep_alive_is_false() {
         "per-proxy keep-alive=true must restore H1 against a false global default"
     );
     assert!(
-        restored.iter().all(|id| id.protocol == UnixWireProtocol::Http1)
+        restored
+            .iter()
+            .all(|id| id.protocol == UnixWireProtocol::Http1)
     );
 }
 
