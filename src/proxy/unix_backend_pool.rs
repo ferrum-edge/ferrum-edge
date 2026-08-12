@@ -73,10 +73,10 @@
 //! maps and keeps its connection open. `shutdown_drain` therefore latches the
 //! pool closed, drops every pooled carrier, awaits the remaining drivers under
 //! one bounded budget, then aborts AND JOINS whatever is left under a second
-//! bounded budget — no driver task survives the drain, the wait cannot be
-//! unbounded, and the drain does not return while a cancelled driver is still
-//! unreaped inside that budget (an expired reap budget is logged, not
-//! silently accepted). The "physical connections open" gauge and the
+//! bounded budget. The wait cannot be unbounded: a cancelled driver is reaped
+//! before return when it drops within that budget, while an expired reap budget
+//! is logged rather than silently presented as a completed join. The "physical
+//! connections open" gauge and the
 //! per-target connection slot are both released by a guard the driver FUTURE
 //! owns, so they are exact on the graceful path, on the forced-abort path
 //! (including a future aborted before its first poll), and on a driver panic
@@ -397,9 +397,12 @@ mod imp {
     /// that outlived the gateway's own `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget;
     /// the ordinary case resolves immediately because dropping the last sender
     /// closes the connection. Anything still running when the budget expires is
-    /// ABORTED, so no driver task is ever leaked past the drain. Deliberately
-    /// not an operator knob: it runs strictly after the operator-configured
-    /// drain and is a backstop, not a policy.
+    /// ABORTED and then joined within the separate reap budget below. An abort
+    /// request cannot synchronously drop a task that is not reaching a runtime
+    /// cancellation point, so expiry of that second budget is logged rather
+    /// than described as a completed reap. Deliberately not an operator knob:
+    /// it runs strictly after the operator-configured drain and is a backstop,
+    /// not a policy.
     const DRIVER_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Bounded budget for JOINING the drivers the graceful phase had to cancel.
@@ -1634,10 +1637,11 @@ mod imp {
         ///    and JOINS whatever is left within `DRIVER_ABORT_REAP_BUDGET`.
         ///    Joining is not ceremony: a cancelled task releases its connection
         ///    slot and its share of the open-connections gauge when the runtime
-        ///    drops it, and joining the handle is what observes that. So the
-        ///    drain returns with no driver task alive and with the pool's
-        ///    accounting settled, under a wait that is bounded by construction
-        ///    (issue #3764).
+        ///    drops it, and joining the handle is what observes that. Drivers
+        ///    that reach cancellation inside the reap budget are gone and
+        ///    accounted before return. If one does not, expiry is logged rather
+        ///    than presented as a completed join; the overall wait remains
+        ///    bounded by construction (issue #3764).
         ///
         /// Terminal by design, in both directions: after the latch is set, a
         /// new checkout is refused before it can dial

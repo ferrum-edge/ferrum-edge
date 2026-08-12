@@ -41905,7 +41905,8 @@ fn unix_backend_error_response(
 /// protocol for it here would be the silent downgrade the transport gate
 /// exists to prevent.
 ///
-/// Runs once per config publication that carries a resource delta, never on the
+/// Runs once per config publication that becomes current, including
+/// out-of-band mesh/MMDB republications with no resource delta; never on the
 /// request path.
 pub fn collect_live_unix_target_identities(
     config: &GatewayConfig,
