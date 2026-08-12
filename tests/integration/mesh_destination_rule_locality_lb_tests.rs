@@ -139,6 +139,8 @@ fn matching_upstream(id: &str, host_fqdn: &str) -> Upstream {
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -926,6 +928,8 @@ fn multi_port_upstream(id: &str, host_fqdn: &str) -> Upstream {
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -1082,6 +1086,8 @@ fn port_level_locality_lb_drives_distribute_at_dispatch() {
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     };
 
     let mut distribute_to = BTreeMap::new();

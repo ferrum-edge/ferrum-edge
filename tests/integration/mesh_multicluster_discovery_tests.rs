@@ -90,6 +90,7 @@ fn service(name: &str, refs: &[&str]) -> MeshService {
             })
             .collect(),
         protocol_overrides: HashMap::new(),
+        uid: None,
     }
 }
 
@@ -358,6 +359,8 @@ async fn mesh_multicluster_load_balancer_fails_over_local_to_remote() {
         api_spec_id: None,
         created_at: now,
         updated_at: now,
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     };
 
     let config = GatewayConfig {

@@ -282,6 +282,7 @@ fn service(name: &str, namespace: &str) -> MeshService {
         }],
         workloads: Vec::new(),
         protocol_overrides: std::collections::HashMap::new(),
+        uid: None,
     }
 }
 

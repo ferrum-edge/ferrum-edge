@@ -63,6 +63,8 @@ fn test_upstream(id: &str, host: &str, port: u16) -> Upstream {
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -147,6 +149,7 @@ fn test_proxy(id: &str, listen_path: &str, plugins: Vec<PluginAssociation>) -> P
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 

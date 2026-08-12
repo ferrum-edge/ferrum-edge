@@ -73,6 +73,8 @@ fn make_upstream(
         api_spec_id: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 
@@ -132,6 +134,7 @@ fn mesh_service(name: &str, spiffe_id: &str, port: u16) -> MeshService {
             spiffe_id: mesh_spiffe(spiffe_id),
         }],
         protocol_overrides: HashMap::new(),
+        uid: None,
     }
 }
 
@@ -2746,6 +2749,7 @@ fn mesh_service_with_ports(spiffe_id: &str, ports: Vec<ServicePort>) -> MeshServ
             spiffe_id: mesh_spiffe(spiffe_id),
         }],
         protocol_overrides: HashMap::new(),
+        uid: None,
     }
 }
 

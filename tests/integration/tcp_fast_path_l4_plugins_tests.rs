@@ -150,6 +150,7 @@ fn fast_path_tcp_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 

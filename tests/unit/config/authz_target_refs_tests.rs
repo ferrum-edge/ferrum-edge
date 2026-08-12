@@ -445,6 +445,7 @@ fn mesh_service(namespace: &str, name: &str) -> MeshService {
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
         cluster_ips: Vec::new(),
+        uid: None,
     }
 }
 
