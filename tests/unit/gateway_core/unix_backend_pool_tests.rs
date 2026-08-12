@@ -1195,7 +1195,7 @@ async fn a_checkout_in_the_post_insert_window_refuses_the_stale_carrier() {
         inflight,
         move || {
             // A publication lands in the pre-insert window. The identity STAYS
-            // declared, so the pass neither removes this key nor tombstones it:
+            // declared, so the pass leaves this key in place:
             // the only thing standing between the racing checkout and a
             // superseded carrier is the entry's own publication token.
             publishing.retain_live_targets(&live_http1_set(&publish_proxy, &publish_socket));
@@ -1242,8 +1242,8 @@ async fn a_checkout_in_the_post_insert_window_refuses_the_stale_carrier() {
 
 /// A withdraw/re-add of the SAME identity is a DISCONTINUITY, not continuity.
 ///
-/// The withdrawal lands while this key has no slot at all, so there is nothing
-/// to tombstone and only the live-set snapshot moves. A check-in that already
+/// The withdrawal lands while this key has no slot at all, so only the
+/// live-set snapshot moves. A check-in that already
 /// passed its live-set read then creates the slot and inserts its
 /// PRE-WITHDRAWAL carrier. The re-add that follows sees a byte-identical
 /// identity tuple under a live key: treating "declared now" as proof of
@@ -1262,7 +1262,8 @@ async fn a_same_identity_readd_refuses_a_carrier_inserted_during_the_absence() {
     let proxy = test_proxy("unix-pool-readd-discontinuity");
 
     // A fresh lease captured at the publication generation current now. Nothing
-    // is pooled for this key, so no slot exists for a withdrawal to tombstone.
+    // is pooled for this key, so no slot exists for the withdrawal pass to
+    // inspect.
     let inflight = pool
         .checkout_h1(
             &proxy,
@@ -1276,7 +1277,7 @@ async fn a_same_identity_readd_refuses_a_carrier_inserted_during_the_absence() {
     assert_eq!(
         pool.stats().idle_h1_connections,
         0,
-        "the slotless precondition: this key has no entry to tombstone"
+        "the slotless precondition: this key has no reusable entry"
     );
 
     let withdrawing = Arc::clone(&pool);
@@ -1295,8 +1296,8 @@ async fn a_same_identity_readd_refuses_a_carrier_inserted_during_the_absence() {
         inflight,
         move || {
             // The identity is withdrawn AFTER this check-in read the live set.
-            // No slot exists, so no tombstone is installed and the insert below
-            // still creates a default, non-withdrawn slot.
+            // No slot exists, so the insert below creates one after the
+            // withdrawal pass has finished.
             withdrawing.retain_live_targets(&std::collections::HashSet::new());
         },
         move || {
@@ -1554,7 +1555,7 @@ async fn a_neighbours_withdraw_and_readd_leaves_a_continuously_live_carrier_pool
 /// A request routed by a SUPERSEDED request epoch can still dial a withdrawn
 /// target, and its lease is bound to the CURRENT generation — so neither half
 /// of the generation fence sees anything wrong with it. The published live-set
-/// snapshot and withdrawal tombstone are what refuse it.
+/// snapshot is what refuses it.
 #[tokio::test]
 async fn a_checkin_for_a_withdrawn_identity_is_refused_after_the_withdrawal() {
     let temp = tempfile::TempDir::new().expect("temp dir");
@@ -1562,10 +1563,10 @@ async fn a_checkin_for_a_withdrawn_identity_is_refused_after_the_withdrawal() {
     let socket = root.join("app.sock");
     let peer = HoldingPeer::bind(&socket);
     let pool = default_pool();
-    let proxy = test_proxy("unix-pool-tombstone");
+    let proxy = test_proxy("unix-pool-live-set-withdrawal");
 
     // Something is pooled for this identity when the withdrawal lands, so the
-    // retirement pass can see the key and mark it.
+    // retirement pass can see and remove the key.
     let lease = pool
         .checkout_h1(
             &proxy,
@@ -1608,6 +1609,46 @@ async fn a_checkin_for_a_withdrawn_identity_is_refused_after_the_withdrawal() {
     expect_accepts(&peer, 2, "two dials, neither of them pooled").await;
 }
 
+/// A long-lived application socket must not pin one empty map slot for every
+/// logical proxy identity that configuration has ever withdrawn. The live-set
+/// snapshot and generation fence reject late check-ins without retaining that
+/// duplicated per-key state.
+#[tokio::test]
+async fn withdrawals_reclaim_empty_key_slots_while_the_socket_stays_live() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let root = root_dir(&temp);
+    let socket = root.join("app.sock");
+    let peer = HoldingPeer::bind(&socket);
+    let pool = default_pool();
+
+    for generation in 0..8 {
+        let proxy = test_proxy(&format!("unix-pool-retired-identity-{generation}"));
+        pool.retain_live_targets(&live_http1_set(&proxy, &socket));
+        let lease = pool
+            .checkout_h1(
+                &proxy,
+                socket.to_str().expect("utf-8"),
+                proxy.backend_connect_timeout_ms,
+                &roots(&root),
+                &[],
+            )
+            .await
+            .expect("checkout");
+        pool.checkin_h1(lease);
+        assert_eq!(pool.resident_key_slots(), (1, 0));
+
+        pool.retain_live_targets(&std::collections::HashSet::new());
+        assert_eq!(
+            pool.resident_key_slots(),
+            (0, 0),
+            "withdrawing generation {generation} must reclaim its empty key even though the \
+             admitted socket inode is still live"
+        );
+    }
+
+    expect_accepts(&peer, 8, "one fresh dial for each logical identity").await;
+}
+
 /// A withdrawal with no carrier and therefore no per-key slot still has to be
 /// authoritative. A late request pinned to the superseded request epoch may
 /// finish on its freshly admitted connection, but that connection must not
@@ -1621,7 +1662,7 @@ async fn a_withdrawal_without_an_existing_slot_still_refuses_a_late_checkin() {
     let pool = default_pool();
     let proxy = test_proxy("unix-pool-slotless-withdrawal");
 
-    // No checkout has occurred, so neither pool map has a key to tombstone.
+    // No checkout has occurred, so neither pool map has a key to inspect.
     pool.retain_live_targets(&std::collections::HashSet::new());
     let late = pool
         .checkout_h1(
@@ -1639,7 +1680,7 @@ async fn a_withdrawal_without_an_existing_slot_still_refuses_a_late_checkin() {
         pool.stats().idle_h1_connections,
         0,
         "the published live-set snapshot must refuse the late carrier even \
-         though the withdrawal had no slot to tombstone"
+         though the withdrawal found no slot"
     );
     assert!(pool.stats().withdrawal_fenced_checkins >= 1);
 }
@@ -1679,7 +1720,7 @@ async fn an_older_config_reconcile_cannot_overwrite_a_newer_live_set() {
 }
 
 /// The h2c half of the slotless-withdrawal rule: even when no key existed for
-/// the retirement pass to tombstone, a shared carrier established for a
+/// the retirement pass to inspect, a shared carrier established for a
 /// withdrawn identity serves the RPC it was dialed for and nothing after it.
 #[tokio::test]
 async fn an_h2c_carrier_dialed_after_a_slotless_withdrawal_is_not_published() {
@@ -1688,9 +1729,9 @@ async fn an_h2c_carrier_dialed_after_a_slotless_withdrawal_is_not_published() {
     let socket = root.join("app.sock");
     let _peer = SettingsThenClosePeer::bind(&socket, std::time::Duration::from_secs(30));
     let pool = default_pool();
-    let proxy = test_proxy("unix-pool-h2c-tombstone");
+    let proxy = test_proxy("unix-pool-h2c-live-set-withdrawal");
 
-    // No checkout has occurred, so there is no h2c key to tombstone.
+    // No checkout has occurred, so there is no h2c key to inspect.
     pool.retain_live_targets(&std::collections::HashSet::new());
     assert_eq!(pool.stats().active_h2c_connections, 0);
 
@@ -1748,8 +1789,8 @@ async fn the_h2c_selector_refuses_a_carrier_published_under_a_superseded_generat
         (
             move || {
                 // A publication lands during the dial. The identity stays
-                // declared, so nothing is tombstoned and — because nothing is
-                // pooled for this key yet — there is no entry to re-stamp.
+                // declared and — because nothing is pooled for this key yet —
+                // there is no entry to re-stamp.
                 publishing.retain_live_targets(&live_h2c_set(&publish_proxy, &publish_socket));
             },
             move || {
@@ -1785,7 +1826,7 @@ async fn the_h2c_selector_refuses_a_carrier_published_under_a_superseded_generat
 
 /// The h2c half of the withdraw/re-add discontinuity. The withdrawal lands
 /// after this publish read the live set and while no h2c slot exists for the
-/// key, so nothing is tombstoned and the superseded carrier still reaches the
+/// key, so the superseded carrier still reaches the
 /// shared map. A re-add of the byte-identical identity must not adopt it: the
 /// production selector may not multiplex a new RPC onto a carrier that predates
 /// the absence.
@@ -1823,8 +1864,8 @@ async fn the_h2c_publish_is_not_adopted_by_a_same_identity_readd() {
         (
             move || {
                 // Withdrawn after this checkout's live-set read, and with no
-                // h2c slot for the key: no tombstone is installed, so the
-                // publish below still creates a slot and inserts.
+                // h2c slot for the key, so the publish below still creates a
+                // slot after the withdrawal pass has finished and inserts.
                 withdrawing.retain_live_targets(&std::collections::HashSet::new());
             },
             move || {
