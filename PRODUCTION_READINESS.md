@@ -51,8 +51,10 @@ absent from or renamed in repository metadata, an open `tracked_blockers` entry
 that never received the `launch-blocker` label, an issue without exactly one
 severity label, a live severity label that contradicts the tracked contract, and
 missing/malformed/stale/future private-advisory input. The label vocabulary is
-proven to exist before any issue listing is trusted, so an empty
-`labels=launch-blocker` result can never be mistaken for a clean inventory.
+proven to exist before any issue listing is trusted, and open issues are
+selected by the verified immutable blocker-label id rather than a name filter,
+so a missing or transiently renamed label can never be mistaken for a clean
+inventory.
 Private advisories contribute a redacted count only; setup and maintenance are
 described in [`docs/launch-readiness.md`](docs/launch-readiness.md).
 

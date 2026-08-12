@@ -36,12 +36,15 @@ classification input.
 
 The Issues API answers `labels=launch-blocker` with an empty list in two very
 different situations: the label exists and no issue carries it, and the label
-does not exist at all. Treating those alike is fail-open, so before any issue
-listing the checker calls `GET /repos/{owner}/{repo}/labels/{name}` before and
-after the paginated issue walk and requires an exact, case-sensitive name plus a
-stable label id. GitHub resolves label lookups case-insensitively, so a case-only
-rename is caught by comparing the returned `name` rather than by the lookup
-succeeding; the id fence catches deletion/recreation during discovery.
+does not exist at all. It can also transiently return an empty set when a label
+is renamed away and back during the request. Treating those cases as clean is
+fail-open. The checker therefore calls
+`GET /repos/{owner}/{repo}/labels/{name}` before and after discovery, requires an
+exact case-sensitive name plus a stable unique id, and walks the unfiltered open
+issue inventory. Blockers are selected by the verified immutable id; every
+in-page id/name pair must still agree. GitHub resolves label lookups
+case-insensitively, so a case-only rename is caught rather than accepted, while
+the identity fences catch deletion/recreation and rename-roundtrip races.
 
 - Missing definition ⇒ `UNKNOWN` (`label_inventory:configured label … is not
   defined in repository metadata`).
@@ -69,9 +72,10 @@ correct fail-closed answer — not a `PASS`.
 
 ## Classification
 
-1. **Label discovery:** after the vocabulary is proven to exist, the whole
-   `launch-blocker` label set is walked with pagination. Pull-request nodes are
-   excluded. Each remaining issue must carry exactly one configured
+1. **Label discovery:** after the vocabulary is proven to exist, the whole open
+   issue inventory is walked with pagination and the immutable blocker-label id
+   selects the authoritative set. Pull-request nodes are excluded. Each
+   remaining issue must carry exactly one configured
    `severity:{critical,high,medium}` label; zero, several, or an unconfigured
    severity-shaped label is `UNKNOWN`, never a silent omission. A newly filed
    blocker with one valid severity is discovered without editing the policy.

@@ -946,6 +946,10 @@ def verify_repository_labels(
             raise GateError(
                 "schema", f"repository label payload for {name} has a malformed id"
             )
+        if live_id in verified.values():
+            raise GateError(
+                "schema", "repository label payload reuses one id for multiple names"
+            )
         verified[name] = live_id
     return verified
 
@@ -955,19 +959,32 @@ def fetch_labeled_blocker_issues(
     policy: dict[str, Any],
     token: str | None,
     *,
+    blocker_label_id: int,
     opener: Callable[..., Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Every issue carrying the launch-blocker label, regardless of severity.
+    """Every open issue carrying the verified launch-blocker label id.
 
-    Querying blocker+severity combinations would silently omit a blocker whose
-    severity label is missing or unrecognized; that case must be UNKNOWN, so
-    the whole label set is walked and the severity requirement is applied after.
+    GitHub's `labels=<name>` filter can transiently return an empty inventory if
+    that label is renamed during the request and then renamed back before the
+    final metadata fence. Enumerate the unfiltered open issue set instead and
+    select by the immutable id proven before the walk. The name carried beside
+    that id must still match exactly; a rename is UNKNOWN rather than omission.
+
+    Querying blocker+severity combinations would also silently omit a blocker
+    whose severity label is missing or unrecognized, so severity remains a
+    separate requirement applied after discovery.
     """
 
+    if (
+        not isinstance(blocker_label_id, int)
+        or isinstance(blocker_label_id, bool)
+        or blocker_label_id < 1
+    ):
+        raise GateError("schema", "verified blocker label id is malformed")
+    blocker_name = policy["labels"]["launch_blocker"]
     query = urllib.parse.urlencode(
         {
-            "state": "all",
-            "labels": policy["labels"]["launch_blocker"],
+            "state": "open",
             "per_page": str(PER_PAGE),
         }
     )
@@ -979,7 +996,37 @@ def fetch_labeled_blocker_issues(
         if "pull_request" in item:
             # PR nodes share the issues API; they are never launch blockers.
             continue
-        collected.append(item)
+        label_items = item.get("labels")
+        if not isinstance(label_items, list):
+            raise GateError("schema", "issue labels payload is not a list")
+        carries_blocker = False
+        for label in label_items:
+            if not isinstance(label, dict):
+                raise GateError("schema", "issue label payload is not an object")
+            label_name = label.get("name")
+            label_id = label.get("id")
+            if not isinstance(label_name, str) or not LABEL_RE.fullmatch(label_name):
+                raise GateError("schema", "issue label name is malformed")
+            if (
+                not isinstance(label_id, int)
+                or isinstance(label_id, bool)
+                or label_id < 1
+            ):
+                raise GateError("schema", "issue label id is malformed")
+            if label_name == blocker_name and label_id != blocker_label_id:
+                raise GateError(
+                    LABEL_INVENTORY_CODE,
+                    "configured blocker label identity changed during issue discovery",
+                )
+            if label_id == blocker_label_id:
+                if label_name != blocker_name:
+                    raise GateError(
+                        LABEL_INVENTORY_CODE,
+                        "configured blocker label name changed during issue discovery",
+                    )
+                carries_blocker = True
+        if carries_blocker:
+            collected.append(item)
     return collected
 
 
@@ -1283,7 +1330,13 @@ def evaluate_live(
             )
             by_number[number] = record
 
-        for payload in labeled_fetch(repo, policy, token, opener=opener):
+        for payload in labeled_fetch(
+            repo,
+            policy,
+            token,
+            blocker_label_id=initial_label_inventory[blocker_label],
+            opener=opener,
+        ):
             if not isinstance(payload, dict):
                 raise GateError("schema", "issues page entry is not an object")
             number = payload.get("number")
@@ -1673,7 +1726,9 @@ def _label_fetcher(
     malformed body.
     """
 
-    known = set(configured_policy_labels(_base_policy())) if defined is None else defined
+    configured = configured_policy_labels(_base_policy())
+    known = set(configured) if defined is None else defined
+    ids = {name: index + 1 for index, name in enumerate(configured)}
 
     def _fetch(repo: str, name: str, token: str | None, opener=None):  # noqa: ARG001
         if asked is not None:
@@ -1681,10 +1736,10 @@ def _label_fetcher(
         if payloads is not None and name in payloads:
             return payloads[name]
         if renamed is not None and name in renamed:
-            return {"name": renamed[name], "id": 1}
+            return {"name": renamed[name], "id": ids[name]}
         if name not in known:
             raise GateError("api", "HTTP 404")
-        return {"name": name, "id": 1, "color": "ededed"}
+        return {"name": name, "id": ids[name], "color": "ededed"}
 
     return _fetch
 
@@ -1924,6 +1979,19 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     check("every configured label is verified", set(verified) == all_labels, str(verified))
     check("every configured label is queried", set(asked) == all_labels, str(asked))
 
+    duplicate_ids = {
+        name: {"name": name, "id": 1}
+        for name in configured_policy_labels(_base_policy())
+    }
+    ev = _evaluate(
+        _base_policy(), label_fetcher=_label_fetcher(payloads=duplicate_ids)
+    )
+    check(
+        "one label id cannot represent multiple configured names",
+        unknown_because(ev, "reuses one id for multiple names"),
+        str(ev.unknown_reasons),
+    )
+
     # Each individual definition is load-bearing: deleting any one is UNKNOWN.
     for missing in sorted(all_labels):
         ev = _evaluate(
@@ -2016,9 +2084,16 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     # turn a temporarily empty listing into PASS. Identity is fenced by id.
     inventory_reads: dict[str, int] = {}
 
+    stable_ids = {
+        name: index + 1
+        for index, name in enumerate(configured_policy_labels(_base_policy()))
+    }
+
     def replaced_label(repo, name, token, opener=None):  # noqa: ARG001
         inventory_reads[name] = inventory_reads.get(name, 0) + 1
-        live_id = 2 if name == "launch-blocker" and inventory_reads[name] > 1 else 1
+        live_id = stable_ids[name]
+        if name == "launch-blocker" and inventory_reads[name] > 1:
+            live_id += 100
         return {"name": name, "id": live_id}
 
     ev = _evaluate(_base_policy(), label_fetcher=replaced_label)
@@ -2496,9 +2571,9 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     except GateError:
         check("non-GitHub request refused", True)
 
-    # ---- label discovery walks every page and drops PR nodes ---------------
+    # ---- label discovery walks every open issue page and drops PR nodes -----
     label_query = urllib.parse.urlencode(
-        {"state": "all", "labels": "launch-blocker", "per_page": str(PER_PAGE)}
+        {"state": "open", "per_page": str(PER_PAGE)}
     )
     label_page_one = f"{API_ORIGIN}repos/ferrum-edge/ferrum-edge/issues?{label_query}"
     label_page_two = f"{label_page_one}&page=2"
@@ -2506,28 +2581,83 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         {
             label_page_one: (
                 [
-                    _issue(9001, labels=["launch-blocker", "severity:high"]),
                     {
-                        **_issue(9002, labels=["launch-blocker"]),
+                        **_issue(9001),
+                        "labels": [
+                            {"name": "launch-blocker", "id": 41},
+                            {"name": "severity:high", "id": 42},
+                        ],
+                    },
+                    {
+                        **_issue(9002),
+                        "labels": [{"name": "launch-blocker", "id": 41}],
                         "pull_request": {"merged_at": None},
+                    },
+                    {
+                        **_issue(9004),
+                        "labels": [{"name": "unrelated", "id": 99}],
                     },
                 ],
                 {"link": f'<{label_page_two}>; rel="next"'},
             ),
             label_page_two: (
-                [_issue(9003, labels=["launch-blocker", "severity:medium"])],
+                [
+                    {
+                        **_issue(9003),
+                        "labels": [
+                            {"name": "launch-blocker", "id": 41},
+                            {"name": "severity:medium", "id": 43},
+                        ],
+                    }
+                ],
                 {},
             ),
         }
     )
     discovered = fetch_labeled_blocker_issues(
-        "ferrum-edge/ferrum-edge", _base_policy(), "tok", opener=label_opener
+        "ferrum-edge/ferrum-edge",
+        _base_policy(),
+        "tok",
+        blocker_label_id=41,
+        opener=label_opener,
     )
     check(
         "label discovery paginates and excludes PR nodes",
         [item["number"] for item in discovered] == [9001, 9003],
         str([item.get("number") for item in discovered]),
     )
+
+    # A rename away-and-back can preserve the metadata id seen before and after
+    # the walk. Selecting the unfiltered inventory by id still sees the issue,
+    # and the mismatched in-page name fails closed instead of producing PASS.
+    renamed_during_walk = page_opener(
+        {
+            label_page_one: (
+                [
+                    {
+                        **_issue(9005),
+                        "labels": [{"name": "launch-blocker-renamed", "id": 41}],
+                    }
+                ],
+                {},
+            )
+        }
+    )
+    try:
+        fetch_labeled_blocker_issues(
+            "ferrum-edge/ferrum-edge",
+            _base_policy(),
+            "tok",
+            blocker_label_id=41,
+            opener=renamed_during_walk,
+        )
+        check("blocker label rename during issue walk is UNKNOWN", False)
+    except GateError as exc:
+        check(
+            "blocker label rename during issue walk is UNKNOWN",
+            exc.code == LABEL_INVENTORY_CODE and "name changed" in exc.message,
+            exc.message,
+        )
 
     # ---- document claim ----------------------------------------------------
     def document(verdict: str, counts: dict[str, int], private: int = 0) -> str:
