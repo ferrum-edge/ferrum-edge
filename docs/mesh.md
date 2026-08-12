@@ -3824,6 +3824,35 @@ independent of that pipeline gate.
    file that omits the three tuple keys for this release; do not carry them
    forward with `--reuse-values`.
 
+**Node reboots and scale-out.** The node-local durable record lives in the pod
+registry hostPath (`nodeAgent.podRegistryDir`, default `/run/ferrum/...`, which
+is tmpfs on a systemd host). A node reboot recreates that directory, and a node
+that joins the cluster after the migration never had one, so neither carries a
+durable record. Both nonetheless provably carry **no** predecessor rules: pod
+network namespaces do not survive a reboot, and a new node has never run a
+predecessor producer. From the stable release onward the chart therefore renders
+`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED` from the **installed**
+`ferrum-mesh-udp-placement-<release>` ConfigMap — only when that installed
+contract already records the same target in a `stable` or `finalize` phase, so
+the release that performs a change can never attest itself. A node with no
+durable record then adopts that placement, records it durably, logs the
+adoption, sets `mesh.udp_placement_migration.established_adoption` on
+authenticated `/health`, and increments
+`ferrum_mesh_udp_placement_migration_established_adoptions_total`. The
+attestation is consulted **only** when the durable record is absent: a present
+record that disagrees with the requested placement is still the hard rejection
+above, so an in-place flip on a running node can never be authorized this way.
+
+A GitOps or client-render pipeline that bypasses Helm's `lookup` must supply the
+same value from its own cluster-state gate. Omitting it is fail-closed but
+costly: rebooted and newly joined nodes keep readiness false with failure reason
+`migration_required` until an explicit cleanup/finalize pair runs. A node that
+somehow missed both migration releases while its workloads kept running (for
+example a node whose Ambient DaemonSet pod was unschedulable throughout, and
+which then rebooted or was reimaged) can be adopted by the attestation; its
+workloads were already fail-closed after the predecessor producer stopped, so
+this costs availability that was already lost and never opens plaintext egress.
+
 For example, pod-netns to host-netns uses one tuple throughout (replace
 `$GENERATION` with a deployment identifier):
 
@@ -3881,9 +3910,14 @@ non-regular, multiply-linked, foreign-UID, or unreadable
    effective UID and a single link, fsync the file, rename it, then fsync the
    directory. Retract `.udp-registry-synced` while both processes are stopped.
    For corrupt or unknown ownership, quarantine the rejected state outside the
-   registry and leave the state path absent, then run a fresh explicit cleanup
-   adoption release; absent state makes cleanup probe **both** ownership
-   domains. Never guess ownership, chown a live file, follow a symlink, or
+   registry, leave the state path absent, create an empty
+   `.udp-placement-quarantined` tombstone beside it, and then run a fresh
+   explicit cleanup adoption release; absent state makes cleanup probe **both**
+   ownership domains. The tombstone is load-bearing, not a note: while it is
+   present, **every** stable bootstrap from an absent record is refused —
+   including a release-attested adoption — so a proxy that restarts between the
+   quarantine and the cleanup release cannot silently adopt a placement instead
+   of proving cleanup. A successful finalize removes it. Never guess ownership, chown a live file, follow a symlink, or
    repair only a subset of nodes.
 5. Verify both artifacts and their tuple on every node before resuming the
    DaemonSets. Apply the matching Helm values only after that verification so
@@ -3895,9 +3929,14 @@ non-regular, multiply-linked, foreign-UID, or unreadable
 
 A planned `securityContext` UID change must use the same stopped-and-drained
 procedure (or retain the old UID until after the migration); the reader rejects
-old-UID state by design. Re-adopting `host-netns` from absent or rejected state
-always requires cleanup/finalize—stable host startup never fabricates a
-predecessor proof.
+old-UID state by design. Re-adopting `host-netns` from **rejected** state always
+requires cleanup/finalize—a corrupt, truncated, foreign-UID, or unreadable
+record is a hard failure, never an absence—and re-adopting it from **absent**
+state requires either cleanup/finalize or the release-level
+`FERRUM_MESH_CAPTURE_UDP_PLACEMENT_ESTABLISHED` attestation described under
+"Node reboots and scale-out", which a `.udp-placement-quarantined` tombstone
+refuses. Stable host startup never fabricates a predecessor proof from node-local
+inspection.
 
 **Recovery and churn contract.** Cleanup persists `(generation, from, to)`
 before touching rules. A proxy restart resumes only that tuple; a different or
