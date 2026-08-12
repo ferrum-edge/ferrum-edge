@@ -99,6 +99,7 @@ fn create_grpc_proxy(id: &str, listen_path: &str, backend_port: u16) -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -355,6 +356,8 @@ fn create_test_upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        k8s_service_uid: None,
+        pending_limit_scope: None,
     }
 }
 

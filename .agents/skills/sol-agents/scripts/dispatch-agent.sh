@@ -72,10 +72,14 @@ if [[ "$prompt_file" != /* || ! -f "$prompt_file" ]]; then
   exit 2
 fi
 
-if ! command -v codex >/dev/null 2>&1; then
-  printf 'codex is not installed or not on PATH\n' >&2
-  exit 127
-fi
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=../../_lib/resolve-agent-bin.sh
+. "$script_dir/../../_lib/resolve-agent-bin.sh"
+
+codex_bin=$(resolve_agent_bin codex CODEX_BIN \
+  /opt/homebrew/bin/codex \
+  /usr/local/bin/codex \
+  "${HOME}/.local/bin/codex")
 
 repo_root=$(git -C "$worktree" rev-parse --show-toplevel)
 physical_worktree=$(cd "$worktree" && pwd -P)
@@ -88,7 +92,10 @@ fi
 
 cd "$physical_worktree"
 
-exec codex exec \
+printf '[sol-agents] dispatch model=gpt-5.6-sol effort=%s worktree=%s bin=%s\n' \
+  "$effort" "$physical_worktree" "$codex_bin" >&2
+
+exec "$codex_bin" exec \
   --model gpt-5.6-sol \
   --config "model_reasoning_effort=\"$effort\"" \
   --sandbox danger-full-access \

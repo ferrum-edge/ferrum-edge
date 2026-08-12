@@ -13,7 +13,7 @@ use ferrum_edge::config_sources::k8s::{
 use ferrum_edge::identity::spiffe::TrustDomain;
 use serde_json::{Value, json};
 
-use crate::common::{TestGateway, spawn_http_identifying};
+use crate::common::{TestGateway, ephemeral_port, spawn_http_identifying};
 
 const NAMESPACE: &str = "default";
 const ROUTE_HOST: &str = "store.example.test";
@@ -37,7 +37,11 @@ fn object(api_version: &str, kind: &str, name: &str, spec: Value) -> K8sObject {
     }
 }
 
-fn service_import_snapshot(backend_port: u16, protocol: &str) -> Vec<K8sObject> {
+fn service_import_snapshot(
+    backend_port: u16,
+    listener_port: u16,
+    protocol: &str,
+) -> Vec<K8sObject> {
     let mut gateway_class = object(
         "gateway.networking.k8s.io/v1",
         "GatewayClass",
@@ -73,7 +77,7 @@ fn service_import_snapshot(backend_port: u16, protocol: &str) -> Vec<K8sObject> 
                 "gatewayClassName": "ferrum",
                 "listeners": [{
                     "name": "http",
-                    "port": 80,
+                    "port": listener_port,
                     "protocol": "HTTP",
                     "allowedRoutes": { "namespaces": { "from": "Same" } }
                 }]
@@ -112,15 +116,17 @@ fn service_import_snapshot(backend_port: u16, protocol: &str) -> Vec<K8sObject> 
     ]
 }
 
-fn translated_config_yaml(backend_port: u16, protocol: &str) -> String {
+fn translated_config_yaml(backend_port: u16, listener_port: u16, protocol: &str) -> String {
     let options = K8sTranslationOptions::new(
         NAMESPACE.to_string(),
         TrustDomain::new("cluster.local").expect("test trust domain"),
     )
     .with_pod_discovery_enabled(true);
-    let translated =
-        translate_k8s_objects(&service_import_snapshot(backend_port, protocol), options)
-            .expect("ServiceImport snapshot should translate");
+    let translated = translate_k8s_objects(
+        &service_import_snapshot(backend_port, listener_port, protocol),
+        options,
+    )
+    .expect("ServiceImport snapshot should translate");
 
     if protocol == "TCP" {
         assert_eq!(translated.config.proxies[0].backend_host, "127.0.0.1");
@@ -148,6 +154,44 @@ fn translated_config_yaml(backend_port: u16, protocol: &str) -> String {
     .expect("serialize translated gateway config")
 }
 
+async fn start_gateway(backend_port: u16, protocol: &str) -> TestGateway {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_error = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let listener_port = ephemeral_port().await.expect("reserve listener port");
+        let builder = TestGateway::builder()
+            // This suite exercises ServiceImport routing, not Service-port
+            // remapping. Use the exact process-global frontend port so an
+            // unrelated parallel :80 listener cannot create a bind refusal.
+            .mode_file(translated_config_yaml(
+                backend_port,
+                listener_port,
+                protocol,
+            ))
+            .namespace(NAMESPACE)
+            .log_level("warn")
+            .reserve_listener_port(backend_port)
+            .max_attempts(1)
+            .capture_output()
+            .env("FERRUM_PROXY_HTTP_PORT", listener_port.to_string());
+        match builder.spawn_classified().await {
+            Ok(gateway) => return gateway,
+            Err(failure) if failure.listener_addr_in_use => {
+                last_error = failure.detail;
+                eprintln!(
+                    "gateway spawn attempt {attempt} lost an ephemeral-port race; retrying: \
+                     {last_error}"
+                );
+            }
+            Err(failure) => panic!(
+                "ServiceImport gateway failed for a deterministic reason on attempt {attempt}: {}",
+                failure.detail
+            ),
+        }
+    }
+    panic!("ServiceImport gateway failed after {MAX_ATTEMPTS} port races: {last_error}");
+}
+
 async fn request(gateway: &TestGateway) -> reqwest::Response {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -167,14 +211,7 @@ async fn service_import_tcp_reaches_backend_and_udp_fails_closed() {
         .await
         .expect("spawn ServiceImport backend");
 
-    let admitted = TestGateway::builder()
-        .mode_file(translated_config_yaml(backend.port, "TCP"))
-        .namespace(NAMESPACE)
-        .log_level("warn")
-        .reserve_listener_port(backend.port)
-        .spawn()
-        .await
-        .expect("start admitted ServiceImport gateway");
+    let admitted = start_gateway(backend.port, "TCP").await;
     let response = request(&admitted).await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body = response.text().await.expect("admitted response body");
@@ -184,14 +221,7 @@ async fn service_import_tcp_reaches_backend_and_udp_fails_closed() {
     );
     drop(admitted);
 
-    let rejected = TestGateway::builder()
-        .mode_file(translated_config_yaml(backend.port, "UDP"))
-        .namespace(NAMESPACE)
-        .log_level("warn")
-        .reserve_listener_port(backend.port)
-        .spawn()
-        .await
-        .expect("start fail-closed ServiceImport gateway");
+    let rejected = start_gateway(backend.port, "UDP").await;
     let response = request(&rejected).await;
     assert_eq!(
         response.status(),

@@ -111,6 +111,7 @@ fn make_proxy(id: &str, namespace: &str) -> Proxy {
         compiled_stream_match: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        pending_limit_scope: None,
     }
 }
 
@@ -123,6 +124,7 @@ fn mesh_with_service(name: &str) -> Box<MeshConfig> {
             ports: Vec::new(),
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
+            uid: None,
         }],
         ..Default::default()
     })

@@ -283,6 +283,7 @@ fn native_mesh_service(namespace: &str, name: &str) -> MeshService {
         ports: Vec::new(),
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
+        uid: None,
     }
 }
 
@@ -558,6 +559,7 @@ fn a_same_name_collision_gives_kubernetes_precedence_then_restores_the_base() {
         ports: Vec::new(),
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
+        uid: None,
     };
     let base = other_source_config(MeshConfig {
         services: vec![base_service.clone()],
@@ -988,6 +990,7 @@ fn overlay_slot_compose_restores_a_non_kubernetes_object_the_overlay_shadowed() 
         ports: Vec::new(),
         workloads: Vec::new(),
         protocol_overrides: HashMap::new(),
+        uid: None,
     };
     let non_kubernetes_base = other_source_config(MeshConfig {
         services: vec![base_service.clone()],
@@ -1292,6 +1295,7 @@ fn all_collections(key_suffix: &str, marker: &str) -> MeshConfig {
             ports: Vec::new(),
             workloads: Vec::new(),
             protocol_overrides: HashMap::new(),
+            uid: None,
         }],
         mesh_policies: vec![MeshPolicy {
             name: name("policy"),

@@ -21,7 +21,13 @@ effort. This skill is only for sessions where the USER asked Codex to delegate t
 ## Preflight
 
 1. Read `AGENTS.md`, the relevant `.claude/rules/*.md`, and the issue or PR before dispatching.
-2. Run `command -v claude`, `claude --version`, `claude auth status`, and `claude --help`.
+2. Confirm the standalone claude CLI is resolvable, then run `claude --version`, `claude auth status`,
+   and `claude --help` against it. The launcher resolves the binary in this order and refuses
+   any candidate under `com.conductor.app`, because Conductor's bundled copy lags the standalone
+   release:
+   - `CLAUDE_BIN` if it points at an executable absolute path,
+   - `~/.local/bin/claude`, `/opt/homebrew/bin/claude`, `/usr/local/bin/claude`,
+   - `claude` on `PATH`.
 3. Confirm that the installed CLI exposes `--effort` with `low`, `medium`, `high`, `xhigh`, and `max`.
 4. Use the pinned model `claude-opus-5[1m]`. Use `opus[1m]` only when the user explicitly asks
    for the rolling latest Opus rather than Opus 5.

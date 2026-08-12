@@ -92,6 +92,7 @@ fn minimal_proxy() -> Proxy {
         compiled_stream_match: None,
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 

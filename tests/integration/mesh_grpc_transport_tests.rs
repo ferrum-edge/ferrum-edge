@@ -197,6 +197,7 @@ fn grpc_proxy_for_test() -> Proxy {
         compiled_stream_match: None,
         created_at: now,
         updated_at: now,
+        pending_limit_scope: None,
     }
 }
 

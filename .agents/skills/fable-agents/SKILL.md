@@ -19,7 +19,13 @@ Fable.
 ## Preflight
 
 1. Read `AGENTS.md`, the relevant `.claude/rules/*.md`, and the issue or PR before dispatching.
-2. Run `command -v claude`, `claude --version`, `claude auth status`, and `claude --help`.
+2. Confirm the standalone claude CLI is resolvable, then run `claude --version`, `claude auth status`,
+   and `claude --help` against it. The launcher resolves the binary in this order and refuses
+   any candidate under `com.conductor.app`, because Conductor's bundled copy lags the standalone
+   release:
+   - `CLAUDE_BIN` if it points at an executable absolute path,
+   - `~/.local/bin/claude`, `/opt/homebrew/bin/claude`, `/usr/local/bin/claude`,
+   - `claude` on `PATH`.
 3. Confirm that the installed CLI accepts `claude-fable-5` and exposes `--effort` with `medium`
    and `high`.
 4. Use only the pinned model `claude-fable-5`. Do not expose a model override in the launcher.

@@ -402,10 +402,10 @@ without a restart. These bounds are deliberate and tested:
   (`:80` / `:443` without `CAP_NET_BIND_SERVICE`) fails and is retried. Either
   way the failure is logged and surfaced on
   `GatewayListenerManager::bind_failures`, and routes scoped to a genuinely
-  refused listener stay unreachable rather than being served somewhere else.
-  Once the matching generation is acknowledged, an ordinary OS bind failure
-  remains eligible for the intentional Service-fronted remap; only admission
-  refusals suppress routing.
+  refused or bind-failed listener stay unreachable rather than being served
+  somewhere else. Once the matching generation is acknowledged, both admission
+  refusals and ordinary OS bind failures suppress the intentional
+  Service-fronted remap.
 - **An HTTP↔HTTPS class flip retires the old generation first.** The retiring
   accept-loop task is awaited before the replacement binds, so with
   `FERRUM_ACCEPT_THREADS > 1` the `SO_REUSEPORT` sockets of the two classes

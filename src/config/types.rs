@@ -711,8 +711,9 @@ pub struct UpstreamPortOverride {
     /// cannot get an in-flight slot is shed with a 503 ("upstream overflow")
     /// before backend dispatch, rather than queued unboundedly. Projected onto
     /// the per-target effective proxy's `pool_http1_max_pending_requests`. The
-    /// cap is keyed per resolved `(host, policy port, selected subset name)`
-    /// lane, without logical upstream/Service identity.
+    /// cap is keyed per logical destination
+    /// `(namespace, upstream/Service identity, policy port, selected subset)` —
+    /// not per selected endpoint host (issue #3778).
     ///
     /// HTTP/1.1-scoped: the multiplexed transports (direct H2, gRPC, HTTP/3,
     /// HBONE, mesh-mTLS) do NOT consult this field — their request concurrency
@@ -1767,6 +1768,32 @@ pub struct Upstream {
     /// spec is removed. NOT loaded by the gateway runtime — admin-only metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_spec_id: Option<String>,
+    /// Kubernetes Service `metadata.uid` stamped from the owning
+    /// [`crate::modes::mesh::config::MeshService`] when materializing mesh
+    /// egress upstreams. Participates in the H1 pending-admission scope
+    /// **alongside** the stable logical Service identity so a delete/recreate
+    /// of the same Service name cannot inherit a stale lane, while a reused
+    /// UID cannot collapse distinct Services (issue #3778). Absent for
+    /// non-mesh / native upstreams.
+    ///
+    /// Runtime-only carrier: `#[serde(skip)]` so the file/admin/API/
+    /// OpenAPI config surface neither accepts nor emits it (no schema
+    /// migration). Stamped in-process during mesh materialization / slice
+    /// apply; never an operator input field.
+    #[serde(skip)]
+    pub k8s_service_uid: Option<String>,
+    /// Precomputed top-level (no-subset) H1 pending-admission scope for this
+    /// upstream (issue #3778). Interned at config publication by
+    /// [`GatewayConfig::resolve_pending_limit_scopes`] so
+    /// [`crate::plugins::RequestContext::apply_route_overrides_with_upstreams`]
+    /// can Arc-clone it when an upstream-id route override rebinds the
+    /// effective proxy — without reconstructing namespace / upstream / UID /
+    /// subset strings on the request path. Subset is always `None` here
+    /// because an upstream change clears `Proxy.upstream_subset`.
+    /// `#[serde(skip)]` — derived only; never an operator input field.
+    #[serde(skip)]
+    pub pending_limit_scope:
+        Option<std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase>>,
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default = "Utc::now")]
@@ -2490,7 +2517,8 @@ pub struct Proxy {
     /// honestly reinterpreted cap on concurrent in-flight requests on the
     /// reqwest/HTTP-1.1 backend-dispatch path. Consulted by `proxy_to_backend`
     /// via [`crate::backend_pending_limit::BackendPendingLimiter`]: a request
-    /// that cannot get a slot for its `(host, policy port, selected subset)`
+    /// that cannot get a slot for its logical destination
+    /// `(namespace, upstream/Service identity, policy port, selected subset)`
     /// lane is shed with a 503 ("upstream overflow") before backend dispatch.
     /// Does NOT gate direct-H2 / gRPC / HTTP/3 / HBONE / mesh-mTLS dispatch.
     ///
@@ -2504,6 +2532,17 @@ pub struct Proxy {
     /// dropped on reload. The DB loaders therefore always start it at `None`.
     #[serde(skip)]
     pub pool_http1_max_pending_requests: Option<u32>,
+    /// Precomputed logical H1 pending-admission scope identity (issue #3778).
+    /// Interned at config publication by
+    /// [`GatewayConfig::resolve_pending_limit_scopes`] so the reqwest/H1 (and
+    /// H3→plain bridge) hot path never reconstructs namespace / upstream /
+    /// subset strings. Upstream-id route overrides Arc-clone the destination
+    /// [`Upstream::pending_limit_scope`]; direct-backend overrides clear it.
+    /// The DestinationRule policy port is appended at acquire time.
+    /// `#[serde(skip)]` — derived only.
+    #[serde(skip)]
+    pub pending_limit_scope:
+        Option<std::sync::Arc<crate::backend_pending_limit::BackendPendingScopeBase>>,
     /// Optional upstream ID for load-balanced backends.
     /// When set, overrides backend_host/backend_port with upstream target selection.
     #[serde(default)]
@@ -3290,6 +3329,34 @@ fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Return the stable logical identity used by H1 pending-admission scopes.
+///
+/// Ordinary upstreams retain their resource id: display names are not unique
+/// and must never make unrelated operator resources share admission. Mesh HTTP
+/// egress is the exception. Its reserved internal upstream ids intentionally
+/// split one Service into a VIP/host upstream and one single-target upstream
+/// per directly addressed workload. Those upstreams are all cold-stamped with
+/// the same Service FQDN in `name`; using that FQDN prevents endpoint fan-out
+/// from multiplying the Service's cap. The optional Kubernetes UID remains an
+/// additive recreate fence, and the policy port is appended at acquire time.
+fn pending_limit_logical_id(upstream: &Upstream) -> &str {
+    let is_mesh_http_egress = upstream
+        .id
+        .starts_with(crate::modes::mesh::MESH_OUTBOUND_UPSTREAM_ID_PREFIX)
+        || upstream
+            .id
+            .starts_with(crate::modes::mesh::MESH_OUTBOUND_HTTP_BYWL_UPSTREAM_ID_PREFIX);
+    if is_mesh_http_egress {
+        upstream
+            .name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(upstream.id.as_str())
+    } else {
+        upstream.id.as_str()
+    }
+}
+
 impl GatewayConfig {
     /// Validate that all proxy (host, listen_path, listen_port) combinations are unique.
     ///
@@ -3808,6 +3875,10 @@ impl GatewayConfig {
         // the non-mesh common case (all `Upstream.port_overrides` empty →
         // every proxy gets `None`).
         self.resolve_dispatch_port_overrides();
+        // Intern logical H1 pending-admission scope identities (issue #3778)
+        // so reqwest/H1 + H3→plain acquire never reconstructs namespace /
+        // upstream / subset strings on the hot path.
+        self.resolve_pending_limit_scopes();
     }
 
     /// Resolve each proxy's `dispatch_kind` from `backend_scheme`, applying
@@ -3946,6 +4017,66 @@ impl GatewayConfig {
                     )
                 })
             });
+        }
+    }
+
+    /// Intern each proxy's and upstream's logical H1 pending-admission scope
+    /// (issue #3778).
+    ///
+    /// Proxy scopes are built from `(namespace, stable upstream/Service identity,
+    /// optional K8s Service UID when stamped, selected subset)`. Each
+    /// Upstream also carries a derived top-level (no-subset) scope so
+    /// request-time upstream route overrides can Arc-clone the destination
+    /// lane without reconstructing identity strings. The DestinationRule
+    /// policy port is appended at acquire time. Must run after
+    /// upstreams/proxies are settled (including mesh materialization that
+    /// stamps `Upstream.k8s_service_uid`). Invoked from `normalize_fields`
+    /// beside `resolve_dispatch_port_overrides`.
+    pub fn resolve_pending_limit_scopes(&mut self) {
+        for upstream in &mut self.upstreams {
+            let scope = {
+                let logical_id = pending_limit_logical_id(upstream);
+                std::sync::Arc::new(crate::backend_pending_limit::BackendPendingScopeBase::new(
+                    upstream.namespace.as_str(),
+                    logical_id,
+                    upstream.k8s_service_uid.as_deref(),
+                    // Top-level only: route overrides clear `upstream_subset`
+                    // when the effective upstream changes.
+                    None,
+                ))
+            };
+            upstream.pending_limit_scope = Some(scope);
+        }
+
+        let upstream_by_key: HashMap<(&str, &str), &Upstream> = self
+            .upstreams
+            .iter()
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
+            .collect();
+
+        for proxy in &mut self.proxies {
+            let (logical_id, uid) = if let Some(ref upstream_id) = proxy.upstream_id {
+                match upstream_by_key.get(&(proxy.namespace.as_str(), upstream_id.as_str())) {
+                    Some(upstream) => (
+                        pending_limit_logical_id(upstream),
+                        upstream.k8s_service_uid.as_deref(),
+                    ),
+                    None => (upstream_id.as_str(), None),
+                }
+            } else {
+                // Direct-backend proxy: the proxy itself is the logical
+                // destination. Distinct proxies do not share a lane unless
+                // they intentionally share an upstream_id.
+                (proxy.id.as_str(), None)
+            };
+            proxy.pending_limit_scope = Some(std::sync::Arc::new(
+                crate::backend_pending_limit::BackendPendingScopeBase::new(
+                    proxy.namespace.as_str(),
+                    logical_id,
+                    uid,
+                    proxy.upstream_subset.as_deref(),
+                ),
+            ));
         }
     }
 
