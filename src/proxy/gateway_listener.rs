@@ -1468,12 +1468,7 @@ mod tests {
         );
         assert!(
             state
-                .find_proxy_on_frontend_for_test(
-                    Some("app.example.com"),
-                    "/api",
-                    Some(0),
-                    false,
-                )
+                .find_proxy_on_frontend_for_test(Some("app.example.com"), "/api", Some(0), false,)
                 .is_none(),
             "dedicated bind failure must not remap onto a process-global frontend"
         );
