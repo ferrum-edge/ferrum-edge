@@ -1756,6 +1756,21 @@ pub struct EnvConfig {
     /// How often (in seconds) the DP retries the primary (first) CP URL while
     /// connected to a fallback CP. Default: 300 (5 minutes). 0 = disabled.
     pub dp_cp_failover_primary_retry_secs: u64,
+    /// Maximum age (seconds) of the DP's last **validated and successfully
+    /// applied** CP configuration snapshot, measured on a monotonic clock so a
+    /// wall-clock step cannot extend the window (issue #3726). Once the bound is
+    /// exceeded with no CP connected, readiness degrades and — under the default
+    /// `fail_closed` action — new traffic is refused while already-accepted work
+    /// drains. Heartbeats, reconnects, transport success, rejected snapshots,
+    /// and failed applies never reset the age. Default: 3600 (1 hour).
+    /// `0` = disabled (unbounded serving of last-known-good config).
+    pub dp_config_max_stale_seconds: u64,
+    /// What the DP does for NEW traffic once `dp_config_max_stale_seconds` is
+    /// exceeded: `fail_closed` (default — degrade readiness and refuse new
+    /// request/connection admissions) or `readiness_only` (explicitly named
+    /// compatibility mode that degrades readiness only). Parsed into
+    /// [`crate::dp_config_freshness::StaleAction`] by `validate()`.
+    pub dp_config_stale_action: String,
     /// Allow plaintext (non-TLS) CP/DP gRPC config sync on a non-loopback
     /// address. Off by default (secure-by-default): the CP gRPC listener refuses
     /// to bind a non-loopback address without TLS, and the DP rejects a
@@ -1822,11 +1837,49 @@ pub struct EnvConfig {
     /// Capacity of the per-ADS-stream response queue between the request
     /// reader task and tonic response stream. Default: 32.
     pub xds_stream_channel_capacity: usize,
-    /// Maximum concurrent ADS streams the CP admits per node id. A DP keeps a
-    /// single stream; the default headroom tolerates brief reconnect overlap.
-    /// `0` disables the cap. Only meaningful when `xds_enabled` is true.
+    /// Maximum concurrent ADS streams the CP admits per node state key
+    /// (namespace + authenticated principal + `Node.id`). A DP keeps a single
+    /// stream; the default headroom tolerates brief reconnect overlap. `0`
+    /// disables the cap. Only meaningful when `xds_enabled` is true.
     /// Default: 4.
     pub xds_max_streams_per_node: usize,
+    /// Maximum total concurrent ADS streams for this CP process, across SotW
+    /// and Delta and every namespace/principal/node. The outermost admission
+    /// budget: it bounds relay tasks, response channels, filtered config
+    /// snapshots, and broadcast subscribers regardless of how many unique
+    /// `Node.id` values a client invents. `0` disables the cap (refused under
+    /// production posture). Default: 1024.
+    pub xds_max_total_streams: usize,
+    /// Maximum concurrent ADS streams per namespace/tenant. `0` disables the
+    /// cap (refused under production posture). Default: 512.
+    pub xds_max_streams_per_namespace: usize,
+    /// Maximum concurrent ADS streams per authenticated principal (JWT `sub`).
+    /// Fleets that share one credential across every DP present a single
+    /// principal, so the default is deliberately generous. `0` disables the cap
+    /// (refused under production posture). Default: 256.
+    pub xds_max_streams_per_principal: usize,
+    /// Maximum distinct node state keys with at least one active ADS stream.
+    /// Bounds the node-scoped snapshot/nonce/identity/waypoint/scoping maps.
+    /// A state key exists only while a stream holds it, so this only binds
+    /// below `xds_max_total_streams` (or when that budget is unbounded); at the
+    /// defaults the total-stream budget saturates first. `0` disables the cap
+    /// (refused under production posture). Default: 2048.
+    pub xds_max_active_nodes: usize,
+    /// Maximum accepted `Node.id` length in UTF-8 bytes. Longer ids are refused
+    /// with `INVALID_ARGUMENT` before the value is cloned, stored, or logged.
+    /// `0` disables the ceiling (refused under production posture).
+    /// Default: 253 (the DNS name ceiling).
+    pub xds_max_node_id_bytes: usize,
+    /// Deadline, in seconds, for an admitted ADS stream to send its first
+    /// request and identify a node. A stream that misses it is closed with
+    /// `DEADLINE_EXCEEDED` so a stalled peer cannot park a task, a channel, and
+    /// an admission permit indefinitely. `0` disables the deadline (refused
+    /// under production posture). Default: 30.
+    pub xds_first_request_timeout_seconds: u64,
+    /// Visibly unsafe override that permits `0` (unbounded) ADS admission
+    /// budgets under `FERRUM_MESH_PRODUCTION_MODE=true`. Startup warns loudly
+    /// whenever any scope is unbounded. Default: false.
+    pub xds_allow_unbounded_stream_limits: bool,
     /// Mesh CA backend. `internal` uses Ferrum's own CA (root cert+key on
     /// disk); `spire` delegates to a SPIRE Agent over UDS; `none` (default)
     /// disables mesh identity features.
@@ -1868,6 +1921,54 @@ pub struct EnvConfig {
     /// that matches no rule is refused: the Workload API never assigns an
     /// identity it was not told to assign.
     pub mesh_workload_api_unix_identity_rules: Vec<String>,
+    /// Simultaneously accepted Workload API connections across all peers
+    /// (issue #3758). Enforced before the accepted socket reaches tonic, so a
+    /// refused connection allocates no HTTP/2 or RPC state. Minimum
+    /// [`crate::identity::workload_api::admission::MIN_MAX_CONNECTIONS`] (**2**),
+    /// hard ceiling
+    /// [`crate::identity::workload_api::admission::MAX_CONNECTIONS_CEILING`].
+    /// Both `0` and `1` are refused: `0` is not an "unbounded" spelling, and `1`
+    /// cannot satisfy the strictly-below per-UID quota rule, so a globally fair
+    /// transport needs room for at least two connections.
+    pub mesh_workload_api_max_connections: usize,
+    /// Simultaneously accepted Workload API connections per kernel-attested
+    /// peer UID. Keeps one compromised member of the socket group from
+    /// consuming the whole global pool and denying identity issuance to every
+    /// other workload on the node. Must be **strictly below**
+    /// `mesh_workload_api_max_connections`: a quota equal to the global ceiling
+    /// lets one UID hold every connection and is not a fair share.
+    pub mesh_workload_api_max_connections_per_uid: usize,
+    /// HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS` advertised on each Workload API
+    /// connection, and the per-connection request-concurrency limit paired with
+    /// load shedding (reject, never queue).
+    pub mesh_workload_api_max_concurrent_streams: u32,
+    /// Service-wide concurrently admitted Workload API RPCs. Bounds the product
+    /// of the connection and stream ceilings; a call over the limit is shed with
+    /// `RESOURCE_EXHAUSTED` before attestation, CA work, or any producer task.
+    /// A **streaming** RPC holds its permit for the whole life of its response
+    /// stream, so this bounds concurrently open Workload API streams rather than
+    /// request rate.
+    pub mesh_workload_api_max_concurrent_rpcs: usize,
+    /// Concurrently admitted Workload API RPCs per kernel-attested peer UID.
+    /// Keeps one socket-group member from occupying every RPC permit — which the
+    /// per-connection quota alone does not prevent, since the bundle RPCs need
+    /// only the mandatory metadata header — and so denying SVID renewal to every
+    /// other workload on the node. Must be **strictly below**
+    /// `mesh_workload_api_max_concurrent_rpcs`.
+    pub mesh_workload_api_max_concurrent_rpcs_per_uid: usize,
+    /// Seconds a newly admitted Workload API connection may go without sending
+    /// its first byte. Bounds the connect-and-say-nothing flood a per-request
+    /// timeout cannot see.
+    pub mesh_workload_api_initial_connection_timeout_seconds: u64,
+    /// Seconds a Workload API connection may go without a byte **read from the
+    /// peer**. HTTP/2 keepalive is derived from this, so a live long-lived
+    /// rotation stream is refreshed by PING ACKs while a peer that has stopped
+    /// participating is closed.
+    pub mesh_workload_api_idle_timeout_seconds: u64,
+    /// Seconds the Workload API listener drains gracefully at shutdown before
+    /// remaining connections are force-closed. Admission stops immediately;
+    /// this bounds only the drain.
+    pub mesh_workload_api_shutdown_grace_seconds: u64,
     /// Mesh runtime config source. `native` consumes Ferrum MeshSubscribe;
     /// `xds` consumes the Ferrum-private ADS profile; `file` loads a localized
     /// mesh config document from `FERRUM_MESH_FILE_CONFIG_PATH` (no control
@@ -3251,6 +3352,8 @@ impl Default for EnvConfig {
             dp_cp_grpc_token_file: None,
             dp_cp_grpc_urls: Vec::new(),
             dp_cp_failover_primary_retry_secs: 300,
+            dp_config_max_stale_seconds: 3600,
+            dp_config_stale_action: "fail_closed".to_string(),
             cp_dp_grpc_allow_plaintext: false,
             cp_grpc_tls_cert_path: None,
             cp_grpc_tls_key_path: None,
@@ -3262,7 +3365,17 @@ impl Default for EnvConfig {
             cp_require_namespace_claim: false,
             xds_enabled: false,
             xds_stream_channel_capacity: 32,
-            xds_max_streams_per_node: 4,
+            xds_max_streams_per_node: crate::xds::admission::DEFAULT_XDS_MAX_STREAMS_PER_NODE,
+            xds_max_total_streams: crate::xds::admission::DEFAULT_XDS_MAX_TOTAL_STREAMS,
+            xds_max_streams_per_namespace:
+                crate::xds::admission::DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE,
+            xds_max_streams_per_principal:
+                crate::xds::admission::DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL,
+            xds_max_active_nodes: crate::xds::admission::DEFAULT_XDS_MAX_ACTIVE_NODES,
+            xds_max_node_id_bytes: crate::xds::admission::DEFAULT_XDS_MAX_NODE_ID_BYTES,
+            xds_first_request_timeout_seconds:
+                crate::xds::admission::DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS,
+            xds_allow_unbounded_stream_limits: false,
             mesh_ca_backend: "none".to_string(),
             mesh_spire_agent_socket: "/run/spire/sockets/agent.sock".to_string(),
             mesh_cert_ttl_seconds: 3600,
@@ -3274,6 +3387,19 @@ impl Default for EnvConfig {
             mesh_jwt_svid_ttl_seconds: 300,
             mesh_jwt_key_lifetime_seconds: 0,
             mesh_workload_api_unix_identity_rules: Vec::new(),
+            mesh_workload_api_max_connections:
+                crate::identity::workload_api::admission::DEFAULT_MAX_CONNECTIONS,
+            mesh_workload_api_max_connections_per_uid:
+                crate::identity::workload_api::admission::DEFAULT_MAX_CONNECTIONS_PER_UID,
+            mesh_workload_api_max_concurrent_streams:
+                crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_STREAMS,
+            mesh_workload_api_max_concurrent_rpcs:
+                crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_RPCS,
+            mesh_workload_api_max_concurrent_rpcs_per_uid:
+                crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_RPCS_PER_UID,
+            mesh_workload_api_initial_connection_timeout_seconds: 10,
+            mesh_workload_api_idle_timeout_seconds: 900,
+            mesh_workload_api_shutdown_grace_seconds: 10,
             mesh_config_protocol: "native".to_string(),
             mesh_file_config_path: None,
             mesh_trust_domain_aliases: Vec::new(),
@@ -3789,6 +3915,10 @@ impl EnvConfig {
             dp_cp_grpc_token_file: Option<String> = "FERRUM_DP_CP_GRPC_TOKEN_FILE";
             dp_cp_grpc_urls: Vec<String> = "FERRUM_DP_CP_GRPC_URLS" => Vec::new();
             dp_cp_failover_primary_retry_secs: u64 = "FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS" => 300u64;
+            // Bounded last-known-good config age (issue #3726). Nonzero by
+            // default: an unbounded window is opt-in, never the silent default.
+            dp_config_max_stale_seconds: u64 = "FERRUM_DP_CONFIG_MAX_STALE_SECONDS" => 3600u64;
+            dp_config_stale_action: String = "FERRUM_DP_CONFIG_STALE_ACTION" => "fail_closed".to_string();
             cp_dp_grpc_allow_plaintext: bool = "FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT" => false;
             cp_grpc_tls_cert_path: Option<String> = "FERRUM_CP_GRPC_TLS_CERT_PATH";
             cp_grpc_tls_key_path: Option<String> = "FERRUM_CP_GRPC_TLS_KEY_PATH";
@@ -3800,7 +3930,14 @@ impl EnvConfig {
             cp_require_namespace_claim: bool = "FERRUM_CP_REQUIRE_NAMESPACE_CLAIM" => false;
             xds_enabled: bool = "FERRUM_XDS_ENABLED" => false;
             xds_stream_channel_capacity: usize = "FERRUM_XDS_STREAM_CHANNEL_CAPACITY" => 32usize;
-            xds_max_streams_per_node: usize = "FERRUM_XDS_MAX_STREAMS_PER_NODE" => 4usize;
+            xds_max_streams_per_node: usize = "FERRUM_XDS_MAX_STREAMS_PER_NODE" => crate::xds::admission::DEFAULT_XDS_MAX_STREAMS_PER_NODE;
+            xds_max_total_streams: usize = "FERRUM_XDS_MAX_TOTAL_STREAMS" => crate::xds::admission::DEFAULT_XDS_MAX_TOTAL_STREAMS;
+            xds_max_streams_per_namespace: usize = "FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE" => crate::xds::admission::DEFAULT_XDS_MAX_STREAMS_PER_NAMESPACE;
+            xds_max_streams_per_principal: usize = "FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL" => crate::xds::admission::DEFAULT_XDS_MAX_STREAMS_PER_PRINCIPAL;
+            xds_max_active_nodes: usize = "FERRUM_XDS_MAX_ACTIVE_NODES" => crate::xds::admission::DEFAULT_XDS_MAX_ACTIVE_NODES;
+            xds_max_node_id_bytes: usize = "FERRUM_XDS_MAX_NODE_ID_BYTES" => crate::xds::admission::DEFAULT_XDS_MAX_NODE_ID_BYTES;
+            xds_first_request_timeout_seconds: u64 = "FERRUM_XDS_FIRST_REQUEST_TIMEOUT_SECONDS" => crate::xds::admission::DEFAULT_XDS_FIRST_REQUEST_TIMEOUT_SECS;
+            xds_allow_unbounded_stream_limits: bool = "FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS" => false;
             mesh_ca_backend: String = "FERRUM_MESH_CA_BACKEND" => "none".to_string();
             mesh_spire_agent_socket: String = "FERRUM_MESH_SPIRE_AGENT_SOCKET" => "/run/spire/sockets/agent.sock".to_string();
             mesh_cert_ttl_seconds: u64 = "FERRUM_MESH_CERT_TTL_SECONDS" => 3600u64;
@@ -3811,6 +3948,14 @@ impl EnvConfig {
             mesh_jwt_svid_ttl_seconds: u64 = "FERRUM_MESH_JWT_SVID_TTL_SECONDS" => 300u64;
             mesh_jwt_key_lifetime_seconds: u64 = "FERRUM_MESH_JWT_KEY_LIFETIME_SECONDS" => 0u64;
             mesh_workload_api_unix_identity_rules: Vec<String> = "FERRUM_MESH_WORKLOAD_API_UNIX_IDENTITY_RULES" => Vec::new();
+            mesh_workload_api_max_connections: usize = "FERRUM_MESH_WORKLOAD_API_MAX_CONNECTIONS" => crate::identity::workload_api::admission::DEFAULT_MAX_CONNECTIONS;
+            mesh_workload_api_max_connections_per_uid: usize = "FERRUM_MESH_WORKLOAD_API_MAX_CONNECTIONS_PER_UID" => crate::identity::workload_api::admission::DEFAULT_MAX_CONNECTIONS_PER_UID;
+            mesh_workload_api_max_concurrent_streams: u32 = "FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_STREAMS" => crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_STREAMS;
+            mesh_workload_api_max_concurrent_rpcs: usize = "FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_RPCS" => crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_RPCS;
+            mesh_workload_api_max_concurrent_rpcs_per_uid: usize = "FERRUM_MESH_WORKLOAD_API_MAX_CONCURRENT_RPCS_PER_UID" => crate::identity::workload_api::admission::DEFAULT_MAX_CONCURRENT_RPCS_PER_UID;
+            mesh_workload_api_initial_connection_timeout_seconds: u64 = "FERRUM_MESH_WORKLOAD_API_INITIAL_CONNECTION_TIMEOUT_SECONDS" => 10u64;
+            mesh_workload_api_idle_timeout_seconds: u64 = "FERRUM_MESH_WORKLOAD_API_IDLE_TIMEOUT_SECONDS" => 900u64;
+            mesh_workload_api_shutdown_grace_seconds: u64 = "FERRUM_MESH_WORKLOAD_API_SHUTDOWN_GRACE_SECONDS" => 10u64;
             mesh_config_protocol: String = "FERRUM_MESH_CONFIG_PROTOCOL" => "native".to_string();
             mesh_file_config_path: Option<String> = "FERRUM_MESH_FILE_CONFIG_PATH";
             mesh_trust_domain_aliases: Vec<String> = "FERRUM_MESH_TRUST_DOMAIN_ALIASES" => Vec::new();
@@ -4574,6 +4719,8 @@ impl EnvConfig {
             dp_cp_grpc_token_file,
             dp_cp_grpc_urls,
             dp_cp_failover_primary_retry_secs,
+            dp_config_max_stale_seconds,
+            dp_config_stale_action,
             cp_dp_grpc_allow_plaintext,
             cp_grpc_tls_cert_path,
             cp_grpc_tls_key_path,
@@ -4586,6 +4733,13 @@ impl EnvConfig {
             xds_enabled,
             xds_stream_channel_capacity,
             xds_max_streams_per_node,
+            xds_max_total_streams,
+            xds_max_streams_per_namespace,
+            xds_max_streams_per_principal,
+            xds_max_active_nodes,
+            xds_max_node_id_bytes,
+            xds_first_request_timeout_seconds,
+            xds_allow_unbounded_stream_limits,
             mesh_ca_backend,
             mesh_spire_agent_socket,
             mesh_cert_ttl_seconds,
@@ -4596,6 +4750,14 @@ impl EnvConfig {
             mesh_jwt_svid_ttl_seconds,
             mesh_jwt_key_lifetime_seconds,
             mesh_workload_api_unix_identity_rules,
+            mesh_workload_api_max_connections,
+            mesh_workload_api_max_connections_per_uid,
+            mesh_workload_api_max_concurrent_streams,
+            mesh_workload_api_max_concurrent_rpcs,
+            mesh_workload_api_max_concurrent_rpcs_per_uid,
+            mesh_workload_api_initial_connection_timeout_seconds,
+            mesh_workload_api_idle_timeout_seconds,
+            mesh_workload_api_shutdown_grace_seconds,
             mesh_config_protocol,
             mesh_file_config_path,
             mesh_trust_domain_aliases,
@@ -4878,6 +5040,20 @@ impl EnvConfig {
             loop_warn_us: self.overload_loop_warn_us,
             loop_critical_us: self.overload_loop_critical_us,
         }
+    }
+
+    /// Parsed `FERRUM_DP_CONFIG_STALE_ACTION` (issue #3726). An unrecognized
+    /// value is an error, never a silent downgrade to the weaker mode.
+    pub fn dp_config_stale_action_parsed(
+        &self,
+    ) -> Result<crate::dp_config_freshness::StaleAction, String> {
+        crate::dp_config_freshness::StaleAction::parse(&self.dp_config_stale_action)
+    }
+
+    /// Configured maximum age of the DP's applied config snapshot.
+    /// `Duration::ZERO` means the bound is disabled.
+    pub fn dp_config_max_stale(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.dp_config_max_stale_seconds)
     }
 
     pub fn proxy_socket_addr(&self, port: u16) -> std::net::SocketAddr {
@@ -5849,6 +6025,9 @@ impl EnvConfig {
                 if self.dp_cp_grpc_urls.is_empty() {
                     return Err("FERRUM_DP_CP_GRPC_URLS is required in dp mode".into());
                 }
+                // Fail closed on a typo'd stale action rather than silently
+                // falling back to the weaker readiness-only behavior (#3726).
+                self.dp_config_stale_action_parsed()?;
             }
             OperatingMode::Mesh => {
                 // Validate the protocol value before the per-protocol CP
@@ -6024,6 +6203,16 @@ impl EnvConfig {
                     socket.validate().map_err(|e| {
                         format!("Invalid FERRUM_MESH_WORKLOAD_API_SOCKET_PATH: {e}")
                     })?;
+
+                    // Transport admission limits (issue #3758). Validated
+                    // through the same policy the listener enforces, so
+                    // `validate` and mesh startup cannot disagree about what a
+                    // bounded Workload API transport is. Refused rather than
+                    // clamped: a limit the operator set and a limit the process
+                    // enforces must be the same number.
+                    self.mesh_workload_api_admission_config()
+                        .validate()
+                        .map_err(|e| e.to_string())?;
 
                     // Parse the attestor configuration through the same
                     // identity-layer parser startup uses. This stays after the
@@ -6660,6 +6849,9 @@ impl EnvConfig {
         // Bounded pre-authentication admission on the CP gRPC listener.
         self.validate_cp_grpc_connection_limits()?;
 
+        // Bounded post-authentication ADS admission (issue #3741).
+        self.validate_xds_admission_limits()?;
+
         // The forwarding trust boundary is parsed strictly here so a typo fails
         // `ferrum-edge validate` and fails startup before any listener binds,
         // rather than quietly shrinking the trust set at runtime.
@@ -6746,6 +6938,58 @@ impl EnvConfig {
         Ok(())
     }
 
+    /// The xDS ADS admission budgets this configuration resolves to
+    /// (issue #3741). Shared by `ferrum-edge validate` and CP startup so the
+    /// two can never disagree about what the CP will actually enforce.
+    pub fn xds_admission_limits(&self) -> crate::xds::admission::XdsAdmissionLimits {
+        crate::xds::admission::XdsAdmissionLimits {
+            max_total_streams: self.xds_max_total_streams,
+            max_streams_per_namespace: self.xds_max_streams_per_namespace,
+            max_streams_per_principal: self.xds_max_streams_per_principal,
+            max_streams_per_node: self.xds_max_streams_per_node,
+            max_active_nodes: self.xds_max_active_nodes,
+            max_node_id_bytes: self.xds_max_node_id_bytes,
+            first_request_timeout: std::time::Duration::from_secs(
+                self.xds_first_request_timeout_seconds,
+            ),
+        }
+    }
+
+    /// Refuse silently unbounded ADS admission budgets under production mesh
+    /// posture (issue #3741).
+    ///
+    /// `0` on any ADS budget means "unbounded", which is exactly the posture
+    /// that let one authenticated bearer exhaust CP tasks, channels, snapshot
+    /// memory, and broadcast subscribers by cycling `Node.id` values. Under
+    /// `FERRUM_MESH_PRODUCTION_MODE=true` that requires the visibly unsafe
+    /// `FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true` acknowledgement; outside
+    /// production it is permitted and warned about at startup.
+    ///
+    /// Only meaningful when `FERRUM_XDS_ENABLED=true`: a CP that never mounts
+    /// ADS enforces nothing here, so an unused value must not fail validation.
+    pub fn validate_xds_admission_limits(&self) -> Result<(), String> {
+        if !self.xds_enabled {
+            return Ok(());
+        }
+        let limits = self.xds_admission_limits();
+        let unbounded = limits.unbounded_scope_names();
+        if unbounded.is_empty() {
+            return Ok(());
+        }
+        if !crate::identity::production_mode() || self.xds_allow_unbounded_stream_limits {
+            return Ok(());
+        }
+        Err(format!(
+            "FERRUM_MESH_PRODUCTION_MODE=true with FERRUM_XDS_ENABLED=true refuses unbounded xDS \
+             admission budgets, but these are set to 0 (unbounded): {}. A 0 value removes an \
+             aggregate DoS boundary: one authenticated bearer can then exhaust control-plane \
+             tasks, response channels, filtered config snapshots, and broadcast subscribers by \
+             cycling arbitrary Node.id values. Set finite values, or set \
+             FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS=true to accept the risk explicitly.",
+            unbounded.join(", ")
+        ))
+    }
+
     /// Resolve the CP gRPC listen address: an explicit
     /// `FERRUM_CP_GRPC_LISTEN_ADDR`, else the hardcoded `0.0.0.0:50051` default.
     /// The default is deliberately NOT derived from `admin_bind_address` (which
@@ -6802,6 +7046,28 @@ impl EnvConfig {
          once the verification overlap has elapsed. Generating a replacement in process would \
          give every replica a different key and lose the signer of every still-live token on \
          restart";
+
+    /// The Workload API transport-admission limits these settings describe
+    /// (issue #3758).
+    ///
+    /// One projection shared by `validate` and mesh startup, so the limits an
+    /// operator is told are acceptable are exactly the limits the listener
+    /// enforces. Ceilings are applied inside the admission layer as well, so a
+    /// caller that reaches it another way still cannot exceed one.
+    pub fn mesh_workload_api_admission_config(
+        &self,
+    ) -> crate::identity::workload_api::WorkloadApiAdmissionConfig {
+        crate::identity::workload_api::WorkloadApiAdmissionConfig::from_settings(
+            self.mesh_workload_api_max_connections,
+            self.mesh_workload_api_max_connections_per_uid,
+            self.mesh_workload_api_max_concurrent_streams,
+            self.mesh_workload_api_max_concurrent_rpcs,
+            self.mesh_workload_api_max_concurrent_rpcs_per_uid,
+            self.mesh_workload_api_initial_connection_timeout_seconds,
+            self.mesh_workload_api_idle_timeout_seconds,
+            self.mesh_workload_api_shutdown_grace_seconds,
+        )
+    }
 
     /// Enforce the JWT-SVID signing-material and rotation contract (issue #3617).
     ///

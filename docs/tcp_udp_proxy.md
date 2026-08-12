@@ -806,7 +806,11 @@ downstream behaviour:
   issue #3288) — one transparent socket in the mesh proxy's own namespace, with
   `mangle PREROUTING` rules scoped per enrolled pod's host-side interface and each
   datagram attributed to a pod by that interface plus its registered source
-  address.
+  address. The production datapath is live-gated by the required
+  `ambient-host-udp-live` workflow (#3705): real TPROXY delivery, `IP_PKTINFO` /
+  `IPV6_PKTINFO` ingress ifindex attribution, dual-stack original-destination
+  recovery, transparent replies, multi-veth identity isolation, and exact
+  Ferrum-owned cleanup under `FERRUM_LIVE_TESTS_REQUIRED=1`.
 
 See [mesh.md](mesh.md) → "UDP TPROXY capture" and "Host-network UDP capture" for
 the capture rules, identity model, fail-closed contract, and the mandatory

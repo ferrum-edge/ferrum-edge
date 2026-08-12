@@ -2124,6 +2124,32 @@ pub async fn run(
     }
     let xds_server = if env_config.xds_enabled {
         info!("FERRUM_XDS_ENABLED=true — mounting xDS ADS on the CP gRPC listener");
+        let xds_admission_limits = env_config.xds_admission_limits();
+        let unbounded_xds_scopes = xds_admission_limits.unbounded_scope_names();
+        if unbounded_xds_scopes.is_empty() {
+            info!(
+                max_total_streams = xds_admission_limits.max_total_streams,
+                max_streams_per_namespace = xds_admission_limits.max_streams_per_namespace,
+                max_streams_per_principal = xds_admission_limits.max_streams_per_principal,
+                max_streams_per_node = xds_admission_limits.max_streams_per_node,
+                max_active_nodes = xds_admission_limits.max_active_nodes,
+                max_node_id_bytes = xds_admission_limits.max_node_id_bytes,
+                first_request_timeout_seconds =
+                    xds_admission_limits.first_request_timeout.as_secs(),
+                "xDS ADS admission budgets active"
+            );
+        } else {
+            // `EnvConfig::validate()` already refused this combination under
+            // production posture unless the operator set the explicit unsafe
+            // override, so reaching here is either dev/test or an acknowledged
+            // risk. Either way it stays loud.
+            warn!(
+                unbounded_scopes = %unbounded_xds_scopes.join(", "),
+                "xDS ADS admission has unbounded (0) budgets: one authenticated bearer can \
+                 exhaust control-plane tasks, channels, and snapshot memory by cycling Node.id \
+                 values. Set finite values for production."
+            );
+        }
         Some(
             XdsAdsServer::with_sidecar_enforcement(
                 config_arc.clone(),
@@ -2141,7 +2167,7 @@ pub async fn run(
             .with_scope(cp_scope.clone())
             .with_require_namespace_claim(env_config.cp_require_namespace_claim)
             .with_namespace_broadcasts(broadcasts.clone())
-            .with_max_streams_per_node(env_config.xds_max_streams_per_node),
+            .with_admission_limits(xds_admission_limits),
         )
     } else {
         None

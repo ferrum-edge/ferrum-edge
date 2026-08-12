@@ -41,6 +41,7 @@ adding, removing, or materially changing a workflow.
 | `gateway-api-conformance.yml` | Gateway API Conformance | PRs, `merge_group`, push to `main`, weekly schedule, manual | Upstream Gateway API conformance lab; `Gateway API Conformance` is directly required on PRs and merge-queue groups. |
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs and merge-queue groups. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main`, `merge_group` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface on PRs; merge-group mode verifies the synthesized combined SHA with `contents: read` only. `Trusted Cross Build Policy` is directly required. |
+| `ambient-host-udp-live.yml` | Ambient Host UDP Live Kernel | Every PR, `merge_group`, manual | Privileged live-kernel gate for Ambient host-network UDP capture (`ProxyHostUdpBackend`), plus a production-image contract job that proves the chart-selected `-ebpf-tools` runtime can execute the shell/iptables tool set while `-ebpf` stays distroless; relevance is decided by a trusted-base classifier and `Ambient Host UDP Live` reports on every run. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
 | `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, `merge_group`, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs and merge-queue groups. |
 | `multicluster-poller-partition-live.yml` | Multicluster Poller Partition Live | PRs, `merge_group`, push to `main`, manual | Release-blocking two-CP/two-DP trust/discovery partition and bounded last-good-retention validation; `Multicluster Poller Partition Live` is directly required. |
@@ -81,7 +82,8 @@ Pull Request / Merge Queue group
             ├─► Gateway API Conformance
             ├─► Mesh E2E Sidecar Live
             ├─► Multicluster Federation Live
-            └─► Multicluster Poller Partition Live
+            ├─► Multicluster Poller Partition Live
+            └─► Ambient Host UDP Live
 
 Push to main
     ├─► Full required validation gate
@@ -107,6 +109,7 @@ app id `15368`):
 | `Trusted Cross Build Policy` | `.github/workflows/cross-build-policy.yml` | `verify` |
 | `Multicluster Federation Live` | `.github/workflows/multicluster-federation-live.yml` | `gate` |
 | `Multicluster Poller Partition Live` | `.github/workflows/multicluster-poller-partition-live.yml` | `gate` |
+| `Ambient Host UDP Live` | `.github/workflows/ambient-host-udp-live.yml` | `gate` |
 
 Each owner declares a `merge_group` (`types: [checks_requested]`) trigger in
 addition to its existing `pull_request` / `pull_request_target` / `push` /
@@ -325,13 +328,14 @@ and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
 
-Branch protection must require seven independent PR **and** merge-queue checks:
+Branch protection must require eight independent PR **and** merge-queue checks:
 the unchanged `Tests` aggregate from `ci.yml`, `Merge Coverage` from
 `coverage.yml`, `Gateway API Conformance` from `gateway-api-conformance.yml`,
 `Mesh E2E Sidecar Live` from `mesh-e2e-sidecar-live.yml`,
 `Multicluster Federation Live` from `multicluster-federation-live.yml`,
 `Multicluster Poller Partition Live` from
-`multicluster-poller-partition-live.yml`, and
+`multicluster-poller-partition-live.yml`,
+`Ambient Host UDP Live` from `ambient-host-udp-live.yml`, and
 `Trusted Cross Build Policy` from `cross-build-policy.yml`. Each dedicated
 workflow triggers on every pull request and on `merge_group`, and fails closed
 on planning or validation failures. They are required directly rather than
@@ -533,6 +537,104 @@ observational while NodeWaypoint remains Experimental; they are not part of the
 release-blocking sidecar GA contract. The workflow uploads Kubernetes
 diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 `bpftool` evidence with 14-day retention.
+
+#### 5b. Ambient Host-Network UDP Live-Kernel Workflow
+
+**Runs**: `ubuntu-24.04`
+
+`ambient-host-udp-live` triggers on **every** pull request and merge-group run —
+it carries no top-level `paths:` filter, because a required check that can
+disappear cannot be relied on. A `changes` job instead decides relevance from
+the **base branch's** copy of `.github/scripts/live_suite_path_filter.py`, read
+by pinned object id at one immutable trusted commit and executed under an
+isolated interpreter, so a pull request can never widen its own suite patterns
+to declare itself irrelevant. The live job runs only when that verdict is
+`true`, and the `if: always()` final gate `Ambient Host UDP Live` reports on
+every run: green when the suite passed or was legitimately irrelevant, red when
+a relevant live job failed or was unexpectedly absent. Every checkout, parsing,
+or classifier error fails closed.
+
+One narrow bootstrap exception exists for the pull request that introduces the
+suite: `origin/main` does not yet list `ambient-host-udp` among the classifier's
+`--suite` choices, so the trusted classifier rejects it with argparse's exact
+`invalid choice: 'ambient-host-udp'`. Only that exact rejection forces
+`relevant=true`, so the introducing pull request still runs the live suite
+rather than deferring it to a future merge; every other classifier failure still
+exits non-zero. Once `main` carries the suite the branch is unreachable and
+ordinary trusted-base classification applies. The required-CI verifier pins
+the workflow's unconditional pull-request / merge-group ownership and exact
+`Ambient Host UDP Live` context. The separately trusted cross-build verifier
+cannot be changed by a pull request, so the introducing bootstrap is also an
+explicit root-review boundary rather than a self-authorizing verifier change.
+
+**Required follow-up: freeze this gate's relevance job.** The other three
+required live gates (`mesh-e2e-sidecar-live.yml`,
+`multicluster-federation-live.yml`, `multicluster-poller-partition-live.yml`)
+have their `changes` job frozen byte-for-byte by
+`LIVE_SUITE_RELEVANCE_CONTRACTS` in `.github/scripts/verify_cross_build_policy.py`,
+together with the live job's `needs`/`if` binding — the only freeze a pull
+request cannot edit, because that verifier runs from the trusted base.
+`ambient-host-udp-live.yml` is **not yet** in that set, and it cannot be added
+by the pull request that introduces it: the trusted base still runs the
+three-entry contract, and the bootstrap block above makes this workflow's
+`changes` job differ from `LIVE_SUITE_RELEVANCE_JOB_TEMPLATE`, so adding the
+entry here would turn `Trusted Cross Build Policy` red on `main` immediately
+after merge. Until the follow-up lands, `Ambient Host UDP Live` is the one
+required live gate whose relevance verdict and live-job binding a later pull
+request could rewrite — note that `verify_required_ci.py` runs from the pull
+request's own checkout in `ci.yml` and is therefore a consistency check, not a
+trust boundary. Once `main` carries the `ambient-host-udp` suite, a follow-up
+pull request must (1) delete the bootstrap exception so the `changes` job is
+byte-identical to the template and (2) add
+`"ambient-host-udp-live.yml": ("changes", "ambient-host-udp-live", "Ambient host-UDP trigger", "ambient-host-udp", "ambient-host-udp")`
+to `LIVE_SUITE_RELEVANCE_CONTRACTS`. Both halves must land in the **same** pull
+request. That pull request's own gate still runs the trusted base's three-entry
+contract and so cannot see the mismatch; if the entry merged without the
+bootstrap removal, `main` would then hold a contract its own workflow violates
+and every subsequent pull request's `Trusted Cross Build Policy` would fail.
+Removing the bootstrap on its own is safe but leaves the gate unfrozen, which is
+the state this note exists to close.
+
+The relevant surfaces are host-UDP capture, mesh UDP serving, capture plan
+generators, Ambient mesh serving, Helm mesh charts, the `Dockerfile` and its
+runtime tool staging, the release publication workflow, the live fixture, and
+related docs. When relevant, the job builds the lib and functional test binaries
+(without running them as the invoking user), preflights `unshare` /
+`iptables` / `ip6tables` / TPROXY primitives, then runs
+`tests/k8s/ambient_host_udp_live/run.sh` as root with
+`FERRUM_LIVE_TESTS_REQUIRED=1`. The fixture exercises the production
+`ProxyHostUdpBackend` path: multi-veth dual-stack TPROXY delivery, original
+destination recovery, ingress-ifindex attribution, transparent replies,
+restart/cleanup ownership, and explicit negative cases. Skips under required
+mode are hard failures. Bounded redacted diagnostics are uploaded with 14-day
+retention.
+
+A second required-gate job, **Ambient host-UDP production image contract**,
+covers the boundary the live-kernel job structurally cannot. That job runs
+prebuilt test binaries directly on the hosted runner, so it proves the RUNNER
+has `ip`/`iptables`/`ip6tables` — not that the image the mesh chart selects
+does. The Ambient UDP lifecycle drives generated `sh -c` iptables/ip6tables
+scripts, so a chart that selected a distroless image would render a pod that
+could not run the very backend the live gate validates, with CI still green.
+The image job therefore:
+
+1. builds `capture-tools-base` first (cheap: apt only), so a broken tool closure
+   fails in about a minute instead of after the Rust and nightly eBPF builds;
+2. builds the exact production target `runtime-ebpf-tools` — the `-ebpf-tools`
+   tag the chart names — and proves inside the container that `/bin/sh`, `ip`,
+   `iptables`, `ip6tables`, `iptables-save`, and `ip6tables-save` all execute,
+   that `ferrum-edge version` runs, and that the BPF ELF is present (so the
+   image really is a superset of `-ebpf`);
+3. builds `runtime-ebpf` and proves from its normalized exported filesystem that
+   it has **not** gained a shell, package manager, `iptables`, `ip6tables`, or
+   `nft`, and has kept its staged `ip`. Without step 3 a later change could
+   "satisfy" this contract by weakening the distroless variant instead.
+
+Full containerized TPROXY execution is deliberately out of scope for this job:
+the datapath needs privileged host-netns manipulation that the live-kernel job
+already performs against the real kernel. The two jobs are complementary — the
+live job proves the datapath, the image job proves the shipped runtime can
+execute it — and the `Ambient Host UDP Live` gate requires both.
 
 #### 6. Performance Regression Job
 
@@ -1545,8 +1647,8 @@ Depends on `Validate release SHA`, then builds optimized release binaries for al
 
 ### Create Release Job
 
-**Depends On**: Release Build Job, Docker Manifest Job, and Docker eBPF Manifest
-Job
+**Depends On**: Release Build Job, Docker Manifest Job, Docker eBPF Manifest
+Job, and Docker eBPF Tools Manifest Job
 
 Creates a GitHub Release with all binaries and checksums after the versioned
 Docker manifests have been pushed. Durable release publication still fails
@@ -1884,14 +1986,16 @@ The GHCR path is `ghcr.io/${{ github.repository }}` in the workflows, so it auto
 
 ## Image Signatures, SBOMs, and Provenance
 
-Every version-tag release signs and attests the final standard and `-ebpf`
-multi-architecture image digests in both Docker Hub and GHCR. The per-platform
-push-by-digest builds deliberately retain `provenance: false`: enabling BuildKit
-provenance there turns each platform output into a manifest list and breaks the
-existing `docker buildx imagetools create` assembly contract. The dedicated
-`attest-release-images` job instead runs after both final manifests exist and:
+Every version-tag release signs and attests the final standard, `-ebpf`, and
+`-ebpf-tools` multi-architecture image digests in both Docker Hub and GHCR. The
+per-platform push-by-digest builds deliberately retain `provenance: false`:
+enabling BuildKit provenance there turns each platform output into a manifest
+list and breaks the existing `docker buildx imagetools create` assembly
+contract. The dedicated `attest-release-images` job instead runs after all three
+final manifests exist and:
 
-1. resolves each canonical `vX.Y.Z` / `vX.Y.Z-ebpf` tag to an immutable digest;
+1. resolves each canonical `vX.Y.Z` / `vX.Y.Z-ebpf` / `vX.Y.Z-ebpf-tools` tag to
+   an immutable digest;
 2. requires exactly the `linux/amd64` and `linux/arm64` descriptors and verifies
    that Docker Hub and GHCR contain the same per-platform manifests;
 3. scans each registry's immutable platform images with the digest-pinned Syft
@@ -1905,12 +2009,25 @@ existing `docker buildx imagetools create` assembly contract. The dedicated
    signature, provenance type and source commit, attestation subject digest,
    and at least two non-empty SPDX predicates.
 
-Because trusted Cross freezes `create-release.needs`, GitHub Release creation
-cannot gain a direct attestation dependency from this pull request. The
-`release-attestation-gate` job therefore joins `create-release` with
+`create-release` depends on all three manifest jobs, so the GitHub Release —
+whose notes advertise all three tag families — cannot publish unless every
+advertised manifest exists. It deliberately does **not** depend on
+`attest-release-images`: adding that edge would let a signing failure leave the
+binaries unpublished as well, and the trusted contract rejects it. The
+`release-attestation-gate` job instead joins `create-release` with
 `attest-release-images` under `if: always()`: the release workflow cannot
 succeed unless attestation verification succeeded, and a GitHub Release created
-before attestation finishes is deleted when attestation fails.
+before attestation finishes is deleted when attestation fails. That retraction
+covers the `-ebpf-tools` family exactly like the other two, because a failure in
+any family's resolve/SBOM/sign/verify step fails the whole attestation job.
+
+The `-ebpf-tools` family is a first-class release image family in the trusted
+contracts: `DIGEST_ARTIFACT_OWNERS` owns the `docker-ebpf-tools-digest-*`
+wildcard and assigns it solely to the `docker-ebpf` job that builds both eBPF
+variants from one source tree, and `PUBLISH_ARTIFACT_STEP_CONTRACTS` /
+`PUBLISH_CONTROL_CONTRACTS` freeze that job's tools build, digest export and
+upload steps together with the whole `docker-ebpf-tools-manifest` job — its
+`needs`, its download pattern, its working directory, and every published tag.
 
 The signatures and attestations are stored beside the immutable subject in each
 registry; neither registry is treated as a mutable pointer or as a fallback for
@@ -1924,9 +2041,9 @@ image to remain immutable.
 ### Consumer verification
 
 Install Cosign 3.x and Docker Buildx, then verify an immutable digest rather
-than a tag. Set `IMAGE` to either registry. For the eBPF variant, append
-`-ebpf` to `IMAGE_TAG`; the signing identity still uses the release tag because
-the workflow itself runs at `refs/tags/vX.Y.Z`.
+than a tag. Set `IMAGE` to either registry. For the eBPF variants, append
+`-ebpf` or `-ebpf-tools` to `IMAGE_TAG`; the signing identity still uses the
+release tag because the workflow itself runs at `refs/tags/vX.Y.Z`.
 
 ```bash
 RELEASE_TAG=v1.2.3
@@ -1936,6 +2053,8 @@ IMAGE=ferrumedge/ferrum-edge
 IMAGE_TAG="$RELEASE_TAG"
 # eBPF variant:
 # IMAGE_TAG="${RELEASE_TAG}-ebpf"
+# Ambient UDP lifecycle (tools-capable) variant:
+# IMAGE_TAG="${RELEASE_TAG}-ebpf-tools"
 
 DIGEST="$(
   docker buildx imagetools inspect \

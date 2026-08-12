@@ -26,6 +26,7 @@ pub mod consumer_index;
 pub mod custom_plugins;
 pub mod date_cache;
 pub mod dns;
+pub mod dp_config_freshness;
 pub mod dtls;
 pub mod ebpf;
 pub mod fips;
@@ -97,6 +98,20 @@ pub mod _test_support {
     use crate::modes::mesh::startup_rollback_test_seams as mesh_startup_rollback_seams;
     use crate::modes::node_agent::startup_cleanup_test_seams as node_agent_cleanup_seams;
     use crate::plugins::Plugin;
+
+    /// Release an xDS node permit through the production last-stream cleanup
+    /// fence. The closure runs while same-key registration is excluded, which
+    /// lets external tests prove a departing generation cannot delete its
+    /// successor's node-scoped state.
+    pub fn release_xds_node_with_cleanup_for_test<F>(
+        permit: &mut crate::xds::admission::XdsStreamPermit,
+        cleanup: F,
+    ) -> bool
+    where
+        F: FnOnce(),
+    {
+        permit.release_node_with_cleanup(cleanup)
+    }
 
     pub type TestSemaphorePermit = tokio::sync::OwnedSemaphorePermit;
 

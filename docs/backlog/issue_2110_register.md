@@ -54,7 +54,7 @@ Current mesh HBONE/DNS perf status lives in
 | NodeWaypoint observability + promotion gates | [#3334](https://github.com/ferrum-edge/ferrum-edge/issues/3334) | |
 | Vendored-patch upstream filing / retirement | `docs/vendored-patch-lifecycle.json` + weekly `dependency-audit` | Replaces #3335 as the sole tracker |
 | Mesh/SPIRE CA-health signal + startup contract | [#3608](https://github.com/ferrum-edge/ferrum-edge/issues/3608) | |
-| CNI ferrum-cni chaining uninstall/rollback | [#3609](https://github.com/ferrum-edge/ferrum-edge/issues/3609) | |
+| CNI ferrum-cni chaining uninstall/rollback | [#3609](https://github.com/ferrum-edge/ferrum-edge/issues/3609) | Done — ownership-scoped install/uninstall/rollback, chart pre-delete cleanup, hosted Rust+Helm gates, and live kind lifecycle suite |
 | Cross-region CP failover topology | [#3610](https://github.com/ferrum-edge/ferrum-edge/issues/3610) | |
 | CP/K8s authoritative mesh config revision | [#3611](https://github.com/ferrum-edge/ferrum-edge/issues/3611) | |
 | Gateway API port-aware route representation | [#3612](https://github.com/ferrum-edge/ferrum-edge/issues/3612) | Done — `GatewayApiListenerKey` identity, real per-listener socket binding + reload/withdrawal, per-listener cross-kind retention, and `Conflicted` status for same-port incompatible-shape refusals |

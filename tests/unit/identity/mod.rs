@@ -7,4 +7,5 @@ mod rotation_tests;
 mod spiffe_id_tests;
 mod svid_source_watch_tests;
 mod uri_san_tests;
+mod workload_api_admission_tests;
 mod workload_api_tests;

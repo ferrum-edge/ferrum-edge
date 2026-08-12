@@ -5519,32 +5519,84 @@ async fn functional_mesh_sidecar_egress_grpc_rejects_untrusted_client_gateway() 
     );
 }
 
-/// gRPC fail-closed (Ambient, issue #2003): a captured native-gRPC request to
-/// an HBONE-tagged destination is refused BEFORE any dial with a Trailers-Only
-/// gRPC UNAVAILABLE (HTTP 200 + `grpc-status: 14` in the response HEADERS) —
-/// the HBONE inner protocol is HTTP/1.1 and cannot carry gRPC trailers, and a
-/// direct plaintext dial would silently bypass the mesh transport. The refusal
-/// must never converge to a completed call.
+/// gRPC keystone (Ambient, issue #3728): a captured native-gRPC request at
+/// gateway A on the STANDARD HTTP/1.1+HTTP/2 frontend rides A's authenticated
+/// **HBONE** egress to the gRPC backend behind gateway B, and the backend's REAL
+/// HTTP/2 trailers (`grpc-status`, custom trailer) survive the whole relay back
+/// to point A's client.
+///
+/// This is the exact call that used to be refused pre-dial with a Trailers-Only
+/// UNAVAILABLE on this frontend while the H3 frontend served it. The refusal
+/// described the GENERIC HTTP-family HBONE dispatch, whose inner HTTP/1.1 client
+/// cannot carry gRPC trailers; native gRPC instead runs a nested
+/// `hyper::client::conn::http2` client over the same authenticated CONNECT byte
+/// tunnel, which is why the trailers below arrive as REAL trailers rather than
+/// response headers.
 #[ignore]
 #[tokio::test]
-async fn functional_mesh_ambient_egress_grpc_fails_closed_unavailable() {
+async fn functional_mesh_ambient_egress_grpc_routes_a_to_b_over_hbone_with_trailers() {
     let (resp, logs) = drive_grpc_egress_a_to_b("ambient", true, |resp| {
-        resp.status == 200 && resp.headers.get("grpc-status").map(String::as_str) == Some("14")
+        resp.status == 200
+            && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")
+            && resp
+                .body
+                .windows(b"ferrum-mesh-grpc-payload".len())
+                .any(|w| w == b"ferrum-mesh-grpc-payload")
     })
     .await
-    .expect("ambient gRPC fail-closed drive");
+    .expect("ambient gRPC egress drive");
     assert_eq!(
         resp.status, 200,
-        "the HBONE gRPC refusal rides HTTP 200 Trailers-Only encoding: {resp:?}\n{logs}"
+        "the captured gRPC request must traverse A's HBONE egress to B's gRPC backend: {resp:?}\n{logs}"
     );
     assert_eq!(
-        resp.headers.get("grpc-status").map(String::as_str),
-        Some("14"),
-        "gRPC to an HBONE-tagged target must fail closed with UNAVAILABLE: {resp:?}\n{logs}"
+        resp.trailers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "the backend's grpc-status TRAILER must survive the nested HTTP/2 connection \
+         inside the HBONE tunnel: {resp:?}\n{logs}"
+    );
+    assert_eq!(
+        resp.trailers.get("x-mesh-trailer").map(String::as_str),
+        Some("echo-ok"),
+        "custom (non-hop-by-hop) trailers must survive the HBONE relay: {resp:?}\n{logs}"
     );
     assert!(
-        resp.body.is_empty(),
-        "the fail-closed refusal must not carry any backend bytes (no dial happened): {resp:?}\n{logs}"
+        !resp.headers.contains_key("grpc-status"),
+        "a completed RPC must NOT carry a header-borne grpc-status — that shape is the \
+         gateway's Trailers-Only refusal, not the backend's answer: {resp:?}\n{logs}"
+    );
+    assert!(
+        resp.body
+            .windows(b"ferrum-mesh-grpc-payload".len())
+            .any(|w| w == b"ferrum-mesh-grpc-payload"),
+        "the echoed gRPC payload must ride the relayed DATA frames: {resp:?}\n{logs}"
+    );
+}
+
+/// gRPC fail-closed negative (Ambient, issue #3728): an UNTRUSTED gateway A —
+/// whose SVID does not chain to the mesh CA — must never complete a gRPC call
+/// over HBONE. Reusing the mesh transport for native gRPC must not weaken its
+/// identity boundary: an unverifiable peer fails closed rather than falling back
+/// to an unauthenticated direct dial to the destination's app port.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_egress_grpc_rejects_untrusted_client_gateway() {
+    let (resp, logs) = drive_grpc_egress_a_to_b("ambient", false, |resp| {
+        // Success shape must never be observed; poll to the deadline.
+        resp.status == 200 && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")
+    })
+    .await
+    .expect("untrusted ambient gRPC egress drive");
+    assert!(
+        !(resp.status == 200 && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")),
+        "an untrusted gateway's gRPC request must fail closed, not complete: {resp:?}\n{logs}"
+    );
+    assert!(
+        !resp
+            .body
+            .windows(b"ferrum-mesh-grpc-payload".len())
+            .any(|w| w == b"ferrum-mesh-grpc-payload"),
+        "no backend payload may leak through an unauthenticated HBONE hop: {resp:?}\n{logs}"
     );
 }
 
@@ -11209,6 +11261,34 @@ impl LiveGatewayChild {
         }
     }
 
+    /// SIGTERM and wait up to `grace` for the child to exit on its own.
+    ///
+    /// Returns whether it did. A `false` result means the child was force-killed
+    /// mid-shutdown, so nothing downstream may treat its graceful-shutdown work
+    /// (listener stop, gate-close handshake, iptables cleanup) as having run.
+    /// `stop()`'s fixed 5s grace is shorter than the host-UDP gate-close
+    /// acknowledgement budget, so a test that asserts a shutdown post-condition
+    /// must use this instead.
+    fn stop_gracefully(&mut self, grace: Duration) -> bool {
+        let Some(mut child) = self.0.take() else {
+            return false;
+        };
+        let pid = child.id();
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if child.try_wait().is_ok_and(|status| status.is_some()) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        false
+    }
+
     fn poll_status(&mut self) -> String {
         match self.0.as_mut().map(Child::try_wait) {
             Some(Ok(Some(status))) => format!("exited with {status}"),
@@ -11526,14 +11606,15 @@ fn wait_for_udp_capture_snapshot(
 }
 
 #[cfg(target_os = "linux")]
-fn udp_round_trip_from_netns(
+fn udp_round_trip_from_netns_with_source(
     pid: u32,
+    source_ip: std::net::IpAddr,
     destination: SocketAddr,
     payload: &'static [u8],
     timeout: Duration,
 ) -> Result<(Vec<u8>, SocketAddr), String> {
     run_in_live_netns(pid, move || {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+        let socket = std::net::UdpSocket::bind(SocketAddr::new(source_ip, 0))
             .map_err(|error| format!("bind pod UDP client: {error}"))?;
         socket
             .set_read_timeout(Some(timeout))
@@ -11547,6 +11628,22 @@ fn udp_round_trip_from_netns(
             .map_err(|error| format!("receive UDP reply: {error}"))?;
         Ok((buf[..n].to_vec(), source))
     })
+}
+
+#[cfg(target_os = "linux")]
+fn udp_round_trip_from_netns(
+    pid: u32,
+    destination: SocketAddr,
+    payload: &'static [u8],
+    timeout: Duration,
+) -> Result<(Vec<u8>, SocketAddr), String> {
+    udp_round_trip_from_netns_with_source(
+        pid,
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        destination,
+        payload,
+        timeout,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -12081,6 +12178,606 @@ impl Drop for LiveVethPod {
             .args(["link", "del", &self.host_if])
             .status();
     }
+}
+
+/// Dual-stack host-side veth pair with `/32`+`/128` host routes so the production
+/// host-UDP interface resolver (`discover_dedicated_veth_for_pod_ip[6]`) can find
+/// the peer without `hostPID`/`setns`.
+#[cfg(target_os = "linux")]
+struct LiveHostUdpVethPod {
+    pod: LivePodNetns,
+    host_if: String,
+    pod_v4: std::net::Ipv4Addr,
+    pod_v6: std::net::Ipv6Addr,
+}
+
+#[cfg(target_os = "linux")]
+impl LiveHostUdpVethPod {
+    fn spawn(subnet_octet: u8) -> Result<Self, String> {
+        let pod = LivePodNetns::spawn(false)?;
+        let suffix = format!("{:x}{subnet_octet:02x}", std::process::id());
+        let suffix = &suffix[suffix.len().saturating_sub(8)..];
+        let host_if = format!("hu{suffix}");
+        let pod_if = format!("pu{suffix}");
+        let host_v4 = std::net::Ipv4Addr::new(10, 204, subnet_octet, 1);
+        let pod_v4 = std::net::Ipv4Addr::new(10, 204, subnet_octet, 2);
+        let host_v6: std::net::Ipv6Addr =
+            format!("fd00:204:{subnet_octet:x}::1").parse().expect("v6");
+        let pod_v6: std::net::Ipv6Addr =
+            format!("fd00:204:{subnet_octet:x}::2").parse().expect("v6");
+        let _ = Command::new("ip").args(["link", "del", &host_if]).status();
+        let setup = Command::new("ip")
+            .args([
+                "link", "add", &host_if, "type", "veth", "peer", "name", &pod_if,
+            ])
+            .status()
+            .map_err(|error| format!("create host-udp veth: {error}"))?;
+        if !setup.success() {
+            return Err(format!("create host-udp veth failed with {setup}"));
+        }
+        let move_peer = Command::new("ip")
+            .args(["link", "set", &pod_if, "netns", &pod.pid().to_string()])
+            .status()
+            .map_err(|error| format!("move host-udp veth peer: {error}"))?;
+        if !move_peer.success() {
+            let _ = Command::new("ip").args(["link", "del", &host_if]).status();
+            return Err(format!("move host-udp veth peer failed with {move_peer}"));
+        }
+        for args in [
+            vec![
+                "addr".to_string(),
+                "add".to_string(),
+                format!("{host_v4}/32"),
+                "dev".to_string(),
+                host_if.clone(),
+            ],
+            vec![
+                "-6".to_string(),
+                "addr".to_string(),
+                "add".to_string(),
+                format!("{host_v6}/128"),
+                "dev".to_string(),
+                host_if.clone(),
+                "nodad".to_string(),
+            ],
+            vec![
+                "link".to_string(),
+                "set".to_string(),
+                host_if.clone(),
+                "up".to_string(),
+            ],
+            vec![
+                "route".to_string(),
+                "add".to_string(),
+                format!("{pod_v4}/32"),
+                "dev".to_string(),
+                host_if.clone(),
+            ],
+            vec![
+                "-6".to_string(),
+                "route".to_string(),
+                "add".to_string(),
+                format!("{pod_v6}/128"),
+                "dev".to_string(),
+                host_if.clone(),
+            ],
+        ] {
+            let status = Command::new("ip")
+                .args(args.iter().map(String::as_str))
+                .status()
+                .map_err(|error| format!("configure host-udp host veth: {error}"))?;
+            if !status.success() {
+                let _ = Command::new("ip").args(["link", "del", &host_if]).status();
+                return Err(format!(
+                    "host-udp host veth command {args:?} failed with {status}"
+                ));
+            }
+        }
+        if let Err(error) = netns_command(
+            pod.pid(),
+            &format!(
+                "set -e; \
+                 ip addr add {pod_v4}/32 dev {pod_if}; \
+                 ip -6 addr add {pod_v6}/128 dev {pod_if} nodad; \
+                 ip link set {pod_if} up; \
+                 ip route add {host_v4}/32 dev {pod_if}; \
+                 ip -6 route add {host_v6}/128 dev {pod_if}; \
+                 ip route add default via {host_v4} dev {pod_if}; \
+                 ip -6 route add default via {host_v6} dev {pod_if}"
+            ),
+        ) {
+            let _ = Command::new("ip").args(["link", "del", &host_if]).status();
+            return Err(error);
+        }
+        Ok(Self {
+            pod,
+            host_if,
+            pod_v4,
+            pod_v6,
+        })
+    }
+
+    fn publish_host_udp(
+        &self,
+        registry_dir: &std::path::Path,
+        pod_uid: &str,
+        spiffe_id: &str,
+    ) -> Result<PathBuf, String> {
+        std::fs::create_dir_all(registry_dir)
+            .map_err(|error| format!("create host-udp registry: {error}"))?;
+        let path = registry_dir.join(pod_uid);
+        let contents = format!(
+            "{}\nspiffe_id={spiffe_id}\nipv4={}\nipv6={}\n",
+            self.pod.cgroup_dir.path().display(),
+            self.pod_v4,
+            self.pod_v6
+        );
+        std::fs::write(&path, contents)
+            .map_err(|error| format!("publish host-udp registry entry: {error}"))?;
+        Ok(path)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LiveHostUdpVethPod {
+    fn drop(&mut self) {
+        let _ = Command::new("ip")
+            .args(["link", "del", &self.host_if])
+            .status();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn seed_host_udp_placement_state(registry_dir: &std::path::Path) -> Result<(), String> {
+    // Host-netns placement refuses to start without durable predecessor proof
+    // (#3703). Seed a completed host-netns ownership record so the production
+    // ProxyHostUdpBackend path can RunStable in this disposable fixture.
+    let path = registry_dir.join(".udp-placement-state-v1.json");
+    std::fs::write(
+        &path,
+        r#"{"version":1,"active":"host-netns","pending":null,"completed":null}"#,
+    )
+    .map_err(|error| format!("seed host-udp placement state: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("chmod host-udp placement state: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn checked_command_stdout(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("{program} spawn failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{program} {args:?} failed with {}", output.status));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn capture_jump_count(rules: &str) -> usize {
+    rules
+        .lines()
+        .filter(|line| line.starts_with("-A PREROUTING ") && line.contains("FERRUM_MESH_UDP_HOST"))
+        .filter(|line| !line.contains("GUARD"))
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+fn host_udp_capture_snapshot(
+    capture_port: u16,
+) -> Result<(usize, usize, usize, usize, usize), String> {
+    let v4_rules = checked_command_stdout("iptables-save", &["-t", "mangle"])?;
+    let v6_rules = checked_command_stdout("ip6tables-save", &["-t", "mangle"])?;
+    let v4_route_rules = checked_command_stdout("ip", &["rule", "show"])?;
+    let v6_route_rules = checked_command_stdout("ip", &["-6", "rule", "show"])?;
+    let v4_routes = v4_route_rules
+        .lines()
+        .filter(|line| line.contains("lookup 33135"))
+        .count();
+    let v6_routes = v6_route_rules
+        .lines()
+        .filter(|line| line.contains("lookup 33135"))
+        .count();
+    let port_suffix = format!(":{:04X}", capture_port);
+    let listeners = std::fs::read_to_string("/proc/net/udp")
+        .unwrap_or_default()
+        .lines()
+        .chain(
+            std::fs::read_to_string("/proc/net/udp6")
+                .unwrap_or_default()
+                .lines(),
+        )
+        .filter(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .is_some_and(|local| local.ends_with(&port_suffix))
+        })
+        .count();
+    Ok((
+        capture_jump_count(&v4_rules),
+        capture_jump_count(&v6_rules),
+        v4_routes,
+        v6_routes,
+        listeners,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_host_udp_capture(
+    capture_port: u16,
+    active: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match host_udp_capture_snapshot(capture_port) {
+            Ok((v4_jumps, v6_jumps, v4_routes, v6_routes, listeners)) => {
+                let ready = if active {
+                    v4_jumps >= 1
+                        && v6_jumps >= 1
+                        && v4_routes >= 1
+                        && v6_routes >= 1
+                        && listeners >= 1
+                } else {
+                    v4_jumps == 0
+                        && v6_jumps == 0
+                        && v4_routes == 0
+                        && v6_routes == 0
+                        && listeners == 0
+                };
+                if ready {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "host UDP capture did not become {} (v4_jumps={v4_jumps} \
+                         v6_jumps={v6_jumps} v4_routes={v4_routes} \
+                         v6_routes={v6_routes} listeners={listeners})",
+                        if active { "active" } else { "absent" }
+                    ));
+                }
+            }
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Production `ProxyHostUdpBackend` live gate (#3705): Ambient host-network UDP
+/// capture with two independent veth-backed workloads, IPv4 delivery, transparent
+/// replies, and exact Ferrum-owned cleanup after shutdown.
+#[cfg(target_os = "linux")]
+#[ignore = "requires root + dual-stack veth + iptables/TPROXY + host-netns UDP placement"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn functional_mesh_live_host_udp_capture_proxy_backend_round_trip() {
+    if !live_source_capture_prerequisites() {
+        return;
+    }
+    for binary in ["ip6tables", "ip6tables-save"] {
+        let present = Command::new("sh")
+            .args(["-c", &format!("command -v {binary} >/dev/null 2>&1")])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !present {
+            skip_or_fail_live_source_capture(&format!("`{binary}` is unavailable"));
+            return;
+        }
+    }
+    ensure_gateway_built().expect("build gateway for host-UDP live test");
+
+    const VIP_V4: &str = "192.0.2.90";
+    const VIP_V6: &str = "2001:db8::90";
+    // Registry filenames ARE the pod UIDs. `UdpSourceIdentity::new` (and therefore
+    // production host-UDP enrollment) fail-closed unless the UID parses as a
+    // Kubernetes UUID — the same shape `host_udp_capture_live_tests` and the
+    // node-agent registry publish. Non-UUID labels leave `source_identity=None`
+    // and surface as `reason=missing_identity` with capture never installed.
+    const POD_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const POD_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let capture_port = ferrum_edge::capture::DEFAULT_UDP_OUTBOUND_PORT;
+
+    let pod_a = match LiveHostUdpVethPod::spawn(21) {
+        Ok(pod) => pod,
+        Err(error) => {
+            skip_or_fail_live_source_capture(&format!("cannot create host-UDP pod A: {error}"));
+            return;
+        }
+    };
+    let pod_b = match LiveHostUdpVethPod::spawn(22) {
+        Ok(pod) => pod,
+        Err(error) => {
+            skip_or_fail_live_source_capture(&format!("cannot create host-UDP pod B: {error}"));
+            return;
+        }
+    };
+
+    let registry = TempDir::new().expect("host-UDP registry");
+    seed_host_udp_placement_state(registry.path()).expect("seed placement state");
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/host-udp-a";
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/host-udp-b";
+    let echo_spiffe = "spiffe://cluster.local/ns/ferrum/sa/host-udp-echo";
+    let _entry_a = pod_a
+        .publish_host_udp(registry.path(), POD_A, a_spiffe)
+        .expect("publish pod A");
+    let _entry_b = pod_b
+        .publish_host_udp(registry.path(), POD_B, b_spiffe)
+        .expect("publish pod B");
+
+    let temp_a = TempDir::new().expect("gateway A tempdir");
+    let temp_b = TempDir::new().expect("gateway B tempdir");
+    let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, echo_spiffe);
+    let (echo_port, _echo_received, echo_task) = start_counting_udp_echo().await;
+    let node_a = "functional-live-host-udp-a";
+    let node_b = "functional-live-host-udp-b";
+    let mut slice_a = live_source_capture_slice(
+        node_a,
+        echo_spiffe,
+        "127.0.0.1",
+        VIP_V4,
+        echo_port,
+        AppProtocol::Udp,
+    );
+    slice_a.services[0].cluster_ips.push(VIP_V6.to_string());
+    let mut slice_b = live_source_capture_slice(
+        node_b,
+        echo_spiffe,
+        "127.0.0.1",
+        VIP_V4,
+        echo_port,
+        AppProtocol::Udp,
+    );
+    slice_b.services[0].cluster_ips.push(VIP_V6.to_string());
+    let cp_a = start_static_mesh_cp(slice_a).await;
+    let cp_b = start_static_mesh_cp(slice_b).await;
+
+    let ports_b = reserve_mesh_ports().await;
+    let b_hbone_port = ports_b.hbone;
+    let mut gateway_b = LiveGatewayChild::new(spawn_mesh_gateway(
+        &temp_b,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_b.addr,
+            ports: ports_b,
+            node_id: node_b,
+            config_protocol: "native",
+            topology: "ambient",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", echo_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    svids.b.trust_bundle_path.clone(),
+                ),
+            ],
+        },
+    ));
+    assert!(
+        wait_for_tcp_port(b_hbone_port, STARTUP_TIMEOUT).await,
+        "host-UDP destination HBONE listener did not bind\n{}",
+        captured_output(&temp_b)
+    );
+
+    let ports_a = reserve_mesh_ports().await;
+    let a_outbound = ports_a.outbound;
+    let mut gateway_a = LiveGatewayChild::new(spawn_mesh_gateway(
+        &temp_a,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_a.addr,
+            ports: ports_a,
+            node_id: node_a,
+            config_protocol: "native",
+            topology: "ambient",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_LOG_LEVEL", "debug".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "true".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", a_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.a.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.a.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    svids.a.trust_bundle_path.clone(),
+                ),
+                (
+                    "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR",
+                    registry.path().display().to_string(),
+                ),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true".to_string()),
+                (
+                    "FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED",
+                    "true".to_string(),
+                ),
+                ("FERRUM_MESH_CAPTURE_UDP_PORT", capture_port.to_string()),
+                (
+                    "FERRUM_MESH_CAPTURE_INCLUDE_CIDRS",
+                    "0.0.0.0/0,::/0".to_string(),
+                ),
+                ("FERRUM_MESH_IP6TABLES_ENABLED", "true".to_string()),
+                ("FERRUM_MESH_EGRESS_HBONE_PORT", b_hbone_port.to_string()),
+            ],
+        },
+    ));
+    assert!(
+        wait_for_tcp_port(a_outbound, STARTUP_TIMEOUT).await,
+        "host-UDP source gateway A did not start\n{}",
+        captured_output(&temp_a)
+    );
+    if let Err(error) = wait_for_host_udp_capture(capture_port, true, Duration::from_secs(25)) {
+        panic!(
+            "ProxyHostUdpBackend did not install host capture: {error}\n{}",
+            captured_output(&temp_a)
+        );
+    }
+    assert!(
+        wait_for_captured_output(
+            &temp_a,
+            "Ambient host-network UDP capture enabled",
+            Duration::from_secs(5),
+        )
+        .await,
+        "gateway A must select the host-network UDP placement\n{}",
+        captured_output(&temp_a)
+    );
+
+    let destination_v4: SocketAddr = format!("{VIP_V4}:{echo_port}")
+        .parse()
+        .expect("IPv4 UDP VIP");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (reply_a, source_a) = loop {
+        match udp_round_trip_from_netns_with_source(
+            pod_a.pod.pid(),
+            std::net::IpAddr::V4(pod_a.pod_v4),
+            destination_v4,
+            b"host-udp-a",
+            Duration::from_secs(3),
+        ) {
+            Ok(result) => break result,
+            Err(error) if Instant::now() < deadline => {
+                eprintln!("host-UDP pod A retry: {error}");
+            }
+            Err(error) => panic!(
+                "host-UDP pod A round trip failed: {error}\n{}",
+                captured_output(&temp_a)
+            ),
+        }
+    };
+    assert_eq!(reply_a, b"host-udp-a");
+    assert_eq!(source_a, destination_v4);
+
+    let (reply_b, source_b) = udp_round_trip_from_netns_with_source(
+        pod_b.pod.pid(),
+        std::net::IpAddr::V4(pod_b.pod_v4),
+        destination_v4,
+        b"host-udp-b",
+        Duration::from_secs(5),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "host-UDP pod B round trip failed: {error}\n{}",
+            captured_output(&temp_a)
+        )
+    });
+    assert_eq!(reply_b, b"host-udp-b");
+    assert_eq!(source_b, destination_v4);
+
+    let destination_v6: SocketAddr = format!("[{VIP_V6}]:{echo_port}")
+        .parse()
+        .expect("IPv6 UDP VIP");
+    for (pod, payload) in [
+        (&pod_a, b"host-udp-a6" as &'static [u8]),
+        (&pod_b, b"host-udp-b6" as &'static [u8]),
+    ] {
+        let (reply, source) = udp_round_trip_from_netns_with_source(
+            pod.pod.pid(),
+            std::net::IpAddr::V6(pod.pod_v6),
+            destination_v6,
+            payload,
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "host-UDP IPv6 round trip failed: {error}\n{}",
+                captured_output(&temp_a)
+            )
+        });
+        assert_eq!(reply, payload);
+        assert_eq!(source, destination_v6);
+    }
+
+    // Shutdown is asserted against an EXACT outcome, never "whatever survived a
+    // timeout". `ProxyHostUdpBackend::shutdown` has exactly two documented
+    // branches, and both retire the capture path completely:
+    //
+    //   * acknowledged  - the node agent published `.udp-not-ready` for every
+    //     pod, so `teardown_all()` removes every Ferrum-owned host object;
+    //   * unacknowledged - the fail-closed branch installs the DROP guard over
+    //     the still-enrolled interfaces FIRST, then removes the capture chain,
+    //     the fwmark routing objects, and the capture listener.
+    //
+    // The acknowledgement wait is capped below mesh mode's background-task drain
+    // so this unacknowledged fixture cannot be aborted mid-handshake (which would
+    // leave jumps/routes installed after the process exits).
+    //
+    // No node agent runs in this fixture, so the unacknowledged branch is the
+    // expected one; either way the branch actually taken must be proven by its
+    // own post-condition rather than tolerated.
+    assert!(
+        gateway_a.stop_gracefully(Duration::from_secs(60)),
+        "gateway A must complete its own shutdown; a force-killed child proves \
+         nothing about ProxyHostUdpBackend cleanup\n{}",
+        captured_output(&temp_a)
+    );
+    let retire_budget = Duration::from_secs(20);
+    if let Err(error) = wait_for_host_udp_capture(capture_port, false, retire_budget) {
+        panic!(
+            "ProxyHostUdpBackend shutdown did not retire the host capture path: {error}\n{}",
+            captured_output(&temp_a)
+        );
+    }
+
+    let mangle = format!(
+        "{}\n{}",
+        checked_command_stdout("iptables-save", &["-t", "mangle"])
+            .expect("read the IPv4 mangle table after host-UDP shutdown"),
+        checked_command_stdout("ip6tables-save", &["-t", "mangle"])
+            .expect("read the IPv6 mangle table after host-UDP shutdown")
+    );
+    assert!(
+        !mangle.lines().any(|line| {
+            line.starts_with("-A PREROUTING ")
+                && line.contains("FERRUM_MESH_UDP_HOST")
+                && !line.contains("GUARD")
+        }),
+        "the capture chain jump must be gone after shutdown\n{mangle}"
+    );
+
+    let logs = captured_output(&temp_a);
+    let unacknowledged = logs.contains("node-agent did not acknowledge closing its UDP gates");
+    if unacknowledged {
+        // Narrowly justified retained-guard outcome: the guard is the ONLY thing
+        // keeping a pod whose BPF gate is still open from escaping in plaintext,
+        // so it must actually be installed and it must DROP.
+        assert!(
+            mangle.contains("FERRUM_MESH_UDP_HOST_GUARD_A")
+                || mangle.contains("FERRUM_MESH_UDP_HOST_GUARD_B"),
+            "an unacknowledged shutdown must retain an installed fail-closed \
+             DROP guard\n{mangle}"
+        );
+        assert!(
+            mangle.lines().any(|line| {
+                line.contains("FERRUM_MESH_UDP_HOST_GUARD") && line.contains("-j DROP")
+            }),
+            "the retained shutdown guard must DROP the enrolled scope\n{mangle}"
+        );
+        assert!(
+            !logs.contains("could not install the shutdown fail-closed guard"),
+            "the shutdown guard install must succeed\n{logs}"
+        );
+    } else {
+        // Acknowledged outcome (`teardown_all`): nothing Ferrum-owned may
+        // survive at all, guard chains included.
+        assert!(
+            !mangle.contains("FERRUM_MESH_UDP_HOST"),
+            "an acknowledged shutdown must remove every Ferrum-owned host UDP \
+             object, guard chains included\n{mangle}"
+        );
+    }
+
+    gateway_b.stop();
+    cp_a.shutdown().await;
+    cp_b.shutdown().await;
+    echo_task.abort();
 }
 
 #[cfg(target_os = "linux")]

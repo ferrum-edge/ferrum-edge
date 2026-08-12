@@ -167,6 +167,18 @@
 //! it carries the socket cleanup with it. Mesh mode observes the signal and
 //! initiates the shared shutdown path; a requested shutdown races nothing,
 //! because the observer checks the shared shutdown flag first and stays quiet.
+//!
+//! A **fatal accept** — a listener whose descriptor can never accept again —
+//! reaches that guard through an explicit channel
+//! ([`super::admission::FatalAcceptSignal`]) rather than through the end of the
+//! incoming stream. Ending the stream is not enough: tonic treats end-of-input
+//! under `serve_with_incoming_shutdown` as a *graceful* shutdown and then waits
+//! for every established connection, and a Workload API rotation stream is
+//! designed to stay open indefinitely — so the serve future would never
+//! complete and termination would never be published. The outer serve task
+//! therefore selects on the fatal signal and runs the same bounded drain a
+//! requested shutdown runs: graceful budget, force close, bounded settle,
+//! identity-checked socket cleanup, termination.
 
 use std::fmt;
 use std::io;
@@ -177,6 +189,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+#[cfg(unix)]
+use super::admission::{ConnectionAdmission, FORCE_CLOSE_SETTLE, admission_stream, wait_until_set};
+use super::admission::{FatalAcceptSignal, WorkloadApiAdmissionConfig};
 use super::server::WorkloadApiService;
 
 /// Default socket path for Ferrum's own Workload API surface.
@@ -388,6 +403,12 @@ pub enum WorkloadApiListenerError {
     /// Bind, chmod, or accept-loop I/O failure.
     #[error("SPIFFE Workload API listener failed: {0}")]
     Io(String),
+    /// The configured transport-admission limits are not acceptable — zero,
+    /// over a hard safety ceiling, or internally contradictory. The message
+    /// names the setting and the operator-supplied number, both of which are
+    /// configuration they already hold.
+    #[error("SPIFFE Workload API transport limits rejected: {0}")]
+    Admission(String),
     /// The platform has no Unix-domain-socket transport.
     #[error("SPIFFE Workload API listener is only supported on Unix platforms")]
     Unsupported,
@@ -557,6 +578,7 @@ pub struct WorkloadApiListener {
     socket_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,
     terminated_rx: watch::Receiver<bool>,
+    fatal_accept: FatalAcceptSignal,
     join: JoinHandle<()>,
 }
 
@@ -587,6 +609,23 @@ impl WorkloadApiListener {
     /// [`Self::shutdown`] is called.
     pub fn termination_signal(&self) -> watch::Receiver<bool> {
         self.terminated_rx.clone()
+    }
+
+    /// The listener's **fatal accept** signal — the exact channel the accept
+    /// loop publishes on when `accept(2)` fails unrecoverably.
+    ///
+    /// Exposed because the property that matters here is a *lifecycle* one and
+    /// is otherwise unobservable: a real fatal `accept(2)` cannot be provoked
+    /// from a test, and the failure mode being guarded against — a fatal accept
+    /// that ends the incoming stream, leaves tonic waiting on an established
+    /// long-lived rotation stream, and therefore never publishes
+    /// [`Self::termination_signal`] — is invisible to any assertion made on the
+    /// retry policy alone. Raising this signal drives the identical path the
+    /// accept loop drives: admission stops, the configured graceful budget runs,
+    /// whatever is left is force-closed, the serve task settles boundedly, the
+    /// socket is cleaned up identity-checked, and termination is published.
+    pub fn fatal_accept_signal(&self) -> FatalAcceptSignal {
+        self.fatal_accept.clone()
     }
 
     /// Signal the serve future to stop, wait for it, and unlink the socket we
@@ -634,19 +673,55 @@ impl Drop for ServeExitGuard {
     }
 }
 
-/// Bind the socket, serve [`WorkloadApiService`] on it, and return a handle.
+/// Bind the socket, serve [`WorkloadApiService`] on it under the default
+/// transport-admission limits, and return a handle.
 ///
 /// The socket exists and is correctly permissioned by the time this returns, so
 /// a caller that treats an `Err` as fatal can be certain that a successful
 /// startup means workloads can actually connect.
+///
+/// The defaults are finite ([`WorkloadApiAdmissionConfig::default`]) — there is
+/// no unbounded spelling of this surface. Use
+/// [`serve_workload_api_with_admission`] to supply operator-configured limits.
 #[cfg(unix)]
 pub async fn serve_workload_api(
     service: WorkloadApiService,
     config: WorkloadApiSocketConfig,
 ) -> Result<WorkloadApiListener, WorkloadApiListenerError> {
-    use tokio_stream::wrappers::UnixListenerStream;
+    serve_workload_api_with_admission(service, config, WorkloadApiAdmissionConfig::default()).await
+}
 
+/// Bind, serve, and bound the transport.
+///
+/// The admission boundary is established **before** any accepted socket reaches
+/// tonic (see [`super::admission`]): kernel peer credentials are read off the
+/// accepted socket, a total-connection and a per-UID permit are taken without
+/// waiting, and the permit is owned by the connection wrapper for its exact
+/// lifetime. tonic itself is then configured with an explicit HTTP/2
+/// `max_concurrent_streams`, a matching per-connection request-concurrency limit
+/// with load shedding (reject, never queue), and keepalive derived from the idle
+/// deadline; the concurrent-RPC bounds — service-wide **and** per kernel-attested
+/// peer UID — are applied inside [`WorkloadApiService`], before attestation, CA
+/// work, or any spawned producer, and each permit is held for the whole life of
+/// its response stream.
+///
+/// Shutdown is bounded in three steps: admission stops immediately, the serve
+/// future is given [`WorkloadApiAdmissionConfig::shutdown_grace`] to drain, and
+/// anything still open is force-closed from inside the transport. The force
+/// close is not optional politeness — tonic serves each accepted connection from
+/// a detached task, so a client that simply never closes would otherwise hold a
+/// graceful shutdown open indefinitely.
+#[cfg(unix)]
+pub async fn serve_workload_api_with_admission(
+    service: WorkloadApiService,
+    config: WorkloadApiSocketConfig,
+    admission: WorkloadApiAdmissionConfig,
+) -> Result<WorkloadApiListener, WorkloadApiListenerError> {
     config.validate()?;
+    admission.validate()?;
+    // Validated above; clamped here as well, so the *enforced* limits can never
+    // exceed a hard ceiling even if this function is reached another way.
+    let limits = admission.clamped();
     let path = config.socket_path.clone();
     // Hold this across the whole listener lifecycle. Without the shared
     // critical section, another same-uid startup can publish after either the
@@ -657,7 +732,10 @@ pub async fn serve_workload_api(
     refuse_live_or_clear_stale_socket(&path).await?;
 
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let service = service.with_service_shutdown(shutdown_tx.subscribe());
+    let mut drain_observer = shutdown_tx.subscribe();
+    let service = service
+        .with_service_shutdown(shutdown_tx.subscribe())
+        .with_rpc_admission(&limits);
     let (listener, bound_identity) = bind_and_publish_socket(&path, config.socket_mode)?;
 
     let (terminated_tx, terminated_rx) = watch::channel(false);
@@ -670,7 +748,24 @@ pub async fn serve_workload_api(
             }
         }
     };
-    let incoming = UnixListenerStream::new(listener);
+
+    // The force-close channel must exist before the first connection is
+    // admitted: every admitted connection's watchdog subscribes to it, and a
+    // connection admitted before the channel existed would be unreachable by
+    // the shutdown deadline.
+    let (force_close_tx, force_close_rx) = watch::channel(false);
+    let connection_admission = ConnectionAdmission::new(limits.clone(), force_close_rx);
+    // The fatal-accept channel is separate from the shutdown channel on purpose:
+    // a requested shutdown and a listener that can never accept again take the
+    // same bounded drain, but they are different events and the second one has
+    // to be distinguishable in the log an operator reads afterwards.
+    let (fatal_accept, mut fatal_accept_observer) = FatalAcceptSignal::new();
+    let incoming = admission_stream(
+        listener,
+        connection_admission,
+        shutdown_tx.subscribe(),
+        fatal_accept.clone(),
+    );
     let server = service.into_server();
     let guard = ServeExitGuard {
         socket_path: path.clone(),
@@ -678,14 +773,61 @@ pub async fn serve_workload_api(
         terminated_tx,
         _socket_lifecycle_lock: startup_lock,
     };
+    let serve_limits = limits.clone();
+    let task_fatal_accept = fatal_accept.clone();
     let join = tokio::spawn(async move {
         // Bound first so it drops LAST — after the serve future, and on a panic
         // unwind as well as on a clean return.
         let exit_guard = guard;
-        let result = tonic::transport::Server::builder()
+        // Held for the task's whole life so the fatal-accept channel stays open
+        // even after tonic has dropped the incoming stream. A *closed* channel
+        // is not a fatal accept, and letting the observer resolve on one would
+        // divert an ordinary shutdown into the fatal branch.
+        let _fatal_accept_retainer = task_fatal_accept;
+        let serve = tonic::transport::Server::builder()
+            .max_concurrent_streams(Some(serve_limits.max_concurrent_streams))
+            // Paired with `load_shed`: a request beyond the per-connection
+            // ceiling is answered RESOURCE_EXHAUSTED immediately instead of
+            // being buffered, so the ceiling bounds work rather than deferring
+            // it into a queue.
+            .concurrency_limit_per_connection(serve_limits.max_concurrent_streams as usize)
+            .load_shed(true)
+            .http2_keepalive_interval(Some(serve_limits.keepalive_interval()))
+            .http2_keepalive_timeout(Some(serve_limits.keepalive_timeout()))
             .add_service(server)
-            .serve_with_incoming_shutdown(incoming, shutdown_signal)
-            .await;
+            .serve_with_incoming_shutdown(incoming, shutdown_signal);
+        tokio::pin!(serve);
+
+        // Two steps rather than one `select!` arm: the borrow of `serve` taken
+        // by the race has to end before the drain can take ownership of it.
+        let stop = tokio::select! {
+            result = &mut serve => ServeStop::Completed(result),
+            _ = wait_until_set(&mut drain_observer) => ServeStop::Requested,
+            _ = wait_until_set(&mut fatal_accept_observer) => ServeStop::FatalAccept,
+        };
+        let result = match stop {
+            ServeStop::Completed(result) => result,
+            // Both stop reasons take the *same* bounded path. A fatal accept
+            // must not be left to tonic's graceful end-of-input handling: with a
+            // shutdown future attached, tonic waits for every established
+            // connection, and a Workload API rotation stream is designed never
+            // to end on its own — so the serve future would never complete, the
+            // exit guard would never publish termination, and mesh mode would go
+            // on serving traffic with no identity surface behind it.
+            ServeStop::Requested => {
+                drain_with_deadline(serve, force_close_tx, serve_limits.shutdown_grace).await
+            }
+            ServeStop::FatalAccept => {
+                tracing::error!(
+                    socket = %exit_guard.socket_path.display(),
+                    grace_secs = serve_limits.shutdown_grace.as_secs(),
+                    "SPIFFE Workload API accept failed fatally; draining the listener within its \
+                     configured grace and then force-closing, so mesh mode observes the loss of \
+                     the surface within a bound"
+                );
+                drain_with_deadline(serve, force_close_tx, serve_limits.shutdown_grace).await
+            }
+        };
         if let Err(error) = result {
             warn!(
                 error = %error,
@@ -695,23 +837,99 @@ pub async fn serve_workload_api(
         }
     });
 
+    crate::plugins::mesh::prometheus_helpers::set_workload_api_admission_armed();
     info!(
         socket = %path.display(),
         mode = format!("{:#o}", config.socket_mode),
+        max_connections = limits.max_connections,
+        max_connections_per_uid = limits.max_connections_per_uid,
+        max_concurrent_streams = limits.max_concurrent_streams,
+        max_concurrent_rpcs = limits.max_concurrent_rpcs,
+        max_concurrent_rpcs_per_uid = limits.max_concurrent_rpcs_per_uid,
+        initial_connection_timeout_secs = limits.initial_connection_timeout.as_secs(),
+        idle_timeout_secs = limits.idle_timeout.as_secs(),
+        shutdown_grace_secs = limits.shutdown_grace.as_secs(),
         "SPIFFE Workload API listener bound"
     );
     Ok(WorkloadApiListener {
         socket_path: path,
         shutdown_tx,
         terminated_rx,
+        fatal_accept,
         join,
     })
+}
+
+/// Why the serve future stopped being raced.
+///
+/// Named rather than an `Option`, because the two non-completion reasons take
+/// the same bounded drain but are different operational events: one is the
+/// operator asking for shutdown, the other is a listener that can never accept
+/// again. Collapsing them would make the second one unreadable in a log.
+#[cfg(unix)]
+enum ServeStop {
+    /// The serve future finished on its own.
+    Completed(Result<(), tonic::transport::Error>),
+    /// Shutdown was requested through [`WorkloadApiListener::shutdown`].
+    Requested,
+    /// The accept loop published [`FatalAcceptSignal`].
+    FatalAccept,
+}
+
+/// Graceful drain, then a force close, then a bounded settle.
+///
+/// `serve_with_incoming_shutdown` alone is not a bound: it stops accepting and
+/// sends GOAWAY, but it then waits for every established connection, and a
+/// Workload API client is *designed* to hold a stream open across rotations. A
+/// peer that simply never closes would hold process shutdown open for as long
+/// as it liked. Expiring the grace deadline therefore flips the shared
+/// force-close flag, which fails the next I/O poll on every live admitted
+/// connection from inside the transport — the only place that reliably reaches
+/// them, since tonic serves each from a detached task that outlives the accept
+/// loop.
+#[cfg(unix)]
+async fn drain_with_deadline<F>(
+    mut serve: std::pin::Pin<&mut F>,
+    force_close_tx: watch::Sender<bool>,
+    grace: Duration,
+) -> Result<(), tonic::transport::Error>
+where
+    F: std::future::Future<Output = Result<(), tonic::transport::Error>>,
+{
+    if let Ok(result) = tokio::time::timeout(grace, &mut serve).await {
+        return result;
+    }
+    warn!(
+        grace_secs = grace.as_secs(),
+        "SPIFFE Workload API graceful drain deadline expired; force-closing remaining connections"
+    );
+    let _ = force_close_tx.send(true);
+    match tokio::time::timeout(FORCE_CLOSE_SETTLE, serve).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            // Every live connection has already been made to fail; the serve
+            // future not having noticed within the settle window is not
+            // something a further wait would change, and the exit guard still
+            // performs the identity-checked socket cleanup.
+            warn!("SPIFFE Workload API transport did not settle after the force close");
+            Ok(())
+        }
+    }
 }
 
 #[cfg(not(unix))]
 pub async fn serve_workload_api(
     _service: WorkloadApiService,
     _config: WorkloadApiSocketConfig,
+) -> Result<WorkloadApiListener, WorkloadApiListenerError> {
+    Err(WorkloadApiListenerError::Unsupported)
+}
+
+#[cfg(not(unix))]
+pub async fn serve_workload_api_with_admission(
+    _service: WorkloadApiService,
+    _config: WorkloadApiSocketConfig,
+    _admission: WorkloadApiAdmissionConfig,
 ) -> Result<WorkloadApiListener, WorkloadApiListenerError> {
     Err(WorkloadApiListenerError::Unsupported)
 }

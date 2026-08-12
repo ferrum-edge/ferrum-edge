@@ -145,7 +145,9 @@ CI today."
   Helm must mount the shared node-agent ↔ ambient pod registry plus host
   cgroup/bpffs views and `SYS_ADMIN`/`SYS_PTRACE` netns capabilities for
   `node_waypoint`), eBPF ambient capture (Dev-only; enabled chart topologies
-  auto-select `-ebpf` images and non-eBPF builds cannot report Ready),
+  auto-select `-ebpf` images -- or the tools-capable `-ebpf-tools` superset for
+  the Ambient UDP lifecycle, which shells out -- and non-eBPF builds cannot
+  report Ready),
   stream-family egress.
 
 ## Acceptable residual / out-of-scope (the long tail)
@@ -206,20 +208,6 @@ need them, or because they are blocked upstream / architecturally:
   preparation while the policy update still applies to supported TCP/HTTP
   traffic. Mesh-wide UDP/DTLS policy stays supported, and Sidecar remains the
   supported topology for workload-scoped UDP/DTLS authorization.
-- **Ambient native gRPC over HBONE on the H1/H2 frontend** — the generic
-  HTTP-family HBONE dispatch relays an inner HTTP/1.1 byte stream through the
-  CONNECT tunnel, so it has no HTTP/2 trailer path for native gRPC and refuses
-  such a request pre-dial with gRPC UNAVAILABLE. On that frontend, use Sidecar
-  mesh-mTLS for native gRPC, or gRPC-Web pass-through when Ambient transport is
-  required. **The HTTP/3 frontend is not affected and is Supported** (issue
-  #3284): its gRPC bridge runs a nested `hyper::client::conn::http2` client over
-  the same authenticated HBONE CONNECT byte tunnel — same-cluster (identity
-  pinned) and cross-cluster (remote east-west gateway + destination-FQDN SNI
-  override + trust-domain scope) — so `grpc-status` trailers, flow control,
-  deadlines, and cancellation relay end-to-end. Reusing that transport on the
-  H1/H2 frontend is now mechanically possible and is a residual, not a
-  non-goal — it is untracked and unimplemented, so this row stays here until an
-  issue owns it.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so
   it is not projected as effective policy. Use `http2MaxRequests`.
@@ -251,7 +239,7 @@ ledger unless they change the support contract.
 |---|---|---|
 | Enrolled Ambient destination pod UDP round trip (source-capture → HBONE → destination pod-netns relay; tc-inbound admit + reply socket inside destination pod netns) | [#3621](https://github.com/ferrum-edge/ferrum-edge/issues/3621) | `docs/mesh.md` UDP TPROXY capture footnote [12] |
 
-Completed historical rows (do **not** re-list as open): EgressGateway UDP `ServiceEntry` materialization (#3263 — external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT to the configured gateway; still no UDP/DTLS listener, by design); Ambient UDP capture producer + privileged live **source-capture** e2e (#2013 / #2038 — host-loopback destination echo only; enrolled-destination residual split to #3621); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); general opaque-TLS SNI L4 routing outside passthrough (#3264 — an ordinary `tcp` stream listener that terminates nothing routes by normalized `server_name`, with fail-closed admission for indeterminate ClientHellos; see [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md#opaque-tls-sni-routing)); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
+Completed historical rows (do **not** re-list as open): EgressGateway UDP `ServiceEntry` materialization (#3263 — external UDP ports materialize a datagram-over-mesh destination allowlist consumed by the gateway's authenticated mesh CONNECT terminator, plus the source-side `Sidecar`/`Ambient` producer that originates the identity-pinned `udp` CONNECT to the configured gateway; still no UDP/DTLS listener, by design); Ambient UDP capture producer + privileged live **source-capture** e2e (#2013 / #2038 — host-loopback destination echo only; enrolled-destination residual split to #3621); Ambient native gRPC over HBONE on the standard H1/H2 frontend (#3728 — the shared nested-HTTP/2 transport now serves every frontend; native gRPC still deliberately bypasses the generic HTTP/1.1 HBONE dispatch); VirtualService `tls[]` SNI passthrough L4 routing (`sniHosts` + port); general opaque-TLS SNI L4 routing outside passthrough (#3264 — an ordinary `tcp` stream listener that terminates nothing routes by normalized `server_name`, with fail-closed admission for indeterminate ClientHellos; see [`docs/tcp_udp_proxy.md`](tcp_udp_proxy.md#opaque-tls-sni-routing)); VirtualService `tcp[]`/`tls[]` weighted multi-destination splitting (#3251); remote-discovery JWT audience binding (#2475); subset-scoped DestinationRule HTTP connection-pool policy (#3228 / #3240–#3242); the poller-driven partition and bounded last-good-retention live gate (#3331); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
 
 ## How a feature graduates
 

@@ -14626,14 +14626,21 @@ async fn start_mesh_workload_api_server(
     )
     .with_jwt_svid_ttl_secs(env_config.mesh_jwt_svid_ttl_seconds);
 
-    let listener = crate::identity::workload_api::serve_workload_api(service, socket)
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "FERRUM_MESH_WORKLOAD_API_ENABLED=true but the SPIFFE Workload API listener could \
-                 not start: {error}"
-            )
-        })?;
+    // Transport admission (issue #3758). The socket is a local trust boundary
+    // that authorizes an identity *request*; it must not also let one workload
+    // exhaust connections, HTTP/2 streams, or RPC producers and so deny identity
+    // issuance to every other workload on the node.
+    let admission = env_config.mesh_workload_api_admission_config();
+    let listener = crate::identity::workload_api::serve_workload_api_with_admission(
+        service, socket, admission,
+    )
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "FERRUM_MESH_WORKLOAD_API_ENABLED=true but the SPIFFE Workload API listener \
+             could not start: {error}"
+        )
+    })?;
     info!(
         socket = %listener.socket_path().display(),
         jwt_svid_ttl_secs = env_config.mesh_jwt_svid_ttl_seconds,
@@ -17251,7 +17258,11 @@ impl MeshStartupOwner {
     }
 }
 
-/// Bound for joining mesh background tasks during startup rollback.
+/// Bound for joining mesh background tasks during startup rollback **and**
+/// graceful shutdown (`shutdown_and_join_mesh`). Host-network UDP capture's
+/// shutdown acknowledgement wait (`GATE_CLOSE_ACK_TIMEOUT` in
+/// `proxy::host_udp_capture`) must stay strictly below this so fail-closed
+/// capture teardown still runs before stragglers are aborted.
 const MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bound for joining mesh listeners during startup-failure rollback only.
