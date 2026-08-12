@@ -19,7 +19,13 @@ model and reasoning effort deliberately.
 ## Preflight
 
 1. Read `AGENTS.md`, the relevant `.claude/rules/*.md`, and the issue or PR before dispatching.
-2. Run `command -v codex`, `codex --version`, `codex login status`, and `codex exec --help`.
+2. Confirm the standalone codex CLI is resolvable, then run `codex --version`, `codex login status`,
+   and `codex exec --help` against it. The launcher resolves the binary in this order and refuses
+   any candidate under `com.conductor.app`, because Conductor's bundled copy lags the standalone
+   release:
+   - `CODEX_BIN` if it points at an executable absolute path,
+   - `/opt/homebrew/bin/codex`, `/usr/local/bin/codex`, `~/.local/bin/codex`,
+   - `codex` on `PATH`.
 3. Confirm that the installed CLI supports `--model`, `--config`, `--sandbox`, `--cd`, and reading
    a prompt from stdin with `-`.
 4. Use the pinned model `gpt-5.6-sol`. Stop and report the exact error if authentication, model

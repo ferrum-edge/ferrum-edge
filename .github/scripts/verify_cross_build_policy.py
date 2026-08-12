@@ -2429,6 +2429,13 @@ LIVE_SUITE_RELEVANCE_JOB_TEMPLATE = r"""  changes:
 
 # workflow file -> (relevance job, live job, display name, temp slug, suite).
 LIVE_SUITE_RELEVANCE_CONTRACTS = {
+    "ambient-host-udp-live.yml": (
+        "changes",
+        "ambient-host-udp-live",
+        "Ambient host-UDP trigger",
+        "ambient-host-udp",
+        "ambient-host-udp",
+    ),
     "mesh-e2e-sidecar-live.yml": (
         "changes",
         "mesh-e2e-sidecar-live",

@@ -1,6 +1,6 @@
 ---
 name: composer-agents
-description: Dispatch and orchestrate local Cursor Composer 2.5 agents via the Conductor Cursor SDK harness for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to Composer or Cursor Composer workers, run multiple Composer agents, resume interrupted Composer runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+description: Dispatch and orchestrate local Cursor Composer 2.5 agents via the standalone cursor-agent CLI for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to Composer or Cursor Composer workers, run multiple Composer agents, resume interrupted Composer runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
 # Composer agents
@@ -19,17 +19,20 @@ selected this session's model deliberately.
 ## Preflight
 
 1. Read `AGENTS.md`, the relevant `.claude/rules/*.md`, and the issue or PR before dispatching.
-2. Confirm Conductor's Cursor harness is present:
-   - `"${CONDUCTOR_INTERNAL_BIN_DIR:-$HOME/Library/Application Support/com.conductor.app/bin}/.internal/node"`
-   - the sibling `cursor-node-worker.mjs` and `@cursor/sdk` install Conductor ships with the app
-3. Authenticate every spawned worker through the dispatch terminal's `CURSOR_API_KEY` environment
-   variable. In the shell that invokes the launcher, ensure the variable is non-empty and exported
-   (`export CURSOR_API_KEY`; never print its value). The launcher may materialize Conductor's stored
-   provider setting into that same variable, then passes it to `@cursor/sdk` as the worker's
-   `apiKey`. Do not ask a worker to perform an interactive login or put the credential in prompts,
-   files, arguments, or logs.
-4. Use only the pinned model `composer-2.5`. Stop and report the exact error if authentication or
-   model access is rejected. Do not silently substitute `grok-4.5`, `auto`, or another provider.
+2. Confirm the standalone `cursor-agent` CLI is resolvable. The launcher resolves it in this order
+   and refuses any candidate under `com.conductor.app`, because Conductor's bundled copies lag the
+   standalone releases:
+   - `CURSOR_AGENT_BIN` if it points at an executable absolute path,
+   - `~/.local/bin/cursor-agent`, `/opt/homebrew/bin/cursor-agent`, `/usr/local/bin/cursor-agent`,
+   - `cursor-agent` on `PATH`.
+3. Authenticate every spawned worker either through an exported `CURSOR_API_KEY` (the launcher
+   leaves it in the environment for `cursor-agent` to read; it is never placed on argv, where `ps`
+   would expose it) or through the CLI's own stored login — check with `cursor-agent status`. Never
+   print the key or put it in prompts, files, arguments, or logs, and do not ask a worker to perform
+   an interactive login.
+4. Use only the pinned model `composer-2.5`; confirm with `cursor-agent models`. Stop and report the
+   exact error if authentication or model access is rejected. Do not silently substitute a Grok SKU,
+   `auto`, `composer-2.5-fast`, or another provider.
 
 ## Isolate every worker
 
@@ -62,19 +65,18 @@ one long-lived execution session:
   --prompt-file <ABS_PROMPT_FILE>
 ```
 
-`--effort medium|high|xhigh|max` is accepted for CLI parity with sibling skills but is ignored —
-the Cursor Composer harness has no effort tiers. Do not claim an effort level was applied.
+`--effort low|medium|high|xhigh|max` is accepted for CLI parity with sibling skills but is ignored —
+Composer 2.5 publishes no reasoning tiers. Do not claim an effort level was applied.
 
-The launcher pins `composer-2.5` with `fast=false` (the non-Fast inference variant, so runs bill at
-the standard rate instead of consuming fast credits), verifies the worktree root, ensures the
-dispatch process has an exported `CURSOR_API_KEY`, and passes that value to `@cursor/sdk` as the
-worker's `apiKey` through Conductor's bundled Node runtime. Delete the temporary prompt after the
-worker exits.
+The launcher resolves the operator's own `cursor-agent`, verifies the worktree root, and runs
+`cursor-agent --print --force --trust --model composer-2.5 --output-format text --workspace
+<worktree>` with the prompt file on stdin. `composer-2.5` is the non-Fast SKU, so runs bill at the
+standard rate instead of consuming fast credits. Delete the temporary prompt after the worker exits.
 
 Start each worker in its own long-lived execution session and retain its exact session handle or
 PID. Prefer one tool call per worker so completions and failures remain attributable. Never wrap
-the fleet in a single shell command, use `killall node`, or broadly kill Cursor/Conductor
-processes; the user may have unrelated sessions. Cap this workflow at seven concurrent Composer
+the fleet in a single shell command, use `killall node`, or broadly kill `cursor-agent` processes;
+the user may have unrelated Cursor sessions. Cap this workflow at seven concurrent Composer
 workers unless the user sets a lower limit.
 
 ## Pin the worker role
@@ -147,9 +149,11 @@ Never put credentials, tokens, cookies, or secrets in prompts or worker logs. Do
 
 - Capacity or transport failure: verify local and remote state before retrying; useful work may
   already be committed or pushed.
-- Missing Conductor harness or a non-empty `CURSOR_API_KEY` in the dispatch terminal: stop and
-  report the exact path or environment failure. Do not attempt an interactive login or fall back
-  to another model provider.
+- `cursor-agent` unresolvable, or resolution refused because the only candidate lives under
+  `com.conductor.app`: stop and report the exact path failure. Install the standalone CLI or set
+  `CURSOR_AGENT_BIN`; do not fall back to Conductor's bundled harness.
+- Neither `CURSOR_API_KEY` nor a stored `cursor-agent` login is available: stop and report. Do not
+  attempt an interactive login or fall back to another model provider.
 - Worker claims it is waiting on a monitor: treat process completion as end-of-turn and continue
   orchestration yourself.
 - No review response: verify the trigger, bot identity, availability, and head SHA before posting

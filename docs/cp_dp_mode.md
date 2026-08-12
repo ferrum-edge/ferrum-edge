@@ -111,6 +111,36 @@ Both caps are observable on `/metrics` as `ferrum_cp_grpc_active_connections`,
 `ferrum_cp_grpc_rejected_connections_total{reason}`. No source-IP labels are
 emitted.
 
+### Authenticated stream lifetime
+
+Every bearer-authenticated long-lived configuration stream is bound to the
+credential and verified `exp` accepted at admission. ConfigSync Subscribe,
+local and cross-cluster native MeshSubscribe, and xDS SotW/delta ADS terminate
+at `exp` plus the verifier's 60-second leeway, or at the independent
+`FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS` ceiling (default 3600, allowed
+60..=86400), whichever comes first. Heartbeats and configuration traffic do not
+renew either deadline. Expiry and maximum-lifetime closure use
+`UNAUTHENTICATED`; removal of the exact accepted verification credential uses
+`PERMISSION_DENIED`. This is deliberately distinct from initial admission:
+missing, malformed, expired, unknown-key, wrong-signature, and wrong-algorithm
+credentials all remain the same non-disclosing `UNAUTHENTICATED` class. If key
+removal coincides with a deadline, removal takes precedence for an already
+admitted stream.
+
+`FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` is watched at
+`FERRUM_SECRET_REFRESH_INTERVAL_SECONDS`. A valid replacement is installed
+atomically. Adding an overlapping credential does not disrupt streams admitted
+by a retained credential with the same namespace policy. Removing that
+credential, or changing its trusted namespace ceiling, closes its existing
+streams. Invalid reloads retain the last accepted verifier. DPs and mesh/xDS
+clients use their existing bounded reconnect backoff and reread
+`FERRUM_DP_CP_GRPC_TOKEN_FILE` (or mint a new short-lived token) on each attempt.
+The fixed-cardinality
+`ferrum_grpc_config_stream_terminations_total{surface,reason}` metric and
+structured `grpc_config_stream_*` audit events distinguish `expired`,
+`verification_key_removed`, `server_max_lifetime`, and `transport_closed`
+without token, claim, key, node, or namespace labels.
+
 ### Config Sync Flow
 
 1. DP connects to CP's gRPC endpoint with JWT authentication
@@ -295,6 +325,7 @@ in a failover set must use the same value.
 | `FERRUM_CP_GRPC_TLS_CLIENT_CA_PATH` | No | PEM CA for verifying DP client certs (mTLS) |
 | `FERRUM_CP_GRPC_MAX_CONNECTIONS` | No | Max concurrent CP gRPC connections, admitted **before** any TLS/mTLS handshake work is allocated and held through the served HTTP/2 session (default `1024`; `0` = unlimited) |
 | `FERRUM_CP_GRPC_MAX_CONNECTIONS_PER_IP` | No | Max concurrent CP gRPC connections from one source IP (default `64`; `0` disables). Must not exceed `FERRUM_CP_GRPC_MAX_CONNECTIONS` |
+| `FERRUM_CP_GRPC_MAX_STREAM_LIFETIME_SECONDS` | No | Finite maximum bearer-authenticated configuration-stream lifetime (default `3600`; range `60..=86400`; cannot be disabled). The verified token deadline may close the stream earlier |
 | `FERRUM_ADMIN_JWT_SECRET` | Yes | JWT secret for the Admin API |
 | `FERRUM_DB_TYPE` | Yes | Database type (`postgres`, `mysql`, `sqlite`, or `mongodb`) |
 | `FERRUM_DB_URL` | Yes | Database connection URL |

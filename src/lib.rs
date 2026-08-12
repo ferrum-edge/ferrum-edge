@@ -124,6 +124,24 @@ pub mod _test_support {
             .expect("process-wide CP token read semaphore is never closed")
     }
 
+    /// Hold the trust-bundle reload reader slot so tests can prove a timed-out
+    /// reload does not spawn another detached filesystem reader.
+    pub async fn acquire_cp_dp_trust_bundle_read_permit_for_test() -> TestSemaphorePermit {
+        crate::grpc::cp_trust::trust_bundle_reload_read_limit()
+            .acquire_owned()
+            .await
+            .expect("process-wide CP trust-bundle read semaphore is never closed")
+    }
+
+    /// Exercise the bounded async trust-bundle reload boundary without
+    /// exposing its failure taxonomy through the production API.
+    pub async fn load_cp_dp_trust_bundle_for_reload_for_test(
+        path: String,
+        timeout: Duration,
+    ) -> Result<(), &'static str> {
+        crate::grpc::cp_trust::load_trust_bundle_reload_candidate_for_test(path, timeout).await
+    }
+
     /// Hold the stock-xDS bearer-token reader slot to prove reconnects cannot
     /// accumulate detached readers after an async timeout.
     pub async fn acquire_stock_xds_token_file_read_permit_for_test() -> TestSemaphorePermit {
