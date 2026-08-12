@@ -696,7 +696,9 @@ mod imp {
 
     impl<T> Default for KeySlot<T> {
         fn default() -> Self {
-            Self { entries: Vec::new() }
+            Self {
+                entries: Vec::new(),
+            }
         }
     }
 
