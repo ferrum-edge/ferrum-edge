@@ -3488,6 +3488,7 @@ async fn publishing_keep_alive_false_retires_a_full_idle_set_and_admits_a_fresh_
     // Fill under reuse-enabled (default).
     assert!(proxy.pool_enable_http_keep_alive.is_none());
 
+    let mut leases = Vec::with_capacity(cap as usize);
     for _ in 0..cap {
         let lease = pool
             .checkout_h1(
@@ -3500,6 +3501,12 @@ async fn publishing_keep_alive_false_retires_a_full_idle_set_and_admits_a_fresh_
             .await
             .expect("fill under the physical cap");
         assert!(!lease.reused());
+        leases.push(lease);
+    }
+    // Keep every checkout live until the cap is full; checking each one in
+    // inside the loop would let the next checkout reuse the same carrier and
+    // would never construct the full idle set this regression needs.
+    for lease in leases {
         pool.checkin_h1(lease);
     }
     assert_eq!(pool.stats().idle_h1_connections, cap as u64);
