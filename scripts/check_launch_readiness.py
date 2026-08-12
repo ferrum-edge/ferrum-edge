@@ -674,7 +674,15 @@ def parse_issue_payload(
     label_severity = severity_from_labels(labels, policy)
     if tracked_severity is not None:
         # The reviewed, checked-in tracked severity is the contract. A live
-        # label that disagrees is a schema mismatch, never a downgrade.
+        # label that disagrees is a schema mismatch, never a downgrade. Open
+        # tracked blockers still need an explicit severity label: the tracked
+        # list is defense in depth, not a substitute for the authoritative
+        # labeled inventory. Closed historical entries need no backfill.
+        if state == "open" and label_severity is None:
+            raise GateError(
+                "schema",
+                f"issue #{number} is a launch blocker without exactly one severity label",
+            )
         if label_severity is not None and label_severity != tracked_severity:
             raise GateError(
                 "schema",
@@ -2103,8 +2111,9 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     policy = _tracked(_base_policy(), 2003, "high")
     ev = _evaluate(policy, issues={2003: _issue(2003, labels=["launch-blocker"])})
     check(
-        "tracked severity used without a severity label",
-        ev.counts_by_severity["high"] == 1,
+        "open tracked blocker without severity is UNKNOWN",
+        unknown_because(ev, "without exactly one severity label"),
+        str(ev.unknown_reasons),
     )
 
     policy = _tracked(_base_policy(), 2004, "high")

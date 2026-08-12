@@ -61,8 +61,10 @@ because a shared name would satisfy the existence proof while leaving the
 vocabulary ambiguous.
 
 Provisioning and backfilling these labels is repository-settings work performed
-outside this tree by a maintainer. Until it is done the gate is `UNKNOWN`, which
-is the correct fail-closed answer — not a `PASS`.
+outside this tree by a maintainer. The production vocabulary was provisioned and
+the open severity-classified launch inventory was backfilled on 2026-08-11.
+Deleting or renaming any definition returns the gate to `UNKNOWN`, which is the
+correct fail-closed answer — not a `PASS`.
 
 ## Classification
 
@@ -78,8 +80,9 @@ is the correct fail-closed answer — not a `PASS`.
    always runs, and an unavailable label vocabulary is `UNKNOWN` rather than
    being masked by the tracked list. The tracked severity is the contract: a
    live severity label that disagrees with it is a schema mismatch (`UNKNOWN`),
-   never a downgrade or a silent replacement. A matching label is accepted; an
-   absent severity label uses the tracked severity.
+   never a downgrade or a silent replacement. Every open tracked blocker must
+   carry the blocker label and exactly one matching severity label; the tracked
+   severity never substitutes for missing live classification.
    Drift between the two sources is detected rather than tolerated: an **open**
    tracked blocker that does not carry the `launch-blocker` label is `UNKNOWN`
    (`label_drift:tracked blocker #N is open without the launch-blocker label`),

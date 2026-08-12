@@ -25,17 +25,17 @@ target SHA and as-of UTC) whenever the blocker set changes.
 <!-- launch-readiness:begin -->
 ```json
 {
-  "verdict": "UNKNOWN",
+  "verdict": "FAIL",
   "policy_version": "2",
   "classification_version": "launch-blocker-v2",
   "launch_tier": "ga",
   "private_blockers_redacted_count": 0,
   "counts_by_severity": {
-    "critical": 0,
-    "high": 0,
-    "medium": 0
+    "critical": 3,
+    "high": 7,
+    "medium": 13
   },
-  "notes": "Reviewed snapshot only. The configured launch-blocker/launch-exempted/severity:* labels are not yet defined in repository metadata, so the labeled inventory is unavailable and the verdict is UNKNOWN with zero counts by construction — this is NOT evidence of a clean blocker set. Refresh to the computed FAIL once a maintainer provisions and backfills the label vocabulary. Target SHA and as-of UTC come from the workflow's evaluated record; they are deliberately not asserted here."
+  "notes": "Reviewed snapshot only. The five configured label definitions exist and every open severity-classified launch blocker is backfilled with launch-blocker plus exactly one severity label. Counts reflect the reconciled 2026-08-11 live inventory; #3332 is not launch-classified. Target SHA and as-of UTC come from the workflow's evaluated record; they are deliberately not asserted here."
 }
 ```
 <!-- launch-readiness:end -->
