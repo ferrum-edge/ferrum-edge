@@ -46,6 +46,16 @@ USER_AGENT = "ferrum-edge-launch-readiness (github.com/ferrum-edge/ferrum-edge)"
 API_ORIGIN = "https://api.github.com/"
 MAX_RESPONSE_BYTES = 1 << 20
 MAX_PAGES = 50
+# Blocker discovery walks the unfiltered all-state issue inventory rather than a
+# `labels=` filter, so its bounds track the whole repository history, not the
+# blocker set. A filtered page held a handful of issues; an unfiltered one holds
+# `PER_PAGE` complete issue payloads, bodies included. The shared ceilings would
+# wedge the gate at UNKNOWN — on page count once the combined issue+pull-request
+# total passed `MAX_PAGES * PER_PAGE`, and on body size well before that, since a
+# full page already measures within a tenth of `MAX_RESPONSE_BYTES`. Both walks
+# stay fail-closed; only this one gets headroom of its own.
+MAX_INVENTORY_PAGES = 400
+MAX_INVENTORY_RESPONSE_BYTES = 16 << 20
 PER_PAGE = 100
 SEVERITIES = ("critical", "high", "medium")
 VERDICTS = ("PASS", "FAIL", "UNKNOWN")
@@ -560,9 +570,12 @@ def http_get_json(
     *,
     opener: Callable[..., Any] | None = None,
     accept: str | None = None,
+    max_bytes: int = MAX_RESPONSE_BYTES,
 ) -> tuple[Any, dict[str, str]]:
     if not url.startswith(API_ORIGIN):
         raise GateError("api", "refusing a non-GitHub API request")
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
+        raise GateError("schema", "response size bound is malformed")
     headers = auth_headers(token)
     if accept:
         headers["Accept"] = accept
@@ -570,7 +583,7 @@ def http_get_json(
     open_fn = opener or urllib.request.urlopen
     try:
         with open_fn(request, timeout=30) as response:
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
+            raw = response.read(max_bytes + 1)
             response_headers = {k.lower(): v for k, v in response.headers.items()}
             status = getattr(response, "status", 200)
     except urllib.error.HTTPError as exc:
@@ -590,7 +603,7 @@ def http_get_json(
         raise GateError("denied", f"HTTP {status}")
     if not isinstance(raw, (bytes, bytearray)):
         raise GateError("schema", "response body is not bytes")
-    if len(raw) > MAX_RESPONSE_BYTES:
+    if len(raw) > max_bytes:
         raise GateError("api", "response exceeded size cap")
     try:
         payload = json.loads(bytes(raw).decode("utf-8"))
@@ -606,18 +619,22 @@ def paginate(
     opener: Callable[..., Any] | None = None,
     accept: str | None = None,
     per_page: int = PER_PAGE,
+    max_pages: int = MAX_PAGES,
+    max_bytes: int = MAX_RESPONSE_BYTES,
 ) -> list[Any]:
     """Walk `Link: rel=next` to completion, failing closed on a truncated walk."""
 
+    if not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages < 1:
+        raise GateError("schema", "pagination bound is malformed")
     items: list[Any] = []
     next_url: str | None = url
     pages = 0
     while next_url:
         pages += 1
-        if pages > MAX_PAGES:
+        if pages > max_pages:
             raise GateError("pagination", "exceeded max pages without completion")
         payload, headers = http_get_json(
-            next_url, token, opener=opener, accept=accept
+            next_url, token, opener=opener, accept=accept, max_bytes=max_bytes
         )
         if not isinstance(payload, list):
             raise GateError("schema", "expected a list page from the GitHub API")
@@ -997,7 +1014,13 @@ def fetch_labeled_blocker_issues(
     )
     url = f"{API_ORIGIN}repos/{repo}/issues?{query}"
     collected: list[dict[str, Any]] = []
-    for item in paginate(url, token, opener=opener):
+    for item in paginate(
+        url,
+        token,
+        opener=opener,
+        max_pages=MAX_INVENTORY_PAGES,
+        max_bytes=MAX_INVENTORY_RESPONSE_BYTES,
+    ):
         if not isinstance(item, dict):
             raise GateError("schema", "issues page entry is not an object")
         if "pull_request" in item:
@@ -2581,6 +2604,34 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
     items = paginate(first_url, "tok", opener=opener, per_page=2)
     check("pagination aggregates pages", [i["n"] for i in items] == [1, 2, 3])
 
+    for bad_bound in (0, -1, True, "1048576"):
+        try:
+            http_get_json(first_url, "tok", opener=opener, max_bytes=bad_bound)
+            check(f"malformed byte bound {bad_bound!r} refused", False)
+        except GateError as exc:
+            check(
+                f"malformed byte bound {bad_bound!r} refused",
+                exc.code == "schema",
+                exc.message,
+            )
+
+    try:
+        paginate(first_url, "tok", opener=opener, per_page=2, max_pages=1)
+        check("caller page bound is enforced", False)
+    except GateError as exc:
+        check("caller page bound is enforced", exc.code == "pagination", exc.message)
+
+    for bad_bound in (0, -1, True, "50"):
+        try:
+            paginate(first_url, "tok", opener=opener, per_page=2, max_pages=bad_bound)
+            check(f"malformed page bound {bad_bound!r} refused", False)
+        except GateError as exc:
+            check(
+                f"malformed page bound {bad_bound!r} refused",
+                exc.code == "schema",
+                exc.message,
+            )
+
     truncated = page_opener({first_url: ([{"n": 1}, {"n": 2}], {})})
     try:
         paginate(first_url, "tok", opener=truncated, per_page=2)
@@ -2666,6 +2717,114 @@ def run_self_test() -> int:  # noqa: C901 — a flat fixture table stays readabl
         [item["number"] for item in discovered] == [9001, 9003],
         str([item.get("number") for item in discovered]),
     )
+
+    # The walk is unfiltered, so its page ceiling has to cover the repository's
+    # whole issue+pull-request history rather than the blocker set. Bounding it
+    # with the shared default would turn ordinary repository growth into a
+    # permanent `pagination` UNKNOWN.
+    check(
+        "inventory page bound exceeds the shared default",
+        MAX_INVENTORY_PAGES > MAX_PAGES,
+        str(MAX_INVENTORY_PAGES),
+    )
+    deep_page_count = MAX_PAGES + 5
+    deep_pages: dict[str, tuple[list[Any], dict[str, str]]] = {}
+    for index in range(deep_page_count):
+        current = label_page_one if index == 0 else f"{label_page_one}&page={index + 1}"
+        deep_pages[current] = (
+            [
+                {
+                    **_issue(9100 + index),
+                    "labels": [
+                        {"name": "launch-blocker", "id": 41},
+                        {"name": "severity:medium", "id": 43},
+                    ],
+                }
+            ],
+            (
+                {"link": f'<{label_page_one}&page={index + 2}>; rel="next"'}
+                if index + 1 < deep_page_count
+                else {}
+            ),
+        )
+    deep = fetch_labeled_blocker_issues(
+        "ferrum-edge/ferrum-edge",
+        _base_policy(),
+        "tok",
+        blocker_label_id=41,
+        opener=page_opener(deep_pages),
+    )
+    check(
+        "inventory walk continues past the shared page default",
+        len(deep) == deep_page_count,
+        str(len(deep)),
+    )
+
+    # A full unfiltered page carries `PER_PAGE` complete issue payloads and
+    # already measures close to `MAX_RESPONSE_BYTES`, so the walk must read
+    # against its own larger ceiling — while a body past that ceiling still
+    # fails closed rather than being silently truncated.
+    check(
+        "inventory byte bound exceeds the shared default",
+        MAX_INVENTORY_RESPONSE_BYTES > MAX_RESPONSE_BYTES,
+        str(MAX_INVENTORY_RESPONSE_BYTES),
+    )
+    oversized_issue = {
+        **_issue(9200),
+        "body": "x" * (MAX_RESPONSE_BYTES + 4096),
+        "labels": [
+            {"name": "launch-blocker", "id": 41},
+            {"name": "severity:medium", "id": 43},
+        ],
+    }
+    oversized = fetch_labeled_blocker_issues(
+        "ferrum-edge/ferrum-edge",
+        _base_policy(),
+        "tok",
+        blocker_label_id=41,
+        opener=page_opener({label_page_one: ([oversized_issue], {})}),
+    )
+    check(
+        "inventory page larger than the shared byte cap is read",
+        [item["number"] for item in oversized] == [9200],
+        str([item.get("number") for item in oversized]),
+    )
+    try:
+        http_get_json(
+            label_page_one,
+            "tok",
+            opener=page_opener({label_page_one: ([oversized_issue], {})}),
+        )
+        check("shared byte cap still refuses an oversized body", False)
+    except GateError as exc:
+        check(
+            "shared byte cap still refuses an oversized body",
+            exc.code == "api" and "size cap" in exc.message,
+            exc.message,
+        )
+
+    over_bound = {
+        f"{label_page_one}&page={index + 1}" if index else label_page_one: (
+            [],
+            {"link": f'<{label_page_one}&page={index + 2}>; rel="next"'},
+        )
+        for index in range(MAX_INVENTORY_PAGES + 1)
+    }
+    try:
+        fetch_labeled_blocker_issues(
+            "ferrum-edge/ferrum-edge",
+            _base_policy(),
+            "tok",
+            blocker_label_id=41,
+            opener=page_opener(over_bound),
+        )
+        check("inventory walk still fails closed at its bound", False)
+    except GateError as exc:
+        check(
+            "inventory walk still fails closed at its bound",
+            exc.code == "pagination",
+            exc.message,
+        )
 
     ev = _evaluate(
         _base_policy(),

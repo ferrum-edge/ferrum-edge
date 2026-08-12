@@ -82,6 +82,12 @@ correct fail-closed answer — not a `PASS`.
    Closed issues are included because `duplicate`, `not_planned`, and a missing
    close reason remain blocking until the issue is completed or explicitly
    exempted; an `open`-only walk would silently drop them.
+   Because this walk is unfiltered, its size tracks the whole repository history
+   rather than the blocker set, so it reads against its own page and body
+   ceilings (`MAX_INVENTORY_PAGES`, `MAX_INVENTORY_RESPONSE_BYTES`) instead of
+   the shared defaults, which ordinary repository growth would otherwise turn
+   into a permanent `pagination` or size-cap `UNKNOWN`. Both ceilings still fail
+   closed: an exhausted bound is `UNKNOWN`, never a truncated inventory.
 2. **Tracked inventory:** `tracked_blockers` in the policy is an explicit,
    CODEOWNERS-reviewed list, kept as defense in depth against a labeling
    mistake. It is never the only functioning inventory: the labeled walk above
