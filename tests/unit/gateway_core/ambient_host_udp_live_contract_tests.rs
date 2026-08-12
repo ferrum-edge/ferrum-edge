@@ -214,7 +214,7 @@ fn ambient_host_udp_live_runner_uses_disposable_outer_netns_ownership_boundary()
         .find("# --- From here on: exclusive lock, then disposable outer netns")
         .expect("post-preflight lock gate marker must exist");
     let outer = runner
-        .find("unshare --net -- \"$0\" \"$FERRUM_HOST_UDP_LIVE_INNER_ARGV\"")
+        .find("unshare --mount --net --propagation private")
         .expect("ordinary root execution must create a disposable outer netns");
     assert!(
         early_main < preflight && preflight < lock_gate && lock_gate < outer,
@@ -239,6 +239,14 @@ fn ambient_host_udp_live_runner_uses_disposable_outer_netns_ownership_boundary()
             && runner.contains("still in the init/host network namespace")
             && runner.contains("still in the parent network namespace"),
         "outer-netns isolation must be proven via self vs parent/init identities"
+    );
+    assert!(
+        runner.contains("mount_and_prove_disposable_sysfs")
+            && runner.contains("mount -t sysfs -o ro,nosuid,nodev,noexec sysfs /sys")
+            && runner.contains("ip link add \"$probe_host\" type veth peer name \"$probe_peer\"")
+            && runner.contains("disposable sysfs view does not track the owned network namespace")
+            && runner.contains("disposable sysfs view retained a removed namespace probe"),
+        "the private mount namespace must expose a freshly mounted sysfs tied to the owned netns"
     );
     assert!(
         runner.contains("Do not trust FERRUM_HOST_UDP_LIVE_IN_OUTER_NETNS")
@@ -310,7 +318,7 @@ fn ambient_host_udp_live_runner_uses_disposable_outer_netns_ownership_boundary()
     // Handled signals terminate and reap the complete owned child process
     // group before ordinary (non-destructive) cleanup releases the lock.
     assert!(
-        runner.contains("setsid unshare --net")
+        runner.contains("setsid unshare --mount --net --propagation private")
             && runner.contains("OUTER_PID=$!")
             && runner.contains("kill -TERM -- \"-$outer_pid\"")
             && runner.contains("kill -KILL -- \"-$outer_pid\"")
@@ -357,7 +365,9 @@ fn ambient_host_udp_live_runner_uses_disposable_outer_netns_ownership_boundary()
     assert!(
         readme.contains("disposable outer network namespace is the ordinary ownership boundary")
             && readme.contains("never enumerates or deletes")
-            && readme.contains("structurally"),
+            && readme.contains("structurally")
+            && readme.contains("fresh read-only sysfs instance")
+            && readme.contains("disposable veth probe"),
         "README must describe the outer-netns ownership boundary and structural proof"
     );
 

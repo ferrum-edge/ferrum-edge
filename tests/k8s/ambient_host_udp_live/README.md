@@ -19,8 +19,8 @@ placement (`FERRUM_MESH_CAPTURE_UDP_HOST_NETNS_ENABLED=true` →
 ## Skip-or-fail
 
 `FERRUM_LIVE_TESTS_REQUIRED=1` (set by the workflow) converts missing root,
-`unshare`/`ip`/`iptables`/`ip6tables` (including both save tools), `flock`, or
-TPROXY primitives into hard failure.
+`unshare`/`mount`/`ip`/`iptables`/`ip6tables` (including both save tools),
+`flock`, or TPROXY primitives into hard failure.
 Local ad-hoc runs without that flag may still print `SKIP:`.
 
 ## Isolation and ownership (#3804)
@@ -29,12 +29,16 @@ The disposable outer network namespace is the ordinary ownership boundary.
 
 Every normal root execution — hosted CI and ad-hoc alike — acquires a fixed
 shared-filesystem exclusive lock, then runs the complete fixture inside a
-**newly created** disposable outer netns (`unshare --net`). Canonical Ferrum
-host-UDP objects therefore exist only inside that sandbox and disappear when
-the owned netns lifetime ends. Ordinary teardown never enumerates or deletes
-canonical host chains, jumps, rules, or routes. Pre-existing canonical state in
-the caller's/host namespace remains byte-for-byte untouched because normal
-execution never mutates that namespace.
+**newly created** disposable outer network and mount namespaces (`unshare
+--mount --net`). The runner mounts a fresh read-only sysfs instance there, so
+production `/sys/class/net/<veth>` validation observes the disposable network
+namespace rather than the caller's sysfs superblock. Before the live suites it
+proves that view by creating and removing a disposable veth probe and observing
+both changes in sysfs. Canonical Ferrum host-UDP objects therefore exist only
+inside that sandbox and disappear when the owned netns lifetime ends. Ordinary
+teardown never enumerates or deletes canonical host chains, jumps, rules, or
+routes. Pre-existing canonical state in the caller's/host namespace remains
+byte-for-byte untouched because normal execution never mutates that namespace.
 
 Isolation is proven structurally before tests run: `/proc/self/ns/net` must
 differ from the parent-captured identity and from `/proc/1/ns/net`. An

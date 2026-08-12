@@ -8,8 +8,9 @@
 # Ownership contract (#3804):
 #   * Complete root/tool/kernel/preflight validation before any network mutation.
 #   * Acquire a fixed shared-filesystem exclusive flock before creating a netns.
-#   * Every ordinary root execution runs the complete fixture inside a newly
-#     created disposable outer network namespace (the ownership boundary).
+#   * Every ordinary root execution runs the complete fixture inside newly
+#     created disposable outer network + mount namespaces (the ownership
+#     boundary). A fresh sysfs mount is bound to that network namespace.
 #   * Isolation is proven structurally (self netns != parent-captured identity
 #     and != init netns). Environment flags are never trusted as proof.
 #   * Ordinary teardown never enumerates or deletes canonical host objects;
@@ -87,6 +88,10 @@ collect_diag() {
     for i in /sys/class/net/*/ifindex; do
       echo "$i=$(cat "$i" 2>/dev/null || true)"
     done | head -n 40
+    echo "=== sysfs namespace probe ==="
+    if [[ -r /sys/class/net/lo/ifindex ]]; then
+      echo "lo_ifindex=$(cat /sys/class/net/lo/ifindex 2>/dev/null || true)"
+    fi
     echo "=== udp binds ==="
     (cat /proc/net/udp /proc/net/udp6 2>/dev/null || true) | head -n 30
     echo "=== netns identity ==="
@@ -261,6 +266,35 @@ prove_disposable_outer_netns() {
   echo "disposable outer netns proven: self=$self parent=$parent init=$init"
 }
 
+# A network namespace alone is not enough for this gate. A sysfs superblock is
+# associated with the network namespace in which it was mounted, so carrying
+# the runner's existing /sys mount into `unshare --net` leaves production's
+# `/sys/class/net/<veth>` validation looking at the parent interfaces. Mount a
+# fresh, read-only sysfs inside the private mount namespace, then prove the view
+# follows a disposable veth through creation and removal before test mutation.
+mount_and_prove_disposable_sysfs() {
+  local probe_host="fhsys0" probe_peer="fhsys1"
+
+  if ! mount -t sysfs -o ro,nosuid,nodev,noexec sysfs /sys; then
+    fail_required "unable to mount disposable-netns sysfs view"
+  fi
+  if ! ip link add "$probe_host" type veth peer name "$probe_peer"; then
+    fail_required "unable to create disposable sysfs namespace probe"
+  fi
+  if [[ ! -r "/sys/class/net/$probe_host/ifindex" \
+    || ! -r "/sys/class/net/$probe_host/iflink" \
+    || ! -r "/sys/class/net/$probe_peer/ifindex" ]]; then
+    ip link del "$probe_host" 2>/dev/null || true
+    fail_required "disposable sysfs view does not track the owned network namespace"
+  fi
+  ip link del "$probe_host" || \
+    fail_required "unable to remove disposable sysfs namespace probe"
+  if [[ -e "/sys/class/net/$probe_host" || -e "/sys/class/net/$probe_peer" ]]; then
+    fail_required "disposable sysfs view retained a removed namespace probe"
+  fi
+  echo "disposable sysfs view proven for the owned network namespace"
+}
+
 bring_up_loopback() {
   ip link set lo up
   if [[ -w /proc/sys/net/ipv6/conf/all/disable_ipv6 ]]; then
@@ -334,6 +368,7 @@ run_inner_fixture() {
 
   prove_disposable_outer_netns "$parent_ns"
   bring_up_loopback
+  mount_and_prove_disposable_sysfs
   run_live_tests
 }
 
@@ -374,7 +409,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 0
 fi
 
-for bin in unshare nsenter ip iptables ip6tables iptables-save ip6tables-save timeout mktemp flock stat setsid sleep; do
+for bin in unshare nsenter mount ip iptables ip6tables iptables-save ip6tables-save timeout mktemp flock stat setsid sleep; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     if [[ "$LIVE_REQUIRED" == "1" || "$LIVE_REQUIRED" == "true" ]]; then
       fail_required "FERRUM_LIVE_TESTS_REQUIRED=1 requires $bin"
@@ -418,7 +453,8 @@ set +e
 # A dedicated session gives signal cleanup an exact process-group ownership
 # boundary. Bash records the session leader in $!, allowing the parent to
 # terminate and reap the complete namespace child tree before lock release.
-setsid unshare --net -- "$0" "$FERRUM_HOST_UDP_LIVE_INNER_ARGV" "$PARENT_NETNS_ID" &
+setsid unshare --mount --net --propagation private -- \
+  "$0" "$FERRUM_HOST_UDP_LIVE_INNER_ARGV" "$PARENT_NETNS_ID" &
 OUTER_PID=$!
 wait "$OUTER_PID"
 inner_status=$?
