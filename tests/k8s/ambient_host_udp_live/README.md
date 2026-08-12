@@ -51,13 +51,18 @@ Contract details:
    lock acquisition or outer-netns creation. Early `SKIP` and prerequisite
    failures leave host networking byte-for-byte unchanged.
 2. A fixed exclusive `flock` at
-   `/tmp/ferrum-host-udp-live-locks/ambient-host-udp-live.lock` is acquired
+   `/run/ferrum-edge-ambient-host-udp-live.lock` is acquired
    before the outer netns is created. A concurrent second invocation is
    rejected before mutation; the lock FD is held for the entire child run.
-   Lock open/close uses safe Bash dynamic-FD redirection (no `eval`).
+   `/run` is verified as a real, root-owned, non-group/world-writable directory,
+   and a pre-existing lock path is rejected if it is a symlink, non-regular
+   file, non-root-owned, or accessible to group/other users. New lock files are
+   created under a `077` umask. Lock open/close uses safe Bash dynamic-FD
+   redirection (no `eval`).
 3. After the child exits, only temp files and the lock are released. Networking
    cleanup is the kernel discarding the owned outer netns — not per-object
-   deletion in the parent/host namespace.
+   deletion in the parent/host namespace. Handled signals terminate and reap
+   the child's complete process group before releasing the lock.
 4. IPv4 and IPv6 live coverage remain symmetric inside the isolated environment.
 
 ### Explicit emergency destroy (development only)

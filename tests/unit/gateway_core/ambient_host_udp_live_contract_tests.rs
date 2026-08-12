@@ -183,8 +183,8 @@ fn ambient_host_udp_live_runner_fail_closed_and_bounded_diagnostics() {
 
 /// #3804: the disposable outer netns is the ordinary ownership boundary.
 /// Ordinary teardown must not delete canonical host objects; isolation is
-/// proven structurally; early SKIP paths stay network-inert; lock FD open
-/// never uses eval.
+/// proven structurally; early SKIP paths stay network-inert; the privileged
+/// lock is rooted safely; and lock FD open never uses eval.
 #[test]
 fn ambient_host_udp_live_runner_uses_disposable_outer_netns_ownership_boundary() {
     let runner = read("tests/k8s/ambient_host_udp_live/run.sh");
@@ -240,7 +240,7 @@ fn ambient_host_udp_live_runner_uses_disposable_outer_netns_ownership_boundary()
     // Fixed shared-filesystem lock before outer netns; safe dynamic FD, no eval.
     assert!(
         runner.contains("flock -n")
-            && runner.contains("/tmp/ferrum-host-udp-live-locks/ambient-host-udp-live.lock")
+            && runner.contains("/run/ferrum-edge-ambient-host-udp-live.lock")
             && runner.contains("another ambient_host_udp_live owner already holds the exclusive lock"),
         "a second fixture invocation must fail before mutation via the fixed exclusive lock"
     );
@@ -254,6 +254,15 @@ fn ambient_host_udp_live_runner_uses_disposable_outer_netns_ownership_boundary()
         runner.contains("ignoring FERRUM_HOST_UDP_LIVE_LOCK_DIR")
             && runner.contains("lock path is fixed"),
         "configurable lock directories must not be accepted as hostile-input surface"
+    );
+    assert!(
+        runner.contains("stat -Lc '%u:%a'")
+            && runner.contains("root-owned and not group/world-writable")
+            && runner.contains("must be a regular file, never a symlink")
+            && runner.contains("must be root-owned and mode 0600")
+            && runner.contains("umask 077")
+            && !runner.contains("/tmp/ferrum-host-udp-live-locks"),
+        "the root-opened lock must not be redirectable through attacker-owned /tmp state"
     );
 
     // Ordinary teardown never deletes canonical networking objects.
@@ -284,12 +293,18 @@ fn ambient_host_udp_live_runner_uses_disposable_outer_netns_ownership_boundary()
         "ordinary_exit_cleanup must not delete iptables/rules/routes"
     );
 
-    // Handled signals use ordinary (non-destructive) cleanup only.
+    // Handled signals terminate and reap the complete owned child process
+    // group before ordinary (non-destructive) cleanup releases the lock.
     assert!(
-        runner.contains("trap 'ordinary_exit_cleanup; exit 130' INT")
-            && runner.contains("trap 'ordinary_exit_cleanup; exit 143' TERM")
-            && runner.contains("trap 'ordinary_exit_cleanup; exit 129' HUP"),
-        "INT/TERM/HUP must run ordinary non-destructive cleanup"
+        runner.contains("setsid unshare --net")
+            && runner.contains("OUTER_PID=$!")
+            && runner.contains("kill -TERM -- \"-$outer_pid\"")
+            && runner.contains("kill -KILL -- \"-$outer_pid\"")
+            && runner.contains("wait \"$outer_pid\"")
+            && runner.contains("trap 'handle_outer_signal 130' INT")
+            && runner.contains("trap 'handle_outer_signal 143' TERM")
+            && runner.contains("trap 'handle_outer_signal 129' HUP"),
+        "INT/TERM/HUP must terminate and reap the child tree before lock release"
     );
     assert!(
         runner.contains("trap 'early_temp_cleanup; exit 130' INT")

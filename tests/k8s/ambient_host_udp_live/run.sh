@@ -28,10 +28,11 @@ LIB_BIN="${FERRUM_HOST_UDP_LIB_TEST_BIN:?FERRUM_HOST_UDP_LIB_TEST_BIN must point
 FUNC_BIN="${FERRUM_HOST_UDP_FUNCTIONAL_TEST_BIN:?FERRUM_HOST_UDP_FUNCTIONAL_TEST_BIN must point at the functional test binary}"
 EMERGENCY_DESTROY="${FERRUM_HOST_UDP_LIVE_EMERGENCY_DESTROY_CANONICAL:-0}"
 
-# Fixed lock location only. Configurable lock dirs are hostile-input surface.
-readonly FERRUM_HOST_UDP_LIVE_LOCK_DIR_FIXED="/tmp/ferrum-host-udp-live-locks"
-# Full fixed path kept as one literal for contracts and operator grepping.
-readonly FERRUM_HOST_UDP_LIVE_LOCK_PATH="/tmp/ferrum-host-udp-live-locks/ambient-host-udp-live.lock"
+# Fixed lock location only. /run is a root-owned, non-user-writable shared
+# mount across the network namespaces created below. Never place this
+# privileged lock beneath /tmp: an unprivileged user could pre-create a
+# directory or symlink and redirect Bash's root open/truncate operation.
+readonly FERRUM_HOST_UDP_LIVE_LOCK_PATH="/run/ferrum-edge-ambient-host-udp-live.lock"
 # Internal argv marker for the disposable-outer child. Not an operator trust root;
 # structural netns proof below is mandatory.
 readonly FERRUM_HOST_UDP_LIVE_INNER_ARGV="--ferrum-inner-host-udp-live"
@@ -41,6 +42,7 @@ func_raw=""
 LOCK_FD=""
 LOCK_HELD=0
 PARENT_NETNS_ID=""
+OUTER_PID=""
 
 HOST_UDP_CHAINS=(
   FERRUM_MESH_UDP_HOST
@@ -130,6 +132,31 @@ ordinary_exit_cleanup() {
   release_lock
 }
 
+terminate_outer_child() {
+  local outer_pid="${OUTER_PID:-}"
+  if [[ -z "$outer_pid" ]]; then
+    return
+  fi
+
+  # The child is launched as its own session/process-group leader. Signal the
+  # whole tree so a synchronous test binary cannot outlive the namespace
+  # owner. Give normal traps a brief chance to scrub raw temp output, then
+  # force termination and reap the leader before the exclusive lock is freed.
+  kill -TERM -- "-$outer_pid" 2>/dev/null || true
+  sleep 1
+  kill -KILL -- "-$outer_pid" 2>/dev/null || true
+  wait "$outer_pid" 2>/dev/null || true
+  OUTER_PID=""
+}
+
+handle_outer_signal() {
+  local status="$1"
+  trap - EXIT INT TERM HUP
+  terminate_outer_child
+  ordinary_exit_cleanup
+  exit "$status"
+}
+
 early_temp_cleanup() {
   if [[ -n "$lib_raw" ]]; then
     rm -f -- "$lib_raw"
@@ -159,14 +186,48 @@ emergency_destroy_canonical() {
 }
 
 acquire_exclusive_lock() {
+  local lock_parent lock_parent_meta lock_parent_owner lock_parent_mode
+  local lock_meta lock_owner lock_mode previous_umask
+
   # Ignore any operator-supplied lock directory; path is fixed above.
   if [[ -n "${FERRUM_HOST_UDP_LIVE_LOCK_DIR:-}" ]]; then
     echo "warning: ignoring FERRUM_HOST_UDP_LIVE_LOCK_DIR (lock path is fixed)" >&2
   fi
-  mkdir -p "$FERRUM_HOST_UDP_LIVE_LOCK_DIR_FIXED"
+
+  lock_parent="${FERRUM_HOST_UDP_LIVE_LOCK_PATH%/*}"
+  if [[ -L "$lock_parent" || ! -d "$lock_parent" ]]; then
+    fail_required "host-UDP live lock parent must be a real directory: $lock_parent"
+  fi
+  lock_parent_meta="$(stat -Lc '%u:%a' -- "$lock_parent")" || \
+    fail_required "unable to inspect host-UDP live lock parent: $lock_parent"
+  lock_parent_owner="${lock_parent_meta%%:*}"
+  lock_parent_mode="${lock_parent_meta#*:}"
+  if [[ "$lock_parent_owner" != "0" ]] || (( (8#$lock_parent_mode & 0022) != 0 )); then
+    fail_required "host-UDP live lock parent must be root-owned and not group/world-writable: $lock_parent"
+  fi
+  if [[ -L "$FERRUM_HOST_UDP_LIVE_LOCK_PATH" ]] \
+    || [[ -e "$FERRUM_HOST_UDP_LIVE_LOCK_PATH" && ! -f "$FERRUM_HOST_UDP_LIVE_LOCK_PATH" ]]; then
+    fail_required "host-UDP live lock path must be a regular file, never a symlink"
+  fi
+  if [[ -e "$FERRUM_HOST_UDP_LIVE_LOCK_PATH" ]]; then
+    lock_meta="$(stat -Lc '%u:%a' -- "$FERRUM_HOST_UDP_LIVE_LOCK_PATH")" || \
+      fail_required "unable to inspect existing host-UDP live lock"
+    lock_owner="${lock_meta%%:*}"
+    lock_mode="${lock_meta#*:}"
+    if [[ "$lock_owner" != "0" ]] || (( (8#$lock_mode & 0077) != 0 )); then
+      fail_required "existing host-UDP live lock must be root-owned and mode 0600"
+    fi
+  fi
+
   # Safe Bash dynamic-FD open — never eval. Treat path as data only.
-  exec {LOCK_FD}>"$FERRUM_HOST_UDP_LIVE_LOCK_PATH" || \
+  previous_umask="$(umask)"
+  umask 077
+  if exec {LOCK_FD}>"$FERRUM_HOST_UDP_LIVE_LOCK_PATH"; then
+    umask "$previous_umask"
+  else
+    umask "$previous_umask"
     fail_required "unable to open host-UDP live lock at $FERRUM_HOST_UDP_LIVE_LOCK_PATH"
+  fi
   if ! flock -n "$LOCK_FD"; then
     exec {LOCK_FD}>&- 2>/dev/null || true
     LOCK_FD=""
@@ -313,7 +374,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 0
 fi
 
-for bin in unshare nsenter ip iptables ip6tables iptables-save ip6tables-save timeout mktemp flock; do
+for bin in unshare nsenter ip iptables ip6tables iptables-save ip6tables-save timeout mktemp flock stat setsid sleep; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     if [[ "$LIVE_REQUIRED" == "1" || "$LIVE_REQUIRED" == "true" ]]; then
       fail_required "FERRUM_LIVE_TESTS_REQUIRED=1 requires $bin"
@@ -343,9 +404,9 @@ fi
 
 acquire_exclusive_lock
 trap ordinary_exit_cleanup EXIT
-trap 'ordinary_exit_cleanup; exit 130' INT
-trap 'ordinary_exit_cleanup; exit 143' TERM
-trap 'ordinary_exit_cleanup; exit 129' HUP
+trap 'handle_outer_signal 130' INT
+trap 'handle_outer_signal 143' TERM
+trap 'handle_outer_signal 129' HUP
 
 PARENT_NETNS_ID="$(netns_identity)"
 if [[ -z "$PARENT_NETNS_ID" ]]; then
@@ -354,8 +415,14 @@ fi
 
 echo "Creating disposable outer network namespace for ambient host-UDP live (#3804)"
 set +e
-unshare --net -- "$0" "$FERRUM_HOST_UDP_LIVE_INNER_ARGV" "$PARENT_NETNS_ID"
+# A dedicated session gives signal cleanup an exact process-group ownership
+# boundary. Bash records the session leader in $!, allowing the parent to
+# terminate and reap the complete namespace child tree before lock release.
+setsid unshare --net -- "$0" "$FERRUM_HOST_UDP_LIVE_INNER_ARGV" "$PARENT_NETNS_ID" &
+OUTER_PID=$!
+wait "$OUTER_PID"
 inner_status=$?
+OUTER_PID=""
 set -e
 
 # Ordinary teardown: release lock / temps only. Do not enumerate or delete
