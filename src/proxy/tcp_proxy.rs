@@ -1633,6 +1633,17 @@ async fn run_tcp_accept_loop(
                     continue;
                 }
 
+                // Stale-configuration admission fence (issue #3726). A data
+                // plane whose applied CP snapshot aged past
+                // FERRUM_DP_CONFIG_MAX_STALE_SECONDS with no CP connected can no
+                // longer be told that this listener or its policy was revoked,
+                // so new connections fail closed while already-accepted ones
+                // keep draining. One relaxed load; constant `false` elsewhere.
+                if crate::dp_config_freshness::new_traffic_blocked() {
+                    drop(stream); // TCP RST
+                    continue;
+                }
+
                 state.metrics.total_connections.fetch_add(1, Ordering::Relaxed);
 
                 let port = state.port;

@@ -872,6 +872,7 @@ jobs:
               integration::gateway_multi_cert_sni_tests
               integration::mesh_grpc_transport_tests
               integration::gateway_svid_identity_tests
+              integration::workload_api_admission_tests
               integration::workload_api_jwt_svid_tests
               integration::graceful_shutdown_tests
               integration::port_aware_route_traffic_tests

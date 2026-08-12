@@ -552,6 +552,7 @@ FULL_CI_DOCUMENTATION_PATHS = frozenset(
         "docs/node_agent.md",
         "docs/plans/node_waypoint_transport_adr.md",
         "docs/spire_deployment.md",
+        "docs/tcp_udp_proxy.md",
     }
 )
 
@@ -565,6 +566,11 @@ FULL_CI_GOVERNANCE_PATHS = frozenset(
     {
         "docs/dependency-policy.md",
         "docs/vendored-patch-lifecycle.json",
+        "docs/launch-blocker-policy.json",
+        "docs/launch-exemptions.json",
+        "docs/launch-readiness.md",
+        "PRODUCTION_READINESS.md",
+        "scripts/check_launch_readiness.py",
     }
 )
 
@@ -620,13 +626,18 @@ HELM_PATTERNS = [
 EBPF_LIVE_PATTERNS = [
     re.compile(pattern)
     for pattern in (
-        r"^\.github/workflows/(?:ci|node-waypoint-ebpf-live)\.yml$",
+        r"^\.github/workflows/(?:ci|node-waypoint-ebpf-live|ambient-host-udp-live)\.yml$",
         r"^\.github/actions/(?:setup-rust-ci|setup-sccache|setup-fast-linker|setup-kubernetes-tools|package-ferrum-runtime-image)/",
         r"^Cargo\.(?:toml|lock)$",
         r"^\.cargo/",
         r"^rust-toolchain\.toml$",
         r"^build\.rs$",
         r"^proto/",
+        # The live eBPF/capture suites build and run the published runtime image
+        # targets, and the mesh chart auto-selects one of them, so the image
+        # definition and its runtime tool staging are in scope for these gates.
+        r"^Dockerfile$",
+        r"^\.github/scripts/stage_iproute2_runtime\.sh$",
         r"^ebpf/",
         r"^src/capture/",
         r"^src/ebpf/",
@@ -638,7 +649,7 @@ EBPF_LIVE_PATTERNS = [
         r"^src/modes/(?:node_agent|node_agent_cni_server)\.rs$",
         r"^src/plugins/mesh/",
         r"^src/plugins/prometheus_metrics\.rs$",
-        r"^src/proxy/(?:backend_dispatch|grpc_proxy|hbone_pool|hbone_proxy|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_udp_capture|mesh_udp_frame|mod|netns_capture|netns_udp_capture|tcp_proxy|udp_batch)\.rs$",
+        r"^src/proxy/(?:backend_dispatch|grpc_proxy|hbone_pool|hbone_proxy|host_udp_capture|host_udp_capture_live_tests|mesh_mtls_pool|mesh_tcp_egress|mesh_tcp_inbound|mesh_udp_capture|mesh_udp_frame|mod|netns_capture|netns_udp_capture|tcp_proxy|udp_batch|udp_placement_migration)\.rs$",
         r"^src/(?:router_cache|socket_opts)\.rs$",
         r"^src/service_discovery/",
         r"^src/tls/",
@@ -646,7 +657,8 @@ EBPF_LIVE_PATTERNS = [
         r"^tests/functional/fixtures/",
         r"^tests/k8s/lib/",
         r"^tests/k8s/node_waypoint_ebpf_live/",
-        r"^tests/.*(?:capture|ebpf|netns|node_waypoint).*",
+        r"^tests/k8s/ambient_host_udp_live/",
+        r"^tests/.*(?:capture|ebpf|netns|node_waypoint|host_udp).*",
     )
 ]
 
@@ -835,6 +847,21 @@ def self_test() -> int:
             "pull_request",
             ["src/backend_conn_limit.rs"],
             {"run_mesh_sidecar_smoke": True},
+        ),
+        (
+            "pull_request",
+            ["src/proxy/host_udp_capture.rs"],
+            {"run_ebpf_live": True},
+        ),
+        (
+            "pull_request",
+            ["tests/k8s/ambient_host_udp_live/run.sh"],
+            {"run_ebpf_live": True},
+        ),
+        (
+            "pull_request",
+            ["Dockerfile"],
+            {"run_ebpf_live": True},
         ),
         (
             "pull_request",

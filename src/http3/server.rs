@@ -1453,6 +1453,25 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // Stale-configuration admission fence (HTTP/3, issue #3726). Same single
+    // relaxed load as the H1/H2 path: a data plane whose applied CP snapshot
+    // aged past its bound with no CP connected fails new work closed while
+    // already-accepted streams drain.
+    if crate::dp_config_freshness::new_traffic_blocked() {
+        record_h3_flavor_aware_reject(&state, http_flavor, 503);
+        send_h3_error_flavor_aware(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"Gateway configuration stale"}"#,
+            crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
+            "Gateway configuration stale",
+        )
+        .await?;
+        return Ok(());
+    }
+
     // Track this request for overload monitoring and graceful drain.
     let request_guard = crate::overload::RequestGuard::new(&state.overload);
 

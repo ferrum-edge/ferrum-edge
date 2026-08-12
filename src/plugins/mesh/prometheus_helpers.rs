@@ -59,11 +59,45 @@ static MESH_SUBSCRIBE_AUDIENCE_REJECTIONS: LazyLock<
     DashMap<MeshSubscribeAudienceRejectKey, AtomicU64>,
 > = LazyLock::new(DashMap::new);
 static XDS_STREAMS_REJECTED: AtomicU64 = AtomicU64::new(0);
+/// Per-reason ADS admission rejections (issue #3741). The key is always a
+/// compile-time `XdsAdmissionRejection::metric_reason()` constant, so the series
+/// count is fixed and no client-supplied text can reach a label.
+static XDS_STREAM_ADMISSION_REJECTIONS: LazyLock<DashMap<&'static str, AtomicU64>> =
+    LazyLock::new(DashMap::new);
+/// Total active ADS streams and distinct active node state keys. Both are
+/// absolute occupancy gauges updated by atomic deltas from the single
+/// process-wide `XdsAdmissionController` on successful admission / exactly-once
+/// release (never by racing load-then-store snapshots). Label-free because every
+/// dimension that could distinguish them (node id, principal, tenant namespace)
+/// is client-influenced and would be unbounded.
+static XDS_ACTIVE_STREAMS: AtomicU64 = AtomicU64::new(0);
+static XDS_ACTIVE_NODE_IDS: AtomicU64 = AtomicU64::new(0);
+/// Set once the ADS admission controller has published a value, so the two
+/// gauges are emitted (including at zero) on a CP that serves xDS and stay
+/// absent everywhere else.
+static XDS_ADMISSION_OBSERVED: AtomicU64 = AtomicU64::new(0);
 static MESH_INBOUND_PLAINTEXT_ALLOWED: AtomicU64 = AtomicU64::new(0);
 static XDS_WARMING_PARTIAL_APPLIES: LazyLock<DashMap<Arc<str>, AtomicU64>> =
     LazyLock::new(DashMap::new);
 static XDS_FIRST_SLICE_NACKS: LazyLock<DashMap<XdsFirstSliceNackKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
+/// `1` once a Workload API listener has stood up in this process. Gates the
+/// gauges below so a gateway that never serves the surface does not publish
+/// permanently-zero series for it.
+static WORKLOAD_API_ADMISSION_ARMED: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_ACTIVE_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_ACTIVE_RPCS: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_RPCS_REJECTED: AtomicU64 = AtomicU64::new(0);
+// One atomic per admitted label keeps these dimensions closed by construction.
+// The increment helpers below match only these spellings; an unexpected static
+// string cannot allocate or create a new Prometheus series.
+static WORKLOAD_API_REJECTED_PEER_CREDENTIALS: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_REJECTED_MAX_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_REJECTED_MAX_CONNECTIONS_PER_UID: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_REJECTED_SHUTTING_DOWN: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_CLOSED_INITIAL_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_CLOSED_IDLE_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+static WORKLOAD_API_CLOSED_SHUTDOWN_DEADLINE: AtomicU64 = AtomicU64::new(0);
 
 /// Istio/GAMMA-style RED metric key for mesh HTTP-family requests.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -842,14 +876,121 @@ pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
         .fetch_add(1, Ordering::Relaxed);
 }
 
-/// Count an ADS stream the CP rejected because a node is already at its
-/// per-node concurrent-stream ceiling (`FERRUM_XDS_MAX_STREAMS_PER_NODE`).
-/// Aggregated (no per-node label) to avoid an unbounded, client-controlled
-/// `node_id` metric dimension; the offending node id is still logged at `warn!`
-/// at the reject site. Surfaces a DoS / misconfigured-client signal the plain
-/// gRPC `RESOURCE_EXHAUSTED` status alone does not expose to scraping.
+/// Count an ADS stream the CP refused at admission — any scope: total,
+/// per-namespace, per-principal, per-node, distinct-node cardinality, an
+/// invalid `Node.id`, or the initial-request deadline (issue #3741).
+///
+/// Aggregated (no labels) to avoid an unbounded, client-controlled `node_id` /
+/// principal metric dimension. The offending node id is never logged raw; the
+/// reject site logs a redacted digest instead. Surfaces a DoS /
+/// misconfigured-client signal the plain gRPC `RESOURCE_EXHAUSTED` status alone
+/// does not expose to scraping. Use
+/// [`increment_xds_stream_admission_rejection`] alongside it for the bounded
+/// per-reason breakdown.
 pub fn increment_xds_stream_rejected() {
     XDS_STREAMS_REJECTED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count an ADS admission rejection by bounded reason (issue #3741).
+///
+/// `reason` must be an `XdsAdmissionRejection::metric_reason()` constant. It is
+/// `&'static str` precisely so the label set is closed at compile time and no
+/// node id, principal, subject, token, SPIFFE URI, or tenant-supplied text can
+/// ever reach `/metrics`.
+pub fn increment_xds_stream_admission_rejection(reason: &'static str) {
+    XDS_STREAM_ADMISSION_REJECTIONS
+        .entry(reason)
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Apply a signed delta to the ADS active-stream gauge.
+///
+/// The controller publishes **exactly one** `+1` on successful aggregate
+/// admission and **exactly one** `-1` on the matching release. Independent
+/// load-then-store snapshots are deliberately avoided: concurrent
+/// reserve/release interleavings must not let an older absolute snapshot
+/// overwrite a newer value and leave a stale gauge after activity stops
+/// (issue #3741).
+pub(crate) fn adjust_xds_active_streams(delta: i64) {
+    apply_xds_admission_gauge_delta(&XDS_ACTIVE_STREAMS, delta);
+}
+
+/// Apply a signed delta to the ADS active-node-id gauge.
+///
+/// Tied exactly to successful distinct-node slot admission (`+1`) and
+/// exactly-once last-stream node removal (`-1`). Same race-safety contract as
+/// [`adjust_xds_active_streams`].
+pub(crate) fn adjust_xds_active_node_ids(delta: i64) {
+    apply_xds_admission_gauge_delta(&XDS_ACTIVE_NODE_IDS, delta);
+}
+
+fn apply_xds_admission_gauge_delta(gauge: &AtomicU64, delta: i64) {
+    if delta == 0 {
+        return;
+    }
+    if delta > 0 {
+        gauge.fetch_add(delta as u64, Ordering::Relaxed);
+    } else {
+        let amount = (-delta) as u64;
+        let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(amount))
+        });
+    }
+    XDS_ADMISSION_OBSERVED.store(1, Ordering::Relaxed);
+}
+
+// This private helper cannot be exercised from the external test crate without
+// exposing process-global gauge internals. Keep its concurrency regression
+// isolated from the parallel test suite so unrelated controllers cannot move a
+// shared baseline underneath the assertion.
+#[cfg(test)]
+mod xds_admission_gauge_delta_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    use super::apply_xds_admission_gauge_delta;
+
+    #[test]
+    fn concurrent_deltas_return_an_isolated_gauge_to_zero() {
+        let threads = 16usize;
+        let gauge = Arc::new(AtomicU64::new(0));
+        let start = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+
+        for _ in 0..threads {
+            let gauge = Arc::clone(&gauge);
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..1_000 {
+                    apply_xds_admission_gauge_delta(&gauge, 1);
+                    std::thread::yield_now();
+                    apply_xds_admission_gauge_delta(&gauge, -1);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("gauge delta thread panicked");
+        }
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
+}
+
+/// Current value of `ferrum_xds_stream_admission_rejections_total{reason}`.
+#[allow(dead_code)] // External integration tests consume the library copy; the binary target does not.
+pub fn xds_stream_admission_rejection_count(reason: &'static str) -> u64 {
+    XDS_STREAM_ADMISSION_REJECTIONS
+        .get(reason)
+        .map(|entry| entry.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Current value of the label-free ADS stream rejection aggregate counter.
+#[allow(dead_code)] // External integration tests consume the library copy; the binary target does not.
+pub fn xds_streams_rejected_total() -> u64 {
+    XDS_STREAMS_REJECTED.load(Ordering::Relaxed)
 }
 
 /// Set the coarse posture gauge for the mesh inbound listener's mTLS
@@ -895,6 +1036,90 @@ pub fn increment_xds_warming_partial_apply(namespace: impl AsRef<str>) {
         .entry(Arc::from(namespace.as_ref()))
         .or_insert_with(|| AtomicU64::new(0))
         .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Arm the SPIFFE Workload API transport-admission gauges.
+///
+/// Called once when a Workload API listener binds. Until then the gauges are
+/// not rendered at all: a gateway that never serves the surface should not
+/// publish a permanently-zero `active_connections` series that an operator
+/// could mistake for a live, idle endpoint.
+pub fn set_workload_api_admission_armed() {
+    WORKLOAD_API_ADMISSION_ARMED.store(1, Ordering::Relaxed);
+}
+
+/// Count one admitted Workload API connection.
+pub fn increment_workload_api_active_connections() {
+    WORKLOAD_API_ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Release one admitted Workload API connection. Saturating, so a double
+/// release (which the permit's `Drop` makes unreachable) could never wrap the
+/// gauge to `u64::MAX`.
+pub fn decrement_workload_api_active_connections() {
+    let _ = WORKLOAD_API_ACTIVE_CONNECTIONS.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |current| Some(current.saturating_sub(1)),
+    );
+}
+
+/// Count a Workload API connection refused at the transport-admission boundary.
+///
+/// `reason` must be one of the fixed
+/// `identity::workload_api::admission::reject_reason` constants. Peer UID, PID,
+/// SPIFFE ID, and token material are deliberately absent: they are
+/// attacker-influenced or credential-adjacent, and a metric label built from
+/// one is both an unbounded cardinality dimension and a disclosure surface.
+/// Rejection `debug!` logs at the reject site carry only fixed reason/limit
+/// context — never raw caller identifiers or credential metadata.
+pub fn increment_workload_api_connection_rejected(reason: &'static str) {
+    let counter = match reason {
+        "peer_credentials" => &WORKLOAD_API_REJECTED_PEER_CREDENTIALS,
+        "max_connections" => &WORKLOAD_API_REJECTED_MAX_CONNECTIONS,
+        "max_connections_per_uid" => &WORKLOAD_API_REJECTED_MAX_CONNECTIONS_PER_UID,
+        "shutting_down" => &WORKLOAD_API_REJECTED_SHUTTING_DOWN,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a Workload API connection the listener closed on a transport deadline
+/// or at the shutdown force-close. Same closed-set `reason` contract.
+pub fn increment_workload_api_connection_closed(reason: &'static str) {
+    let counter = match reason {
+        "initial_timeout" => &WORKLOAD_API_CLOSED_INITIAL_TIMEOUT,
+        "idle_timeout" => &WORKLOAD_API_CLOSED_IDLE_TIMEOUT,
+        "shutdown_deadline" => &WORKLOAD_API_CLOSED_SHUTDOWN_DEADLINE,
+        _ => return,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count one admitted Workload API RPC (held for a streaming RPC's whole
+/// response stream, not just for its handler).
+pub fn increment_workload_api_active_rpcs() {
+    WORKLOAD_API_ACTIVE_RPCS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Release one admitted Workload API RPC.
+pub fn decrement_workload_api_active_rpcs() {
+    let _ =
+        WORKLOAD_API_ACTIVE_RPCS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(1))
+        });
+}
+
+/// Count a Workload API RPC shed by RPC admission — the service-wide ceiling,
+/// the per-peer-UID quota, or an unattributable peer.
+///
+/// Label-free **deliberately**, including for the per-UID case: the only honest
+/// key for that half is the peer UID, and a synthetic stand-in operators would
+/// learn to map back to a principal is the same disclosure with extra steps.
+/// Which of the two bounds refused is stated only in the off-by-default,
+/// UID-free `debug!`.
+pub fn increment_workload_api_rpc_rejected() {
+    WORKLOAD_API_RPCS_REJECTED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Render process-static mesh families without a gateway namespace label.
@@ -1187,13 +1412,51 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
     let xds_streams_rejected = XDS_STREAMS_REJECTED.load(Ordering::Relaxed);
     if xds_streams_rejected > 0 {
         output.push_str(
-            "# HELP ferrum_xds_streams_rejected_total ADS streams rejected for exceeding the per-node concurrent-stream ceiling.\n",
+            "# HELP ferrum_xds_streams_rejected_total ADS streams rejected at admission by any scope (total, namespace, principal, node, node cardinality, invalid Node.id, or initial-request deadline).\n",
         );
         output.push_str("# TYPE ferrum_xds_streams_rejected_total counter\n");
         render_mesh_process_metric(
             output,
             "ferrum_xds_streams_rejected_total",
             xds_streams_rejected,
+            gateway_ns_label,
+        );
+    }
+
+    if !XDS_STREAM_ADMISSION_REJECTIONS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_xds_stream_admission_rejections_total ADS streams rejected at admission, by bounded reason.\n",
+        );
+        output.push_str("# TYPE ferrum_xds_stream_admission_rejections_total counter\n");
+        for entry in XDS_STREAM_ADMISSION_REJECTIONS.iter() {
+            output.push_str(&format!(
+                "ferrum_xds_stream_admission_rejections_total{{reason=\"{}\"{}}} {}\n",
+                escape_label_value(entry.key()),
+                gateway_ns_label,
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if XDS_ADMISSION_OBSERVED.load(Ordering::Relaxed) != 0 {
+        output.push_str(
+            "# HELP ferrum_xds_active_streams Currently active ADS streams (SotW plus Delta) admitted by the control plane.\n",
+        );
+        output.push_str("# TYPE ferrum_xds_active_streams gauge\n");
+        render_mesh_process_metric(
+            output,
+            "ferrum_xds_active_streams",
+            XDS_ACTIVE_STREAMS.load(Ordering::Relaxed),
+            gateway_ns_label,
+        );
+        output.push_str(
+            "# HELP ferrum_xds_active_node_ids Distinct node state keys with at least one active ADS stream.\n",
+        );
+        output.push_str("# TYPE ferrum_xds_active_node_ids gauge\n");
+        render_mesh_process_metric(
+            output,
+            "ferrum_xds_active_node_ids",
+            XDS_ACTIVE_NODE_IDS.load(Ordering::Relaxed),
             gateway_ns_label,
         );
     }
@@ -1227,6 +1490,105 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
                 entry.value().load(Ordering::Relaxed)
             ));
         }
+    }
+
+    if WORKLOAD_API_ADMISSION_ARMED.load(Ordering::Relaxed) == 1 {
+        output.push_str(
+            "# HELP ferrum_mesh_workload_api_active_connections SPIFFE Workload API connections currently admitted by the transport admission boundary.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_workload_api_active_connections gauge\n");
+        render_mesh_process_metric(
+            output,
+            "ferrum_mesh_workload_api_active_connections",
+            WORKLOAD_API_ACTIVE_CONNECTIONS.load(Ordering::Relaxed),
+            gateway_ns_label,
+        );
+
+        output.push_str(
+            "# HELP ferrum_mesh_workload_api_active_rpcs SPIFFE Workload API RPCs currently admitted by RPC admission (service-wide ceiling and per-peer-UID quota); counts service-dispatched RPC streams only — each occupies one HTTP/2 stream, but streams refused inside HTTP/2 or rejected before service dispatch are not observable here.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_workload_api_active_rpcs gauge\n");
+        render_mesh_process_metric(
+            output,
+            "ferrum_mesh_workload_api_active_rpcs",
+            WORKLOAD_API_ACTIVE_RPCS.load(Ordering::Relaxed),
+            gateway_ns_label,
+        );
+    }
+
+    let workload_api_rejections = [
+        (
+            "peer_credentials",
+            WORKLOAD_API_REJECTED_PEER_CREDENTIALS.load(Ordering::Relaxed),
+        ),
+        (
+            "max_connections",
+            WORKLOAD_API_REJECTED_MAX_CONNECTIONS.load(Ordering::Relaxed),
+        ),
+        (
+            "max_connections_per_uid",
+            WORKLOAD_API_REJECTED_MAX_CONNECTIONS_PER_UID.load(Ordering::Relaxed),
+        ),
+        (
+            "shutting_down",
+            WORKLOAD_API_REJECTED_SHUTTING_DOWN.load(Ordering::Relaxed),
+        ),
+    ];
+    if workload_api_rejections.iter().any(|(_, count)| *count > 0) {
+        output.push_str(
+            "# HELP ferrum_mesh_workload_api_connections_rejected_total SPIFFE Workload API connections refused before any tonic allocation, by fixed admission reason.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_workload_api_connections_rejected_total counter\n");
+        for (reason, count) in workload_api_rejections
+            .iter()
+            .filter(|(_, count)| *count > 0)
+        {
+            output.push_str(&format!(
+                "ferrum_mesh_workload_api_connections_rejected_total{{reason=\"{}\"{}}} {}\n",
+                reason, gateway_ns_label, count
+            ));
+        }
+    }
+
+    let workload_api_closes = [
+        (
+            "initial_timeout",
+            WORKLOAD_API_CLOSED_INITIAL_TIMEOUT.load(Ordering::Relaxed),
+        ),
+        (
+            "idle_timeout",
+            WORKLOAD_API_CLOSED_IDLE_TIMEOUT.load(Ordering::Relaxed),
+        ),
+        (
+            "shutdown_deadline",
+            WORKLOAD_API_CLOSED_SHUTDOWN_DEADLINE.load(Ordering::Relaxed),
+        ),
+    ];
+    if workload_api_closes.iter().any(|(_, count)| *count > 0) {
+        output.push_str(
+            "# HELP ferrum_mesh_workload_api_connections_closed_total Established SPIFFE Workload API connections closed by a transport deadline or the bounded shutdown force-close, by fixed reason.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_workload_api_connections_closed_total counter\n");
+        for (reason, count) in workload_api_closes.iter().filter(|(_, count)| *count > 0) {
+            output.push_str(&format!(
+                "ferrum_mesh_workload_api_connections_closed_total{{reason=\"{}\"{}}} {}\n",
+                reason, gateway_ns_label, count
+            ));
+        }
+    }
+
+    let workload_api_rpcs_rejected = WORKLOAD_API_RPCS_REJECTED.load(Ordering::Relaxed);
+    if workload_api_rpcs_rejected > 0 {
+        output.push_str(
+            "# HELP ferrum_mesh_workload_api_rpcs_rejected_total SPIFFE Workload API RPCs shed by RPC admission — the service-wide concurrency ceiling or the per-peer-UID quota — before any producer work was spawned; the HTTP/2 stream is already open and carries a RESOURCE_EXHAUSTED result, so this is not a protocol-level stream refusal.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_workload_api_rpcs_rejected_total counter\n");
+        render_mesh_process_metric(
+            output,
+            "ferrum_mesh_workload_api_rpcs_rejected_total",
+            workload_api_rpcs_rejected,
+            gateway_ns_label,
+        );
     }
 
     crate::grpc::mesh_slice_drift::render_mesh_slice_drift_metrics(output, gateway_ns_label);

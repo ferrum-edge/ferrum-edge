@@ -3,7 +3,10 @@
 //! These tests mutate process-global environment variables, so they MUST run serially.
 //! We use `serial_test` via a simple mutex to enforce this.
 
+use std::time::Duration;
+
 use ferrum_edge::config::{DbTlsMode, EnvConfig, OperatingMode};
+use ferrum_edge::dp_config_freshness::StaleAction;
 use ferrum_edge::ebpf::NodeAgentProxyMode;
 
 // Shared process-wide env lock: serializes against the identity guardrail
@@ -147,10 +150,30 @@ fn test_xds_enabled_defaults_false() {
             remove_var("FERRUM_XDS_ENABLED");
             remove_var("FERRUM_XDS_STREAM_CHANNEL_CAPACITY");
             remove_var("FERRUM_XDS_MAX_STREAMS_PER_NODE");
+            remove_var("FERRUM_XDS_MAX_TOTAL_STREAMS");
+            remove_var("FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE");
+            remove_var("FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL");
+            remove_var("FERRUM_XDS_MAX_ACTIVE_NODES");
+            remove_var("FERRUM_XDS_MAX_NODE_ID_BYTES");
+            remove_var("FERRUM_XDS_FIRST_REQUEST_TIMEOUT_SECONDS");
+            remove_var("FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS");
             let config = EnvConfig::from_env().unwrap();
             assert!(!config.xds_enabled);
             assert_eq!(config.xds_stream_channel_capacity, 32);
             assert_eq!(config.xds_max_streams_per_node, 4);
+            // Issue #3741: every aggregate ADS budget defaults to a finite
+            // value; none may be silently unbounded.
+            assert_eq!(config.xds_max_total_streams, 1024);
+            assert_eq!(config.xds_max_streams_per_namespace, 512);
+            assert_eq!(config.xds_max_streams_per_principal, 256);
+            assert_eq!(config.xds_max_active_nodes, 2048);
+            assert_eq!(config.xds_max_node_id_bytes, 253);
+            assert_eq!(config.xds_first_request_timeout_seconds, 30);
+            assert!(!config.xds_allow_unbounded_stream_limits);
+            assert!(
+                !config.xds_admission_limits().has_unbounded_scope(),
+                "default xDS admission budgets must all be finite"
+            );
         },
     );
 }
@@ -164,12 +187,125 @@ fn test_xds_enabled_parsed_from_env() {
             ("FERRUM_XDS_ENABLED", "true"),
             ("FERRUM_XDS_STREAM_CHANNEL_CAPACITY", "64"),
             ("FERRUM_XDS_MAX_STREAMS_PER_NODE", "8"),
+            ("FERRUM_XDS_MAX_TOTAL_STREAMS", "77"),
+            ("FERRUM_XDS_MAX_STREAMS_PER_NAMESPACE", "55"),
+            ("FERRUM_XDS_MAX_STREAMS_PER_PRINCIPAL", "33"),
+            ("FERRUM_XDS_MAX_ACTIVE_NODES", "111"),
+            ("FERRUM_XDS_MAX_NODE_ID_BYTES", "64"),
+            ("FERRUM_XDS_FIRST_REQUEST_TIMEOUT_SECONDS", "5"),
+            ("FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS", "true"),
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
             assert!(config.xds_enabled);
             assert_eq!(config.xds_stream_channel_capacity, 64);
             assert_eq!(config.xds_max_streams_per_node, 8);
+            assert_eq!(config.xds_max_total_streams, 77);
+            assert_eq!(config.xds_max_streams_per_namespace, 55);
+            assert_eq!(config.xds_max_streams_per_principal, 33);
+            assert_eq!(config.xds_max_active_nodes, 111);
+            assert_eq!(config.xds_max_node_id_bytes, 64);
+            assert_eq!(config.xds_first_request_timeout_seconds, 5);
+            assert!(config.xds_allow_unbounded_stream_limits);
+
+            // The resolved budgets startup enforces come from this one helper,
+            // so `validate` and CP startup cannot disagree (issue #3741).
+            let limits = config.xds_admission_limits();
+            assert_eq!(limits.max_total_streams, 77);
+            assert_eq!(limits.max_streams_per_namespace, 55);
+            assert_eq!(limits.max_streams_per_principal, 33);
+            assert_eq!(limits.max_streams_per_node, 8);
+            assert_eq!(limits.max_active_nodes, 111);
+            assert_eq!(limits.max_node_id_bytes, 64);
+            assert_eq!(limits.first_request_timeout, Duration::from_secs(5));
+        },
+    );
+}
+
+#[test]
+fn test_xds_unbounded_budget_allowed_outside_production_mode() {
+    // Issue #3741: `0` is unbounded. Outside production posture it is
+    // permitted (and warned about at startup), so dev/test setups keep working.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_XDS_ENABLED", "true"),
+            ("FERRUM_XDS_MAX_TOTAL_STREAMS", "0"),
+        ],
+        || {
+            remove_var("FERRUM_MESH_PRODUCTION_MODE");
+            remove_var("FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.xds_admission_limits().has_unbounded_scope());
+            assert!(
+                config.validate_xds_admission_limits().is_ok(),
+                "unbounded budgets are a dev-only posture, not a hard error"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_xds_unbounded_budget_rejected_under_production_mode() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_XDS_ENABLED", "true"),
+            ("FERRUM_MESH_PRODUCTION_MODE", "true"),
+            ("FERRUM_XDS_MAX_TOTAL_STREAMS", "0"),
+            ("FERRUM_XDS_MAX_ACTIVE_NODES", "0"),
+        ],
+        || {
+            remove_var("FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS");
+            let error = EnvConfig::from_env()
+                .expect_err("production posture must refuse unbounded ADS budgets");
+            assert!(error.contains("FERRUM_XDS_MAX_TOTAL_STREAMS"), "{error}");
+            assert!(error.contains("FERRUM_XDS_MAX_ACTIVE_NODES"), "{error}");
+            assert!(
+                error.contains("FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS"),
+                "the error must name the explicit unsafe override: {error}"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_xds_unbounded_budget_accepted_with_explicit_unsafe_override() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_XDS_ENABLED", "true"),
+            ("FERRUM_MESH_PRODUCTION_MODE", "true"),
+            ("FERRUM_XDS_MAX_TOTAL_STREAMS", "0"),
+            ("FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.validate_xds_admission_limits().is_ok());
+        },
+    );
+}
+
+#[test]
+fn test_xds_admission_limits_not_enforced_when_xds_disabled() {
+    // A control plane that never mounts ADS enforces nothing here, so an unused
+    // `0` must not fail validation.
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
+            ("FERRUM_MESH_PRODUCTION_MODE", "true"),
+            ("FERRUM_XDS_MAX_TOTAL_STREAMS", "0"),
+        ],
+        || {
+            remove_var("FERRUM_XDS_ENABLED");
+            remove_var("FERRUM_XDS_ALLOW_UNBOUNDED_STREAM_LIMITS");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(!config.xds_enabled);
+            assert!(config.validate_xds_admission_limits().is_ok());
         },
     );
 }
@@ -349,6 +485,104 @@ fn test_env_config_dp_mode_missing_grpc_url() {
             let result = EnvConfig::from_env();
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("FERRUM_DP_CP_GRPC_URLS"));
+        },
+    );
+}
+
+/// Issue #3726: the bounded last-known-good config age is nonzero by default,
+/// so an operator who never touches it still gets the safety boundary.
+#[test]
+fn test_env_config_dp_config_max_stale_defaults_to_one_hour_fail_closed() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+        ],
+        || {
+            remove_var("FERRUM_DP_CONFIG_MAX_STALE_SECONDS");
+            remove_var("FERRUM_DP_CONFIG_STALE_ACTION");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dp_config_max_stale_seconds, 3600);
+            assert_eq!(
+                config.dp_config_max_stale(),
+                std::time::Duration::from_secs(3600)
+            );
+            assert_eq!(
+                config.dp_config_stale_action_parsed().unwrap(),
+                StaleAction::FailClosed
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_dp_config_max_stale_zero_is_the_unbounded_opt_in() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_DP_CONFIG_MAX_STALE_SECONDS", "0"),
+            ("FERRUM_DP_CONFIG_STALE_ACTION", "readiness_only"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.dp_config_max_stale_seconds, 0);
+            assert!(config.dp_config_max_stale().is_zero());
+            assert_eq!(
+                config.dp_config_stale_action_parsed().unwrap(),
+                StaleAction::ReadinessOnly
+            );
+        },
+    );
+}
+
+/// The documented accepted values are exactly `fail_closed` and
+/// `readiness_only`; a case or dash variant is not an alias.
+#[test]
+fn test_env_config_dp_config_stale_action_rejects_case_and_dash_variants() {
+    for rejected in ["FAIL_CLOSED", "fail-closed", "Readiness-Only"] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "dp"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_DP_CONFIG_STALE_ACTION", rejected),
+            ],
+            || {
+                let err = EnvConfig::from_env()
+                    .expect_err("only the exact documented spellings are accepted");
+                assert!(err.contains("FERRUM_DP_CONFIG_STALE_ACTION"));
+            },
+        );
+    }
+}
+
+#[test]
+fn test_env_config_dp_config_stale_action_rejects_unknown_values() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "dp"),
+            ("FERRUM_DP_CP_GRPC_URLS", "http://127.0.0.1:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret-padding-for-32-char-min!!",
+            ),
+            ("FERRUM_DP_CONFIG_STALE_ACTION", "allow-everything"),
+        ],
+        || {
+            let err = EnvConfig::from_env().expect_err("unknown stale action must fail closed");
+            assert!(err.contains("FERRUM_DP_CONFIG_STALE_ACTION"));
         },
     );
 }
