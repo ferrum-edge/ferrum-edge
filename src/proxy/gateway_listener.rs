@@ -864,11 +864,7 @@ impl GatewayListenerManager {
                         GatewayListenerFailureReason::RebindDeferred
                     };
                     warn!(port, "Gateway API listener rebind deferred: {error}");
-                    failures.push(GatewayListenerBindFailure::tcp(
-                        port,
-                        reason,
-                        error,
-                    ));
+                    failures.push(GatewayListenerBindFailure::tcp(port, reason, error));
                     defer_rebind.insert(port);
                     self.draining.lock().await.extend(
                         pending

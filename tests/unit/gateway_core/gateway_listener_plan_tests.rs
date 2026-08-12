@@ -340,13 +340,8 @@ fn process_global_same_class_frontend_is_already_served_with_udp_present() {
     let mut existing = BTreeMap::new();
     existing.insert(PORT, GatewayListenerClass::Tls);
 
-    let plan = GatewayListenerPlan::from_config(
-        &config,
-        &HashSet::new(),
-        &existing,
-        DEFAULT_BIND,
-        true,
-    );
+    let plan =
+        GatewayListenerPlan::from_config(&config, &HashSet::new(), &existing, DEFAULT_BIND, true);
 
     assert!(
         plan.ports.is_empty(),
