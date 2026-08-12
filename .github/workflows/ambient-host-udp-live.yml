@@ -41,17 +41,9 @@ jobs:
       # validation and execution, and every failure exits non-zero so the gate
       # fails closed instead of quietly declaring itself irrelevant.
       #
-      # Bootstrap exception: when the
-      # trusted-base classifier specifically rejects suite ambient-host-udp as
-      # an unknown choice — which is the introducing-PR case against immutable
-      # origin/main — force relevant=true so this PR still runs the live suite.
-      # Every other checkout, parsing, or classifier error fails closed. Once
-      # main contains the suite, ordinary trusted-base classification applies.
-      #
-      # The required-CI verifier pins the workflow's unconditional
-      # pull_request / merge_group ownership and exact final context. The root
-      # merge gate reviews this introducing bootstrap because the separately
-      # trusted cross-build verifier cannot be modified by a pull request.
+      # This block is frozen by .github/scripts/verify_cross_build_policy.py
+      # (see live_suite_relevance_errors); it is byte-identical across every
+      # live-suite workflow apart from the suite, slug, and display name.
       - name: Check for ambient-host-udp changes
         id: filter
         env:
@@ -182,33 +174,7 @@ jobs:
           # and no implicit path entry, so nothing the pull request committed
           # can be imported by the trusted filter.
           python3 -I "$trusted_filter" --self-test
-          filter_err="$RUNNER_TEMP/ambient-host-udp-filter.err"
-          rm -f -- "$filter_err"
-          set +e
-          plan="$(python3 -I "$trusted_filter" "${filter_args[@]}" 2>"$filter_err")"
-          filter_status=$?
-          set -e
-          if [ "$filter_status" -ne 0 ]; then
-            # Narrow fail-closed bootstrap for the introducing PR of suite
-            # ambient-host-udp: immutable origin/main does not yet list this suite in
-            # live_suite_path_filter.py choices. Only that exact unknown-suite
-            # rejection forces relevant=true; every other classifier failure
-            # exits non-zero. Once main admits the suite, argparse accepts it
-            # and ordinary trusted-base classification applies.
-            if grep -Fq "invalid choice: 'ambient-host-udp'" "$filter_err"; then
-              echo "relevant=true" >> "$GITHUB_OUTPUT"
-              {
-                echo "Bootstrap: trusted base ${trusted_sha} does not recognize suite ambient-host-udp; forcing relevant=true for the introducing PR."
-                echo ""
-                echo "Classifier stderr:"
-                cat "$filter_err"
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            cat "$filter_err" >&2 || true
-            echo "::error::trusted relevance filter failed" >&2
-            exit 1
-          fi
+          plan="$(python3 -I "$trusted_filter" "${filter_args[@]}")"
           relevant="$(printf '%s\n' "$plan" | sed -n 's/^relevant=//p')"
           case "$relevant" in
             true|false) ;;

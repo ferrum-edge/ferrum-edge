@@ -224,6 +224,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_dp_config_stale` | gauge | `namespace` | `dp_config` | `documented_only` | `conditional` | Whether the DP's applied configuration is past its bound with no authoritative CP (1) or not (0). |
 | `ferrum_dp_config_stale_transitions_total` | counter | `namespace` | `dp_config` | `documented_only` | `conditional` | Transitions into the stale state since process start. |
 | `ferrum_edge_overhead_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Gateway overhead (excluding backend and plugins) in milliseconds. |
+| `ferrum_grpc_config_stream_terminations_total` | counter | `surface`, `reason`, `gateway_namespace` | `grpc_config` | `documented_only` | `always` | Authenticated configuration streams ended by fixed surface and reason. |
 | `ferrum_jwks_consecutive_failures` | gauge | `class` | `jwks` | `documented_only` | `always` | Maximum current consecutive failures among active remote stores by fixed failure class. |
 | `ferrum_jwks_refresh_failures_total` | counter | `class` | `jwks` | `documented_only` | `always` | Remote JWKS refresh failures by fixed failure class. |
 | `ferrum_jwks_trust_age_seconds` | gauge | `state` | `jwks` | `documented_only` | `always` | Maximum age of the last validated non-empty JWKS among active remote stores in each trust state. |

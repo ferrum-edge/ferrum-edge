@@ -32,10 +32,11 @@ Non-negotiables:
 - The launcher pins **`opencode/laguna-s-2.1-free`** on the write-enabled `build` agent and feeds
   the prompt on stdin (`opencode run --auto`). Pass `--model opencode/<other>` only when the user
   asks for a different opencode zen model (e.g. `opencode/deepseek-v4-pro`).
-- The opencode binary is resolved from `OPENCODE_BIN`, then `PATH`, then Conductor's bundled
-  `~/Library/Application Support/com.conductor.app/agent-binaries/acp-providers/opencode/<version>/opencode`.
-  Confirm `<opencode> models` lists the model before dispatching; the `-free` zen tier needs no
-  local credential.
+- The opencode binary is resolved from `OPENCODE_BIN`, then `~/.opencode/bin/opencode` /
+  `/opt/homebrew/bin/opencode` / `/usr/local/bin/opencode`, then `PATH`. Any candidate under
+  `com.conductor.app` is refused — Conductor's bundled ACP-provider copy lags the standalone
+  release. Confirm `<opencode> models` lists the model before dispatching; the `-free` zen tier
+  needs no local credential.
 - Run each dispatch as a **background / long-lived task**; prefer one task per agent.
 - **Parallel cap: 7** unless the user sets a lower limit.
 
@@ -85,8 +86,9 @@ checks -> fmt -> push -> ONE review trigger -> EXIT with report."
 
 ## Known failure modes
 
-- opencode binary not resolvable (no `OPENCODE_BIN`, not on `PATH`, and no Conductor bundle) or the
-  model absent from `opencode models` — stop and report; do not fall back to another model.
+- opencode binary not resolvable, refused because the only candidate is under `com.conductor.app`,
+  or the model absent from `opencode models` — stop and report; do not fall back to Conductor's
+  bundle or to another model.
 - Capacity or transport kills mid-loop — work may already be pushed; check PR state first.
 - Agents may exit claiming "waiting on monitor" — treat every completion as end-of-turn.
 - Nested dispatch: if a completed run's report mentions "dispatching a worker", treat the actual

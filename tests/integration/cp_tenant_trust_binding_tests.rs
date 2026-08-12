@@ -24,19 +24,27 @@ use arc_swap::ArcSwap;
 use chrono::Utc;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::json;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 
 use ferrum_edge::config::types::GatewayConfig;
-use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
+use ferrum_edge::grpc::auth::{
+    AuthorizedResponseStream, MESH_LOCAL_SUBSCRIBE_AUDIENCE, StreamAuthSurface,
+    remote_discovery_audience,
+};
 use ferrum_edge::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry};
 use ferrum_edge::grpc::cp_trust::{
-    CpDpTrustBundle, CpDpVerifier, CpGrpcConnectInfo, PeerNamespaceScope,
+    CpDpTrustBundle, CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo, PeerNamespaceScope,
 };
 use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
 use ferrum_edge::identity::TrustDomain;
 use ferrum_edge::modes::mesh::config::{MeshConfig, MeshService, TrustBundle, TrustBundleSet};
+use ferrum_edge::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
+use ferrum_edge::xds::proto::{DeltaDiscoveryRequest, DiscoveryRequest, Node};
 use ferrum_edge::xds::{LDS_TYPE_URL, XdsAdsServer};
 
 const TEST_ISSUER: &str = "ferrum-edge-cp-dp";
@@ -54,7 +62,7 @@ const TENANT_B: &str = "tenant-b";
 
 /// A two-tenant symmetric trust bundle: each `kid` is bound, by control-plane
 /// configuration, to exactly one namespace.
-fn two_tenant_bundle() -> Arc<CpDpVerifier> {
+fn two_tenant_verifier() -> CpDpVerifier {
     let document = json!({
         "version": 1,
         "keys": [
@@ -67,7 +75,43 @@ fn two_tenant_bundle() -> Arc<CpDpVerifier> {
     .to_string();
     let bundle = CpDpTrustBundle::from_document_str(&document, "test-bundle", None)
         .expect("two-tenant bundle must load");
-    Arc::new(CpDpVerifier::TrustBundle(bundle))
+    CpDpVerifier::TrustBundle(bundle)
+}
+
+fn two_tenant_bundle() -> Arc<CpDpVerifier> {
+    Arc::new(two_tenant_verifier())
+}
+
+fn tenant_b_only_verifier() -> CpDpVerifier {
+    let document = json!({
+        "version": 1,
+        "keys": [
+            { "kid": TENANT_B, "algorithm": "HS256", "secret": TENANT_B_SECRET,
+              "namespaces": [TENANT_B] },
+        ]
+    })
+    .to_string();
+    CpDpVerifier::TrustBundle(
+        CpDpTrustBundle::from_document_str(&document, "tenant-b-only", None)
+            .expect("tenant B verifier must load"),
+    )
+}
+
+fn tenant_a_broad_verifier() -> CpDpVerifier {
+    let document = json!({
+        "version": 1,
+        "keys": [
+            { "kid": TENANT_A, "algorithm": "HS256", "secret": TENANT_A_SECRET,
+              "namespaces": [TENANT_A, TENANT_B] },
+            { "kid": TENANT_B, "algorithm": "HS256", "secret": TENANT_B_SECRET,
+              "namespaces": [TENANT_B] },
+        ]
+    })
+    .to_string();
+    CpDpVerifier::TrustBundle(
+        CpDpTrustBundle::from_document_str(&document, "tenant-a-broad", None)
+            .expect("broad tenant A verifier must load"),
+    )
 }
 
 /// Mint a token exactly as a compromised node would: arbitrary claims, signed
@@ -81,10 +125,22 @@ fn mint(
     audience: Option<&str>,
 ) -> String {
     let now = Utc::now().timestamp();
+    mint_with_exp(secret, kid, node_id, ns, audience, now + 600)
+}
+
+fn mint_with_exp(
+    secret: &str,
+    kid: Option<&str>,
+    node_id: &str,
+    ns: Option<serde_json::Value>,
+    audience: Option<&str>,
+    exp: i64,
+) -> String {
+    let now = Utc::now().timestamp();
     let mut claims = json!({
         "sub": node_id,
         "iat": now,
-        "exp": now + 600,
+        "exp": exp,
         "iss": TEST_ISSUER,
         "role": "data_plane",
     });
@@ -155,6 +211,10 @@ fn multi_tenant_scope() -> CpScope {
     )
 }
 
+fn fixed_verifier_store(verifier: Arc<CpDpVerifier>) -> Arc<CpDpVerifierStore> {
+    Arc::new(CpDpVerifierStore::from_arc(verifier))
+}
+
 // ── Server harnesses ─────────────────────────────────────────────────────
 
 async fn start_configsync(
@@ -165,7 +225,7 @@ async fn start_configsync(
         .channel_capacity(64)
         .registry(Arc::new(DpNodeRegistry::new()))
         .expected_issuer(TEST_ISSUER.to_string())
-        .verifier(verifier)
+        .verifier_store(fixed_verifier_store(verifier))
         .scope(multi_tenant_scope())
         .real_ip_header(None)
         .build();
@@ -187,7 +247,7 @@ async fn start_mesh(verifier: Arc<CpDpVerifier>) -> (SocketAddr, tokio::task::Jo
         .channel_capacity(64)
         .registry(Arc::new(MeshNodeRegistry::new()))
         .expected_issuer(TEST_ISSUER.to_string())
-        .verifier(verifier)
+        .verifier_store(fixed_verifier_store(verifier))
         .scope(multi_tenant_scope())
         .build();
     let (listener, addr) = bind_loopback().await;
@@ -216,7 +276,7 @@ async fn start_xds(verifier: Arc<CpDpVerifier>) -> (SocketAddr, tokio::task::Joi
         TENANT_A.to_string(),
         32,
     )
-    .with_verifier(verifier)
+    .with_verifier_store(fixed_verifier_store(verifier))
     .with_scope(multi_tenant_scope());
     let (listener, addr) = bind_loopback().await;
     let handle = tokio::spawn(async move {
@@ -225,6 +285,55 @@ async fn start_xds(verifier: Arc<CpDpVerifier>) -> (SocketAddr, tokio::task::Joi
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .expect("xDS server failed");
+    });
+    settle().await;
+    (addr, handle)
+}
+
+async fn start_all_stream_surfaces(
+    verifier: Arc<CpDpVerifierStore>,
+    max_lifetime: Duration,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let cfg_arc = Arc::new(ArcSwap::new(Arc::new(tenant_marked_config())));
+    let (cp, update_tx) = CpGrpcServer::builder(cfg_arc.clone(), TENANT_A_SECRET.to_string())
+        .channel_capacity(64)
+        .registry(Arc::new(DpNodeRegistry::new()))
+        .expected_issuer(TEST_ISSUER.to_string())
+        .verifier_store(verifier.clone())
+        .max_stream_lifetime(max_lifetime)
+        .scope(multi_tenant_scope())
+        .real_ip_header(None)
+        .build();
+    let (mesh, _mesh_tx) = MeshGrpcServer::builder(cfg_arc.clone(), TENANT_A_SECRET.to_string())
+        .channel_capacity(64)
+        .registry(Arc::new(MeshNodeRegistry::new()))
+        .expected_issuer(TEST_ISSUER.to_string())
+        .verifier_store(verifier.clone())
+        .max_stream_lifetime(max_lifetime)
+        .scope(multi_tenant_scope())
+        .cluster_audience(Some("test-cluster".to_string()))
+        .build();
+    let xds = XdsAdsServer::new(
+        cfg_arc,
+        update_tx,
+        TENANT_A_SECRET.to_string(),
+        TEST_ISSUER.to_string(),
+        TENANT_A.to_string(),
+        32,
+    )
+    .with_verifier_store(verifier)
+    .with_max_stream_lifetime(max_lifetime)
+    .with_scope(multi_tenant_scope());
+
+    let (listener, addr) = bind_loopback().await;
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(cp.into_service())
+            .add_service(mesh.into_service())
+            .add_service(xds.into_service())
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .expect("combined configuration stream server failed");
     });
     settle().await;
     (addr, handle)
@@ -290,6 +399,707 @@ fn subscribe_request(node_id: &str, namespace: &str) -> ferrum_edge::grpc::proto
         real_ip_header: Some(String::new()),
         supports_heartbeat: true,
     }
+}
+
+fn mesh_subscribe_request(
+    node_id: &str,
+    namespace: &str,
+    remote_discovery: bool,
+) -> ferrum_edge::grpc::proto::MeshSubscribeRequest {
+    ferrum_edge::grpc::proto::MeshSubscribeRequest {
+        node_id: node_id.to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: namespace.to_string(),
+        workload_spiffe_id: String::new(),
+        labels: HashMap::new(),
+        waypoint_name: String::new(),
+        ambient_udp_source_scoping: false,
+        node_waypoint_capture_scoping: false,
+        remote_discovery,
+    }
+}
+
+async fn wait_for_terminal_status<T>(stream: &mut tonic::Streaming<T>) -> tonic::Code {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            match stream.message().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("configuration stream closed without terminal status"),
+                Err(status) => return status.code(),
+            }
+        }
+    })
+    .await
+    .expect("configuration stream must terminate within the bounded lease window")
+}
+
+async fn xds_channel(addr: SocketAddr) -> tonic::transport::Channel {
+    tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap()
+}
+
+fn authorize<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<T> {
+    request.metadata_mut().insert(
+        "authorization",
+        tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+    );
+    request
+}
+
+/// Admission must bind to the generation carried by the exact immutable
+/// verifier snapshot used for signature and claims verification. Re-reading
+/// generation from the current store would accept here because tenant A's
+/// opaque credential identity is present again after the remove/re-add.
+#[test]
+fn captured_old_verifier_snapshot_cannot_bind_after_remove_then_readd() {
+    let verifier = CpDpVerifierStore::from_arc(two_tenant_bundle());
+    let captured = verifier.load();
+    let token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "captured-snapshot-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let request = authorize(tonic::Request::new(()), &token);
+
+    verifier.replace(tenant_b_only_verifier());
+    verifier.replace(two_tenant_verifier());
+
+    let status = match captured.verify_and_bind_grpc_identity(
+        request.metadata(),
+        TEST_ISSUER,
+        None,
+        &verifier,
+    ) {
+        Ok(_) => panic!("an identity verified by the removed generation must not bind"),
+        Err(status) => status,
+    };
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test(start_paused = true)]
+async fn finite_server_lease_closes_every_bearer_configuration_stream() {
+    let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+    let (addr, handle) = start_all_stream_surfaces(verifier, Duration::from_millis(150)).await;
+
+    let config_token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "config-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let mut config_client = configsync_client!(addr, config_token);
+    let mut config_stream = config_client
+        .subscribe(tonic::Request::new(subscribe_request(
+            "config-node",
+            TENANT_A,
+        )))
+        .await
+        .expect("ConfigSync admission")
+        .into_inner();
+    assert_eq!(
+        wait_for_terminal_status(&mut config_stream).await,
+        tonic::Code::Unauthenticated
+    );
+
+    for (node_id, remote, audience) in [
+        (
+            "mesh-local-node",
+            false,
+            MESH_LOCAL_SUBSCRIBE_AUDIENCE.to_string(),
+        ),
+        (
+            "mesh-remote-node",
+            true,
+            remote_discovery_audience("test-cluster"),
+        ),
+    ] {
+        let mesh_token = mint(
+            TENANT_A_SECRET,
+            Some(TENANT_A),
+            node_id,
+            Some(json!(TENANT_A)),
+            Some(&audience),
+        );
+        let mut mesh_client = mesh_client!(addr, mesh_token);
+        let mut mesh_stream = mesh_client
+            .mesh_subscribe(tonic::Request::new(mesh_subscribe_request(
+                node_id, TENANT_A, remote,
+            )))
+            .await
+            .expect("MeshSubscribe admission")
+            .into_inner();
+        assert_eq!(
+            wait_for_terminal_status(&mut mesh_stream).await,
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    let sotw_token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "xds-sotw-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let mut sotw_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
+    let (sotw_tx, sotw_rx) = mpsc::channel(2);
+    sotw_tx
+        .send(DiscoveryRequest {
+            node: Some(Node {
+                id: "xds-sotw-node".to_string(),
+                ..Node::default()
+            }),
+            resource_names: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            ..DiscoveryRequest::default()
+        })
+        .await
+        .unwrap();
+    let mut sotw_stream = sotw_client
+        .stream_aggregated_resources(authorize(
+            tonic::Request::new(ReceiverStream::new(sotw_rx)),
+            &sotw_token,
+        ))
+        .await
+        .expect("SotW ADS admission")
+        .into_inner();
+    assert_eq!(
+        wait_for_terminal_status(&mut sotw_stream).await,
+        tonic::Code::Unauthenticated
+    );
+    drop(sotw_tx);
+
+    let delta_token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "xds-delta-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let mut delta_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
+    let (delta_tx, delta_rx) = mpsc::channel(2);
+    delta_tx
+        .send(DeltaDiscoveryRequest {
+            node: Some(Node {
+                id: "xds-delta-node".to_string(),
+                ..Node::default()
+            }),
+            resource_names_subscribe: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            ..DeltaDiscoveryRequest::default()
+        })
+        .await
+        .unwrap();
+    let mut delta_stream = delta_client
+        .delta_aggregated_resources(authorize(
+            tonic::Request::new(ReceiverStream::new(delta_rx)),
+            &delta_token,
+        ))
+        .await
+        .expect("delta ADS admission")
+        .into_inner();
+    assert_eq!(
+        wait_for_terminal_status(&mut delta_stream).await,
+        tonic::Code::Unauthenticated
+    );
+    drop(delta_tx);
+
+    handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verifier_rotation_revokes_only_streams_bound_to_removed_credentials() {
+    let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+    // Keep the independent server lease well beyond the client-side terminal
+    // wait so this test isolates verifier rotation.
+    let (addr, handle) =
+        start_all_stream_surfaces(verifier.clone(), Duration::from_secs(300)).await;
+
+    let token_a = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "dp-a-rotation",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let token_b = mint(
+        TENANT_B_SECRET,
+        Some(TENANT_B),
+        "dp-b-rotation",
+        Some(json!(TENANT_B)),
+        None,
+    );
+    let mut client_a = configsync_client!(addr, token_a);
+    let mut stream_a = client_a
+        .subscribe(tonic::Request::new(subscribe_request(
+            "dp-a-rotation",
+            TENANT_A,
+        )))
+        .await
+        .expect("tenant A stream admission")
+        .into_inner();
+    let mut client_b = configsync_client!(addr, token_b);
+    let mut stream_b = client_b
+        .subscribe(tonic::Request::new(subscribe_request(
+            "dp-b-rotation",
+            TENANT_B,
+        )))
+        .await
+        .expect("tenant B stream admission")
+        .into_inner();
+    stream_a
+        .message()
+        .await
+        .unwrap()
+        .expect("tenant A initial snapshot");
+    stream_b
+        .message()
+        .await
+        .unwrap()
+        .expect("tenant B initial snapshot");
+
+    verifier.replace(tenant_b_only_verifier());
+    // Re-add the exact tenant-A key before either stream observes the watch
+    // revision. Its new generation must not resurrect a stream admitted by
+    // the removed generation, while tenant B remains continuously accepted.
+    verifier.replace(two_tenant_verifier());
+    assert_eq!(
+        wait_for_terminal_status(&mut stream_a).await,
+        tonic::Code::PermissionDenied
+    );
+    assert!(
+        timeout(Duration::from_millis(600), stream_b.message())
+            .await
+            .is_err(),
+        "an overlapping retained credential must not churn its live stream"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn revocation_preempts_buffered_delivery_on_every_configuration_surface() {
+    for surface in [
+        StreamAuthSurface::ConfigSync,
+        StreamAuthSurface::MeshSubscribeLocal,
+        StreamAuthSurface::MeshSubscribeRemote,
+        StreamAuthSurface::XdsSotw,
+        StreamAuthSurface::XdsDelta,
+    ] {
+        let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+        let snapshot = verifier.load();
+        let token = mint(
+            TENANT_A_SECRET,
+            Some(TENANT_A),
+            "buffered-delivery-node",
+            Some(json!(TENANT_A)),
+            None,
+        );
+        let request = authorize(tonic::Request::new(()), &token);
+        let identity = snapshot
+            .verify_and_bind_grpc_identity(request.metadata(), TEST_ISSUER, None, verifier.as_ref())
+            .expect("test identity must bind to the active generation");
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Ok::<_, tonic::Status>(()))
+            .await
+            .expect("buffered response must enqueue");
+        let mut stream = AuthorizedResponseStream::new(
+            ReceiverStream::new(rx),
+            &identity,
+            verifier.clone(),
+            Duration::from_secs(300),
+            surface,
+        );
+
+        verifier.replace(tenant_b_only_verifier());
+        let status = stream
+            .next()
+            .await
+            .expect("authorization closure must emit one terminal item")
+            .expect_err("authorization closure must preempt buffered configuration output");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            status.message(),
+            "Stream verification credential is no longer trusted"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_reload_cannot_mask_the_next_revocation_on_an_idle_stream() {
+    let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+    let snapshot = verifier.load();
+    let token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "idle-reload-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let request = authorize(tonic::Request::new(()), &token);
+    let identity = snapshot
+        .verify_and_bind_grpc_identity(request.metadata(), TEST_ISSUER, None, verifier.as_ref())
+        .expect("test identity must bind to the active generation");
+    let (_tx, rx) = mpsc::channel::<Result<(), tonic::Status>>(1);
+    let mut stream = AuthorizedResponseStream::new(
+        ReceiverStream::new(rx),
+        &identity,
+        verifier.clone(),
+        Duration::from_secs(300),
+        StreamAuthSurface::ConfigSync,
+    );
+    let waiter = tokio::spawn(async move { stream.next().await });
+    tokio::task::yield_now().await;
+
+    // This replacement retains tenant A's exact credential generation. The
+    // authorization watch must re-arm after observing it so the following
+    // removal still wakes an otherwise idle response stream.
+    verifier.replace(two_tenant_verifier());
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    verifier.replace(tenant_b_only_verifier());
+
+    let status = waiter
+        .await
+        .expect("idle response waiter must not panic")
+        .expect("revocation must emit one terminal item")
+        .expect_err("revocation must terminate the idle stream");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test(start_paused = true)]
+async fn deadlines_preempt_buffered_configuration_output() {
+    let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+    let snapshot = verifier.load();
+    let token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "server-deadline-buffered-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let request = authorize(tonic::Request::new(()), &token);
+    let identity = snapshot
+        .verify_and_bind_grpc_identity(request.metadata(), TEST_ISSUER, None, verifier.as_ref())
+        .expect("test identity must bind to the active generation");
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Ok::<_, tonic::Status>(()))
+        .await
+        .expect("buffered response must enqueue");
+    let mut stream = AuthorizedResponseStream::new(
+        ReceiverStream::new(rx),
+        &identity,
+        verifier,
+        Duration::ZERO,
+        StreamAuthSurface::ConfigSync,
+    );
+    let status = stream
+        .next()
+        .await
+        .expect("server deadline must emit one terminal item")
+        .expect_err("server deadline must preempt buffered configuration output");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    assert_eq!(
+        status.message(),
+        "Authenticated stream reached server maximum lifetime"
+    );
+
+    let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+    let snapshot = verifier.load();
+    let token = mint_with_exp(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "token-deadline-buffered-node",
+        Some(json!(TENANT_A)),
+        None,
+        Utc::now().timestamp() - 59,
+    );
+    let request = authorize(tonic::Request::new(()), &token);
+    let identity = snapshot
+        .verify_and_bind_grpc_identity(request.metadata(), TEST_ISSUER, None, verifier.as_ref())
+        .expect("token inside verification leeway must bind");
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Ok::<_, tonic::Status>(()))
+        .await
+        .expect("buffered response must enqueue");
+    let mut stream = AuthorizedResponseStream::new(
+        ReceiverStream::new(rx),
+        &identity,
+        verifier,
+        Duration::from_secs(300),
+        StreamAuthSurface::ConfigSync,
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let status = stream
+        .next()
+        .await
+        .expect("token deadline must emit one terminal item")
+        .expect_err("token deadline must preempt buffered configuration output");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    assert_eq!(status.message(), "Stream authorization expired");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xds_revocation_terminates_sotw_and_delta_with_buffered_transport_data() {
+    let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+    // This test isolates credential revocation with the independent server
+    // lease well beyond the client-side terminal wait.
+    let (addr, handle) =
+        start_all_stream_surfaces(verifier.clone(), Duration::from_secs(300)).await;
+
+    let sotw_token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "buffered-xds-sotw-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let mut sotw_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
+    let (sotw_tx, sotw_rx) = mpsc::channel(2);
+    sotw_tx
+        .send(DiscoveryRequest {
+            node: Some(Node {
+                id: "buffered-xds-sotw-node".to_string(),
+                ..Node::default()
+            }),
+            resource_names: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            ..DiscoveryRequest::default()
+        })
+        .await
+        .unwrap();
+    let mut sotw_stream = sotw_client
+        .stream_aggregated_resources(authorize(
+            tonic::Request::new(ReceiverStream::new(sotw_rx)),
+            &sotw_token,
+        ))
+        .await
+        .expect("SotW ADS admission")
+        .into_inner();
+
+    let delta_token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "buffered-xds-delta-node",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let mut delta_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
+    let (delta_tx, delta_rx) = mpsc::channel(2);
+    delta_tx
+        .send(DeltaDiscoveryRequest {
+            node: Some(Node {
+                id: "buffered-xds-delta-node".to_string(),
+                ..Node::default()
+            }),
+            resource_names_subscribe: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            ..DeltaDiscoveryRequest::default()
+        })
+        .await
+        .unwrap();
+    let mut delta_stream = delta_client
+        .delta_aggregated_resources(authorize(
+            tonic::Request::new(ReceiverStream::new(delta_rx)),
+            &delta_token,
+        ))
+        .await
+        .expect("delta ADS admission")
+        .into_inner();
+
+    // Let both producer tasks enqueue their initial response. Tonic may already
+    // have placed that authorized-at-delivery response on the wire; regardless
+    // of client-side buffering, revocation must be the terminal stream status.
+    settle().await;
+    verifier.replace(tenant_b_only_verifier());
+    assert_eq!(
+        wait_for_terminal_status(&mut sotw_stream).await,
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        wait_for_terminal_status(&mut delta_stream).await,
+        tonic::Code::PermissionDenied
+    );
+
+    drop(sotw_tx);
+    drop(delta_tx);
+    handle.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn namespace_binding_narrowing_revokes_stream_using_the_old_ceiling() {
+    let verifier = Arc::new(CpDpVerifierStore::new(tenant_a_broad_verifier()));
+    let (addr, handle) = start_all_stream_surfaces(verifier.clone(), Duration::from_secs(5)).await;
+    let token = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "dp-a-old-ceiling",
+        Some(json!(TENANT_B)),
+        None,
+    );
+    let mut client = configsync_client!(addr, token);
+    let mut stream = client
+        .subscribe(tonic::Request::new(subscribe_request(
+            "dp-a-old-ceiling",
+            TENANT_B,
+        )))
+        .await
+        .expect("the original broad namespace policy must admit the stream")
+        .into_inner();
+    stream
+        .message()
+        .await
+        .expect("initial response must be readable")
+        .expect("initial snapshot must be present");
+
+    verifier.replace(two_tenant_verifier());
+    assert_eq!(
+        wait_for_terminal_status(&mut stream).await,
+        tonic::Code::PermissionDenied
+    );
+
+    handle.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn accepted_token_expiry_closes_stream_without_heartbeat_extension() {
+    let verifier = Arc::new(CpDpVerifierStore::from_arc(two_tenant_bundle()));
+    let (addr, handle) = start_all_stream_surfaces(verifier, Duration::from_secs(5)).await;
+    let config_token = mint_with_exp(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "expiring-config-node",
+        Some(json!(TENANT_A)),
+        None,
+        Utc::now().timestamp() - 58,
+    );
+    let mut config_client = configsync_client!(addr, config_token);
+    let mut config_stream = config_client
+        .subscribe(tonic::Request::new(subscribe_request(
+            "expiring-config-node",
+            TENANT_A,
+        )))
+        .await
+        .expect("token inside verifier leeway must be admitted")
+        .into_inner();
+    assert_eq!(
+        wait_for_terminal_status(&mut config_stream).await,
+        tonic::Code::Unauthenticated
+    );
+
+    for (node_id, remote, audience) in [
+        (
+            "expiring-mesh-local-node",
+            false,
+            MESH_LOCAL_SUBSCRIBE_AUDIENCE.to_string(),
+        ),
+        (
+            "expiring-mesh-remote-node",
+            true,
+            remote_discovery_audience("test-cluster"),
+        ),
+    ] {
+        let mesh_token = mint_with_exp(
+            TENANT_A_SECRET,
+            Some(TENANT_A),
+            node_id,
+            Some(json!(TENANT_A)),
+            Some(&audience),
+            Utc::now().timestamp() - 58,
+        );
+        let mut mesh_client = mesh_client!(addr, mesh_token);
+        let mut mesh_stream = mesh_client
+            .mesh_subscribe(tonic::Request::new(mesh_subscribe_request(
+                node_id, TENANT_A, remote,
+            )))
+            .await
+            .expect("mesh token inside verifier leeway must be admitted")
+            .into_inner();
+        assert_eq!(
+            wait_for_terminal_status(&mut mesh_stream).await,
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    let sotw_token = mint_with_exp(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "expiring-xds-sotw-node",
+        Some(json!(TENANT_A)),
+        None,
+        Utc::now().timestamp() - 58,
+    );
+    let mut sotw_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
+    let (sotw_tx, sotw_rx) = mpsc::channel(2);
+    sotw_tx
+        .send(DiscoveryRequest {
+            node: Some(Node {
+                id: "expiring-xds-sotw-node".to_string(),
+                ..Node::default()
+            }),
+            resource_names: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            ..DiscoveryRequest::default()
+        })
+        .await
+        .unwrap();
+    let mut sotw_stream = sotw_client
+        .stream_aggregated_resources(authorize(
+            tonic::Request::new(ReceiverStream::new(sotw_rx)),
+            &sotw_token,
+        ))
+        .await
+        .expect("SotW token inside verifier leeway must be admitted")
+        .into_inner();
+    assert_eq!(
+        wait_for_terminal_status(&mut sotw_stream).await,
+        tonic::Code::Unauthenticated
+    );
+    drop(sotw_tx);
+
+    let delta_token = mint_with_exp(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "expiring-xds-delta-node",
+        Some(json!(TENANT_A)),
+        None,
+        Utc::now().timestamp() - 58,
+    );
+    let mut delta_client = AggregatedDiscoveryServiceClient::new(xds_channel(addr).await);
+    let (delta_tx, delta_rx) = mpsc::channel(2);
+    delta_tx
+        .send(DeltaDiscoveryRequest {
+            node: Some(Node {
+                id: "expiring-xds-delta-node".to_string(),
+                ..Node::default()
+            }),
+            resource_names_subscribe: vec!["*".to_string()],
+            type_url: LDS_TYPE_URL.to_string(),
+            ..DeltaDiscoveryRequest::default()
+        })
+        .await
+        .unwrap();
+    let mut delta_stream = delta_client
+        .delta_aggregated_resources(authorize(
+            tonic::Request::new(ReceiverStream::new(delta_rx)),
+            &delta_token,
+        ))
+        .await
+        .expect("delta token inside verifier leeway must be admitted")
+        .into_inner();
+    assert_eq!(
+        wait_for_terminal_status(&mut delta_stream).await,
+        tonic::Code::Unauthenticated
+    );
+    drop(delta_tx);
+
+    handle.abort();
 }
 
 // ── The core cross-tenant forgery, per surface ───────────────────────────
@@ -708,6 +1518,93 @@ fn malformed_bundles_are_refused_without_echoing_material() {
     }
 }
 
+#[test]
+fn trust_bundle_and_file_backed_material_reads_are_bounded_regular_files() {
+    const FILE_LIMIT: usize = 1024 * 1024;
+
+    let dir = tempfile::tempdir().expect("create bounded-read fixture directory");
+    let oversized = vec![b'x'; FILE_LIMIT + 1];
+
+    let bundle_path = dir.path().join("oversized-bundle.json");
+    std::fs::write(&bundle_path, &oversized).expect("write oversized bundle fixture");
+    let error = CpDpTrustBundle::load_from_path(
+        bundle_path.to_str().expect("UTF-8 bundle fixture path"),
+        None,
+    )
+    .expect_err("an oversized trust bundle must be refused before parsing");
+    assert!(error.contains("above the 1048576-byte limit"), "{error}");
+
+    let secret_path = dir.path().join("oversized-secret");
+    std::fs::write(&secret_path, &oversized).expect("write oversized secret fixture");
+    let document = json!({
+        "keys": [{
+            "kid": "bounded-secret",
+            "algorithm": "HS256",
+            "secret_path": secret_path.display().to_string(),
+            "namespaces": [TENANT_A]
+        }]
+    })
+    .to_string();
+    let error = CpDpTrustBundle::from_document_str(&document, "bounded-material-test", None)
+        .expect_err("oversized file-backed material must be refused");
+    assert!(error.contains("above the 1048576-byte limit"), "{error}");
+
+    let non_file_path = dir.path().join("material-directory");
+    std::fs::create_dir(&non_file_path).expect("create non-file material fixture");
+    let document = json!({
+        "keys": [{
+            "kid": "regular-file-only",
+            "algorithm": "HS256",
+            "secret_path": non_file_path.display().to_string(),
+            "namespaces": [TENANT_A]
+        }]
+    })
+    .to_string();
+    let error = CpDpTrustBundle::from_document_str(&document, "regular-material-test", None)
+        .expect_err("non-regular file-backed material must be refused");
+    assert!(error.contains("is not a regular file"), "{error}");
+}
+
+#[tokio::test]
+async fn trust_bundle_reload_times_out_without_accumulating_detached_readers() {
+    let dir = tempfile::tempdir().expect("create reload-reader fixture directory");
+    let bundle_path = dir.path().join("trust-bundle.json");
+    std::fs::write(
+        &bundle_path,
+        json!({
+            "version": 1,
+            "keys": [{
+                "kid": TENANT_A,
+                "algorithm": "HS256",
+                "secret": TENANT_A_SECRET,
+                "namespaces": [TENANT_A]
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write valid trust-bundle fixture");
+
+    let permit =
+        ferrum_edge::_test_support::acquire_cp_dp_trust_bundle_read_permit_for_test().await;
+    assert_eq!(
+        ferrum_edge::_test_support::load_cp_dp_trust_bundle_for_reload_for_test(
+            bundle_path.to_string_lossy().into_owned(),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("the occupied reader must time out"),
+        "reload_read_timed_out"
+    );
+
+    drop(permit);
+    ferrum_edge::_test_support::load_cp_dp_trust_bundle_for_reload_for_test(
+        bundle_path.to_string_lossy().into_owned(),
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("valid trust bundle must load after the detached-reader slot is released");
+}
+
 /// A bound credential backed by the fleet-wide `FERRUM_CP_DP_GRPC_JWT_SECRET`
 /// is structurally valid but semantically identical to the pre-advisory
 /// posture: every data plane already holds that value, so any of them could
@@ -839,14 +1736,14 @@ fn verifier_debug_never_renders_material() {
 /// a trust-bundle control plane threads
 /// `cp_dp_grpc_jwt_secret.unwrap_or_default()` — an empty string — into those
 /// builders so cross-cluster remote discovery can still mint. A call site that
-/// forgot `.verifier(..)` would then verify against the empty HS256 key, which
-/// every caller can reproduce. The verifier itself refuses instead.
+/// forgot `.verifier_store(..)` would then verify against the empty HS256 key,
+/// which every caller can reproduce. The verifier itself refuses instead.
 #[test]
 fn empty_shared_secret_never_verifies() {
     let empty = CpDpVerifier::SharedSecret(String::new());
     assert!(
         empty
-            .with_decoding_key(None, Algorithm::HS256, |_, _, _| ())
+            .with_decoding_key(None, Algorithm::HS256, |_, _, _, _| ())
             .is_err(),
         "an empty shared secret must not produce a usable decoding key"
     );
@@ -856,7 +1753,7 @@ fn empty_shared_secret_never_verifies() {
     let legacy = CpDpVerifier::SharedSecret(TENANT_A_SECRET.to_string());
     assert!(
         legacy
-            .with_decoding_key(None, Algorithm::HS256, |_, _, _| ())
+            .with_decoding_key(None, Algorithm::HS256, |_, _, _, _| ())
             .is_ok(),
         "a configured shared secret must still verify"
     );
@@ -939,7 +1836,7 @@ async fn xds_all_scope_rejects_bound_credential_without_ns_claim() {
         TENANT_A.to_string(),
         32,
     )
-    .with_verifier(two_tenant_bundle())
+    .with_verifier_store(fixed_verifier_store(two_tenant_bundle()))
     .with_scope(CpScope::All);
     let (listener, addr) = bind_loopback().await;
     let handle = tokio::spawn(async move {
@@ -998,7 +1895,7 @@ async fn single_scope_require_ns_claim_rejects_token_without_ns() {
         .channel_capacity(64)
         .registry(Arc::new(DpNodeRegistry::new()))
         .expected_issuer(TEST_ISSUER.to_string())
-        .verifier(verifier)
+        .verifier_store(fixed_verifier_store(verifier))
         .scope(CpScope::Single(TENANT_A.to_string()))
         .require_ns_claim(true)
         .real_ip_header(None)
@@ -1040,7 +1937,7 @@ async fn single_scope_without_require_accepts_no_ns_but_applies_bound() {
         .channel_capacity(64)
         .registry(Arc::new(DpNodeRegistry::new()))
         .expected_issuer(TEST_ISSUER.to_string())
-        .verifier(verifier)
+        .verifier_store(fixed_verifier_store(verifier))
         .scope(CpScope::Single(TENANT_A.to_string()))
         .require_ns_claim(false)
         .real_ip_header(None)

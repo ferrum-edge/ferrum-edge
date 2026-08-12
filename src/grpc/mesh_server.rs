@@ -16,11 +16,12 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 use super::auth::{
-    AllowedNamespaces, AudienceRejectReason, GrpcAudiencePolicy, MESH_LOCAL_SUBSCRIBE_AUDIENCE,
-    VerifiedGrpcIdentity, remote_discovery_audience, verify_grpc_jwt_metadata_with_audience,
+    AllowedNamespaces, AudienceRejectReason, AuthorizedResponseStream,
+    DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS, GrpcAudiencePolicy, MESH_LOCAL_SUBSCRIBE_AUDIENCE,
+    StreamAuthSurface, VerifiedGrpcIdentity, remote_discovery_audience,
 };
 use super::cp_server::{CpGrpcServer, CpScope, DEFAULT_CP_DP_JWT_ISSUER};
-use super::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
+use super::cp_trust::{CpDpVerifier, CpDpVerifierStore, CpGrpcConnectInfo};
 use super::mesh_registry::{MeshNodeInfo, MeshNodeRegistry};
 use super::mesh_slice_drift::{MeshSliceDriftAdmitError, MeshSliceDriftRegistry, validate_version};
 use super::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
@@ -93,7 +94,8 @@ pub struct MeshGrpcServer {
     /// Shared with the ConfigSync and xDS servers so native MeshSubscribe
     /// enforces the same namespace-bound verification credentials
     /// (advisory GHSA-3f2j-wwqw-grmg).
-    verifier: Arc<CpDpVerifier>,
+    verifier: Arc<CpDpVerifierStore>,
+    max_stream_lifetime: Duration,
     expected_issuer: String,
     mesh_update_tx: broadcast::Sender<MeshConfigBroadcast>,
     registry: Arc<MeshNodeRegistry>,
@@ -130,7 +132,8 @@ pub struct MeshGrpcServer {
 
 pub struct MeshGrpcServerBuilder {
     config: Arc<ArcSwap<GatewayConfig>>,
-    verifier: Arc<CpDpVerifier>,
+    verifier: Arc<CpDpVerifierStore>,
+    max_stream_lifetime: Duration,
     channel_capacity: usize,
     registry: Arc<MeshNodeRegistry>,
     drift: Arc<MeshSliceDriftRegistry>,
@@ -149,7 +152,10 @@ impl MeshGrpcServerBuilder {
     fn new(config: Arc<ArcSwap<GatewayConfig>>, jwt_secret: String) -> Self {
         Self {
             config,
-            verifier: Arc::new(CpDpVerifier::SharedSecret(jwt_secret)),
+            verifier: Arc::new(CpDpVerifierStore::new(CpDpVerifier::SharedSecret(
+                jwt_secret,
+            ))),
+            max_stream_lifetime: Duration::from_secs(DEFAULT_GRPC_MAX_STREAM_LIFETIME_SECONDS),
             channel_capacity: 128,
             registry: Arc::new(MeshNodeRegistry::new()),
             drift: Arc::new(MeshSliceDriftRegistry::new()),
@@ -185,10 +191,13 @@ impl MeshGrpcServerBuilder {
         self
     }
 
-    /// Replace the seeded shared-secret verifier with the CP's configured
-    /// namespace-bound trust bundle.
-    pub fn verifier(mut self, verifier: Arc<CpDpVerifier>) -> Self {
+    pub fn verifier_store(mut self, verifier: Arc<CpDpVerifierStore>) -> Self {
         self.verifier = verifier;
+        self
+    }
+
+    pub fn max_stream_lifetime(mut self, lifetime: Duration) -> Self {
+        self.max_stream_lifetime = lifetime;
         self
     }
 
@@ -246,6 +255,7 @@ impl MeshGrpcServerBuilder {
             MeshGrpcServer {
                 config: self.config,
                 verifier: self.verifier,
+                max_stream_lifetime: self.max_stream_lifetime,
                 expected_issuer: self.expected_issuer,
                 mesh_update_tx: tx,
                 registry: self.registry,
@@ -376,12 +386,13 @@ impl MeshGrpcServer {
         extensions: &tonic::Extensions,
         remote_discovery: bool,
     ) -> Result<VerifiedGrpcIdentity, (Status, Option<AudienceRejectReason>)> {
-        verify_grpc_jwt_metadata_with_audience(
+        let verifier_snapshot = self.verifier.load();
+        verifier_snapshot.verify_and_bind_grpc_identity_with_audience(
             metadata,
-            &self.verifier,
             &self.expected_issuer,
             self.audience_policy_for(remote_discovery),
             extensions.get::<CpGrpcConnectInfo>(),
+            &self.verifier,
         )
     }
 
@@ -946,7 +957,19 @@ impl MeshConfigSync for MeshGrpcServer {
             connected_at: now,
             session_token,
         };
-        Ok(Response::new(Box::pin(tracked)))
+        let surface = if remote_discovery {
+            StreamAuthSurface::MeshSubscribeRemote
+        } else {
+            StreamAuthSurface::MeshSubscribeLocal
+        };
+        let authorized = AuthorizedResponseStream::new(
+            tracked,
+            &identity,
+            self.verifier.clone(),
+            self.max_stream_lifetime,
+            surface,
+        );
+        Ok(Response::new(Box::pin(authorized)))
     }
 
     async fn report_mesh_slice_status(
