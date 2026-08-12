@@ -54,6 +54,7 @@ fn local_echo(spiffe: &str, app_port: u16) -> (Workload, MeshService) {
         }],
         workloads: vec![WorkloadRef { spiffe_id: id }],
         protocol_overrides: HashMap::new(),
+        uid: None,
     };
     (workload, service)
 }
